@@ -266,6 +266,14 @@ pub(crate) struct InstalledRuntimeManifest {
     pub pip_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub rocm_sdk: Option<RocmSdkPythonProbe>,
+    /// The torch this SDK install wrote, e.g. `2.11.0+rocm7.13.0`.
+    ///
+    /// Recorded because an engine install later overwrites torch in the same
+    /// environment. Reading the environment afterwards tells you what is there
+    /// now, not which build belongs to these libraries; only the manifest still
+    /// knows that, and it has to survive repeat installs to be worth anything.
+    #[serde(default)]
+    pub sdk_torch: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -977,6 +985,7 @@ fn install_wheel_runtime(
         python_executable: Some(env_python.display().to_string()),
         pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
+        sdk_torch: Some(resolution.package_versions.torch.clone()),
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1105,6 +1114,7 @@ fn install_tarball_runtime(
         python_executable: None,
         pip_cache_dir: None,
         rocm_sdk: None,
+        sdk_torch: None,
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -2630,6 +2640,214 @@ fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
     serde_json::from_str(output.trim()).context("failed to parse rocm_sdk probe output")
 }
 
+/// What the runtime's torch reports about the GPUs it can actually open.
+///
+/// [`validate_rocm_sdk_runtime_probe`] establishes that the SDK's libraries are
+/// present and resolvable. That is not the same question as whether the torch
+/// sharing the venv can enumerate a device: a torch built against a different
+/// HIP version loads happily against those libraries and then reports no
+/// devices at all.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct RuntimeDeviceProbe {
+    pub import_ok: bool,
+    pub torch_version: Option<String>,
+    pub hip_version: Option<String>,
+    /// `None` when torch never imported, so "unknown" stays distinct from "zero".
+    pub device_count: Option<u32>,
+    pub error: Option<String>,
+}
+
+/// Ask the runtime's own interpreter how many devices its torch can open.
+///
+/// `library_paths` must be the runtime's recorded ROCm library directories (see
+/// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
+/// `LD_LIBRARY_PATH` for the child, which is how a served process resolves them.
+///
+/// This cannot be replaced with an in-process `rocm_sdk.initialize_process()`
+/// call in the probe script. Measured on MI300X against a runtime that serves
+/// correctly: with the library directories on `LD_LIBRARY_PATH` torch reports 8
+/// devices, and with `initialize_process()` alone it reports 0. A probe built on
+/// the latter would fail healthy runtimes and send people to reinstall them,
+/// which is the operation that breaks them.
+pub(crate) fn probe_runtime_devices(
+    python_executable: &Path,
+    library_paths: &[PathBuf],
+) -> Result<RuntimeDeviceProbe> {
+    let mut env = Vec::new();
+    if !library_paths.is_empty() {
+        let mut entries = library_paths.to_vec();
+        if let Some(existing) = std::env::var_os(LIBRARY_PATH_ENV) {
+            entries.extend(split_runtime_path(&existing));
+        }
+        let joined = std::env::join_paths(entries)
+            .context("failed to compose the runtime library path for the device probe")?;
+        env.push((
+            LIBRARY_PATH_ENV.to_owned(),
+            joined.to_string_lossy().into_owned(),
+        ));
+    }
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        RUNTIME_DEVICE_PROBE_SCRIPT,
+        &env,
+        "launch runtime device probe",
+    )
+    .with_context(|| {
+        format!(
+            "failed to launch runtime device probe via {}",
+            python_executable.display()
+        )
+    })?;
+    serde_json::from_str(text.trim()).context("failed to parse runtime device probe output")
+}
+
+/// The loader search-path variable used to expose the runtime's ROCm libraries.
+#[cfg(windows)]
+const LIBRARY_PATH_ENV: &str = "PATH";
+#[cfg(not(windows))]
+const LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
+
+/// Reports what torch sees, never raising: an unusable runtime must be
+/// described, not turned into a probe crash.
+const RUNTIME_DEVICE_PROBE_SCRIPT: &str = r#"
+import json
+
+out = {
+    "import_ok": False,
+    "torch_version": None,
+    "hip_version": None,
+    "device_count": None,
+    "error": None,
+}
+
+try:
+    import torch
+
+    out["import_ok"] = True
+    out["torch_version"] = getattr(torch, "__version__", None)
+    out["hip_version"] = getattr(getattr(torch, "version", None), "hip", None)
+    out["device_count"] = int(torch.cuda.device_count())
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ": " + str(exc)
+
+print(json.dumps(out))
+"#;
+
+/// What torch is installed, and what torch the engine's metadata demands.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct TorchAlignmentProbe {
+    /// The installed torch, e.g. `2.11.0+rocm7.13.0`. `None` if torch is absent.
+    pub installed_torch: Option<String>,
+    /// The engine's pinned requirement, e.g. `torch==2.11.0+gitd0c8b1f`. `None`
+    /// when the engine is not installed yet or does not pin torch.
+    pub engine_requires_torch: Option<String>,
+}
+
+/// Read installed/required torch from distribution metadata, without importing
+/// torch. Metadata questions must not depend on the runtime being usable — this
+/// is called both before and after an engine install, and in the broken state
+/// importing torch is exactly what fails.
+pub(crate) fn probe_torch_alignment(
+    python_executable: &Path,
+    engine_distribution: &str,
+) -> Result<TorchAlignmentProbe> {
+    let env = vec![(
+        "ROCM_CLI_PROBE_DIST".to_owned(),
+        engine_distribution.to_owned(),
+    )];
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        TORCH_ALIGNMENT_PROBE_SCRIPT,
+        &env,
+        "launch torch alignment probe",
+    )?;
+    serde_json::from_str(text.trim()).context("failed to parse torch alignment probe output")
+}
+
+const TORCH_ALIGNMENT_PROBE_SCRIPT: &str = r#"
+import json
+import os
+import re
+import importlib.metadata as md
+
+out = {"installed_torch": None, "engine_requires_torch": None}
+
+try:
+    out["installed_torch"] = md.version("torch")
+except Exception:
+    pass
+
+try:
+    for raw in md.requires(os.environ.get("ROCM_CLI_PROBE_DIST", "vllm")) or []:
+        # `Requires-Dist` entries carry environment markers after ';'. Only the
+        # requirement itself matters here.
+        requirement = raw.split(";")[0].strip()
+        # The distribution name runs up to the first specifier, extra or space —
+        # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
+        matched = re.match(r"[A-Za-z0-9._-]+", requirement)
+        if matched is None:
+            continue
+        if matched.group(0).lower().replace("_", "-") == "torch":
+            out["engine_requires_torch"] = requirement
+            break
+except Exception:
+    pass
+
+print(json.dumps(out))
+"#;
+
+/// Split a version into its public part and its local segment.
+///
+/// `2.11.0+rocm7.13.0` -> `("2.11.0", Some("rocm7.13.0"))`. The local segment is
+/// the build identifier: for TheRock wheels it names the ROCm build, and for the
+/// engine's own index it is an opaque commit tag.
+pub(crate) fn split_local_version(version: &str) -> (&str, Option<&str>) {
+    match version.split_once('+') {
+        Some((base, local)) => (base, Some(local)),
+        None => (version, None),
+    }
+}
+
+/// The version pinned by a `==` requirement, e.g. `torch==2.11.0+git…` -> the
+/// version. Returns `None` for any looser requirement, since only an exact pin
+/// tells us which release the engine was built against.
+pub(crate) fn requirement_pinned_version(requirement: &str) -> Option<&str> {
+    let (_, version) = requirement.split_once("==")?;
+    let version = version.trim();
+    if version.is_empty() || version.contains(',') {
+        return None;
+    }
+    Some(version)
+}
+
+/// Install one exact package version from `index_url` into `python_executable`.
+///
+/// Used to put the SDK's build of a package back after another installer has
+/// replaced it. `--reinstall-package` is required: without it uv treats the
+/// already-present distribution as satisfying the request and does nothing.
+pub(crate) fn install_pinned_package(
+    paths: &AppPaths,
+    python_executable: &Path,
+    index_url: &str,
+    package: &str,
+    requirement: &str,
+) -> Result<()> {
+    let uv = rocm_core::uv::ensure_uv_binary(paths)
+        .context("failed to acquire uv binary for the torch alignment install")?;
+    let mut args = rocm_core::uv::uv_pip_install_base(python_executable);
+    args.push("--extra-index-url".to_owned());
+    args.push(index_url.to_owned());
+    args.push("--reinstall-package".to_owned());
+    args.push(package.to_owned());
+    args.push(requirement.to_owned());
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command(
+        &uv,
+        &borrowed,
+        "install the SDK build of the engine's torch",
+    )
+}
+
 pub(crate) fn validate_rocm_sdk_runtime_probe(probe: &RocmSdkPythonProbe) -> Result<()> {
     if !probe.import_ok {
         bail!(
@@ -2833,6 +3051,50 @@ fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Resu
         stdout,
         stderr,
     })
+}
+
+/// Run a probe script with extra environment set and return its stdout.
+///
+/// The script goes to a temp file rather than `python -c`, because the loader
+/// search path this exists to set must reach the child through its environment,
+/// and a file keeps the invocation identical on every platform.
+fn capture_python_stdout_with_env(
+    python_executable: &Path,
+    script: &str,
+    env: &[(String, String)],
+    context_text: &str,
+) -> Result<String> {
+    let temp_root = if runtime_is_windows() {
+        windows_temp_dir("rocm-cli-python-probe")?
+    } else {
+        linux_temp_dir("rocm-cli-python-probe")?
+    };
+    let script_path = temp_root.join("probe.py");
+    fs::write(&script_path, script)
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+
+    let mut command = Command::new(python_executable);
+    command.arg(&script_path);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch {}", python_executable.display()));
+    let _ = fs::remove_dir_all(&temp_root);
+    let output = output?;
+
+    if !output.status.success() {
+        bail!(
+            "{context_text}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("{context_text}: failed to decode Python output"))
 }
 
 fn capture_python_stdout(
@@ -5319,6 +5581,7 @@ echo Python 3.12.10
             python_executable: Some("python".to_owned()),
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,

@@ -172,16 +172,23 @@ async fn user_reinstalls_sdk(world: &mut E2eWorld) {
     user_installs_sdk(world).await;
 }
 
-#[then("the install reports the engine's requirements as satisfied")]
-async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
+#[then("the runtime can still use the GPU")]
+async fn assert_runtime_can_still_use_the_gpu(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
+    // The functional signal rather than a diagnostic string: the device check asks
+    // the runtime's own torch how many devices it can open. A runtime left holding
+    // a torch that one of the two installers cannot use reports none, and that is
+    // the failure this scenario exists to catch.
+    assert!(
+        output.contains("device_check: usable"),
+        "the reinstall left a runtime that cannot open a GPU:\n{output}"
+    );
+    // A genuine unmet requirement must still fail the scenario. Torch itself is
+    // expected to diverge from the engine's exact pin once it is settled on the
+    // SDK's build of the same release, and that is reported as a divergence.
     assert!(
         !output.contains("dependency_check: violated"),
-        "the reinstall left the engine's declared requirements unmet:\n{output}"
-    );
-    assert!(
-        output.contains("dependency_check: satisfied"),
-        "the install did not report on the engine's requirements at all:\n{output}"
+        "the reinstall left a genuine requirement unmet:\n{output}"
     );
 }
 
@@ -192,8 +199,9 @@ async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
 /// violated — that false green is the very thing this feature's scenario exists
 /// to catch — so asserting it afterwards would pass whether or not the fix
 /// works. Teaching that surface to notice a violated pin is tracked separately;
-/// until it does, the `dependency_check: satisfied` assertion is the only
-/// falsifiable signal available.
+/// until it does, the device check is the falsifiable signal, because it asks
+/// the runtime how many GPUs it can actually open rather than whether it looks
+/// installed.
 fn assert_engine_ready(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["engines", "list"]);
     assert!(

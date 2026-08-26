@@ -19,18 +19,21 @@ Feature: Runtime configuration
     When the user inspects the system
     Then the managed runtime folder path is not recursively nested
 
-  # The SDK and the engine share one Python environment, so a second
-  # `install sdk` wrote the SDK's torch stack over the build the engine pins. The
-  # engine still resolved, so the install reported success and every health surface
-  # kept saying `ready` — the first signal was a serve failure naming neither. Needs
-  # a real SDK install, a real engine install, and a second SDK install, so it runs
-  # on the nightly GPU lane. `@requires-engine:vllm` because only vLLM shares the
-  # runtime environment; Lemonade manages its own.
+  # The SDK and the engine share one Python environment and both write torch into
+  # it, so a second `install sdk` could leave a torch that one of the two cannot
+  # use. Every health surface still reported `ready` and the install still exited
+  # 0 — the first signal was a serve failure naming neither. The runtime now
+  # settles on the SDK's build of the release the engine pins, so this asserts the
+  # outcome that actually matters rather than the wording of a check: can the
+  # runtime still reach the GPU afterwards. Needs a real SDK install, a real engine
+  # install, and a second SDK install, so it runs on the nightly GPU lane.
+  # `@requires-engine:vllm` because only vLLM shares the runtime environment;
+  # Lemonade manages its own.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
-  Scenario: 4 - Reinstalling the SDK leaves the installed engine's requirements satisfied
+  Scenario: 4 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
-    Then the install reports the engine's requirements as satisfied
+    Then the runtime can still use the GPU
 
   # The GPU E2E lanes no longer install the shared runtime once and keep it
   # forever: `xtask e2e-prewarm` asks `rocm update` whether the channel index has

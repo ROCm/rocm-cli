@@ -2444,8 +2444,8 @@ fn install(target: InstallTarget) -> Result<()> {
                         finalize_successful_sdk_install(&paths)?
                     };
                     print!("{output}");
-                    if let Some(finalized) = finalized {
-                        print_sdk_install_success(&finalized);
+                    if let Some(finalized) = &finalized {
+                        print_sdk_install_success(finalized);
                         // The SDK runtime wheel bundles PyTorch, whose ROCm build
                         // links against libatomic.so.1 and the system numactl
                         // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
@@ -2453,41 +2453,22 @@ fn install(target: InstallTarget) -> Result<()> {
                         // engine (if any) is auto-installed below.
                         ensure_libatomic_for_torch(yes);
                         ensure_libnuma_for_torch(yes);
-                        if let Err(error) =
-                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
-                        {
-                            record_cli_audit_event(
-                                &paths,
-                                "engine",
-                                "engine_auto_install",
-                                "error",
-                                format!(
-                                    "auto-install failed engine=vllm runtime_id={} family={}: {error}",
-                                    finalized.runtime_key, finalized.family
-                                ),
-                                None,
-                            );
-                            eprintln!("warning: automatic vLLM install failed: {error}");
-                            eprintln!(
-                                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
-                                finalized.runtime_key
-                            );
-                        }
                     }
-                    record_cli_audit_event(
+                    finish_sdk_install(
                         &paths,
-                        "runtime",
+                        finalized.as_ref(),
                         if dry_run {
                             "install_sdk_dry_run"
                         } else {
                             "install_sdk"
                         },
-                        "info",
                         format!(
                             "sdk install completed channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
                         ),
-                        None,
-                    );
+                        |paths, finalized| {
+                            maybe_auto_install_sdk_preferred_engine(paths, finalized, yes)
+                        },
+                    )?;
                 }
                 Err(error) => {
                     record_cli_audit_event(
@@ -3806,13 +3787,14 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 },
                 env_root.as_deref(),
             )?;
+            settle_engine_install(&paths, &engine, &runtime_id, &response)?;
             println!("engine install");
             println!("  engine: {engine}");
             println!("  runtime_id: {runtime_id}");
             println!("  reinstall: {reinstall}");
             println!("  env_id: {}", response.env_id);
             println!("  env_path: {}", response.env_path);
-            for warning in response.warnings {
+            for warning in &response.warnings {
                 println!("  warning: {warning}");
             }
             if response.managed_env == Some(false) {
@@ -4014,7 +3996,7 @@ fn ensure_self_managed_engine_ready(
         None
     } else {
         eprintln!("Preparing {engine} for GPU serving...");
-        Some(engine_request_with_env_root::<_, InstallResponse>(
+        let response = engine_request_with_env_root::<_, InstallResponse>(
             Some(paths),
             engine,
             EngineMethod::Install,
@@ -4025,7 +4007,9 @@ fn ensure_self_managed_engine_ready(
                 env_root: env_root.clone(),
             },
             env_root.as_deref(),
-        )?)
+        )?;
+        settle_engine_install(paths, engine, &runtime_id, &response)?;
+        Some(response)
     };
 
     let engine_config = config.engine_config_mut(engine);
@@ -4342,6 +4326,7 @@ fn resolve_engine_env(
         },
         env_root.as_deref(),
     )?;
+    settle_engine_install(paths, engine, &runtime_id, &response)?;
     Ok(ResolvedEngineEnv {
         env_id: response.env_id,
         runtime_id,
@@ -7394,6 +7379,9 @@ fn maybe_auto_install_sdk_preferred_engine(
                 engine,
                 runtime_python_for_key(paths, &finalized.runtime_key).as_deref(),
                 &finalized.runtime_key,
+                // The engine install failed, so no alignment ran and any
+                // divergence found here is a real one.
+                None,
             );
             return Err(error);
         }
@@ -7401,7 +7389,7 @@ fn maybe_auto_install_sdk_preferred_engine(
     println!("  reinstall: false");
     println!("  env_id: {}", response.env_id);
     println!("  env_path: {}", response.env_path);
-    for warning in response.warnings {
+    for warning in &response.warnings {
         println!("  warning: {warning}");
     }
 
@@ -7417,16 +7405,7 @@ fn maybe_auto_install_sdk_preferred_engine(
         }
         config.save(paths)?;
 
-        // The SDK and the engine share this environment, and the SDK's torch stack was
-        // just written into it. Say plainly whether the engine's own requirements
-        // survived that, so a runtime the engine cannot use is never reported only as a
-        // successful install.
-        report_engine_dependency_check(
-            paths,
-            engine,
-            Some(Path::new(&response.python_executable)),
-            &finalized.runtime_key,
-        );
+        settle_engine_install(paths, engine, &finalized.runtime_key, &response)?;
     }
 
     record_cli_audit_event(
@@ -7452,6 +7431,14 @@ enum EngineDependencyCheck {
     /// The engine declares requirements the environment does not meet, one line each,
     /// as the resolver reported them.
     Violated(Vec<String>),
+    /// The only unmet requirements are ones the install deliberately diverged from.
+    ///
+    /// Torch alignment leaves the runtime holding the SDK's build of the release
+    /// the engine pins, which the engine's exact-pin metadata cannot express. The
+    /// distinction matters because the remedy for a real violation — reinstalling
+    /// the engine — is precisely what would undo the alignment and restore a
+    /// runtime that cannot open a device.
+    ExpectedDivergence(Vec<String>),
     /// The check itself could not run (no usable `uv`, unreadable environment).
     NotVerified(String),
 }
@@ -7466,8 +7453,9 @@ fn report_engine_dependency_check(
     engine: &str,
     python: Option<&Path>,
     runtime_key: &str,
+    realigned_package: Option<&str>,
 ) {
-    let outcome = engine_dependency_check(paths, engine, python);
+    let outcome = engine_dependency_check(paths, engine, python, realigned_package);
     print!("{}", render_engine_dependency_check(engine, &outcome));
     let (level, message) = match &outcome {
         EngineDependencyCheck::Satisfied => (
@@ -7478,6 +7466,13 @@ fn report_engine_dependency_check(
             "error",
             format!(
                 "engine={engine} runtime_id={runtime_key} dependency_check=violated: {}",
+                details.join("; ")
+            ),
+        ),
+        EngineDependencyCheck::ExpectedDivergence(details) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=expected_divergence: {}",
                 details.join("; ")
             ),
         ),
@@ -7507,10 +7502,617 @@ fn runtime_python_for_key(paths: &AppPaths, runtime_key: &str) -> Option<PathBuf
     manifest.python_executable.as_deref().map(PathBuf::from)
 }
 
+/// The runtime's recorded ROCm library directories.
+///
+/// These are what a served process gets on its loader path, so a probe must use
+/// them too or it will judge a healthy runtime unusable.
+fn runtime_library_paths_for_key(paths: &AppPaths, runtime_key: &str) -> Vec<PathBuf> {
+    let Ok(manifests) = therock::load_runtime_manifests(paths) else {
+        return Vec::new();
+    };
+    runtime_manifest_for_selector(&manifests, runtime_key)
+        .and_then(|manifest| manifest.rocm_sdk.as_ref())
+        .map(|probe| probe.library_paths.clone())
+        .unwrap_or_default()
+}
+
+/// The wheel index the runtime was installed from.
+fn runtime_index_url_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    manifest.index_url.clone()
+}
+
+/// Which torch a runtime should hold once an engine has been installed into it.
+///
+/// Two installers write torch into the same environment. The SDK install writes
+/// TheRock's build; the engine then writes the build from its own index, pinned
+/// to an exact version. Letting either side win unconditionally is wrong, and
+/// both failures have been observed in the field:
+///
+/// * If the engine's build always wins, the runtime can end up with a torch that
+///   loads against the installed SDK and then enumerates no devices, so serving
+///   fails with an unhelpful error long after the install reported success.
+/// * If the SDK's build always wins, the runtime can end up on a torch *release*
+///   the engine does not accept, which breaks the engine in a different way.
+///
+/// The version and the build answer different questions, so they are taken from
+/// different places: the *release* comes from the engine, which is built against
+/// it, and the *build* comes from the SDK, which the libraries belong to. That
+/// is what this resolves to — the SDK's build of the release the engine pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchAlignment {
+    /// The runtime already holds the SDK build of the engine's torch release.
+    AlreadyAligned { version: String },
+    /// The engine's build was replaced with the SDK build of the same release.
+    Realigned { from: String, to: String },
+    /// The SDK publishes no build of that release; the engine's own is kept.
+    ///
+    /// Claimed only when the resolver actually said so. Any other failure is an
+    /// `InstallFailed`, because asserting "not published" over a network or disk
+    /// error sends the reader hunting for a missing wheel that exists.
+    Unavailable { wanted: String, kept: String },
+    /// The realignment install failed for some other reason, carried verbatim.
+    InstallFailed {
+        wanted: String,
+        kept: String,
+        error: String,
+    },
+    /// Nothing to decide — no exact pin, no engine metadata, or no SDK torch.
+    NotApplicable(String),
+}
+
+/// What the alignment rule concludes, before any of it is acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchAlignmentPlan {
+    AlreadyAligned { version: String },
+    Install { wanted: String, from: String },
+    NotApplicable(String),
+}
+
+/// The rule itself, kept free of I/O so both field failures can be tested.
+///
+/// `wanted` is the engine's pinned *release* carrying the SDK's *build*.
+fn plan_torch_alignment(
+    sdk_build: Option<&str>,
+    installed_torch: Option<&str>,
+    engine_requirement: Option<&str>,
+    engine: &str,
+) -> TorchAlignmentPlan {
+    let Some(sdk_build) = sdk_build else {
+        return TorchAlignmentPlan::NotApplicable(
+            "the runtime manifest does not identify the SDK's torch build".to_owned(),
+        );
+    };
+    let Some(requirement) = engine_requirement else {
+        return TorchAlignmentPlan::NotApplicable(format!("{engine} does not pin torch"));
+    };
+    let Some(pinned) = therock::requirement_pinned_version(requirement) else {
+        return TorchAlignmentPlan::NotApplicable(format!(
+            "{engine} does not pin torch to an exact version ({requirement})"
+        ));
+    };
+    let wanted = format!("{}+{sdk_build}", therock::split_local_version(pinned).0);
+    let installed = installed_torch.unwrap_or_default().to_owned();
+    if installed == wanted {
+        TorchAlignmentPlan::AlreadyAligned { version: wanted }
+    } else {
+        TorchAlignmentPlan::Install {
+            wanted,
+            from: installed,
+        }
+    }
+}
+
+/// Whether a failed install means the resolver could not find that version.
+///
+/// Deliberately narrow. Anything unmatched is reported as a plain failure with
+/// its error, so an unrecognised message degrades to the honest answer rather
+/// than to a confident wrong one.
+fn install_error_reports_version_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no solution found")
+        || error.contains("were found for")
+        || error.contains("not found in the package registry")
+        || error.contains("has no version")
+}
+
+fn align_runtime_torch(
+    paths: &AppPaths,
+    python: &Path,
+    index_url: Option<&str>,
+    sdk_build: Option<&str>,
+    engine: &str,
+) -> TorchAlignment {
+    let probe = match therock::probe_torch_alignment(python, engine) {
+        Ok(probe) => probe,
+        Err(error) => return TorchAlignment::NotApplicable(error.to_string()),
+    };
+    let plan = plan_torch_alignment(
+        sdk_build,
+        probe.installed_torch.as_deref(),
+        probe.engine_requires_torch.as_deref(),
+        engine,
+    );
+    let (wanted, from) = match plan {
+        TorchAlignmentPlan::AlreadyAligned { version } => {
+            return TorchAlignment::AlreadyAligned { version };
+        }
+        TorchAlignmentPlan::NotApplicable(reason) => {
+            return TorchAlignment::NotApplicable(reason);
+        }
+        TorchAlignmentPlan::Install { wanted, from } => (wanted, from),
+    };
+    let Some(index_url) = index_url else {
+        return TorchAlignment::NotApplicable(
+            "the runtime manifest records no wheel index to install from".to_owned(),
+        );
+    };
+    match therock::install_pinned_package(
+        paths,
+        python,
+        index_url,
+        "torch",
+        &format!("torch=={wanted}"),
+    ) {
+        Ok(()) => TorchAlignment::Realigned { from, to: wanted },
+        // The SDK index may not publish this release at all. That is a real
+        // possibility, not an error to abort on: the engine's own build is left
+        // in place and the device check that follows reports whether it works.
+        Err(error) => {
+            let error = format!("{error:#}");
+            if install_error_reports_version_unavailable(&error) {
+                TorchAlignment::Unavailable { wanted, kept: from }
+            } else {
+                TorchAlignment::InstallFailed {
+                    wanted,
+                    kept: from,
+                    error,
+                }
+            }
+        }
+    }
+}
+
+fn render_torch_alignment(outcome: &TorchAlignment) -> String {
+    let mut output = String::new();
+    match outcome {
+        TorchAlignment::AlreadyAligned { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: already_aligned ({})",
+                sanitize_log_value(version)
+            );
+        }
+        TorchAlignment::Realigned { from, to } => {
+            let _ = writeln!(output, "  torch_alignment: realigned");
+            let _ = writeln!(
+                output,
+                "    {} -> {} (the SDK's build of the release {} pins)",
+                sanitize_log_value(from),
+                sanitize_log_value(to),
+                sanitize_log_value("the engine")
+            );
+        }
+        TorchAlignment::Unavailable { wanted, kept } => {
+            let _ = writeln!(output, "  torch_alignment: unavailable");
+            let _ = writeln!(
+                output,
+                "    the SDK index publishes no {}; keeping {}",
+                sanitize_log_value(wanted),
+                sanitize_log_value(kept)
+            );
+        }
+        TorchAlignment::InstallFailed {
+            wanted,
+            kept,
+            error,
+        } => {
+            let _ = writeln!(output, "  torch_alignment: install_failed");
+            let _ = writeln!(
+                output,
+                "    could not install {}: {}",
+                sanitize_log_value(wanted),
+                sanitize_log_value(error)
+            );
+            let _ = writeln!(output, "    keeping {}", sanitize_log_value(kept));
+        }
+        TorchAlignment::NotApplicable(reason) => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: not_applicable ({})",
+                sanitize_log_value(reason)
+            );
+        }
+    }
+    output
+}
+
+/// Returns the package the runtime now deliberately diverges on, if any, so the
+/// dependency check can tell that divergence apart from a real violation.
+///
+/// Both `Realigned` and `AlreadyAligned` diverge from the engine's exact pin —
+/// the second is simply a rerun over a runtime already put right, which is the
+/// normal state on every refresh after the first.
+fn report_torch_alignment(
+    paths: &AppPaths,
+    engine: &str,
+    python: &Path,
+    runtime_key: &str,
+    sdk_build: Option<&str>,
+) -> TorchAlignment {
+    let index_url = runtime_index_url_for_key(paths, runtime_key);
+    let outcome = align_runtime_torch(paths, python, index_url.as_deref(), sdk_build, engine);
+    print!("{}", render_torch_alignment(&outcome));
+    let (level, message) = match &outcome {
+        TorchAlignment::AlreadyAligned { version } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=already_aligned version={version}"
+            ),
+        ),
+        TorchAlignment::Realigned { from, to } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=realigned from={from} to={to}"
+            ),
+        ),
+        TorchAlignment::Unavailable { wanted, kept } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=unavailable wanted={wanted} kept={kept}"
+            ),
+        ),
+        TorchAlignment::InstallFailed {
+            wanted,
+            kept,
+            error,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=install_failed wanted={wanted} kept={kept}: {error}"
+            ),
+        ),
+        TorchAlignment::NotApplicable(reason) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=not_applicable: {reason}"
+            ),
+        ),
+    };
+    record_cli_audit_event(paths, "engine", "torch_alignment", level, message, None);
+    outcome
+}
+
+/// The package the runtime now deliberately diverges on, if any, so the
+/// dependency check can tell that divergence apart from a real violation.
+///
+/// Both `Realigned` and `AlreadyAligned` diverge from the engine's exact pin —
+/// the second is a rerun over a runtime already put right, which is the normal
+/// state on every refresh after the first.
+const fn deliberately_diverged_package(outcome: &TorchAlignment) -> Option<&'static str> {
+    match outcome {
+        TorchAlignment::Realigned { .. } | TorchAlignment::AlreadyAligned { .. } => Some("torch"),
+        TorchAlignment::Unavailable { .. }
+        | TorchAlignment::InstallFailed { .. }
+        | TorchAlignment::NotApplicable(_) => None,
+    }
+}
+
+/// Whether the installed runtime can actually open a GPU.
+///
+/// The dependency check answers whether the engine's declared requirements are
+/// satisfied. That is a question about metadata, and it is not the same question
+/// as whether the environment works: a torch built against a different ROCm
+/// version than the installed SDK satisfies nothing yet loads cleanly, and then
+/// reports no devices. vLLM turns that into `Failed to infer device type` at
+/// first serve, long after the install reported success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeDeviceCheck {
+    /// torch imported and reported at least one device.
+    Usable {
+        device_count: u32,
+        torch_version: String,
+    },
+    /// torch imported but reported no devices — the failure this check exists for.
+    NoDevices {
+        torch_version: String,
+        hip_version: String,
+    },
+    /// The question could not be answered; never assume healthy.
+    NotVerified(String),
+}
+
+fn runtime_device_check(python: Option<&Path>, library_paths: &[PathBuf]) -> RuntimeDeviceCheck {
+    let Some(python) = python else {
+        return RuntimeDeviceCheck::NotVerified(
+            "the runtime's Python environment could not be located".to_owned(),
+        );
+    };
+    let probe = match therock::probe_runtime_devices(python, library_paths) {
+        Ok(probe) => probe,
+        Err(error) => return RuntimeDeviceCheck::NotVerified(error.to_string()),
+    };
+    if !probe.import_ok {
+        return RuntimeDeviceCheck::NotVerified(
+            probe
+                .error
+                .unwrap_or_else(|| "torch did not import".to_owned()),
+        );
+    }
+    let torch_version = probe.torch_version.unwrap_or_else(|| "unknown".to_owned());
+    match probe.device_count {
+        Some(0) => RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version: probe.hip_version.unwrap_or_else(|| "unknown".to_owned()),
+        },
+        Some(device_count) => RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        },
+        None => RuntimeDeviceCheck::NotVerified(
+            "torch imported but did not report a device count".to_owned(),
+        ),
+    }
+}
+
+fn render_runtime_device_check(outcome: &RuntimeDeviceCheck) -> String {
+    let mut output = String::new();
+    match outcome {
+        RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        } => {
+            let _ = writeln!(
+                output,
+                "  device_check: usable ({device_count} device(s), torch {})",
+                sanitize_log_value(torch_version)
+            );
+        }
+        RuntimeDeviceCheck::NotVerified(reason) => {
+            let _ = writeln!(
+                output,
+                "  device_check: not_verified ({})",
+                sanitize_log_value(reason)
+            );
+        }
+        RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version,
+        } => {
+            let _ = writeln!(output, "  device_check: no_devices");
+            let _ = writeln!(
+                output,
+                "    torch {} (hip {}) imported but reports 0 devices",
+                sanitize_log_value(torch_version),
+                sanitize_log_value(hip_version)
+            );
+            // Deliberately no remedy: the reinstall that would satisfy the
+            // engine's pin is what produces this state, so naming it here would
+            // send people in a circle. Say what is wrong and let them choose.
+            let _ = writeln!(
+                output,
+                "    serving will fail with `Failed to infer device type`; this torch is built \
+                 for a different ROCm version than the installed SDK"
+            );
+        }
+    }
+    output
+}
+
+fn report_runtime_device_check(
+    paths: &AppPaths,
+    engine: &str,
+    python: Option<&Path>,
+    runtime_key: &str,
+) -> RuntimeDeviceCheck {
+    let library_paths = runtime_library_paths_for_key(paths, runtime_key);
+    let outcome = runtime_device_check(python, &library_paths);
+    print!("{}", render_runtime_device_check(&outcome));
+    let (level, message) = match &outcome {
+        RuntimeDeviceCheck::Usable { device_count, .. } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=usable devices={device_count}"
+            ),
+        ),
+        RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=no_devices torch={torch_version} hip={hip_version}"
+            ),
+        ),
+        RuntimeDeviceCheck::NotVerified(reason) => (
+            "info",
+            format!("engine={engine} runtime_id={runtime_key} device_check=not_verified: {reason}"),
+        ),
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "runtime_device_check",
+        level,
+        message,
+        None,
+    );
+    outcome
+}
+
+/// The build identifier of the torch that belongs to this runtime's SDK.
+///
+/// Taken from the manifest, never from whatever torch happens to be installed.
+/// The environment tells you what is there now, which after an engine install is
+/// the engine's build — trusting that would let a runtime already holding the
+/// wrong torch declare itself correct and never recover.
+///
+/// Older manifests predate the recorded value, so fall back to deriving it from
+/// the SDK version, which is how TheRock names these builds.
+fn sdk_torch_build_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    if let Some(recorded) = manifest.sdk_torch.as_deref()
+        && let Some(build) = therock::split_local_version(recorded).1
+    {
+        return Some(build.to_owned());
+    }
+    let version = manifest
+        .rocm_sdk
+        .as_ref()
+        .and_then(|probe| probe.rocm_sdk_version.clone())
+        .unwrap_or_else(|| manifest.version.clone());
+    (!version.trim().is_empty()).then(|| format!("rocm{version}"))
+}
+
+/// Settle which torch a managed runtime keeps after an engine install, then report.
+///
+/// Every path that installs an engine into a managed runtime must call this.
+/// Skipping it anywhere lets the engine's own torch win silently and can leave a
+/// runtime that cannot open a device — including after an explicit
+/// `rocm engines install <engine> --reinstall`, which is exactly what someone
+/// reaches for when a runtime already looks wrong.
+///
+/// External environments are left alone: rocm-cli does not own them.
+/// Whether an install finished having produced a runtime that cannot serve.
+///
+/// The conjunction is the point. An alignment that could not run may still leave
+/// a working environment, and a device count of zero is expected wherever no GPU
+/// is present — neither alone justifies failing a multi-gigabyte install. Both
+/// together mean the runtime cannot open a device and we could not correct it.
+const fn install_left_runtime_unusable(
+    alignment: &TorchAlignment,
+    devices: &RuntimeDeviceCheck,
+) -> bool {
+    let unsettled = matches!(
+        alignment,
+        TorchAlignment::Unavailable { .. } | TorchAlignment::InstallFailed { .. }
+    );
+    unsettled && matches!(devices, RuntimeDeviceCheck::NoDevices { .. })
+}
+
+/// An engine install finished having left a runtime that cannot open a device.
+///
+/// A distinct type rather than a plain message so `install sdk` can tell this
+/// apart from an ordinary engine-install failure. It deliberately tolerates the
+/// latter — a failed engine install still leaves a good multi-gigabyte SDK
+/// behind, and discarding that would be worse — but a runtime it has just left
+/// unable to serve is the exact silent success this change exists to end, so
+/// that one has to fail the command.
+#[derive(Debug)]
+struct UnusableRuntimeAfterInstall(String);
+
+impl std::fmt::Display for UnusableRuntimeAfterInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnusableRuntimeAfterInstall {}
+
+fn unusable_runtime_error(engine: &str, runtime_key: &str) -> anyhow::Error {
+    anyhow::Error::new(UnusableRuntimeAfterInstall(format!(
+        "the {engine} install left runtime `{runtime_key}` on a torch it cannot use: no GPU could \
+         be opened, and the matching build from the SDK index could not be installed. The ROCm \
+         SDK itself is installed; re-run once the index is reachable, or install a torch matching \
+         the SDK into the runtime environment."
+    )))
+}
+
+/// Whether a failed engine auto-install should fail `rocm install sdk` itself.
+///
+/// Only the unusable-runtime case does. Everything else — an unreachable engine
+/// index, a resolver error, a missing build tool — leaves the SDK installed and
+/// usable, so it warns and keeps the successful exit rather than throwing away
+/// the install that did succeed.
+fn engine_auto_install_failure_is_fatal(error: &anyhow::Error) -> bool {
+    error.is::<UnusableRuntimeAfterInstall>()
+}
+
+/// Everything `install sdk` does once the SDK itself is on disk: auto-install the
+/// family's engine, record the install, and decide the exit code.
+///
+/// The engine auto-install is a parameter so that decision is reachable from a
+/// test without a multi-gigabyte install behind it. It is the part worth pinning:
+/// a failed engine install must keep the successful exit, because the SDK is
+/// installed and usable and only a separately retryable step is missing, while a
+/// runtime this install left unable to open a device must not — reporting success
+/// for that is the defect being fixed. The SDK's own audit event is recorded
+/// either way, before the command fails, because the SDK install did complete.
+fn finish_sdk_install(
+    paths: &AppPaths,
+    finalized: Option<&SdkInstallFinalization>,
+    audit_action: &str,
+    audit_detail: String,
+    auto_install: impl FnOnce(&AppPaths, &SdkInstallFinalization) -> Result<()>,
+) -> Result<()> {
+    let mut unusable_runtime = None;
+    if let Some(finalized) = finalized
+        && let Err(error) = auto_install(paths, finalized)
+    {
+        record_cli_audit_event(
+            paths,
+            "engine",
+            "engine_auto_install",
+            "error",
+            format!(
+                "auto-install failed engine=vllm runtime_id={} family={}: {error}",
+                finalized.runtime_key, finalized.family
+            ),
+            None,
+        );
+        if engine_auto_install_failure_is_fatal(&error) {
+            unusable_runtime = Some(error);
+        } else {
+            eprintln!("warning: automatic vLLM install failed: {error}");
+            eprintln!(
+                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
+                finalized.runtime_key
+            );
+        }
+    }
+    record_cli_audit_event(paths, "runtime", audit_action, "info", audit_detail, None);
+    if let Some(error) = unusable_runtime {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn settle_engine_install(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_key: &str,
+    response: &InstallResponse,
+) -> Result<()> {
+    if response.managed_env == Some(false) {
+        return Ok(());
+    }
+    let python = Path::new(&response.python_executable);
+    let sdk_build = sdk_torch_build_for_key(paths, runtime_key);
+    let alignment =
+        report_torch_alignment(paths, engine, python, runtime_key, sdk_build.as_deref());
+    let diverged = deliberately_diverged_package(&alignment);
+    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
+    let devices = report_runtime_device_check(paths, engine, Some(python), runtime_key);
+
+    // Fail only on the conjunction: torch could not be settled AND the runtime
+    // cannot open a device. Either alone is survivable — an alignment that could
+    // not run may still leave a working environment, and a device count of zero
+    // is expected where no GPU is present. Together they mean this install
+    // produced a runtime that cannot serve, and reporting success for that is the
+    // whole failure this change exists to end.
+    if install_left_runtime_unusable(&alignment, &devices) {
+        return Err(unusable_runtime_error(engine, runtime_key));
+    }
+    Ok(())
+}
+
 fn engine_dependency_check(
     paths: &AppPaths,
     engine: &str,
     python: Option<&Path>,
+    realigned_package: Option<&str>,
 ) -> EngineDependencyCheck {
     let Some(python) = python else {
         return EngineDependencyCheck::NotVerified(
@@ -7520,18 +8122,37 @@ fn engine_dependency_check(
     match rocm_core::check_dependencies(paths, python) {
         Ok(violations) => {
             let owned = rocm_core::violations_requiring(&violations, engine);
-            if owned.is_empty() {
-                EngineDependencyCheck::Satisfied
-            } else {
-                EngineDependencyCheck::Violated(
-                    owned
-                        .iter()
-                        .map(|violation| violation.detail.clone())
-                        .collect(),
-                )
-            }
+            let details: Vec<String> = owned
+                .iter()
+                .map(|violation| violation.detail.clone())
+                .collect();
+            classify_dependency_details(details, realigned_package)
         }
         Err(error) => EngineDependencyCheck::NotVerified(error.to_string()),
+    }
+}
+
+/// Separate a deliberate divergence from a genuine violation.
+///
+/// Only a divergence about the realigned package is expected; anything else in
+/// the same run is still a violation and must keep saying so.
+fn classify_dependency_details(
+    details: Vec<String>,
+    realigned_package: Option<&str>,
+) -> EngineDependencyCheck {
+    if details.is_empty() {
+        return EngineDependencyCheck::Satisfied;
+    }
+    let Some(package) = realigned_package else {
+        return EngineDependencyCheck::Violated(details);
+    };
+    // `uv pip check` phrases the requirement as ``requires `torch==…` ``, so the
+    // package name followed by a specifier is what identifies the subject.
+    let marker = format!("`{package}==");
+    if details.iter().all(|detail| detail.contains(&marker)) {
+        EngineDependencyCheck::ExpectedDivergence(details)
+    } else {
+        EngineDependencyCheck::Violated(details)
     }
 }
 
@@ -7556,6 +8177,19 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             let _ = writeln!(
                 output,
                 "  action: rocm engines install {engine} --reinstall"
+            );
+        }
+        EngineDependencyCheck::ExpectedDivergence(details) => {
+            let _ = writeln!(output, "  dependency_check: expected_divergence");
+            for detail in details {
+                let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
+            }
+            // Deliberately not the reinstall remedy. It does not apply: every
+            // path that installs an engine realigns torch afterwards, so a
+            // reinstall reproduces this same state rather than resolving it.
+            let _ = writeln!(
+                output,
+                "  action: none; the SDK's build is intended here (see torch_alignment above)"
             );
         }
     }
@@ -7848,6 +8482,9 @@ fn adopt_runtime_from_probe(
         python_executable: Some(python_executable.display().to_string()),
         pip_cache_dir: None,
         rocm_sdk: Some(probe),
+        // Adoption does not install torch, so the build is derived from the SDK
+        // version instead.
+        sdk_torch: None,
         read_only: true,
         imported_from: Some(install_root),
         installed_at_unix_ms: rocm_core::unix_time_millis(),
@@ -26004,13 +26641,394 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn a_divergence_on_the_realigned_package_does_not_advise_undoing_it() {
+        // The reinstall remedy is correct for a real violation and catastrophic
+        // here: it reinstates the engine's own build and restores a runtime that
+        // cannot open a device.
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        assert!(matches!(
+            outcome,
+            EngineDependencyCheck::ExpectedDivergence(_)
+        ));
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: expected_divergence\n"));
+        assert!(
+            !rendered.contains("action: rocm engines install vllm --reinstall"),
+            "the reinstall remedy does not apply to a deliberate divergence: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_divergence_on_any_other_package_is_still_a_violation() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
+                "The package `vllm` requires `numpy==1.26.4`, but `2.0.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        assert!(matches!(outcome, EngineDependencyCheck::Violated(_)));
+    }
+
+    /// The engine's build enumerates no devices against the installed SDK.
+    ///
+    /// Observed on MI300X: the engine pins a torch built for a different ROCm
+    /// version, installs it over the SDK's, and the runtime then reports zero
+    /// devices. The release is right; only the build is wrong.
+    #[test]
+    fn the_engines_build_is_replaced_by_the_sdk_build_of_the_same_release() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::Install {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                from: "2.11.0+gitd0c8b1f".to_owned(),
+            }
+        );
+    }
+
+    /// The SDK picked a torch *release* the engine does not accept.
+    ///
+    /// The mirror-image failure: here the SDK's own choice is the wrong one, and
+    /// simply keeping it would break the engine. The rule takes the release the
+    /// engine pins while still keeping the SDK's build of it — so neither the
+    /// engine's build nor the SDK's release selection wins outright.
+    #[test]
+    fn the_sdks_release_is_corrected_to_the_one_the_engine_pins() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.14.0a20260611"),
+            Some("2.10.0+git8514f05"),
+            Some("torch==2.10.0+git8514f05"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::Install {
+                wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
+                from: "2.10.0+git8514f05".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_install_is_failed_only_when_it_left_a_runtime_that_cannot_serve() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+        let usable = RuntimeDeviceCheck::Usable {
+            device_count: 8,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        };
+        let failed = TorchAlignment::InstallFailed {
+            wanted: "2.11.0+rocm7.13.0".to_owned(),
+            kept: "2.11.0+gitd0c8b1f".to_owned(),
+            error: "dns error".to_owned(),
+        };
+        let realigned = TorchAlignment::Realigned {
+            from: "2.11.0+gitd0c8b1f".to_owned(),
+            to: "2.11.0+rocm7.13.0".to_owned(),
+        };
+
+        // Could not settle torch, and the runtime sees nothing: unusable.
+        assert!(install_left_runtime_unusable(&failed, &no_devices));
+        // Could not settle torch, but the runtime works anyway: not our call to fail.
+        assert!(!install_left_runtime_unusable(&failed, &usable));
+        // Settled fine; no devices just means no GPU on this host.
+        assert!(!install_left_runtime_unusable(&realigned, &no_devices));
+    }
+
+    fn sdk_install_finalization() -> SdkInstallFinalization {
+        SdkInstallFinalization {
+            runtime_key: "wheel-gfx942-7.13.0".to_owned(),
+            install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
+            family: "gfx94X-dcgpu".to_owned(),
+        }
+    }
+
+    /// Run the real `install sdk` completion path against a stubbed auto-install.
+    fn finish_sdk_install_with(
+        paths: &AppPaths,
+        outcome: Result<()>,
+    ) -> (Result<()>, SdkInstallFinalization) {
+        let finalized = sdk_install_finalization();
+        let result = finish_sdk_install(
+            paths,
+            Some(&finalized),
+            "install_sdk",
+            "sdk install completed".to_owned(),
+            |_, _| outcome,
+        );
+        (result, finalized)
+    }
+
+    #[test]
+    fn install_sdk_fails_when_the_install_left_a_runtime_that_cannot_open_a_device() -> Result<()> {
+        let (_root, paths) = test_paths("install-sdk-unusable");
+
+        // Exercises the command's own completion path, not just the predicate: if the
+        // catch goes back to warning and falling through, this fails.
+        let (result, _) = finish_sdk_install_with(
+            &paths,
+            Err(unusable_runtime_error("vllm", "wheel-gfx942-7.13.0")),
+        );
+        let error = result.expect_err("an unusable runtime must fail `install sdk`");
+        // And it must still say the SDK survived, so a transient index failure does
+        // not read as a ruined install that has to be started from scratch.
+        assert!(
+            error
+                .to_string()
+                .contains("The ROCm SDK itself is installed"),
+            "the failure must say the SDK survived:\n{error}"
+        );
+
+        // The SDK install did complete, so its record is written before the command
+        // fails — otherwise the audit trail would show an install that never happened.
+        let actions: Vec<String> = load_recent_audit_events(&paths, 10)?
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(
+            actions.iter().any(|action| action == "install_sdk"),
+            "the successful SDK install was not recorded before failing: {actions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn install_sdk_survives_an_engine_install_failure() -> Result<()> {
+        let (_root, paths) = test_paths("install-sdk-engine-failure");
+
+        // The complement, and the reason the catch exists at all: the SDK is installed
+        // and usable, only a separately retryable step is missing. Failing here would
+        // throw away a multi-gigabyte install over an unreachable engine index.
+        let (result, _) = finish_sdk_install_with(
+            &paths,
+            Err(anyhow::anyhow!(
+                "failed to reach the engine index: dns error"
+            )),
+        );
+        assert!(
+            result.is_ok(),
+            "an engine install failure must not discard a good SDK install: {:?}",
+            result.err()
+        );
+
+        let actions: Vec<String> = load_recent_audit_events(&paths, 10)?
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.iter().any(|action| action == "install_sdk"));
+        assert!(
+            actions.iter().any(|action| action == "engine_auto_install"),
+            "the engine failure must still be recorded: {actions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_unusable_runtime_failure_survives_being_wrapped_in_context() {
+        // The error reaches the catch through several `?` hops. Flattening it into a
+        // plain message is the realistic way a later change silently restores the
+        // exit-0 bug, since every failure would then look recoverable.
+        let propagated: Result<()> = Err(unusable_runtime_error("vllm", "wheel-gfx942-7.13.0"))
+            .context("automatic vLLM install failed");
+        let propagated = propagated.expect_err("expected the unusable-runtime error");
+        assert!(engine_auto_install_failure_is_fatal(&propagated));
+        assert!(!engine_auto_install_failure_is_fatal(&anyhow::anyhow!(
+            "uv exited with status 1"
+        )));
+    }
+
+    #[test]
+    fn an_install_failure_is_not_reported_as_a_missing_wheel() {
+        // Saying "the index publishes no such build" over a network or disk error
+        // sends the reader hunting for a wheel that exists. Anything the resolver
+        // did not actually attribute to a missing version degrades to the honest
+        // answer: the failure, verbatim.
+        assert!(!install_error_reports_version_unavailable(
+            "failed to launch uv: Permission denied"
+        ));
+        assert!(!install_error_reports_version_unavailable(
+            "error sending request: dns error: failed to lookup address"
+        ));
+        assert!(install_error_reports_version_unavailable(
+            "No solution found when resolving: torch==2.10.0+rocm7.14.0a20260611"
+        ));
+    }
+
+    #[test]
+    fn an_unresolvable_version_still_reads_as_unavailable() {
+        let rendered = render_torch_alignment(&TorchAlignment::Unavailable {
+            wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
+            kept: "2.10.0+git8514f05".to_owned(),
+        });
+
+        assert!(rendered.contains("  torch_alignment: unavailable\n"));
+        assert!(rendered.contains("publishes no 2.10.0+rocm7.14.0a20260611"));
+    }
+
+    #[test]
+    fn a_failed_realignment_reports_the_error_it_actually_hit() {
+        let rendered = render_torch_alignment(&TorchAlignment::InstallFailed {
+            wanted: "2.11.0+rocm7.13.0".to_owned(),
+            kept: "2.11.0+gitd0c8b1f".to_owned(),
+            error: "failed to launch uv: Permission denied".to_owned(),
+        });
+
+        assert!(rendered.contains("  torch_alignment: install_failed\n"));
+        assert!(rendered.contains("Permission denied"));
+        assert!(
+            !rendered.contains("publishes no"),
+            "an install failure must not be described as a missing wheel: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_already_correct_runtime_is_left_alone() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+rocm7.13.0"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_loose_torch_requirement_is_not_second_guessed() {
+        // Without an exact pin there is no release to carry over, so the engine's
+        // resolution stands rather than being overridden on a guess.
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch>=2.10"),
+            "vllm",
+        );
+
+        assert!(
+            matches!(plan, TorchAlignmentPlan::NotApplicable(reason) if reason.contains("exact")),
+            "a non-pinned requirement must be left alone"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_sdk_build_is_not_acted_on() {
+        // Nothing to carry over, so guessing a build would be worse than doing
+        // nothing and letting the device check report the result.
+        let plan = plan_torch_alignment(
+            None,
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert!(matches!(plan, TorchAlignmentPlan::NotApplicable(_)));
+    }
+
+    /// A runtime already holding the engine's build must still be corrected.
+    ///
+    /// The build identifier comes from the manifest, so this stays right even
+    /// when the environment has already been overwritten — the case where
+    /// inferring it from the installed torch would call the wrong build correct
+    /// and leave the runtime broken for good.
+    #[test]
+    fn a_runtime_already_on_the_engines_build_is_still_corrected() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::Install {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                from: "2.11.0+gitd0c8b1f".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_runtime_that_sees_no_devices_names_the_torch_that_cannot_use_the_sdk() {
+        // The install succeeded and the engine's requirements are satisfied, so
+        // every other surface reports this runtime healthy. Measured on MI300X:
+        // this torch loads against a ROCm 7.13 SDK and enumerates nothing, and
+        // the first symptom would otherwise be a serve failure.
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        });
+
+        assert!(rendered.contains("  device_check: no_devices\n"));
+        assert!(rendered.contains("2.11.0+gitd0c8b1f"));
+        assert!(rendered.contains("7.2.53211"));
+        assert!(rendered.contains("Failed to infer device type"));
+        // No remedy is offered on purpose: reinstalling to satisfy the engine's
+        // pin is what produces this state.
+        assert!(
+            !rendered.contains("action:"),
+            "a remedy that recreates the fault must not be suggested: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_usable_runtime_states_how_many_devices_it_found() {
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::Usable {
+            device_count: 8,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        });
+
+        assert_eq!(
+            rendered,
+            "  device_check: usable (8 device(s), torch 2.11.0+rocm7.13.0)\n"
+        );
+    }
+
+    #[test]
+    fn a_device_check_without_an_interpreter_is_not_verified_not_healthy() {
+        // Same rule as the dependency check: absence of an answer is never
+        // allowed to read as a passing one.
+        let outcome = runtime_device_check(None, &[]);
+
+        assert_eq!(
+            outcome,
+            RuntimeDeviceCheck::NotVerified(
+                "the runtime's Python environment could not be located".to_owned()
+            )
+        );
+        assert!(render_runtime_device_check(&outcome).contains("not_verified"));
+    }
+
+    #[test]
     fn an_unlocatable_environment_is_reported_not_assumed_healthy() {
         // The engine install can fail before it reports its own interpreter. That path
         // still prints a block, and with no interpreter to check it must say so rather
         // than fall through to `satisfied`.
         let (root, paths) = test_paths("engine-dependency-no-python");
 
-        let outcome = engine_dependency_check(&paths, "vllm", None);
+        let outcome = engine_dependency_check(&paths, "vllm", None, None);
         let _ = fs::remove_dir_all(root);
 
         assert_eq!(
@@ -27070,6 +28088,7 @@ ID_LIKE="suse opensuse"
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -27108,6 +28127,7 @@ ID_LIKE="suse opensuse"
             python_executable: Some("python".to_owned()),
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 1,
