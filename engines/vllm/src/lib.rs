@@ -1671,7 +1671,6 @@ print(json.dumps({"present": spec is not None, "version": version}))
 }
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
-    command.env("VLLM_TARGET_DEVICE", "rocm");
     if let Some(target_family) = therock_device_target(runtime) {
         command.env("ROCM_SDK_TARGET_FAMILY", target_family);
     }
@@ -1894,7 +1893,15 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
     let Some(root) = runtime.sdk_root.as_ref() else {
         return dedupe_paths(runtime.sdk_library_paths.clone());
     };
-    let mut entries = runtime.sdk_library_paths.clone();
+    let mut entries = Vec::new();
+    if let Some(amdsmi) = therock_amdsmi_library_dir(runtime) {
+        // vLLM's ROCm wheel pins its own amdsmi Python bindings and shared
+        // library. Put that directory before TheRock's SDK libraries so
+        // amdsmi's unqualified `dlopen("libamd_smi.so")` cannot bind those
+        // pinned bindings to a different same-named SDK library.
+        entries.push(amdsmi);
+    }
+    entries.extend(runtime.sdk_library_paths.iter().cloned());
     entries.extend([
         root.join("lib"),
         root.join("lib64"),
@@ -1937,6 +1944,20 @@ fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
         }
     }
     dedupe_paths(entries)
+}
+
+fn therock_amdsmi_library_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    // Managed TheRock wheel paths share one site-packages root. Tarball and
+    // external runtimes do not host vLLM in this managed Python environment.
+    runtime.sdk_library_paths.iter().find_map(|path| {
+        path.ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .file_name()
+                    .is_some_and(|name| name == "site-packages")
+            })
+            .map(|site_packages| site_packages.join("amdsmi"))
+    })
 }
 
 /// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
@@ -3573,7 +3594,32 @@ mod tests {
     }
 
     #[test]
-    fn launch_env_sets_vllm_rocm_target_device() -> Result<()> {
+    fn therock_library_paths_prefer_vllms_pinned_amdsmi_library() {
+        let site_packages = PathBuf::from("/runtime/lib/python3.12/site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(sdk_root.clone()),
+            sdk_bin: Some(sdk_root.join("bin")),
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: vec![
+                site_packages.join("_rocm_sdk_core").join("lib"),
+                site_packages.join("_rocm_sdk_device_gfx942").join("lib"),
+            ],
+        };
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert_eq!(entries.first(), Some(&site_packages.join("amdsmi")));
+    }
+
+    #[test]
+    fn launch_env_sets_rocm_sdk_target_family() -> Result<()> {
         let runtime = VllmRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             env_id: "external-vllm-therock".to_owned(),
@@ -3591,12 +3637,13 @@ mod tests {
         let mut command = ProcessCommand::new("vllm");
 
         apply_therock_env(&mut command, &runtime)?;
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != "VLLM_TARGET_DEVICE"),
+            "VLLM_TARGET_DEVICE is a build-time setting and must not be used as a runtime override"
+        );
 
-        let target_device = command
-            .get_envs()
-            .find_map(|(key, value)| (key == "VLLM_TARGET_DEVICE").then_some(value))
-            .flatten();
-        assert_eq!(target_device, Some(std::ffi::OsStr::new("rocm")));
         let target_family = command
             .get_envs()
             .find_map(|(key, value)| (key == "ROCM_SDK_TARGET_FAMILY").then_some(value))
