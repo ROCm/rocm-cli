@@ -1,3 +1,9 @@
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+
 # Getting started with ROCm CLI
 
 ```{include} ../../README.md
