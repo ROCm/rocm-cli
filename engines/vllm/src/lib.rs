@@ -32,7 +32,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+// Platform detection diagnostics precede the final Python traceback; retain
+// enough lines to include the actual plugin rejection reason in startup errors.
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 300;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
