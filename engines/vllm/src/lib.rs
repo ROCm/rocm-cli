@@ -1672,6 +1672,9 @@ print(json.dumps({"present": spec is not None, "version": version}))
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
+    if let Some(target_family) = therock_device_target(runtime) {
+        command.env("ROCM_SDK_TARGET_FAMILY", target_family);
+    }
     let Some(root) = runtime.sdk_root.as_ref() else {
         return Ok(());
     };
@@ -1703,6 +1706,17 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
         );
     }
     Ok(())
+}
+
+fn therock_device_target(runtime: &VllmRuntime) -> Option<&str> {
+    runtime.sdk_library_paths.iter().find_map(|path| {
+        path.components().find_map(|component| {
+            component
+                .as_os_str()
+                .to_str()?
+                .strip_prefix("_rocm_sdk_device_")
+        })
+    })
 }
 
 /// Full argument vector for `vllm serve`, as spawned by [`spawn_vllm_server`].
@@ -3570,7 +3584,9 @@ mod tests {
             sdk_root: None,
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
+            sdk_library_paths: vec![PathBuf::from(
+                "/runtime/lib/python3.12/site-packages/_rocm_sdk_device_gfx942/lib",
+            )],
         };
         let mut command = ProcessCommand::new("vllm");
 
@@ -3581,6 +3597,37 @@ mod tests {
             .find_map(|(key, value)| (key == "VLLM_TARGET_DEVICE").then_some(value))
             .flatten();
         assert_eq!(target_device, Some(std::ffi::OsStr::new("rocm")));
+        let target_family = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "ROCM_SDK_TARGET_FAMILY").then_some(value))
+            .flatten();
+        assert_eq!(target_family, Some(std::ffi::OsStr::new("gfx942")));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_env_omits_rocm_target_without_device_package() -> Result<()> {
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: vec![PathBuf::from("/runtime/lib")],
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != "ROCM_SDK_TARGET_FAMILY")
+        );
         Ok(())
     }
 
