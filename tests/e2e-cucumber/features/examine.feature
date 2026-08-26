@@ -17,11 +17,18 @@ Feature: GPU detection and system inspection
     When the user asks for help
     Then the subcommands are listed in alphabetical order
 
+  # The target assertion is a cross-check, not a tautology: the expectation comes
+  # from the KFD topology in sysfs, while `examine` reaches its answer through the
+  # CLI's own probe. Detection used to look for `gfx_target_version` as a standalone
+  # file, which no kernel exposes, and silently fell back to decoding a GC IP
+  # version -- naming an MI300X `gfx943` instead of `gfx942`. Only the GPU lane can
+  # exercise this; there is no KFD topology to read on the mock lane.
   @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
+    And the inspection names the GPU target that the kernel reports
     And the inspection reports that the driver is available
 
   # `examine` used to report a hardcoded platform constant as the default engine,
