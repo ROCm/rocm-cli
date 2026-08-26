@@ -28,6 +28,7 @@ const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_ROOT_TAG: &str = "requires-root";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -82,6 +83,15 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
+    /// `@requires-root`: the scenario's premise is a process running as root
+    /// (effective UID 0), so it is skipped where the test process is not root.
+    /// Needed by the driver-install-as-root contract (EAI-8053): the fix is
+    /// uid-aware (prepend `sudo` only when NOT root), so the "no `sudo` prefix"
+    /// contract only holds where the runner is actually root. None of the four
+    /// `expectations.toml` condition keys can express "running as root", so — like
+    /// `@requires-wsl` — this is a tag, not a row, keeping the xfail row honest on
+    /// non-root lanes (they SKIP rather than falsely PASS).
+    pub requires_root: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -120,6 +130,7 @@ impl ScenarioDecl {
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
+        let mut requires_root = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -147,6 +158,8 @@ impl ScenarioDecl {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_ROOT_TAG {
+                requires_root = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -161,6 +174,7 @@ impl ScenarioDecl {
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
+            requires_root,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -363,8 +377,8 @@ pub struct PlatformManifest<'a> {
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-gpu`
 ///    scenario on a host with no AMD GPU, a `@requires-bare-metal` scenario on
-///    WSL2, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
-///    effective engine can't start.
+///    WSL2, a `@requires-root` scenario off root, a `@requires-os:<os>` scenario
+///    on a different OS, or a scenario whose effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
@@ -418,6 +432,11 @@ pub fn resolve(
     if decl.requires_wsl && !cap.is_wsl {
         return Expectation::Skip {
             reason: "requires WSL; this host is not running under WSL".to_owned(),
+        };
+    }
+    if decl.requires_root && !cap.is_root {
+        return Expectation::Skip {
+            reason: "requires the runner to be root; this process is not root".to_owned(),
         };
     }
     if let Some(os) = &decl.requires_os
@@ -500,6 +519,7 @@ mod tests {
             "mi300x" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: false,
+                is_root: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -509,6 +529,7 @@ mod tests {
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: false,
+                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -518,6 +539,7 @@ mod tests {
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
                 is_wsl: false,
+                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -531,6 +553,7 @@ mod tests {
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
+                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -543,6 +566,7 @@ mod tests {
             "wsl" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
+                is_root: false,
                 gfx_target: None,
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -554,15 +578,29 @@ mod tests {
             "wsl-no-passthrough" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
+                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
             },
+            // A no-GPU host running as root — the mock CI lane's shape, where the
+            // driver-install sudo-prefix contract (EAI-8053) has a premise.
+            "mock-root" => HostCapability {
+                os_family: "linux".into(),
+                is_wsl: false,
+                is_root: true,
+                gfx_target: None,
+                has_amd_gpu: false,
+                available_engines: vec!["lemonade".into(), "vllm".into()],
+                effective_serve_engine: "lemonade".into(),
+                platform_slug: "mock".into(),
+            },
             _ => HostCapability {
                 os_family: "other".into(),
                 is_wsl: false,
+                is_root: false,
                 gfx_target: None,
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -620,6 +658,28 @@ serve_timeout_secs = 90
         assert!(decl(&["@id:x", "@requires-bare-metal"]).requires_bare_metal);
         // Absent by default, so no existing scenario changes meaning.
         assert!(!decl(&["id:x", "requires-gpu"]).requires_bare_metal);
+    }
+
+    #[test]
+    fn root_tag_parses_and_gates_on_root() {
+        // Parses in both shapes; absent by default so no existing scenario changes.
+        assert!(decl(&["id:x", "requires-root"]).requires_root);
+        assert!(decl(&["@id:x", "@requires-root"]).requires_root);
+        assert!(!decl(&["id:x", "requires-gpu"]).requires_root);
+
+        let m = Expectations::default();
+        let d = decl(&["id:driver-root", "requires-os:linux", "requires-root"]);
+        // Root host: the premise holds, so it resolves (here, expected-pass with
+        // an empty matrix — an xfail row is layered on separately).
+        assert_eq!(
+            resolve(&d, &cap("mock-root"), &m, false, false, false),
+            Expectation::ExpectPass
+        );
+        // Non-root host: skipped, so a `when = {}` xfail row can't XPASS there.
+        assert!(matches!(
+            resolve(&d, &cap("mock"), &m, false, false, false),
+            Expectation::Skip { .. }
+        ));
     }
 
     #[test]

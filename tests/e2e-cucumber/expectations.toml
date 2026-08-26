@@ -178,7 +178,6 @@ flaky = true
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
-
 # --- EAI-8031 (public mirror: ROCm/rocm-cli#260): on a Strix Halo WINDOWS host,
 # serving a canonical Hugging Face checkpoint through the `owner/repo:variant`
 # direct-serve path (`unsloth/Qwen3-0.6B-GGUF:Q4_0`) exits 0 but `/v1/models`
@@ -208,3 +207,23 @@ when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-8031"
 reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
 serve_timeout_secs = 240
+
+# --- EAI-8053: `install driver --dkms` prefixes every plan command with a literal
+# `sudo `, unconditionally. As root that prefix is unnecessary, and on a root host
+# with no `sudo` binary it is fatal: `sh -c "sudo apt-get update"` dies with
+# `sudo: not found` before any driver work. The fix is uid-aware (prepend `sudo`
+# only when NOT root), so the scenario is @requires-root (it SKIPS off root, where
+# the prefix is correct); on a root runner the "no sudo prefix" contract fails
+# today. Unconditional there, so `when = {}`. Remove when the plan stops prefixing
+# `sudo` while already root. ---
+[["driver-install-as-root-does-not-require-sudo"]]
+when = {}
+bug = "EAI-8053"
+reason = "install driver --dkms prefixes sudo even as root, so it fails with `sudo: not found` on a root host without sudo."
+
+# EAI-8051 had a row here — `comfyui install` pulling CUDA `nvidia-*` wheels into
+# the managed ROCm runtime and displacing its ROCm torch. The fix landed in
+# 3e59435a (#298): the install now pins the runtime's torch stack with a `uv
+# --constraint` file, so a transitive dependency can no longer resolve torch from
+# PyPI. `comfyui-install-preserves-the-rocm-runtime` therefore EXPECT-PASSES now;
+# keeping the row would make it a stale XPASS and fail the lane.

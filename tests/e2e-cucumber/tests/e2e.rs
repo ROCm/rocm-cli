@@ -21,10 +21,12 @@ mod e2e {
     pub mod automations_steps;
     pub mod bench_steps;
     pub mod chat_steps;
+    pub mod comfyui_steps;
     pub mod config_steps;
     pub mod dash_steps;
     pub mod dependency_guard_steps;
     pub mod diagnose_steps;
+    pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
@@ -86,6 +88,12 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// The managed runtime's torch distribution version captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require it to be unchanged.
+    /// A ComfyUI install must not replace the runtime's torch at all; comparing the
+    /// exact version catches a swap to any other build (CUDA `+cu`, a plain
+    /// `2.13.0` CPU wheel, etc.), which a "not a CUDA build" check alone would miss.
+    pub comfyui_baseline_torch: Option<String>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -195,6 +203,7 @@ impl Default for E2eWorld {
             expect_xfail: false,
             tui: None,
             chat_use_mock: false,
+            comfyui_baseline_torch: None,
             lifecycle: None,
         }
     }
@@ -616,6 +625,65 @@ pub fn run_rocm_with_env(
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Run `rocm` with `PATH` pointed at a temp dir exposing only the given host tools.
+///
+/// This lets a scenario prove how the CLI behaves when a tool it shells out to is
+/// absent. Returns `(stdout, stderr, rc)` plus the `TempDir`, which the caller must
+/// keep alive for the duration of the run.
+///
+/// Used by the root-without-`sudo` driver-install scenario (EAI-8053): the driver
+/// plan shells its commands through `sh -c`, so `sh` must stay reachable while
+/// `sudo` must not. Each requested tool is symlinked from wherever it lives on the
+/// current `PATH`; a tool that cannot be found is skipped (its absence is exactly
+/// what some scenarios want to arrange).
+///
+/// Compiles on every platform (cucumber step functions are registered regardless
+/// of host), but the only scenario that uses it is `@requires-os:linux`, so its
+/// Unix-only symlink path is the only one that runs; on Windows the temp dir is
+/// created empty and the scenario is skipped before reaching this call.
+pub fn run_rocm_with_only_tools(
+    world: &E2eWorld,
+    args: &[&str],
+    tools: &[&str],
+) -> (String, String, i32, TempDir) {
+    let bin = TempDir::with_prefix("rocm-e2e-path-").expect("failed to create temp PATH dir");
+    for tool in tools {
+        if let Some(real) = which_on_path(tool) {
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(&real, bin.path().join(tool));
+            #[cfg(not(unix))]
+            let _ = std::fs::copy(&real, bin.path().join(tool));
+        }
+    }
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env("PATH", bin.path());
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+        bin,
+    )
+}
+
+/// Resolve a bare tool name to its absolute path by scanning the current `PATH`,
+/// following the same first-match rule a shell would. Returns `None` if the tool
+/// is not on `PATH`.
+fn which_on_path(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Append one `rocm` invocation to `results/commands.jsonl` so the consolidated
