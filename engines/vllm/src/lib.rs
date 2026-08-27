@@ -1706,16 +1706,12 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
     if let Some(target_family) = therock_device_target(runtime) {
         command.env("ROCM_SDK_TARGET_FAMILY", target_family);
     }
+    command.env("ROCM_CLI_THEROCK_RUNTIME_ID", &runtime.runtime_id);
     let Some(root) = runtime.sdk_root.as_ref() else {
         return Ok(());
     };
     let bin = runtime.sdk_bin.as_ref();
-    command
-        .env("ROCM_SDK_ROOT", root)
-        .env("ROCM_PATH", root)
-        .env("ROCM_HOME", root)
-        .env("HIP_PATH", root)
-        .env("ROCM_CLI_THEROCK_RUNTIME_ID", &runtime.runtime_id);
+    command.env("ROCM_SDK_ROOT", root);
     if let Some(bin) = bin {
         command.env("ROCM_CLI_THEROCK_SDK_BIN", bin).env(
             "PATH",
@@ -1726,6 +1722,16 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
             "PATH",
             prepend_path_entries(&runtime_bin_paths(runtime), std::env::var_os("PATH"))?,
         );
+    }
+    command
+        .env("ROCM_PATH", root)
+        .env("ROCM_HOME", root)
+        .env("HIP_PATH", root);
+    if runtime_is_managed(runtime) {
+        // The pinned vLLM wheel installs its own torch/ROCm binary stack. Keep
+        // SDK metadata and tools, but do not override dynamic-library discovery
+        // with independently versioned canonical SDK paths.
+        return Ok(());
     }
     if !cfg!(windows) {
         command.env(
@@ -3735,6 +3741,48 @@ mod tests {
             .find_map(|(key, value)| (key == "ROCM_SDK_TARGET_FAMILY").then_some(value))
             .flatten();
         assert_eq!(target_family, Some(std::ffi::OsStr::new("gfx942")));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_vllm_does_not_mix_canonical_sdk_libraries_into_pinned_stack() -> Result<()> {
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/runtime/bin/vllm"),
+            python_executable: Some(PathBuf::from("/runtime/bin/python")),
+            version: Some("0.26.0+rocm723".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(PathBuf::from("/runtime/_rocm_sdk_devel")),
+            sdk_bin: Some(PathBuf::from("/runtime/_rocm_sdk_devel/bin")),
+            sdk_bin_paths: vec![PathBuf::from("/runtime/_rocm_sdk_core/bin")],
+            sdk_library_paths: vec![PathBuf::from("/runtime/_rocm_sdk_core/lib")],
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        assert!(
+            command.get_envs().all(|(key, _)| key != "LD_LIBRARY_PATH"),
+            "managed vLLM must use its pinned dynamic-library stack"
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "ROCM_SDK_ROOT"
+                && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel"))
+        }));
+        for key in ["ROCM_PATH", "ROCM_HOME", "HIP_PATH"] {
+            assert!(command.get_envs().any(|(actual, value)| {
+                actual == key && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel"))
+            }));
+        }
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "ROCM_CLI_THEROCK_SDK_BIN"
+                && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel/bin"))
+        }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "ROCM_CLI_THEROCK_RUNTIME_ID"
+                && value == Some(std::ffi::OsStr::new("therock-release:gfx94X-dcgpu"))
+        }));
         Ok(())
     }
 
