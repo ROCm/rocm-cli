@@ -63,25 +63,6 @@ const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
 /// what lets [`vllm_rocm_build_from_index_url`] recover the build a custom
 /// index serves and keep the requirement pinned to it.
 const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
-/// Managed TheRock runtimes already passed rocm-cli's strict ROCm GPU checks.
-/// Seed vLLM's pinned platform singleton before its CLI builds default configs,
-/// avoiding its separate AMD SMI auto-detection path in the managed environment.
-const MANAGED_ROCM_VLLM_BOOTSTRAP: &str = r"
-import sys
-sys.argv[0] = 'vllm'
-import torch
-torch.cuda.set_device(0)
-original_get_device_properties = torch.cuda.get_device_properties
-def managed_get_device_properties(device=None):
-    return original_get_device_properties(0 if device == 'cuda' else device)
-torch.cuda.get_device_properties = managed_get_device_properties
-import vllm.platforms
-from vllm.platforms.rocm import RocmPlatform
-torch.cuda.get_device_properties = original_get_device_properties
-vllm.platforms._current_platform = RocmPlatform()
-from vllm.entrypoints.cli.main import main
-main()
-";
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -933,18 +914,6 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     }
 }
 
-fn vllm_command_for_runtime(runtime: &VllmRuntime) -> ProcessCommand {
-    if runtime_is_managed(runtime)
-        && let Some(python) = runtime.python_executable.as_ref()
-    {
-        let mut command = ProcessCommand::new(python);
-        command.args(["-c", MANAGED_ROCM_VLLM_BOOTSTRAP]);
-        command
-    } else {
-        ProcessCommand::new(&runtime.command)
-    }
-}
-
 fn spawn_vllm_server(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
@@ -1011,7 +980,7 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let mut command = vllm_command_for_runtime(runtime);
+    let mut command = ProcessCommand::new(&runtime.command);
     command
         .args(vllm_serve_args(
             &request.model_ref,
@@ -1706,12 +1675,16 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
     if let Some(target_family) = therock_device_target(runtime) {
         command.env("ROCM_SDK_TARGET_FAMILY", target_family);
     }
-    command.env("ROCM_CLI_THEROCK_RUNTIME_ID", &runtime.runtime_id);
     let Some(root) = runtime.sdk_root.as_ref() else {
         return Ok(());
     };
     let bin = runtime.sdk_bin.as_ref();
-    command.env("ROCM_SDK_ROOT", root);
+    command
+        .env("ROCM_SDK_ROOT", root)
+        .env("ROCM_PATH", root)
+        .env("ROCM_HOME", root)
+        .env("HIP_PATH", root)
+        .env("ROCM_CLI_THEROCK_RUNTIME_ID", &runtime.runtime_id);
     if let Some(bin) = bin {
         command.env("ROCM_CLI_THEROCK_SDK_BIN", bin).env(
             "PATH",
@@ -1722,16 +1695,6 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
             "PATH",
             prepend_path_entries(&runtime_bin_paths(runtime), std::env::var_os("PATH"))?,
         );
-    }
-    command
-        .env("ROCM_PATH", root)
-        .env("ROCM_HOME", root)
-        .env("HIP_PATH", root);
-    if runtime_is_managed(runtime) {
-        // The pinned vLLM wheel installs its own torch/ROCm binary stack. Keep
-        // SDK metadata and tools, but do not override dynamic-library discovery
-        // with independently versioned canonical SDK paths.
-        return Ok(());
     }
     if !cfg!(windows) {
         command.env(
@@ -1927,31 +1890,11 @@ fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
     dedupe_paths(entries)
 }
 
-fn managed_vllm_library_dirs(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let Some(site_packages) = runtime.sdk_library_paths.iter().find_map(|path| {
-        path.ancestors().find(|ancestor| {
-            ancestor
-                .file_name()
-                .is_some_and(|name| name == "site-packages")
-        })
-    }) else {
-        return Vec::new();
-    };
-    vec![
-        site_packages.join("torch").join("lib"),
-        site_packages.join("amdsmi"),
-    ]
-}
-
 fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    // vLLM pins a self-contained torch/ROCm stack. Its binary directories must
-    // precede the canonical SDK's same-named libraries; mixing those ABIs makes
-    // torch report zero GPUs before vLLM can initialize its ROCm platform.
-    let mut entries = managed_vllm_library_dirs(runtime);
-    entries.extend(runtime.sdk_library_paths.iter().cloned());
     let Some(root) = runtime.sdk_root.as_ref() else {
-        return dedupe_paths(entries);
+        return dedupe_paths(runtime.sdk_library_paths.clone());
     };
+    let mut entries = runtime.sdk_library_paths.clone();
     entries.extend([
         root.join("lib"),
         root.join("lib64"),
@@ -2772,57 +2715,6 @@ mod tests {
             !args.iter().any(|arg| arg == "--gpu-memory-utilization"),
             "vLLM must apply its own default when the user asked for nothing: {args:?}"
         );
-    }
-
-    #[test]
-    fn managed_runtime_uses_explicit_rocm_platform_bootstrap() {
-        let python = PathBuf::from("/runtime/bin/python");
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("/runtime/bin/vllm"),
-            python_executable: Some(python.clone()),
-            version: Some("0.26.0+rocm723".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(PathBuf::from("/runtime/sdk")),
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-        };
-
-        let command = vllm_command_for_runtime(&runtime);
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(command.get_program(), python.as_os_str());
-        assert_eq!(args.first().map(String::as_str), Some("-c"));
-        let script = args.get(1).expect("bootstrap script argument");
-        let device_initialization = script
-            .find("torch.cuda.set_device(0)")
-            .expect("bootstrap must initialize logical GPU zero");
-        let device_normalization = script
-            .find("0 if device == 'cuda' else device")
-            .expect("bootstrap must normalize vLLM's unindexed CUDA device");
-        let rocm_import = script
-            .find("from vllm.platforms.rocm import RocmPlatform")
-            .expect("bootstrap must import the ROCm platform");
-        let restore = script
-            .find("torch.cuda.get_device_properties = original_get_device_properties")
-            .expect("bootstrap must restore the torch API after importing vLLM");
-        let platform_assignment = script
-            .find("_current_platform = RocmPlatform()")
-            .expect("bootstrap must seed the ROCm platform singleton");
-        let main_import = script
-            .find("from vllm.entrypoints.cli.main import main")
-            .expect("bootstrap must invoke the pinned CLI entry point");
-        assert!(device_initialization < device_normalization);
-        assert!(device_normalization < rocm_import);
-        assert!(rocm_import < restore);
-        assert!(restore < platform_assignment);
-        assert!(platform_assignment < main_import);
-        assert!(script.contains("sys.argv[0] = 'vllm'"));
     }
 
     #[test]
@@ -3681,37 +3573,6 @@ mod tests {
     }
 
     #[test]
-    fn therock_library_paths_prefer_vllms_pinned_binary_stack() {
-        let site_packages = PathBuf::from("/runtime/lib/python3.12/site-packages");
-        let sdk_root = site_packages.join("_rocm_sdk_devel");
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: Some(PathBuf::from("/runtime/bin/python")),
-            version: Some("0.26.0+rocm723".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(sdk_root.clone()),
-            sdk_bin: Some(sdk_root.join("bin")),
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: vec![site_packages.join("_rocm_sdk_core").join("lib")],
-        };
-
-        let entries = therock_library_path_entries(&runtime);
-
-        assert_eq!(
-            entries.get(..2),
-            Some(
-                [
-                    site_packages.join("torch").join("lib"),
-                    site_packages.join("amdsmi")
-                ]
-                .as_slice()
-            )
-        );
-    }
-
-    #[test]
     fn launch_env_sets_vllm_rocm_target_device() -> Result<()> {
         let runtime = VllmRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
@@ -3741,48 +3602,6 @@ mod tests {
             .find_map(|(key, value)| (key == "ROCM_SDK_TARGET_FAMILY").then_some(value))
             .flatten();
         assert_eq!(target_family, Some(std::ffi::OsStr::new("gfx942")));
-        Ok(())
-    }
-
-    #[test]
-    fn managed_vllm_does_not_mix_canonical_sdk_libraries_into_pinned_stack() -> Result<()> {
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx94X-dcgpu".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("/runtime/bin/vllm"),
-            python_executable: Some(PathBuf::from("/runtime/bin/python")),
-            version: Some("0.26.0+rocm723".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(PathBuf::from("/runtime/_rocm_sdk_devel")),
-            sdk_bin: Some(PathBuf::from("/runtime/_rocm_sdk_devel/bin")),
-            sdk_bin_paths: vec![PathBuf::from("/runtime/_rocm_sdk_core/bin")],
-            sdk_library_paths: vec![PathBuf::from("/runtime/_rocm_sdk_core/lib")],
-        };
-        let mut command = ProcessCommand::new("vllm");
-
-        apply_therock_env(&mut command, &runtime)?;
-
-        assert!(
-            command.get_envs().all(|(key, _)| key != "LD_LIBRARY_PATH"),
-            "managed vLLM must use its pinned dynamic-library stack"
-        );
-        assert!(command.get_envs().any(|(key, value)| {
-            key == "ROCM_SDK_ROOT"
-                && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel"))
-        }));
-        for key in ["ROCM_PATH", "ROCM_HOME", "HIP_PATH"] {
-            assert!(command.get_envs().any(|(actual, value)| {
-                actual == key && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel"))
-            }));
-        }
-        assert!(command.get_envs().any(|(key, value)| {
-            key == "ROCM_CLI_THEROCK_SDK_BIN"
-                && value == Some(std::ffi::OsStr::new("/runtime/_rocm_sdk_devel/bin"))
-        }));
-        assert!(command.get_envs().any(|(key, value)| {
-            key == "ROCM_CLI_THEROCK_RUNTIME_ID"
-                && value == Some(std::ffi::OsStr::new("therock-release:gfx94X-dcgpu"))
-        }));
         Ok(())
     }
 
