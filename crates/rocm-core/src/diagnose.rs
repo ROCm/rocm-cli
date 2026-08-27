@@ -106,14 +106,17 @@ impl DiagnoseReport {
 }
 
 /// Upstream tracker for a framework key.
+/// Upstream tracker for a routing target.
+///
+/// Only the targets [`route_when_no_match`] can actually produce are listed.
+/// Arms for lemonade / ollama / lm-studio / amdgpu-install were unreachable —
+/// the host probe never reports those frameworks — so they described a
+/// capability the CLI does not have. Routing an app that merely appears in the
+/// symptom text is the caller's job, not the probe's.
 fn upstream_tracker(target: &str) -> &'static str {
     match target {
         "pytorch" => "https://github.com/pytorch/pytorch/issues  (tag with rocm label)",
         "llama-cpp" => "https://github.com/ggml-org/llama.cpp/issues",
-        "lemonade" => "https://github.com/lemonade-sdk/lemonade/issues",
-        "ollama" => "https://github.com/ollama/ollama/issues",
-        "lm-studio" => "https://lmstudio.ai/docs/app  (use in-app support; no public repo)",
-        "amdgpu-install" => "https://repo.radeon.com  (raise via your AMD support contact)",
         _ => "https://github.com/ROCm/ROCm/issues",
     }
 }
@@ -957,7 +960,11 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: false,
+            // `rocm fix fix-9-igpu-dgpu --device-index N` really does apply this
+            // on Linux (see `fix::run_hip_visible_devices_linux`), so the
+            // diagnosis must not tell an agent otherwise — it branches on this
+            // flag to decide whether to offer to run the fix or just print it.
+            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
@@ -1311,13 +1318,17 @@ fn run_all_checks(e: &Examination, symptom: &str) -> Vec<Diagnosis> {
     results
 }
 
+/// Where to send a user when nothing in the catalog matched.
+///
+/// Keyed off the *host-detected* framework, which `Examination::probe` only
+/// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
+/// named arms plus the ROCm-core default are the whole reachable set. If a probe
+/// for another framework is added, add its arm here and in [`upstream_tracker`];
+/// `routing_targets_cover_every_framework_the_probe_reports` will flag it.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
         "pytorch" => "pytorch",
         "llama-cpp" => "llama-cpp",
-        "lemonade" => "lemonade",
-        "ollama" => "ollama",
-        "lm-studio" => "lm-studio",
         _ => "rocm-core",
     };
     Route {
@@ -1659,6 +1670,102 @@ mod tests {
         assert_eq!(top.id, "fix-1-arch");
         // 50 (keyword) + 55 (missing arch), clamped to 100.
         assert_eq!(top.score, 100);
+    }
+
+    /// Routing must stay defined for every framework the probe can report, and
+    /// must not claim targets it can never reach.
+    ///
+    /// `Examination::probe` sets `framework` to exactly these four values (see
+    /// `examine.rs`). The catalog docs previously advertised lemonade / ollama /
+    /// lm-studio routing that no probe could ever trigger; this pins the
+    /// reachable set so a re-added arm has to come with a probe that reaches it.
+    #[test]
+    fn routing_targets_cover_every_framework_the_probe_reports() {
+        let mut targets = Vec::new();
+        for framework in ["skipped", "pytorch", "llama-cpp", "unknown"] {
+            let e = Examination {
+                framework: framework.to_owned(),
+                ..Examination::default()
+            };
+            let route = route_when_no_match(&e);
+            assert!(
+                route.url.starts_with("http"),
+                "{framework}: routed to a non-URL {:?}",
+                route.url
+            );
+            targets.push(route.target);
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(
+            targets,
+            vec!["llama-cpp", "pytorch", "rocm-core"],
+            "the reachable routing targets changed; update the docs in \
+             skills/rocm-doctor/reference.md (and the amd/skills copy) to match"
+        );
+    }
+
+    /// Every diagnosis must agree with the fix catalog about whether the CLI
+    /// can apply the fix itself.
+    ///
+    /// An agent following the rocm-doctor skill branches on `auto_applicable`
+    /// from `diagnose --json` to decide whether to offer to run `rocm fix` or
+    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. When
+    /// the two disagree the CLI contradicts itself: fix-9 advertised
+    /// `auto_applicable: false` on Linux and then applied itself anyway.
+    ///
+    /// Both OS families are exercised because the checkers build their `Fix`
+    /// per-OS and only one branch is taken per run — the Linux branch was the
+    /// stale one, and a Linux-only test would not have seen it.
+    #[test]
+    fn every_diagnosis_agrees_with_the_fix_catalog_on_auto_applicability() {
+        for os in ["linux", "windows"] {
+            let mut e = Examination {
+                os_family: os.to_owned(),
+                ..Examination::default()
+            };
+            // Trip several checkers at once so this covers more of the catalog
+            // than a single fix.
+            e.in_render_group = Some(false);
+            e.in_video_group = Some(false);
+            e.has_apu = true;
+            e.has_discrete_amd = true;
+            e.gpus = vec![
+                Gpu {
+                    gfx_target: "gfx1103".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ];
+
+            let report = diagnose(&e, "torch crashes with a segfault");
+            assert!(
+                !report.matched.is_empty(),
+                "{os}: expected at least one diagnosis to compare against the catalog"
+            );
+            for d in &report.matched {
+                let fix = d
+                    .fix
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
+                let catalog = crate::fix::auto_applicable_for(&fix.fix_id).unwrap_or_else(|| {
+                    panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
+                });
+                assert_eq!(
+                    fix.auto_applicable, catalog,
+                    "{os}/{}: diagnose reports auto_applicable={}, but the fix catalog \
+                     (what `rocm fix` actually does) says {catalog}",
+                    fix.fix_id, fix.auto_applicable
+                );
+            }
+        }
     }
 
     #[test]

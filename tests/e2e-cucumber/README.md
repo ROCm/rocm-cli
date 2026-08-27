@@ -35,6 +35,7 @@ tests/e2e-cucumber/
 │   ├── chat.feature
 │   ├── examine.feature
 │   ├── model_serving.feature
+│   ├── rocm_doctor_skill.feature # skill↔CLI contract (see below)
 │   └── runtime_setup.feature
 │
 ├── tests/                        # test binary + step modules
@@ -43,7 +44,8 @@ tests/e2e-cucumber/
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
 │       ├── runtime_steps.rs
-│       └── serving_steps.rs
+│       ├── serving_steps.rs
+│       └── skill_steps.rs
 │
 └── src/                          # shared test infrastructure
     ├── lib.rs
@@ -213,3 +215,48 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
+
+## The rocm-doctor skill contract
+
+`rocm_doctor_skill.feature` is the one feature that treats a file in this repo as
+an expected value. `skills/rocm-doctor/` is a byte-verbatim mirror of a skill
+published in [`amd/skills`](https://github.com/amd/skills); the skill owns no
+probe, no catalog and no fixes — all of that ships inside the binary — so what it
+does own is a **contract**: which fix-ids exist, which ones the CLI applies
+itself, which machines each is for, which fields a diagnosis carries, which
+confidence thresholds an agent reasons about, which verdicts `examine` can
+return, and where a report goes when nothing matched.
+
+`diagnose.feature` covers the same commands, so the division matters:
+
+|  | expected value lives in | catches |
+|---|---|---|
+| `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
+| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+
+Only the second can notice that a published document has gone stale, and that is
+the whole reason the feature exists. So anything already proven by
+`diagnose.feature` — that a fix for another OS is declined without writing
+anything, that the listing is complete, that a report says plainly whether a
+cause was established — stays there and is **not** restated here. If a scenario
+in this feature does not read `reference.md`, it is in the wrong file.
+
+Reading that document as test data is a deliberate, narrow exception to
+**Black-box only** above: nothing is imported from the rocm-cli codebase — a
+*documentation artifact* is read as test data, and that artifact is the thing
+under test. `skill_steps.rs` parses its claims rather than restating them as
+constants, so a claim added upstream starts being checked with no code change,
+and every parser asserts it found something — a heading reworded upstream must
+fail loudly rather than quietly reduce an assertion to a no-op.
+
+Two rules follow:
+
+- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+  these scenarios fails, the CLI is right and the docs are what change.
+- A skill-only edit must still run this job, so `skills/**` is in the `heavy`
+  paths filter that gates the `e2e` job.
+
+No scenario asserts that a symptom actually matched: on a host the catalog rules
+out of scope (WSL2) an empty `matched` list is the correct answer. What is
+asserted holds either way, so the feature is clean on WSL2, the no-GPU lane, and
+the GPU lanes alike.
