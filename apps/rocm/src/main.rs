@@ -992,15 +992,22 @@ enum DevicePolicyArg {
     /// Require a ROCm GPU; fail if none is usable (the default).
     #[value(alias = "auto", alias = "gpu")]
     GpuRequired,
-    /// Prefer a ROCm GPU when one is available.
+    /// Accepted for compatibility; behaves identically to `gpu_required`
+    /// (rocm serve has no CPU fallback path).
     GpuPreferred,
-    /// Run on CPU only (not a supported fallback path in rocm serve).
-    #[value(alias = "cpu")]
+    /// Accepted but always rejected: rocm serve has no CPU fallback path, so
+    /// this exits with an error. Hidden from `--help`, shell completions and the
+    /// invalid-value suggestion list so it is never advertised as usable, while
+    /// still parsing so the deliberate rejection message is preserved.
+    #[value(alias = "cpu", hide = true)]
     CpuOnly,
 }
 
 impl DevicePolicyArg {
-    /// Canonical policy string understood by [`parse_device_policy`].
+    /// Canonical policy string understood by [`parse_device_policy`]. Routing the
+    /// parsed variant back through the string keeps `parse_device_policy` the
+    /// single choke point that enforces the `cpu_only` rejection across every
+    /// caller, rather than adding a second conversion path that could bypass it.
     const fn as_policy_str(self) -> &'static str {
         match self {
             Self::GpuRequired => "gpu_required",
@@ -18168,6 +18175,31 @@ mod tests {
                 other => panic!("expected Serve, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn device_policy_arg_maps_through_parse_device_policy() {
+        // `as_policy_str` feeds the parsed variant back through
+        // `parse_device_policy`, the single choke point enforcing the strict
+        // no-CPU policy. Guard the mapping so a mis-typed arm (e.g. `CpuOnly =>
+        // "gpu_required"`) cannot silently turn the deliberate CPU rejection into
+        // a GPU-required serve while every other test stays green.
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuRequired.as_policy_str()))
+                .expect("gpu_required parses"),
+            DevicePolicy::GpuRequired
+        );
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuPreferred.as_policy_str()))
+                .expect("gpu_preferred parses"),
+            DevicePolicy::GpuRequired
+        );
+        // `cpu_only` must still be rejected outright rather than mapped to a
+        // GPU policy.
+        assert!(
+            parse_device_policy(Some(DevicePolicyArg::CpuOnly.as_policy_str())).is_err(),
+            "cpu_only must be rejected"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
