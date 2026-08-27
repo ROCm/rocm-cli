@@ -82,28 +82,30 @@ directory to your shell `PATH`. Rerun it any time to upgrade.
 
 ### Linux and WSL (x86_64)
 
-Only nightly builds are published today, so pass the `nightly` channel:
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
+```
+
+This tracks the default `release` channel. For nightly builds, pass the
+`nightly` channel instead:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
 ```
 
-Once a stable release exists, omit the argument to track the default `release`
-channel instead:
+### Windows (x86_64, PowerShell)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
+```powershell
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
 
-### Windows (x86_64, PowerShell)
+This tracks the default `release` channel. For nightly builds, set
+`ROCM_CLI_CHANNEL` to `nightly` first:
 
 ```powershell
 $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
-
-Drop the `ROCM_CLI_CHANNEL` line to track the default `release` channel once a
-stable release is published.
 
 ## Build from source
 
@@ -177,7 +179,7 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | Tab | What it shows |
 |---|---|
 | **Home** | At-a-glance status: GPU, active runtime, running servers |
-| **ROCm** | Guided ROCm/runtime actions with inline details |
+| **ROCm** | Guided ROCm and runtime actions with inline details |
 | **Serving** | Start, inspect, and manage model servers |
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
@@ -228,6 +230,23 @@ requirements.
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
+
+### Examine
+
+```
+rocm examine [--json] [--framework auto|pytorch|llama-cpp|skip]
+```
+
+Checks this computer's GPU, ROCm install, engines, and managed setup
+folders — the command to run first to see whether a system is ready, and
+what `rocm install sdk` and `rocm serve` will see. `--json` emits a
+machine-readable report for diagnosis tooling instead of the human-readable
+summary. `--framework` controls which ML framework the `--json` report probes
+for its ROCm build and compiled GPU architectures: `auto` (the default) tries
+PyTorch, then falls back to llama.cpp; `pytorch` or `llama-cpp` probe only
+that framework; `skip` runs no framework probe at all, which is fastest and
+still enough to answer GPU and driver questions. `--framework` only affects
+the JSON report, not the human-readable one.
 
 ### ROCm installation
 
@@ -378,13 +397,13 @@ rocm model [--verbose]
 ```
 
 `rocm model` prints a curated catalog of popular open-weight models grouped by
-the hardware path they target — Strix Halo (Lemonade / llama.cpp) and MI300X
+the hardware path they target — Strix Halo (Lemonade and llama.cpp) and MI300X
 (vLLM) — using canonical Hugging Face ids, and shows for each the quantization
 that fits a single GPU. Strix Halo entries use the `owner/repo:variant` GGUF form
 (for example, `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
 entries serve at BF16. This catalog ships inside the binary, so it is available
 offline; when a recipe index is configured instead, the header names it.
-`--verbose` also lists the other recipes (the default assistant and smoke/test
+`--verbose` also lists the other recipes (the default assistant and smoke-test
 paths) that `rocm serve` can still resolve but that are hidden from the list.
 
 The catalog is only a starting point: you can serve any compatible Hugging Face
@@ -452,6 +471,11 @@ rocm automations disable <watcher-id>
 Optional background checks that can propose or apply changes automatically.
 
 ### Configuration
+
+Show or change rocm-cli's saved settings — the default engine and runtime,
+which runtime each engine prefers, local GPU telemetry opt-in, and the
+provider used for chat, automations, and ambiguous natural-language plans
+(including enabling providers and storing their API keys).
 
 ```
 rocm config show
