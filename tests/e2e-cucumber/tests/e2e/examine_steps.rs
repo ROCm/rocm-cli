@@ -63,12 +63,39 @@ async fn user_asks_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user previews the driver install plan")]
+async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
+    // `--dry-run` renders the plan and returns before touching the system, so
+    // this is safe to run on any Linux host including the no-GPU mock lane.
+    let (stdout, _, rc) = crate::run_rocm(world, &["install", "driver", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
 #[then("a version string is returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
     assert!(
         output.trim().starts_with("rocm "),
         "expected version string starting with 'rocm ': {output}"
+    );
+}
+
+#[then("the plan's repo version is a concrete version, not a shell placeholder")]
+async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let repo_version = field_value(output, "repo_version")
+        .unwrap_or_else(|| panic!("no repo_version line in driver install plan:\n{output}"));
+    assert!(
+        !repo_version.contains("${"),
+        "repo_version still shows an unresolved shell placeholder: {repo_version:?}\n{output}"
+    );
+    assert!(
+        repo_version
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit()),
+        "repo_version is not a concrete version string: {repo_version:?}\n{output}"
     );
 }
 
