@@ -140,7 +140,7 @@ Feature: Model serving
   # check runs inside argument parsing, before engine selection or any GPU
   # pre-flight, so it needs no GPU and no engine and gates every PR (ungated).
   @id:serve-negative-temperature-rejected
-  Scenario: Serving with a temperature below zero is refused with a clear reason
+  Scenario: 15 - Serving with a temperature below zero is refused with a clear reason
     When the user serves a model with a negative sampling temperature
     Then serving is refused before any engine starts
     And the CLI explains that temperature cannot be negative
