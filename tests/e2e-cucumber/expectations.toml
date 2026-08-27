@@ -208,3 +208,57 @@ when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-8031"
 reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
 serve_timeout_secs = 240
+
+# ── Second README-walkthrough batch (EAI-8050) ─────────────────────────────
+# Four defects found walking the CLI on an MI300X app-dev pod, each pinned by a
+# scenario asserting the CORRECT behaviour. All four are in code paths with no
+# hardware, engine or network dependency, and all four were re-confirmed in a
+# plain Linux container against this branch's binary — so every row is scoped
+# `when = {}` and each is expected to go stale (XPASS) on every lane the day its
+# bug is fixed. None is `flaky`: each reproduced deterministically.
+
+# --- EAI-8046: `rocm chat` ignores a piped prompt ---
+# With no `--prompt` and a non-terminal stdin, the command renders an assistant
+# status summary and exits 0 without ever reading stdin or contacting the model,
+# though `--prompt`'s own help says it reads standard input when omitted and the
+# command's EXAMPLES block shows `echo … | rocm chat`. Container-measured: the
+# `--prompt` control produced a POST on the served model, the piped run produced
+# only the readiness GET. Remove this row once a piped prompt reaches the model.
+[["chat-cli-stdin-prompt"]]
+when = {}
+bug = "EAI-8046"
+reason = "`rocm chat` with a piped prompt and no --prompt never sends a request; it prints an assistant status summary and exits 0."
+
+# --- EAI-8047: listed automation checks cannot be turned on from the listing ---
+# `automations list` shows each check by display name only ("Server recovery"),
+# while `automations enable` accepts the internal id ("server-recover") and
+# rejects anything else with rc=1. The names do not mechanically reduce to the
+# ids, so nothing the listing prints is enough to act on. Remove this row once
+# the listing exposes an identifier a user can pass back in.
+[["automations-listed-checks-can-be-enabled"]]
+when = {}
+bug = "EAI-8047"
+reason = "`automations list` publishes no usable identifier, so the checks it lists cannot be enabled from what it shows."
+
+# --- EAI-8048: `dash --replay` does not validate its recording ---
+# Pointed at a file that does not exist, the dashboard enters its alternate
+# screen and waits for input instead of refusing. Container-measured under a
+# pseudo-terminal: no output, killed at a 12s timeout (rc=124). The scenario's
+# step imposes its own deadline, so this xfails promptly rather than hanging.
+# Remove this row once an unreadable recording is rejected before the TUI opens.
+[["dash-replay-rejects-an-unreadable-session"]]
+when = {}
+bug = "EAI-8048"
+reason = "`rocm dash --replay` opens the interactive dashboard on a recording that cannot be read instead of refusing it."
+
+# --- EAI-8049: the engine shell's activation hint names a path that is not there ---
+# `engines shell` builds the hint by appending the interpreter directory to the
+# manifest's env_path, but the vLLM install records env_path as the directory
+# CONTAINING the command, so the hint doubles that segment and points at a file
+# nobody can source. Container-measured: with a vLLM-shaped manifest the hint
+# named `<env>/bin/bin/activate` (absent) while a root-shaped one named
+# `<env>/bin/activate` (present). Remove this row once the two agree.
+[["engine-shell-activation-hint-is-usable"]]
+when = {}
+bug = "EAI-8049"
+reason = "`engines shell` prints an activation hint whose path does not exist, because the recorded env_path already includes the interpreter directory."

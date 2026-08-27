@@ -80,6 +80,21 @@ async fn running_managed_model(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
+#[when("the user replays a session recording that does not exist")]
+async fn replay_missing_session(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let missing = root.path().join("missing-session.ndjson");
+    assert!(
+        !missing.exists(),
+        "the replay fixture unexpectedly exists: {}",
+        missing.display()
+    );
+    let path = missing.to_string_lossy().into_owned();
+    let tui = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to launch the replay command: {e}"));
+    world.tui = Some(tui);
+}
+
 #[when("the user opens the dashboard with demo data")]
 async fn open_dashboard_demo(world: &mut E2eWorld) {
     // `--demo` replays a deterministic synthetic session, so the dashboard
@@ -227,6 +242,33 @@ async fn quit_interactive_chat(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the dashboard refuses to start without opening the interactive view")]
+async fn assert_replay_refused_promptly(world: &mut E2eWorld) {
+    let tui = session(world);
+    let rc = tui
+        .wait_for_any_exit(Duration::from_secs(2))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the dashboard did not reject the unreadable replay promptly; it appears to have \
+                 opened the interactive view instead: {e}"
+            )
+        });
+    // Both halves of the contract. A prompt non-zero exit alone would be
+    // satisfied by an implementation that opens the full-screen TUI, then
+    // notices the unreadable file and exits — which still violates "instead of
+    // entering the TUI". Assert it never switched to the alternate screen too;
+    // that latched flag survives the switch-back an exiting TUI would perform.
+    assert!(
+        !tui.entered_alternate_screen(),
+        "the dashboard opened the interactive view before rejecting the unreadable replay"
+    );
+    assert_ne!(
+        rc, 0,
+        "the dashboard accepted a replay recording that does not exist"
+    );
+}
 
 #[then("the dashboard home view is displayed")]
 async fn home_view_displayed(world: &mut E2eWorld) {
