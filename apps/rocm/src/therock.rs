@@ -832,7 +832,7 @@ fn install_wheel_runtime(
         &resolution.family,
         Some(&resolution.latest_version),
     );
-    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "wheel", &runtime_key));
+    let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
     let mut output = String::new();
@@ -1047,8 +1047,7 @@ fn install_tarball_runtime(
         &artifact.family,
         Some(&artifact.version),
     );
-    let install_root =
-        prefix.unwrap_or_else(|| managed_runtime_root(paths, "tarball", &runtime_key));
+    let install_root = resolved_install_root(paths, "tarball", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
     let cache_path = paths.cache_dir.join("therock").join(&artifact.file_name);
 
@@ -3472,6 +3471,34 @@ fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> Pa
         .join(runtime_key)
 }
 
+/// Where to build a runtime, resolved to its real location on disk first.
+///
+/// `install sdk` writes this path into three places that all outlive the command:
+/// the registry manifest, the sidecar beside the runtime, and — via `uv` — the
+/// `#!` line of every console script in the venv. So the path handed to the
+/// installer has to name where the files land, not the route taken to get there.
+/// Reaching `data/runtimes` through a symlink is enough to make those differ, and
+/// once the link goes the runtime reports itself installed at a folder that is not
+/// there while the files sit untouched next door.
+///
+/// Applies to `--prefix` too, which has the identical failure mode.
+///
+/// Only the root is resolved. `python_executable` is derived from it and must
+/// keep the venv's own `bin/python`, which is itself a symlink to the base
+/// interpreter — resolving that would record the system Python and break venv
+/// semantics. The adopt path already draws the line in the same place: see
+/// `main::adopt_runtime_from_probe`, which canonicalizes the install root next to
+/// `absolute_existing_file_path_preserving_symlink` for the interpreter.
+fn resolved_install_root(
+    paths: &AppPaths,
+    format: &str,
+    runtime_key: &str,
+    prefix: Option<PathBuf>,
+) -> PathBuf {
+    let requested = prefix.unwrap_or_else(|| managed_runtime_root(paths, format, runtime_key));
+    rocm_core::resolve_path_through_symlinks(&requested)
+}
+
 fn runtime_registry_dir(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("runtimes").join("registry")
 }
@@ -4246,6 +4273,104 @@ mod tests {
     fn python_venv_args_target_install_root() {
         let args = python_venv_args(Path::new("/mnt/envs/my-env"));
         assert_eq!(args, vec!["-m", "venv", "/mnt/envs/my-env"]);
+    }
+
+    /// A data dir whose `runtimes` folder is a symlink to somewhere else, plus the
+    /// real folder it points at — both canonical, so an assertion cannot pass or
+    /// fail on whether the machine's temp dir is itself behind a link.
+    ///
+    /// Deliberately not `test_paths`: that builds paths by plain `join` and never
+    /// canonicalizes, which is exactly the property under test here.
+    #[cfg(unix)]
+    fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-linked-runtimes-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let real = root.join("data").join("real-runtimes");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("data").join("runtimes")).unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        (root, paths, real)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_a_symlinked_runtimes_folder() {
+        // The e2e harness points a scenario's `data/runtimes` at a shared tree this
+        // way. Recording the link's path made the runtime name a folder that
+        // vanished with the scenario, while the files stayed where they were
+        // written (rocm-cli#315).
+        let (root, paths, real) = linked_runtimes_paths("resolves");
+        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+
+        let resolved = resolved_install_root(&paths, "wheel", runtime_key, None);
+
+        assert_eq!(resolved, real.join("wheel").join(runtime_key));
+        assert!(
+            !resolved.starts_with(paths.data_dir.join("runtimes")),
+            "the recorded root must not be expressed through the link: {}",
+            resolved.display()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_a_symlinked_prefix() {
+        // `--prefix` has the identical failure mode, so it gets the identical fix.
+        let (root, paths, real) = linked_runtimes_paths("prefix");
+        let prefix = paths.data_dir.join("runtimes").join("chosen-env");
+
+        let resolved = resolved_install_root(&paths, "wheel", "unused-key", Some(prefix));
+
+        assert_eq!(resolved, real.join("chosen-env"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_the_tarball_format_too() {
+        let (root, paths, real) = linked_runtimes_paths("tarball");
+        let runtime_key = "release-tarball-gfx120x-all-7-14-0";
+
+        let resolved = resolved_install_root(&paths, "tarball", runtime_key, None);
+
+        assert_eq!(resolved, real.join("tarball").join(runtime_key));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_root_is_unchanged_when_nothing_is_linked() {
+        // Guards against gratuitous rewriting: on an ordinary tree the recorded
+        // root must still be the plain layout path, so existing installs and the
+        // paths compared against them do not move.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-plain-runtimes-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+
+        assert_eq!(
+            resolved_install_root(&paths, "wheel", runtime_key, None),
+            managed_runtime_root(&paths, "wheel", runtime_key)
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

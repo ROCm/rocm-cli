@@ -18,6 +18,80 @@ async fn setup_no_runtimes(world: &mut E2eWorld) {
 #[given("a machine with a standard ROCm install")]
 async fn setup_standard_rocm(_world: &mut E2eWorld) {}
 
+#[given("a machine whose runtimes folder is a link to somewhere else")]
+async fn setup_linked_runtimes_folder(world: &mut E2eWorld) {
+    world
+        .link_runtimes_within_scenario()
+        .expect("failed to link the scenario's runtimes folder");
+}
+
+/// The folder the scenario's `data/runtimes` link points at, resolved so it can be
+/// compared against a path the CLI resolved.
+fn linked_runtimes_target(world: &E2eWorld) -> std::path::PathBuf {
+    let real = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("real-runtimes");
+    real.canonicalize().unwrap_or(real)
+}
+
+#[when("the user previews an SDK install")]
+async fn user_previews_sdk_install(world: &mut E2eWorld) {
+    // `--family` because a host with no AMD GPU has no target to detect, and the
+    // preview resolves the install folder before it needs one. `--dry-run` keeps
+    // this to a plan: no venv, no multi-GiB download.
+    let stdout = crate::run_rocm_ok(
+        world,
+        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+}
+
+/// The `  target: <path>` line of the install preview.
+fn planned_runtime_folder(world: &E2eWorld) -> String {
+    let output = world.cli_output.as_deref().expect("no install preview");
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("target: "))
+        .unwrap_or_else(|| panic!("no planned runtime folder in the preview:\n{output}"))
+        .trim()
+        .to_owned()
+}
+
+#[then("the planned runtime folder is inside the folder the link points at")]
+async fn assert_planned_folder_is_the_real_one(world: &mut E2eWorld) {
+    let planned = planned_runtime_folder(world);
+    let real = linked_runtimes_target(world);
+    assert!(
+        std::path::Path::new(&planned).starts_with(&real),
+        "the install would record {planned}, which is not inside {}",
+        real.display()
+    );
+}
+
+#[then("the planned runtime folder is not expressed through the link")]
+async fn assert_planned_folder_avoids_the_link(world: &mut E2eWorld) {
+    // The failure this pins: a folder named through the link reads as valid until
+    // the link goes, and takes the environment's console-script shebangs with it.
+    let planned = planned_runtime_folder(world);
+    let link = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("runtimes");
+    assert!(
+        !std::path::Path::new(&planned).starts_with(&link),
+        "the install would record {planned}, which names the link at {} rather than \
+         the folder it points at",
+        link.display()
+    );
+}
+
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
     // On a no-GPU host this is a no-op: a managed TheRock SDK runtime can only be
