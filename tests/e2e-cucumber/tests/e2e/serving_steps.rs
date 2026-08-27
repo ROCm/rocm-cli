@@ -715,6 +715,21 @@ async fn user_serves_gpu_required(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve with a negative `--temperature` in the space form. The value parser
+/// runs inside argument parsing, before engine selection or any GPU pre-flight,
+/// so a bogus model name never gets that far — the refusal needs no GPU and no
+/// engine, which is what lets this scenario gate every PR.
+#[when("the user serves a model with a negative sampling temperature")]
+async fn user_serves_negative_temperature(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", "sampling-check-model", "--temperature", "-1"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// Serve with every GPU hidden from the CLI and engine via an empty
 /// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
 #[when("the user serves a model with every GPU masked from view")]
@@ -800,6 +815,17 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     assert!(
         output.to_lowercase().contains("no usable amd gpu"),
         "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+#[then("the CLI explains that temperature cannot be negative")]
+async fn assert_negative_temperature_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output
+            .to_lowercase()
+            .contains("temperature must be a finite value >= 0.0"),
+        "expected a temperature range explanation, got:\n{output}"
     );
 }
 
