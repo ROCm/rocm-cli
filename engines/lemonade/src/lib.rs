@@ -40,6 +40,8 @@ const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GG
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
+#[cfg(feature = "e2e-test-hooks")]
+const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
 /// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
 /// we pick the highest-priority backend it considers supported on this host.
 /// GPU backends only — `cpu` is intentionally excluded so the router path never
@@ -426,6 +428,14 @@ fn detect_response() -> DetectResponse {
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
+    // Debug builds expose a deterministic failure seam for the black-box CLI
+    // scenario that pins retry count and terminal recovery guidance. Keep it at
+    // the backend phase: the real defect happens after the embeddable is ready,
+    // and exercising it must not download or alter a runtime on the test host.
+    #[cfg(feature = "e2e-test-hooks")]
+    if std::env::var_os(BACKEND_INSTALL_FAILURE_TEST_ENV).is_some() {
+        install_llamacpp_backend_with_retry(|| bail!("scripted Lemonade backend install failure"))?;
+    }
     eprintln!(
         "Preparing Lemonade embeddable {}...",
         rocm_deps::LEMONADE_VERSION
@@ -1136,6 +1146,25 @@ fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Resu
 
 /// Ask Lemonade which llama.cpp backends it supports on this GPU, choose the best
 /// one (`LLAMACPP_BACKEND_PRIORITY`), install it if necessary, and return its name.
+/// Retry the backend install itself once, rather than the whole Lemonade runtime
+/// preparation. The embeddable download already has bounded transport retries;
+/// repeating that outer operation would redo deterministic failures and may
+/// re-extract a healthy runtime. A backend subprocess can instead fail after a
+/// completed download when its connection to lemond is interrupted, and a second
+/// call can reuse the backend cache immediately without a delay.
+fn install_llamacpp_backend_with_retry(mut install: impl FnMut() -> Result<()>) -> Result<()> {
+    match install() {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            eprintln!("Lemonade backend installation failed; retrying once: {first_error:#}");
+            install().with_context(|| {
+                "Lemonade backend installation failed again; run `rocm engines install \
+                 lemonade --reinstall` and then retry `rocm serve`"
+            })
+        }
+    }
+}
+
 fn ensure_best_llamacpp_backend(
     manifest: &LemonadeInstallManifest,
     host: &str,
@@ -1157,7 +1186,9 @@ fn ensure_best_llamacpp_backend(
         eprintln!("Using installed Lemonade {LLAMACPP_RECIPE}:{backend} backend.");
     } else {
         eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
-        run_lemonade_backend_install(manifest, host, port, &backend, process_env)?;
+        install_llamacpp_backend_with_retry(|| {
+            run_lemonade_backend_install(manifest, host, port, &backend, process_env)
+        })?;
     }
     Ok(backend)
 }
@@ -4362,6 +4393,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn backend_install_succeeds_without_retry() {
+        let mut attempts = 0;
+
+        install_llamacpp_backend_with_retry(|| {
+            attempts += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn backend_install_recovers_on_the_second_attempt() {
+        let mut attempts = 0;
+
+        install_llamacpp_backend_with_retry(|| {
+            attempts += 1;
+            if attempts == 1 {
+                bail!("first backend connection was interrupted");
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn backend_install_stops_after_one_retry_with_reinstall_guidance() {
+        let mut attempts = 0;
+
+        let error = install_llamacpp_backend_with_retry(|| {
+            attempts += 1;
+            if attempts == 1 {
+                bail!("first backend connection was interrupted");
+            }
+            bail!("second backend connection was interrupted");
+        })
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert_eq!(attempts, 2);
+        assert!(
+            rendered.contains("second backend connection was interrupted"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("first backend connection was interrupted"),
+            "the terminal error must be the retry's failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("rocm engines install lemonade --reinstall"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("retry `rocm serve`"), "{rendered}");
     }
 
     fn test_manifest(runtime_dir: PathBuf) -> LemonadeInstallManifest {
