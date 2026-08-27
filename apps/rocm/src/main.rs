@@ -18108,10 +18108,15 @@ mod tests {
     }
 
     // Both `--engine` and `--device` restrict their input to a fixed set via a
-    // clap `value_parser`/`ValueEnum`, so the possible values are advertised in
-    // `--help` and shell completion structurally (not a hand-written doc string)
-    // and invalid input is rejected as a usage error (exit code 2) with the valid
-    // choices listed. The sync tests below keep the advertised lists honest.
+    // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
+    // error (exit code 2) with the accepted choices listed. Values are advertised
+    // in `--help` and shell completion structurally (not a hand-written doc
+    // string), with one deliberate exception: `--device cpu_only` is
+    // `#[value(hide = true)]` — still accepted so its exit-1 rejection message
+    // survives, but kept out of help and completion. The sync tests below keep the
+    // advertised lists honest; `serve_device_help_lists_match_device_policy_names`
+    // compares against the full `DevicePolicy` set (hidden entries included, via
+    // `get_possible_values`), so a dropped or renamed variant still fails.
     #[test]
     fn serve_engine_help_lists_match_engine_inventory() {
         let mut listed = serve_possible_values("engine");
