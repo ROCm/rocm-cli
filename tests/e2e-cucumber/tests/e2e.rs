@@ -8,7 +8,7 @@
 // than splitting the step API into sync/async and mut/non-mut variants.
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
@@ -77,6 +77,10 @@ pub struct E2eWorld {
     /// a run whose failure is already the expected outcome — see the relaunch
     /// budget in `setup_gpu_model`.
     pub expect_xfail: bool,
+    /// Extra environment for this scenario's next `rocm` invocation. A Given step
+    /// records a behavioral precondition here; the When step remains a plain user
+    /// action and consumes the fixture without exposing its mechanism in Gherkin.
+    pub command_env: Vec<(&'static str, std::ffi::OsString)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -193,6 +197,7 @@ impl Default for E2eWorld {
             legacy_rocm_path: None,
             serve_timeout_override: None,
             expect_xfail: false,
+            command_env: Vec::new(),
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
@@ -273,6 +278,42 @@ impl E2eWorld {
         }
     }
 
+    /// Create `link` as a directory link to `target`.
+    ///
+    /// Self-hosted Windows runners commonly lack `SeCreateSymbolicLinkPrivilege`,
+    /// so a failed symlink falls back to a directory junction, which needs neither
+    /// developer mode nor an elevated token and looks the same to the CLI.
+    #[allow(unused_variables)]
+    fn link_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).or_else(|_| {
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "mklink /J exited with {status}"
+                    )))
+                }
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::other(
+                "directory links are unsupported here",
+            ))
+        }
+    }
+
     /// Opt this scenario into the shared managed-runtime tree (see
     /// [`shared_runtimes_dir`]): replace its empty isolated `data/runtimes` with a
     /// directory link to the shared dir, so an `install sdk` here populates the
@@ -294,29 +335,31 @@ impl E2eWorld {
         }
         let link = data.join("runtimes");
         let _ = std::fs::remove_dir_all(&link);
-        #[cfg(unix)]
-        let res = std::os::unix::fs::symlink(&shared, &link);
-        #[cfg(windows)]
-        let res = std::os::windows::fs::symlink_dir(&shared, &link).or_else(|_| {
-            // Self-hosted Windows runners commonly lack SeCreateSymbolicLinkPrivilege.
-            // Directory junctions need no developer mode or elevated token and expose
-            // the same shared runtime tree to the scenario's isolated data directory.
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&shared)
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!(
-                    "mklink /J exited with {status}"
-                )))
-            }
-        });
-        if res.is_err() {
+        if Self::link_directory(&shared, &link).is_err() {
             let _ = std::fs::create_dir_all(&link);
         }
+    }
+
+    /// Point this scenario's `data/runtimes` at a sibling folder inside its own
+    /// isolated tree, and return that folder.
+    ///
+    /// The same shape as [`use_shared_runtimes`] without the shared tree: for
+    /// scenarios that need to observe what the CLI does when its runtimes folder is
+    /// reached through a link, but must not write anywhere a later run can see.
+    pub fn link_runtimes_within_scenario(&self) -> std::io::Result<PathBuf> {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("scenario has no isolated root")
+            .path();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let real = data.join("real-runtimes");
+        std::fs::create_dir_all(&real)?;
+        let link = data.join("runtimes");
+        let _ = std::fs::remove_dir_all(&link);
+        Self::link_directory(&real, &link)?;
+        Ok(real)
     }
 
     /// Plant a fake pre-existing (non-CLI) ROCm install in the scenario's isolated
@@ -603,6 +646,29 @@ pub fn run_rocm_with_env(
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
     for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Run `rocm` with the behavioral fixture established by a Given step, then
+/// consume it so it cannot leak into a later action in the same scenario.
+pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in std::mem::take(&mut world.command_env) {
         cmd.env(key, value);
     }
     let output = cmd

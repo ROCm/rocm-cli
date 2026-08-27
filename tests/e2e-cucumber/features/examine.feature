@@ -111,3 +111,14 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
+
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
+  # placeholder on its `repo_version:` line instead of the effective version, so
+  # the preview a user reviews before approving disagreed with what the install
+  # would actually pull. The plan is rendered on every Linux host regardless of
+  # GPU (the driver is not yet installed when you preview it), so the mock lane
+  # pins this without hardware.
+  @id:install-driver-dry-run-resolves-repo-version @requires-os:linux
+  Scenario: 12 - The driver install dry-run shows the effective repo version
+    When the user previews the driver install plan
+    Then the plan's repo version is a concrete version, not a shell placeholder

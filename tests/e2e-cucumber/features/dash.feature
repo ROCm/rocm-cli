@@ -110,3 +110,16 @@ Feature: Interactive dashboard
     Then generation throughput is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:launcher-shows-live-serving-instance @requires-os:linux
+  Scenario: 10 - The launcher front door shows a live serving model rather than idle
+    # EAI-8190 regression: bare `rocm` opens the launcher front door, which
+    # reads the managed-service registry (`launcher_serving_instances`) the same
+    # way `rocm services` does. A model already serving must surface as
+    # "Serving <model>", not the "Idle — nothing serving" state the front door
+    # showed before the fix, which drove this whole PR.
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user quits the launcher
+    Then the launcher exits successfully

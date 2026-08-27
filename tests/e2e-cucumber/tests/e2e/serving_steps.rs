@@ -790,6 +790,31 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[given("Lemonade preparation cannot complete")]
+async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
+    world.command_env.push((
+        "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
+        "repeated".into(),
+    ));
+}
+
+#[when("the user serves a model with Lemonade")]
+async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user sends a chat completion request")]
 async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
@@ -802,6 +827,21 @@ async fn user_sends_completion(world: &mut E2eWorld) {
 async fn user_serves_gpu_required(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
     let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", model, "--engine", engine]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with a negative `--temperature` in the space form. The value parser
+/// runs inside argument parsing, before engine selection or any GPU pre-flight,
+/// so a bogus model name never gets that far — the refusal needs no GPU and no
+/// engine, which is what lets this scenario gate every PR.
+#[when("the user serves a model with a negative sampling temperature")]
+async fn user_serves_negative_temperature(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", "sampling-check-model", "--temperature", "-1"],
+    );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -903,6 +943,46 @@ async fn when_cli_reports_ready(world: &mut E2eWorld) {
 
 // ── Then ───────────────────────────────────────────────────────────
 
+#[then("serving stops after one automatic retry")]
+async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "serve unexpectedly succeeded:\n{output}"
+    );
+    // The scripted failure seam also waives serve's no-GPU pre-flight, so this
+    // refusal can only appear when the seam is compiled out. Name that cause:
+    // otherwise a lane that pre-builds `rocm` without the feature reports a
+    // baffling "no retry announcement" instead of its real misconfiguration.
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached \
+         Lemonade preparation. E2E lanes that pre-build `rocm` and export \
+         ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
+         what `cargo xtask e2e` builds for itself:\n{output}"
+    );
+    assert_eq!(
+        output.matches("retrying once").count(),
+        1,
+        "expected exactly one retry announcement:\n{output}"
+    );
+}
+
+#[then("the user is told how to reinstall Lemonade and retry serving")]
+async fn assert_lemonade_recovery_guidance(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("rocm engines install lemonade --reinstall"),
+        "expected a forced-reinstall recovery command:\n{output}"
+    );
+    assert!(
+        output.contains("retry `rocm serve`"),
+        "expected guidance to retry serving:\n{output}"
+    );
+}
+
 #[then("an inference request succeeds immediately")]
 async fn assert_inference_succeeds_now(world: &mut E2eWorld) {
     // No extra wait: the CLI already reported ready, so inference must work now.
@@ -946,6 +1026,17 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     assert!(
         output.to_lowercase().contains("no usable amd gpu"),
         "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+#[then("the CLI explains that temperature cannot be negative")]
+async fn assert_negative_temperature_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output
+            .to_lowercase()
+            .contains("temperature must be a finite value >= 0.0"),
+        "expected a temperature range explanation, got:\n{output}"
     );
 }
 

@@ -30,15 +30,22 @@ for Lemonade and vLLM.
 <!-- platform-support-table-start -->
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
-| Linux (x86_64) | Yes | Full support, including the live dashboard and both inference engines |
+| Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
 only (see [docs/vllm.md](docs/vllm.md)).
+
+The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
+other distributions the equivalent requirement is glibc 2.38 with
+`GLIBCXX_3.4.32`: that is what the Lemonade engine is linked against, and every
+published build of it needs those versions, so there is no older release to fall
+back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
+glibc 2.39 and `GLIBCXX_3.4.33`.
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
@@ -299,7 +306,7 @@ Start a local OpenAI-compatible model server:
 
 ```
 rocm serve <model> [--engine lemonade|vllm]
-                   [--device gpu_required|gpu_preferred|cpu_only]
+                   [--device gpu_required|gpu_preferred]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
@@ -360,8 +367,7 @@ not already used by another rocm-cli server (managed or foreground), falling
 back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
 pin a specific device. The
 selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
-model across multiple GPUs is not supported. `--gpu` is ignored with
-`--device cpu_only` (the model runs on CPU). Because selection uses the
+model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
 `ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
 

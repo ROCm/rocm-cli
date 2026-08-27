@@ -257,13 +257,19 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         #[arg(long)]
         prompt: Option<String>,
         /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
-        #[arg(long, value_parser = parse_non_negative_temperature)]
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Nucleus sampling probability to send with the request (0.0-1.0).
-        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
         top_p: Option<f32>,
         /// Maximum number of tokens to generate in the response.
-        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
         max_tokens: Option<u32>,
         #[arg(
             long,
@@ -346,9 +352,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Engine to use.
         #[arg(long, value_parser = SUPPORTED_ENGINES)]
         engine: Option<String>,
-        /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
+        /// Device policy.
         #[arg(long)]
-        device: Option<String>,
+        device: Option<DevicePolicyArg>,
         /// GPU device to serve on: `auto` (default; first free GPU) or a single
         /// index like `1`.
         #[arg(long, value_name = "INDEX|auto")]
@@ -398,13 +404,19 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
         gpu_memory_utilization: Option<String>,
         /// Default sampling temperature for generation (>= 0.0).
-        #[arg(long, value_parser = parse_non_negative_temperature)]
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Default nucleus sampling probability for generation (0.0-1.0).
-        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
         top_p: Option<f32>,
         /// Default maximum number of tokens to generate per response.
-        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
         max_tokens: Option<u32>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
@@ -976,6 +988,45 @@ enum TelemetryModeArg {
     Local,
     /// Disable telemetry collection entirely.
     Off,
+}
+
+/// User-facing `rocm serve --device` policy.
+///
+/// Modeled as a clap `ValueEnum` so invalid input is rejected by clap's usage
+/// validation (exit code 2, with the valid choices listed) rather than a generic
+/// application error (exit code 1) — matching how every other enum-style CLI
+/// argument behaves. The historical aliases (`auto`/`gpu` for `gpu_required`,
+/// `cpu` for `cpu_only`) stay accepted for backward compatibility but are hidden
+/// from the advertised list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum DevicePolicyArg {
+    /// Require a ROCm GPU; fail if none is usable (the default).
+    #[value(alias = "auto", alias = "gpu")]
+    GpuRequired,
+    /// Accepted for compatibility; behaves identically to `gpu_required`
+    /// (rocm serve has no CPU fallback path).
+    GpuPreferred,
+    /// Accepted but always rejected: rocm serve has no CPU fallback path, so
+    /// this exits with an error. Hidden from `--help`, shell completions and the
+    /// invalid-value suggestion list so it is never advertised as usable, while
+    /// still parsing so the deliberate rejection message is preserved.
+    #[value(alias = "cpu", hide = true)]
+    CpuOnly,
+}
+
+impl DevicePolicyArg {
+    /// Canonical policy string understood by [`parse_device_policy`]. Routing the
+    /// parsed variant back through the string keeps `parse_device_policy` the
+    /// single choke point that enforces the `cpu_only` rejection across every
+    /// caller, rather than adding a second conversion path that could bypass it.
+    const fn as_policy_str(self) -> &'static str {
+        match self {
+            Self::GpuRequired => "gpu_required",
+            Self::GpuPreferred => "gpu_preferred",
+            Self::CpuOnly => "cpu_only",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2820,7 +2871,7 @@ struct DriverInstallPlan {
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
     reason: String,
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
@@ -2900,7 +2951,17 @@ fn build_driver_install_plan(
     os_release_text: &str,
     dkms: bool,
 ) -> DriverInstallPlan {
-    let repo_version_expr = "${ROCM_CLI_AMDGPU_VERSION:-7.2.4}".to_owned();
+    // Resolve the AMD graphics version and amdgpu-install package release once,
+    // here at plan-build time, so the concrete values are baked into both the
+    // human-readable summary and every command the plan runs. Keeping shell
+    // `${VAR:-default}` templates in the commands used to be load-bearing, but
+    // AMD's apt `sources.list` line embeds the template inside POSIX single
+    // quotes, which suppress all expansion — so the literal `${...}` would land
+    // in the repo file. Resolving up front fixes that and keeps the summary and
+    // the executed commands in agreement.
+    let repo_version = resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}");
+    let package_release =
+        resolve_shell_default_template("${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}");
     if examine.os == "windows" {
         return DriverInstallPlan {
             supported: false,
@@ -2909,7 +2970,7 @@ fn build_driver_install_plan(
             os_id: "windows".to_owned(),
             version_id: String::new(),
             codename: String::new(),
-            repo_version_expr,
+            repo_version,
             reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
@@ -2924,7 +2985,7 @@ fn build_driver_install_plan(
             os_id: "wsl".to_owned(),
             version_id: String::new(),
             codename: String::new(),
-            repo_version_expr,
+            repo_version,
             reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
@@ -2945,7 +3006,7 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
             dkms,
             true,
         ),
@@ -2955,7 +3016,7 @@ fn build_driver_install_plan(
                 os_id,
                 version_id,
                 repo_codename.to_owned(),
-                repo_version_expr,
+                repo_version,
                 dkms,
                 false,
             );
@@ -2974,7 +3035,8 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Rhel,
         ),
@@ -2982,7 +3044,8 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Oracle,
         ),
@@ -2990,19 +3053,21 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Rocky,
         ),
         ("sles" | "sle", "15.7") => {
-            sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms)
+            sles_driver_plan(os_id, version_id, codename, repo_version, package_release, dkms)
         }
         _ => driver_plan_via_id_like(
             &os_id,
             &version_id,
             &id_like,
             &codename,
-            &repo_version_expr,
+            &repo_version,
+            &package_release,
             dkms,
         )
         .unwrap_or_else(|| DriverInstallPlan {
@@ -3012,7 +3077,7 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
             reason: "Linux DKMS driver install is currently planned only for AMD-documented Ubuntu, Debian, RHEL, Oracle Linux, SLES, and Rocky versions; no commands were guessed for this distro.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
@@ -3035,7 +3100,8 @@ fn driver_plan_via_id_like(
     version_id: &str,
     id_like: &str,
     codename: &str,
-    repo_version_expr: &str,
+    repo_version: &str,
+    package_release: &str,
     dkms: bool,
 ) -> Option<DriverInstallPlan> {
     let likes: Vec<String> = id_like
@@ -3061,7 +3127,7 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             codename,
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
             dkms,
             true,
         ));
@@ -3075,7 +3141,7 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             repo_codename.to_owned(),
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
             dkms,
             false,
         ));
@@ -3095,7 +3161,8 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             codename.to_owned(),
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
+            package_release.to_owned(),
             dkms,
             DnfDriverDistro::Generic,
         ));
@@ -3129,7 +3196,7 @@ fn apt_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
     dkms: bool,
     include_linux_modules_extra: bool,
 ) -> DriverInstallPlan {
@@ -3160,7 +3227,7 @@ fn apt_driver_plan(
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version_expr}/ubuntu {codename} main' | sudo tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
+                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version}/ubuntu {codename} main' | sudo tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
                 ),
             ),
             driver_command(
@@ -3190,7 +3257,7 @@ fn apt_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's package-manager DKMS flow and requires explicit approval before execution."
         } else {
@@ -3222,7 +3289,8 @@ fn dnf_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
+    package_release: String,
     dkms: bool,
     distro: DnfDriverDistro,
 ) -> DriverInstallPlan {
@@ -3253,7 +3321,7 @@ fn dnf_driver_plan(
             DriverCommandPhase::Prepare,
             &format!(
                 "sudo dnf install -y {}",
-                amdgpu_install_rpm_url(&repo_version_expr, &version_id, distro)
+                amdgpu_install_rpm_url(&repo_version, &package_release, &version_id, distro)
             ),
         ));
         commands.push(driver_command(
@@ -3281,7 +3349,7 @@ fn dnf_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's documented DNF DKMS flow and requires explicit approval before execution."
         } else {
@@ -3316,7 +3384,8 @@ fn sles_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
+    package_release: String,
     dkms: bool,
 ) -> DriverInstallPlan {
     let mut commands = Vec::new();
@@ -3343,7 +3412,7 @@ fn sles_driver_plan(
                 DriverCommandPhase::Prepare,
                 &format!(
                     "sudo zypper --no-gpg-checks install -y {}",
-                    amdgpu_install_sles_rpm_url(&repo_version_expr, &version_id)
+                    amdgpu_install_sles_rpm_url(&repo_version, &package_release, &version_id)
                 ),
             ),
             driver_command(DriverCommandPhase::Prepare, "sudo zypper refresh"),
@@ -3367,7 +3436,7 @@ fn sles_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's documented SLES DKMS flow and requires explicit approval before execution."
         } else {
@@ -3413,7 +3482,8 @@ fn rhel_kernel_prepare_commands(version_id: &str) -> Vec<&'static str> {
 }
 
 fn amdgpu_install_rpm_url(
-    repo_version_expr: &str,
+    repo_version: &str,
+    package_release: &str,
     version_id: &str,
     distro: DnfDriverDistro,
 ) -> String {
@@ -3421,16 +3491,20 @@ fn amdgpu_install_rpm_url(
         DnfDriverDistro::Rhel => "rhel",
         DnfDriverDistro::Oracle | DnfDriverDistro::Rocky | DnfDriverDistro::Generic => "el",
     };
-    let repo_version = dnf_repo_version_path(version_id);
+    let repo_version_path = dnf_repo_version_path(version_id);
     let el_major = linux_major_version(version_id);
     format!(
-        "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/{repo_family}/{repo_version}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.el{el_major}.noarch.rpm"
+        "https://repo.radeon.com/amdgpu-install/{repo_version}/{repo_family}/{repo_version_path}/amdgpu-install-{repo_version}.{package_release}-1.el{el_major}.noarch.rpm"
     )
 }
 
-fn amdgpu_install_sles_rpm_url(repo_version_expr: &str, version_id: &str) -> String {
+fn amdgpu_install_sles_rpm_url(
+    repo_version: &str,
+    package_release: &str,
+    version_id: &str,
+) -> String {
     format!(
-        "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/sle/{version_id}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.noarch.rpm"
+        "https://repo.radeon.com/amdgpu-install/{repo_version}/sle/{version_id}/amdgpu-install-{repo_version}.{package_release}-1.noarch.rpm"
     )
 }
 
@@ -3457,6 +3531,38 @@ fn driver_command(phase: DriverCommandPhase, command: &str) -> DriverPlanCommand
     }
 }
 
+/// Resolve a `${VAR:-default}` shell parameter-expansion template to its
+/// effective value: the value of `VAR` when it is set and non-empty (matching
+/// the shell `:-` semantics), otherwise the literal default. This is resolved
+/// once at plan-build time so the concrete value is baked into both the
+/// human-readable summary and the commands the plan runs, rather than leaking an
+/// unexpanded `${...}` placeholder into user-facing output or depending on the
+/// runtime shell — which, for the single-quoted apt `sources.list` line, would
+/// never expand it at all.
+///
+/// Only a single, flat `${VAR:-default}` template is recognized. Anything else —
+/// a bare `${VAR}`, a `${VAR:=x}`/`${VAR-x}` form, or a nested default such as
+/// `${A:-${B:-x}}` whose default itself contains `${` — is returned unchanged, so
+/// an unresolvable shape degrades to its literal input rather than to a
+/// half-resolved string.
+fn resolve_shell_default_template(expr: &str) -> String {
+    let Some(inner) = expr.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return expr.to_owned();
+    };
+    let Some((var, default)) = inner.split_once(":-") else {
+        return expr.to_owned();
+    };
+    if default.contains("${") {
+        // Nested or embedded templates are beyond this flat matcher; return the
+        // input untouched rather than emitting a partially resolved string.
+        return expr.to_owned();
+    }
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
 fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "driver install plan");
@@ -3476,7 +3582,7 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         empty_as_unknown(&plan.version_id)
     );
     let _ = writeln!(output, "  codename: {}", empty_as_unknown(&plan.codename));
-    let _ = writeln!(output, "  repo_version: {}", plan.repo_version_expr);
+    let _ = writeln!(output, "  repo_version: {}", plan.repo_version);
     let _ = writeln!(output, "  reason: {}", plan.reason);
     if !plan.preflight_checks.is_empty() {
         let _ = writeln!(output, "  preflight_checks:");
@@ -4704,7 +4810,7 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
 struct ServeArgs {
     model: String,
     engine: Option<String>,
-    device: Option<String>,
+    device: Option<DevicePolicyArg>,
     gpu: Option<String>,
     runtime_id: Option<String>,
     env_id: Option<String>,
@@ -4843,7 +4949,7 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let device_policy = parse_device_policy(device.as_deref())?;
+    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
@@ -4853,8 +4959,13 @@ fn serve(args: ServeArgs) -> Result<()> {
     // BEFORE preparing or launching any engine (no wasted engine download, and an
     // actionable message instead of a late engine crash). The engine enforces the
     // same rule as a backstop. Skipped for cpu_only; permissive when availability
-    // cannot be probed on this platform (probe returns `None`).
+    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // backend-failure scenario bypasses this host precondition so the black-box
+    // test reaches Lemonade's backend boundary without real GPU hardware.
+    let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
+        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
+        && !scripted_backend_failure
         && let Some(usable) = rocm_core::usable_amd_gpu_indices()
         && usable.is_empty()
     {
@@ -17820,6 +17931,80 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Serializes and isolates tests that read or mutate process-global env vars.
+    ///
+    /// `std::env::set_var`/`remove_var` are `unsafe` in edition 2024 because
+    /// concurrent env mutation races with any concurrent `env::var` read anywhere
+    /// in the process, and `cargo test` runs these functions multi-threaded in one
+    /// binary. A unique variable name does not make a mutation safe — the hazard is
+    /// the mutation racing a read, not a name collision. Every test that touches
+    /// env therefore holds this one process-wide lock, and each mutation is saved
+    /// and restored on drop so it cannot leak into another test.
+    struct ScopedTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedTestEnv {
+        fn new() -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                _lock: lock,
+                saved: Vec::new(),
+            }
+        }
+
+        /// Clear the two AMD driver-install override vars for the duration of the
+        /// test, so a value exported in the developer's or runner's shell cannot
+        /// leak into a plan and make its resolved `repo_version`/package release
+        /// disagree with the assertion.
+        fn with_amd_overrides_cleared() -> Self {
+            let mut env = Self::new();
+            env.clear("ROCM_CLI_AMDGPU_VERSION");
+            env.clear("ROCM_CLI_AMDGPU_PACKAGE_RELEASE");
+            env
+        }
+
+        fn save(&mut self, key: &str) {
+            if !self.saved.iter().any(|(saved_key, _)| saved_key == key) {
+                self.saved.push((key.to_owned(), std::env::var(key).ok()));
+            }
+        }
+
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(&mut self, key: &str, value: &str) {
+            self.save(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024
+        fn clear(&mut self, key: &str) {
+            self.save(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for ScopedTestEnv {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            for (key, previous) in self.saved.iter().rev() {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
     // The previous `daemon_run_argv_targets_rocmd_run_with_automations` unit test
     // only re-asserted the literals `daemon_run_argv()` returns, so it tested
     // nothing real. The intended real behavior — that this argv actually drives
@@ -18199,23 +18384,7 @@ mod tests {
         }
     }
 
-    fn possible_values_listed_in_help(help: &str) -> Vec<String> {
-        let marker = "[possible values:";
-        let start = help
-            .find(marker)
-            .unwrap_or_else(|| panic!("help text missing `{marker}`: {help:?}"));
-        let rest = &help[start + marker.len()..];
-        let end = rest
-            .find(']')
-            .unwrap_or_else(|| panic!("unterminated possible-values list in help: {help:?}"));
-        rest[..end]
-            .split(',')
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    fn serve_arg_help(arg_id: &str) -> String {
+    fn serve_possible_values(arg_id: &str) -> Vec<String> {
         let cli = Cli::command();
         let serve = cli
             .find_subcommand("serve")
@@ -18224,32 +18393,25 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id().as_str() == arg_id)
             .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
-            .get_help()
-            .map(ToString::to_string)
-            .unwrap_or_default()
-    }
-
-    // `--engine` restricts its input to `SUPPORTED_ENGINES` via a clap
-    // `value_parser`, so the possible values are advertised in `--help` and shell
-    // completion structurally (not a hand-written doc string). `--device` stays
-    // free-form (it accepts aliases such as `auto`/`gpu` plus the intentional
-    // `cpu_only` rejection), so its advertised list is hand-written and guarded
-    // by a sync test below. Both guards keep the advertised lists honest.
-    #[test]
-    fn serve_engine_help_lists_match_engine_inventory() {
-        let cli = Cli::command();
-        let serve = cli
-            .find_subcommand("serve")
-            .expect("serve subcommand exists");
-        let engine_arg = serve
-            .get_arguments()
-            .find(|arg| arg.get_id() == "engine")
-            .expect("serve has an `engine` argument");
-        let mut listed: Vec<String> = engine_arg
             .get_possible_values()
             .iter()
             .map(|value| value.get_name().to_owned())
-            .collect();
+            .collect()
+    }
+
+    // Both `--engine` and `--device` restrict their input to a fixed set via a
+    // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
+    // error (exit code 2) with the accepted choices listed. Values are advertised
+    // in `--help` and shell completion structurally (not a hand-written doc
+    // string), with one deliberate exception: `--device cpu_only` is
+    // `#[value(hide = true)]` — still accepted so its exit-1 rejection message
+    // survives, but kept out of help and completion. The sync tests below keep the
+    // advertised lists honest; `serve_device_help_lists_match_device_policy_names`
+    // compares against the full `DevicePolicy` set (hidden entries included, via
+    // `get_possible_values`), so a dropped or renamed variant still fails.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = serve_possible_values("engine");
         let mut expected: Vec<String> = builtin_engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
@@ -18264,7 +18426,7 @@ mod tests {
 
     #[test]
     fn serve_device_help_lists_match_device_policy_names() {
-        let mut listed = possible_values_listed_in_help(&serve_arg_help("device"));
+        let mut listed = serve_possible_values("device");
         let mut expected: Vec<String> = [
             DevicePolicy::GpuRequired,
             DevicePolicy::GpuPreferred,
@@ -18277,7 +18439,63 @@ mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --device help possible-values must stay in sync with DevicePolicy names"
+            "serve --device possible-values must stay in sync with DevicePolicy names"
+        );
+    }
+
+    #[test]
+    fn serve_rejects_unknown_device_policy_as_usage_error() {
+        // An invalid `--device` must fail clap's value validation (a usage error,
+        // exit code 2) rather than parsing as a free-form string and failing later
+        // in application logic (exit code 1). This keeps `--device` consistent with
+        // every other enum-style argument and lists the valid choices in the error.
+        let error = parse_serve(&["--device", "bogus"]).expect_err("invalid device rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn serve_accepts_device_policy_values_and_aliases() {
+        for (value, expected) in [
+            ("gpu_required", DevicePolicyArg::GpuRequired),
+            ("gpu_preferred", DevicePolicyArg::GpuPreferred),
+            ("cpu_only", DevicePolicyArg::CpuOnly),
+            // Historical aliases stay accepted for backward compatibility.
+            ("auto", DevicePolicyArg::GpuRequired),
+            ("gpu", DevicePolicyArg::GpuRequired),
+            ("cpu", DevicePolicyArg::CpuOnly),
+        ] {
+            let cli = parse_serve(&["--device", value]).expect("device value parses");
+            match cli.command {
+                Some(Command::Serve { device, .. }) => {
+                    assert_eq!(device, Some(expected), "device value `{value}`");
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn device_policy_arg_maps_through_parse_device_policy() {
+        // `as_policy_str` feeds the parsed variant back through
+        // `parse_device_policy`, the single choke point enforcing the strict
+        // no-CPU policy. Guard the mapping so a mis-typed arm (e.g. `CpuOnly =>
+        // "gpu_required"`) cannot silently turn the deliberate CPU rejection into
+        // a GPU-required serve while every other test stays green.
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuRequired.as_policy_str()))
+                .expect("gpu_required parses"),
+            DevicePolicy::GpuRequired
+        );
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuPreferred.as_policy_str()))
+                .expect("gpu_preferred parses"),
+            DevicePolicy::GpuRequired
+        );
+        // `cpu_only` must still be rejected outright rather than mapped to a
+        // GPU policy.
+        assert!(
+            parse_device_policy(Some(DevicePolicyArg::CpuOnly.as_policy_str())).is_err(),
+            "cpu_only must be rejected"
         );
     }
 
@@ -18397,6 +18615,57 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::ValueValidation
         );
+    }
+
+    #[test]
+    fn serve_negative_sampling_space_form_reaches_range_validator() {
+        // The space form (`--temperature -1`) must reach the value parser and
+        // report a value error, not be rejected by clap as an unexpected argument.
+        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
+        // makes both forms validate identically. `--max-tokens` shares the gotcha even
+        // though it is a positive integer: the ambiguity is at the tokenizer, before the
+        // value parser runs, so the space form must reach `parse_positive_u32` too.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            assert_eq!(
+                parse_serve(args)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_negative_sampling_space_form_reaches_range_validator() {
+        // Mirrors `serve_negative_sampling_space_form_reaches_range_validator`: the
+        // same numeric value flags carry `allow_negative_numbers` on `chat`, so the
+        // space form reaches the value parser instead of clap's unexpected-argument path.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            let mut argv = vec!["rocm", "chat", "--prompt", "hi"];
+            argv.extend_from_slice(args);
+            assert_eq!(
+                Cli::try_parse_from(argv)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -23967,6 +24236,7 @@ install therock";
 
     #[test]
     fn driver_plan_ubuntu_2404_uses_official_dkms_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
 VERSION_ID="24.04"
@@ -24133,6 +24403,7 @@ VERSION_CODENAME=noble
 
     #[test]
     fn driver_plan_default_linux_preflight_has_no_execution_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
 VERSION_ID="24.04"
@@ -24151,7 +24422,84 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn resolve_shell_default_template_uses_default_when_env_unset() {
+        let _env = ScopedTestEnv::new();
+        // A made-up variable name that nothing else sets, cleared under the lock,
+        // isolates the default path.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION:-7.2.4}"),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_prefers_env_value_when_set() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_OVERRIDE";
+        env.set(var, "9.9.9");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "9.9.9"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_treats_empty_env_as_unset() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_EMPTY";
+        env.set(var, "");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_passes_through_non_template() {
+        assert_eq!(resolve_shell_default_template("7.2.4"), "7.2.4");
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_bare_var_untouched() {
+        let _env = ScopedTestEnv::new();
+        // No `:-default`, so there is nothing to resolve to; the input must pass
+        // through unchanged rather than being partially rewritten.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION}"),
+            "${ROCM_CLI_TEST_UNSET_REPO_VERSION}"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_nested_default_untouched() {
+        let _env = ScopedTestEnv::new();
+        // A nested default is beyond the flat matcher; returning the literal
+        // input keeps a `${B:-x}` fragment from leaking as a "resolved" value.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"),
+            "${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"
+        );
+    }
+
+    #[test]
+    fn driver_plan_dry_run_repo_version_line_is_resolved() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // Regression for the dry-run output leaking the raw shell placeholder on
+        // the `repo_version:` line instead of the effective version.
+        let os_release = r#"
+ID=rhel
+VERSION_ID="9.7"
+"#;
+        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let rendered = render_driver_install_plan(&plan, false, true);
+
+        assert!(rendered.contains("repo_version: 7.2.4"));
+        assert!(!rendered.contains("repo_version: ${ROCM_CLI_AMDGPU_VERSION:-7.2.4}"));
+    }
+
+    #[test]
     fn driver_plan_debian_12_omits_linux_modules_extra() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=debian
 VERSION_ID="12"
@@ -24170,6 +24518,7 @@ VERSION_CODENAME=bookworm
 
     #[test]
     fn driver_plan_rhel_97_uses_documented_dnf_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=rhel
 VERSION_ID="9.7"
@@ -24184,16 +24533,15 @@ VERSION_ID="9.7"
         assert!(rendered.contains("kernel-headers-$(uname -r)"));
         assert!(rendered.contains("kernel-devel-$(uname -r)"));
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
-        ));
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/rhel/9.7/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
     }
 
     #[test]
     fn driver_plan_oracle_linux_101_uses_el_10_uek_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ol
 VERSION_ID="10.1"
@@ -24204,17 +24552,14 @@ VERSION_ID="10.1"
         assert!(plan.supported);
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("kernel-uek-devel-$(uname -r)"));
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/10/"
-            )
-        );
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el10.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/10/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el10.noarch.rpm"));
         assert!(rendered.contains("dry run only"));
     }
 
     #[test]
     fn driver_plan_rocky_97_uses_el_dnf_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=rocky
 VERSION_ID="9.7"
@@ -24227,16 +24572,13 @@ VERSION_ID="9.7"
             rendered
                 .contains("sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched")
         );
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.7/"
-            )
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.7/"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_rocky_94_uses_el_dnf_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Rocky 9.x point releases must resolve like RHEL 9.x, not just 9.7.
         let os_release = r#"
 ID=rocky
@@ -24247,17 +24589,14 @@ VERSION_ID="9.4"
 
         assert!(plan.supported);
         assert!(plan.mutating);
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.4/"
-            )
-        );
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.4/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_rocky_8_and_10_remain_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
         for version in ["8.10", "10.0"] {
             let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
@@ -24273,6 +24612,7 @@ VERSION_ID="9.4"
 
     #[test]
     fn driver_plan_debian_uses_intended_ubuntu_suite() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AMD's documented Debian install deliberately serves Debian from the
         // Ubuntu-suite graphics tree (Debian 12 -> jammy). Lock that in and
         // ensure the plan explains the mapping is intentional.
@@ -24286,9 +24626,7 @@ VERSION_CODENAME=bookworm
 
         assert!(plan.supported);
         assert_eq!(plan.codename, "jammy");
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(
             plan.reason
                 .contains("intentionally uses AMD's Ubuntu-suite repository")
@@ -24297,6 +24635,7 @@ VERSION_CODENAME=bookworm
 
     #[test]
     fn driver_plan_sles_157_uses_documented_zypper_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=sles
 VERSION_ID="15.7"
@@ -24309,9 +24648,7 @@ VERSION_ID="15.7"
         assert!(rendered.contains("SUSEConnect"));
         assert!(rendered.contains("sle-module-desktop-applications/15.7/x86_64"));
         assert!(rendered.contains("sudo zypper install -y kernel-default-devel"));
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/sle/15.7/"
-        ));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/sle/15.7/"));
         assert!(rendered.contains("sudo zypper --no-gpg-checks install -y"));
         assert!(rendered.contains("Execute: sudo zypper install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -24319,6 +24656,7 @@ VERSION_ID="15.7"
 
     #[test]
     fn driver_plan_unsupported_linux_is_non_mutating() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=fedora
 VERSION_ID="41"
@@ -24336,6 +24674,7 @@ VERSION_ID="41"
 
     #[test]
     fn windows_install_driver_is_validate_only() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let plan = build_driver_install_plan(&test_examine("windows", false), "", true);
         let rendered = render_driver_install_plan(&plan, false, true);
 
@@ -24352,6 +24691,7 @@ VERSION_ID="41"
 
     #[test]
     fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let plan = build_driver_install_plan(&test_examine("linux", true), "", true);
         let rendered = render_driver_install_plan(&plan, false, false);
 
@@ -24370,6 +24710,7 @@ VERSION_ID="41"
 
     #[test]
     fn driver_plan_ubuntu_derivative_via_id_like_matches_ubuntu_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Pop!_OS reports its own ID but reuses Ubuntu's version + repositories.
         let os_release = r#"
 ID=pop
@@ -24385,14 +24726,13 @@ ID_LIKE="ubuntu debian"
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // Ubuntu-family derivatives ship the Ubuntu kernel, so linux-modules-extra applies.
         assert!(rendered.contains("linux-modules-extra-$(uname -r)"));
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_debian_derivative_via_id_like_matches_debian_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // A Debian derivative (e.g. LMDE) that shares Debian's version scheme.
         let os_release = r#"
 ID=lmde
@@ -24404,15 +24744,14 @@ ID_LIKE=debian
 
         assert!(plan.supported);
         // Debian-family maps to the Ubuntu jammy repo and omits linux-modules-extra.
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(!rendered.contains("linux-modules-extra-$(uname -r)"));
         assert!(rendered.contains("amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_almalinux_via_id_like_uses_el_9_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AlmaLinux is a RHEL rebuild: standard kernel, served from the el/ path.
         let os_release = r#"
 ID=almalinux
@@ -24426,13 +24765,9 @@ ID_LIKE="rhel centos fedora"
         assert!(plan.mutating);
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // EL rebuilds use the vendor-neutral el/ repo path, not rhel/.
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.6/"
-            )
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.6/"));
         assert!(!rendered.contains("/rhel/9.6/"));
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         // el9 uses the version-aware standard-kernel prepare commands.
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
@@ -24440,6 +24775,7 @@ ID_LIKE="rhel centos fedora"
 
     #[test]
     fn driver_plan_almalinux_8_via_id_like_uses_el_major_path() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=almalinux
 VERSION_ID="8.10"
@@ -24450,10 +24786,7 @@ ID_LIKE="rhel centos fedora"
 
         assert!(plan.supported);
         // EL 8 is served from the major-version path (el/8), matching AMD docs.
-        assert!(
-            rendered
-                .contains("repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/8/")
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/8/"));
         assert!(rendered.contains("-1.el8.noarch.rpm"));
         // el8 has no kernel-devel-matched package.
         assert!(!rendered.contains("kernel-devel-matched"));
@@ -24462,6 +24795,7 @@ ID_LIKE="rhel centos fedora"
 
     #[test]
     fn driver_plan_id_like_with_unsupported_version_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // A Debian-family derivative whose VERSION_ID does not align with any
         // AMD-documented Debian version must not fabricate a plan.
         let os_release = r#"
@@ -24480,6 +24814,7 @@ ID_LIKE=debian
 
     #[test]
     fn driver_plan_exact_id_takes_precedence_over_id_like() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // An exact RHEL match must keep the rhel/ path even though ID_LIKE=fedora.
         let os_release = r#"
 ID=rhel
@@ -24490,14 +24825,13 @@ ID_LIKE=fedora
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
-        ));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/rhel/9.7/"));
         assert!(!rendered.contains("/el/9.7/"));
     }
 
     #[test]
     fn driver_plan_oracle_linux_off_arm_version_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Oracle Linux reports `ID_LIKE=fedora` (not rhel) and boots UEK. An OL
         // version outside the exact `ol` arm must NOT be captured by the EL
         // fallback, which would emit non-UEK kernel commands that cannot install.
@@ -24518,6 +24852,7 @@ ID_LIKE=fedora
 
     #[test]
     fn driver_plan_opensuse_leap_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // openSUSE Leap shares SLES's version scheme but has no SUSEConnect/SCC
         // entitlement, so it must not be matched to the SLES plan.
         let os_release = r#"

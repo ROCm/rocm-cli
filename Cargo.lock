@@ -3569,6 +3569,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "rocm-core",
+ "rocm-dash-core",
  "rocm-dash-daemon",
  "rocm-dash-tui",
  "rocm-deps",

@@ -135,6 +135,16 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
+  # Parse-time refusal: `--temperature -1` (space form) must reach the value
+  # parser and report the range error, not clap's "unexpected argument". The
+  # check runs inside argument parsing, before engine selection or any GPU
+  # pre-flight, so it needs no GPU and no engine and gates every PR (ungated).
+  @id:serve-negative-temperature-rejected
+  Scenario: 15 - Serving with a temperature below zero is refused with a clear reason
+    When the user serves a model with a negative sampling temperature
+    Then serving is refused before any engine starts
+    And the CLI explains that temperature cannot be negative
+
   # The masked-device path: on a real GPU host where every device is hidden, the
   # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
   # GPU hardware (Strix Halo / Instinct).
@@ -164,3 +174,15 @@ Feature: Model serving
     When the user serves a model selecting both a runtime and an environment
     Then serving is refused before any engine starts
     And the user is told the two selectors cannot be combined
+
+  # The failure is injected at Lemonade's backend-install boundary in debug/test
+  # builds, after the CLI has selected Lemonade but before any runtime download or
+  # machine mutation. That makes the user-visible retry and final recovery command
+  # deterministic on the blocking no-GPU lane rather than relying on a real 3 GiB
+  # transfer to fail at just the right moment.
+  @id:serve-lemonade-preparation-recovery @requires-no-gpu
+  Scenario: 16 - Repeated Lemonade preparation failure gives the user a recovery path
+    Given Lemonade preparation cannot complete
+    When the user serves a model with Lemonade
+    Then serving stops after one automatic retry
+    And the user is told how to reinstall Lemonade and retry serving
