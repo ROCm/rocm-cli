@@ -668,6 +668,16 @@ pub fn resolve_path_through_symlinks(path: &Path) -> PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut candidate = absolute.as_path();
     loop {
+        // Checked BEFORE `exists`, because the two platforms disagree about what a
+        // `..` past a missing directory even means. Windows collapses it lexically,
+        // so `<root>/missing/..` "exists" and canonicalizes to `<root>`; Unix walks
+        // the path through the filesystem, so it does not exist at all. Resolving
+        // here would therefore record a different folder depending on the host —
+        // and the whole point of this function is that the folder it returns is the
+        // one the files land in. Give up instead.
+        if candidate.components().next_back() == Some(std::path::Component::ParentDir) {
+            return absolute;
+        }
         if candidate.exists() {
             let Ok(resolved) = candidate.canonicalize() else {
                 return absolute;
@@ -678,8 +688,8 @@ pub fn resolve_path_through_symlinks(path: &Path) -> PathBuf {
             }
             return resolved;
         }
-        // `file_name` is None for the root and for a `..` component. Either way
-        // there is nothing safe to re-attach, so keep the caller's path.
+        // `file_name` is None at the root. Nothing left to walk up to, so keep the
+        // caller's path.
         let (Some(name), Some(parent)) = (candidate.file_name(), candidate.parent()) else {
             return absolute;
         };
@@ -890,12 +900,32 @@ mod tests {
 
     #[test]
     fn resolving_gives_up_rather_than_guess_at_a_parent_component() {
-        // Re-attaching `..` after resolving an ancestor could name a different
-        // place than the caller meant, so the path comes back untouched.
+        // A `..` reached past a missing directory means different things on
+        // different hosts: Windows collapses it lexically, so `<root>/missing/..`
+        // resolves to `<root>`, while Unix walks the filesystem and finds nothing.
+        // Resolving it would record a different folder depending on the host, so
+        // the path comes back untouched on both.
         let root = scratch_dir("parent-component");
         let requested = root.join("missing").join("..").join("sibling");
 
         assert_eq!(resolve_path_through_symlinks(&requested), requested);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolving_still_handles_a_parent_component_the_filesystem_can_walk() {
+        // The give-up above must not spread to a `..` whose parent is really
+        // there — that one is unambiguous on every host, and refusing it would
+        // leave an ordinary path unresolved.
+        let root = scratch_dir("parent-that-exists");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let requested = nested.join("..").join("b").join("leaf");
+
+        assert_eq!(
+            resolve_path_through_symlinks(&requested),
+            nested.join("leaf")
+        );
         fs::remove_dir_all(&root).ok();
     }
 
