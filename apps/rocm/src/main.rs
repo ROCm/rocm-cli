@@ -24539,6 +24539,7 @@ VERSION_ID="41"
 
     #[test]
     fn windows_install_driver_is_validate_only() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let plan = build_driver_install_plan(&test_examine("windows", false), "", true);
         let rendered = render_driver_install_plan(&plan, false, true);
 
@@ -24555,6 +24556,7 @@ VERSION_ID="41"
 
     #[test]
     fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let plan = build_driver_install_plan(&test_examine("linux", true), "", true);
         let rendered = render_driver_install_plan(&plan, false, false);
 
