@@ -129,6 +129,12 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
     }
+    // Name the runtime rather than leaving the CLI to infer it: the shared tree
+    // grows a second runtime whenever the channel index publishes one, and the
+    // CLI refuses to auto-select from more than one (see
+    // `E2eWorld::activate_shared_runtime`). Without this the step still passes —
+    // a runtime IS present — and the serve that follows fails instead.
+    world.activate_shared_runtime();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
         !stdout.contains("installed: none"),
@@ -147,6 +153,10 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
     }
+    // Same reason as `a managed runtime is active`: pin the runtime explicitly so
+    // the engine lookup and the serve that follows resolve the same one whatever
+    // the shared tree happens to hold.
+    world.activate_shared_runtime();
     assert_engine_ready(world);
 }
 
