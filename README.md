@@ -23,19 +23,21 @@ SPDX-License-Identifier: MIT
 ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs, with a
 full-screen TUI dashboard for GPU telemetry, model serving, and chat.
 
-A single prebuilt binary for Linux and Windows (x86_64). No Python, Rust, or
-existing ROCm install required. Ships with inference engine adapters for
-Lemonade and vLLM.
+It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
+Python, Rust, or existing ROCm install, and includes inference engine adapters
+for Lemonade and vLLM.
 
+<!-- platform-support-table-start -->
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
 | macOS | No | No official installer, release, CI, or QA coverage |
+<!-- platform-support-table-end -->
 
 Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux/WSL2
+[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
@@ -47,7 +49,7 @@ glibc 2.39 and `GLIBCXX_3.4.33`.
 
 > [!IMPORTANT]
 > **Tech Preview** -- This software is provided as-is, without warranty or
-> guarantee of stability. APIs, commands, and behavior may change without
+> guarantee of stability. APIs, commands, and behavior might change without
 > notice. Intended for experimentation and early feedback only.
 
 ## Demos
@@ -78,30 +80,32 @@ The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. Rerun it any time to upgrade.
 
-### Linux / WSL (x86_64)
-
-Only nightly builds are published today, so pass the `nightly` channel:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
-```
-
-Once a stable release exists, omit the argument to track the default `release`
-channel instead:
+### Linux and WSL (x86_64)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
 ```
 
+This tracks the default `release` channel. For nightly builds, pass the
+`nightly` channel instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh -s -- nightly
+```
+
 ### Windows (x86_64, PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
+```
+
+This tracks the default `release` channel. For nightly builds, set
+`ROCM_CLI_CHANNEL` to `nightly` first:
 
 ```powershell
 $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
-
-Drop the `ROCM_CLI_CHANNEL` line to track the default `release` channel once a
-stable release is published.
 
 ## Build from source
 
@@ -131,10 +135,12 @@ Or copy the release binaries onto your `PATH`:
 install -m 0755 target/release/rocm target/release/rocmd ~/.local/bin/
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup, test
+See [CONTRIBUTING.md](https://github.com/ROCm/rocm-cli/blob/main/CONTRIBUTING.md) for the full development setup, test
 commands, and commit-signing requirements.
 
 ## First run
+
+Launch ROCm CLI with no arguments:
 
 ```
 rocm
@@ -173,7 +179,7 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | Tab | What it shows |
 |---|---|
 | **Home** | At-a-glance status: GPU, active runtime, running servers |
-| **ROCm** | Guided ROCm/runtime actions with inline details |
+| **ROCm** | Guided ROCm and runtime actions with inline details |
 | **Serving** | Start, inspect, and manage model servers |
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
@@ -182,7 +188,7 @@ Live mode reads telemetry over a Unix domain socket, so it requires Linux or
 WSL. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
 GPU or daemon.
 
-## Getting started
+## Configure ROCm and serve a model
 
 Before serving a model, ensure a managed ROCm runtime is configured:
 
@@ -206,9 +212,6 @@ box. You can also serve any compatible Hugging Face model directly — see
 [Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
-Use `rocm model` to see available model recipes and their GPU memory
-requirements.
-
 ## Quick reference
 
 | Command | Description |
@@ -225,11 +228,28 @@ requirements.
 
 ## Commands
 
+### Examine
+
+```
+rocm examine [--json] [--framework auto|pytorch|llama-cpp|skip]
+```
+
+Checks this computer's GPU, ROCm install, engines, and managed setup
+folders — the command to run first to see whether a system is ready, and
+what `rocm install sdk` and `rocm serve` will see. `--json` emits a
+machine-readable report for diagnosis tooling instead of the human-readable
+summary. `--framework` controls which ML framework the `--json` report probes
+for its ROCm build and compiled GPU architectures: `auto` (the default) tries
+PyTorch, then falls back to llama.cpp; `pytorch` or `llama-cpp` probe only
+that framework; `skip` runs no framework probe at all, which is fastest and
+still enough to answer GPU and driver questions. `--framework` only affects
+the JSON report, not the human-readable one.
+
 ### ROCm installation
 
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
-                    [--version X.Y.Z | --build-date YYYY-MM-DD]
+                    [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--dry-run]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -257,7 +277,7 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 ```
 
 `adopt` registers an existing TheRock-based Python environment as a managed
-runtime. It does not work with standard ROCm package installs (e.g.
+runtime. It does not work with standard ROCm package installs (for example,
 `/opt/rocm`); use `rocm install sdk` instead.
 
 ### Disk space
@@ -345,15 +365,14 @@ to stop the server instead. `--managed` is the explicit form of the default
 background behavior. `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
-engine (Ryzen AI / Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
-with an explicit quantization variant, e.g.
+engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
+with an explicit quantization variant, for example,
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
-**safetensors** repos, e.g. `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
+**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
-rather than silently substituting a different model. Short
-aliases from `rocm model` may not resolve with all engines.
+rather than silently substituting a different model.
 
-Some models (e.g., Llama) are gated and require HuggingFace authentication.
+Some models (such as Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
@@ -366,26 +385,6 @@ selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
 model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
 `ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
-
-Show recommended models and hardware compatibility:
-
-```
-rocm model [--verbose]
-```
-
-`rocm model` prints a curated catalog of popular open-weight models grouped by
-the hardware path they target — Strix Halo (Lemonade / llama.cpp) and MI300X
-(vLLM) — using canonical Hugging Face ids, and shows for each the quantization
-that fits a single GPU. Strix Halo entries use the `owner/repo:variant` GGUF form
-(e.g. `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
-entries serve at BF16. This catalog ships inside the binary, so it is available
-offline; when a recipe index is configured instead, the header names it.
-`--verbose` also lists the other recipes (the default assistant and smoke/test
-paths) that `rocm serve` can still resolve but that are hidden from the list.
-
-The catalog is only a starting point: you can serve any compatible Hugging Face
-model by passing its id to `rocm serve` — `owner/repo` for vLLM, or
-`owner/repo:<quant>` for a Lemonade GGUF.
 
 Manage background servers started with `--managed`:
 
@@ -448,6 +447,11 @@ rocm automations disable <watcher-id>
 Optional background checks that can propose or apply changes automatically.
 
 ### Configuration
+
+Show or change rocm-cli's saved settings — the default engine and runtime,
+which runtime each engine prefers, local GPU telemetry opt-in, and the
+provider used for chat, automations, and ambiguous natural-language plans
+(including enabling providers and storing their API keys).
 
 ```
 rocm config show

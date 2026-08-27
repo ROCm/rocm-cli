@@ -17,3 +17,7 @@ __pycache__/
 /plans/
 /workspace/
 /e2e-consolidated-report.md
+
+# Sphinx docs: _toc.yml is generated from _toc.yml.in at build time
+docs/rocm-docs/sphinx/_toc.yml
+docs/rocm-docs/_build/
