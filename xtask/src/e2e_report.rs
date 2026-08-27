@@ -145,6 +145,30 @@ fn label_for_root_report(dir: &Path) -> String {
     }
 }
 
+/// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
+///
+/// Deliberately not filtered to `-report`: that is the shape the caller
+/// asserts, so filtering on it first would make the population and the
+/// assertion the same condition, and an artifact named `e2e-gpu-results`
+/// would be invisible to a test claiming to check every e2e artifact.
+///
+/// Lives outside `mod tests` so `workflow_contract`'s docs guard can derive the
+/// canonical artifact list from the same scan this module's guard asserts on,
+/// rather than keeping a second copy that could drift from it.
+#[cfg(test)]
+pub(crate) fn uploaded_e2e_artifacts(path: &Path) -> Vec<String> {
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("name: "))
+        .map(str::trim)
+        // Job and step display names are titlecased (`E2E tests …`), so the
+        // lowercase prefix picks out artifact names only.
+        .filter(|name| name.starts_with("e2e-"))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,25 +192,6 @@ mod tests {
         "e2e-gpu-strix-windows-report",
         "e2e-gpu-strix-wsl-report",
     ];
-
-    /// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
-    ///
-    /// Deliberately not filtered to `-report`: that is the shape the caller
-    /// asserts, so filtering on it first would make the population and the
-    /// assertion the same condition, and an artifact named `e2e-gpu-results`
-    /// would be invisible to a test claiming to check every e2e artifact.
-    fn uploaded_e2e_artifacts(path: &Path) -> Vec<String> {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        text.lines()
-            .filter_map(|line| line.trim().strip_prefix("name: "))
-            .map(str::trim)
-            // Job and step display names are titlecased (`E2E tests …`), so the
-            // lowercase prefix picks out artifact names only.
-            .filter(|name| name.starts_with("e2e-"))
-            .map(str::to_owned)
-            .collect()
-    }
 
     /// Every workflow in `.github/workflows`, so a new one cannot upload under a
     /// name nothing checks — the exact hole this guard exists to close.
