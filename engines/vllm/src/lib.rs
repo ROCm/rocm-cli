@@ -443,10 +443,14 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             Some(assessed) => assessed,
             None => resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
                 || {
-                    format!(
+                    let base = format!(
                         "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
                         request.runtime_id
-                    )
+                    );
+                    match describe_skipped_managed_runtimes(Some(&request.runtime_id)) {
+                        Some(skipped) => format!("{base}\n\n{skipped}"),
+                        None => base,
+                    }
                 },
             )?,
         };
@@ -853,9 +857,48 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
         command.stderr(Stdio::from(log));
     }
 
-    command
-        .spawn()
-        .with_context(|| format!("failed to spawn vLLM command {}", runtime.command.display()))
+    command.spawn().map_err(|error| {
+        let base = anyhow::Error::new(error).context(format!(
+            "failed to spawn vLLM command {}",
+            runtime.command.display()
+        ));
+        match stale_interpreter_hint(&runtime.command) {
+            Some(hint) => base.context(hint),
+            None => base,
+        }
+    })
+}
+
+/// Explain a spawn that failed on a script whose `#!` interpreter is gone.
+///
+/// The kernel reports the missing *interpreter* as ENOENT against the *script*,
+/// so the raw error names a file that is plainly there. A virtualenv whose folder
+/// was recorded under one path and now lives at another produces exactly this: the
+/// entry points still exist, and not one of them can start.
+///
+/// Returns `None` whenever the ordinary reading is the right one — a genuinely
+/// absent file, a binary, or a shebang whose interpreter is present — so this only
+/// ever speaks up when it has something to add.
+fn stale_interpreter_hint(command: &Path) -> Option<String> {
+    if !command.is_file() {
+        return None;
+    }
+    let head = fs::read(command).ok()?;
+    let first_line = head.split(|byte| *byte == b'\n').next()?;
+    let text = String::from_utf8_lossy(first_line);
+    let shebang = text.strip_prefix("#!")?.trim();
+    // `#!/usr/bin/env python` names the launcher, not the interpreter; the path
+    // that goes stale is the direct one a venv writes.
+    let interpreter = shebang.split_whitespace().next()?;
+    if Path::new(interpreter).is_file() {
+        return None;
+    }
+    Some(format!(
+        "`{}` is present, but the interpreter on its `#!` line is not: {interpreter}. \
+         Its environment was recorded at a folder that is no longer there, so none of \
+         its entry points can start. Reinstall it with `rocm install sdk`.",
+        command.display()
+    ))
 }
 
 fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckResponse> {
@@ -1017,9 +1060,11 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
         });
     }
 
-    bail!(
-        "vLLM is not installed in a Linux/WSL ROCm Python environment. Install/build vLLM against a ROCm-capable Python environment, then set ROCM_CLI_VLLM_COMMAND, set ROCM_CLI_VLLM_PYTHON, or install it into the active rocm-cli TheRock runtime. Native Windows is skipped; no CPU fallback is used."
-    )
+    let base = "vLLM is not installed in a Linux/WSL ROCm Python environment. Install/build vLLM against a ROCm-capable Python environment, then set ROCM_CLI_VLLM_COMMAND, set ROCM_CLI_VLLM_PYTHON, or install it into the active rocm-cli TheRock runtime. Native Windows is skipped; no CPU fallback is used.";
+    match describe_skipped_managed_runtimes(runtime_id) {
+        Some(skipped) => bail!("{base}\n\n{skipped}"),
+        None => bail!("{base}"),
+    }
 }
 
 fn runtime_from_python(
@@ -1131,6 +1176,56 @@ struct ManagedRuntimeCandidate {
     sdk_bin: Option<PathBuf>,
     sdk_bin_paths: Vec<PathBuf>,
     sdk_library_paths: Vec<PathBuf>,
+}
+
+/// Registered runtimes that matched the request but were passed over because the
+/// interpreter they record is not there, phrased for the end of an error message.
+///
+/// [`collect_managed_runtime_candidates`] drops those silently, which is right for
+/// resolution — a runtime that cannot run is not a candidate — but leaves the
+/// failure describing a registry that looks empty while `rocm runtimes list`
+/// happily prints the entry. Naming the manifest and the interpreter turns
+/// "nothing resolved" into something actionable.
+///
+/// Best-effort: this only ever decorates an error that is already being returned,
+/// so any problem reading the registry yields no note rather than replacing the
+/// original failure.
+fn describe_skipped_managed_runtimes(runtime_id: Option<&str>) -> Option<String> {
+    let paths = AppPaths::discover().ok()?;
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let mut skipped = Vec::new();
+    for entry in fs::read_dir(&registry).ok()? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(manifest) = serde_json::from_slice::<TheRockRuntimeManifest>(&bytes) else {
+            continue;
+        };
+        if !runtime_matches(&manifest, runtime_id) {
+            continue;
+        }
+        let Some(python) = manifest.python_executable.as_ref() else {
+            continue;
+        };
+        if python.is_file() {
+            continue;
+        }
+        let key = manifest.runtime_key.as_deref().unwrap_or("<unnamed>");
+        skipped.push(format!("  {key}: {} is missing", python.display()));
+    }
+    if skipped.is_empty() {
+        return None;
+    }
+    skipped.sort();
+    Some(format!(
+        "These registered runtimes were skipped because the Python interpreter they \
+         record is not there:\n{}\nReinstall one with `rocm install sdk`, or drop it with \
+         `rocm runtimes uninstall <runtime_key>`.",
+        skipped.join("\n")
+    ))
 }
 
 fn collect_managed_runtime_candidates(
@@ -2045,6 +2140,83 @@ fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway directory for the shebang cases. Scoped per test and per
+    /// thread so the suite can keep running these concurrently.
+    fn shebang_scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "vllm-shebang-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create scratch dir");
+        root
+    }
+
+    #[test]
+    fn a_dead_shebang_interpreter_is_named() {
+        // The reported confusion: ENOENT against a script that is plainly there,
+        // because the kernel reports the missing interpreter against the script.
+        let root = shebang_scratch("dead");
+        let script = root.join("vllm");
+        fs::write(&script, "#!/gone/bin/python\nprint()\n").unwrap();
+
+        let hint = stale_interpreter_hint(&script).expect("a dead interpreter must be named");
+
+        assert!(hint.contains("/gone/bin/python"), "{hint}");
+        assert!(hint.contains("is present"), "{hint}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_live_shebang_interpreter_gets_no_hint() {
+        // Nothing to add: the ordinary reading of the error is the right one.
+        let root = shebang_scratch("live");
+        let interpreter = root.join("python");
+        fs::write(&interpreter, "").unwrap();
+        let script = root.join("vllm");
+        fs::write(&script, format!("#!{}\n", interpreter.display())).unwrap();
+
+        assert!(stale_interpreter_hint(&script).is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_genuinely_missing_command_gets_no_hint() {
+        let root = shebang_scratch("absent");
+        assert!(stale_interpreter_hint(&root.join("not-there")).is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_command_with_no_shebang_gets_no_hint() {
+        // A real binary. Reading its first bytes must not produce a hint.
+        let root = shebang_scratch("binary");
+        let binary = root.join("vllm");
+        fs::write(&binary, [0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00]).unwrap();
+
+        assert!(stale_interpreter_hint(&binary).is_none());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn shebang_arguments_do_not_hide_the_interpreter() {
+        // `#!/path/python -X foo` names the interpreter first; the flags are not
+        // part of the path being checked.
+        let root = shebang_scratch("args");
+        let script = root.join("vllm");
+        fs::write(&script, "#!/gone/bin/python -X utf8\n").unwrap();
+
+        let hint = stale_interpreter_hint(&script).expect("interpreter must still be found");
+
+        assert!(hint.contains("/gone/bin/python"), "{hint}");
+        assert!(
+            !hint.contains("-X"),
+            "the flags are not part of the path: {hint}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 
     /// Answer `count` chat requests on a loopback port with the given status,
     /// reporting how many arrived.
