@@ -257,13 +257,19 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         #[arg(long)]
         prompt: Option<String>,
         /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
-        #[arg(long, value_parser = parse_non_negative_temperature)]
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Nucleus sampling probability to send with the request (0.0-1.0).
-        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
         top_p: Option<f32>,
         /// Maximum number of tokens to generate in the response.
-        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
         max_tokens: Option<u32>,
         #[arg(
             long,
@@ -398,13 +404,19 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
         gpu_memory_utilization: Option<String>,
         /// Default sampling temperature for generation (>= 0.0).
-        #[arg(long, value_parser = parse_non_negative_temperature)]
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Default nucleus sampling probability for generation (0.0-1.0).
-        #[arg(long = "top-p", value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
         top_p: Option<f32>,
         /// Default maximum number of tokens to generate per response.
-        #[arg(long = "max-tokens", value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
         max_tokens: Option<u32>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
@@ -18531,6 +18543,57 @@ mod tests {
                 .kind(),
             clap::error::ErrorKind::ValueValidation
         );
+    }
+
+    #[test]
+    fn serve_negative_sampling_space_form_reaches_range_validator() {
+        // The space form (`--temperature -1`) must reach the value parser and
+        // report a value error, not be rejected by clap as an unexpected argument.
+        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
+        // makes both forms validate identically. `--max-tokens` shares the gotcha even
+        // though it is a positive integer: the ambiguity is at the tokenizer, before the
+        // value parser runs, so the space form must reach `parse_positive_u32` too.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            assert_eq!(
+                parse_serve(args)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_negative_sampling_space_form_reaches_range_validator() {
+        // Mirrors `serve_negative_sampling_space_form_reaches_range_validator`: the
+        // same numeric value flags carry `allow_negative_numbers` on `chat`, so the
+        // space form reaches the value parser instead of clap's unexpected-argument path.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            let mut argv = vec!["rocm", "chat", "--prompt", "hi"];
+            argv.extend_from_slice(args);
+            assert_eq!(
+                Cli::try_parse_from(argv)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
     }
 
     #[test]
