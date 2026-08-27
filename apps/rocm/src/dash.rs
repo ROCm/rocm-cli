@@ -206,6 +206,12 @@ pub fn resolved_args(
         model_recipes: model_recipe_summaries(),
         runtimes: runtime_summaries(paths, config),
         automations: automation_summaries(config),
+        // The dash chat used to send a four-sentence preamble that never said
+        // which machine it was on, so platform questions were answered from
+        // pretraining ("ROCm is not compatible with Windows"). Compose the real
+        // assistant prompt plus this host's facts here — the bin is the only
+        // side with both — and hand the TUI a plain String.
+        chat_system_prompt: Some(crate::rocm_chat_tool_system_prompt_for_host(Some(paths))),
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
