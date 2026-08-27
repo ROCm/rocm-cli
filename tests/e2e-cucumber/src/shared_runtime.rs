@@ -21,6 +21,11 @@
 //! `<runtimes>/active.json`, which lives *inside* the shared tree and is therefore
 //! visible through the symlink even though each scenario keeps its own config dir.
 //! Reading it back is what makes selection deterministic for any tree contents.
+//!
+//! Naming a runtime is not the same as naming a *usable* one, which is the second
+//! half of this. A registry entry can outlive the folder it points at, and a name
+//! the CLI rejects fails the scenario just as surely as no name at all — so what
+//! gets named is filtered down to the entries `activate` can accept.
 
 use std::path::Path;
 
@@ -30,6 +35,10 @@ use std::path::Path;
 /// nothing to name and the caller should leave selection to the CLI — either the
 /// tree is empty (the scenario installs its own) or it holds exactly one runtime,
 /// which the CLI already auto-selects.
+///
+/// Chooses only among [`activatable_runtime_keys`] — entries the CLI would
+/// actually accept — so neither branch below can name a runtime that fails to
+/// activate.
 ///
 /// Prefers `active.json` because that records the runtime the pre-warm actually
 /// installed and verified — but only when the registry still holds it, so a
@@ -41,7 +50,7 @@ use std::path::Path;
 /// silently mismatched pass.
 #[must_use]
 pub fn runtime_key_to_activate(runtimes_dir: &Path) -> Option<String> {
-    let installed = registry_runtime_keys(runtimes_dir);
+    let installed = activatable_runtime_keys(runtimes_dir);
     active_runtime_key(runtimes_dir)
         .filter(|key| installed.iter().any(|installed| installed == key))
         .or_else(|| match installed.as_slice() {
@@ -62,10 +71,50 @@ fn active_runtime_key(runtimes_dir: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
+/// The registry keys `rocm runtimes activate` would actually accept.
+///
+/// A registry entry is not enough: the CLI refuses to activate a runtime whose
+/// recorded `install_root` is gone ("install root is missing"). That is not
+/// hypothetical here — a scenario that installs through its own `data/runtimes`
+/// symlink records its per-scenario temp dir as the install root, and the folder
+/// dies with the scenario, leaving a registry entry pointing at nothing (see
+/// rocm-cli#315/#316). The pre-warm normally evicts those, but its repair is
+/// deliberately non-fatal and skips the whole tree when `runtimes list` itself
+/// fails — which a poisoned entry makes it do. So the suite must expect to meet
+/// one and step over it rather than name it and fail.
+///
+/// Judged by the same rule the pre-warm's own repair uses: an install root
+/// inside this tree is sound, one outside it is a corpse. Checking existence
+/// alone would be wrong — on a runner where a foreign path happens to exist the
+/// scenario would serve against a runtime outside the shared tree.
+fn activatable_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
+    registry_runtime_keys(runtimes_dir)
+        .into_iter()
+        .filter(|key| {
+            let Ok(text) =
+                std::fs::read_to_string(runtimes_dir.join("registry").join(format!("{key}.json")))
+            else {
+                return false;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return false;
+            };
+            // No recorded root: nothing to disqualify it on, so keep it and let
+            // the CLI have the final say.
+            let Some(root) = json.get("install_root").and_then(|v| v.as_str()) else {
+                return true;
+            };
+            Path::new(root).starts_with(runtimes_dir)
+        })
+        .collect()
+}
+
 /// Every runtime key present in the registry, empty when it is absent.
 ///
 /// Public so a caller that declines to activate can name what it found: "no
 /// runtime to activate" is only actionable alongside the list it chose from.
+/// Deliberately unfiltered — a diagnostic should report the tree as it is, so a
+/// key skipped by [`activatable_runtime_keys`] still shows up in the message.
 #[must_use]
 pub fn registry_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(runtimes_dir.join("registry")) else {
@@ -96,6 +145,29 @@ mod tests {
 
     fn manifest(dir: &Path, key: &str) {
         write(&dir.join("registry").join(format!("{key}.json")), "{}");
+    }
+
+    /// A runtime installed in place: its recorded root lives inside the tree.
+    fn installed(dir: &Path, key: &str) {
+        let root = dir.join("wheel").join(key);
+        std::fs::create_dir_all(&root).expect("create install root");
+        write(
+            &dir.join("registry").join(format!("{key}.json")),
+            &serde_json::json!({ "runtime_key": key, "install_root": root }).to_string(),
+        );
+    }
+
+    /// A runtime whose recorded root is a dead per-scenario temp dir — the
+    /// rocm-cli#315 poisoning the pre-warm failed to evict.
+    fn poisoned(dir: &Path, key: &str) {
+        write(
+            &dir.join("registry").join(format!("{key}.json")),
+            &serde_json::json!({
+                "runtime_key": key,
+                "install_root": format!("/tmp/rocm-e2e-gone/data/runtimes/wheel/{key}"),
+            })
+            .to_string(),
+        );
     }
 
     fn active(dir: &Path, key: &str) {
@@ -185,6 +257,66 @@ mod tests {
         assert_eq!(
             runtime_key_to_activate(dir).as_deref(),
             Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    /// The regression from the first attempt at this fix: the sole *registry*
+    /// entry was a corpse pointing at a dead per-scenario temp dir, so naming it
+    /// made every activate fail with "install root is missing" — the suite
+    /// traded one silent breakage for a louder one. Skip it and name the runtime
+    /// that is really there.
+    #[test]
+    fn skips_a_runtime_whose_install_root_left_the_tree() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        poisoned(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-multi-arch-7-14-0");
+
+        assert_eq!(
+            runtime_key_to_activate(dir).as_deref(),
+            Some("release-wheel-multi-arch-7-14-0")
+        );
+    }
+
+    /// A marker naming a poisoned runtime must not override a sound one either:
+    /// the pre-warm activates before a scenario poisons the tree, so the stale
+    /// marker outlives the runtime it names.
+    #[test]
+    fn ignores_a_marker_naming_a_runtime_that_left_the_tree() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        poisoned(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-multi-arch-7-14-0");
+        active(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+
+        assert_eq!(
+            runtime_key_to_activate(dir).as_deref(),
+            Some("release-wheel-multi-arch-7-14-0")
+        );
+    }
+
+    /// Every runtime is a corpse: name none. Letting the CLI report "no active
+    /// ROCm runtime is configured" beats an activate that cannot succeed.
+    #[test]
+    fn names_nothing_when_every_runtime_left_the_tree() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        poisoned(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+
+        assert_eq!(runtime_key_to_activate(dir), None);
+    }
+
+    /// The diagnostic reports the tree as it is: a skipped runtime still has to
+    /// appear, or "no runtime to activate" names an empty tree that isn't empty.
+    #[test]
+    fn reports_a_skipped_runtime_in_the_registry_listing() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        poisoned(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+
+        assert_eq!(
+            registry_runtime_keys(dir),
+            vec!["release-wheel-gfx94x-dcgpu-7-13-0"]
         );
     }
 
