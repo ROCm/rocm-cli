@@ -108,6 +108,15 @@ async fn open_dashboard(world: &mut E2eWorld) {
     world.tui = Some(tui);
 }
 
+#[when("the user opens the launcher")]
+async fn open_launcher(world: &mut E2eWorld) {
+    // Bare `rocm` (no subcommand) opens the launcher front door under an
+    // interactive terminal — the PTY slave satisfies `interactive_terminal()`.
+    let tui = TuiSession::spawn(world, &[])
+        .unwrap_or_else(|e| panic!("failed to open the launcher: {e}"));
+    world.tui = Some(tui);
+}
+
 #[when("the user opens the ROCm view")]
 async fn open_rocm_view(world: &mut E2eWorld) {
     // Dashboard tabs are currently ordered Home, ROCm, Serving, Observe; these
@@ -224,6 +233,11 @@ async fn quit_dashboard(world: &mut E2eWorld) {
 #[when("the user quits interactive chat")]
 async fn quit_interactive_chat(world: &mut E2eWorld) {
     quit_tui(world, "interactive chat").await;
+}
+
+#[when("the user quits the launcher")]
+async fn quit_launcher(world: &mut E2eWorld) {
+    quit_tui(world, "the launcher").await;
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -405,6 +419,36 @@ fn assert_tui_opened(world: &E2eWorld) {
 
 #[then("the dashboard exits successfully")]
 async fn dashboard_exited(world: &mut E2eWorld) {
+    assert_tui_opened(world);
+}
+
+#[then("the launcher shows the model serving")]
+async fn launcher_shows_serving(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let tui = session(world);
+    // The front door's status strip renders "Serving <model>" for a live
+    // registry instance; wait on the model name to synchronise with the first
+    // paint before inspecting the whole screen.
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher never showed the serving model: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serving"),
+        "launcher did not show the model as serving:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Idle — nothing serving"),
+        "launcher still reported idle despite a live registry instance:\n{screen}"
+    );
+}
+
+#[then("the launcher exits successfully")]
+async fn launcher_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 

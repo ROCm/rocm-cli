@@ -66,6 +66,9 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
+        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // integration tests with a fake binary skip it.
+        amd_smi_skip_kfd_preflight: false,
     }
 }
 
@@ -942,5 +945,78 @@ mod tests {
             first_summary.preferred_engine.as_ref(),
             first.preferred_engines.first()
         );
+    }
+
+    /// The launcher front-door seam that regressed: a `ready` managed vLLM
+    /// service recorded on disk must map into a live `Instance` (id, model,
+    /// port, status) so bare `rocm` shows it instead of "Idle". Reads the same
+    /// registry `rocm services` reads — status-only, no daemon, no network.
+    #[test]
+    fn launcher_serving_instances_maps_ready_registry_record() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-launcher-serving-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let p = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let services_dir = p.services_dir();
+        std::fs::create_dir_all(&services_dir).unwrap();
+        std::fs::write(
+            services_dir.join("svc.json"),
+            r#"{"service_id":"vllm-launcher","engine":"vllm",
+                "model_ref":"meta-llama/Llama-3.1-8B","canonical_model_id":"m",
+                "host":"127.0.0.1","port":11435,
+                "endpoint_url":"http://127.0.0.1:11435/v1","mode":"managed",
+                "status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let instances = launcher_serving_instances(&p);
+
+        assert_eq!(instances.len(), 1, "the ready managed service must surface");
+        let inst = &instances[0];
+        assert_eq!(inst.container_id, "vllm-launcher");
+        assert_eq!(inst.model_name, "meta-llama/Llama-3.1-8B");
+        assert_eq!(inst.port, Some(11435));
+        assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-scrapeable record (unbound `port:0`) must NOT surface as a live
+    /// instance on the front door — the registry is the authority and `:0` is
+    /// never a real serving endpoint.
+    #[test]
+    fn launcher_serving_instances_skips_unbound_record() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-launcher-serving-skip-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let p = AppPaths {
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let services_dir = p.services_dir();
+        std::fs::create_dir_all(&services_dir).unwrap();
+        std::fs::write(
+            services_dir.join("svc.json"),
+            r#"{"service_id":"vllm-unbound","engine":"vllm","model_ref":"m",
+                "canonical_model_id":"m","host":"127.0.0.1","port":0,
+                "mode":"managed","status":"ready","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        assert!(
+            launcher_serving_instances(&p).is_empty(),
+            "an unbound (:0) record must not surface as a live instance"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -338,9 +338,13 @@ async fn scrape_warning_persists_between_scrape_ticks() {
 /// cannot: the loop only starts ticking after detection completes, so the very
 /// first snapshot carrying the instance already has `gpu_system_info == Some`.
 ///
-/// On hosts without `/dev/kfd` the fake is never invoked (detection
-/// short-circuits to "no GPU", leaving `gpu_system_info == None` forever), which
-/// is exactly the case where this bug cannot occur — the assertion still holds.
+/// The fake `amd-smi` is forced through the real detection path via
+/// `amd_smi_skip_kfd_preflight` (see `RunnerOptions`): otherwise the `/dev/kfd`
+/// pre-flight short-circuits to "no GPU" on GPU-less CI, the fake never runs,
+/// and the assertion passes vacuously even with the fix reverted. The surfaced
+/// snapshot must also carry NO "amd-smi unavailable" warning — detection is
+/// still in flight there, so flashing that alarm would be a false alarm the
+/// header ⚠ badge should never show.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_gpu_detection_does_not_delay_service_discovery() {
@@ -373,6 +377,10 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
         let opts = runner::RunnerOptions {
             services_dir: Some(services_dir),
             amd_smi_binary: Some(fake_bin),
+            // Drive the fake through the real detection path on GPU-less CI:
+            // without this the `/dev/kfd` pre-flight would short-circuit before
+            // the fake runs, making the ordering assertion vacuous.
+            amd_smi_skip_kfd_preflight: true,
             disable_vllm_metrics: true,
             ..Default::default()
         };
@@ -392,6 +400,7 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
     // GPU info because detection ran to completion before the loop started.
     // The generous timeout covers detection + any subscriber starvation.
     let mut surfaced_before_gpu = None;
+    let mut surfaced_without_unavailable_warning = None;
     let overall = Duration::from_secs(15);
     loop {
         let ev = match timeout(overall, rx.recv()).await {
@@ -407,6 +416,12 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
                 .any(|i| i.container_id == "vllm-ready-fast")
         {
             surfaced_before_gpu = Some(snap.gpu_system_info.is_none());
+            surfaced_without_unavailable_warning = Some(
+                !snap
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("amd-smi unavailable")),
+            );
             break;
         }
     }
@@ -422,4 +437,14 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
         ),
         None => panic!("ready managed service never surfaced in a snapshot"),
     }
+
+    // Detection is still in flight in that first snapshot, so the honest state
+    // is "GPU pending", never "amd-smi unavailable". Flashing the unavailable
+    // warning here would be a false alarm on healthy hardware.
+    assert_eq!(
+        surfaced_without_unavailable_warning,
+        Some(true),
+        "managed service surfaced with a premature `amd-smi unavailable` warning \
+         while detection was still in flight"
+    );
 }
