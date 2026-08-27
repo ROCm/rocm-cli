@@ -825,9 +825,16 @@ mod tests {
         ));
         fs::remove_dir_all(&root).ok();
         fs::create_dir_all(&root).unwrap();
-        // Canonical up front, so an assertion cannot turn on whether the
-        // platform's temp dir is itself reached through a link.
-        root.canonicalize().unwrap()
+        // Resolved up front, so an assertion cannot turn on whether the platform's
+        // temp dir is itself reached through a link.
+        //
+        // Deliberately the function under test rather than a bare `canonicalize`:
+        // on Windows `canonicalize` hands back a verbatim `\\?\C:\…` path, which
+        // would make every expectation here verbatim while the function correctly
+        // returns a plain one — the tests would then fail on the prefix rather than
+        // on the behaviour they are about. That the prefix really is stripped is
+        // asserted separately, in `resolving_never_yields_a_windows_verbatim_prefix`.
+        resolve_path_through_symlinks(&root)
     }
 
     #[test]

@@ -4358,7 +4358,11 @@ mod tests {
             unix_time_millis()
         ));
         fs::create_dir_all(root.join("data")).unwrap();
-        let root = root.canonicalize().unwrap();
+        // Resolved rather than canonicalized: on Windows `canonicalize` returns a
+        // verbatim `\\?\C:\…` path, so the expectation would carry a prefix the
+        // resolver deliberately strips and the test would fail on that rather than
+        // on whether the layout path moved.
+        let root = rocm_core::resolve_path_through_symlinks(&root);
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),

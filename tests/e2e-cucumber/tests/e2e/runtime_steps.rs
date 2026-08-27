@@ -27,6 +27,13 @@ async fn setup_linked_runtimes_folder(world: &mut E2eWorld) {
 
 /// The folder the scenario's `data/runtimes` link points at, resolved so it can be
 /// compared against a path the CLI resolved.
+///
+/// The verbatim prefix has to come back off. `canonicalize` returns `\\?\C:\…` on
+/// Windows and the CLI records a plain path, so comparing the two raw would fail on
+/// the prefix rather than on the folder — and only on the Windows lane, long after
+/// this was written. The CLI strips it for the same reason (`rocm-core`'s
+/// `strip_verbatim_prefix`); this crate cannot reach that helper, and a dependency
+/// on `rocm-core` for six lines of string handling is the worse trade.
 fn linked_runtimes_target(world: &E2eWorld) -> std::path::PathBuf {
     let real = world
         .isolated_root
@@ -35,7 +42,15 @@ fn linked_runtimes_target(world: &E2eWorld) -> std::path::PathBuf {
         .path()
         .join("data")
         .join("real-runtimes");
-    real.canonicalize().unwrap_or(real)
+    let resolved = real.canonicalize().unwrap_or(real);
+    let text = resolved.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => resolved.clone(),
+    }
 }
 
 #[when("the user previews an SDK install")]
