@@ -35,7 +35,11 @@ copyright = "Copyright (c) Advanced Micro Devices, Inc. All rights reserved."
 # -- General configuration -------------------------------------------------
 
 html_theme = "rocm_docs_theme"
-html_theme_options = {"flavor": "rocm"}
+html_theme_options = {
+    "flavor": "rocm-ai",
+    "use_repository_button": True,
+    "use_download_button": True,
+}
 html_title = "ROCm CLI documentation"
 # myst.header: `:start-after:` on included README sections strips the heading
 # line itself, so the first heading in the chunk renders one level below its
