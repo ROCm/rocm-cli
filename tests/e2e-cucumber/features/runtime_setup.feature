@@ -47,6 +47,33 @@ Feature: Runtime configuration
     When the user checks for runtime updates
     Then the report states the runtime's freshness against the channel index
 
+  # The install used to record the path it was handed rather than the folder the
+  # files land in, so reaching `data/runtimes` through a link made the runtime name
+  # a folder that disappeared with the link — taking every console-script shebang
+  # in the environment with it, while the files stayed where they were written
+  # (rocm-cli#315). The E2E harness itself creates exactly that link when a scenario
+  # opts into the shared pre-warmed runtime, so the shared tree on a runner was the
+  # thing being poisoned. Previewing the install is enough to pin this and needs no
+  # GPU and no download: the planned folder is resolved before the preview prints
+  # it, so a regression shows up in the plan. `--family` is supplied because
+  # without a GPU there is no target to detect.
+  #
+  # `@nightly` is not about this scenario's own cost — it runs in about eight
+  # seconds, nearly all of it resolving the channel index. It is that the no-GPU
+  # mock lane runs 64 scenarios at once, and that much concurrent network work is
+  # enough to push `eai-7960-gen-tps-held-after-scrape-failure` and
+  # `eai-7960-gen-tps-expiry-boundary` past the validity window they assert on
+  # (measured: both fail 3/3 with this scenario on the mock lane, and pass with the
+  # very same scenario once the suite is serialized). Those two are timing-fragile
+  # under load, which is their own problem to fix; until then this runs on the
+  # nightly lanes, where a GPU is present and scenarios are serialized.
+  @id:runtime-install-records-the-real-folder @nightly
+  Scenario: 8 - Previewing an install through a linked runtimes folder names the real folder
+    Given a machine whose runtimes folder is a link to somewhere else
+    When the user previews an SDK install
+    Then the planned runtime folder is inside the folder the link points at
+    And the planned runtime folder is not expressed through the link
+
   # Linux-only: the step adopts a standard `/opt/rocm` install with a Unix python
   # path. On Windows those paths don't exist (the CLI resolves `/usr/bin/python3`
   # to a bogus `C:/usr/bin/python3` and errors on the missing path before it can
