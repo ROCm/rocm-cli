@@ -142,9 +142,18 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ## The shared pre-warmed runtime
 
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
-pre-warmed managed runtime (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
+pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
 lives on the runner's persistent workspace and survives `git clean`.
+
+The tree may hold **more than one** runtime — the pre-warm installs a newer one
+side by side when the channel index publishes it (below) — so scenarios must not
+rely on the CLI auto-selecting a runtime, which it deliberately declines to do
+once two are installed. Each scenario keeps its own config dir, so the pre-warm's
+`--activate` is invisible to it; the precondition steps re-activate from the
+tree's own `active.json`, which lives inside the shared tree and is therefore
+visible through the symlink. Without that, a serve fails with `no active ROCm
+runtime is configured` while the precondition still passes.
 
 It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
 

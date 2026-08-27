@@ -153,9 +153,10 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
     }
-    // Same reason as `a managed runtime is active`: pin the runtime explicitly so
-    // the engine lookup and the serve that follows resolve the same one whatever
-    // the shared tree happens to hold.
+    // Same reason as `a managed runtime is active`: pin the runtime explicitly,
+    // or the serve that follows refuses to pick one. Not for `assert_engine_ready`
+    // below — `engines list` scans every registered manifest and never consults
+    // the active key, which is exactly why it cannot stand in for this call.
     world.activate_shared_runtime();
     assert_engine_ready(world);
 }
@@ -285,6 +286,16 @@ async fn user_checks_for_updates(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The runtime key `runtimes list` reports as active, if any.
+fn active_runtime_key(world: &mut E2eWorld) -> Option<String> {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let key = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("active_runtime_key:"))?
+        .trim();
+    (!key.is_empty() && key != "<unset>").then(|| key.to_owned())
+}
+
 /// Freshness verdicts `runtime_update_plan` can emit, plus the degraded `error`
 /// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
 /// exactly these, so a rename here must break this scenario rather than silently
@@ -293,16 +304,29 @@ const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {
-    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stdout = stdout.as_str();
     let rc = world.cli_rc.expect("no command was run");
     assert_eq!(rc, 0, "`rocm update` failed:\n{stdout}");
 
     // The line `xtask e2e-prewarm` parses: `runtime <key> ... status=<verdict>`.
-    let Some(line) = stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("runtime "))
-    else {
+    // The report carries one such line per installed runtime, newest first, and
+    // the shared tree holds more than one — so select the ACTIVE runtime's line
+    // rather than whichever came first, or this scenario reports on a runtime the
+    // run never used. Falls back to the first line when nothing is active, which
+    // is the single-runtime case this scenario was written against.
+    let active = active_runtime_key(world);
+    let runtime_lines = || {
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("runtime "))
+    };
+    let line = active
+        .as_deref()
+        .and_then(|key| runtime_lines().find(|line| line.split_whitespace().nth(1) == Some(key)))
+        .or_else(|| runtime_lines().next());
+    let Some(line) = line else {
         panic!("no `runtime <key> …` line in the update report:\n{stdout}");
     };
     let status = line

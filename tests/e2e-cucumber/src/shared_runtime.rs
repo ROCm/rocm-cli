@@ -63,7 +63,11 @@ fn active_runtime_key(runtimes_dir: &Path) -> Option<String> {
 }
 
 /// Every runtime key present in the registry, empty when it is absent.
-fn registry_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
+///
+/// Public so a caller that declines to activate can name what it found: "no
+/// runtime to activate" is only actionable alongside the list it chose from.
+#[must_use]
+pub fn registry_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(runtimes_dir.join("registry")) else {
         return Vec::new();
     };

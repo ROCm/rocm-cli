@@ -196,8 +196,16 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 }
 
 /// Read the active managed runtime's `(version, install_root)` from the runtimes
-/// registry: prefer the runtime named by `active.json`, else the sole installed
-/// manifest. Returns `None` when nothing is installed.
+/// registry. Returns `None` when the tree names no single runtime.
+///
+/// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
+/// the same answer the scenarios activate — so the version this report attributes
+/// a run to is the version the run actually served on. This used to fall back to
+/// the first `read_dir` entry when `active.json` named nothing, which was a
+/// coin flip as soon as the pre-warm started keeping a newer runtime alongside
+/// the old one: the report could name one ROCm version while the serve used
+/// another. Reporting no version is the better failure — an absent field reads
+/// as unknown, a wrong one reads as fact.
 ///
 /// The install_root is resolved from `runtimes_dir` (the shared tree we were
 /// handed) as `<runtimes_dir>/wheel/<runtime_key>`, NOT from the manifest's own
@@ -210,41 +218,18 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 fn active_runtime_install_root(
     runtimes_dir: &std::path::Path,
 ) -> Option<(String, std::path::PathBuf)> {
-    let registry = runtimes_dir.join("registry");
-    let entries: Vec<std::path::PathBuf> = std::fs::read_dir(&registry)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
-    // Prefer the active runtime's key if active.json names one.
-    let active_key = std::fs::read_to_string(runtimes_dir.join("active.json"))
-        .ok()
-        .and_then(|t| {
-            serde_json::from_str::<serde_json::Value>(&t)
-                .ok()?
-                .get("runtime_key")?
-                .as_str()
-                .map(str::to_owned)
-        });
-    let pick = entries
-        .iter()
-        .find(|p| {
-            active_key
-                .as_deref()
-                .is_some_and(|k| p.file_stem().and_then(|s| s.to_str()) == Some(k))
-        })
-        .or_else(|| entries.first())?;
+    let key = crate::shared_runtime::runtime_key_to_activate(runtimes_dir)?;
+    let manifest = runtimes_dir.join("registry").join(format!("{key}.json"));
     let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(pick).ok()?).ok()?;
+        serde_json::from_str(&std::fs::read_to_string(manifest).ok()?).ok()?;
     let version = json.get("version")?.as_str()?.to_owned();
-    // Runtime key = the manifest file stem (e.g. release-wheel-gfx1151-7-13-0).
-    let key = pick.file_stem().and_then(|s| s.to_str());
     // Resolve the root inside the shared tree first; fall back to the manifest's
     // recorded install_root only if that derived path doesn't exist.
-    let derived = key.map(|k| runtimes_dir.join("wheel").join(k));
-    let root = match derived {
-        Some(d) if d.is_dir() => d,
-        _ => std::path::PathBuf::from(json.get("install_root")?.as_str()?),
+    let derived = runtimes_dir.join("wheel").join(&key);
+    let root = if derived.is_dir() {
+        derived
+    } else {
+        std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
     Some((version, root))
 }
@@ -788,5 +773,58 @@ Local model engines
             derive_platform_slug(true, Some("gfx1151"), "linux", true),
             "strix-halo-wsl"
         );
+    }
+
+    fn write_manifest(runtimes_dir: &std::path::Path, key: &str, version: &str) {
+        let registry = runtimes_dir.join("registry");
+        std::fs::create_dir_all(&registry).expect("create registry");
+        let install_root = runtimes_dir.join("wheel").join(key);
+        std::fs::create_dir_all(&install_root).expect("create install root");
+        std::fs::write(
+            registry.join(format!("{key}.json")),
+            serde_json::json!({
+                "runtime_key": key,
+                "version": version,
+                "install_root": install_root,
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+    }
+
+    /// The report must name the ROCm version the run actually served on. The
+    /// pre-warm keeps a newer runtime beside the old one, so picking whichever
+    /// manifest `read_dir` yielded first could attribute a run to the version it
+    /// did NOT use — and read as fact.
+    #[test]
+    fn reports_the_active_runtimes_version_when_several_are_installed() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        write_manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0", "7.13.0");
+        write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
+        std::fs::write(
+            dir.join("active.json"),
+            r#"{"runtime_key": "release-wheel-multi-arch-7-14-0"}"#,
+        )
+        .expect("write marker");
+
+        let (version, root) = active_runtime_install_root(dir).expect("a runtime is named");
+        assert_eq!(version, "7.14.0");
+        assert_eq!(
+            root,
+            dir.join("wheel").join("release-wheel-multi-arch-7-14-0")
+        );
+    }
+
+    /// Several runtimes and no marker: report nothing rather than guess. An
+    /// absent version reads as unknown; a wrong one reads as fact.
+    #[test]
+    fn reports_no_version_when_the_tree_names_no_runtime() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let dir = tmp.path();
+        write_manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0", "7.13.0");
+        write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
+
+        assert!(active_runtime_install_root(dir).is_none());
     }
 }

@@ -377,19 +377,44 @@ impl E2eWorld {
     /// tree's own `active.json` makes the choice explicit and independent of how
     /// many runtimes the pre-warm has accumulated.
     ///
-    /// Best-effort and deliberately quiet: a no-op for local runs (no shared
-    /// tree), for a tree with nothing to name, and if the activation itself
-    /// fails. Nothing here should turn a scenario red on its own — the
-    /// precondition's own assertion below is what reports a genuinely unusable
-    /// runtime, with the full `runtimes list` output.
+    /// Also writes the shared tree's `active.json`, because for a symlinked
+    /// scenario that marker IS the shared one — the activation is not confined
+    /// to this scenario's config.
+    ///
+    /// Best-effort: a no-op for local runs (no shared tree), and it does not
+    /// fail the scenario when the tree names no runtime or the activation is
+    /// refused. Both of those leave the serve that follows failing with "no
+    /// active ROCm runtime is configured", and NEITHER precondition assertion
+    /// can see it — `installed: none` reports an empty registry, not an
+    /// unset active key, and `engines list` scans every manifest regardless of
+    /// which is active. So say what happened on stderr instead of failing here:
+    /// the serve's own failure is the one worth reading, and this is the line
+    /// that explains it.
     pub fn activate_shared_runtime(&self) {
         let Some(shared) = shared_runtimes_dir() else {
             return;
         };
         let Some(key) = e2e_cucumber::shared_runtime::runtime_key_to_activate(&shared) else {
+            eprintln!(
+                "shared runtime: no runtime to activate in {}; a serve will fail unless exactly \
+                 one is installed. Installed: {:?}",
+                shared.display(),
+                e2e_cucumber::shared_runtime::registry_runtime_keys(&shared)
+            );
             return;
         };
-        let _ = run_rocm(self, &["runtimes", "activate", &key]);
+        let (stdout, stderr, rc) = run_rocm(self, &["runtimes", "activate", &key]);
+        if rc != 0 {
+            eprintln!(
+                "shared runtime: {}",
+                e2e_cucumber::cli_failure_report(
+                    &["runtimes", "activate", &key],
+                    rc,
+                    &stdout,
+                    &stderr
+                )
+            );
+        }
     }
 
     /// Plant a fake pre-existing (non-CLI) ROCm install in the scenario's isolated
