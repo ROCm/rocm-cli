@@ -143,6 +143,132 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
     }
 }
 
+/// A managed runtime in the shared tree that records an install root somewhere
+/// else, so serving against it cannot work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoisonedRuntime {
+    pub runtime_key: String,
+    pub format: String,
+    pub install_root: String,
+}
+
+/// Managed runtimes in the pre-warm tree whose recorded install root is not in
+/// that tree.
+///
+/// Pure so every branch is unit-testable without a GPU, a network, or an install
+/// — same contract as [`decide`].
+///
+/// A scenario reaches the shared tree through a symlink at its own
+/// `data/runtimes` (`E2eWorld::use_shared_runtimes`). `install sdk` run that way
+/// writes the *link's* path — a per-scenario temp dir — into the manifest that
+/// lands in the SHARED registry, and into the venv's console-script shebangs. Once
+/// the scenario's temp dir is gone the shared runtime records a path that no
+/// longer exists, and every later run that resolves it fails.
+///
+/// The signal is deliberately "install root is outside the tree" and NOT
+/// `status=unusable`. Unusable has many causes — a missing `rocm_sdk` probe block
+/// alone reports it — and this function's caller DELETES what it returns. Keying
+/// a multi-GiB delete off a status that a future tightening of
+/// `validate_runtime_manifest_for_activation` could start emitting for healthy
+/// runtimes is not a trade worth making. An out-of-tree install root, for a
+/// runtime this tree is supposed to own, has exactly one cause.
+///
+/// `mode=read-only` is exempt: `runtimes import` / `runtimes adopt` record an
+/// external folder on purpose, and that is what read-only means.
+#[must_use]
+pub fn assess(runtimes_list_report: &str, runtimes_dir: &Path) -> Vec<PoisonedRuntime> {
+    // The recorded root of a poisoned runtime does not exist, so it cannot be
+    // canonicalized. Compare textually instead, against both the path as given and
+    // its resolved form, so a caller that passes a path through a symlinked parent
+    // still matches the roots the CLI wrote.
+    let mut roots = vec![runtimes_dir.to_path_buf()];
+    if let Ok(resolved) = runtimes_dir.canonicalize()
+        && resolved != *runtimes_dir
+    {
+        roots.push(resolved);
+    }
+
+    let lines: Vec<&str> = runtimes_list_report.lines().collect();
+    let mut poisoned = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(entry) = RuntimeEntry::parse(line) else {
+            continue;
+        };
+        if entry.read_only {
+            continue;
+        }
+        // `install_root:` is written immediately under its entry by
+        // `render_runtimes_text`. Without it there is nothing to judge, and
+        // guessing a path we are about to delete is not acceptable.
+        let Some(install_root) = lines
+            .get(index + 1)
+            .and_then(|next| next.trim().strip_prefix("install_root: "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if roots
+            .iter()
+            .any(|root| Path::new(install_root).starts_with(root))
+        {
+            continue;
+        }
+        poisoned.push(PoisonedRuntime {
+            runtime_key: entry.runtime_key,
+            format: entry.format,
+            install_root: install_root.to_owned(),
+        });
+    }
+    poisoned
+}
+
+/// One `  {marker} <key> runtime_id=… format=… mode=… status=…` line from
+/// `rocm runtimes list`.
+///
+/// `status=` is last and its value carries spaces and parentheses
+/// (`unusable (install root is missing: /x)`), so it is not read here — every
+/// field this needs appears before it and is space-free.
+struct RuntimeEntry {
+    runtime_key: String,
+    format: String,
+    read_only: bool,
+}
+
+impl RuntimeEntry {
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        let first = fields.next()?;
+        // The active/rollback markers are separate tokens; anything else is the key.
+        let runtime_key = if matches!(first, "*" | "-") {
+            fields.next()?
+        } else {
+            first
+        };
+        let mut format = None;
+        let mut mode = None;
+        let mut is_entry = false;
+        for field in fields {
+            match field.split_once('=') {
+                Some(("runtime_id", _)) => is_entry = true,
+                Some(("format", value)) => format = Some(value.to_owned()),
+                Some(("mode", value)) => mode = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        // `runtime_id=` and `mode=` together separate a real entry from the
+        // header lines, which use `active_runtime_id:` / `registry:` shapes.
+        if !is_entry {
+            return None;
+        }
+        Some(Self {
+            runtime_key: runtime_key.to_owned(),
+            format: format?,
+            read_only: mode.as_deref() == Some("read-only"),
+        })
+    }
+}
+
 /// One `  runtime <key> format=… channel=… … status=…` line from `rocm update`.
 ///
 /// Both shapes that renderer emits are handled: the full report line, and the
@@ -187,6 +313,12 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create pre-warm directory {}", dir.display()))?;
     }
+
+    // Before asking whether the tree is FRESH, make sure what is in it is
+    // actually usable from this tree. `rocm update` compares versions against the
+    // index; it cannot see that a runtime records a folder somewhere else.
+    // Repairing first means `decide` reads a registry with nothing dead in it.
+    repair_poisoned_runtimes(&rocm, prewarm_dir)?;
 
     let decision = match probe(&rocm, prewarm_dir) {
         Ok(report) => decide(&report, channel),
@@ -260,6 +392,94 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         println!("pre-warm: pruning old installs failed ({error:#}); continuing");
     }
     Ok(())
+}
+
+/// Drop any managed runtime in the shared tree that records an install root
+/// outside it, so the pre-warm reinstalls instead of serving a dead one.
+///
+/// Deleting the folder is not belt-and-braces, it is the repair. A poisoned venv
+/// keeps a working `bin/python` — that is a symlink to the base interpreter, which
+/// is still there — so `ensure_uv_venv` REUSES it, and an already-satisfied
+/// package is audited rather than reinstalled, leaving every console-script
+/// shebang still pointing at the folder that went away. Measured with uv 0.9.30:
+/// re-running the install over a poisoned venv reports success and repairs
+/// nothing; only removing the folder first does.
+///
+/// Failure to repair is fatal, unlike the rest of this module. Everywhere else a
+/// conservative fallback keeps the lane green; here the alternative is serving
+/// against a runtime already known to be broken, which fails later, elsewhere, and
+/// for reasons that name none of this.
+fn repair_poisoned_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let runtimes_dir = prewarm_dir.join("data").join("runtimes");
+    if !runtimes_dir.is_dir() {
+        return Ok(());
+    }
+
+    let listing = match list_runtimes(rocm, prewarm_dir) {
+        Ok(listing) => listing,
+        Err(error) => {
+            // Same floor as everywhere else in this module: an unreadable report
+            // must not delete anything, and must not redden the lane.
+            println!(
+                "pre-warm: could not list runtimes ({error:#}); leaving the shared tree untouched"
+            );
+            return Ok(());
+        }
+    };
+
+    for runtime in assess(&listing, &runtimes_dir) {
+        println!(
+            "::warning::pre-warm: removing the shared runtime {} — it records an install root \
+             outside this tree ({}), which a scenario that installed through its own \
+             `data/runtimes` symlink would have written. A reinstall follows. See rocm-cli#315.",
+            runtime.runtime_key, runtime.install_root
+        );
+
+        // Drops the registry entry, the active marker, and the config pointers.
+        // Tolerates the recorded folder being absent, which it is.
+        rocm_command(rocm, prewarm_dir)
+            .args(["runtimes", "uninstall", &runtime.runtime_key])
+            .status_ok("rocm runtimes uninstall")?;
+
+        // The physical tree the CLI could not reach: it removed what the manifest
+        // POINTED at, and the files are where the manifest should have said.
+        let planted = runtimes_dir
+            .join(&runtime.format)
+            .join(&runtime.runtime_key);
+        if !planted.starts_with(&runtimes_dir) {
+            bail!(
+                "refusing to remove {}: outside the pre-warm tree at {}",
+                planted.display(),
+                runtimes_dir.display()
+            );
+        }
+        if planted.is_dir() {
+            std::fs::remove_dir_all(&planted).with_context(|| {
+                format!(
+                    "failed to remove the poisoned runtime folder {}",
+                    planted.display()
+                )
+            })?;
+            println!("pre-warm: removed {}", planted.display());
+        }
+    }
+    Ok(())
+}
+
+/// Ask the CLI what it has registered. Read-only.
+fn list_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["runtimes", "list"])
+        .output()
+        .context("failed to run `rocm runtimes list`")?;
+    if !output.status.success() {
+        bail!(
+            "`rocm runtimes list` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Ask the CLI whether the installed runtimes are current. Check-only: plain
@@ -370,6 +590,145 @@ family=gfx94X-dcgpu installed=7.13.0 latest=7.15.0 status={status}\n    \
 install_root: /w/e2e-prewarm/data/runtimes/wheel/{channel}-wheel-gfx94x-dcgpu-7-13-0\n    \
 source: index\n"
         )
+    }
+
+    /// A real `rocm runtimes list` on a tree holding all three shapes that matter,
+    /// captured verbatim from the built binary rather than written by hand: one
+    /// poisoned managed runtime (an install root under a per-scenario temp dir that
+    /// is gone), one healthy managed runtime inside the tree, and one read-only
+    /// runtime adopted from outside it.
+    ///
+    /// Note that ALL THREE report `status=unusable` here. That is the whole reason
+    /// [`assess`] keys off the install root instead: the healthy one is unusable
+    /// only for want of a `rocm_sdk` probe block, and treating that as poison would
+    /// delete a multi-GiB runtime that a reinstall would have kept.
+    const MIXED: &str = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=unusable (pip runtime manifest is missing rocm_sdk probe data)
+      install_root: /opt/external-rocm
+    release-wheel-gfx94x-dcgpu-7-15-0 runtime_id=therock-release-gfx94x-dcgpu version=7.15.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (pip runtime manifest is missing rocm_sdk probe data)
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (install root is missing: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0)
+      install_root: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+";
+
+    /// A real `rocm runtimes list` on an empty tree, captured from the binary.
+    const NO_RUNTIMES: &str = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed: none
+  next step: rocm install sdk --channel release --format wheel
+";
+
+    fn prewarm_runtimes_dir() -> &'static Path {
+        Path::new("/w/e2e-prewarm/data/runtimes")
+    }
+
+    #[test]
+    fn a_runtime_recording_a_scenario_temp_dir_is_poisoned() {
+        assert_eq!(
+            assess(MIXED, prewarm_runtimes_dir()),
+            vec![PoisonedRuntime {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned(),
+                format: "wheel".to_owned(),
+                install_root:
+                    "/tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0"
+                        .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unusable_runtime_inside_the_tree_is_left_alone() {
+        // The healthy-but-unusable entry in MIXED. Deleting it would throw away a
+        // multi-GiB install over a validation detail a reinstall would have fixed.
+        let poisoned = assess(MIXED, prewarm_runtimes_dir());
+        assert!(
+            !poisoned
+                .iter()
+                .any(|runtime| runtime.runtime_key.ends_with("7-15-0")),
+            "an in-tree runtime must never be removed for being unusable: {poisoned:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_runtime_adopted_from_outside_is_left_alone() {
+        // `runtimes adopt` records an external folder on purpose. Removing it would
+        // delete a runtime the tree never owned.
+        let poisoned = assess(MIXED, prewarm_runtimes_dir());
+        assert!(
+            !poisoned
+                .iter()
+                .any(|runtime| runtime.runtime_key == "adopted-external-env"),
+            "a read-only adopted runtime must be exempt: {poisoned:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_tree_has_nothing_to_repair() {
+        assert!(assess(NO_RUNTIMES, prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_read_removes_nothing() {
+        // The conservative floor: never delete on a shape this does not recognise.
+        assert!(assess("", prewarm_runtimes_dir()).is_empty());
+        assert!(assess("totally unexpected output\n", prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn an_entry_without_its_install_root_line_removes_nothing() {
+        // Guessing the folder to delete from the key alone is not acceptable.
+        let text = "  installed:\n    k runtime_id=r version=1 format=wheel family=f \
+mode=managed status=ready\n";
+        assert!(assess(text, prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn the_active_and_rollback_markers_do_not_hide_an_entry() {
+        // `render_runtimes_text` prefixes the active runtime with `*` and the
+        // rollback target with `-`; a poisoned runtime is usually the active one.
+        for marker in ["*", "-"] {
+            let text = format!(
+                "  installed:\n  {marker} k runtime_id=r version=1 format=wheel family=f \
+mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/wheel/k\n"
+            );
+            let poisoned = assess(&text, prewarm_runtimes_dir());
+            assert_eq!(poisoned.len(), 1, "marker {marker} hid the entry");
+            assert_eq!(poisoned[0].runtime_key, "k");
+        }
+    }
+
+    #[test]
+    fn header_lines_are_not_read_as_entries() {
+        // `active_runtime_id:` is one character away from the `runtime_id=` field
+        // that identifies a real entry.
+        assert!(RuntimeEntry::parse("  active_runtime_id: <unset>").is_none());
+        assert!(RuntimeEntry::parse("  registry: /w/e2e-prewarm/data/runtimes/registry").is_none());
+        assert!(RuntimeEntry::parse("  installed: none").is_none());
+        assert!(RuntimeEntry::parse("      install_root: /tmp/x").is_none());
+    }
+
+    #[test]
+    fn a_tarball_runtime_reports_its_own_format() {
+        // The folder to remove is `<runtimes>/<format>/<key>`, so the format has to
+        // survive parsing — removing the wheel path for a tarball runtime would
+        // silently repair nothing.
+        let text = "  installed:\n    k runtime_id=r version=1 format=tarball family=f \
+mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/tarball/k\n";
+        let poisoned = assess(text, prewarm_runtimes_dir());
+        assert_eq!(poisoned.len(), 1);
+        assert_eq!(poisoned[0].format, "tarball");
     }
 
     #[test]
