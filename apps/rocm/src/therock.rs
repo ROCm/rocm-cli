@@ -2912,7 +2912,7 @@ pub(crate) struct RuntimeDeviceProbe {
     pub kernel_error: Option<String>,
 }
 
-/// Ask the runtime's own interpreter how many devices its torch can open.
+/// Ask the runtime's own interpreter whether torch can execute a GPU kernel.
 ///
 /// `library_paths` must be the runtime's recorded ROCm library directories (see
 /// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
@@ -2986,7 +2986,8 @@ try:
     out["import_ok"] = True
     out["torch_version"] = getattr(torch, "__version__", None)
     out["hip_version"] = getattr(getattr(torch, "version", None), "hip", None)
-    out["device_count"] = int(torch.cuda.device_count())
+    device_count = int(torch.cuda.device_count())
+    out["device_count"] = device_count
 except Exception as exc:
     out["error"] = type(exc).__name__ + ": " + str(exc)
 

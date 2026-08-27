@@ -7596,12 +7596,11 @@ fn runtime_index_url_for_key(paths: &AppPaths, runtime_key: &str) -> Option<Stri
     manifest.index_url.clone()
 }
 
-/// Which torch a runtime should hold once an engine has been installed into it.
+/// Which torch a managed vLLM runtime should hold after engine installation.
 ///
 /// Two installers write torch into the same environment. The SDK install writes
-/// TheRock's build; the engine then writes the build from its own index, pinned
-/// to an exact version. Letting either side win unconditionally is wrong, and
-/// both failures have been observed in the field:
+/// TheRock's build; vLLM then writes the build from its own index, pinned to an
+/// exact version. Neither source is universally compatible with every GPU:
 ///
 /// * If the engine's build always wins, the runtime can end up with a torch that
 ///   loads against the installed SDK and then enumerates no devices, so serving
