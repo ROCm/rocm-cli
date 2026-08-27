@@ -212,9 +212,6 @@ box. You can also serve any compatible Hugging Face model directly — see
 [Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
-Use `rocm model` to see available model recipes and their GPU memory
-requirements.
-
 ## Quick reference
 
 | Command | Description |
@@ -373,8 +370,7 @@ with an explicit quantization variant, for example,
 `rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
 **safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
-rather than silently substituting a different model. Short
-aliases from `rocm model` might not resolve with all engines.
+rather than silently substituting a different model.
 
 Some models (such as Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
@@ -389,26 +385,6 @@ selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
 model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
 `ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
-
-Show recommended models and hardware compatibility:
-
-```
-rocm model [--verbose]
-```
-
-`rocm model` prints a curated catalog of popular open-weight models grouped by
-the hardware path they target — Strix Halo (Lemonade and llama.cpp) and MI300X
-(vLLM) — using canonical Hugging Face ids, and shows for each the quantization
-that fits a single GPU. Strix Halo entries use the `owner/repo:variant` GGUF form
-(for example, `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M`) that `rocm serve` needs; MI300X
-entries serve at BF16. This catalog ships inside the binary, so it is available
-offline; when a recipe index is configured instead, the header names it.
-`--verbose` also lists the other recipes (the default assistant and smoke-test
-paths) that `rocm serve` can still resolve but that are hidden from the list.
-
-The catalog is only a starting point: you can serve any compatible Hugging Face
-model by passing its id to `rocm serve` — `owner/repo` for vLLM, or
-`owner/repo:<quant>` for a Lemonade GGUF.
 
 Manage background servers started with `--managed`:
 
