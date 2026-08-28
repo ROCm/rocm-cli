@@ -2640,13 +2640,19 @@ fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
     serde_json::from_str(output.trim()).context("failed to parse rocm_sdk probe output")
 }
 
-/// What the runtime's torch reports about the GPUs it can actually open.
+/// What the runtime's torch reports about the GPUs it can actually open, and
+/// whether those GPUs can actually run a kernel.
 ///
 /// [`validate_rocm_sdk_runtime_probe`] establishes that the SDK's libraries are
 /// present and resolvable. That is not the same question as whether the torch
 /// sharing the venv can enumerate a device: a torch built against a different
 /// HIP version loads happily against those libraries and then reports no
 /// devices at all.
+///
+/// Enumeration succeeding is in turn not the same question as the device being
+/// usable. A torch built against a different HIP version can enumerate the
+/// GPUs and then fault on the first kernel it launches, so the two failures are
+/// reported separately and must not be conflated.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub(crate) struct RuntimeDeviceProbe {
     pub import_ok: bool,
@@ -2654,7 +2660,12 @@ pub(crate) struct RuntimeDeviceProbe {
     pub hip_version: Option<String>,
     /// `None` when torch never imported, so "unknown" stays distinct from "zero".
     pub device_count: Option<u32>,
+    /// An import or enumeration failure. Never a kernel failure.
     pub error: Option<String>,
+    /// A GPU kernel failure observed *after* devices enumerated successfully.
+    /// `None` when no kernel was attempted (no devices, or enumeration failed).
+    #[serde(default)]
+    pub kernel_error: Option<String>,
 }
 
 /// Ask the runtime's own interpreter how many devices its torch can open.
@@ -2698,7 +2709,11 @@ pub(crate) fn probe_runtime_devices(
             python_executable.display()
         )
     })?;
-    serde_json::from_str(text.trim()).context("failed to parse runtime device probe output")
+    parse_runtime_device_probe(&text)
+}
+
+fn parse_runtime_device_probe(output: &str) -> Result<RuntimeDeviceProbe> {
+    serde_json::from_str(output.trim()).context("failed to parse runtime device probe output")
 }
 
 /// The loader search-path variable used to expose the runtime's ROCm libraries.
@@ -2718,6 +2733,7 @@ out = {
     "hip_version": None,
     "device_count": None,
     "error": None,
+    "kernel_error": None,
 }
 
 try:
@@ -2729,6 +2745,19 @@ try:
     out["device_count"] = int(torch.cuda.device_count())
 except Exception as exc:
     out["error"] = type(exc).__name__ + ": " + str(exc)
+
+# Enumeration is not execution. A runtime whose torch and HIP disagree can
+# report devices and then fault on the first kernel, so the kernel is launched
+# under its own guard and its failure is recorded in its own field. Only run it
+# once enumeration actually produced a device: with no devices there is nothing
+# to execute on, and a failed import has already been described.
+if out["error"] is None and (out["device_count"] or 0) > 0:
+    try:
+        probe = torch.ones(32, device="cuda")
+        probe.add_(1.0)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        out["kernel_error"] = type(exc).__name__ + ": " + str(exc)
 
 print(json.dumps(out))
 "#;
@@ -5640,6 +5669,106 @@ echo Python 3.12.10
             runtime_version_build_date("7.14.0a20260230"),
             None,
             "invalid calendar dates should not be displayed"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_without_kernel_error_field_still_parses() {
+        // Output produced before the kernel probe existed must not become a parse
+        // failure: an older runtime's probe is still a valid "no kernel attempted".
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null}"#,
+        )
+        .expect("probe without kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(probe.kernel_error, None);
+    }
+
+    #[test]
+    fn runtime_device_probe_keeps_kernel_failures_out_of_the_enumeration_error() {
+        // The distinction the caller acts on: devices were found, so this is not a
+        // "no devices" runtime, but the GPU cannot run work.
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null,
+                "kernel_error":"RuntimeError: HIP error: invalid device function"}"#,
+        )
+        .expect("probe with kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(
+            probe.kernel_error.as_deref(),
+            Some("RuntimeError: HIP error: invalid device function")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_reports_import_failures_only_as_enumeration_errors() {
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":false,"torch_version":null,"hip_version":null,
+                "device_count":null,"error":"ImportError: no module named torch",
+                "kernel_error":null}"#,
+        )
+        .expect("failed-import probe should parse");
+
+        assert!(!probe.import_ok);
+        assert_eq!(probe.device_count, None);
+        assert_eq!(probe.kernel_error, None);
+        assert_eq!(
+            probe.error.as_deref(),
+            Some("ImportError: no module named torch")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_guards_the_kernel_behind_successful_enumeration() {
+        // The script is the contract: a kernel must never be launched when the
+        // import or enumeration already failed, or when there is no device to launch
+        // it on. Getting this wrong turns a "no devices" runtime into a crash.
+        assert!(
+            RUNTIME_DEVICE_PROBE_SCRIPT
+                .contains(r#"if out["error"] is None and (out["device_count"] or 0) > 0:"#),
+            "the kernel attempt must be gated on a clean enumeration with devices"
+        );
+
+        let guard = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .0;
+        assert!(
+            !guard.contains("device=\"cuda\"") && !guard.contains("synchronize"),
+            "no kernel work may run before the guard"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_records_kernel_failures_in_their_own_field() {
+        let kernel_section = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .1;
+
+        // Allocate, mutate, and synchronize: an unusable GPU commonly survives the
+        // allocation and only faults once work is actually launched and awaited.
+        assert!(kernel_section.contains(r#"torch.ones(32, device="cuda")"#));
+        assert!(kernel_section.contains("probe.add_(1.0)"));
+        assert!(kernel_section.contains("torch.cuda.synchronize()"));
+
+        assert!(
+            kernel_section.contains(r#"out["kernel_error"] = type(exc).__name__"#),
+            "a kernel failure must be recorded in kernel_error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["error"] ="#),
+            "the kernel attempt must never overwrite the enumeration error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["device_count"] ="#),
+            "a kernel failure must preserve the enumerated device count"
         );
     }
 }

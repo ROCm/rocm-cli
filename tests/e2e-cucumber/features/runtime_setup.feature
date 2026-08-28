@@ -35,12 +35,49 @@ Feature: Runtime configuration
   # "settled correctly" from "skipped entirely" — and skipping is the regression the
   # gate in front of the settle step would produce. Only the alignment block
   # separates them, and it is the one part of this path with no other e2e coverage.
+  # It reads the block's verdict rather than one string, because a torch that has
+  # already run a GPU kernel with this SDK is kept instead of rewritten and reports
+  # a `retained_*` verdict — settled, with nothing installed.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: 4 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
     Then the runtime can still use the GPU
-    And the torch alignment settled on the SDK's build
+    And the torch alignment settled rather than being skipped
+
+  # `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` is the exit for the machine where the stack
+  # the alignment settles on — the SDK's build of the release the engine pins —
+  # does not work. That stack is not validated against the supported matrix, and
+  # the alignment runs on every path that installs an engine, so without the
+  # opt-out a torch the user installed deliberately is replaced again by the next
+  # command and the only remaining exit is to stop using the CLI.
+  #
+  # Nothing asserted it from the user's side. The unit tests reach the gate
+  # directly, and a gate that is honoured in isolation but bypassed by the install
+  # path around it looks identical to a working one from every surface a user can
+  # see. This is the same reinstall as scenario 4 with the opt-out set, so what
+  # differs between them is exactly the variable.
+  #
+  # Four claims across three Thens, because the opt-out is only coherent if all
+  # four hold: torch was not rewritten; the skip is reported as its own verdict
+  # rather than folded into the generic `not_applicable`, which would leave the
+  # user unable to tell whether the variable did anything; the divergence the
+  # opt-out deliberately leaves behind is not then sold back to that user as a
+  # runtime to repair by reinstalling the engine — an instruction that would undo
+  # what they asked for; and the checks the opt-out does not suppress still run,
+  # because it suppresses the correction, not the diagnosis.
+  #
+  # Same lane as scenario 4 and for the same reasons: a real SDK install and a
+  # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
+  # because only vLLM shares the runtime environment the alignment writes into.
+  @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @nightly
+  Scenario: 9 - Opting out of the torch alignment keeps the torch the user installed
+    Given a managed runtime with an inference engine already installed
+    And the user has opted out of realigning torch
+    When the user installs the SDK again
+    Then the torch alignment reports the opt-out instead of rewriting torch
+    And the install does not offer to reinstall the engine over the kept torch
+    And the runtime's device health is still reported
 
   # The GPU E2E lanes no longer install the shared runtime once and keep it
   # forever: `xtask e2e-prewarm` asks `rocm update` whether the channel index has

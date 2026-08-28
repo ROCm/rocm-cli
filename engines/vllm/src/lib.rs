@@ -551,6 +551,7 @@ fn assess_runtime_repair(runtime: &VllmRuntime) -> RepairAssessment {
         Ok(violations) => repair_from_violations(
             &violations,
             recorded_sdk_torch_build(&runtime.runtime_id).as_deref(),
+            torch_alignment_disabled(),
         ),
         // An unusable `uv` or an offline host must not block an install that would
         // otherwise succeed; report that the check did not run and carry on as before.
@@ -560,6 +561,18 @@ fn assess_runtime_repair(runtime: &VllmRuntime) -> RepairAssessment {
 
 /// The package whose build the SDK and the engine both have an opinion about.
 const TORCH_PACKAGE: &str = "torch";
+
+/// Whether the user has opted out of rocm-cli choosing this runtime's torch.
+///
+/// The same variable, read the same way, as the CLI's own opt-out: presence is the
+/// signal, so any value — including the empty string — disables the alignment. The
+/// engine cannot call into the CLI binary that owns the alignment itself, so the
+/// contract is duplicated rather than shared; the two must not drift, or a runtime
+/// the CLI deliberately left alone gets rewritten by the engine on the very next
+/// `rocm engines install vllm`, which is the fight the opt-out exists to end.
+fn torch_alignment_disabled() -> bool {
+    std::env::var_os("ROCM_CLI_DISABLE_TORCH_ALIGNMENT").is_some()
+}
 
 /// Whether this violation is the torch divergence rocm-cli deliberately leaves behind.
 ///
@@ -572,8 +585,10 @@ const TORCH_PACKAGE: &str = "torch";
 /// next invocation starts over — two full torch-stack flips a run, and a warning
 /// claiming a repair that undid the intended state.
 ///
-/// Three conditions, all required, and they are exactly the rule rocm-cli applies:
-/// take the *release* from the engine's pin and the *build* from the SDK.
+/// With the alignment disabled the rule is simply "any torch pin": see below.
+///
+/// Otherwise three conditions, all required, and they are exactly the rule rocm-cli
+/// applies: take the *release* from the engine's pin and the *build* from the SDK.
 ///
 /// The violation must be about torch — any other unmet requirement is real. The
 /// installed release must be the one the engine pins; an SDK torch of a *different*
@@ -582,16 +597,30 @@ const TORCH_PACKAGE: &str = "torch";
 /// the runtime's manifest records for the SDK; a torch from neither side is the
 /// breakage this check exists to catch. Miss any one and the engine either fights the
 /// alignment or silently accepts a runtime that cannot serve.
-fn is_intended_torch_divergence(detail: &str, sdk_torch_build: Option<&str>) -> bool {
-    let Some(sdk_torch_build) = sdk_torch_build else {
-        return false;
-    };
+fn is_intended_torch_divergence(
+    detail: &str,
+    sdk_torch_build: Option<&str>,
+    torch_alignment_disabled: bool,
+) -> bool {
     let Some(subject) = violation_subject(detail) else {
         return false;
     };
     if !subject.package.eq_ignore_ascii_case(TORCH_PACKAGE) {
         return false;
     }
+    // Opted out, so rocm-cli does not choose this runtime's torch and no build it
+    // holds can be wrong *here*: the pin is unmet because the user meant it to be.
+    // The build and release tests below are the aligned-case rule — asking a
+    // hand-installed torch to match the SDK's build would fail every time, and the
+    // reinstall that followed would install the engine's build over exactly the torch
+    // the opt-out exists to keep. Only torch is spared: the check above already
+    // rejected every other package, so an unrelated vLLM-owned defect still repairs.
+    if torch_alignment_disabled {
+        return true;
+    }
+    let Some(sdk_torch_build) = sdk_torch_build else {
+        return false;
+    };
     let (Some(required), Some(installed)) =
         (subject.required.as_deref(), subject.installed.as_deref())
     else {
@@ -608,24 +637,43 @@ fn is_intended_torch_divergence(detail: &str, sdk_torch_build: Option<&str>) -> 
 /// `sdk_torch_build` is the build identifier the runtime's manifest records for the
 /// SDK's torch, or `None` when it cannot be determined — in which case nothing is
 /// treated as intended and the previous behaviour stands.
+///
+/// `torch_alignment_disabled` is the user's opt-out. It changes which violations count
+/// as defects, never whether defects are acted on: a torch pin stops being one, and
+/// everything else vLLM requires is assessed exactly as before. Returning early on the
+/// opt-out instead would hide a broken torchvision behind an unrelated preference.
 fn repair_from_violations(
     violations: &[DependencyViolation],
     sdk_torch_build: Option<&str>,
+    torch_alignment_disabled: bool,
 ) -> RepairAssessment {
     let owned = violations_requiring(violations, ENGINE_NAME);
     if owned.is_empty() {
         return RepairAssessment::default();
     }
-    let (intended, defects): (Vec<&DependencyViolation>, Vec<&DependencyViolation>) = owned
-        .into_iter()
-        .partition(|violation| is_intended_torch_divergence(&violation.detail, sdk_torch_build));
+    let (intended, defects): (Vec<&DependencyViolation>, Vec<&DependencyViolation>) =
+        owned.into_iter().partition(|violation| {
+            is_intended_torch_divergence(
+                &violation.detail,
+                sdk_torch_build,
+                torch_alignment_disabled,
+            )
+        });
 
     if defects.is_empty() {
-        // Nothing to repair. Reinstalling here would replace the SDK's build with the
-        // engine's and hand back a runtime that cannot open a device.
-        let mut notes = vec![
-            "the runtime holds the SDK's build of the torch vLLM pins; that divergence is intended and a reinstall would undo it".to_owned(),
-        ];
+        // Nothing to repair. Reinstalling here would replace that torch with the
+        // engine's build and hand back a runtime nobody asked for.
+        //
+        // Which sentence is true depends on whose torch this is. Under the alignment it
+        // is the SDK's and rocm-cli put it there; under the opt-out it is the user's and
+        // rocm-cli never touched it. Reusing the first line for the second case would
+        // tell a user who hand-installed torch that the CLI had installed it for them.
+        let headline = if torch_alignment_disabled {
+            "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT; the torch this runtime holds is the user's and a reinstall would replace it"
+        } else {
+            "the runtime holds the SDK's build of the torch vLLM pins; that divergence is intended and a reinstall would undo it"
+        };
+        let mut notes = vec![headline.to_owned()];
         notes.extend(
             intended
                 .iter()
@@ -657,7 +705,11 @@ fn repair_from_violations(
             .iter()
             .map(|violation| format!("expected divergence: {}", violation.detail)),
     );
-    if sdk_torch_build.is_none() {
+    // The hint blames `rocm install sdk` for writing the SDK torch stack over vLLM's
+    // pins, which is only a live theory while the alignment runs. Under the opt-out
+    // torch is never a defect here, so the hint would be pointing at the one package
+    // that cannot be the cause.
+    if sdk_torch_build.is_none() && !torch_alignment_disabled {
         notes.push(
             "if this recurs after `rocm install sdk`, the SDK torch stack is being written over vLLM's pinned torch".to_owned(),
         );
@@ -2869,10 +2921,19 @@ mod tests {
     /// The build identifier the SDK recorded in the runtimes used by these tests.
     const SDK_BUILD: &str = "rocm7.13.0";
 
+    /// `repair_from_violations`'s opt-out argument, named at the call sites so a bare
+    /// `false`/`true` does not have to be decoded against the signature.
+    const ALIGNED: bool = false;
+    const OPTED_OUT: bool = true;
+
     #[test]
     fn a_consistent_environment_is_not_reinstalled() {
+        // The other settled state: the SDK published no build of the release vLLM
+        // pins, so the runtime kept the engine's own build and the exact pin is
+        // satisfied. `uv pip check` reports nothing at all, and the recorded SDK
+        // build must not manufacture a finding out of that silence.
         assert_eq!(
-            repair_from_violations(&[], Some(SDK_BUILD)),
+            repair_from_violations(&[], Some(SDK_BUILD), ALIGNED),
             RepairAssessment::default()
         );
     }
@@ -2889,6 +2950,7 @@ mod tests {
                 "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed",
             )],
             Some("rocm7.14.0a20260611"),
+            ALIGNED,
         );
 
         assert!(assessment.needed);
@@ -2915,6 +2977,7 @@ mod tests {
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
             )],
             Some(SDK_BUILD),
+            ALIGNED,
         );
 
         assert!(
@@ -2943,6 +3006,7 @@ mod tests {
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+cpu` is installed",
             )],
             Some(SDK_BUILD),
+            ALIGNED,
         );
 
         assert!(assessment.needed);
@@ -2959,6 +3023,7 @@ mod tests {
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
             )],
             None,
+            ALIGNED,
         );
 
         assert!(assessment.needed);
@@ -2998,6 +3063,7 @@ mod tests {
                 ),
             ],
             Some(SDK_BUILD),
+            ALIGNED,
         );
 
         assert!(assessment.needed);
@@ -3044,6 +3110,30 @@ mod tests {
     }
 
     #[test]
+    fn an_sdk_built_torchvision_is_still_a_violation() {
+        // The SDK writes the whole torch stack, so torchvision can carry the same
+        // build as torch and — when the releases happen to line up — look exactly
+        // like the intended divergence. rocm-cli realigns torch and nothing else, so
+        // this is a real violation the engine must repair. The stack test above
+        // cannot catch a regression here: its torchvision release differs too, so
+        // the release check alone would still reject it.
+        let assessment = repair_from_violations(
+            &[violation(
+                "vllm",
+                "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.24.1+rocm7.13.0` is installed",
+            )],
+            Some(SDK_BUILD),
+            ALIGNED,
+        );
+
+        assert!(
+            assessment.needed,
+            "only torch is realigned; another package at the SDK's build is a genuine violation: {:?}",
+            assessment.notes
+        );
+    }
+
+    #[test]
     fn unrelated_upstream_conflicts_do_not_force_a_reinstall() {
         // These environments routinely carry conflicts between third-party packages.
         // Reinstalling vLLM would not resolve them, so they must not trigger one.
@@ -3059,9 +3149,115 @@ mod tests {
                 ),
             ],
             Some(SDK_BUILD),
+            ALIGNED,
         );
 
         assert_eq!(assessment, RepairAssessment::default());
+    }
+
+    #[test]
+    fn an_opted_out_custom_torch_alone_does_not_force_a_reinstall() {
+        // The runtime the opt-out exists to produce: the user set
+        // ROCM_CLI_DISABLE_TORCH_ALIGNMENT, rocm-cli left their torch alone, and the
+        // engine's exact pin is therefore unmet. The build belongs to neither the SDK
+        // nor the engine — it is whatever the user chose — so the aligned-case rule
+        // would call it a defect and reinstall vLLM, which installs the engine's torch
+        // over the one the opt-out was set to keep. That is the CLI-side fight moved
+        // into the engine, and it would make the opt-out worthless on any managed
+        // runtime.
+        let assessment = repair_from_violations(
+            &[violation(
+                "vllm",
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.9.1+cu128` is installed",
+            )],
+            Some(SDK_BUILD),
+            OPTED_OUT,
+        );
+
+        assert!(
+            !assessment.needed,
+            "the opt-out must spare a hand-installed torch: {:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .all(|note| !note.contains("was reinstalled")),
+            "no note may claim a repair that did not happen: {:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .any(|note| note.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT")),
+            "the reason given must be the opt-out, not a divergence rocm-cli produced: {:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .all(|note| !note.contains("the runtime holds the SDK's build")),
+            "rocm-cli did not install this torch and must not say it did: {:?}",
+            assessment.notes
+        );
+    }
+
+    #[test]
+    fn an_opted_out_custom_torch_still_repairs_an_unrelated_defect() {
+        // The opt-out is about torch, not about the environment. A vLLM-owned pin that
+        // has nothing to do with torch is broken the same way it was before, and
+        // reinstalling vLLM is still what fixes it. Returning early on the opt-out
+        // would hide this defect behind a preference about a different package, and the
+        // runtime would stay unable to serve with nothing said about why.
+        let assessment = repair_from_violations(
+            &[
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.9.1+cu128` is installed",
+                ),
+                violation(
+                    "vllm",
+                    "The package `vllm` requires `torchvision==0.24.1+d801a34`, but `0.20.0+cu128` is installed",
+                ),
+            ],
+            Some(SDK_BUILD),
+            OPTED_OUT,
+        );
+
+        assert!(
+            assessment.needed,
+            "an unrelated vLLM pin is still a defect under the opt-out: {:?}",
+            assessment.notes
+        );
+        let violation_notes: Vec<&String> = assessment
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("violation: "))
+            .collect();
+        assert_eq!(
+            violation_notes.len(),
+            1,
+            "only the unrelated pin is a violation: {:?}",
+            assessment.notes
+        );
+        assert!(
+            violation_notes[0].contains("torchvision=="),
+            "the defect named must be the unrelated one: {:?}",
+            assessment.notes
+        );
+        assert!(
+            assessment
+                .notes
+                .iter()
+                .any(|note| note.starts_with("expected divergence: ")
+                    && note.contains("torch==2.11.0+gitd0c8b1f")),
+            "the spared torch is still named, so the reader is not left thinking the \
+             reinstall was about torch: {:?}",
+            assessment.notes
+        );
     }
 
     #[test]
@@ -3101,6 +3297,52 @@ mod tests {
             sdk_torch_build_from_manifest(&TheRockRuntimeManifest::default()),
             None
         );
+    }
+
+    #[test]
+    fn a_settled_runtime_converges_on_the_build_its_own_manifest_records() {
+        // The convergence proof the tests above cannot give on their own. They hand
+        // the classification a build literal, so a change to what
+        // `sdk_torch_build_from_manifest` yields — `7.13.0` where the local segment
+        // reads `rocm7.13.0`, say — would leave every one of them passing while the
+        // real pipeline churned forever: the engine would call the realigned torch a
+        // defect, reinstall its own build, rocm-cli would put the SDK's back, and the
+        // next invocation would start over. Feeding the classification the value the
+        // manifest actually produces is what ties the two halves together.
+        //
+        // The SDK's own torch release is deliberately not the one vLLM pins, because
+        // that is the case realignment exists for: the release comes from the engine,
+        // only the build comes from the SDK.
+        let settled = violation(
+            "vllm",
+            "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
+        );
+        let recorded = TheRockRuntimeManifest {
+            sdk_torch: Some("2.9.1+rocm7.13.0".to_owned()),
+            ..TheRockRuntimeManifest::default()
+        };
+        // Written before `sdk_torch` was recorded. These runtimes are already on real
+        // machines, so they have to settle too rather than churn forever.
+        let reconstructed = TheRockRuntimeManifest {
+            rocm_sdk: Some(RocmSdkRuntimeProbe {
+                rocm_sdk_version: Some("7.13.0".to_owned()),
+                ..RocmSdkRuntimeProbe::default()
+            }),
+            ..TheRockRuntimeManifest::default()
+        };
+
+        for manifest in [recorded, reconstructed] {
+            let build = sdk_torch_build_from_manifest(&manifest)
+                .expect("both manifest generations identify the SDK's build");
+            let assessment =
+                repair_from_violations(std::slice::from_ref(&settled), Some(&build), ALIGNED);
+
+            assert!(
+                !assessment.needed,
+                "the state rocm-cli settles on must survive the engine's own check: {:?}",
+                assessment.notes
+            );
+        }
     }
 
     #[test]

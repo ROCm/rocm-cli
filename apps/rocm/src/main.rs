@@ -7543,13 +7543,16 @@ fn runtime_index_url_for_key(paths: &AppPaths, runtime_key: &str) -> Option<Stri
 /// * If the engine's build always wins, the runtime can end up with a torch that
 ///   loads against the installed SDK and then enumerates no devices, so serving
 ///   fails with an unhelpful error long after the install reported success.
-/// * If the SDK's build always wins, the runtime can end up on a torch *release*
-///   the engine does not accept, which breaks the engine in a different way.
+/// * If the SDK's build always wins, the runtime can end up on a torch that
+///   enumerates a device and still has no kernel image for this exact target,
+///   failing on the first tensor operation instead.
 ///
-/// The version and the build answer different questions, so they are taken from
-/// different places: the *release* comes from the engine, which is built against
-/// it, and the *build* comes from the SDK, which the libraries belong to. That
-/// is what this resolves to — the SDK's build of the release the engine pins.
+/// So compatibility is tested rather than assumed. A torch already executing a
+/// GPU kernel with this SDK is kept exactly as it is — that decision is
+/// `TorchRetention`, and it runs first. This alignment is the repair for
+/// everything else, and what it installs is the SDK's *build* of the *release*
+/// the engine pins: the release comes from the engine, which is built against it,
+/// and the build comes from the SDK, which the libraries belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TorchAlignment {
     /// The runtime already holds the SDK build of the engine's torch release.
@@ -7568,6 +7571,15 @@ enum TorchAlignment {
         kept: String,
         error: String,
     },
+    /// The user opted out, and a replacement was due: their torch is kept.
+    ///
+    /// Distinct from every other outcome because nothing was attempted. Reading
+    /// it as `NotApplicable` would say the rule had no opinion, when it had one
+    /// and was told not to act on it, and that difference is what the reader
+    /// needs: `wanted` is the build that was not installed, `kept` the one still
+    /// there. Only reachable when those two actually differ, so a runtime the
+    /// opt-out changed nothing about is never described as one it spared.
+    Disabled { wanted: String, kept: String },
     /// Nothing to decide — no exact pin, no engine metadata, or no SDK torch.
     NotApplicable(String),
 }
@@ -7637,27 +7649,33 @@ fn install_error_reports_version_unavailable(error: &str) -> bool {
 /// build does not work on this machine" is a case that can happen rather than a
 /// hypothetical one, and it needs an exit that is not "stop using the CLI".
 ///
-/// Checked before the probe runs, so opting out skips the rewrite rather than
-/// performing it and describing it differently. The dependency and device checks
-/// still run: this suppresses the correction, not the diagnosis, and a runtime
-/// that cannot open a device is still reported as one.
+/// This suppresses the correction, not the diagnosis. The runtime is still asked
+/// what it can do, the dependency check still runs, and a runtime that opens no
+/// device or cannot run a kernel on one is still reported as such — and still
+/// fails the install on a host where a GPU was found.
 fn torch_alignment_disabled() -> bool {
     std::env::var_os("ROCM_CLI_DISABLE_TORCH_ALIGNMENT").is_some()
 }
 
+/// Install the SDK's build of the release the engine pins, when that is needed.
+///
+/// `torch` is the metadata probe the caller already took: the retention decision
+/// that runs first needs the engine's pin too, and asking the runtime the same
+/// question twice would be a second interpreter launch for an answer in hand.
+///
+/// The opt-out is read where the install would run, not at the top. That is the
+/// only place it changes anything, and reading it there is what lets the result
+/// name the replacement it declined to make: a runtime with no replacement due
+/// reports what it is, rather than reporting an opt-out that skipped nothing.
 fn align_runtime_torch(
     paths: &AppPaths,
     python: &Path,
     index_url: Option<&str>,
     sdk_build: Option<&str>,
     engine: &str,
+    torch: Result<&therock::TorchAlignmentProbe, &anyhow::Error>,
 ) -> TorchAlignment {
-    if torch_alignment_disabled() {
-        return TorchAlignment::NotApplicable(
-            "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT".to_owned(),
-        );
-    }
-    let probe = match therock::probe_torch_alignment(python, engine) {
+    let probe = match torch {
         Ok(probe) => probe,
         Err(error) => return TorchAlignment::NotApplicable(error.to_string()),
     };
@@ -7676,6 +7694,12 @@ fn align_runtime_torch(
         }
         TorchAlignmentPlan::Install { wanted, from } => (wanted, from),
     };
+    // Read only now that a replacement is actually due, so the opt-out reports
+    // the install it stopped rather than standing in for a runtime that needed
+    // nothing. Everything after this point is the rewrite itself.
+    if torch_alignment_disabled() {
+        return TorchAlignment::Disabled { wanted, kept: from };
+    }
     let Some(index_url) = index_url else {
         return TorchAlignment::NotApplicable(
             "the runtime manifest records no wheel index to install from".to_owned(),
@@ -7756,6 +7780,15 @@ fn render_torch_alignment(outcome: &TorchAlignment, engine: &str) -> String {
             );
             let _ = writeln!(output, "    keeping {}", sanitize_log_value(kept));
         }
+        TorchAlignment::Disabled { wanted, kept } => {
+            let _ = writeln!(output, "  torch_alignment: disabled");
+            let _ = writeln!(
+                output,
+                "    ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set; keeping {} rather than installing {}",
+                sanitize_log_value(kept),
+                sanitize_log_value(wanted)
+            );
+        }
         TorchAlignment::NotApplicable(reason) => {
             let _ = writeln!(
                 output,
@@ -7767,21 +7800,29 @@ fn render_torch_alignment(outcome: &TorchAlignment, engine: &str) -> String {
     output
 }
 
-/// Settle the runtime's torch, print the `torch_alignment:` block, and record it.
+/// Repair the runtime's torch, print the `torch_alignment:` block, and record it.
 ///
-/// The outcome is returned so the dependency and device checks that follow can be
-/// read against it — `deliberately_diverged_package` turns it into the one package
-/// whose divergence is intended, and `install_left_runtime_unusable` pairs it with
-/// the device count.
+/// Reached only when no torch in the runtime has proven it can run a GPU kernel.
+/// The outcome is returned so the dependency check that follows can be read
+/// against it: `deliberately_diverged_package` turns it into the one package
+/// whose divergence is intended.
 fn report_torch_alignment(
     paths: &AppPaths,
     engine: &str,
     python: &Path,
     runtime_key: &str,
     sdk_build: Option<&str>,
+    torch: Result<&therock::TorchAlignmentProbe, &anyhow::Error>,
 ) -> TorchAlignment {
     let index_url = runtime_index_url_for_key(paths, runtime_key);
-    let outcome = align_runtime_torch(paths, python, index_url.as_deref(), sdk_build, engine);
+    let outcome = align_runtime_torch(
+        paths,
+        python,
+        index_url.as_deref(),
+        sdk_build,
+        engine,
+        torch,
+    );
     print!("{}", render_torch_alignment(&outcome, engine));
     let (level, message) = match &outcome {
         TorchAlignment::AlreadyAligned { version } => (
@@ -7812,6 +7853,15 @@ fn report_torch_alignment(
                 "engine={engine} runtime_id={runtime_key} torch_alignment=install_failed wanted={wanted} kept={kept}: {error}"
             ),
         ),
+        // The user's own decision, carried out as asked, so it is not an error.
+        // The device check that follows is what says whether the torch they kept
+        // works, and that verdict is recorded — and enforced — on its own.
+        TorchAlignment::Disabled { wanted, kept } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=disabled kept={kept} wanted={wanted}"
+            ),
+        ),
         TorchAlignment::NotApplicable(reason) => (
             "info",
             format!(
@@ -7829,23 +7879,37 @@ fn report_torch_alignment(
 /// Both `Realigned` and `AlreadyAligned` diverge from the engine's exact pin —
 /// the second is a rerun over a runtime already put right, which is the normal
 /// state on every refresh after the first.
+///
+/// `Disabled` counts for the same reason, from the other direction: the torch
+/// that does not satisfy the pin is the one the user told us to leave alone, so
+/// reporting it as a violation would answer their instruction with an error and
+/// a `--reinstall` remedy that would undo it. It is only ever constructed over a
+/// real mismatch, so this never suppresses a divergence that is not there.
+///
+/// `Unavailable` and `InstallFailed` stay excluded. Nothing was replaced there
+/// either, but nothing was intended either — the repair was attempted and did
+/// not happen — so whatever the dependency check finds is a real finding.
 const fn deliberately_diverged_package(outcome: &TorchAlignment) -> Option<&'static str> {
     match outcome {
-        TorchAlignment::Realigned { .. } | TorchAlignment::AlreadyAligned { .. } => Some("torch"),
+        TorchAlignment::Realigned { .. }
+        | TorchAlignment::AlreadyAligned { .. }
+        | TorchAlignment::Disabled { .. } => Some("torch"),
         TorchAlignment::Unavailable { .. }
         | TorchAlignment::InstallFailed { .. }
         | TorchAlignment::NotApplicable(_) => None,
     }
 }
 
-/// Whether the installed runtime can actually open a GPU.
+/// Whether the installed runtime can actually run work on a GPU.
 ///
 /// The dependency check answers whether the engine's declared requirements are
 /// satisfied. That is a question about metadata, and it is not the same question
-/// as whether the environment works: a torch built against a different ROCm
-/// version than the installed SDK satisfies nothing yet loads cleanly, and then
-/// reports no devices. vLLM turns that into `Failed to infer device type` at
-/// first serve, long after the install reported success.
+/// as whether the environment works. Two distinct answers matter here, because a
+/// torch can fail at either step: one built against a different ROCm version than
+/// the installed SDK loads cleanly and then reports no devices, which vLLM turns
+/// into `Failed to infer device type` at first serve; one built without a kernel
+/// image for this target reports a device and then dies on the first tensor
+/// operation. Only a torch that gets past both has been shown to work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeDeviceCheck {
     /// torch imported and reported at least one device.
@@ -7853,20 +7917,30 @@ enum RuntimeDeviceCheck {
         device_count: u32,
         torch_version: String,
     },
-    /// torch imported but reported no devices — the failure this check exists for.
+    /// torch imported but reported no devices — a torch built for another SDK.
     NoDevices {
         torch_version: String,
         hip_version: String,
     },
+    /// torch found a device and then could not execute a kernel on it.
+    ///
+    /// Distinct from `NoDevices` because the remedy is different: the runtime is
+    /// not looking at the wrong SDK, it is holding a build with no code for this
+    /// GPU.
+    KernelFailed {
+        torch_version: String,
+        error: String,
+    },
     /// The question could not be answered — including when torch does not import.
     ///
     /// Never a reason to assume healthy, but on its own never fatal either: see
-    /// `install_left_runtime_unusable`, which acts only on `NoDevices`. This
-    /// variant covers benign causes as well as real ones — a runtime whose Python
-    /// could not be located, or a probe that could not launch — and failing a
-    /// multi-gigabyte install because a probe did not run is worse than reporting
-    /// what was and was not seen. The cost is that a runtime whose torch is
-    /// present but unimportable is reported rather than failed.
+    /// `install_left_runtime_unusable`, which acts only on the verdicts where the
+    /// runtime was asked and answered badly. This variant covers benign causes as
+    /// well as real ones — a runtime whose Python could not be located, or a probe
+    /// that could not launch — and failing a multi-gigabyte install because a
+    /// probe did not run is worse than reporting what was and was not seen. The
+    /// cost is that a runtime whose torch is present but unimportable is reported
+    /// rather than failed.
     NotVerified(String),
 }
 
@@ -7876,10 +7950,14 @@ fn runtime_device_check(python: Option<&Path>, library_paths: &[PathBuf]) -> Run
             "the runtime's Python environment could not be located".to_owned(),
         );
     };
-    let probe = match therock::probe_runtime_devices(python, library_paths) {
-        Ok(probe) => probe,
-        Err(error) => return RuntimeDeviceCheck::NotVerified(error.to_string()),
-    };
+    match therock::probe_runtime_devices(python, library_paths) {
+        Ok(probe) => classify_runtime_device_probe(probe),
+        Err(error) => RuntimeDeviceCheck::NotVerified(error.to_string()),
+    }
+}
+
+/// Read one probe as a verdict, kept free of I/O so every state can be tested.
+fn classify_runtime_device_probe(probe: therock::RuntimeDeviceProbe) -> RuntimeDeviceCheck {
     if !probe.import_ok {
         return RuntimeDeviceCheck::NotVerified(
             probe
@@ -7888,6 +7966,15 @@ fn runtime_device_check(python: Option<&Path>, library_paths: &[PathBuf]) -> Run
         );
     }
     let torch_version = probe.torch_version.unwrap_or_else(|| "unknown".to_owned());
+    // A kernel that would not launch is definitive, so it is read before the
+    // count and never dropped: the probe only reaches that step after it has
+    // already enumerated a device, and the count alone would read as healthy.
+    if let Some(error) = probe.kernel_error {
+        return RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        };
+    }
     match probe.device_count {
         Some(0) => RuntimeDeviceCheck::NoDevices {
             torch_version,
@@ -7950,18 +8037,38 @@ fn render_runtime_device_check(outcome: &RuntimeDeviceCheck) -> String {
                  for a different ROCm version than the installed SDK"
             );
         }
+        RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        } => {
+            let _ = writeln!(output, "  device_check: kernel_failed");
+            let _ = writeln!(
+                output,
+                "    torch {} found a GPU but could not run a kernel on it: {}",
+                sanitize_log_value(torch_version),
+                sanitize_log_value(error)
+            );
+            let _ = writeln!(
+                output,
+                "    serving will fail on the first tensor operation; this torch has no kernel \
+                 image for this GPU"
+            );
+        }
     }
     output
 }
 
+/// Print one device-check verdict and record it.
+///
+/// The verdict is taken as an argument because the settle path probes the runtime
+/// before it decides what to do with it, and the block is printed in its usual
+/// place afterwards rather than where the probe happened to run.
 fn report_runtime_device_check(
     paths: &AppPaths,
     engine: &str,
-    python: Option<&Path>,
     runtime_key: &str,
+    outcome: RuntimeDeviceCheck,
 ) -> RuntimeDeviceCheck {
-    let library_paths = runtime_library_paths_for_key(paths, runtime_key);
-    let outcome = runtime_device_check(python, &library_paths);
     print!("{}", render_runtime_device_check(&outcome));
     let (level, message) = match &outcome {
         RuntimeDeviceCheck::Usable { device_count, .. } => (
@@ -7977,6 +8084,15 @@ fn report_runtime_device_check(
             "error",
             format!(
                 "engine={engine} runtime_id={runtime_key} device_check=no_devices torch={torch_version} hip={hip_version}"
+            ),
+        ),
+        RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=kernel_failed torch={torch_version}: {error}"
             ),
         ),
         RuntimeDeviceCheck::NotVerified(reason) => (
@@ -8029,24 +8145,199 @@ fn sdk_torch_build_from_manifest(manifest: &therock::InstalledRuntimeManifest) -
     (!version.trim().is_empty()).then(|| format!("rocm{version}"))
 }
 
-/// Whether an install finished having produced a runtime that cannot serve.
+/// Which torch a runtime keeps once one of them has run a GPU kernel.
 ///
-/// The conjunction is the point. An alignment that could not run may still leave
-/// a working environment, and a device count of zero is expected wherever no GPU
-/// is present — neither alone justifies failing a multi-gigabyte install. Both
-/// together mean the runtime cannot open a device and we could not correct it.
-const fn install_left_runtime_unusable(
-    alignment: &TorchAlignment,
-    devices: &RuntimeDeviceCheck,
-) -> bool {
-    let unsettled = matches!(
-        alignment,
-        TorchAlignment::Unavailable { .. } | TorchAlignment::InstallFailed { .. }
-    );
-    unsettled && matches!(devices, RuntimeDeviceCheck::NoDevices { .. })
+/// Exactly two builds are allowed to stand: the engine's own exact pin, and the
+/// SDK's build of the release it pins. Both are states this tool produces on
+/// purpose, and each is a fixed point — a rerun over either one keeps it and
+/// installs nothing, which is what stops `--reinstall` from oscillating between
+/// the two package sources. Anything else is repaired by `TorchAlignment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchRetention {
+    /// The engine's exact pin ran a kernel. It satisfies the pin, so it diverges
+    /// from nothing and the dependency check is read straight.
+    EngineBuild { version: String },
+    /// The SDK's build of the pinned release ran. The engine's pin stays
+    /// deliberately unsatisfied, which the dependency check is told to expect.
+    SdkBuild { version: String },
+    /// Nothing here has been shown to work: align, then look again.
+    Realign,
 }
 
-/// An engine install finished having left a runtime that cannot open a device.
+/// Decide retention from the torch that actually executed a kernel.
+///
+/// The version compared is the one the running interpreter reported, not the one
+/// distribution metadata claims: the build that ran is the build being kept. The
+/// engine's pin is checked first, so a pin that already names the SDK's build is
+/// reported as satisfied rather than as an intended divergence from itself.
+fn classify_retained_torch(
+    sdk_build: Option<&str>,
+    devices: &RuntimeDeviceCheck,
+    engine_requirement: Option<&str>,
+) -> TorchRetention {
+    // Only a kernel that ran earns retention. Every other verdict — no devices,
+    // a failed launch, or no answer at all — goes to the repair path, which is
+    // also what this tool did before it could tell those apart.
+    let RuntimeDeviceCheck::Usable { torch_version, .. } = devices else {
+        return TorchRetention::Realign;
+    };
+    let Some(pinned) = engine_requirement.and_then(therock::requirement_pinned_version) else {
+        return TorchRetention::Realign;
+    };
+    if torch_version.as_str() == pinned {
+        return TorchRetention::EngineBuild {
+            version: torch_version.clone(),
+        };
+    }
+    let Some(sdk_build) = sdk_build else {
+        return TorchRetention::Realign;
+    };
+    // The same version `plan_torch_alignment` would install, so the state that
+    // repair produces is the state recognised here on the next run.
+    let sdk_torch = format!("{}+{sdk_build}", therock::split_local_version(pinned).0);
+    if torch_version.as_str() == sdk_torch {
+        return TorchRetention::SdkBuild {
+            version: torch_version.clone(),
+        };
+    }
+    TorchRetention::Realign
+}
+
+/// The package a retained torch deliberately diverges on, if any.
+///
+/// The SDK's build does not satisfy the engine's exact pin and is kept anyway;
+/// the engine's own build satisfies it, so claiming a divergence there would
+/// suppress a violation that has not happened.
+const fn retained_diverged_package(retention: &TorchRetention) -> Option<&'static str> {
+    match retention {
+        TorchRetention::SdkBuild { .. } => Some("torch"),
+        TorchRetention::EngineBuild { .. } | TorchRetention::Realign => None,
+    }
+}
+
+/// Render a retention as the `torch_alignment:` block, in place of an alignment.
+///
+/// `Realign` renders nothing: nothing was retained, and `render_torch_alignment`
+/// prints the block for the repair that runs instead.
+fn render_torch_retention(retention: &TorchRetention, engine: &str) -> String {
+    let mut output = String::new();
+    match retention {
+        TorchRetention::EngineBuild { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: retained_engine_build ({})",
+                sanitize_log_value(version)
+            );
+            let _ = writeln!(
+                output,
+                "    the torch {} pins ran a GPU kernel with this SDK",
+                sanitize_log_value(engine)
+            );
+        }
+        TorchRetention::SdkBuild { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: retained_sdk_build ({})",
+                sanitize_log_value(version)
+            );
+            let _ = writeln!(
+                output,
+                "    the SDK's build of the release {} pins ran a GPU kernel",
+                sanitize_log_value(engine)
+            );
+        }
+        TorchRetention::Realign => {}
+    }
+    output
+}
+
+/// Print the retention block and record it. `Realign` records nothing.
+fn report_torch_retention(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_key: &str,
+    retention: &TorchRetention,
+) {
+    print!("{}", render_torch_retention(retention, engine));
+    let (state, version) = match retention {
+        TorchRetention::EngineBuild { version } => ("retained_engine_build", version),
+        TorchRetention::SdkBuild { version } => ("retained_sdk_build", version),
+        TorchRetention::Realign => return,
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "torch_alignment",
+        "info",
+        format!(
+            "engine={engine} runtime_id={runtime_key} torch_alignment={state} version={version}"
+        ),
+        None,
+    );
+}
+
+/// Whether this host has a GPU at all, answered by inspecting the host itself.
+///
+/// Deliberately independent of the runtime under test: the runtime reporting no
+/// devices is the symptom being judged, so it cannot also be the evidence. The
+/// third state is the one that matters — a host that could not be examined is not
+/// a host without a GPU, and failing a multi-gigabyte install on that guess would
+/// be worse than saying what was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostGpu {
+    Detected,
+    Absent,
+    NotVerified(String),
+}
+
+fn detect_host_gpu() -> HostGpu {
+    match ExamineSummary::gather() {
+        Ok(summary) if summary.detected_gfx_target.is_some() => HostGpu::Detected,
+        Ok(_) => HostGpu::Absent,
+        Err(error) => HostGpu::NotVerified(format!("{error:#}")),
+    }
+}
+
+/// Say why a runtime that cannot serve did not fail the install.
+fn report_unverified_host_gpu(paths: &AppPaths, engine: &str, runtime_key: &str, reason: &str) {
+    println!("  host_gpu: not_verified ({})", sanitize_log_value(reason));
+    println!("    the install is not failed on a host whose GPUs could not be inspected");
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "host_gpu",
+        "info",
+        format!("engine={engine} runtime_id={runtime_key} host_gpu=not_verified: {reason}"),
+        None,
+    );
+}
+
+/// Whether the runtime this install produced is one that cannot serve.
+///
+/// Both bad verdicts count: a runtime that opens no device and one that opens a
+/// device it cannot run a kernel on both fail at first serve. Neither says
+/// anything about the alignment that preceded it — a repair that could not run
+/// may still leave a working environment, and one that ran may still not have
+/// helped, so what the runtime does now is the only thing read.
+const fn runtime_cannot_serve(devices: &RuntimeDeviceCheck) -> bool {
+    matches!(
+        devices,
+        RuntimeDeviceCheck::NoDevices { .. } | RuntimeDeviceCheck::KernelFailed { .. }
+    )
+}
+
+/// Whether an install finished having produced a runtime that cannot serve.
+///
+/// Gated on the host, because the same verdict means different things on
+/// different machines: no device is the correct answer on a machine with no GPU,
+/// and a host that could not be examined has not told us which machine this is.
+/// Only a GPU found independently of the runtime turns a runtime that cannot
+/// serve into a failed install.
+const fn install_left_runtime_unusable(devices: &RuntimeDeviceCheck, host_gpu: &HostGpu) -> bool {
+    matches!(host_gpu, HostGpu::Detected) && runtime_cannot_serve(devices)
+}
+
+/// An engine install finished having left a runtime that cannot run GPU work.
 ///
 /// A distinct type rather than a plain message so `install sdk` can tell this
 /// apart from an ordinary engine-install failure. It deliberately tolerates the
@@ -8067,10 +8358,9 @@ impl std::error::Error for UnusableRuntimeAfterInstall {}
 
 fn unusable_runtime_error(engine: &str, runtime_key: &str) -> anyhow::Error {
     anyhow::Error::new(UnusableRuntimeAfterInstall(format!(
-        "the {engine} install left runtime `{runtime_key}` on a torch it cannot use: no GPU could \
-         be opened, and the matching build from the SDK index could not be installed. The ROCm \
-         SDK itself is installed; re-run once the index is reachable, or install a torch matching \
-         the SDK into the runtime environment."
+        "the {engine} install left runtime `{runtime_key}` on a torch that cannot run GPU work \
+         with this SDK, on a host where a GPU was found. The ROCm SDK itself is installed; read \
+         the device check above and install a torch build that suits both this SDK and this GPU."
     )))
 }
 
@@ -8151,9 +8441,15 @@ fn settles_runtime_torch(engine: &str, managed_env: Option<bool>) -> bool {
 ///
 /// Every path that installs an engine into a managed runtime must call this.
 /// Skipping it anywhere lets the engine's own torch win silently and can leave a
-/// runtime that cannot open a device — including after an explicit
+/// runtime that cannot serve — including after an explicit
 /// `rocm engines install <engine> --reinstall`, which is exactly what someone
 /// reaches for when a runtime already looks wrong.
+///
+/// The runtime is asked what it can do before anything is written to it, and a
+/// torch that already runs a GPU kernel is kept, whichever of the two intended
+/// builds it is. Only when nothing has proven itself does the alignment install
+/// run, and then the runtime is asked again, because that answer is now about a
+/// different torch.
 ///
 /// See `settles_runtime_torch` for the environments this deliberately skips.
 fn settle_engine_install(
@@ -8166,20 +8462,58 @@ fn settle_engine_install(
         return Ok(());
     }
     let python = Path::new(&response.python_executable);
+    let host_gpu = detect_host_gpu();
+    let library_paths = runtime_library_paths_for_key(paths, runtime_key);
     let sdk_build = sdk_torch_build_for_key(paths, runtime_key);
-    let alignment =
-        report_torch_alignment(paths, engine, python, runtime_key, sdk_build.as_deref());
-    let diverged = deliberately_diverged_package(&alignment);
-    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
-    let devices = report_runtime_device_check(paths, engine, Some(python), runtime_key);
+    let torch = therock::probe_torch_alignment(python, engine);
+    let probed = runtime_device_check(Some(python), &library_paths);
 
-    // Fail only on the conjunction: torch could not be settled AND the runtime
-    // cannot open a device. Either alone is survivable — an alignment that could
-    // not run may still leave a working environment, and a device count of zero
-    // is expected where no GPU is present. Together they mean this install
-    // produced a runtime that cannot serve, and reporting success for that is the
-    // whole failure this change exists to end.
-    if install_left_runtime_unusable(&alignment, &devices) {
+    let retention = classify_retained_torch(
+        sdk_build.as_deref(),
+        &probed,
+        torch
+            .as_ref()
+            .ok()
+            .and_then(|probe| probe.engine_requires_torch.as_deref()),
+    );
+    let (diverged, devices) = match retention {
+        TorchRetention::Realign => {
+            let alignment = report_torch_alignment(
+                paths,
+                engine,
+                python,
+                runtime_key,
+                sdk_build.as_deref(),
+                torch.as_ref(),
+            );
+            // Only a realignment replaced torch. After every other outcome the
+            // environment is the one already probed, and asking it again would
+            // spend a second interpreter launch to be told the same thing.
+            let devices = match alignment {
+                TorchAlignment::Realigned { .. } => {
+                    runtime_device_check(Some(python), &library_paths)
+                }
+                _ => probed,
+            };
+            (deliberately_diverged_package(&alignment), devices)
+        }
+        retention => {
+            report_torch_retention(paths, engine, runtime_key, &retention);
+            (retained_diverged_package(&retention), probed)
+        }
+    };
+    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
+    let devices = report_runtime_device_check(paths, engine, runtime_key, devices);
+
+    // A runtime that cannot serve is only this install's failure where the host
+    // has a GPU to serve with. Where the host could not be examined, say so
+    // rather than failing a multi-gigabyte install on a guess.
+    if let HostGpu::NotVerified(reason) = &host_gpu
+        && runtime_cannot_serve(&devices)
+    {
+        report_unverified_host_gpu(paths, engine, runtime_key, reason);
+    }
+    if install_left_runtime_unusable(&devices, &host_gpu) {
         return Err(unusable_runtime_error(engine, runtime_key));
     }
     Ok(())
@@ -8261,12 +8595,14 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
             for detail in details {
                 let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
             }
-            // Deliberately not the reinstall remedy. It does not apply: every
-            // path that installs an engine realigns torch afterwards, so a
-            // reinstall reproduces this same state rather than resolving it.
+            // Deliberately not the reinstall remedy. It does not apply to
+            // either state that reaches here: a reinstall realigns torch again
+            // and reproduces the SDK build, and where the user has opted out of
+            // that realignment it would undo the decision they made. Which of
+            // the two this is, the block above has already said.
             let _ = writeln!(
                 output,
-                "  action: none; the SDK's build is intended here (see torch_alignment above)"
+                "  action: none; this torch is kept on purpose (see torch_alignment above)"
             );
         }
     }
@@ -26807,26 +27143,299 @@ ID_LIKE="suse opensuse"
             torch_version: "2.11.0+gitd0c8b1f".to_owned(),
             hip_version: "7.2.53211".to_owned(),
         };
+        let kernel_failed = RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        };
         let usable = RuntimeDeviceCheck::Usable {
             device_count: 8,
             torch_version: "2.11.0+rocm7.13.0".to_owned(),
         };
-        let failed = TorchAlignment::InstallFailed {
-            wanted: "2.11.0+rocm7.13.0".to_owned(),
-            kept: "2.11.0+gitd0c8b1f".to_owned(),
-            error: "dns error".to_owned(),
-        };
-        let realigned = TorchAlignment::Realigned {
-            from: "2.11.0+gitd0c8b1f".to_owned(),
-            to: "2.11.0+rocm7.13.0".to_owned(),
-        };
 
-        // Could not settle torch, and the runtime sees nothing: unusable.
-        assert!(install_left_runtime_unusable(&failed, &no_devices));
-        // Could not settle torch, but the runtime works anyway: not our call to fail.
-        assert!(!install_left_runtime_unusable(&failed, &usable));
-        // Settled fine; no devices just means no GPU on this host.
-        assert!(!install_left_runtime_unusable(&realigned, &no_devices));
+        // A machine with a GPU that this runtime cannot use, either way round.
+        assert!(install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Detected
+        ));
+        assert!(install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Detected
+        ));
+        // A machine with a GPU and a runtime that can use it.
+        assert!(!install_left_runtime_unusable(&usable, &HostGpu::Detected));
+        // On a host with no GPU both verdicts are the expected answer, not a
+        // reason to throw away a multi-gigabyte install.
+        assert!(!install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Absent
+        ));
+        assert!(!install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Absent
+        ));
+        // A host we could not examine is not a host without a GPU, but it is not
+        // evidence of one either, so it never fails the install on its own.
+        let unknown = HostGpu::NotVerified("lspci is not installed".to_owned());
+        assert!(!install_left_runtime_unusable(&no_devices, &unknown));
+        assert!(!install_left_runtime_unusable(&kernel_failed, &unknown));
+    }
+
+    #[test]
+    fn a_kernel_launch_failure_is_not_reported_as_a_usable_device() {
+        // The probe enumerated a device and then failed to run anything on it.
+        // Reading only the count calls that healthy, which is the whole defect:
+        // the install passes and the first serve dies.
+        let outcome = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+rocm7.14.0".to_owned()),
+            hip_version: Some("7.14.0".to_owned()),
+            device_count: Some(1),
+            error: None,
+            kernel_error: Some("AcceleratorError: device kernel image is invalid".to_owned()),
+        });
+
+        assert_eq!(
+            outcome,
+            RuntimeDeviceCheck::KernelFailed {
+                torch_version: "2.11.0+rocm7.14.0".to_owned(),
+                error: "AcceleratorError: device kernel image is invalid".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_enumeration_failure_stays_a_verdict_of_its_own() {
+        // `error` still carries the failures that happen before any kernel runs.
+        // Reporting one of those as a kernel failure would name the wrong remedy.
+        let import_failed = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: false,
+            torch_version: None,
+            hip_version: None,
+            device_count: None,
+            error: Some("ImportError: libamdhip64.so.7".to_owned()),
+            kernel_error: None,
+        });
+        let count_raised = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+rocm7.13.0".to_owned()),
+            hip_version: Some("7.13.0".to_owned()),
+            device_count: None,
+            error: Some("RuntimeError: HIP failed to initialize".to_owned()),
+            kernel_error: None,
+        });
+        let no_devices = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+gitd0c8b1f".to_owned()),
+            hip_version: Some("7.13.0".to_owned()),
+            device_count: Some(0),
+            error: None,
+            kernel_error: None,
+        });
+
+        assert_eq!(
+            import_failed,
+            RuntimeDeviceCheck::NotVerified("ImportError: libamdhip64.so.7".to_owned())
+        );
+        assert_eq!(
+            count_raised,
+            RuntimeDeviceCheck::NotVerified("RuntimeError: HIP failed to initialize".to_owned())
+        );
+        assert_eq!(
+            no_devices,
+            RuntimeDeviceCheck::NoDevices {
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                hip_version: "7.13.0".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_kernel_failure_is_reported_as_a_failure_and_says_what_broke() {
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.11.0+rocm7.14.0".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        });
+
+        assert!(rendered.contains("  device_check: kernel_failed\n"));
+        assert!(rendered.contains("2.11.0+rocm7.14.0"));
+        assert!(rendered.contains("device kernel image is invalid"));
+        // The remedy differs from `no_devices`, so the text must not borrow its
+        // explanation about being built for a different ROCm version.
+        assert!(!rendered.contains("Failed to infer device type"));
+        assert!(rendered.contains("no kernel image for this GPU"));
+    }
+
+    /// The engine's own pin runs: keep it, and claim no divergence from it.
+    #[test]
+    fn a_working_engine_torch_is_kept_instead_of_realigned() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::EngineBuild {
+                version: "2.11.0+gitd0c8b1f".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), None);
+        let rendered = render_torch_retention(&retention, "vllm");
+        assert!(
+            rendered.contains("  torch_alignment: retained_engine_build (2.11.0+gitd0c8b1f)\n")
+        );
+        assert!(rendered.contains("ran a GPU kernel with this SDK"));
+    }
+
+    /// The SDK's build of the pinned release runs: keep it, and expect the pin to
+    /// stay unsatisfied so the dependency check does not report it as a violation.
+    #[test]
+    fn a_working_sdk_torch_is_kept_as_an_intended_divergence() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 8,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::SdkBuild {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), Some("torch"));
+        let rendered = render_torch_retention(&retention, "vllm");
+        assert!(rendered.contains("  torch_alignment: retained_sdk_build (2.11.0+rocm7.13.0)\n"));
+        assert!(rendered.contains("the SDK's build of the release vllm pins ran a GPU kernel"));
+    }
+
+    /// Both intended builds are fixed points, so a repeated install settles rather
+    /// than swapping torch back and forth between the two package sources.
+    #[test]
+    fn repairing_a_runtime_converges_on_one_of_the_two_intended_builds() {
+        let after_engine_install = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+        // What the realignment installs, seen on the next run over the same runtime.
+        let after_realignment = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert!(!matches!(after_engine_install, TorchRetention::Realign));
+        assert!(!matches!(after_realignment, TorchRetention::Realign));
+    }
+
+    /// A pin that already names the SDK's build satisfies itself. Calling that an
+    /// intended divergence would suppress a violation that has not happened.
+    #[test]
+    fn a_pin_that_already_names_the_sdk_build_diverges_from_nothing() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+rocm7.13.0"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::EngineBuild {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), None);
+    }
+
+    /// Everything that has not been shown to work goes to the repair path — which
+    /// is what this tool did unconditionally before it could test a kernel.
+    #[test]
+    fn a_torch_that_has_not_been_shown_to_work_is_realigned() {
+        let usable = |version: &str| RuntimeDeviceCheck::Usable {
+            device_count: 1,
+            torch_version: version.to_owned(),
+        };
+        let pin = Some("torch==2.11.0+gitd0c8b1f");
+
+        // A third build nobody here installed on purpose.
+        assert_eq!(
+            classify_retained_torch(Some("rocm7.13.0"), &usable("2.9.0+cpu"), pin),
+            TorchRetention::Realign
+        );
+        // No devices at all, whatever build it is.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::NoDevices {
+                    torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                    hip_version: "7.13.0".to_owned(),
+                },
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // A device that cannot run a kernel is never retained, not even when it
+        // holds exactly the build the engine pins.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::KernelFailed {
+                    torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                    error: "device kernel image is invalid".to_owned(),
+                },
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // No answer is not an answer.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::NotVerified("torch did not import".to_owned()),
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // Nothing pins torch, so there is no release to hold either build of.
+        assert_eq!(
+            classify_retained_torch(Some("rocm7.13.0"), &usable("2.11.0+gitd0c8b1f"), None),
+            TorchRetention::Realign
+        );
+        // A range is not an exact pin, so it cannot identify the engine's build.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &usable("2.11.0+gitd0c8b1f"),
+                Some("torch>=2.10")
+            ),
+            TorchRetention::Realign
+        );
+        // The manifest does not say what the SDK's build is, so a torch that is
+        // not the engine's pin cannot be recognised as the other intended one.
+        assert_eq!(
+            classify_retained_torch(None, &usable("2.11.0+rocm7.13.0"), pin),
+            TorchRetention::Realign
+        );
+        // Nothing is retained, so nothing is reported in place of the repair.
+        assert!(render_torch_retention(&TorchRetention::Realign, "vllm").is_empty());
+        assert_eq!(retained_diverged_package(&TorchRetention::Realign), None);
     }
 
     fn sdk_install_finalization() -> SdkInstallFinalization {
@@ -27135,17 +27744,21 @@ ID_LIKE="suse opensuse"
         assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
     }
 
-    /// Opting out skips the rewrite without needing a runtime that answers.
+    /// A torch the user installed themselves is kept, and named as kept.
     ///
-    /// The gate has to precede the probe. Someone reaches for it precisely when the
-    /// SDK's build does not work on their machine, so it cannot depend on that
-    /// machine probing cleanly first. Pointing it at a Python that does not exist
-    /// would otherwise produce a probe failure; getting the opt-out reason back
-    /// instead is what shows nothing ran.
+    /// The Python does not exist and an index is supplied, so an alignment that
+    /// still ran would reach the install and come back `InstallFailed`. Getting
+    /// the divergence described instead — the build that was not installed, and
+    /// the one still there — is what shows the rewrite was skipped rather than
+    /// attempted and then reported differently.
     #[test]
-    fn disabling_alignment_skips_the_rewrite_before_anything_is_probed() {
+    fn disabling_alignment_keeps_the_installed_torch_and_says_what_it_declined() {
         let mut env = ScopedTestEnv::new();
         env.set("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.9.0+cpu".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
 
         let outcome = align_runtime_torch(
             &test_app_paths(),
@@ -27153,25 +27766,64 @@ ID_LIKE="suse opensuse"
             Some("https://example.invalid/simple"),
             Some("rocm7.13.0"),
             "vllm",
+            Ok(&probe),
         );
 
         assert_eq!(
             outcome,
-            TorchAlignment::NotApplicable(
-                "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT".to_owned()
-            )
+            TorchAlignment::Disabled {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.9.0+cpu".to_owned(),
+            }
         );
     }
 
     /// Unset, the rewrite is attempted as usual.
     ///
     /// Paired with the test above so the opt-out cannot appear to work for an
-    /// unrelated reason: the same call with the same unusable Python has to fail at
-    /// the probe rather than report itself disabled.
+    /// unrelated reason. The index is withheld here on purpose: it is the first
+    /// thing read after the gate, so the call stops there rather than reaching a
+    /// real install, and the outcome still tells the two paths apart.
     #[test]
     fn alignment_runs_unless_the_variable_is_set() {
         let mut env = ScopedTestEnv::new();
         env.clear("ROCM_CLI_DISABLE_TORCH_ALIGNMENT");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.9.0+cpu".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            None,
+            Some("rocm7.13.0"),
+            "vllm",
+            Ok(&probe),
+        );
+
+        assert_eq!(
+            outcome,
+            TorchAlignment::NotApplicable(
+                "the runtime manifest records no wheel index to install from".to_owned()
+            ),
+            "the opt-out must not fire when the variable is unset"
+        );
+    }
+
+    /// Opting out of a rewrite that was never due reports the runtime as it is.
+    ///
+    /// `Disabled` says a replacement was declined. On a runtime already holding
+    /// the SDK's build there was none to decline, and saying otherwise would send
+    /// the reader looking for a torch that was spared when nothing was.
+    #[test]
+    fn disabling_alignment_over_an_aligned_runtime_still_reports_it_aligned() {
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.11.0+rocm7.13.0".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
 
         let outcome = align_runtime_torch(
             &test_app_paths(),
@@ -27179,16 +27831,103 @@ ID_LIKE="suse opensuse"
             Some("https://example.invalid/simple"),
             Some("rocm7.13.0"),
             "vllm",
+            Ok(&probe),
         );
 
-        assert!(
-            !matches!(
-                &outcome,
-                TorchAlignment::NotApplicable(reason)
-                    if reason.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT")
-            ),
-            "the opt-out must not fire when the variable is unset, got {outcome:?}"
+        assert_eq!(
+            outcome,
+            TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
         );
+    }
+
+    /// The kept torch is a deliberate divergence, and the remedy is not reinstall.
+    ///
+    /// The engine's pin is unsatisfied on purpose here, so reporting a violation
+    /// would answer the user's instruction with an error — and the remedy that
+    /// comes with it, `--reinstall`, is the one action that would undo the very
+    /// decision they made.
+    #[test]
+    fn a_disabled_alignment_diverges_on_torch_without_offering_a_reinstall() {
+        let outcome = TorchAlignment::Disabled {
+            wanted: "2.11.0+rocm7.13.0".to_owned(),
+            kept: "2.9.0+cpu".to_owned(),
+        };
+        assert_eq!(deliberately_diverged_package(&outcome), Some("torch"));
+
+        let rendered = render_torch_alignment(&outcome, "vllm");
+        assert!(
+            rendered.contains("  torch_alignment: disabled\n"),
+            "the block has to name the state, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains(
+                "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set; keeping 2.9.0+cpu rather than installing 2.11.0+rocm7.13.0"
+            ),
+            "the block has to name the variable and both builds, got {rendered:?}"
+        );
+
+        let dependencies = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.9.0+cpu` is installed".to_owned(),
+            ],
+            deliberately_diverged_package(&outcome),
+        );
+        assert!(matches!(
+            dependencies,
+            EngineDependencyCheck::ExpectedDivergence(_)
+        ));
+        let rendered = render_engine_dependency_check("vllm", &dependencies);
+        assert!(
+            !rendered.contains("--reinstall"),
+            "the remedy would undo the opt-out, got {rendered:?}"
+        );
+    }
+
+    /// Opting out suppresses the correction, not the diagnosis.
+    ///
+    /// The escape hatch exists because the SDK's build does not always work, so it
+    /// cannot also become a way to make a runtime that does not work pass. The
+    /// device check is taken over the torch the user kept and read exactly as it
+    /// would be otherwise: a host with a GPU the runtime cannot open, or can open
+    /// and then not run a kernel on, still fails the install.
+    #[test]
+    fn opting_out_still_fails_an_install_that_left_a_gpu_host_unable_to_serve() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.9.0+cpu".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+        let kernel_failed = RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.9.0+cpu".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        };
+
+        assert!(install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Detected
+        ));
+        assert!(install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Detected
+        ));
+    }
+
+    /// On a machine with no GPU the same verdict is the correct answer.
+    ///
+    /// Someone running a CPU torch deliberately is the person this opt-out is for,
+    /// and a runtime reporting no device there has not failed at anything.
+    #[test]
+    fn opting_out_on_a_host_with_no_gpu_leaves_the_install_successful() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.9.0+cpu".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+
+        assert!(!install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Absent
+        ));
     }
 
     #[test]
