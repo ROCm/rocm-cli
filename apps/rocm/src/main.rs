@@ -5034,27 +5034,6 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
-    // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
-    // read inside `resolve_gpu_indices` and the claiming record write inside
-    // `spawn_managed_engine_child` must be atomic, or two concurrent
-    // `rocm serve --gpu auto` can both read the same GPU as free and launch on
-    // it. The guard is acquired here and handed to the launch path; it is held
-    // across GPU selection, the serve-plan rendering below, and the claiming
-    // record write, then dropped once the record is persisted (before the
-    // readiness wait) so unrelated serves are not blocked. Explicit-index and
-    // CPU-only launches take it too, so the select-then-claim ordering is uniform.
-    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
-    let gpu_indices = if cpu_only {
-        Vec::new()
-    } else {
-        resolve_gpu_indices(
-            &paths,
-            &gpu_selection,
-            detect_gpu_count(),
-            visible_gpu_indices.as_deref(),
-            gpu_vram.as_deref(),
-        )?
-    };
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -5089,6 +5068,30 @@ fn serve(args: ServeArgs) -> Result<()> {
             engine_recipe,
         },
     )?;
+    // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
+    // read inside `resolve_gpu_indices` and the claiming record write inside
+    // `spawn_managed_engine_child` must be atomic, or two concurrent
+    // `rocm serve --gpu auto` can both read the same GPU as free and launch on
+    // it. Acquired here — after engine resolution, self-managed runtime prep, and
+    // the `ResolveModel` RPC have all completed unlocked — so a slow first-use
+    // install (e.g. the Lemonade embeddable download/extract) never blocks an
+    // unrelated serve. The guard spans only GPU selection, the serve-plan
+    // rendering below, and the claiming record write, then is dropped once the
+    // record is persisted (before the readiness wait). Explicit-index and
+    // CPU-only launches take it too, so the select-then-claim ordering is uniform;
+    // with the install moved out of the critical section they hold it only briefly.
+    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+    let gpu_indices = if cpu_only {
+        Vec::new()
+    } else {
+        resolve_gpu_indices(
+            &paths,
+            &gpu_selection,
+            detect_gpu_count(),
+            visible_gpu_indices.as_deref(),
+            gpu_vram.as_deref(),
+        )?
+    };
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
