@@ -83,7 +83,7 @@ repos:
         stages: [pre-push]
         groups: [local-tools] # local-only; CI uses the `commit-signatures` job
 
-  # License headers: mirrors the korandoru/hawkeye CI check.
+  # License headers: mirrors the fast/hawkeye CI check.
   # Requires: cargo install hawkeye
   - repo: local
     hooks:
