@@ -88,6 +88,7 @@ fn active_runtime_key(runtimes_dir: &Path) -> Option<String> {
 /// alone would be wrong — on a runner where a foreign path happens to exist the
 /// scenario would serve against a runtime outside the shared tree.
 fn activatable_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
+    let roots = comparable_roots(runtimes_dir);
     registry_runtime_keys(runtimes_dir)
         .into_iter()
         .filter(|key| {
@@ -104,9 +105,54 @@ fn activatable_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
             let Some(root) = json.get("install_root").and_then(|v| v.as_str()) else {
                 return true;
             };
-            Path::new(root).starts_with(runtimes_dir)
+            let root = Path::new(root);
+            roots.iter().any(|base| root.starts_with(base))
         })
         .collect()
+}
+
+/// Every spelling of `runtimes_dir` a recorded `install_root` might match.
+///
+/// The two sides are resolved-vs-as-given by construction, so one comparison is
+/// not enough. The CLI canonicalizes an install root before recording it, while
+/// `E2E_SHARED_RUNTIMES_DIR` reaches us verbatim — `validated_shared_dir` checks
+/// that it is absolute and free of `..`, and deliberately does not resolve it.
+/// Reach the tree through a symlinked component of the workspace and the two
+/// spellings differ, so *every healthy* entry looks out-of-tree: selection comes
+/// back empty and the serve fails with the very error this module exists to
+/// prevent — silently, since declining to activate is best-effort by design.
+///
+/// This mirrors `xtask::e2e_prewarm::assess`, which compares against both
+/// spellings for the same reason. Windows needs the third: `canonicalize` yields
+/// a `\\?\` verbatim path there and the CLI records a plain one, so the prefix
+/// has to come off or the comparison fails on it rather than on the folder. That
+/// is the same trap `runtime_steps::linked_runtimes_target` documents, and 8.3
+/// short paths (which `canonicalize` expands) are why resolving matters even
+/// when no symlink is involved.
+fn comparable_roots(runtimes_dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![runtimes_dir.to_path_buf()];
+    let Ok(resolved) = runtimes_dir.canonicalize() else {
+        return roots;
+    };
+    for candidate in [strip_verbatim_prefix(&resolved), resolved] {
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
+}
+
+/// Drop Windows' `\\?\` verbatim prefix, which never `starts_with`-matches the
+/// plain path the CLI records. A no-op on every other platform.
+fn strip_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Every runtime key present in the registry, empty when it is absent.
@@ -143,11 +189,14 @@ mod tests {
         std::fs::write(path, body).expect("write file");
     }
 
-    fn manifest(dir: &Path, key: &str) {
-        write(&dir.join("registry").join(format!("{key}.json")), "{}");
-    }
-
     /// A runtime installed in place: its recorded root lives inside the tree.
+    ///
+    /// This is the shape the CLI really writes, so it is what the tests use.
+    /// A manifest with no `install_root` at all takes the "nothing to judge on"
+    /// branch and would pass whether or not the root is checked; since
+    /// `InstalledRuntimeManifest::install_root` is non-optional and
+    /// `load_runtime_manifests` drops anything that fails to deserialize, such a
+    /// manifest cannot arise in CI either. Testing against it proved nothing.
     fn installed(dir: &Path, key: &str) {
         let root = dir.join("wheel").join(key);
         std::fs::create_dir_all(&root).expect("create install root");
@@ -184,8 +233,8 @@ mod tests {
     fn names_the_active_runtime_when_several_are_installed() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
-        manifest(dir, "release-wheel-multi-arch-7-14-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-multi-arch-7-14-0");
         active(dir, "release-wheel-multi-arch-7-14-0");
 
         assert_eq!(
@@ -201,7 +250,7 @@ mod tests {
     fn falls_back_to_the_sole_manifest_without_a_marker() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
 
         assert_eq!(
             runtime_key_to_activate(dir).as_deref(),
@@ -216,8 +265,8 @@ mod tests {
     fn refuses_to_guess_between_several_without_a_marker() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
-        manifest(dir, "release-wheel-multi-arch-7-14-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-multi-arch-7-14-0");
 
         assert_eq!(runtime_key_to_activate(dir), None);
     }
@@ -236,7 +285,7 @@ mod tests {
     fn ignores_a_marker_naming_no_installed_runtime() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
         active(dir, "release-wheel-multi-arch-7-14-0");
 
         assert_eq!(
@@ -251,7 +300,7 @@ mod tests {
     fn treats_an_unreadable_marker_as_absent() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
         write(&dir.join("active.json"), "{ not json");
 
         assert_eq!(
@@ -276,6 +325,57 @@ mod tests {
             runtime_key_to_activate(dir).as_deref(),
             Some("release-wheel-multi-arch-7-14-0")
         );
+    }
+
+    /// Reaching the tree through a symlinked parent must not disqualify every
+    /// healthy runtime in it.
+    ///
+    /// The CLI records a canonicalized `install_root`; `E2E_SHARED_RUNTIMES_DIR`
+    /// arrives unresolved. Compare only the spelling we were handed and the two
+    /// never match, so selection comes back empty and the serve fails with the
+    /// error this module exists to prevent — the original bug through a different
+    /// door, and silent. Approximates a symlinked component of the runner's
+    /// workspace, which is the shape that would trigger it in CI.
+    #[test]
+    fn resolves_a_tree_reached_through_a_symlinked_parent() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real tree");
+        // The manifest records the resolved root, as the CLI writes it.
+        installed(&real, "release-wheel-multi-arch-7-14-0");
+
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+
+        // Selection is handed the unresolved spelling, exactly as CI would.
+        assert_eq!(
+            runtime_key_to_activate(&link).as_deref(),
+            Some("release-wheel-multi-arch-7-14-0"),
+            "a tree reached through a symlink must still resolve its runtimes"
+        );
+    }
+
+    /// The symlink tolerance must not become "any path anywhere": a corpse
+    /// pointing outside the tree stays disqualified when the tree is reached
+    /// through a link, or the fix above would have re-admitted every poisoned
+    /// entry it was meant to skip.
+    #[test]
+    fn still_skips_a_corpse_when_the_tree_is_reached_through_a_symlink() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).expect("create real tree");
+        poisoned(&real, "release-wheel-gfx94x-dcgpu-7-13-0");
+
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+
+        assert_eq!(runtime_key_to_activate(&link), None);
     }
 
     /// A marker naming a poisoned runtime must not override a sound one either:
@@ -325,8 +425,8 @@ mod tests {
     fn treats_a_blank_marker_key_as_absent() {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
-        manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
-        manifest(dir, "release-wheel-multi-arch-7-14-0");
+        installed(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+        installed(dir, "release-wheel-multi-arch-7-14-0");
         active(dir, "   ");
 
         assert_eq!(runtime_key_to_activate(dir), None);
