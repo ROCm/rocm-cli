@@ -141,8 +141,8 @@ fn shared_uv_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
 
-/// A persistent directory holding ONE installed managed-runtime tree
-/// (`runtimes/registry/*` + the TheRock venv) shared across scenarios that only
+/// A persistent directory holding the installed managed-runtime trees
+/// (`runtimes/registry/*` + the TheRock venvs) shared across scenarios that only
 /// need *a* runtime active. Set by CI (`E2E_SHARED_RUNTIMES_DIR`) on the runner's
 /// persistent disk; unset for local runs, where every scenario installs its own.
 ///
@@ -154,10 +154,14 @@ fn shared_uv_cache_dir() -> Option<PathBuf> {
 /// (see [`E2eWorld::use_shared_runtimes`]) so the install happens once per runner.
 /// Scenarios that ASSERT a clean slate ("a machine with no CLI-managed runtimes",
 /// "Installing the SDK") deliberately do NOT opt in — they keep their empty
-/// isolated runtimes dir. A serve resolves the shared runtime via
-/// `single_ready_runtime` (no active-key wiring needed) and `runtimes list`
-/// reports it `status=ready`, so both the precondition and serve are satisfied
-/// (verified by hand on MI300X: serve + chat completion through a symlinked tree).
+/// isolated runtimes dir.
+///
+/// The tree may hold MORE THAN ONE runtime: `xtask e2e-prewarm` installs a newer
+/// one side by side when the channel index publishes it, so the count tracks
+/// upstream releases rather than anything the suite controls. A serve therefore
+/// cannot lean on the CLI's `single_ready_runtime` fallback, which deliberately
+/// refuses to guess once two are installed — the scenario names its runtime
+/// explicitly instead (see [`E2eWorld::activate_shared_runtime`]).
 fn shared_runtimes_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_RUNTIMES_DIR")
 }
@@ -360,6 +364,57 @@ impl E2eWorld {
         let _ = std::fs::remove_dir_all(&link);
         Self::link_directory(&real, &link)?;
         Ok(real)
+    }
+
+    /// Point this scenario's config at a specific runtime in the shared tree.
+    ///
+    /// The shared tree is reached through a symlinked `data/runtimes`, but the
+    /// config dir stays per-scenario — so the activation `xtask e2e-prewarm`
+    /// performed is invisible here and every scenario starts with no active
+    /// runtime. That was harmless only while the CLI could auto-select, which it
+    /// stops doing as soon as the tree holds a second runtime (serve then fails
+    /// with "no active ROCm runtime is configured"). Re-activating from the
+    /// tree's own `active.json` makes the choice explicit and independent of how
+    /// many runtimes the pre-warm has accumulated.
+    ///
+    /// Also writes the shared tree's `active.json`, because for a symlinked
+    /// scenario that marker IS the shared one — the activation is not confined
+    /// to this scenario's config.
+    ///
+    /// Best-effort: a no-op for local runs (no shared tree), and it does not
+    /// fail the scenario when the tree names no runtime or the activation is
+    /// refused. Both of those leave the serve that follows failing with "no
+    /// active ROCm runtime is configured", and NEITHER precondition assertion
+    /// can see it — `installed: none` reports an empty registry, not an
+    /// unset active key, and `engines list` scans every manifest regardless of
+    /// which is active. So say what happened on stderr instead of failing here:
+    /// the serve's own failure is the one worth reading, and this is the line
+    /// that explains it.
+    pub fn activate_shared_runtime(&self) {
+        let Some(shared) = shared_runtimes_dir() else {
+            return;
+        };
+        let Some(key) = e2e_cucumber::shared_runtime::runtime_key_to_activate(&shared) else {
+            eprintln!(
+                "shared runtime: no runtime to activate in {}; a serve will fail unless exactly \
+                 one is installed. Installed: {:?}",
+                shared.display(),
+                e2e_cucumber::shared_runtime::registry_runtime_keys(&shared)
+            );
+            return;
+        };
+        let (stdout, stderr, rc) = run_rocm(self, &["runtimes", "activate", &key]);
+        if rc != 0 {
+            eprintln!(
+                "shared runtime: {}",
+                e2e_cucumber::cli_failure_report(
+                    &["runtimes", "activate", &key],
+                    rc,
+                    &stdout,
+                    &stderr
+                )
+            );
+        }
     }
 
     /// Plant a fake pre-existing (non-CLI) ROCm install in the scenario's isolated
