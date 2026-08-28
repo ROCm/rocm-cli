@@ -902,8 +902,11 @@ fn install_wheel_runtime(
     if let Some(host_version) = host_rocm_version_newer_than(&resolution.latest_version) {
         let _ = writeln!(
             output,
-            "  version_note: this host reports ROCm {host_version}, but {resolved} is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override",
-            resolved = runtime_version_display(&resolution.latest_version)
+            "  version_note: {}",
+            wheel_host_version_note(
+                &host_version,
+                &runtime_version_display(&resolution.latest_version)
+            )
         );
     }
     let _ = writeln!(
@@ -943,9 +946,9 @@ fn install_wheel_runtime(
         &resolution.latest_version,
     )
     .map(|newest| {
-        format!(
-            "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved} instead",
-            resolved = runtime_version_display(&resolution.latest_version)
+        no_wheel_warning_message(
+            &newest,
+            &runtime_version_display(&resolution.latest_version),
         )
     });
     if let Some(warning) = no_wheel_warning.as_deref() {
@@ -1202,11 +1205,44 @@ fn existing_runtime_relation(
 /// version rocm-cli is about to install, otherwise `None`. Used to explain why a
 /// seemingly older wheel version is selected over the host's ROCm.
 fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
-    let host_version = detect_legacy_rocm_summary().version?;
+    host_version_newer_than(detect_legacy_rocm_summary().version, resolved_version)
+}
+
+/// Pure core of [`host_rocm_version_newer_than`]: given the host's detected ROCm
+/// version (if any) and the version about to be installed, return the host
+/// version only when it is strictly newer. Split out from the filesystem probe so
+/// the newer-than decision is unit-testable without a real legacy ROCm on disk.
+fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
+    let host_version = host_version?;
     match compare_version_strings(&host_version, resolved_version) {
         Ordering::Greater => Some(host_version),
         _ => None,
     }
+}
+
+/// The wheel-path `version_note` body explaining why a host-newer legacy ROCm is
+/// passed over for the newest TheRock version that still has a matching PyTorch
+/// stack. Pure so the exact user-facing wording is unit-testable.
+fn wheel_host_version_note(host_version: &str, resolved_display: &str) -> String {
+    format!(
+        "this host reports ROCm {host_version}, but {resolved_display} is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override"
+    )
+}
+
+/// The tarball-path `version_note` body explaining why a host-newer legacy ROCm is
+/// passed over for the newest TheRock tarball for this GPU family.
+fn tarball_host_version_note(host_version: &str, resolved_display: &str) -> String {
+    format!(
+        "this host reports ROCm {host_version}, but {resolved_display} is the newest TheRock ROCm tarball for this GPU family, so it is selected"
+    )
+}
+
+/// The `warning` body surfaced when the repository's newest version has no
+/// installable PyTorch wheels for this Python/platform, so an older one is used.
+fn no_wheel_warning_message(newest: &str, resolved_display: &str) -> String {
+    format!(
+        "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved_display} instead"
+    )
 }
 
 /// The repo's newest version when it is strictly newer than the version we are
@@ -1332,8 +1368,8 @@ fn install_tarball_runtime(
     if let Some(host_version) = host_rocm_version_newer_than(&artifact.version) {
         let _ = writeln!(
             output,
-            "  version_note: this host reports ROCm {host_version}, but {resolved} is the newest TheRock ROCm tarball for this GPU family, so it is selected",
-            resolved = runtime_version_display(&artifact.version)
+            "  version_note: {}",
+            tarball_host_version_note(&host_version, &runtime_version_display(&artifact.version))
         );
     }
     let _ = writeln!(output, "  target: {}", install_root.display());
@@ -6015,6 +6051,45 @@ echo Python 3.12.10
         assert!(repo_version_without_wheels(None, "7.13.0").is_none());
         // Defensive: an older "newest" (should not happen) never warns.
         assert!(repo_version_without_wheels(Some("7.12.0"), "7.13.0").is_none());
+    }
+
+    #[test]
+    fn host_version_newer_than_reports_only_a_strictly_newer_host() {
+        // Host ROCm is newer than the version being installed -> surface it.
+        assert_eq!(
+            host_version_newer_than(Some("7.14.0".to_owned()), "7.13.0").as_deref(),
+            Some("7.14.0")
+        );
+        // Host ROCm matches the installed version -> nothing to explain.
+        assert!(host_version_newer_than(Some("7.13.0".to_owned()), "7.13.0").is_none());
+        // Host ROCm is older than the installed version -> nothing to explain.
+        assert!(host_version_newer_than(Some("7.12.0".to_owned()), "7.13.0").is_none());
+        // No legacy ROCm detected on the host -> nothing to explain.
+        assert!(host_version_newer_than(None, "7.13.0").is_none());
+    }
+
+    #[test]
+    fn host_version_notes_and_warning_render_the_expected_text() {
+        // Wheel path: the note names both versions and offers the --version override.
+        let wheel = wheel_host_version_note("7.14.0", "7.13.0");
+        assert_eq!(
+            wheel,
+            "this host reports ROCm 7.14.0, but 7.13.0 is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override"
+        );
+
+        // Tarball path: same explanation, phrased for the GPU-family tarball.
+        let tarball = tarball_host_version_note("7.14.0", "7.13.0");
+        assert_eq!(
+            tarball,
+            "this host reports ROCm 7.14.0, but 7.13.0 is the newest TheRock ROCm tarball for this GPU family, so it is selected"
+        );
+
+        // The no-wheels warning names the repo-newest and the fallback it installs.
+        let warning = no_wheel_warning_message("7.14.0", "7.13.0");
+        assert_eq!(
+            warning,
+            "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
+        );
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
