@@ -57,6 +57,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
+    "fix-16-vllm-oom",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -115,6 +116,13 @@ async fn user_hit_known_failure(world: &mut E2eWorld) {
 #[given("a user who hit a failure the CLI does not recognise")]
 async fn user_hit_unknown_failure(world: &mut E2eWorld) {
     world.model_name = Some("xyzzy totally unrelated gibberish".to_string());
+}
+
+#[given("a user whose vLLM server ran out of GPU memory")]
+async fn user_hit_vllm_oom(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string(),
+    );
 }
 
 #[given("a user who has chosen a known fix")]
@@ -320,6 +328,70 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some(),
         "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+/// Locate the `fix-16-vllm-oom` diagnosis in a parsed report's `matched` array,
+/// panicking with the raw output if it is absent. Shared by the two `Then`
+/// steps that assert on the vLLM OOM entry.
+fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_json::Value {
+    report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|matches| {
+            matches.iter().find(|diagnosis| {
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+            })
+        })
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"))
+}
+
+#[then("the diagnosis identifies the vLLM startup OOM")]
+async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose should exit 0");
+    let (report, output) = parsed_diagnosis(world);
+    let oom = find_vllm_oom(&report, &output);
+    let high_confidence = report
+        .get("high_confidence_threshold")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("report must publish its high_confidence_threshold:\n{output}"));
+    assert!(
+        oom.get("score")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|score| score >= high_confidence),
+        "the distinctive OOM signature should be high-confidence:\n{output}"
+    );
+    assert_eq!(
+        oom.pointer("/fix/auto_applicable")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the OOM remedy must remain print-only:\n{output}"
+    );
+}
+
+#[then("the OOM remedy distinguishes a busy GPU from a model that does not fit")]
+async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix = find_vllm_oom(&report, &output)
+        .get("fix")
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom remediation:\n{output}"));
+    let rendered = fix.to_string();
+    assert!(
+        rendered.contains("shared/busy")
+            && rendered.contains("does not fit")
+            && rendered.contains("--gpu-memory-utilization")
+            && rendered.contains("smaller or quantized"),
+        "the remedy must retain both conditional branches:\n{output}"
+    );
+    assert!(
+        !rendered.contains("--tensor-parallel-size"),
+        "the remedy must not prescribe the non-existent multi-GPU sharding flag:\n{output}"
+    );
+    assert!(
+        !fix.get("verify")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|verify| verify.contains("--gpu-memory-utilization")),
+        "verification must not unconditionally prescribe the tenancy workaround:\n{output}"
     );
 }
 

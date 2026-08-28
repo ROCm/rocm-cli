@@ -2227,14 +2227,23 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 /// with the `rocm` CLI's pre-launch low-VRAM note so both surfaces point the
 /// user at the same fix rather than drifting into different phrasing.
 fn oom_utilization_hint(log_tail: &str) -> String {
-    if log_tail_shows_oom(log_tail) {
-        format!(
-            "\n\nDetected an out-of-memory failure. {}",
-            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
-        )
-    } else {
-        String::new()
+    if !log_tail_shows_oom(log_tail) {
+        return String::new();
     }
+    // Route the user's *actual* failing line into the `--symptom` example
+    // rather than a canned string, prefixed with a `vllm:` anchor so the
+    // diagnose checker attributes it to this failure mode.
+    let symptom_line = log_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && log_tail_shows_oom(line))
+        .unwrap_or("out of memory");
+    format!(
+        "\n\nDetected an out-of-memory failure. {}\n\
+         For conditional remediation, run `rocm diagnose --symptom 'vllm: {symptom_line}'`.",
+        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
+    )
 }
 
 /// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
@@ -2716,6 +2725,16 @@ mod tests {
             "an OOM tail must surface the utilization workaround: {hint}"
         );
         assert!(hint.contains("--gpu <index>"));
+        assert!(
+            hint.contains("rocm diagnose --symptom"),
+            "an OOM tail must route the user to the conditional catalog entry: {hint}"
+        );
+        assert!(
+            hint.contains(
+                "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+            ),
+            "the user's real failing line must be routed into --symptom, not a canned string: {hint}"
+        );
 
         // Detection is case-insensitive and also matches the spaced phrasing.
         assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
