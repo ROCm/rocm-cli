@@ -140,3 +140,13 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI which fixes it offers
     Then every fix the catalog documents is listed
     And only the fixes the CLI can carry out itself are marked as such
+
+  # vLLM runs on Linux and WSL, but not native Windows. This scenario is
+  # GPU-independent: it supplies the captured startup error as symptom text and
+  # proves the public diagnosis output preserves both branches of the remedy.
+  @id:diagnose-vllm-oom-is-conditional @requires-os:linux
+  Scenario: diagnose-13 - A vLLM startup OOM receives conditional remediation
+    Given a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the diagnosis identifies the vLLM startup OOM
+    And the OOM remedy distinguishes a busy GPU from a model that does not fit
