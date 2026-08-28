@@ -177,7 +177,6 @@ a tiny model. rocm-cli helps in three ways:
 Explicitly, the workaround for an OOM on a shared card is:
 
 ```bash
-```bash
 rocm serve <model> --engine vllm --gpu-memory-utilization 0.1
 # optionally target a specific, less-busy GPU by index
 rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.1
