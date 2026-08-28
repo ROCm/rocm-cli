@@ -18261,29 +18261,13 @@ fn resolve_gpu_indices(
 
 /// Resolve an explicit `--gpu <index>` to its pinned ordinal — the `Index` arm
 /// of [`resolve_gpu_indices`], split out so the validation path can be
-/// unit-tested against an injected device count.
+/// unit-tested against injected GPU authorities.
 fn resolve_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
-    validate_pinned_gpu_index(index, pinned_index_bound(detected))
-}
-
-/// The device count to validate an explicit `--gpu <index>` against. Prefers the
-/// `amd-smi` `list` count; when that is unavailable (`detected` is `None`) it
-/// falls back to the amd-smi-independent KFD/DRM authority behind
-/// [`rocm_core::usable_amd_gpu_indices`] — the same source the engine device
-/// gate itself trusts.
-///
-/// Deliberately does NOT borrow the DRM sysfs VRAM-fallback row count: that
-/// probe withholds telemetry entirely on multi-GPU hosts and drops a card on a
-/// transient counter-read failure, so using its length as a validation bound
-/// would hard-reject legitimate `--gpu <index>` values on exactly those hosts.
-/// VRAM rows stay scoped to `--gpu auto` ranking (see [`effective_gpu_count`]).
-/// `None` when no count source is available, leaving the index unvalidated so
-/// serving can still proceed where GPU probing is impossible.
-fn pinned_index_bound(detected: Option<usize>) -> Option<usize> {
-    detected
-        .filter(|&count| count > 0)
-        .or_else(|| rocm_core::usable_amd_gpu_indices().map(|indices| indices.len()))
-        .filter(|&count| count > 0)
+    validate_pinned_gpu_index_against(
+        index,
+        detected,
+        rocm_core::usable_amd_gpu_indices().as_deref(),
+    )
 }
 
 /// The GPU count to rank `--gpu auto` candidates over. Prefers the `amd-smi`
@@ -18291,25 +18275,52 @@ fn pinned_index_bound(detected: Option<usize>) -> Option<usize> {
 /// DRM sysfs VRAM fallback still produced rows, its length stands in so
 /// auto-selection can still consider those devices. Used only for `--gpu auto`
 /// ranking, never as a `--gpu <index>` validation bound — see
-/// [`pinned_index_bound`]. `None` when neither source is available.
+/// [`validate_pinned_gpu_index_against`]. `None` when neither source is available.
 fn effective_gpu_count(detected: Option<usize>, vram: Option<&[GpuVramUsage]>) -> Option<usize> {
     detected
         .filter(|&count| count > 0)
         .or_else(|| vram.map(<[GpuVramUsage]>::len).filter(|&count| count > 0))
 }
 
-/// Validate an explicit `--gpu <index>` against the detected GPU count and
-/// return the single pinned ordinal. Errors when the index is out of range for
-/// a known device count; an unknown count (amd-smi unavailable and the DRM
-/// sysfs fallback found no rows either) is allowed through so serving can
-/// still proceed where GPU probing is not possible at all.
-fn validate_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
-    if let Some(count) = detected
-        && (index as usize) >= count
+/// Validate an explicit `--gpu <index>` against whichever GPU authority is
+/// available — both injected so each branch is unit-testable — and return the
+/// single pinned ordinal.
+///
+/// Prefers the `amd-smi` `list` count (`detected`), a renumbered `0..count`
+/// space, so an index at or beyond it is out of range. When amd-smi is
+/// unavailable (`detected` is `None`) it falls back to *membership* in the
+/// amd-smi-independent KFD/DRM usable set (`usable`) — the same authority the
+/// engine device gate trusts. Those are absolute, unrenumbered ordinals (e.g.
+/// `HIP_VISIBLE_DEVICES=2` on a 4-GPU host yields `[2]`), so a valid index must
+/// be one of them, not merely below their count; validating against the length
+/// would hard-reject the sole usable device on exactly that host. When neither
+/// source is available the index is left unvalidated so serving can still
+/// proceed where GPU probing is impossible; the engine device gate stays the
+/// backstop. An empty `usable` set is not treated as authoritative here — the
+/// caller's no-usable-GPU fail-fast owns that message — so it does not reject.
+fn validate_pinned_gpu_index_against(
+    index: u32,
+    detected: Option<usize>,
+    usable: Option<&[u32]>,
+) -> Result<Vec<u32>> {
+    if let Some(count) = detected.filter(|&count| count > 0) {
+        if (index as usize) >= count {
+            bail!(
+                "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
+                count - 1
+            );
+        }
+    } else if let Some(usable) = usable.filter(|indices| !indices.is_empty())
+        && !usable.contains(&index)
     {
         bail!(
-            "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
-            count - 1
+            "--gpu index {index} is not among the usable AMD GPU(s) [{}]; \
+             it may be hidden by HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES",
+            usable
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(vec![index])
@@ -25608,19 +25619,29 @@ install therock";
 
     #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
-        // Index equal to or beyond the detected count is rejected.
-        let error = validate_pinned_gpu_index(4, Some(4)).expect_err("index 4 is out of range");
+        // Index equal to or beyond the detected amd-smi count is rejected.
+        let error = validate_pinned_gpu_index_against(4, Some(4), None)
+            .expect_err("index 4 is out of range");
         assert!(error.to_string().contains("out of range"));
-        assert!(validate_pinned_gpu_index(9, Some(2)).is_err());
+        assert!(validate_pinned_gpu_index_against(9, Some(2), None).is_err());
     }
 
     #[test]
     fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
         // In-range index pins exactly that ordinal.
-        assert_eq!(validate_pinned_gpu_index(0, Some(1)).unwrap(), vec![0]);
-        assert_eq!(validate_pinned_gpu_index(3, Some(4)).unwrap(), vec![3]);
-        // Unknown count (amd-smi unavailable) is allowed through unvalidated.
-        assert_eq!(validate_pinned_gpu_index(7, None).unwrap(), vec![7]);
+        assert_eq!(
+            validate_pinned_gpu_index_against(0, Some(1), None).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            validate_pinned_gpu_index_against(3, Some(4), None).unwrap(),
+            vec![3]
+        );
+        // No count and no usable set (GPU unprobeable): allowed through unvalidated.
+        assert_eq!(
+            validate_pinned_gpu_index_against(7, None, None).unwrap(),
+            vec![7]
+        );
     }
 
     #[test]
@@ -25648,11 +25669,38 @@ install therock";
     }
 
     #[test]
-    fn pinned_index_bound_prefers_the_amd_smi_count() {
-        // When amd-smi reports a device count, that is the validation bound; a
-        // zero count is treated as "no usable source" rather than a hard zero.
-        assert_eq!(pinned_index_bound(Some(4)), Some(4));
-        assert_eq!(pinned_index_bound(Some(0)), None);
+    fn validate_pinned_gpu_index_prefers_the_amd_smi_count() {
+        // When amd-smi reports a device count, that is the validation authority:
+        // an index within it passes and one at/beyond it is out of range,
+        // regardless of the usable set.
+        assert_eq!(
+            validate_pinned_gpu_index_against(3, Some(4), None).unwrap(),
+            vec![3]
+        );
+        assert!(validate_pinned_gpu_index_against(3, Some(2), Some(&[3])).is_err());
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_falls_back_to_usable_set_membership() {
+        // amd-smi unavailable (`detected == None`): validation switches from a
+        // count bound to membership in the KFD/DRM usable set, which carries
+        // absolute, unrenumbered ordinals. On a 4-GPU host with
+        // `HIP_VISIBLE_DEVICES=2` the usable set is `[2]`, so `--gpu 2` — the
+        // sole usable device — must pass even though its ordinal exceeds the
+        // set's length, and a hidden device must be rejected.
+        assert_eq!(
+            validate_pinned_gpu_index_against(2, None, Some(&[2])).unwrap(),
+            vec![2]
+        );
+        let error = validate_pinned_gpu_index_against(0, None, Some(&[2, 3]))
+            .expect_err("index 0 is hidden by the visibility mask");
+        assert!(error.to_string().contains("not among the usable"));
+        // An empty usable set is not authoritative here (the caller's GPU
+        // fail-fast owns the "no usable GPU" message), so it does not reject.
+        assert_eq!(
+            validate_pinned_gpu_index_against(1, None, Some(&[])).unwrap(),
+            vec![1]
+        );
     }
 
     #[test]
