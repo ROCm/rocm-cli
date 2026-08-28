@@ -209,12 +209,22 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 ///
 /// The install_root is resolved from `runtimes_dir` (the shared tree we were
 /// handed) as `<runtimes_dir>/wheel/<runtime_key>`, NOT from the manifest's own
-/// `install_root` field. That field records the absolute path where the runtime
-/// was first installed — on Strix a per-scenario temp dir that no longer exists
-/// by report time — so trusting it made `vllm`/`lemonade` probe a dead path and
-/// come back `None`. On MI300X the two coincide (prewarm installs in place),
-/// which is why it worked there but not on Strix. Falls back to the manifest
-/// path if the derived one is absent, for any tree that predates the wheel layout.
+/// `install_root` field, which records where the runtime was first installed and
+/// need not be where it lives now. On MI300X the two coincide (the pre-warm
+/// installs in place); on Strix they did not, and trusting the field made
+/// `vllm`/`lemonade` probe a dead path and report no versions at all.
+///
+/// The manifest fallback is load-bearing, not legacy — do not read it as dead
+/// code. `MANAGED_RUNTIME_FORMATS` is `["wheel", "tarball"]`, and a tarball
+/// runtime lives at `<tree>/tarball/<key>`, which the derived `wheel` path never
+/// matches. For those the fallback is the only correct answer. It also still
+/// covers a tree predating the `wheel/` layout.
+///
+/// One shape can no longer reach here: a runtime whose recorded root left the
+/// tree entirely. `runtime_key_to_activate` now filters those out, so the
+/// fallback yields an in-tree path or nothing. Where every entry is such a
+/// corpse this returns `None` and the report simply omits the version — absent
+/// reads as unknown, which is the honest outcome; a wrong version reads as fact.
 fn active_runtime_install_root(
     runtimes_dir: &std::path::Path,
 ) -> Option<(String, std::path::PathBuf)> {

@@ -287,7 +287,7 @@ async fn user_checks_for_updates(world: &mut E2eWorld) {
 }
 
 /// The runtime key `runtimes list` reports as active, if any.
-fn active_runtime_key(world: &mut E2eWorld) -> Option<String> {
+fn active_runtime_key(world: &E2eWorld) -> Option<String> {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     let key = stdout
         .lines()
@@ -304,8 +304,7 @@ const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {
-    let stdout = world.cli_output.clone().unwrap_or_default();
-    let stdout = stdout.as_str();
+    let stdout = world.cli_output.as_deref().unwrap_or("");
     let rc = world.cli_rc.expect("no command was run");
     assert_eq!(rc, 0, "`rocm update` failed:\n{stdout}");
 
@@ -313,8 +312,7 @@ async fn assert_update_reports_freshness(world: &mut E2eWorld) {
     // The report carries one such line per installed runtime, newest first, and
     // the shared tree holds more than one — so select the ACTIVE runtime's line
     // rather than whichever came first, or this scenario reports on a runtime the
-    // run never used. Falls back to the first line when nothing is active, which
-    // is the single-runtime case this scenario was written against.
+    // run never used.
     let active = active_runtime_key(world);
     let runtime_lines = || {
         stdout
@@ -322,10 +320,24 @@ async fn assert_update_reports_freshness(world: &mut E2eWorld) {
             .map(str::trim)
             .filter(|line| line.starts_with("runtime "))
     };
-    let line = active
-        .as_deref()
-        .and_then(|key| runtime_lines().find(|line| line.split_whitespace().nth(1) == Some(key)))
-        .or_else(|| runtime_lines().next());
+    let line = match active.as_deref() {
+        // Something is active: assert on ITS line or not at all. Falling back to
+        // the first line here would report on a runtime the run did not use —
+        // the misattribution this selection exists to remove — and it would pass
+        // while doing it.
+        Some(key) => {
+            let found = runtime_lines().find(|line| line.split_whitespace().nth(1) == Some(key));
+            assert!(
+                found.is_some(),
+                "runtime `{key}` is active but the update report has no `runtime {key} …` \
+                 line:\n{stdout}"
+            );
+            found
+        }
+        // Nothing active: the single-runtime case this scenario was written
+        // against, where the sole line is unambiguously the right one.
+        None => runtime_lines().next(),
+    };
     let Some(line) = line else {
         panic!("no `runtime <key> …` line in the update report:\n{stdout}");
     };
