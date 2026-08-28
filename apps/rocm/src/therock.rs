@@ -2801,11 +2801,12 @@ print(json.dumps(out))
 /// `2.11.0+rocm7.13.0` -> `("2.11.0", Some("rocm7.13.0"))`. The local segment is
 /// the build identifier: for TheRock wheels it names the ROCm build, and for the
 /// engine's own index it is an opaque commit tag.
+///
+/// Defined in `rocm-core` because the vLLM engine has to make the same split to
+/// recognise a runtime the CLI deliberately realigned; two copies of this would be
+/// two places for the two sides to drift apart.
 pub(crate) fn split_local_version(version: &str) -> (&str, Option<&str>) {
-    match version.split_once('+') {
-        Some((base, local)) => (base, Some(local)),
-        None => (version, None),
-    }
+    rocm_core::uv::split_local_version(version)
 }
 
 /// The version pinned by a `==` requirement, e.g. `torch==2.11.0+git…` -> the
@@ -2825,6 +2826,21 @@ pub(crate) fn requirement_pinned_version(requirement: &str) -> Option<&str> {
 /// Used to put the SDK's build of a package back after another installer has
 /// replaced it. `--reinstall-package` is required: without it uv treats the
 /// already-present distribution as satisfying the request and does nothing.
+///
+/// `--index-url`, not `--extra-index-url`, so the SDK index is the only place a
+/// candidate can come from. This matches how `install_therock_runtime` installs
+/// from the same index, and it is load-bearing rather than cosmetic: with PyPI
+/// left in the candidate set, a `+rocm` build the SDK index does not publish can
+/// resolve against PyPI instead, and the caller's `Unavailable` classification —
+/// the whole point of which is to say "the SDK index has no such build" — never
+/// gets the resolver error it keys on.
+///
+/// `--no-deps` because this is a surgical swap of one build for another build of
+/// the *same release*: the environment already carries a resolved dependency tree
+/// and re-resolving it here is free to move `torchvision`/`torchaudio` as a side
+/// effect, which is the mixed stack this change is trying not to create. A build
+/// that genuinely needs a different dependency is not silently ignored — the
+/// `uv pip check` that runs immediately after reports it as a violation.
 pub(crate) fn install_pinned_package(
     paths: &AppPaths,
     python_executable: &Path,
@@ -2835,15 +2851,26 @@ pub(crate) fn install_pinned_package(
     let uv = rocm_core::uv::ensure_uv_binary(paths)
         .context("failed to acquire uv binary for the torch alignment install")?;
     let mut args = rocm_core::uv::uv_pip_install_base(python_executable);
-    args.push("--extra-index-url".to_owned());
+    args.push("--index-url".to_owned());
     args.push(index_url.to_owned());
+    args.push("--no-deps".to_owned());
     args.push("--reinstall-package".to_owned());
     args.push(package.to_owned());
     args.push(requirement.to_owned());
     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_command(
+    // `run_command_with_env`, not `run_command`, for two reasons. The uv environment
+    // carries `UV_HTTP_TIMEOUT` (uv has no `--timeout` flag) and `UV_CACHE_DIR`;
+    // without the latter uv falls back to `$HOME/.cache/uv`, loses hardlinking when
+    // that is on another filesystem, and silently copies the whole torch stack per
+    // environment — and the e2e lanes' shared cache is threaded through the same
+    // helper. It also captures stderr on every platform, where `run_command`'s
+    // Windows branch reports only an exit status; the caller classifies this
+    // install's outcome by matching the resolver's message, so on Windows an
+    // unpublished build would otherwise be reported as a generic failure.
+    run_command_with_env(
         &uv,
         &borrowed,
+        &rocm_core::uv::uv_command_env(paths),
         "install the SDK build of the engine's torch",
     )
 }

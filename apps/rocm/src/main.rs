@@ -3787,7 +3787,6 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 },
                 env_root.as_deref(),
             )?;
-            settle_engine_install(&paths, &engine, &runtime_id, &response)?;
             println!("engine install");
             println!("  engine: {engine}");
             println!("  runtime_id: {runtime_id}");
@@ -3813,6 +3812,12 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 config.save(&paths)?;
                 let _ = seeded_preference;
             }
+            // Settle last, matching `maybe_auto_install_sdk_preferred_engine`. The
+            // check blocks then print under the `engine:`/`runtime_id:`/`env_id:`
+            // lines they describe instead of above them, and the config bookkeeping
+            // above still lands when settling fails — the engine did install; it is
+            // the runtime it left behind that is being reported on.
+            settle_engine_install(&paths, &engine, &runtime_id, &response)?;
             record_cli_audit_event(
                 &paths,
                 "engine",
@@ -4008,7 +4013,12 @@ fn ensure_self_managed_engine_ready(
             },
             env_root.as_deref(),
         )?;
-        settle_engine_install(paths, engine, &runtime_id, &response)?;
+        // No `settle_engine_install` here. This function returns at the top unless
+        // `engine_manages_own_runtime(engine)`, and that is exactly the case
+        // `settles_runtime_torch` declines: the runtime holds the engine's own
+        // binary, not an interpreter with a torch in it. Calling it would be inert
+        // at best, and a call that provably cannot act invites someone to "fix" the
+        // gate later.
         Some(response)
     };
 
@@ -7674,7 +7684,13 @@ fn align_runtime_torch(
     }
 }
 
-fn render_torch_alignment(outcome: &TorchAlignment) -> String {
+/// Render one alignment outcome as the `torch_alignment:` check block.
+///
+/// `engine` names the engine whose pin decided the release, so the realigned line
+/// reads `... the release vllm pins` rather than an anonymous "the engine". It
+/// arrives from the engine selection and is sanitized like every other
+/// interpolated value.
+fn render_torch_alignment(outcome: &TorchAlignment, engine: &str) -> String {
     let mut output = String::new();
     match outcome {
         TorchAlignment::AlreadyAligned { version } => {
@@ -7691,7 +7707,7 @@ fn render_torch_alignment(outcome: &TorchAlignment) -> String {
                 "    {} -> {} (the SDK's build of the release {} pins)",
                 sanitize_log_value(from),
                 sanitize_log_value(to),
-                sanitize_log_value("the engine")
+                sanitize_log_value(engine)
             );
         }
         TorchAlignment::Unavailable { wanted, kept } => {
@@ -7728,12 +7744,12 @@ fn render_torch_alignment(outcome: &TorchAlignment) -> String {
     output
 }
 
-/// Returns the package the runtime now deliberately diverges on, if any, so the
-/// dependency check can tell that divergence apart from a real violation.
+/// Settle the runtime's torch, print the `torch_alignment:` block, and record it.
 ///
-/// Both `Realigned` and `AlreadyAligned` diverge from the engine's exact pin —
-/// the second is simply a rerun over a runtime already put right, which is the
-/// normal state on every refresh after the first.
+/// The outcome is returned so the dependency and device checks that follow can be
+/// read against it — `deliberately_diverged_package` turns it into the one package
+/// whose divergence is intended, and `install_left_runtime_unusable` pairs it with
+/// the device count.
 fn report_torch_alignment(
     paths: &AppPaths,
     engine: &str,
@@ -7743,7 +7759,7 @@ fn report_torch_alignment(
 ) -> TorchAlignment {
     let index_url = runtime_index_url_for_key(paths, runtime_key);
     let outcome = align_runtime_torch(paths, python, index_url.as_deref(), sdk_build, engine);
-    print!("{}", render_torch_alignment(&outcome));
+    print!("{}", render_torch_alignment(&outcome, engine));
     let (level, message) = match &outcome {
         TorchAlignment::AlreadyAligned { version } => (
             "info",
@@ -7850,8 +7866,15 @@ fn runtime_device_check(python: Option<&Path>, library_paths: &[PathBuf]) -> Run
             device_count,
             torch_version,
         },
+        // A `device_count()` that raises — HIP init failures are the live example —
+        // reports no count and puts the real exception in `error`. That exception is
+        // precisely the diagnostic this probe exists to capture, so prefer it over
+        // the generic line, which is only right when the probe returned nothing at
+        // all to explain itself.
         None => RuntimeDeviceCheck::NotVerified(
-            "torch imported but did not report a device count".to_owned(),
+            probe
+                .error
+                .unwrap_or_else(|| "torch imported but did not report a device count".to_owned()),
         ),
     }
 }
@@ -7953,6 +7976,15 @@ fn report_runtime_device_check(
 fn sdk_torch_build_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String> {
     let manifests = therock::load_runtime_manifests(paths).ok()?;
     let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    sdk_torch_build_from_manifest(manifest)
+}
+
+/// The build identifier one manifest names, with the fallback for older manifests.
+///
+/// Split out from the lookup so the decision can be tested without a registry on
+/// disk: the lookup is a directory scan, but this is the part that has to be right
+/// for a runtime already stuck on the engine's build to recover.
+fn sdk_torch_build_from_manifest(manifest: &therock::InstalledRuntimeManifest) -> Option<String> {
     if let Some(recorded) = manifest.sdk_torch.as_deref()
         && let Some(build) = therock::split_local_version(recorded).1
     {
@@ -7966,15 +7998,6 @@ fn sdk_torch_build_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String
     (!version.trim().is_empty()).then(|| format!("rocm{version}"))
 }
 
-/// Settle which torch a managed runtime keeps after an engine install, then report.
-///
-/// Every path that installs an engine into a managed runtime must call this.
-/// Skipping it anywhere lets the engine's own torch win silently and can leave a
-/// runtime that cannot open a device — including after an explicit
-/// `rocm engines install <engine> --reinstall`, which is exactly what someone
-/// reaches for when a runtime already looks wrong.
-///
-/// External environments are left alone: rocm-cli does not own them.
 /// Whether an install finished having produced a runtime that cannot serve.
 ///
 /// The conjunction is the point. An alignment that could not run may still leave
@@ -8079,13 +8102,36 @@ fn finish_sdk_install(
     Ok(())
 }
 
+/// Whether rocm-cli owns the torch in the runtime this install just produced.
+///
+/// Two kinds of environment are left alone, because there is no torch here that
+/// rocm-cli put in place. External environments are the obvious one. The subtler
+/// one is an engine that manages its own runtime: those report
+/// `managed_env: Some(true)` — rocm-cli did create the runtime — but their
+/// `python_executable` is the engine's native binary, not an interpreter, and no
+/// torch ever lived in there. Probing one anyway spawns that binary with a
+/// generated `.py` path as `argv[1]` and prints check blocks about a package the
+/// runtime never had.
+fn settles_runtime_torch(engine: &str, managed_env: Option<bool>) -> bool {
+    managed_env != Some(false) && !engine_manages_own_runtime(engine)
+}
+
+/// Settle which torch a managed runtime keeps after an engine install, then report.
+///
+/// Every path that installs an engine into a managed runtime must call this.
+/// Skipping it anywhere lets the engine's own torch win silently and can leave a
+/// runtime that cannot open a device — including after an explicit
+/// `rocm engines install <engine> --reinstall`, which is exactly what someone
+/// reaches for when a runtime already looks wrong.
+///
+/// See `settles_runtime_torch` for the environments this deliberately skips.
 fn settle_engine_install(
     paths: &AppPaths,
     engine: &str,
     runtime_key: &str,
     response: &InstallResponse,
 ) -> Result<()> {
-    if response.managed_env == Some(false) {
+    if !settles_runtime_torch(engine, response.managed_env) {
         return Ok(());
     }
     let python = Path::new(&response.python_executable);
@@ -26873,10 +26919,13 @@ ID_LIKE="suse opensuse"
 
     #[test]
     fn an_unresolvable_version_still_reads_as_unavailable() {
-        let rendered = render_torch_alignment(&TorchAlignment::Unavailable {
-            wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
-            kept: "2.10.0+git8514f05".to_owned(),
-        });
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Unavailable {
+                wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
+                kept: "2.10.0+git8514f05".to_owned(),
+            },
+            "vllm",
+        );
 
         assert!(rendered.contains("  torch_alignment: unavailable\n"));
         assert!(rendered.contains("publishes no 2.10.0+rocm7.14.0a20260611"));
@@ -26884,11 +26933,14 @@ ID_LIKE="suse opensuse"
 
     #[test]
     fn a_failed_realignment_reports_the_error_it_actually_hit() {
-        let rendered = render_torch_alignment(&TorchAlignment::InstallFailed {
-            wanted: "2.11.0+rocm7.13.0".to_owned(),
-            kept: "2.11.0+gitd0c8b1f".to_owned(),
-            error: "failed to launch uv: Permission denied".to_owned(),
-        });
+        let rendered = render_torch_alignment(
+            &TorchAlignment::InstallFailed {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.11.0+gitd0c8b1f".to_owned(),
+                error: "failed to launch uv: Permission denied".to_owned(),
+            },
+            "vllm",
+        );
 
         assert!(rendered.contains("  torch_alignment: install_failed\n"));
         assert!(rendered.contains("Permission denied"));
@@ -26896,6 +26948,64 @@ ID_LIKE="suse opensuse"
             !rendered.contains("publishes no"),
             "an install failure must not be described as a missing wheel: {rendered}"
         );
+    }
+
+    #[test]
+    fn a_realigned_runtime_names_both_builds_and_the_engine_that_decided_the_release() {
+        // The line a successful run actually prints, and the one a user reads when
+        // deciding whether the divergence reported just below it is expected.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Realigned {
+                from: "2.11.0+gitd0c8b1f".to_owned(),
+                to: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+        );
+
+        assert!(rendered.contains("  torch_alignment: realigned\n"));
+        assert!(rendered.contains("2.11.0+gitd0c8b1f -> 2.11.0+rocm7.13.0"));
+        assert!(
+            rendered.contains("the release vllm pins"),
+            "the engine that pinned the release is named rather than left anonymous: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_already_aligned_runtime_reports_the_version_it_kept() {
+        // Every refresh after the first lands here, so this is the most frequently
+        // printed of the five outcomes.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+        );
+
+        assert!(rendered.contains("  torch_alignment: already_aligned (2.11.0+rocm7.13.0)\n"));
+    }
+
+    #[test]
+    fn a_managed_python_runtime_is_settled() {
+        assert!(settles_runtime_torch("vllm", Some(true)));
+        assert!(
+            settles_runtime_torch("vllm", None),
+            "an engine that does not report the field is still assumed managed, as before"
+        );
+    }
+
+    #[test]
+    fn an_external_runtime_is_left_alone() {
+        assert!(!settles_runtime_torch("vllm", Some(false)));
+    }
+
+    #[test]
+    fn an_engine_that_manages_its_own_runtime_is_left_alone() {
+        // Lemonade reports `managed_env: Some(true)` — rocm-cli did create the
+        // runtime — but its `python_executable` is the Lemonade binary, not an
+        // interpreter, and no torch ever lived there. Settling it would spawn that
+        // binary twice with a generated `.py` path as `argv[1]` and print torch and
+        // device check blocks for a runtime that has neither, on the serve path.
+        assert!(!settles_runtime_torch("lemonade", Some(true)));
     }
 
     #[test]
@@ -26946,28 +27056,52 @@ ID_LIKE="suse opensuse"
         assert!(matches!(plan, TorchAlignmentPlan::NotApplicable(_)));
     }
 
-    /// A runtime already holding the engine's build must still be corrected.
+    /// The build comes from the manifest, not from whatever torch is installed.
     ///
-    /// The build identifier comes from the manifest, so this stays right even
-    /// when the environment has already been overwritten — the case where
-    /// inferring it from the installed torch would call the wrong build correct
-    /// and leave the runtime broken for good.
+    /// This is what makes a runtime already overwritten by the engine recoverable:
+    /// reading the environment would call the engine's build the SDK's and leave the
+    /// runtime broken for good. `plan_torch_alignment` takes the build as an opaque
+    /// argument, so the property lives here, in the lookup that produces it.
     #[test]
-    fn a_runtime_already_on_the_engines_build_is_still_corrected() {
-        let plan = plan_torch_alignment(
+    fn the_sdk_build_is_read_from_the_manifest_not_the_environment() {
+        let mut manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "7.13.0");
+        manifest.sdk_torch = Some("2.11.0+rocm7.13.0".to_owned());
+
+        assert_eq!(
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
             Some("rocm7.13.0"),
-            Some("2.11.0+gitd0c8b1f"),
-            Some("torch==2.11.0+gitd0c8b1f"),
-            "vllm",
+            "the recorded SDK torch names the build"
+        );
+    }
+
+    /// Manifests written before `sdk_torch` existed still have to yield a build.
+    ///
+    /// These are the runtimes already on real machines, so this fallback is the
+    /// repair path rather than a nicety. TheRock names the build `rocm<version>`.
+    #[test]
+    fn a_manifest_without_a_recorded_torch_derives_the_build_from_the_sdk_version() {
+        let manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "7.13.0");
+        assert!(
+            manifest.sdk_torch.is_none(),
+            "this test is about the pre-change manifest shape"
         );
 
         assert_eq!(
-            plan,
-            TorchAlignmentPlan::Install {
-                wanted: "2.11.0+rocm7.13.0".to_owned(),
-                from: "2.11.0+gitd0c8b1f".to_owned(),
-            }
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
+            Some("rocm7.13.0")
         );
+    }
+
+    /// A manifest that names no version at all must not invent a build.
+    #[test]
+    fn a_manifest_with_no_version_identifies_no_build() {
+        let mut manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "  ");
+        manifest.sdk_torch = None;
+
+        assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
     }
 
     #[test]
