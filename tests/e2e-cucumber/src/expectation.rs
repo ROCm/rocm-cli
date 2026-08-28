@@ -64,11 +64,14 @@ pub struct ScenarioDecl {
     /// in-tree amdgpu driver, so it does not hold under WSL2 — which uses
     /// `/dev/dxg` and the Windows host driver instead.
     ///
-    /// Two things stop short there. `rocm diagnose` skips its bare-metal catalog
-    /// *by design* rather than emitting Linux diagnoses that cannot apply, so a
-    /// scenario needing a catalog match has no premise. And `examine`'s probe
-    /// returns as soon as it recognises WSL2, before most of its steps run, so a
-    /// scenario asserting anything those steps populate has none either.
+    /// Two things stop short there. `rocm diagnose` skips its *bare-metal*
+    /// catalog *by design* rather than emitting Linux diagnoses that cannot
+    /// apply, so a scenario needing one of those bare-metal matches has no
+    /// premise. (Keyword-only checks explicitly registered for WSL — e.g. the
+    /// vLLM startup-OOM entry — do run there; those belong under
+    /// `@requires-os:linux`, not this tag.) And `examine`'s probe returns as
+    /// soon as it recognises WSL2, before most of its steps run, so a scenario
+    /// asserting anything those steps populate has none either.
     ///
     /// This is a SKIP and not an xfail row: the diagnose half is deliberate and
     /// separately unit-tested, and recording it as a known bug would tell every
