@@ -200,6 +200,12 @@ mod tests {
     fn installed(dir: &Path, key: &str) {
         let root = dir.join("wheel").join(key);
         std::fs::create_dir_all(&root).expect("create install root");
+        // Record the CANONICAL root, because that is what the CLI writes. It
+        // matters on Windows, where a temp dir is handed to us in 8.3 short form
+        // (`RUNNER~1`) and canonicalizing expands it: writing the short spelling
+        // here would test a manifest the CLI never produces, and the two spellings
+        // do not `starts_with`-match.
+        let root = root.canonicalize().expect("canonicalize install root");
         write(
             &dir.join("registry").join(format!("{key}.json")),
             &serde_json::json!({ "runtime_key": key, "install_root": root }).to_string(),
