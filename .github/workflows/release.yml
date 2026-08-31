@@ -144,15 +144,12 @@ jobs:
             --asset "${DIST}.tar.gz" \
             --asset rocm-cli-linux-amd64.tar.gz
 
-      - name: Create release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.value }}"
-          gh release create "${VERSION}" \
-            --draft \
-            --title "rocm-cli ${VERSION}" \
-            --notes "$(cat <<EOF
+          NOTES="$(cat <<EOF
           Install the latest stable release on Linux x86_64:
 
           \`\`\`bash
@@ -171,7 +168,24 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- ${VERSION}
           \`\`\`
           EOF
-          )" \
+          )"
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            EXISTING_BODY="$(gh release view "${VERSION}" --json body -q .body)"
+            if [[ "${EXISTING_BODY}" != *"Install the latest stable release on Linux x86_64"* ]]; then
+              if [ -n "${EXISTING_BODY}" ]; then
+                COMBINED_NOTES="${EXISTING_BODY}"$'\n\n'"${NOTES}"
+                gh release edit "${VERSION}" --notes "${COMBINED_NOTES}"
+              else
+                gh release edit "${VERSION}" --notes "${NOTES}"
+              fi
+            fi
+            gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --draft \
+            --title "rocm-cli ${VERSION}" \
+            --notes "${NOTES}" \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
   windows-release:
