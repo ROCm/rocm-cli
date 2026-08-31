@@ -144,11 +144,15 @@ jobs:
             --asset "${DIST}.tar.gz" \
             --asset rocm-cli-linux-amd64.tar.gz
 
-      - name: Create release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.value }}"
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
+            exit 0
+          fi
           gh release create "${VERSION}" \
             --draft \
             --title "rocm-cli ${VERSION}" \
