@@ -360,8 +360,23 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         }
         Decision::Reuse { reason } => {
             println!("pre-warm: reusing the shared {channel} runtime ({reason})");
-            return Ok(());
         }
+    }
+
+    // Unconditional, and deliberately BEFORE the reuse early return below. The
+    // runtime and the serving engine are installed separately: `install sdk`
+    // lays down the ROCm runtime, `engines install` builds the engine venv
+    // against it. `decide` only ever reasons about the runtime, so a tree whose
+    // runtime is current but whose engine was never installed — or was left
+    // behind with an older runtime — resolves to `Reuse`, which used to return
+    // here having done nothing. The shared tree then served every GPU scenario a
+    // runtime with no engine, which is the one thing those lanes exist to
+    // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
+    // `engines install` on a ready engine installs nothing.
+    ensure_default_engine(&rocm, prewarm_dir)?;
+
+    if !runtime_changed(&decision) {
+        return Ok(());
     }
 
     // An install/update that exits 0 without leaving a registry behind is the
@@ -392,6 +407,59 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         println!("pre-warm: pruning old installs failed ({error:#}); continuing");
     }
     Ok(())
+}
+
+/// Whether `decision` put a new runtime in the tree, and so whether the registry
+/// check and the retention prune at the end of [`run`] have anything to do.
+///
+/// Read AFTER the engine check, never inside the decision's own match arm: the
+/// engine is installed separately from the runtime, so every decision — reuse
+/// most of all, since it is the one a warm runner takes every time — has to
+/// reach that check before this can end the pre-warm early.
+const fn runtime_changed(decision: &Decision) -> bool {
+    !matches!(decision, Decision::Reuse { .. })
+}
+
+/// Install the engine the active runtime would serve on, so the shared tree has
+/// one before a scenario asks it to serve.
+///
+/// Which engine that is comes from the CLI rather than from a constant here:
+/// `rocm engines list` marks the engine `serve` picks for the detected GPU with
+/// `* ` (vLLM on Instinct, Lemonade on Strix), and the pre-warm must agree with
+/// `serve` on every runner without this file learning the hardware map.
+///
+/// Fatal on failure, like [`repair_poisoned_runtimes`] and unlike the freshness
+/// path: reusing a stale-but-working runtime keeps a lane meaningful, whereas
+/// serving with no engine fails every GPU scenario later and for reasons that
+/// name none of this.
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["engines", "list"])
+        .output()
+        .context("failed to run `rocm engines list`")?;
+    if !output.status.success() {
+        bail!("`rocm engines list` exited with {}", output.status);
+    }
+    let inventory = String::from_utf8_lossy(&output.stdout);
+    let engine = default_engine_from_inventory(&inventory)
+        .context("`rocm engines list` did not identify a default engine")?;
+    println!("pre-warm: ensuring the {engine} engine is installed");
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", engine, "--yes"])
+        .status_ok("rocm engines install")
+}
+
+/// The engine `rocm engines list` marks as the default for this host, if any.
+///
+/// The inventory renders one line per engine as `{marker} {name:10} {note}` with
+/// the marker in column 0, then indents that engine's detail lines (`    adapter:
+/// …`, `    runtime: …`) beneath it. Matching `* ` at the start of the line
+/// unindented is therefore what separates the default engine's own line from
+/// everything else the report prints.
+fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
+    inventory
+        .lines()
+        .find_map(|line| line.strip_prefix("* ")?.split_whitespace().next())
 }
 
 /// Drop any managed runtime in the shared tree that records an install root
@@ -729,6 +797,73 @@ mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/
         let poisoned = assess(text, prewarm_runtimes_dir());
         assert_eq!(poisoned.len(), 1);
         assert_eq!(poisoned[0].format, "tarball");
+    }
+
+    /// A real `rocm engines list` on an Instinct host, captured verbatim: the
+    /// default engine's line carries the `* ` marker in column 0, and its own
+    /// detail lines are indented beneath it.
+    const ENGINES_READY: &str = "\
+Local model engines
+  Built-in engines are included with rocm-cli. External plugins are optional.
+  ROCm GPU execution is required.
+  Plugin folders:
+    1. /w/e2e-prewarm/data/engines/plugins (primary)
+  lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    runtime: not found
+* vllm       Linux/WSL ROCm GPU serving engine through external vLLM
+    adapter: built-in
+    runtime: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+  protocol: 0.1.0
+";
+
+    #[test]
+    fn the_marked_engine_is_the_one_pre_warmed() {
+        // Which engine to install comes from the CLI's own host detection, not
+        // from a hardware map duplicated here.
+        assert_eq!(default_engine_from_inventory(ENGINES_READY), Some("vllm"));
+    }
+
+    #[test]
+    fn an_indented_detail_line_is_not_read_as_the_default() {
+        // Every engine's detail lines are indented under it, and a note may well
+        // start with a bullet. Only the marker in column 0 names the default.
+        let inventory = "\
+Local model engines
+* lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    * not a marker
+";
+        assert_eq!(default_engine_from_inventory(inventory), Some("lemonade"));
+    }
+
+    #[test]
+    fn an_inventory_without_a_default_engine_names_none() {
+        // `ensure_default_engine` turns this into an error rather than guessing an
+        // engine: installing the wrong one costs a multi-GiB build and still
+        // leaves the lane with nothing to serve on.
+        assert_eq!(default_engine_from_inventory(""), None);
+        assert_eq!(
+            default_engine_from_inventory("Local model engines\n  lemonade   embedded\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn reusing_the_shared_runtime_still_reaches_the_engine_check() {
+        // The regression this guards: `Reuse` — the decision EVERY warm runner
+        // takes, run after run — used to end `run` with a `return` inside its own
+        // match arm, before anything looked at the engine. The early return is now
+        // this predicate, read only AFTER `ensure_default_engine`, so reuse cannot
+        // skip the engine. Reuse must still install and update NOTHING, which is
+        // what keeps it cheap enough to re-check the engine on every run.
+        assert!(!runtime_changed(&Decision::Reuse {
+            reason: "up to date".to_owned()
+        }));
+        assert!(runtime_changed(&Decision::Install));
+        assert!(runtime_changed(&Decision::Update {
+            runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+        }));
     }
 
     #[test]
