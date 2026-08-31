@@ -149,14 +149,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.value }}"
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
-            exit 0
-          fi
-          gh release create "${VERSION}" \
-            --draft \
-            --title "rocm-cli ${VERSION}" \
-            --notes "$(cat <<EOF
+          NOTES="$(cat <<EOF
           Install the latest stable release on Linux x86_64:
 
           \`\`\`bash
@@ -175,7 +168,16 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- ${VERSION}
           \`\`\`
           EOF
-          )" \
+          )"
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release edit "${VERSION}" --notes "${NOTES}"
+            gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --draft \
+            --title "rocm-cli ${VERSION}" \
+            --notes "${NOTES}" \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
   windows-release:
