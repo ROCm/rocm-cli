@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
+    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
+    detect_host_gpu_diagnostics, detect_managed_therock_family, disk_space, ensure_uv_binary,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
@@ -32,6 +32,14 @@ const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl";
 const THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
+/// ROCm 10's flat, extras-based pip index ("next" layout), distinct from the
+/// legacy per-family PEP503 directory layout above.
+const THEROCK_NEXT_RELEASE_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
+/// ROCm 10's tarball listing ("next" layout). Same scrapeable HTML format as
+/// the legacy tarball base, but with different family naming and extra
+/// non-release sibling files (see `tarball_family_token`, the `-tests-`
+/// filter in `resolve_tarball_artifact_from_base`).
+const THEROCK_NEXT_RELEASE_TARBALL_BASE: &str = "https://stable.repo.amd.com/rocm/core/tarball/";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
@@ -111,19 +119,98 @@ impl TheRockChannel {
             Self::Nightly => "nightly",
         }
     }
+}
 
-    const fn tarball_base_url(self) -> &'static str {
+/// Which AMD hosting layout a candidate index/tarball base belongs to.
+///
+/// Orthogonal to [`TheRockChannel`] (release/nightly): a `Release` install can
+/// have both a `Next` (ROCm 10, `stable.repo.amd.com`) and a `Legacy`
+/// candidate, tried in that order. `Nightly` has no confirmed `Next`
+/// equivalent, so it stays `Legacy`-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TheRockIndexGeneration {
+    Legacy,
+    Next,
+}
+
+impl TheRockIndexGeneration {
+    const fn as_str(self) -> &'static str {
         match self {
-            Self::Release => THEROCK_RELEASE_TARBALL_BASE,
-            Self::Nightly => THEROCK_NIGHTLY_TARBALL_BASE,
+            Self::Legacy => "legacy",
+            Self::Next => "next",
         }
     }
+}
+
+/// Reads `env_var` for a test/operator override of a hardcoded base URL,
+/// falling back to `default` when unset or blank. Mirrors the existing
+/// `ROCM_CLI_THEROCK_FAMILY` override precedent so every base used to resolve
+/// TheRock artifacts can be pointed at a fixture server in tests.
+fn env_override_base(env_var: &str, default: &str) -> String {
+    std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn release_pip_index_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_RELEASE_PIP_BASE",
+        THEROCK_RELEASE_PIP_INDEX_BASE,
+    )
+}
+
+fn release_pip_multi_arch_index_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_RELEASE_PIP_MULTI_ARCH_BASE",
+        THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE,
+    )
+}
+
+fn nightly_pip_index_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE",
+        THEROCK_NIGHTLY_PIP_INDEX_BASE,
+    )
+}
+
+fn next_release_pip_index_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_NEXT_RELEASE_PIP_BASE",
+        THEROCK_NEXT_RELEASE_PIP_INDEX_BASE,
+    )
+}
+
+fn release_tarball_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        THEROCK_RELEASE_TARBALL_BASE,
+    )
+}
+
+fn nightly_tarball_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE",
+        THEROCK_NIGHTLY_TARBALL_BASE,
+    )
+}
+
+fn next_release_tarball_base() -> String {
+    env_override_base(
+        "ROCM_CLI_THEROCK_NEXT_RELEASE_TARBALL_BASE",
+        THEROCK_NEXT_RELEASE_TARBALL_BASE,
+    )
 }
 
 #[derive(Debug, Clone)]
 struct FamilyResolution {
     family: String,
     source: String,
+    /// The raw, un-normalized GPU arch code (e.g. `gfx1200`), when known.
+    /// Required to build a `Next`-generation pip extra (`device-<raw_arch>`);
+    /// `None` whenever only a grouped family label is available.
+    raw_arch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +218,8 @@ struct PipRuntimeResolution {
     family: String,
     family_source: String,
     index_url: String,
+    generation: TheRockIndexGeneration,
+    raw_arch: Option<String>,
     latest_version: String,
     package_versions: TheRockPipPackageVersions,
 }
@@ -251,6 +340,8 @@ pub(crate) struct InstalledRuntimeManifest {
     pub format: String,
     pub family: String,
     pub family_source: String,
+    #[serde(default)]
+    pub raw_arch: Option<String>,
     pub version: String,
     pub install_root: PathBuf,
     pub selected_artifact_url: String,
@@ -631,6 +722,7 @@ fn resolve_latest_for_manifest(
                 paths,
                 channel,
                 Some(manifest.family.as_str()),
+                manifest.raw_arch.as_deref(),
                 &wheel_compatibility,
                 None,
                 download_timeout_secs,
@@ -827,6 +919,7 @@ fn install_wheel_runtime(
         paths,
         channel,
         family_override,
+        None,
         &wheel_compatibility,
         version_selector,
     )?;
@@ -888,7 +981,12 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" ")
+        therock_pip_package_specs(
+            &resolution.package_versions,
+            resolution.generation,
+            resolution.raw_arch.as_deref(),
+        )
+        .join(" ")
     );
     let _ = writeln!(
         output,
@@ -901,7 +999,11 @@ fn install_wheel_runtime(
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
-        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+        install_args.extend(therock_pip_package_specs(
+            &resolution.package_versions,
+            resolution.generation,
+            resolution.raw_arch.as_deref(),
+        ));
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
         let venv_args_display = venv_args
             .iter()
@@ -941,7 +1043,12 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        therock_pip_package_specs(
+            &resolution.package_versions,
+            resolution.generation,
+            resolution.raw_arch.as_deref(),
+        )
+        .join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -949,7 +1056,11 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+    install_args.extend(therock_pip_package_specs(
+        &resolution.package_versions,
+        resolution.generation,
+        resolution.raw_arch.as_deref(),
+    ));
     run_uv_progress_command(
         paths,
         &uv,
@@ -976,6 +1087,7 @@ fn install_wheel_runtime(
         format: "wheel".to_owned(),
         family: resolution.family.clone(),
         family_source: resolution.family_source.clone(),
+        raw_arch: resolution.raw_arch.clone(),
         version: installed_version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: resolution.index_url.clone(),
@@ -1021,11 +1133,30 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    generation: TheRockIndexGeneration,
+    raw_arch: Option<&str>,
+) -> Vec<String> {
+    let Some(raw_arch) = raw_arch.filter(|_| matches!(generation, TheRockIndexGeneration::Next))
+    else {
+        return vec![
+            format!("rocm[libraries,devel]=={}", package_versions.rocm),
+            format!("torch=={}", package_versions.torch),
+            format!("torchvision=={}", package_versions.torchvision),
+            format!("torchaudio=={}", package_versions.torchaudio),
+        ];
+    };
     vec![
-        format!("rocm[libraries,devel]=={}", package_versions.rocm),
-        format!("torch=={}", package_versions.torch),
-        format!("torchvision=={}", package_versions.torchvision),
+        format!(
+            "rocm[libraries,devel,device-{raw_arch}]=={}",
+            package_versions.rocm
+        ),
+        format!("torch[device-{raw_arch}]=={}", package_versions.torch),
+        format!(
+            "torchvision[device-{raw_arch}]=={}",
+            package_versions.torchvision
+        ),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
 }
@@ -1105,6 +1236,7 @@ fn install_tarball_runtime(
         format: "tarball".to_owned(),
         family: artifact.family.clone(),
         family_source: artifact.family_source.clone(),
+        raw_arch: None,
         version: artifact.version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: artifact.url.clone(),
@@ -1130,6 +1262,7 @@ fn resolve_pip_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    raw_arch_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
 ) -> Result<PipRuntimeResolution> {
@@ -1137,6 +1270,7 @@ fn resolve_pip_runtime(
         paths,
         channel,
         family_override,
+        raw_arch_override,
         wheel_compatibility,
         version_selector,
         None,
@@ -1147,17 +1281,27 @@ fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    raw_arch_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
-    let family_resolution = resolve_family(paths, family_override)?;
-    let index_urls = therock_index_urls(channel, &family_resolution.family);
+    let mut family_resolution = resolve_family(paths, family_override)?;
+    if let Some(raw_arch) = raw_arch_override {
+        family_resolution.raw_arch = Some(raw_arch.to_owned());
+    }
+    let index_candidates = therock_pip_index_candidates(
+        channel,
+        &family_resolution.family,
+        family_resolution.raw_arch.as_deref(),
+        version_selector,
+    );
     let mut errors = Vec::new();
-    for index_url in index_urls {
+    for (generation, index_url) in index_candidates {
         match resolve_pip_runtime_from_index(
             paths,
             channel,
+            generation,
             &family_resolution,
             &index_url,
             wheel_compatibility,
@@ -1181,9 +1325,11 @@ fn resolve_pip_runtime_with_timeout(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
+    generation: TheRockIndexGeneration,
     family_resolution: &FamilyResolution,
     index_url: &str,
     wheel_compatibility: &WheelCompatibility,
@@ -1242,6 +1388,8 @@ fn resolve_pip_runtime_from_index(
         family: family_resolution.family.clone(),
         family_source: family_resolution.source.clone(),
         index_url: index_url.to_owned(),
+        generation,
+        raw_arch: family_resolution.raw_arch.clone(),
         latest_version,
         package_versions,
     })
@@ -1262,29 +1410,115 @@ fn resolve_tarball_artifact_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
+    let mut errors = Vec::new();
+    for (generation, base_url) in therock_tarball_base_candidates(channel) {
+        match resolve_tarball_artifact_from_base(
+            paths,
+            channel,
+            generation,
+            &family_resolution,
+            &base_url,
+            download_timeout_secs,
+        ) {
+            Ok(artifact) => return Ok(artifact),
+            Err(error) => errors.push(format!("{base_url}: {error}")),
+        }
+    }
+    bail!(
+        "failed to resolve a TheRock tarball artifact from candidate sources:\n  - {}\n\n{}",
+        errors.join("\n  - "),
+        family_resolution_hint(
+            &family_resolution.source,
+            &family_resolution.family,
+            channel,
+            "tarball",
+        )
+    )
+}
+
+/// The tarball listing bases to try, in order, for `channel`. `Release` tries
+/// ROCm 10's `Next` layout before falling back to the `Legacy` layout, so
+/// GPU families dropped from the new listing (e.g. `gfx900`) still resolve
+/// via the existing legacy index.
+fn therock_tarball_base_candidates(
+    channel: TheRockChannel,
+) -> Vec<(TheRockIndexGeneration, String)> {
+    match channel {
+        TheRockChannel::Release => vec![
+            (TheRockIndexGeneration::Next, next_release_tarball_base()),
+            (TheRockIndexGeneration::Legacy, release_tarball_base()),
+        ],
+        TheRockChannel::Nightly => vec![(TheRockIndexGeneration::Legacy, nightly_tarball_base())],
+    }
+}
+
+/// ROCm 10's tarball listing renames the `gfx103X-dgpu` family filename token
+/// to `gfx103X-all`; every other family keeps its canonical name. Confined to
+/// this call site rather than the shared `normalize_therock_family` so the
+/// tarball-only naming quirk doesn't leak into pip resolution or manifests.
+fn tarball_family_token(generation: TheRockIndexGeneration, family: &str) -> &str {
+    if matches!(generation, TheRockIndexGeneration::Next) && family == "gfx103X-dgpu" {
+        "gfx103X-all"
+    } else {
+        family
+    }
+}
+
+fn resolve_tarball_artifact_from_base(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    generation: TheRockIndexGeneration,
+    family_resolution: &FamilyResolution,
+    base_url: &str,
+    download_timeout_secs: Option<u64>,
+) -> Result<TarballArtifact> {
     let html = download_text_cached(
         paths,
-        &format!("tarball-index-{}", channel.as_str()),
-        channel.tarball_base_url(),
+        &format!("tarball-index-{}-{}", channel.as_str(), generation.as_str()),
+        base_url,
         download_timeout_secs,
     )?
     .text;
     let files = parse_tarball_index_html(&html)?;
+    let family_token = tarball_family_token(generation, &family_resolution.family);
     let prefix = format!(
         "therock-dist-{}-{}-",
         platform_tarball_token(),
-        family_resolution.family
+        family_token
     );
+    let (file, version) = select_tarball_artifact(files, &prefix)
+        .context("no matching TheRock tarball artifact was found in this index")?;
+    Ok(TarballArtifact {
+        family: family_resolution.family.clone(),
+        family_source: family_resolution.source.clone(),
+        url: format!("{}/{}", base_url.trim_end_matches('/'), file.name),
+        file_name: file.name,
+        version,
+    })
+}
+
+/// Picks the newest real dist artifact matching `prefix` out of a tarball
+/// index listing. Requiring the extracted version suffix to actually parse
+/// (via [`parse_version`]) excludes non-release sibling files that TheRock's
+/// "next" listing includes alongside the real dist file (e.g. a
+/// `-tests-...` artifact with a later mtime than the dist file it shadows);
+/// this is a no-op against legacy listings, which are all version-shaped
+/// already.
+fn select_tarball_artifact(
+    files: Vec<TarballIndexFile>,
+    prefix: &str,
+) -> Option<(TarballIndexFile, String)> {
     let mut candidates = files
         .into_iter()
         .filter_map(|file| {
             let version = file
                 .name
-                .strip_prefix(&prefix)?
+                .strip_prefix(prefix)?
                 .strip_suffix(".tar.gz")?
                 .to_owned();
             Some((file, version))
         })
+        .filter(|(_file, version)| parse_version(version).is_some())
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.0
@@ -1293,28 +1527,24 @@ fn resolve_tarball_artifact_with_timeout(
             .unwrap_or(Ordering::Equal)
             .then_with(|| compare_version_strings(&left.1, &right.1))
     });
-    let (file, version) = candidates.pop().with_context(|| {
-        format!(
-            "no matching TheRock tarball artifact was found for the resolved GPU family\n\n{}",
-            family_resolution_hint(
-                &family_resolution.source,
-                &family_resolution.family,
-                channel,
-                "tarball",
-            )
-        )
-    })?;
-    Ok(TarballArtifact {
-        family: family_resolution.family,
-        family_source: family_resolution.source,
-        url: format!(
-            "{}/{}",
-            channel.tarball_base_url().trim_end_matches('/'),
-            file.name
-        ),
-        file_name: file.name,
-        version,
-    })
+    candidates.pop()
+}
+
+/// Whether `value` is itself a recognized grouped family label (case-insensitive).
+/// Used to tell a specific raw GPU arch code (e.g. `gfx1200`) apart from an
+/// already-grouped `--family`/env override (e.g. `gfx120X-all`); only the
+/// former carries usable `raw_arch` information for a `Next`-generation pip
+/// extra.
+fn family_override_raw_arch(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || known_therock_families()
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(trimmed))
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
@@ -1324,6 +1554,7 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "manifest".to_owned(),
+            raw_arch: family_override_raw_arch(value),
         });
     }
 
@@ -1333,6 +1564,7 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "env".to_owned(),
+            raw_arch: family_override_raw_arch(&value),
         });
     }
 
@@ -1340,13 +1572,17 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "managed-runtime".to_owned(),
+            raw_arch: None,
         });
     }
 
-    if let Some(family) = detect_host_therock_family() {
+    if let Some(raw_arch) = detect_host_gfx_target()
+        && let Some(family) = normalize_therock_family(&raw_arch)
+    {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
+            raw_arch: Some(raw_arch),
         });
     }
 
@@ -3684,13 +3920,67 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
-    match channel {
+/// Legacy per-family PEP503 pip index candidates: byte-for-byte the same URLs
+/// and order the CLI has always tried, now built from the env-override-aware
+/// base accessors instead of the raw consts.
+fn legacy_pip_index_candidates(
+    channel: TheRockChannel,
+    family: &str,
+) -> Vec<(TheRockIndexGeneration, String)> {
+    let urls = match channel {
         TheRockChannel::Release => vec![
-            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
-            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
+            format!("{}/{family}", release_pip_index_base()),
+            format!("{}/{family}", release_pip_multi_arch_index_base()),
         ],
-        TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
+        TheRockChannel::Nightly => vec![format!("{}/{family}", nightly_pip_index_base())],
+    };
+    urls.into_iter()
+        .map(|url| (TheRockIndexGeneration::Legacy, url))
+        .collect()
+}
+
+/// ROCm 10's flat, extras-based pip index. Release-channel only (no confirmed
+/// nightly equivalent), and only usable when a raw GPU arch code is known to
+/// build the `device-<arch>` extra from.
+fn next_pip_index_candidate(
+    channel: TheRockChannel,
+    raw_arch: Option<&str>,
+) -> Option<(TheRockIndexGeneration, String)> {
+    if !matches!(channel, TheRockChannel::Release) || raw_arch.is_none() {
+        return None;
+    }
+    Some((TheRockIndexGeneration::Next, next_release_pip_index_base()))
+}
+
+/// Chooses which generation(s) of pip index to try, and in what order.
+///
+/// A pinned `Version` selector is decisive: ROCm 10+ only exists in the
+/// `Next` layout, and anything older only exists in `Legacy`, so trying the
+/// other generation would just waste a request. With no selector (latest) or
+/// a `BuildDate` selector (which doesn't carry a parseable major version),
+/// `Next` is tried first, falling back to `Legacy`. In every branch, `Next`
+/// is dropped whenever `raw_arch` is unavailable to build its pip extra.
+fn therock_pip_index_candidates(
+    channel: TheRockChannel,
+    family: &str,
+    raw_arch: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Vec<(TheRockIndexGeneration, String)> {
+    match version_selector {
+        Some(RuntimeVersionSelector::Version(value)) => {
+            match parse_version(value).map(|parsed| parsed.major) {
+                Some(major) if major >= 10 => next_pip_index_candidate(channel, raw_arch)
+                    .into_iter()
+                    .collect(),
+                _ => legacy_pip_index_candidates(channel, family),
+            }
+        }
+        Some(RuntimeVersionSelector::BuildDate(_)) | None => {
+            next_pip_index_candidate(channel, raw_arch)
+                .into_iter()
+                .chain(legacy_pip_index_candidates(channel, family))
+                .collect()
+        }
     }
 }
 
@@ -3914,6 +4204,98 @@ mod tests {
     // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
     // can fail with ENOENT while another test has temporarily narrowed `PATH`.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tarball_base_candidates_try_next_before_legacy_on_release_only() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let release = therock_tarball_base_candidates(TheRockChannel::Release);
+        assert_eq!(
+            release
+                .iter()
+                .map(|(generation, _)| *generation)
+                .collect::<Vec<_>>(),
+            vec![TheRockIndexGeneration::Next, TheRockIndexGeneration::Legacy],
+        );
+        assert_eq!(release[0].1, THEROCK_NEXT_RELEASE_TARBALL_BASE);
+        assert_eq!(release[1].1, THEROCK_RELEASE_TARBALL_BASE);
+
+        let nightly = therock_tarball_base_candidates(TheRockChannel::Nightly);
+        assert_eq!(
+            nightly
+                .iter()
+                .map(|(generation, _)| *generation)
+                .collect::<Vec<_>>(),
+            vec![TheRockIndexGeneration::Legacy],
+        );
+        assert_eq!(nightly[0].1, THEROCK_NIGHTLY_TARBALL_BASE);
+    }
+
+    #[test]
+    fn tarball_family_token_renames_only_next_generation_dgpu_family() {
+        assert_eq!(
+            tarball_family_token(TheRockIndexGeneration::Next, "gfx103X-dgpu"),
+            "gfx103X-all"
+        );
+        assert_eq!(
+            tarball_family_token(TheRockIndexGeneration::Legacy, "gfx103X-dgpu"),
+            "gfx103X-dgpu"
+        );
+        assert_eq!(
+            tarball_family_token(TheRockIndexGeneration::Next, "gfx90a-dcgpu"),
+            "gfx90a-dcgpu"
+        );
+    }
+
+    /// Fixture mtimes are the confirmed live values from ROCm 10's tarball
+    /// listing for gfx90a: the `-tests-` sibling has a *later* mtime
+    /// (1787612032.0) than the real dist artifact (1787612008.0), so a naive
+    /// "highest mtime wins" selection picks the wrong file.
+    #[test]
+    fn tarball_selection_excludes_non_version_sibling_files() {
+        let prefix = "therock-dist-linux-gfx90a-dcgpu-";
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}7.10.0.tar.gz"),
+                mtime: 1_787_612_008.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}tests-7.10.0.tar.gz"),
+                mtime: 1_787_612_032.0,
+            },
+        ];
+        let (file, version) = select_tarball_artifact(files, prefix)
+            .expect("the real dist artifact must be selected");
+        assert_eq!(file.name, format!("{prefix}7.10.0.tar.gz"));
+        assert_eq!(version, "7.10.0");
+    }
+
+    #[test]
+    fn tarball_selection_is_unaffected_when_no_sibling_files_are_present() {
+        let prefix = "therock-dist-linux-gfx1100-";
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}6.5.0.tar.gz"),
+                mtime: 100.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}6.6.0.tar.gz"),
+                mtime: 200.0,
+            },
+        ];
+        let (file, version) =
+            select_tarball_artifact(files, prefix).expect("the newest artifact must be selected");
+        assert_eq!(file.name, format!("{prefix}6.6.0.tar.gz"));
+        assert_eq!(version, "6.6.0");
+    }
+
+    #[test]
+    fn tarball_selection_returns_none_when_nothing_matches_the_prefix() {
+        let files = vec![TarballIndexFile {
+            name: "therock-dist-linux-gfx1100-6.5.0.tar.gz".to_owned(),
+            mtime: 100.0,
+        }];
+        assert!(select_tarball_artifact(files, "therock-dist-linux-gfx90a-dcgpu-").is_none());
+    }
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -4383,7 +4765,8 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions);
+        let package_specs =
+            therock_pip_package_specs(&package_versions, TheRockIndexGeneration::Legacy, None);
 
         assert_eq!(
             package_specs,
@@ -4394,6 +4777,185 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn pip_package_specs_use_device_extras_for_next_generation() {
+        let package_versions = TheRockPipPackageVersions {
+            rocm: "10.0.0".to_owned(),
+            torch: "2.10.0+rocm10.0.0".to_owned(),
+            torchvision: "0.25.0+rocm10.0.0".to_owned(),
+            torchaudio: "2.10.0+rocm10.0.0".to_owned(),
+            compatibility_key: "10.0.0".to_owned(),
+        };
+
+        let package_specs = therock_pip_package_specs(
+            &package_versions,
+            TheRockIndexGeneration::Next,
+            Some("gfx1200"),
+        );
+
+        assert_eq!(
+            package_specs,
+            vec![
+                "rocm[libraries,devel,device-gfx1200]==10.0.0".to_owned(),
+                "torch[device-gfx1200]==2.10.0+rocm10.0.0".to_owned(),
+                "torchvision[device-gfx1200]==0.25.0+rocm10.0.0".to_owned(),
+                "torchaudio==2.10.0+rocm10.0.0".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pip_package_specs_fall_back_to_legacy_shape_when_raw_arch_is_missing() {
+        let package_versions = TheRockPipPackageVersions {
+            rocm: "10.0.0".to_owned(),
+            torch: "2.10.0+rocm10.0.0".to_owned(),
+            torchvision: "0.25.0+rocm10.0.0".to_owned(),
+            torchaudio: "2.10.0+rocm10.0.0".to_owned(),
+            compatibility_key: "10.0.0".to_owned(),
+        };
+
+        let package_specs =
+            therock_pip_package_specs(&package_versions, TheRockIndexGeneration::Next, None);
+
+        assert_eq!(
+            package_specs,
+            vec![
+                "rocm[libraries,devel]==10.0.0".to_owned(),
+                "torch==2.10.0+rocm10.0.0".to_owned(),
+                "torchvision==0.25.0+rocm10.0.0".to_owned(),
+                "torchaudio==2.10.0+rocm10.0.0".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn family_override_raw_arch_distinguishes_raw_codes_from_grouped_labels() {
+        assert_eq!(
+            family_override_raw_arch("gfx1200"),
+            Some("gfx1200".to_owned())
+        );
+        assert_eq!(family_override_raw_arch("gfx120X-all"), None);
+        assert_eq!(family_override_raw_arch("GFX120X-ALL"), None);
+        assert_eq!(family_override_raw_arch(""), None);
+        assert_eq!(family_override_raw_arch("   "), None);
+    }
+
+    #[test]
+    fn pip_index_candidates_with_no_selector_tries_next_before_legacy_on_release() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let candidates = therock_pip_index_candidates(
+            TheRockChannel::Release,
+            "gfx120X-all",
+            Some("gfx1200"),
+            None,
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(generation, _)| *generation)
+                .collect::<Vec<_>>(),
+            vec![
+                TheRockIndexGeneration::Next,
+                TheRockIndexGeneration::Legacy,
+                TheRockIndexGeneration::Legacy,
+            ],
+        );
+        assert_eq!(candidates[0].1, THEROCK_NEXT_RELEASE_PIP_INDEX_BASE);
+        assert_eq!(
+            candidates[1].1,
+            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/gfx120X-all")
+        );
+        assert_eq!(
+            candidates[2].1,
+            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/gfx120X-all")
+        );
+    }
+
+    #[test]
+    fn pip_index_candidates_with_no_selector_on_nightly_are_unchanged() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let candidates = therock_pip_index_candidates(
+            TheRockChannel::Nightly,
+            "gfx120X-all",
+            Some("gfx1200"),
+            None,
+        );
+
+        assert_eq!(
+            candidates,
+            vec![(
+                TheRockIndexGeneration::Legacy,
+                format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/gfx120X-all")
+            )],
+        );
+    }
+
+    #[test]
+    fn pip_index_candidates_with_pinned_pre_rocm10_version_are_legacy_only() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let selector = RuntimeVersionSelector::version("7.13.0a20260513").unwrap();
+        let candidates = therock_pip_index_candidates(
+            TheRockChannel::Release,
+            "gfx120X-all",
+            Some("gfx1200"),
+            Some(&selector),
+        );
+
+        assert_eq!(
+            candidates,
+            legacy_pip_index_candidates(TheRockChannel::Release, "gfx120X-all"),
+        );
+    }
+
+    #[test]
+    fn pip_index_candidates_with_pinned_rocm10_version_are_next_only() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let selector = RuntimeVersionSelector::version("10.0.0").unwrap();
+        let candidates = therock_pip_index_candidates(
+            TheRockChannel::Release,
+            "gfx120X-all",
+            Some("gfx1200"),
+            Some(&selector),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![(
+                TheRockIndexGeneration::Next,
+                THEROCK_NEXT_RELEASE_PIP_INDEX_BASE.to_owned()
+            )],
+        );
+    }
+
+    #[test]
+    fn pip_index_candidates_without_raw_arch_never_include_next_generation() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+
+        // No selector: this is the key backward-compat regression case. A caller
+        // that cannot supply a raw GPU arch code (e.g. a managed-runtime family
+        // with no raw arch on record) must fall back to exactly today's
+        // legacy-only candidate list, regardless of channel or version.
+        let no_selector =
+            therock_pip_index_candidates(TheRockChannel::Release, "gfx120X-all", None, None);
+        assert_eq!(
+            no_selector,
+            legacy_pip_index_candidates(TheRockChannel::Release, "gfx120X-all"),
+        );
+
+        // Pinned ROCm 10+ version with no raw arch: Next is unusable without an
+        // arch to build its extra from, so no candidates at all (not a Legacy
+        // fallback, since Legacy structurally cannot host a `+rocm10.x` package).
+        let rocm10_selector = RuntimeVersionSelector::version("10.0.0").unwrap();
+        let pinned = therock_pip_index_candidates(
+            TheRockChannel::Release,
+            "gfx120X-all",
+            None,
+            Some(&rocm10_selector),
+        );
+        assert!(pinned.is_empty());
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it
@@ -5628,6 +6190,7 @@ echo Python 3.12.10
                 .split_once(':')
                 .map_or_else(|| "gfx120X-all".to_owned(), |(_, family)| family.to_owned()),
             family_source: "test".to_owned(),
+            raw_arch: None,
             version: "7.13.0a20260416".to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/rocm".to_owned(),
