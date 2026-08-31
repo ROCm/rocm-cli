@@ -886,7 +886,7 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm (with any resolved device extras), torch, torchvision, and torchaudio versions in one uv transaction"
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
