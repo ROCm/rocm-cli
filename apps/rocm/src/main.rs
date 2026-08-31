@@ -766,7 +766,7 @@ enum ComfyuiCommand {
     },
     /// Install ComfyUI into ROCm CLI's app folder.
     Install {
-        /// ROCm runtime key to use.
+        /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
         /// Reinstall even if ComfyUI already exists.

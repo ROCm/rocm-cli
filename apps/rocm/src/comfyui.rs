@@ -1039,10 +1039,20 @@ fn select_runtime(
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .with_context(|| {
-            "The selected ROCm install does not have a Python executable. Choose another ROCm install from /runtimes."
+            "The selected ROCm runtime has no Python executable. Pick another in `/runtimes` or pass `--runtime-id <key>`. See `rocm runtimes list`."
                 .to_string()
         })?;
     Ok(SelectedRuntime { manifest, python })
+}
+
+fn format_available_runtime_keys<'a>(
+    manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
+) -> String {
+    manifests
+        .into_iter()
+        .map(|manifest| manifest.runtime_key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn select_default_runtime<'a>(
@@ -1062,9 +1072,17 @@ fn select_default_runtime<'a>(
     match matches.as_slice() {
         [manifest] => Ok(*manifest),
         [] => {
-            bail!("The configured default ROCm install was not found. Choose one from /runtimes.")
+            let available = format_available_runtime_keys(manifests);
+            bail!(
+                "The configured default ROCm runtime was not found. Re-activate one with `rocm runtimes activate <key>` or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+            )
         }
-        _ => bail!("More than one ROCm install matches the default. Choose one from /runtimes."),
+        _ => {
+            let available = format_available_runtime_keys(matches.iter().copied());
+            bail!(
+                "More than one ROCm runtime matches the configured default. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+            )
+        }
     }
 }
 
@@ -1077,8 +1095,15 @@ fn select_single_ready_runtime(
         .collect::<Vec<_>>();
     match ready.as_slice() {
         [manifest] => Ok(*manifest),
-        [] => bail!("Choose a ROCm install from /runtimes before installing ComfyUI."),
-        _ => bail!("More than one ROCm install is ready. Choose one from /runtimes."),
+        [] => bail!(
+            "No ROCm runtime is ready. Set up ROCm first from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI."
+        ),
+        _ => {
+            let available = format_available_runtime_keys(ready.iter().copied());
+            bail!(
+                "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+            )
+        }
     }
 }
 
@@ -1098,10 +1123,18 @@ fn select_runtime_by_selector<'a>(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [manifest] => Ok(*manifest),
-        [] => bail!("ROCm install not found: {selector}"),
-        _ => bail!(
-            "More than one ROCm install matches `{selector}`. Choose the exact runtime key from /runtimes."
-        ),
+        [] => {
+            let available = format_available_runtime_keys(manifests);
+            bail!(
+                "ROCm runtime not found: `{selector}`. Re-activate one with `rocm runtimes activate <key>` or pass a runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+            )
+        }
+        _ => {
+            let available = format_available_runtime_keys(matches.iter().copied());
+            bail!(
+                "More than one ROCm runtime matches `{selector}`. Pass the exact runtime key with `--runtime-id <key>` or pick one in `/runtimes`. Available: {available}. See `rocm runtimes list`."
+            )
+        }
     }
 }
 
@@ -2121,6 +2154,41 @@ mod tests {
         assert_eq!(
             selected.runtime_key,
             "release-pip-gfx120x-all-7-13-0a20260511"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_ready_runtimes_name_flag_and_list_keys() -> Result<()> {
+        let paths = test_paths("comfyui-ambiguous-ready-runtimes");
+        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
+
+        let manifests = [release, nightly];
+        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
+            .expect_err("two ready runtimes should be ambiguous");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("--runtime-id <key>"),
+            "error should name the real flag, got: {message}"
+        );
+        assert!(
+            message.contains("release-wheel-gfx94x-dcgpu-7-13-0")
+                && message.contains("nightly-wheel-gfx94x-dcgpu-7-14-0"),
+            "error should list the available runtime keys, got: {message}"
+        );
+        assert!(
+            message.contains("rocm runtimes list"),
+            "error should point to `rocm runtimes list`, got: {message}"
+        );
+        assert!(
+            message.contains("/runtimes"),
+            "error should offer the TUI `/runtimes` remediation, got: {message}"
+        );
+        assert!(
+            message.contains("rocm runtimes activate"),
+            "error should offer the durable `rocm runtimes activate` remediation, got: {message}"
         );
         Ok(())
     }
