@@ -5034,6 +5034,22 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
+    // Validate an explicit `--gpu <index>` up front — before engine/runtime
+    // resolution — so an out-of-range or masked-out ordinal produces a
+    // GPU-specific refusal even when no ROCm runtime is configured. Otherwise the
+    // "no active ROCm runtime is configured" bail-out below pre-empts it and the
+    // user sees a generic runtime error for what is really a bad `--gpu` value.
+    // This is pure validation (no service-state read), so it needs no lock;
+    // `--gpu auto` reads live busy-GPU state and stays under `launch_lock` below.
+    let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
+        Some(validate_pinned_gpu_index(
+            *index,
+            detect_gpu_count(),
+            visible_gpu_indices.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -5075,15 +5091,21 @@ fn serve(args: ServeArgs) -> Result<()> {
     // it. Acquired here — after engine resolution, self-managed runtime prep, and
     // the `ResolveModel` RPC have all completed unlocked — so a slow first-use
     // install (e.g. the Lemonade embeddable download/extract) never blocks an
-    // unrelated serve. The guard spans only GPU selection, the serve-plan
-    // rendering below, and the claiming record write, then is dropped once the
-    // record is persisted (before the readiness wait). Explicit-index and
-    // CPU-only launches take it too, so the select-then-claim ordering is uniform;
+    // unrelated serve. The guard spans only `--gpu auto`'s busy-GPU read, the
+    // serve-plan rendering below, and the claiming record write, then is dropped
+    // once the record is persisted (before the readiness wait). Explicit-index and
+    // CPU-only launches hold it too — their selection is already fixed (the index
+    // was validated above) — so the claim-record write stays uniformly serialized;
     // with the install moved out of the critical section they hold it only briefly.
     let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
     let gpu_indices = if cpu_only {
         Vec::new()
+    } else if let Some(indices) = pinned_gpu_indices {
+        // Explicit `--gpu <index>`: validated before runtime resolution above.
+        indices
     } else {
+        // `--gpu auto`: read live busy-GPU state under the lock so a concurrent
+        // claim cannot make two serves land on the same idle GPU.
         resolve_gpu_indices(
             &paths,
             &gpu_selection,
