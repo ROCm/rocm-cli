@@ -7627,6 +7627,24 @@ fn install_error_reports_version_unavailable(error: &str) -> bool {
         || error.contains("has no version")
 }
 
+/// Whether the user has opted out of realigning torch.
+///
+/// The alignment rewrites a package the user may have installed deliberately, and
+/// it runs on every path that installs an engine, so a hand-installed torch is
+/// otherwise replaced again by the next `engines install`, `install sdk`, or
+/// `engines shell`. The stack this resolves to — the SDK's build of the release
+/// the engine pins — is not validated against the supported matrix, so "the SDK's
+/// build does not work on this machine" is a case that can happen rather than a
+/// hypothetical one, and it needs an exit that is not "stop using the CLI".
+///
+/// Checked before the probe runs, so opting out skips the rewrite rather than
+/// performing it and describing it differently. The dependency and device checks
+/// still run: this suppresses the correction, not the diagnosis, and a runtime
+/// that cannot open a device is still reported as one.
+fn torch_alignment_disabled() -> bool {
+    std::env::var_os("ROCM_CLI_DISABLE_TORCH_ALIGNMENT").is_some()
+}
+
 fn align_runtime_torch(
     paths: &AppPaths,
     python: &Path,
@@ -7634,6 +7652,11 @@ fn align_runtime_torch(
     sdk_build: Option<&str>,
     engine: &str,
 ) -> TorchAlignment {
+    if torch_alignment_disabled() {
+        return TorchAlignment::NotApplicable(
+            "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT".to_owned(),
+        );
+    }
     let probe = match therock::probe_torch_alignment(python, engine) {
         Ok(probe) => probe,
         Err(error) => return TorchAlignment::NotApplicable(error.to_string()),
@@ -27102,6 +27125,62 @@ ID_LIKE="suse opensuse"
         manifest.sdk_torch = None;
 
         assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
+    }
+
+    /// Opting out skips the rewrite without needing a runtime that answers.
+    ///
+    /// The gate has to precede the probe. Someone reaches for it precisely when the
+    /// SDK's build does not work on their machine, so it cannot depend on that
+    /// machine probing cleanly first. Pointing it at a Python that does not exist
+    /// would otherwise produce a probe failure; getting the opt-out reason back
+    /// instead is what shows nothing ran.
+    #[test]
+    fn disabling_alignment_skips_the_rewrite_before_anything_is_probed() {
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1");
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            Some("https://example.invalid/simple"),
+            Some("rocm7.13.0"),
+            "vllm",
+        );
+
+        assert_eq!(
+            outcome,
+            TorchAlignment::NotApplicable(
+                "torch alignment is disabled by ROCM_CLI_DISABLE_TORCH_ALIGNMENT".to_owned()
+            )
+        );
+    }
+
+    /// Unset, the rewrite is attempted as usual.
+    ///
+    /// Paired with the test above so the opt-out cannot appear to work for an
+    /// unrelated reason: the same call with the same unusable Python has to fail at
+    /// the probe rather than report itself disabled.
+    #[test]
+    fn alignment_runs_unless_the_variable_is_set() {
+        let mut env = ScopedTestEnv::new();
+        env.clear("ROCM_CLI_DISABLE_TORCH_ALIGNMENT");
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            Some("https://example.invalid/simple"),
+            Some("rocm7.13.0"),
+            "vllm",
+        );
+
+        assert!(
+            !matches!(
+                &outcome,
+                TorchAlignment::NotApplicable(reason)
+                    if reason.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT")
+            ),
+            "the opt-out must not fire when the variable is unset, got {outcome:?}"
+        );
     }
 
     #[test]
