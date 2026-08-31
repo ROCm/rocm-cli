@@ -170,7 +170,15 @@ jobs:
           EOF
           )"
           if gh release view "${VERSION}" >/dev/null 2>&1; then
-            gh release edit "${VERSION}" --notes "${NOTES}"
+            EXISTING_BODY="$(gh release view "${VERSION}" --json body -q .body)"
+            if [[ "${EXISTING_BODY}" != *"Install the latest stable release on Linux x86_64"* ]]; then
+              if [ -n "${EXISTING_BODY}" ]; then
+                COMBINED_NOTES="${EXISTING_BODY}"$'\n\n'"${NOTES}"
+                gh release edit "${VERSION}" --notes "${COMBINED_NOTES}"
+              else
+                gh release edit "${VERSION}" --notes "${NOTES}"
+              fi
+            fi
             gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
             exit 0
           fi
