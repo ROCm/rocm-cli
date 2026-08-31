@@ -192,6 +192,56 @@ async fn assert_runtime_can_still_use_the_gpu(world: &mut E2eWorld) {
     );
 }
 
+/// The alignment ran, and settled on one of its two healthy outcomes.
+///
+/// Separate from the device check above because the two can disagree: a runtime
+/// whose torch was never touched at all can still open a device, so that check
+/// passes whether or not the alignment fired. The `torch_alignment:` block is the
+/// only evidence that `settle_engine_install` reached this engine, and the gate in
+/// front of it is the part most likely to be widened or narrowed by a later change.
+#[then("the torch alignment settled on the SDK's build")]
+async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output.contains("torch_alignment:"),
+        "no torch alignment block, so the runtime was never settled:\n{output}"
+    );
+    // Both healthy outcomes are accepted rather than pinning one: whether this
+    // reinstall rewrote torch or found it already correct depends on what the shared
+    // tree held when the scenario started, and either way the rule held.
+    assert!(
+        output.contains("torch_alignment: realigned")
+            || output.contains("torch_alignment: already_aligned"),
+        "torch alignment reached no healthy outcome:\n{output}"
+    );
+    // Asserted negatively as well, because the positive check above would pass on a
+    // second block that failed. `not_applicable` is the one that would otherwise go
+    // unnoticed: it is what a manifest yielding no SDK build produces, which is
+    // exactly the repair path for every runtime installed before `sdk_torch` was
+    // recorded.
+    for unhealthy in [
+        "torch_alignment: unavailable",
+        "torch_alignment: install_failed",
+        "torch_alignment: not_applicable",
+    ] {
+        assert!(
+            !output.contains(unhealthy),
+            "torch alignment reported `{unhealthy}`:\n{output}"
+        );
+    }
+    // Conditional on purpose. A divergence is today's steady state — the engine pins
+    // an exact build and the SDK supplies a different one of the same release — but
+    // a future pair could agree, and then there is nothing to classify. Pinning it
+    // unconditionally would encode today's versions into the scenario. What must
+    // never happen is the CLI reporting a divergence and calling it a defect.
+    if output.contains("divergence:") {
+        assert!(
+            output.contains("dependency_check: expected_divergence"),
+            "a divergence was reported without being classified as expected:\n{output}"
+        );
+    }
+}
+
 /// The engine inventory reports a usable engine runtime.
 ///
 /// A precondition only. It deliberately has no Then counterpart: `engines list`

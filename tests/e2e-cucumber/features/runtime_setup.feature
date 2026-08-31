@@ -29,11 +29,18 @@ Feature: Runtime configuration
   # install, and a second SDK install, so it runs on the nightly GPU lane.
   # `@requires-engine:vllm` because only vLLM shares the runtime environment;
   # Lemonade manages its own.
+  #
+  # The second Then is not a restatement of the first. A runtime the alignment never
+  # touched can still open a device, so the device check alone cannot distinguish
+  # "settled correctly" from "skipped entirely" — and skipping is the regression the
+  # gate in front of the settle step would produce. Only the alignment block
+  # separates them, and it is the one part of this path with no other e2e coverage.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
   Scenario: 4 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
     Then the runtime can still use the GPU
+    And the torch alignment settled on the SDK's build
 
   # The GPU E2E lanes no longer install the shared runtime once and keep it
   # forever: `xtask e2e-prewarm` asks `rocm update` whether the channel index has
