@@ -7858,7 +7858,15 @@ enum RuntimeDeviceCheck {
         torch_version: String,
         hip_version: String,
     },
-    /// The question could not be answered; never assume healthy.
+    /// The question could not be answered — including when torch does not import.
+    ///
+    /// Never a reason to assume healthy, but on its own never fatal either: see
+    /// `install_left_runtime_unusable`, which acts only on `NoDevices`. This
+    /// variant covers benign causes as well as real ones — a runtime whose Python
+    /// could not be located, or a probe that could not launch — and failing a
+    /// multi-gigabyte install because a probe did not run is worse than reporting
+    /// what was and was not seen. The cost is that a runtime whose torch is
+    /// present but unimportable is reported rather than failed.
     NotVerified(String),
 }
 
