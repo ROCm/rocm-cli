@@ -34,6 +34,46 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+## Remote control-channel checks
+
+`rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
+tests use a scripted stand-in, which proves control flow but assumes those tools
+behave a certain way. Two scripts check that assumption against a real OpenSSH
+server in a container — no GPU, no ROCm, no tailnet, since the remote's `rocm`
+and `tailscale` are stand-ins:
+
+```bash
+tests/remote-ssh/run.sh       # the tools and their contracts
+tests/remote-ssh/run-e2e.sh   # the real binary, end to end
+```
+
+`run.sh` covers argument handling, exit-code propagation, delivering a
+credential on stdin, file copy, batch-mode refusal, and that withdrawing a
+published endpoint actually removes it.
+
+`run-e2e.sh` runs the built `rocm` through the whole flow — discover, probe,
+serve, publish, reconcile status, re-publish after an out-of-band withdrawal,
+tear down — and needs `cargo build -p rocm` first. It does not prove the
+endpoint carries traffic; that needs a real two-node tailnet.
+
+The `rocm remote` cucumber scenarios that need a second machine carry
+`@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the
+GitHub-hosted `E2E tests` lane sets. A working daemon alone is not enough — the
+self-hosted GPU runners have one but cannot reach the package mirror the fixture
+image builds from, so they skip those scenarios. To run them locally:
+
+```bash
+E2E_INCLUDE_DOCKER=1 cargo xtask e2e
+```
+
+On a network that intercepts TLS, point the container's package manager at
+plain-HTTP mirrors:
+
+```bash
+export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3.20/main \
+  --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
+```
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs

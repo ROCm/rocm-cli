@@ -221,6 +221,7 @@ form works depends on the engine your GPU selects.
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
@@ -389,11 +390,51 @@ model across multiple GPUs is not supported. Because selection uses the
 Manage background servers started with `--managed`:
 
 ```
-rocm services list [--all]
+rocm services list [--all] [--json]
 rocm services logs <service-id>
 rocm services stop <service-id> [--yes]
 rocm services restart <service-id> [--yes]
 ```
+
+`--json` prints the service records verbatim, for scripting and for the remote
+orchestration below.
+
+### Remote machines (preview)
+
+Run a model on a different GPU machine and reach it from your own. Both machines
+join a [Tailscale](https://tailscale.com) network; the GPU machine serves the
+model on its own loopback address and publishes that port onto the network, so
+the endpoint keeps working after the command exits and answers from any of your
+machines rather than only the one that started it.
+
+```console
+rocm remote targets [--tag <tag>]
+rocm remote doctor <machine> [--symptom <text>]
+rocm remote serve <machine> <model> [--engine <engine>] [--gpu <index>]
+                                    [--tailnet-port <port>] [--install-rocm]
+rocm remote status [<session>]
+rocm remote attach <session>
+rocm remote stop <session> [--force]
+```
+
+`targets` lists machines on your network — it does not check whether they can
+actually serve, which is what `doctor` is for. `serve` prepares the machine
+(installing the CLI if it is missing), starts the model, publishes the endpoint
+and prints the address together with an API key.
+
+**The endpoint is reachable by every machine on your network that your network's
+access rules allow**, not just yours. That API key is what stops anyone else
+using it, so `rocm remote` always sets one — unlike local serving, which is
+credential-free because only your own machine can reach it.
+
+`status` reports the model and the endpoint separately, because either can fail
+alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
+withdraws the endpoint and stops the model, and keeps the session listed if it
+cannot confirm both — use `--force` to forget one whose machine is gone.
+
+Communication with the machine uses your existing `ssh` setup. Set
+`ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
+default.
 
 ### Dashboard
 
