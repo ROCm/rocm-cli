@@ -9494,7 +9494,7 @@ fn config(command: ConfigCommand) -> Result<()> {
                 bail!("local provider does not use a cloud API key");
             }
             let key = read_provider_key_from_user(provider)?;
-            let status = provider_keys::set_provider_api_key(provider, &key)?;
+            let status = provider_keys::store_provider_credential(provider, &key)?;
             println!("{provider} API key saved");
             println!(
                 "  key: {}",
@@ -9517,7 +9517,7 @@ fn config(command: ConfigCommand) -> Result<()> {
             if provider == "local" {
                 bail!("local provider does not use a cloud API key");
             }
-            let status = provider_keys::clear_provider_api_key(provider)?;
+            let status = provider_keys::remove_provider_credential(provider)?;
             println!("{provider} API key cleared");
             println!(
                 "  key: {}",
