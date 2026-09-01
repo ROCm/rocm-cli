@@ -7485,7 +7485,16 @@ enum EngineDependencyCheck {
     Satisfied,
     /// The engine declares requirements the environment does not meet, one line each,
     /// as the resolver reported them.
-    Violated(Vec<String>),
+    ///
+    /// `expected` carries any divergence the install made on purpose that shares the
+    /// run with a genuine violation. It is reported separately rather than folded in
+    /// because the remedy differs: reinstalling the engine repairs `violations` and
+    /// destroys `expected`, so naming that remedy is only safe while `expected` is
+    /// empty.
+    Violated {
+        violations: Vec<String>,
+        expected: Vec<String>,
+    },
     /// The only unmet requirements are ones the install deliberately diverged from.
     ///
     /// Torch alignment leaves the runtime holding the SDK's build of the release
@@ -7517,11 +7526,19 @@ fn report_engine_dependency_check(
             "info",
             format!("engine={engine} runtime_id={runtime_key} dependency_check=satisfied"),
         ),
-        EngineDependencyCheck::Violated(details) => (
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } => (
             "error",
             format!(
-                "engine={engine} runtime_id={runtime_key} dependency_check=violated: {}",
-                details.join("; ")
+                "engine={engine} runtime_id={runtime_key} dependency_check=violated: {}{}",
+                violations.join("; "),
+                if expected.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (expected_divergence: {})", expected.join("; "))
+                }
             ),
         ),
         EngineDependencyCheck::ExpectedDivergence(details) => (
@@ -8601,8 +8618,11 @@ fn engine_dependency_check(
 
 /// Separate a deliberate divergence from a genuine violation.
 ///
-/// Only a divergence about the realigned package is expected; anything else in
-/// the same run is still a violation and must keep saying so.
+/// Each line is judged on its own subject: a genuine violation elsewhere in the
+/// same run says nothing about the package the install deliberately diverged on,
+/// and must not drag it along. Lumping the two together loses the distinction
+/// exactly where it matters most — the remedy for the genuine violation would
+/// reinstall the engine and undo the alignment.
 fn classify_dependency_details(
     details: Vec<String>,
     realigned_package: Option<&str>,
@@ -8611,15 +8631,25 @@ fn classify_dependency_details(
         return EngineDependencyCheck::Satisfied;
     }
     let Some(package) = realigned_package else {
-        return EngineDependencyCheck::Violated(details);
+        return EngineDependencyCheck::Violated {
+            violations: details,
+            expected: Vec::new(),
+        };
     };
-    // `uv pip check` phrases the requirement as ``requires `torch==…` ``, so the
-    // package name followed by a specifier is what identifies the subject.
-    let marker = format!("`{package}==");
-    if details.iter().all(|detail| detail.contains(&marker)) {
-        EngineDependencyCheck::ExpectedDivergence(details)
+    // A line whose subject cannot be parsed is not evidence of a divergence, so it
+    // stays a violation: the conservative side keeps saying something is wrong.
+    let (expected, violations): (Vec<String>, Vec<String>) =
+        details.into_iter().partition(|detail| {
+            rocm_core::violation_subject(detail)
+                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+        });
+    if violations.is_empty() {
+        EngineDependencyCheck::ExpectedDivergence(expected)
     } else {
-        EngineDependencyCheck::Violated(details)
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        }
     }
 }
 
@@ -8636,15 +8666,32 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
                 sanitize_log_value(reason)
             );
         }
-        EngineDependencyCheck::Violated(details) => {
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } => {
             let _ = writeln!(output, "  dependency_check: violated");
-            for detail in details {
+            for detail in violations {
                 let _ = writeln!(output, "  violation: {}", sanitize_log_value(detail));
             }
-            let _ = writeln!(
-                output,
-                "  action: rocm engines install {engine} --reinstall"
-            );
+            for detail in expected {
+                let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
+            }
+            if expected.is_empty() {
+                let _ = writeln!(
+                    output,
+                    "  action: rocm engines install {engine} --reinstall"
+                );
+            } else {
+                // The reinstall would repair the violations above and reinstate the
+                // engine's own build of the diverged package, restoring a runtime
+                // that cannot open a device. Naming a remedy that trades one defect
+                // for a worse one is not worth the convenience.
+                let _ = writeln!(
+                    output,
+                    "  action: repair the violations above without reinstalling {engine}; a reinstall would undo the divergence kept on purpose (see torch_alignment above)"
+                );
+            }
         }
         EngineDependencyCheck::ExpectedDivergence(details) => {
             let _ = writeln!(output, "  dependency_check: expected_divergence");
@@ -27098,9 +27145,12 @@ ID_LIKE="suse opensuse"
         // succeeded, so the only signal the user gets is this block.
         let rendered = render_engine_dependency_check(
             "vllm",
-            &EngineDependencyCheck::Violated(vec![
-                "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed".to_owned(),
-            ]),
+            &EngineDependencyCheck::Violated {
+                violations: vec![
+                    "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed".to_owned(),
+                ],
+                expected: Vec::new(),
+            },
         );
 
         assert!(rendered.contains("  dependency_check: violated\n"));
@@ -27135,6 +27185,10 @@ ID_LIKE="suse opensuse"
 
     #[test]
     fn a_divergence_on_any_other_package_is_still_a_violation() {
+        // The unrelated violation is real and must keep saying so, but it does not
+        // make the deliberate torch divergence one too — and the reinstall that
+        // would repair numpy is exactly what must not be advised while the
+        // alignment stands.
         let outcome = classify_dependency_details(
             vec![
                 "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
@@ -27143,7 +27197,38 @@ ID_LIKE="suse opensuse"
             Some("torch"),
         );
 
-        assert!(matches!(outcome, EngineDependencyCheck::Violated(_)));
+        let EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } = &outcome
+        else {
+            panic!("an unrelated violation is still a violation: {outcome:?}");
+        };
+        assert_eq!(violations.len(), 1, "only numpy violates: {violations:?}");
+        assert!(violations[0].contains("numpy"));
+        assert_eq!(expected.len(), 1, "torch diverged on purpose: {expected:?}");
+        assert!(expected[0].contains("torch"));
+
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: violated\n"));
+        assert!(rendered.contains("  violation: The package `vllm` requires `numpy"));
+        assert!(rendered.contains("  divergence: The package `vllm` requires `torch"));
+        assert!(
+            !rendered.contains("action: rocm engines install vllm --reinstall"),
+            "the reinstall would undo the alignment while repairing numpy: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_line_whose_subject_cannot_be_parsed_stays_a_violation() {
+        // Conservative by construction: an unrecognised shape is not evidence that
+        // the divergence was intended, so it must not be quietly excused.
+        let outcome = classify_dependency_details(
+            vec!["something uv said that this parser does not recognise".to_owned()],
+            Some("torch"),
+        );
+
+        assert!(matches!(outcome, EngineDependencyCheck::Violated { .. }));
     }
 
     /// The engine's build enumerates no devices against the installed SDK.
