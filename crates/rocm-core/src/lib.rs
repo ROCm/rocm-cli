@@ -1700,6 +1700,17 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Where `rocm remote` records the sessions it started on other machines.
+    ///
+    /// Kept beside [`Self::services_dir`] and following the same file-per-record
+    /// shape, but deliberately separate: these describe work running on a
+    /// *different* machine, and anything walking the local service registry
+    /// (status rendering, the daemon's recovery supervisor) must not mistake a
+    /// remote session for a local server it can supervise.
+    pub fn remote_sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("remote-sessions")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
