@@ -1777,6 +1777,17 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Where `rocm remote` records the sessions it started on other machines.
+    ///
+    /// Kept beside [`Self::services_dir`] and following the same file-per-record
+    /// shape, but deliberately separate: these describe work running on a
+    /// *different* machine, and anything walking the local service registry
+    /// (status rendering, the daemon's recovery supervisor) must not mistake a
+    /// remote session for a local server it can supervise.
+    pub fn remote_sessions_dir(&self) -> PathBuf {
+        self.data_dir.join("remote-sessions")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -7250,6 +7261,15 @@ pub struct ManagedServiceRecord {
     /// identity token. `None` until the engine state records one.
     #[serde(default)]
     pub engine_start_ticks: Option<u64>,
+    /// Whether this service must never come back up without an endpoint key.
+    ///
+    /// The bind address alone cannot answer that. A service bound to loopback is
+    /// unreachable from elsewhere *until something republishes the port* — a
+    /// tailnet publish, a proxy, a container port map — and the publish outlives
+    /// the process. So the requirement has to be recorded next to the service and
+    /// survive a restart, exactly as the key itself does.
+    #[serde(default)]
+    pub requires_api_key: bool,
     #[serde(default)]
     pub runtime_id: Option<String>,
     #[serde(default)]
@@ -7333,6 +7353,9 @@ impl ManagedServiceRecord {
             engine_pid: None,
             supervisor_start_ticks: None,
             engine_start_ticks: None,
+            // Off unless a caller says otherwise: local loopback serving stays
+            // credential-free, which is the unchanged default.
+            requires_api_key: false,
             runtime_id,
             env_id,
             device_policy,

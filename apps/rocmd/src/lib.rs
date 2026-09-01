@@ -2519,6 +2519,14 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
         // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
         Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
+        // `remote targets` reads the local tailnet, `doctor` fetches another
+        // machine's state and scores it here, `status` probes sessions that
+        // already exist. None of them change anything on either machine.
+        // `serve`, `attach` and `stop` start, publish or tear down, so they stay
+        // off the list and go through the approval UI like any other mutation.
+        Some("remote") => second
+            .as_deref()
+            .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")),
         _ => false,
     };
     if read_only {
@@ -3224,6 +3232,16 @@ fn supervise_service(
     );
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
+    // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts
+    // this false, so rebuilding a record here without restoring it would not
+    // just skip the check now — it would write the weakened record back and
+    // disarm every later `rocm services restart` as well.
+    let previously_required = load_managed_services(paths)
+        .unwrap_or_default()
+        .iter()
+        .any(|existing| existing.service_id == record.service_id && existing.requires_api_key);
+    record.requires_api_key = previously_required
+        || rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id).is_some();
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
@@ -3233,6 +3251,7 @@ fn supervise_service(
         rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
             .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
             .is_some(),
+        record.requires_api_key,
     )?;
     record.write()?;
 
@@ -3271,7 +3290,11 @@ fn supervise_service(
     // no auth, so fail closed instead — an unreachable service is recoverable,
     // an anonymous public one is not.
     let endpoint_key_applied = apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    ensure_public_service_has_endpoint_key(&record.host, endpoint_key_applied)?;
+    ensure_public_service_has_endpoint_key(
+        &record.host,
+        endpoint_key_applied,
+        record.requires_api_key,
+    )?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -4793,6 +4816,7 @@ fn handle_server_recover_event_with_record(
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
                     .is_some(),
+                record.requires_api_key,
             ) {
                 return record_event(
                     paths,
@@ -5192,6 +5216,57 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn recovery_refuses_a_service_that_lost_a_key_it_was_launched_with() {
+        // The daemon keeps its own copy of this guard, and it only knew about
+        // public binds. A loopback service that something republishes — a
+        // tailnet publish outlives this daemon, let alone the process — would
+        // be recovered without authentication, and the rebuilt record would
+        // then disarm `rocm services restart` too.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let error = super::ensure_public_service_has_endpoint_key(host, false, true)
+                .expect_err("a service launched with a key must not be recovered without one");
+            assert!(
+                format!("{error:#}").contains("without authentication"),
+                "{error:#}"
+            );
+        }
+        // With the key still present, recovery proceeds.
+        super::ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
+        // And a service that never had one is untouched.
+        super::ensure_public_service_has_endpoint_key("127.0.0.1", false, false).unwrap();
+    }
+
+    #[test]
+    fn remote_read_only_verbs_are_allowed_and_mutating_ones_are_not() {
+        let allow = |args: &[&str]| {
+            let owned = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+            super::ensure_rocm_command_is_read_only(&owned)
+        };
+
+        // These read: the local tailnet, another machine's state, sessions that
+        // already exist. Rejecting them made the whole family unusable here even
+        // though none of them change anything.
+        for args in [
+            &["remote", "targets"][..],
+            &["remote", "targets", "--tag", "gpu"][..],
+            &["remote", "doctor", "gpu-box"][..],
+            &["remote", "status"][..],
+        ] {
+            allow(args).unwrap_or_else(|error| panic!("{args:?} should be read-only: {error:#}"));
+        }
+
+        // These start, publish or tear down, so they go through approval.
+        for args in [
+            &["remote", "serve", "gpu-box", "a-model"][..],
+            &["remote", "attach", "sess"][..],
+            &["remote", "stop", "sess"][..],
+            &["remote"][..],
+        ] {
+            assert!(allow(args).is_err(), "{args:?} must not be read-only");
+        }
+    }
     use super::*;
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
@@ -7493,15 +7568,15 @@ mod tests {
         // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
         // the key gone the child would listen on that public host anonymously,
         // so the spawn must be refused instead.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
         assert!(
             error.to_string().contains("without authentication"),
             "{error:#}"
         );
 
-        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
         for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false)
+            ensure_public_service_has_endpoint_key(host, false, false)
                 .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
         }
     }
@@ -9463,7 +9538,24 @@ fn apply_endpoint_key_env(
 /// Mirrors the guard of the same name in `rocm`; the shared
 /// [`rocm_engine_protocol::is_public_bind_host`] keeps the two classifications
 /// identical for a given `ManagedServiceRecord::host`.
-fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+fn ensure_public_service_has_endpoint_key(
+    host: &str,
+    key_present: bool,
+    requires_api_key: bool,
+) -> Result<()> {
+    // The bind address is not the whole story. A service bound to loopback is
+    // only private until something republishes the port, and a tailnet publish
+    // outlives both the process and this daemon. The requirement is recorded on
+    // the service precisely so recovery can honour it without re-deriving it
+    // from an address that no longer answers the question.
+    if requires_api_key && !key_present {
+        bail!(
+            "refusing to recover a service that was launched with an endpoint API key but no \
+             longer has one: it would come back up without authentication, and something \
+             outside this machine may still be publishing its port. Relaunch it with \
+             `rocm serve --require-api-key` to issue a new key."
+        );
+    }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "refusing to respawn a service bound to the public host `{host}` without an endpoint \
