@@ -703,10 +703,13 @@ fn repair_from_violations(
             .map(|violation| format!("expected divergence: {}", violation.detail)),
     );
     // The hint blames `rocm install sdk` for writing the SDK torch stack over vLLM's
-    // pins, which is only a live theory while the alignment runs. Under the opt-out
-    // torch is never a defect here, so the hint would be pointing at the one package
-    // that cannot be the cause.
-    if sdk_torch_build.is_none() && !torch_alignment_disabled {
+    // pins, which stops being a live theory once the manifest names the SDK's build:
+    // the alignment then identifies that stack and settles it, so a defect surviving
+    // to here is something else. It stays on under the opt-out, which spares only the
+    // package named `torch` — a `torchvision` or `torchaudio` defect is still the SDK
+    // stack written over vLLM's pins, and the opt-out has turned off the step that
+    // would have corrected it, so the hint is more use there rather than less.
+    if sdk_torch_build.is_none() {
         notes.push(
             "if this recurs after `rocm install sdk`, the SDK torch stack is being written over vLLM's pinned torch".to_owned(),
         );
