@@ -8583,7 +8583,6 @@ fn settle_engine_install(
     // The interpreter is unambiguous, so let it name its own runtime.
     let owned = runtime_key_for_python(paths, python);
     let runtime_key = owned.as_deref().unwrap_or(selector);
-    let host_gpu = detect_host_gpu();
     let library_paths = runtime_library_paths_for_key(paths, runtime_key);
     let sdk_build = sdk_torch_build_for_key(paths, runtime_key);
     let torch = therock::probe_torch_alignment(python, engine);
@@ -8627,12 +8626,19 @@ fn settle_engine_install(
     report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
     let devices = report_runtime_device_check(paths, engine, runtime_key, devices);
 
+    // Only a runtime that cannot serve raises the question the host answers, so
+    // the host is inspected only then. Both readers below already require this,
+    // so asking earlier would spend a full host scan on every healthy install to
+    // reach an answer nothing goes on to read.
+    if !runtime_cannot_serve(&devices) {
+        return Ok(());
+    }
+
     // A runtime that cannot serve is only this install's failure where the host
     // has a GPU to serve with. Where the host could not be examined, say so
     // rather than failing a multi-gigabyte install on a guess.
-    if let HostGpu::NotVerified(reason) = &host_gpu
-        && runtime_cannot_serve(&devices)
-    {
+    let host_gpu = detect_host_gpu();
+    if let HostGpu::NotVerified(reason) = &host_gpu {
         report_unverified_host_gpu(paths, engine, runtime_key, reason);
     }
     if install_left_runtime_unusable(&devices, &host_gpu) {
