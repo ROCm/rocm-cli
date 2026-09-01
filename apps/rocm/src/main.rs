@@ -27734,6 +27734,34 @@ ID_LIKE="suse opensuse"
         );
     }
 
+    /// A dated alpha carries its date into the build, and must not be trimmed.
+    ///
+    /// Nightly SDKs version as `7.14.0a20260812`, and TheRock's torch for one is
+    /// `+rocm7.14.0a20260812` — the date is part of the build, not decoration on
+    /// the version. Shortening it to the `7.14.0` release would name a build that
+    /// exists for a different SDK, so the alignment would install a torch built
+    /// against libraries the runtime does not have. The fallback is a whole-string
+    /// interpolation today; this pins that, because the tempting "clean up the
+    /// version first" refactor is the one that breaks every nightly runtime.
+    #[test]
+    fn a_dated_alpha_sdk_keeps_its_date_in_the_derived_build() {
+        let manifest = test_runtime_manifest_for_update(
+            "wheel-gfx94x",
+            "gfx94x",
+            "gfx94x-dcgpu",
+            "7.14.0a20260812",
+        );
+        assert!(
+            manifest.sdk_torch.is_none(),
+            "this test is about the pre-change manifest shape"
+        );
+
+        assert_eq!(
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
+            Some("rocm7.14.0a20260812")
+        );
+    }
+
     /// A manifest that names no version at all must not invent a build.
     #[test]
     fn a_manifest_with_no_version_identifies_no_build() {
