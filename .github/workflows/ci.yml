@@ -122,6 +122,9 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # The containerised control-channel lane; its Dockerfile matches
+              # none of the extension globs above.
+              - 'tests/remote-ssh/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -430,6 +433,47 @@ jobs:
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
+
+  remote-ssh:
+    # `rocm remote` drives ssh, scp, and the remote's service/serve tooling. Its
+    # unit tests use a scripted stand-in, which proves the control flow but
+    # assumes the real tools behave a certain way. This job checks that
+    # assumption against a real OpenSSH server in a container: argument
+    # handling, exit-code propagation, stdin delivery of a credential, file
+    # copy, batch-mode refusal, and — the one that matters most — that
+    # withdrawing a published endpoint actually removes it. A publish is
+    # configuration rather than a process, so it survives reboots, and a
+    # withdrawal that silently does nothing leaves a GPU endpoint exposed with
+    # nothing tracking it.
+    #
+    # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
+    # stand-ins that answer in the shapes the real tools do.
+    name: remote control channel (containerised)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Docker and the OpenSSH client are both present on ubuntu-latest; jq is
+      # the only extra, and only for asserting on JSON contracts.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check the control-channel contracts
+        run: tests/remote-ssh/run.sh
+
+      # The same container, driven by the real binary this time: discover a
+      # target, probe it, serve, publish, reconcile status, re-publish after an
+      # out-of-band withdrawal, tear down. Catches the orchestration mistakes a
+      # scripted stand-in cannot — an argument the CLI builds wrongly, a session
+      # record it fails to clean up.
+      - name: Build the CLI for the end-to-end run
+        run: cargo build -p rocm
+
+      - name: Drive rocm remote end to end
+        run: tests/remote-ssh/run-e2e.sh
 
   clippy:
     runs-on: ubuntu-latest
@@ -767,6 +811,14 @@ jobs:
 
       - name: Run E2E tests
         if: steps.gate.outputs.run == 'true'
+        # E2E_INCLUDE_DOCKER turns on the `rocm remote` scenarios that need a
+        # second machine, stood up as a container. This is the only lane that
+        # opts in: GitHub-hosted runners can build the fixture image, while the
+        # self-hosted GPU runners have a daemon but no route to the package
+        # mirror it installs from, so they skip rather than fail on an image
+        # they could never build.
+        env:
+          E2E_INCLUDE_DOCKER: "1"
         run: cargo xtask e2e
 
       - name: Upload E2E report

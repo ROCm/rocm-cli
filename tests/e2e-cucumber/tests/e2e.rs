@@ -29,6 +29,7 @@ mod e2e {
     pub mod examine_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod serving_steps;
@@ -53,6 +54,14 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
+    /// tailscale stand-in, and the status document it should serve. Set by a
+    /// Given step so the When steps stay about what the user does.
+    pub remote_env: Vec<(String, String)>,
+    /// Container standing in for a second machine, for the `@requires-docker`
+    /// scenarios. Held on the World so it lives for the scenario and is torn
+    /// down when the World drops, even if a step panics.
+    pub remote_machine: Option<e2e::remote_steps::RemoteMachine>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
     /// report can join commands to pass/fail results.
@@ -196,6 +205,8 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            remote_env: Vec::new(),
+            remote_machine: None,
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,
@@ -1077,6 +1088,11 @@ async fn main() {
     // install/uninstall) are skipped unless the caller opts in via
     // `E2E_INCLUDE_LIFECYCLE`, so the default `cargo xtask e2e` stays fast.
     let include_lifecycle = std::env::var_os("E2E_INCLUDE_LIFECYCLE").is_some_and(|v| v == "1");
+    // The container-backed remote scenarios need a runner that can *build* the
+    // fixture image, which a working daemon alone does not guarantee — a
+    // restricted network gives you one without the other. Opt in explicitly on
+    // the lanes where it holds.
+    let include_docker = std::env::var_os("E2E_INCLUDE_DOCKER").is_some_and(|v| v == "1");
     // CI runs just the lifecycle set after opting in. Keep this selection inside
     // our custom filter instead of cucumber's `--tags`/`-n`: cucumber 0.23 uses
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
@@ -1158,9 +1174,12 @@ async fn main() {
                     &decl,
                     cap,
                     matrix,
-                    include_nightly,
-                    include_lifecycle,
-                    include_merge_queue,
+                    e2e_cucumber::expectation::Included {
+                        nightly: include_nightly,
+                        lifecycle: include_lifecycle,
+                        docker: include_docker,
+                        merge_queue: include_merge_queue,
+                    },
                 );
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
