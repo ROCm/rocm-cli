@@ -789,6 +789,57 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// Both self-hosted workflows, so a lane added to either is covered.
+    fn self_hosted_workflows() -> [(&'static str, String); 2] {
+        [
+            ("e2e-selfhosted.yml", read_workflow("e2e-selfhosted.yml")),
+            ("nightly.yml", read_workflow("nightly.yml")),
+        ]
+    }
+
+    #[test]
+    fn every_self_hosted_lane_waits_for_an_available_gpu() {
+        // `e2e-gpu-nightly` shipped without one and nothing noticed: it hung to
+        // the 90-minute job cap on a wedged driver instead of failing in ~90s,
+        // while its own per-PR twin and every sibling failed fast. The preflight
+        // is what turns "absent, wedged, or still held by a leftover serve" into
+        // a named error rather than a timeout.
+        //
+        // Deliberately derived rather than listed, so a new lane is covered the
+        // day it lands. Any lane that genuinely should not wait for a GPU needs
+        // an exemption added here with the reason — which is the point: it
+        // becomes a decision someone makes, not one a copy-paste makes for them.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                assert!(
+                    job_block(&text, &job).contains("- name: GPU preflight"),
+                    "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
+                     GPU preflight step: on a wedged or occupied GPU it hangs to the job \
+                     timeout instead of failing fast with a reason"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_self_hosted_lane_allows_for_a_cold_serve() {
+        // The per-PR Strix Windows lane was the only lane without this, while its
+        // own nightly twin set it. A first serve on shared hardware loads the
+        // model before it answers; the default budget is short enough that the
+        // load reads as a product failure.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                let env = job_mapping(job_block(&text, &job), "env");
+                assert_eq!(
+                    env.get("E2E_SERVE_TIMEOUT_SECS").map(String::as_str),
+                    Some("300"),
+                    "{workflow} job `{job}` must give a cold serve the same budget as \
+                     every other self-hosted lane"
+                );
+            }
+        }
+    }
+
     #[test]
     fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
         let self_hosted = read_workflow("e2e-selfhosted.yml");
