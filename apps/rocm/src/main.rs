@@ -27317,9 +27317,13 @@ ID_LIKE="suse opensuse"
     /// engine's build nor the SDK's release selection wins outright.
     #[test]
     fn the_sdks_release_is_corrected_to_the_one_the_engine_pins() {
+        // The installed torch already carries the SDK's build, so the build is not
+        // what is wrong here — the release is. Pinning it needs the two sides to
+        // disagree on the release and agree on the build, which is the opposite of
+        // the case above; identical arguments to it would only restate that one.
         let plan = plan_torch_alignment(
             Some("rocm7.14.0a20260611"),
-            Some("2.10.0+git8514f05"),
+            Some("2.11.0+rocm7.14.0a20260611"),
             Some("torch==2.10.0+git8514f05"),
             "vllm",
         );
@@ -27328,8 +27332,9 @@ ID_LIKE="suse opensuse"
             plan,
             TorchAlignmentPlan::Install {
                 wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
-                from: "2.10.0+git8514f05".to_owned(),
-            }
+                from: "2.11.0+rocm7.14.0a20260611".to_owned(),
+            },
+            "the engine's release must win while the SDK's build is kept"
         );
     }
 
