@@ -3941,6 +3941,51 @@ fn runtime_manifest_for_selector<'a>(
         })
 }
 
+/// The `runtime_key` of the runtime whose install root contains `python`.
+fn runtime_key_for_python(paths: &AppPaths, python: &Path) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    runtime_key_owning_python(&manifests, python).map(str::to_owned)
+}
+
+/// Which runtime owns an interpreter, decided by install root.
+///
+/// Split from the registry read so the decision can be tested without a
+/// registry on disk, matching `sdk_torch_build_from_manifest`.
+///
+/// `runtime_id` cannot answer this: it is shared by every side-by-side install
+/// of one channel and family, which is exactly the situation an engine install
+/// has to be attributed in. An install root contains one runtime by
+/// construction, so the interpreter's path settles it.
+///
+/// Both sides are compared verbatim *and* canonicalized. The CLI writes
+/// `install_root` canonicalized while an engine adapter reports back whatever
+/// path it was handed, and comparing a single form makes ownership fail
+/// silently on a symlinked runtimes directory. Roots can nest, so the longest
+/// containing root wins.
+fn runtime_key_owning_python<'a>(
+    manifests: &'a [therock::InstalledRuntimeManifest],
+    python: &Path,
+) -> Option<&'a str> {
+    fn both_forms(path: &Path) -> Vec<PathBuf> {
+        let verbatim = path.to_path_buf();
+        match path.canonicalize() {
+            Ok(resolved) if resolved != verbatim => vec![verbatim, resolved],
+            _ => vec![verbatim],
+        }
+    }
+
+    let pythons = both_forms(python);
+    manifests
+        .iter()
+        .filter(|manifest| {
+            both_forms(&manifest.install_root)
+                .iter()
+                .any(|root| pythons.iter().any(|python| python.starts_with(root)))
+        })
+        .max_by_key(|manifest| manifest.install_root.as_os_str().len())
+        .map(|manifest| manifest.runtime_key.as_str())
+}
+
 fn env_root_for_service(
     paths: &AppPaths,
     engine: &str,
@@ -8455,13 +8500,23 @@ fn settles_runtime_torch(engine: &str, managed_env: Option<bool>) -> bool {
 fn settle_engine_install(
     paths: &AppPaths,
     engine: &str,
-    runtime_key: &str,
+    selector: &str,
     response: &InstallResponse,
 ) -> Result<()> {
     if !settles_runtime_torch(engine, response.managed_env) {
         return Ok(());
     }
     let python = Path::new(&response.python_executable);
+    // Which runtime is being settled has to be asked of the environment, not of
+    // the caller. Two of the three callers pass a `runtime_id`, and side-by-side
+    // installs of one channel and family share it, so the selector can name two
+    // runtimes at once; `runtime_manifest_for_selector` then correctly declines
+    // to guess and every lookup below silently comes back empty. It can also
+    // name the *active* runtime while the engine was installed into an older
+    // one, which is worse than empty — it settles the wrong tree's torch.
+    // The interpreter is unambiguous, so let it name its own runtime.
+    let owned = runtime_key_for_python(paths, python);
+    let runtime_key = owned.as_deref().unwrap_or(selector);
     let host_gpu = detect_host_gpu();
     let library_paths = runtime_library_paths_for_key(paths, runtime_key);
     let sdk_build = sdk_torch_build_for_key(paths, runtime_key);
@@ -27770,6 +27825,97 @@ ID_LIKE="suse opensuse"
         manifest.sdk_torch = None;
 
         assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
+    }
+
+    /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
+    ///
+    /// They differ in `runtime_key`, `version` and install root, and share one
+    /// `runtime_id` — that is what the field means, so this is not a corrupt
+    /// registry.
+    fn side_by_side_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
+        let mut older = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-13-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.13.0",
+        );
+        older.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0");
+        let mut newer = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.14.0",
+        );
+        newer.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
+        vec![older, newer]
+    }
+
+    /// The interpreter names its runtime where the shared `runtime_id` cannot.
+    ///
+    /// This is the cross-wiring that settled the active runtime's torch into an
+    /// older runtime's environment: the engine's env id drops the version, so
+    /// the environment belongs to 7.13.0 while the caller's selector says only
+    /// "release, gfx94X-dcgpu". Resolving by install root has to pick 7.13.0.
+    #[test]
+    fn the_runtime_is_resolved_by_its_interpreter_not_the_shared_runtime_id() {
+        let manifests = side_by_side_runtimes();
+
+        assert_eq!(
+            runtime_manifest_for_selector(&manifests, "therock-release:gfx94X-dcgpu")
+                .map(|manifest| manifest.runtime_key.as_str()),
+            None,
+            "the shared runtime_id names two runtimes, so a selector cannot resolve it"
+        );
+        assert_eq!(
+            runtime_key_owning_python(
+                &manifests,
+                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0/bin/python3"),
+            ),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
+            "the interpreter's install root names the runtime being settled"
+        );
+    }
+
+    /// An interpreter outside every install root leaves the caller's selector alone.
+    ///
+    /// External and self-managed environments live outside the registry, and
+    /// inventing an owner for them would settle a runtime nobody asked about.
+    #[test]
+    fn an_interpreter_outside_every_install_root_owns_nothing() {
+        assert_eq!(
+            runtime_key_owning_python(
+                &side_by_side_runtimes(),
+                Path::new("/opt/somewhere-else/bin/python3"),
+            ),
+            None
+        );
+    }
+
+    /// A prefix match alone is ambiguous once roots nest, so the longest wins.
+    #[test]
+    fn the_longest_containing_install_root_owns_the_interpreter() {
+        let mut outer = test_runtime_manifest_for_update(
+            "outer",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.13.0",
+        );
+        outer.install_root = PathBuf::from("/runtimes");
+        let mut inner = test_runtime_manifest_for_update(
+            "inner",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.14.0",
+        );
+        inner.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
+
+        assert_eq!(
+            runtime_key_owning_python(
+                &[outer, inner],
+                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0/bin/python3"),
+            ),
+            Some("inner")
+        );
     }
 
     /// A torch the user installed themselves is kept, and named as kept.
