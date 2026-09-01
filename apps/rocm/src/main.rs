@@ -7800,7 +7800,20 @@ fn align_runtime_torch(
 /// reads `... the release vllm pins` rather than an anonymous "the engine". It
 /// arrives from the engine selection and is sanitized like every other
 /// interpolated value.
-fn render_torch_alignment(outcome: &TorchAlignment, engine: &str) -> String {
+///
+/// `before` is the verdict the runtime gave *prior* to the realignment. Only the
+/// realigned outcome replaced anything, so only that arm prints it — and it must,
+/// because the `device_check:` block further down reports the runtime as it is
+/// now. Without the before verdict beside it, a realignment that ends in a
+/// failing runtime does not say whether the alignment broke something that
+/// worked or found something already broken, and answering that afterwards means
+/// going to the machine to look. The value is already in hand at the call site;
+/// dropping it only moves the cost onto whoever reads the output.
+fn render_torch_alignment(
+    outcome: &TorchAlignment,
+    engine: &str,
+    before: Option<&RuntimeDeviceCheck>,
+) -> String {
     let mut output = String::new();
     match outcome {
         TorchAlignment::AlreadyAligned { version } => {
@@ -7819,6 +7832,13 @@ fn render_torch_alignment(outcome: &TorchAlignment, engine: &str) -> String {
                 sanitize_log_value(to),
                 sanitize_log_value(engine)
             );
+            if let Some(before) = before {
+                let _ = writeln!(
+                    output,
+                    "    before this replacement: {} (device_check below is after it)",
+                    sanitize_log_value(&device_check_verdict(before))
+                );
+            }
         }
         TorchAlignment::Unavailable { wanted, kept } => {
             let _ = writeln!(output, "  torch_alignment: unavailable");
@@ -7876,6 +7896,7 @@ fn report_torch_alignment(
     runtime_key: &str,
     sdk_build: Option<&str>,
     torch: Result<&therock::TorchAlignmentProbe, &anyhow::Error>,
+    before: &RuntimeDeviceCheck,
 ) -> TorchAlignment {
     let index_url = runtime_index_url_for_key(paths, runtime_key);
     let outcome = align_runtime_torch(
@@ -7886,7 +7907,7 @@ fn report_torch_alignment(
         engine,
         torch,
     );
-    print!("{}", render_torch_alignment(&outcome, engine));
+    print!("{}", render_torch_alignment(&outcome, engine, Some(before)));
     let (level, message) = match &outcome {
         TorchAlignment::AlreadyAligned { version } => (
             "info",
@@ -7894,10 +7915,14 @@ fn report_torch_alignment(
                 "engine={engine} runtime_id={runtime_key} torch_alignment=already_aligned version={version}"
             ),
         ),
+        // The before verdict rides along in the audit line too: the log is read
+        // long after the install, when the runtime on disk can no longer answer
+        // what it was like beforehand.
         TorchAlignment::Realigned { from, to } => (
             "info",
             format!(
-                "engine={engine} runtime_id={runtime_key} torch_alignment=realigned from={from} to={to}"
+                "engine={engine} runtime_id={runtime_key} torch_alignment=realigned from={from} to={to} before={}",
+                device_check_verdict(before)
             ),
         ),
         TorchAlignment::Unavailable { wanted, kept } => (
@@ -8057,6 +8082,29 @@ fn classify_runtime_device_probe(probe: therock::RuntimeDeviceProbe) -> RuntimeD
                 .error
                 .unwrap_or_else(|| "torch imported but did not report a device count".to_owned()),
         ),
+    }
+}
+
+/// One device-check verdict on one line, for quoting inside another block.
+///
+/// The full block explains the verdict and names a consequence, which is right
+/// where it is the answer and wrong where it is context for something else. This
+/// keeps the part that identifies the verdict — the name and the torch it was
+/// asked about — so a before/after pair reads as a pair rather than as two
+/// competing diagnoses.
+fn device_check_verdict(outcome: &RuntimeDeviceCheck) -> String {
+    match outcome {
+        RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        } => format!("usable ({device_count} device(s), torch {torch_version})"),
+        RuntimeDeviceCheck::NoDevices { torch_version, .. } => {
+            format!("no_devices (torch {torch_version})")
+        }
+        RuntimeDeviceCheck::KernelFailed { torch_version, .. } => {
+            format!("kernel_failed (torch {torch_version})")
+        }
+        RuntimeDeviceCheck::NotVerified(reason) => format!("not_verified ({reason})"),
     }
 }
 
@@ -8558,6 +8606,7 @@ fn settle_engine_install(
                 runtime_key,
                 sdk_build.as_deref(),
                 torch.as_ref(),
+                &probed,
             );
             // Only a realignment replaced torch. After every other outcome the
             // environment is the one already probed, and asking it again would
@@ -27706,6 +27755,7 @@ ID_LIKE="suse opensuse"
                 kept: "2.10.0+git8514f05".to_owned(),
             },
             "vllm",
+            None,
         );
 
         assert!(rendered.contains("  torch_alignment: unavailable\n"));
@@ -27721,6 +27771,7 @@ ID_LIKE="suse opensuse"
                 error: "failed to launch uv: Permission denied".to_owned(),
             },
             "vllm",
+            None,
         );
 
         assert!(rendered.contains("  torch_alignment: install_failed\n"));
@@ -27741,6 +27792,7 @@ ID_LIKE="suse opensuse"
                 to: "2.11.0+rocm7.13.0".to_owned(),
             },
             "vllm",
+            None,
         );
 
         assert!(rendered.contains("  torch_alignment: realigned\n"));
@@ -27752,6 +27804,65 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn a_realignment_reports_what_the_runtime_could_do_before_it() {
+        // The whole point of the line: the device_check printed afterwards is the
+        // after state, so without this one a realignment that ends badly does not
+        // say whether it broke a working runtime or repaired a broken one. Here it
+        // repaired one, and the output says so without anyone visiting the machine.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Realigned {
+                from: "2.11.0+rocm7.14.0".to_owned(),
+                to: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+            Some(&RuntimeDeviceCheck::KernelFailed {
+                torch_version: "2.11.0+rocm7.14.0".to_owned(),
+                error: "HIP error: hipErrorInvalidImage".to_owned(),
+            }),
+        );
+
+        assert!(
+            rendered.contains("before this replacement: kernel_failed (torch 2.11.0+rocm7.14.0)"),
+            "the before verdict names itself and the torch it judged: {rendered}"
+        );
+        assert!(
+            rendered.contains("device_check below is after it"),
+            "the reader is told which of the two blocks is which: {rendered}"
+        );
+    }
+
+    #[test]
+    fn only_a_realignment_reports_a_before_verdict() {
+        // Every other outcome left the runtime as it was, so the device_check
+        // below is already about the same torch this block names. A before/after
+        // pair there would invite reading a change into an outcome that made none.
+        let before = RuntimeDeviceCheck::Usable {
+            device_count: 1,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        };
+
+        for outcome in [
+            TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            TorchAlignment::Disabled {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.9.0+cpu".to_owned(),
+            },
+            TorchAlignment::Unavailable {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+        ] {
+            let rendered = render_torch_alignment(&outcome, "vllm", Some(&before));
+            assert!(
+                !rendered.contains("before this replacement"),
+                "{outcome:?} replaced nothing: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn an_already_aligned_runtime_reports_the_version_it_kept() {
         // Every refresh after the first lands here, so this is the most frequently
         // printed of the five outcomes.
@@ -27760,6 +27871,7 @@ ID_LIKE="suse opensuse"
                 version: "2.11.0+rocm7.13.0".to_owned(),
             },
             "vllm",
+            None,
         );
 
         assert!(rendered.contains("  torch_alignment: already_aligned (2.11.0+rocm7.13.0)\n"));
@@ -28116,7 +28228,7 @@ ID_LIKE="suse opensuse"
         };
         assert_eq!(deliberately_diverged_package(&outcome), Some("torch"));
 
-        let rendered = render_torch_alignment(&outcome, "vllm");
+        let rendered = render_torch_alignment(&outcome, "vllm", None);
         assert!(
             rendered.contains("  torch_alignment: disabled\n"),
             "the block has to name the state, got {rendered:?}"
