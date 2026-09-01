@@ -564,14 +564,11 @@ const TORCH_PACKAGE: &str = "torch";
 
 /// Whether the user has opted out of rocm-cli choosing this runtime's torch.
 ///
-/// The same variable, read the same way, as the CLI's own opt-out: presence is the
-/// signal, so any value — including the empty string — disables the alignment. The
-/// engine cannot call into the CLI binary that owns the alignment itself, so the
-/// contract is duplicated rather than shared; the two must not drift, or a runtime
-/// the CLI deliberately left alone gets rewritten by the engine on the very next
-/// `rocm engines install vllm`, which is the fight the opt-out exists to end.
+/// The CLI's own opt-out is the same call, not a matching one: the engine cannot
+/// call into the binary that owns the alignment, and a duplicated read is a
+/// contract that drifts. [`rocm_core::torch_alignment_disabled`] carries the rest.
 fn torch_alignment_disabled() -> bool {
-    std::env::var_os("ROCM_CLI_DISABLE_TORCH_ALIGNMENT").is_some()
+    rocm_core::torch_alignment_disabled()
 }
 
 /// Whether this violation is the torch divergence rocm-cli deliberately leaves behind.

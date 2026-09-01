@@ -78,6 +78,28 @@ pub use uv::{
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
+
+/// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
+pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
+
+/// Whether the user has opted out of rocm-cli choosing this runtime's torch.
+///
+/// Presence is the signal, so any value — including the empty string — disables the
+/// alignment; that keeps `ROCM_CLI_DISABLE_TORCH_ALIGNMENT=` from reading as "off"
+/// to one side and "on" to the other.
+///
+/// The CLI and the vLLM engine both consult this: the engine cannot call into the
+/// binary that owns the alignment, and a duplicated read is a contract that drifts.
+/// If the two ever disagreed, a runtime the CLI deliberately left alone would be
+/// rewritten by the engine on the very next `rocm engines install vllm` — the fight
+/// the opt-out exists to end.
+///
+/// This suppresses the correction, not the diagnosis. The runtime is still asked
+/// what it can do, the dependency check still runs, and a runtime that opens no
+/// device or cannot run a kernel on one is still reported as such.
+pub fn torch_alignment_disabled() -> bool {
+    std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
+}
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;

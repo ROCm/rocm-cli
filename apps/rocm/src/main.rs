@@ -7694,12 +7694,13 @@ fn install_error_reports_version_unavailable(error: &str) -> bool {
 /// build does not work on this machine" is a case that can happen rather than a
 /// hypothetical one, and it needs an exit that is not "stop using the CLI".
 ///
-/// This suppresses the correction, not the diagnosis. The runtime is still asked
-/// what it can do, the dependency check still runs, and a runtime that opens no
-/// device or cannot run a kernel on one is still reported as such — and still
-/// fails the install on a host where a GPU was found.
+/// The engine reads the same variable through the same helper, so the two sides
+/// cannot drift; [`rocm_core::torch_alignment_disabled`] carries why that matters.
+/// Suppressing the correction does not suppress the diagnosis: a runtime that
+/// opens no device or cannot run a kernel on one is still reported as such — and
+/// still fails the install on a host where a GPU was found.
 fn torch_alignment_disabled() -> bool {
-    std::env::var_os("ROCM_CLI_DISABLE_TORCH_ALIGNMENT").is_some()
+    rocm_core::torch_alignment_disabled()
 }
 
 /// Install the SDK's build of the release the engine pins, when that is needed.
