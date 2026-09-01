@@ -288,17 +288,17 @@ async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
             "torch alignment reported `{unsettled}`:\n{output}"
         );
     }
-    // Conditional on purpose. A divergence is today's steady state — the engine pins
-    // an exact build and the SDK supplies a different one of the same release — but
-    // a future pair could agree, and then there is nothing to classify. Pinning it
-    // unconditionally would encode today's versions into the scenario. What must
-    // never happen is the CLI reporting a divergence and calling it a defect.
-    if output.contains("divergence:") {
-        assert!(
-            output.contains("dependency_check: expected_divergence"),
-            "a divergence was reported without being classified as expected:\n{output}"
-        );
-    }
+    // Asserted on the verdict, not on the divergence lines. Requiring
+    // `expected_divergence` whenever `divergence:` appears cannot fail: one render
+    // arm emits both, the verdict first. The property worth protecting is the other
+    // one — that a torch this tool put here on purpose is never called a defect —
+    // and `violated` is the only rendering that would say so. Unconditional because
+    // it stays true if a future engine pin and SDK build happen to agree: then there
+    // is no divergence to classify, and still no violation to report.
+    assert!(
+        !output.contains("dependency_check: violated"),
+        "the dependency check called a settled runtime a violation:\n{output}"
+    );
 }
 
 /// The opt-out was honoured, and said so in its own words.
