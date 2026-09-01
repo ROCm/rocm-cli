@@ -1530,21 +1530,36 @@ fn select_tarball_artifact(
     candidates.pop()
 }
 
-/// Whether `value` is itself a recognized grouped family label (case-insensitive).
-/// Used to tell a specific raw GPU arch code (e.g. `gfx1200`) apart from an
-/// already-grouped `--family`/env override (e.g. `gfx120X-all`); only the
-/// former carries usable `raw_arch` information for a `Next`-generation pip
-/// extra.
+/// Whether `value` is a specific raw GPU arch code (e.g. `gfx1200`, `gfx90a`)
+/// rather than a grouped family label (e.g. `gfx120X-all`, `gfx103X-dgpu`) or
+/// free-form text with a gfx token embedded in it. Only a genuine raw code
+/// carries usable `raw_arch` information for a `Next`-generation pip extra;
+/// grouped labels have no single arch to put in a `device-<arch>` extra.
+fn is_raw_gfx_arch_code(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("gfx") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let last = rest.len() - 1;
+    rest.bytes()
+        .enumerate()
+        .all(|(i, b)| b.is_ascii_digit() || (i == last && b.is_ascii_lowercase()))
+}
+
 fn family_override_raw_arch(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty()
-        || known_therock_families()
-            .iter()
-            .any(|known| known.eq_ignore_ascii_case(trimmed))
-    {
-        return None;
-    }
-    Some(trimmed.to_owned())
+    is_raw_gfx_arch_code(trimmed).then(|| trimmed.to_owned())
+}
+
+/// `raw_arch` only carries usable arch information if it normalizes to the
+/// same family already resolved by some other, more authoritative source
+/// (e.g. a managed-runtime manifest); otherwise it's stale or from a
+/// different GPU and must be dropped.
+fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Option<String> {
+    raw_arch.filter(|raw| normalize_therock_family(raw).as_deref() == Some(family))
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
@@ -1569,10 +1584,15 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
+        // The managed manifest only stores the normalized family, not a raw
+        // arch code. Re-run the (cheap, local) host probe and attach its raw
+        // code only if it agrees with the managed family, so a `Next`-generation
+        // pip extra can still be built without trusting a stale/mismatched probe.
+        let raw_arch = raw_arch_agreeing_with_family(detect_host_gfx_target(), &family);
         return Ok(FamilyResolution {
             family,
             source: "managed-runtime".to_owned(),
-            raw_arch: None,
+            raw_arch,
         });
     }
 
@@ -4838,8 +4858,33 @@ mod tests {
         );
         assert_eq!(family_override_raw_arch("gfx120X-all"), None);
         assert_eq!(family_override_raw_arch("GFX120X-ALL"), None);
+        assert_eq!(family_override_raw_arch("gfx103X-all"), None);
+        assert_eq!(family_override_raw_arch("gfx103X-dgpu"), None);
+        assert_eq!(
+            family_override_raw_arch("gpu output: gfx1030 detected"),
+            None
+        );
+        assert_eq!(
+            family_override_raw_arch("gfx90a"),
+            Some("gfx90a".to_owned())
+        );
         assert_eq!(family_override_raw_arch(""), None);
         assert_eq!(family_override_raw_arch("   "), None);
+    }
+
+    #[test]
+    fn raw_arch_agreeing_with_family_keeps_only_matching_arch() {
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx1030".to_owned()), "gfx103X-dgpu"),
+            Some("gfx1030".to_owned())
+        );
+        // Detected arch from a different GPU family than the managed runtime:
+        // don't attach it, it would build a mismatched `device-<arch>` extra.
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx90a".to_owned()), "gfx103X-dgpu"),
+            None
+        );
+        assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
     }
 
     #[test]

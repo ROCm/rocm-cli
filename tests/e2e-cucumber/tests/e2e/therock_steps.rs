@@ -27,7 +27,9 @@ fn root(world: &E2eWorld) -> &Path {
 }
 
 fn wheel_index_html(package: &str, version: &str) -> String {
-    format!("<a href=\"{package}-{version}-py3-none-any.whl\">{package}-{version}-py3-none-any.whl</a>")
+    format!(
+        "<a href=\"{package}-{version}-py3-none-any.whl\">{package}-{version}-py3-none-any.whl</a>"
+    )
 }
 
 #[given("a ROCm 10 pip index fixture for family gfx1200")]

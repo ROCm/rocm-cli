@@ -14,7 +14,10 @@ Feature: TheRock ROCm 10 ("next") install layout
     Then the dry-run output selects the ROCm 10 pip index
     And the dry-run output requests the gfx1200 device extras
 
-  @id:therock-next-tarball-skips-tests-artifact
+  # Linux-only: `--format tarball` is rejected outright on Windows (native
+  # tarball installs aren't supported there), so this scenario's premise
+  # doesn't hold on that platform.
+  @id:therock-next-tarball-skips-tests-artifact @requires-os:linux
   Scenario: Installing the SDK against the ROCm 10 tarball layout skips the tests sibling
     Given a ROCm 10 tarball index fixture for family gfx1200 with a tests sibling
     When the user previews a tarball SDK install for family gfx1200
