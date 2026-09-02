@@ -8693,10 +8693,17 @@ fn classify_dependency_details(
     };
     // A line whose subject cannot be parsed is not evidence of a divergence, so it
     // stays a violation: the conservative side keeps saying something is wrong.
+    // Replacing torch also resolves torch's pinned triton dependency from the same
+    // SDK index. That companion version can therefore diverge from the engine pin
+    // for the same deliberate reason as torch itself. This is one-way: realigning
+    // triton alone does not make a torch divergence expected.
     let (expected, violations): (Vec<String>, Vec<String>) =
         details.into_iter().partition(|detail| {
-            rocm_core::violation_subject(detail)
-                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+            rocm_core::violation_subject(detail).is_some_and(|subject| {
+                subject.package.eq_ignore_ascii_case(package)
+                    || (package.eq_ignore_ascii_case("torch")
+                        && subject.package.eq_ignore_ascii_case("triton"))
+            })
         });
     if violations.is_empty() {
         EngineDependencyCheck::ExpectedDivergence(expected)
@@ -15658,6 +15665,10 @@ fn append_update_surfaces(output: &mut String) {
     );
 }
 
+const fn source_family_for_update(source: &therock::InstalledRuntimeManifest) -> &str {
+    source.family.as_str()
+}
+
 fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -15667,7 +15678,8 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source)?;
+    let family_override = Some(source_family_for_update(source));
+    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15700,7 +15712,7 @@ fn apply_runtime_update(
             &source.format,
             None,
             None,
-            None,
+            family_override,
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15716,7 +15728,7 @@ fn apply_runtime_update(
         &source.format,
         None,
         None,
-        None,
+        family_override,
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
@@ -27236,6 +27248,24 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn torch_realignment_treats_its_triton_repin_as_expected_divergence() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.14.0` is installed".to_owned(),
+                "The package `vllm` requires `triton==3.6.0`, but `3.7.1+git0263a6a6.rocm7.14.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        let EngineDependencyCheck::ExpectedDivergence(details) = &outcome else {
+            panic!("the coupled torch/triton change is expected: {outcome:?}");
+        };
+        assert_eq!(details.len(), 2);
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(!rendered.contains("action: rocm engines install vllm --reinstall"));
+    }
+
+    #[test]
     fn a_divergence_on_any_other_package_is_still_a_violation() {
         // The unrelated violation is real and must keep saying so, but it does not
         // make the deliberate torch divergence one too — and the reinstall that
@@ -29327,6 +29357,18 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("--runtime <runtime-key>"));
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_updates_preserve_the_source_family() {
+        let source = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx120X-all",
+            "gfx120X-all",
+            "7.14.0",
+        );
+
+        assert_eq!(source_family_for_update(&source), "gfx120X-all");
     }
 
     #[test]

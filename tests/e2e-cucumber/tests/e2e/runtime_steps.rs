@@ -450,6 +450,7 @@ async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
         "selected_rocm_version:",
         "build_date:",
         "source_layout_generation: multi-arch-v2",
+        "device_target:",
     ] {
         assert!(
             output.contains(expected),

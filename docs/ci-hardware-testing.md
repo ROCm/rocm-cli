@@ -144,7 +144,9 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace and survives `git clean`.
+lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+by source-layout generation so a branch using a new package layout cannot poison
+the cache consumed by code that only understands the previous layout.
 
 The tree may hold **more than one** runtime — the pre-warm installs a newer one
 side by side when the channel index publishes it (below) — so scenarios must not
@@ -173,6 +175,8 @@ Pre-warm then:
   ahead;
 - replaces a same-version runtime side-by-side when its manifest has an older or
   missing wheel composition, then activates the composition-keyed replacement;
+- treats that repair as complete while the matching replacement remains installed,
+  so retained legacy manifests do not trigger repeated repairs or notifications;
 - ensures the default engine is installed even when the runtime itself is reused;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
   (a pinned build newer than the index must not be rolled back), or when freshness
