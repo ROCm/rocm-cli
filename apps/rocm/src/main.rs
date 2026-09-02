@@ -4,6 +4,7 @@
 
 mod automations;
 mod bootstrap;
+mod chat_host_facts;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -9771,7 +9772,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     if rocm_tools {
         messages.push(providers::ChatMessage {
             role: "system".to_owned(),
-            content: rocm_chat_tool_system_prompt(),
+            content: rocm_chat_tool_system_prompt_for_host(Some(paths)),
         });
     }
     messages.push(providers::ChatMessage {
@@ -10890,11 +10891,28 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. On native Windows, vLLM is skipped; use WSL/Linux for that ROCm GPU engine. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+/// The host-independent half of the assistant prompt.
+///
+/// Statements that are only true on *some* hosts do not belong here — they used
+/// to, and a WSL user was told "on native Windows, vLLM is skipped" while vLLM
+/// was in fact their supported path. Anything host-dependent now comes from
+/// [`chat_host_facts::HostFacts`], which knows which machine it is describing.
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
     format!("{ROCM_CHAT_TOOL_SYSTEM_PROMPT}\n\nROCm CLI assistant skill:\n{ROCM_CHAT_TOOL_SKILL}")
+}
+
+/// The assistant prompt grounded in the machine it will answer for.
+///
+/// The single composition point: both chat surfaces (`rocm chat --prompt
+/// --tools` in this bin, and the dashboard chat via
+/// [`crate::dash::resolved_args`]) send this, so neither can drift into
+/// answering platform questions from pretraining alone.
+pub(crate) fn rocm_chat_tool_system_prompt_for_host(paths: Option<&AppPaths>) -> String {
+    let facts = chat_host_facts::HostFacts::detect(paths);
+    format!("{}\n\n{}", rocm_chat_tool_system_prompt(), facts.render())
 }
 
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
@@ -21622,6 +21640,86 @@ mod tests {
             assert!(
                 prompt.contains(expected),
                 "system prompt should mention {expected}"
+            );
+        }
+    }
+
+    /// The reported bug: asked "What can ROCm do on Windows?", the assistant
+    /// answered that ROCm is Windows-incompatible and suggested CUDA/DirectX —
+    /// because nothing ever told it which machine it was on. The prompt the CLI
+    /// actually sends must carry the host.
+    #[test]
+    fn assistant_prompt_states_the_host_it_is_answering_for() {
+        let prompt = rocm_chat_tool_system_prompt_for_host(None);
+
+        // The tool-use rules survive the composition (this is the same prompt,
+        // grounded — not a replacement for it).
+        assert!(
+            prompt.contains("You are ROCm CLI's local assistant"),
+            "the ROCm tool-use prompt must still be there:\n{prompt}"
+        );
+
+        // …and it now names this machine's OS and GPU state.
+        let expected_os = if cfg!(windows) {
+            "- Operating system: Windows"
+        } else {
+            "- Operating system: Linux"
+        };
+        assert!(
+            prompt.contains(expected_os),
+            "the prompt must state this machine's operating system:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- AMD GPU: "),
+            "the prompt must state what GPU was detected (or that none was):\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Never tell the user ROCm is unavailable on their platform"),
+            "the prompt must refuse the reported answer:\n{prompt}"
+        );
+    }
+
+    /// The static prompt asserted two Windows-only facts at every host, which is
+    /// how a WSL user — where vLLM IS the supported path — was told to go use
+    /// WSL. Platform claims now come from the detected facts instead.
+    #[test]
+    fn assistant_prompt_makes_no_unconditional_windows_claims() {
+        let prompt = rocm_chat_tool_system_prompt();
+        assert!(
+            !prompt.contains("non-technical Windows users"),
+            "the audience is not assumed to be on Windows:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("On native Windows, vLLM is skipped"),
+            "the vLLM caveat belongs in the host facts, not the static prompt:\n{prompt}"
+        );
+
+        // Stated only where it is true: present on Windows, absent elsewhere.
+        let grounded = rocm_chat_tool_system_prompt_for_host(None);
+        assert_eq!(
+            grounded.contains("vLLM is skipped on native Windows"),
+            cfg!(windows),
+            "the vLLM caveat must track the host:\n{grounded}"
+        );
+    }
+
+    /// The prompt tells the model to "use examine … before answering". The dash
+    /// registers its machine check as `doctor`, so before the alias that
+    /// sentence named a tool absent from the dash's schema.
+    #[test]
+    fn every_tool_the_prompt_names_exists_in_the_dash_schema() {
+        let prompt = rocm_chat_tool_system_prompt();
+        for named in [
+            "examine",
+            "gpu_snapshot",
+            "port_status",
+            "natural_language_plan",
+        ] {
+            assert!(prompt.contains(named), "prompt should mention {named}");
+            assert!(
+                rocm_dash_tui::agent::ROCM_READ_TOOL_NAMES.contains(&named),
+                "the prompt names `{named}` but the dash never registers it, so a \
+                 model that obeys the prompt calls a tool the schema does not offer"
             );
         }
     }

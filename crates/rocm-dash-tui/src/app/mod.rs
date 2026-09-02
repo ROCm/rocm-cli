@@ -120,6 +120,12 @@ pub struct ResolvedArgs {
     /// Background checks for the automations manager (Phase 3 Wave 3). Adapted
     /// by the bin. Empty when none are available.
     pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
+    /// System prompt for the chat assistant: the ROCm tool-use prompt plus this
+    /// machine's detected facts (OS, WSL, AMD GPU, available engines). Composed
+    /// by the bin (`apps/rocm`, which has `rocm-core`) so this crate needs no
+    /// `rocm-core` dep. `None` for demo/replay/`--chat-mock`, which have no bin
+    /// seam and keep the agent's built-in default preamble.
+    pub chat_system_prompt: Option<String>,
     /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
     /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
@@ -1822,6 +1828,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 Some(chat_tx.clone()),
             )
             .ok()
+            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
@@ -1831,6 +1838,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     args.inference_params(),
                     state.tool_executor.clone(),
                     chat_tx.clone(),
+                    args.chat_system_prompt.clone(),
                 )
                 .ok(),
                 None => None,
@@ -2314,6 +2322,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         args.inference_params(),
                         state.tool_executor.clone(),
                         chat_tx.clone(),
+                        args.chat_system_prompt.clone(),
                     ) {
                         Ok(arc) => {
                             agent = Some(arc.clone());
@@ -5556,6 +5565,7 @@ mod tests {
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
+            chat_system_prompt: None,
             tool_executor: None,
             bench_results_dir: None,
         }

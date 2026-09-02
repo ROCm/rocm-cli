@@ -2347,7 +2347,7 @@ fn normalize_cpu_model(value: &str) -> String {
 /// route-out note, a false negative runs bare-metal driver checks against a
 /// platform that has no amdgpu module and reports nonsense.
 #[must_use]
-pub(crate) fn is_wsl_host() -> bool {
+pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),

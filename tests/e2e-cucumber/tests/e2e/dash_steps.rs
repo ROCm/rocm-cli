@@ -314,6 +314,114 @@ async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
     );
 }
 
+/// The recorded chat request's message contents, in order.
+///
+/// The grounding steps look across every role rather than only `system`: what
+/// matters is that the model was told, not which envelope carried it (the
+/// built-in local provider folds system text into the user turn).
+async fn recorded_chat_messages(world: &mut E2eWorld) -> Vec<String> {
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the mock never received a chat request: {e}"));
+    body.get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"))
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(message_text)
+        .collect()
+}
+
+/// The text of one OpenAI-format message. `content` is a bare string on the
+/// turns the TUI builds, but an array of typed parts on the system message the
+/// chat client emits — read both, or the grounding looks absent when it is
+/// simply wrapped.
+fn message_text(content: &serde_json::Value) -> String {
+    content.as_str().map_or_else(
+        || {
+            content
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        },
+        str::to_owned,
+    )
+}
+
+/// The single line of the sent prompt that opens with `label`, or a failure
+/// naming what was actually sent. Asserting on the request — never on the
+/// canned reply — is the point: the mock answers identically whatever it is
+/// told, so only the request can show the assistant was grounded.
+fn sent_fact_line(messages: &[String], label: &str) -> String {
+    messages
+        .iter()
+        .flat_map(|m| m.lines())
+        .map(str::trim)
+        .find(|line| line.starts_with(label))
+        .unwrap_or_else(|| {
+            panic!(
+                "the assistant was never told `{label}`; the request carried:\n{}",
+                messages.join("\n---\n")
+            )
+        })
+        .to_owned()
+}
+
+#[then("the assistant is told which operating system this machine runs")]
+async fn assistant_told_the_operating_system(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- Operating system:");
+    let host = e2e_cucumber::capability::host_capability();
+    let expected = if host.os_family.eq_ignore_ascii_case("windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+    assert!(
+        line.contains(expected),
+        "this machine runs {}, but the assistant was told: {line}",
+        host.os_family
+    );
+    // WSL is the case the old prompt got wrong — it told WSL users vLLM was
+    // unavailable — so a WSL host must be named as one, not flattened to Linux.
+    assert_eq!(
+        line.contains("WSL"),
+        host.is_wsl,
+        "WSL must be stated exactly when this machine is WSL (is_wsl={}): {line}",
+        host.is_wsl
+    );
+}
+
+#[then("the assistant is told which GPU this machine has")]
+async fn assistant_told_the_gpu(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- AMD GPU:");
+    let host = e2e_cucumber::capability::host_capability();
+    match host.gfx_target.as_deref() {
+        // A host with a real GPU must see that GPU named, not a placeholder.
+        Some(target) => assert!(
+            line.contains(target),
+            "this machine's GPU is {target}, but the assistant was told: {line}"
+        ),
+        // A host without one must be told so explicitly, rather than left to
+        // fill the silence from pretraining.
+        None => assert!(
+            line.contains("no AMD GPU detected"),
+            "no GPU is detectable here, so the assistant must be told that: {line}"
+        ),
+    }
+}
+
 #[then("the managed model is shown as loading rather than ready")]
 async fn managed_model_shown_loading(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");

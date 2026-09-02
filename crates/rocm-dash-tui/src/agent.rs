@@ -102,10 +102,50 @@ fn validate_chatgpt_inference_params(params: &InferenceParams) -> Result<(), Age
 }
 
 /// Default system preamble for the dashboard assistant.
+///
+/// The fallback only — a live dash replaces it via `with_preamble` with the
+/// bin-composed prompt, which carries the ROCm tool-use rules AND this
+/// machine's detected facts. This text stands alone for demo/replay/`--chat-mock`,
+/// which have no bin seam to compose one.
 const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a terminal dashboard for AMD \
      Instinct GPU telemetry and benchmarks. Use the provided tools (gpu_status, \
      list_instances, bench_summary, tokens_per_watt) to answer questions about \
      live GPU, serving instance, and benchmark state. Prefer short, direct answers.";
+
+/// Give one backend a `with_preamble` override for its system prompt.
+///
+/// All three backends carry the same `preamble: String`, and all three must
+/// accept the bin's host-grounded prompt or the grounding would depend on which
+/// provider the operator happened to pick. One macro keeps that parity the way
+/// the tool-registration helpers already do.
+///
+/// An override is applied post-construction rather than as a `new` parameter so
+/// the constructors keep their signatures; `None` or a blank string leaves
+/// [`DEFAULT_PREAMBLE`] in place, which is what demo/replay/`--chat-mock` pass.
+macro_rules! impl_with_preamble {
+    ($ty:ident) => {
+        impl $ty {
+            #[must_use]
+            pub fn with_preamble(mut self, preamble: Option<String>) -> Self {
+                if let Some(prompt) = preamble.filter(|p| !p.trim().is_empty()) {
+                    self.preamble = prompt;
+                }
+                self
+            }
+
+            /// The system prompt this client sends. Test-only: it exists so the
+            /// override can be pinned without a network round-trip.
+            #[cfg(test)]
+            pub(crate) fn preamble(&self) -> &str {
+                &self.preamble
+            }
+        }
+    };
+}
+
+impl_with_preamble!(RigAgentClient);
+impl_with_preamble!(ChatGptAgentClient);
+impl_with_preamble!(AnthropicAgentClient);
 
 /// Errors from a chat completion. Public form is string-only so no `rig` type
 /// leaks past this file. Messages never include the api_key (it is a header,
@@ -661,6 +701,19 @@ rocm_read_tool!(
      runtime status, and readiness checks. Read-only.",
     { "type": "object", "properties": {} }
 );
+// The same machine inspection under the name the assistant prompt uses. The
+// bin has exposed it as `examine` since before the dash existed and accepts
+// both names (`validate_chat_tool_call`), but the dash schema advertised only
+// `doctor` — so the shared prompt's "use examine … before answering" named a
+// tool the model could not see here. Registering the alias makes the one prompt
+// valid against both catalogs.
+rocm_read_tool!(
+    ExamineRocmTool,
+    "examine",
+    "Alias of `doctor`: the same read-only environment check (detected AMD \
+     GPU/driver, active ROCm runtime status, readiness). Read-only.",
+    { "type": "object", "properties": {} }
+);
 rocm_read_tool!(
     EnginesRocmTool,
     "engines",
@@ -793,8 +846,9 @@ rocm_read_tool!(
 /// Used for uniqueness/registration checks and the parity map. Mutating tools
 /// are intentionally absent. `natural_language_plan` is read-only: it plans but
 /// never executes (Phase 7).
-pub const ROCM_READ_TOOL_NAMES: [&str; 13] = [
+pub const ROCM_READ_TOOL_NAMES: [&str; 14] = [
     DoctorRocmTool::NAME,
+    ExamineRocmTool::NAME,
     EnginesRocmTool::NAME,
     ServicesRocmTool::NAME,
     ServiceLogsRocmTool::NAME,
@@ -1204,6 +1258,10 @@ where
 {
     builder
         .tool(DoctorRocmTool {
+            executor: executor.cloned(),
+            fired: fired.clone(),
+        })
+        .tool(ExamineRocmTool {
             executor: executor.cloned(),
             fired: fired.clone(),
         })
@@ -2003,6 +2061,9 @@ mod tests {
         // Every expected read-only tool is registered…
         for expected in [
             "doctor",
+            // The prompt's name for the same check; both must be advertised or
+            // the shared assistant prompt names a tool the dash never offers.
+            "examine",
             "engines",
             "services",
             "service_logs",
@@ -2100,6 +2161,64 @@ mod tests {
         let client_default =
             RigAgentClient::new(cfg, InferenceParams::default(), None, None).expect("build");
         assert_eq!(client_default.params, InferenceParams::default());
+    }
+
+    #[test]
+    fn a_bin_composed_prompt_replaces_the_default_preamble() {
+        // Construction is offline, so this pins that the host-grounded prompt
+        // the bin composes actually reaches the field every request's system
+        // message is built from — and that demo/replay/mock, which pass None,
+        // keep the standalone default.
+        let cfg = LlmConfig {
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            model: "local-model".to_string(),
+            api_key: None,
+            auth_header: None,
+        };
+        let grounded = "You are ROCm CLI's local assistant. Operating system: Linux.";
+        let client = RigAgentClient::new(cfg.clone(), InferenceParams::default(), None, None)
+            .expect("build rig client")
+            .with_preamble(Some(grounded.to_string()));
+        assert_eq!(client.preamble(), grounded);
+
+        for absent in [None, Some(String::new()), Some("   ".to_string())] {
+            let fallback = RigAgentClient::new(cfg.clone(), InferenceParams::default(), None, None)
+                .expect("build rig client")
+                .with_preamble(absent.clone());
+            assert_eq!(
+                fallback.preamble(),
+                DEFAULT_PREAMBLE,
+                "no usable prompt ({absent:?}) must leave the built-in default"
+            );
+        }
+
+        // Same for the other two backends: grounding must not depend on which
+        // provider the operator picked, so all three accept the override.
+        let chatgpt = ChatGptAgentClient::new(
+            None,
+            InferenceParams::default(),
+            |_url, _code| {},
+            None,
+            None,
+        )
+        .expect("build chatgpt oauth client")
+        .with_preamble(Some(grounded.to_string()));
+        assert_eq!(chatgpt.preamble(), grounded);
+
+        let anthropic = AnthropicAgentClient::new(
+            LlmConfig {
+                base_url: String::new(),
+                model: String::new(),
+                api_key: Some("dummy".to_string()),
+                auth_header: None,
+            },
+            InferenceParams::default(),
+            None,
+            None,
+        )
+        .expect("build anthropic client")
+        .with_preamble(Some(grounded.to_string()));
+        assert_eq!(anthropic.preamble(), grounded);
     }
 
     #[test]
@@ -2321,7 +2440,7 @@ mod tests {
         }
         assert_eq!(
             ROCM_READ_TOOL_NAMES.len(),
-            13,
+            14,
             "canonical read-tool set size"
         );
         assert_eq!(
