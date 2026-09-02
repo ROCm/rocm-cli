@@ -185,6 +185,29 @@ sha256 and size metadata, Hugging Face host scoping, Hugging Face token
 approval, or manual-only blocking. Existing signed indexes without
 `source_policy` keep the older explicit-review behavior.
 
+## TheRock Base URL Overrides
+
+rocm-cli hardcodes the pip index and tarball listing bases it resolves
+TheRock SDK artifacts from. Seven of those bases can be overridden, for
+fixture-server testing only:
+
+```text
+ROCM_CLI_THEROCK_RELEASE_PIP_BASE
+ROCM_CLI_THEROCK_RELEASE_PIP_MULTI_ARCH_BASE
+ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE
+ROCM_CLI_THEROCK_NEXT_RELEASE_PIP_BASE
+ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE
+ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE
+ROCM_CLI_THEROCK_NEXT_RELEASE_TARBALL_BASE
+```
+
+None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is
+also set to a non-empty value. Without that gate, a stray override left in a
+developer's shell environment cannot silently redirect a release install to
+an untrusted host; rocm-cli always resolves the hardcoded default base
+instead. Set both the gate and the specific base variable together, and only
+in tests or deliberate manual QA against a fixture server.
+
 ## Remaining Owner Step
 
 The repo still needs a real project-owned public signing key and matching

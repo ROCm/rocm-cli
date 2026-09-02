@@ -142,11 +142,25 @@ impl TheRockIndexGeneration {
     }
 }
 
+/// Gates every `env_override_base` call behind an explicit opt-in, so a
+/// stray `ROCM_CLI_THEROCK_*_BASE` left in a developer's environment can't
+/// silently redirect a release install to an untrusted host. See
+/// `docs/release-trust.md`.
+fn therock_base_override_allowed() -> bool {
+    std::env::var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 /// Reads `env_var` for a test/operator override of a hardcoded base URL,
-/// falling back to `default` when unset or blank. Mirrors the existing
+/// falling back to `default` when unset, blank, or when
+/// `therock_base_override_allowed` is false. Mirrors the existing
 /// `ROCM_CLI_THEROCK_FAMILY` override precedent so every base used to resolve
 /// TheRock artifacts can be pointed at a fixture server in tests.
 fn env_override_base(env_var: &str, default: &str) -> String {
+    if !therock_base_override_allowed() {
+        return default.to_owned();
+    }
     std::env::var(env_var)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -1296,6 +1310,13 @@ fn resolve_pip_runtime_with_timeout(
         family_resolution.raw_arch.as_deref(),
         version_selector,
     );
+    if index_candidates.is_empty() {
+        bail!(
+            "installing TheRock ROCm 10 or newer wheel runtimes requires a specific GPU arch \
+             (for example `--family gfx1200`); \"{}\" is a grouped family with no arch code",
+            family_resolution.family
+        );
+    }
     let mut errors = Vec::new();
     for (generation, index_url) in index_candidates {
         match resolve_pip_runtime_from_index(
@@ -1436,17 +1457,20 @@ fn resolve_tarball_artifact_with_timeout(
     )
 }
 
-/// The tarball listing bases to try, in order, for `channel`. `Release` tries
-/// ROCm 10's `Next` layout before falling back to the `Legacy` layout, so
-/// GPU families dropped from the new listing (e.g. `gfx900`) still resolve
-/// via the existing legacy index.
+/// The tarball listing bases to try, in order, for `channel`. `Release` keeps
+/// today's `Legacy` layout as the default, byte-for-byte unchanged, and only
+/// falls back to ROCm 10's `Next` layout for families the legacy listing has
+/// dropped. Tarball installs have no version-pin escape hatch (unlike wheel's
+/// `--version`), so the default order can't assume `Next` first without
+/// silently changing which artifact a plain `install sdk --format tarball`
+/// resolves to.
 fn therock_tarball_base_candidates(
     channel: TheRockChannel,
 ) -> Vec<(TheRockIndexGeneration, String)> {
     match channel {
         TheRockChannel::Release => vec![
-            (TheRockIndexGeneration::Next, next_release_tarball_base()),
             (TheRockIndexGeneration::Legacy, release_tarball_base()),
+            (TheRockIndexGeneration::Next, next_release_tarball_base()),
         ],
         TheRockChannel::Nightly => vec![(TheRockIndexGeneration::Legacy, nightly_tarball_base())],
     }
@@ -1486,7 +1510,7 @@ fn resolve_tarball_artifact_from_base(
         platform_tarball_token(),
         family_token
     );
-    let (file, version) = select_tarball_artifact(files, &prefix)
+    let (file, version) = select_tarball_artifact(files, &prefix, generation)
         .context("no matching TheRock tarball artifact was found in this index")?;
     Ok(TarballArtifact {
         family: family_resolution.family.clone(),
@@ -1498,15 +1522,19 @@ fn resolve_tarball_artifact_from_base(
 }
 
 /// Picks the newest real dist artifact matching `prefix` out of a tarball
-/// index listing. Requiring the extracted version suffix to actually parse
-/// (via [`parse_version`]) excludes non-release sibling files that TheRock's
-/// "next" listing includes alongside the real dist file (e.g. a
-/// `-tests-...` artifact with a later mtime than the dist file it shadows);
-/// this is a no-op against legacy listings, which are all version-shaped
-/// already.
+/// index listing. For the `Next` generation, requiring the extracted version
+/// suffix to actually parse (via [`parse_version`]) excludes non-release
+/// sibling files that TheRock's "next" listing includes alongside the real
+/// dist file (e.g. a `-tests-...` artifact with a later mtime than the dist
+/// file it shadows). That filter is skipped for `Legacy` and `Nightly`
+/// listings: their version suffixes have never been guaranteed to match
+/// `parse_version`'s grammar (two-component versions, `.postN`/`.devN`, or a
+/// dash-separated pre-release), and applying it there would silently drop
+/// otherwise-legitimate artifacts instead of a no-op.
 fn select_tarball_artifact(
     files: Vec<TarballIndexFile>,
     prefix: &str,
+    generation: TheRockIndexGeneration,
 ) -> Option<(TarballIndexFile, String)> {
     let mut candidates = files
         .into_iter()
@@ -1518,7 +1546,9 @@ fn select_tarball_artifact(
                 .to_owned();
             Some((file, version))
         })
-        .filter(|(_file, version)| parse_version(version).is_some())
+        .filter(|(_file, version)| {
+            generation != TheRockIndexGeneration::Next || parse_version(version).is_some()
+        })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.0
@@ -1585,9 +1615,13 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
 
     if let Some(family) = detect_managed_therock_family(paths) {
         // The managed manifest only stores the normalized family, not a raw
-        // arch code. Re-run the (cheap, local) host probe and attach its raw
-        // code only if it agrees with the managed family, so a `Next`-generation
-        // pip extra can still be built without trusting a stale/mismatched probe.
+        // arch code. Re-run the host probe and attach its raw code only if it
+        // agrees with the managed family, so a `Next`-generation pip extra can
+        // still be built without trusting a stale/mismatched probe. On Windows
+        // this probe shells out to `pnputil`/WMI/CIM (up to four subprocess
+        // calls, 5s timeout each); confined to this interactive `install sdk`
+        // path, not the startup update-check path, which short-circuits earlier
+        // with `Some(manifest.family)`.
         let raw_arch = raw_arch_agreeing_with_family(detect_host_gfx_target(), &family);
         return Ok(FamilyResolution {
             family,
@@ -4226,7 +4260,7 @@ mod tests {
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn tarball_base_candidates_try_next_before_legacy_on_release_only() {
+    fn tarball_base_candidates_try_legacy_before_next_on_release_only() {
         let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let release = therock_tarball_base_candidates(TheRockChannel::Release);
         assert_eq!(
@@ -4234,10 +4268,10 @@ mod tests {
                 .iter()
                 .map(|(generation, _)| *generation)
                 .collect::<Vec<_>>(),
-            vec![TheRockIndexGeneration::Next, TheRockIndexGeneration::Legacy],
+            vec![TheRockIndexGeneration::Legacy, TheRockIndexGeneration::Next],
         );
-        assert_eq!(release[0].1, THEROCK_NEXT_RELEASE_TARBALL_BASE);
-        assert_eq!(release[1].1, THEROCK_RELEASE_TARBALL_BASE);
+        assert_eq!(release[0].1, THEROCK_RELEASE_TARBALL_BASE);
+        assert_eq!(release[1].1, THEROCK_NEXT_RELEASE_TARBALL_BASE);
 
         let nightly = therock_tarball_base_candidates(TheRockChannel::Nightly);
         assert_eq!(
@@ -4283,7 +4317,7 @@ mod tests {
                 mtime: 1_787_612_032.0,
             },
         ];
-        let (file, version) = select_tarball_artifact(files, prefix)
+        let (file, version) = select_tarball_artifact(files, prefix, TheRockIndexGeneration::Next)
             .expect("the real dist artifact must be selected");
         assert_eq!(file.name, format!("{prefix}7.10.0.tar.gz"));
         assert_eq!(version, "7.10.0");
@@ -4302,8 +4336,8 @@ mod tests {
                 mtime: 200.0,
             },
         ];
-        let (file, version) =
-            select_tarball_artifact(files, prefix).expect("the newest artifact must be selected");
+        let (file, version) = select_tarball_artifact(files, prefix, TheRockIndexGeneration::Next)
+            .expect("the newest artifact must be selected");
         assert_eq!(file.name, format!("{prefix}6.6.0.tar.gz"));
         assert_eq!(version, "6.6.0");
     }
@@ -4314,7 +4348,43 @@ mod tests {
             name: "therock-dist-linux-gfx1100-6.5.0.tar.gz".to_owned(),
             mtime: 100.0,
         }];
-        assert!(select_tarball_artifact(files, "therock-dist-linux-gfx90a-dcgpu-").is_none());
+        assert!(
+            select_tarball_artifact(
+                files,
+                "therock-dist-linux-gfx90a-dcgpu-",
+                TheRockIndexGeneration::Next
+            )
+            .is_none()
+        );
+    }
+
+    /// The `parse_version` exclusion filter only applies to `Next` listings
+    /// (which mix in non-release `-tests-` siblings). `Legacy` listings (used
+    /// for both the release and nightly channels) have never been guaranteed
+    /// to use `parse_version`'s grammar, so a non-standard but legitimate
+    /// version shape must still be selected rather than silently dropped.
+    #[test]
+    fn tarball_selection_skips_version_parse_filter_on_legacy() {
+        let prefix = "therock-dist-linux-gfx1100-";
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}6.5.tar.gz"),
+                mtime: 100.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}6.6.0.post1.tar.gz"),
+                mtime: 200.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}6.7.0-rc1.tar.gz"),
+                mtime: 300.0,
+            },
+        ];
+        let (file, version) =
+            select_tarball_artifact(files, prefix, TheRockIndexGeneration::Legacy)
+                .expect("legacy listings must select the newest artifact");
+        assert_eq!(file.name, format!("{prefix}6.7.0-rc1.tar.gz"));
+        assert_eq!(version, "6.7.0-rc1");
     }
 
     #[test]
@@ -5001,6 +5071,44 @@ mod tests {
             Some(&rocm10_selector),
         );
         assert!(pinned.is_empty());
+    }
+
+    #[test]
+    fn resolve_pip_runtime_with_pinned_rocm10_and_grouped_family_fails_clearly() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("pinned-rocm10-grouped-family");
+        let compatibility = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["linux_x86_64".to_owned()],
+        };
+        let selector = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        let error = resolve_pip_runtime_with_timeout(
+            &paths,
+            TheRockChannel::Release,
+            Some("gfx120X-all"),
+            None,
+            &compatibility,
+            Some(&selector),
+            Some(1),
+        )
+        .unwrap_err()
+        .to_string();
+
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            error.contains("requires a specific GPU arch"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("--family gfx1200"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("candidate indexes"),
+            "unexpected error: {error}"
+        );
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it

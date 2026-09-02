@@ -50,6 +50,9 @@ async fn rocm10_pip_index_fixture(world: &mut E2eWorld) {
         .expect("failed to write fixture pip index");
     }
     let server = LoopbackServer::start(&served);
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
     world.command_env.push((
         "ROCM_CLI_THEROCK_NEXT_RELEASE_PIP_BASE",
         server.base_url().into(),
@@ -71,6 +74,17 @@ async fn rocm10_tarball_index_fixture(world: &mut E2eWorld) {
     std::fs::write(served.join("index.html"), index_html)
         .expect("failed to write fixture tarball index");
     let server = LoopbackServer::start(&served);
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", "1".into()));
+    // Release tarball resolution tries the legacy layout first; point it at a
+    // path with no index so it 404s and falls through to the ROCm 10 fixture
+    // below, exercising the same fallback a family dropped from the legacy
+    // listing would hit.
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{}/missing/", server.base_url()).into(),
+    ));
     world.command_env.push((
         "ROCM_CLI_THEROCK_NEXT_RELEASE_TARBALL_BASE",
         format!("{}/", server.base_url()).into(),

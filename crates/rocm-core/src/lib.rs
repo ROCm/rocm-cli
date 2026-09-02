@@ -3354,10 +3354,6 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn detect_host_therock_family() -> Option<String> {
-    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
-}
-
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
 }
@@ -3929,9 +3925,6 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
     match target.as_str() {
         "gfx101x-dgpu" => Some("gfx101X-dgpu".to_owned()),
         "gfx103x-dgpu" => Some("gfx103X-dgpu".to_owned()),
-        // ROCm 10's docs/index use "gfx103X-all" for the same GPU group; alias it
-        // to the existing canonical name rather than renaming everywhere.
-        "gfx103x-all" => Some("gfx103X-dgpu".to_owned()),
         "gfx110x-all" => Some("gfx110X-all".to_owned()),
         "gfx120x-all" => Some("gfx120X-all".to_owned()),
         "gfx90x-dgpu" => Some("gfx90X-dgpu".to_owned()),
@@ -8908,6 +8901,9 @@ mod tests {
         );
     }
 
+    // Characterizes pre-existing behavior: `starts_with("gfx103")` already
+    // aliases both of these to the canonical dgpu label with no dedicated
+    // "gfx103X-all" match arm needed.
     #[test]
     fn normalize_therock_family_aliases_gfx103x_all_to_canonical_dgpu_label() {
         assert_eq!(
