@@ -509,6 +509,10 @@ jobs:
       # Raise the wait budget rather than let that read as a product failure; a
       # genuine hang still fails, just later.
       E2E_TUI_TIMEOUT_SECS: "90"
+      # Same cold-start budget as every other lane and as this lane's own nightly
+      # twin: a first serve on shared hardware loads the model before it answers,
+      # and the default is short enough to read that as a product failure.
+      E2E_SERVE_TIMEOUT_SECS: "300"
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"

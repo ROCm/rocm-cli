@@ -53,12 +53,20 @@ mod tests {
     /// block/flow continuation lines so a label split across lines can't hide.
     /// Returns one flattened string per `runs-on` key.
     fn runs_on_values(text: &str) -> Vec<String> {
+        flattened_values(text, "runs-on")
+    }
+
+    /// Extract the COMPLETE value of every `{key}:` in `text`, joining any
+    /// block/flow continuation lines so a list item split across lines can't
+    /// hide. Returns one flattened string per occurrence of the key.
+    fn flattened_values(text: &str, key: &str) -> Vec<String> {
+        let marker = format!("{key}:");
         let lines: Vec<&str> = text.lines().collect();
         let mut out = Vec::new();
         for (i, raw) in lines.iter().enumerate() {
             let line = strip_comment(raw);
             let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix("runs-on:") else {
+            let Some(rest) = trimmed.strip_prefix(&marker) else {
                 continue;
             };
             let key_indent = indent_of(line);
@@ -79,6 +87,28 @@ mod tests {
             out.push(value);
         }
         out
+    }
+
+    /// Split a flattened YAML sequence into its items. Handles the flow form
+    /// (`[a, b]`) and the block form, which [`flattened_values`] joins into
+    /// `- a - b`, so the two spellings compare equal.
+    fn flattened_list_items(value: &str) -> Vec<String> {
+        let value = value.trim();
+        let items: Vec<String> =
+            if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                inner
+                    .split(',')
+                    .map(|item| item.trim().to_owned())
+                    .collect()
+            } else if let Some(block) = value.strip_prefix("- ") {
+                block
+                    .split(" - ")
+                    .map(|item| item.trim().to_owned())
+                    .collect()
+            } else {
+                vec![value.to_owned()]
+            };
+        items.into_iter().filter(|item| !item.is_empty()).collect()
     }
 
     /// Extract the top-level `concurrency.group` value, joining folded (`>-`)
@@ -264,6 +294,39 @@ mod tests {
         &rest[..end]
     }
 
+    /// Every job in `text` that targets a self-hosted runner, as
+    /// `(job id, flattened runs-on)` pairs in file order.
+    ///
+    /// This is what lets the docs guard assert against the workflow instead of
+    /// against a list copied into the test source: add a lane and the derived
+    /// list grows, so the documentation assertions fail until the docs follow.
+    ///
+    /// The job-id scan is scoped to the `jobs:` block, because top-level keys
+    /// like `push:` (under `on:`) and `group:` (under `concurrency:`) sit at the
+    /// same indent and would otherwise read as job ids.
+    fn self_hosted_e2e_jobs(text: &str) -> Vec<(String, String)> {
+        let jobs = top_level_block(text, "jobs");
+        jobs.lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .filter_map(|job| {
+                let mut values = runs_on_values(job_block(text, job));
+                assert!(
+                    values.len() <= 1,
+                    "job `{job}` declares more than one runs-on"
+                );
+                // A job without a runs-on (e.g. one that only `uses:` a
+                // reusable workflow) schedules nothing self-hosted.
+                let runs_on = values.pop()?.trim().to_owned();
+                let labels = flattened_list_items(&runs_on);
+                SELF_HOSTED_LABELS
+                    .iter()
+                    .any(|self_hosted| labels.iter().any(|label| label == self_hosted))
+                    .then_some((job.to_owned(), runs_on))
+            })
+            .collect()
+    }
+
     /// Extract the direct scalar entries from a named job-level mapping such as
     /// `env:`. Nested step mappings cannot satisfy this extractor.
     fn job_mapping(block: &str, mapping: &str) -> BTreeMap<String, String> {
@@ -344,6 +407,14 @@ mod tests {
             .collect()
     }
 
+    /// Every backtick-delimited span in `text`, in order.
+    fn backticked_items(text: &str) -> Vec<String> {
+        text.split('`')
+            .enumerate()
+            .filter_map(|(i, item)| (i % 2 == 1).then_some(item.to_owned()))
+            .collect()
+    }
+
     fn backticked_list_between(text: &str, prefix: &str, suffix: &str) -> Vec<String> {
         let section = text
             .split_once(prefix)
@@ -352,11 +423,7 @@ mod tests {
             .split_once(suffix)
             .unwrap_or_else(|| panic!("section ends with `{suffix}`"))
             .0;
-        section
-            .split('`')
-            .enumerate()
-            .filter_map(|(i, item)| (i % 2 == 1).then_some(item.to_owned()))
-            .collect()
+        backticked_items(section)
     }
 
     fn normalized_whitespace(text: &str) -> String {
@@ -722,6 +789,57 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// Both self-hosted workflows, so a lane added to either is covered.
+    fn self_hosted_workflows() -> [(&'static str, String); 2] {
+        [
+            ("e2e-selfhosted.yml", read_workflow("e2e-selfhosted.yml")),
+            ("nightly.yml", read_workflow("nightly.yml")),
+        ]
+    }
+
+    #[test]
+    fn every_self_hosted_lane_waits_for_an_available_gpu() {
+        // `e2e-gpu-nightly` shipped without one and nothing noticed: it hung to
+        // the 90-minute job cap on a wedged driver instead of failing in ~90s,
+        // while its own per-PR twin and every sibling failed fast. The preflight
+        // is what turns "absent, wedged, or still held by a leftover serve" into
+        // a named error rather than a timeout.
+        //
+        // Deliberately derived rather than listed, so a new lane is covered the
+        // day it lands. Any lane that genuinely should not wait for a GPU needs
+        // an exemption added here with the reason — which is the point: it
+        // becomes a decision someone makes, not one a copy-paste makes for them.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                assert!(
+                    job_block(&text, &job).contains("- name: GPU preflight"),
+                    "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
+                     GPU preflight step: on a wedged or occupied GPU it hangs to the job \
+                     timeout instead of failing fast with a reason"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_self_hosted_lane_allows_for_a_cold_serve() {
+        // The per-PR Strix Windows lane was the only lane without this, while its
+        // own nightly twin set it. A first serve on shared hardware loads the
+        // model before it answers; the default budget is short enough that the
+        // load reads as a product failure.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, _) in self_hosted_e2e_jobs(&text) {
+                let env = job_mapping(job_block(&text, &job), "env");
+                assert_eq!(
+                    env.get("E2E_SERVE_TIMEOUT_SECS").map(String::as_str),
+                    Some("300"),
+                    "{workflow} job `{job}` must give a cold serve the same budget as \
+                     every other self-hosted lane"
+                );
+            }
+        }
+    }
+
     #[test]
     fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
         let self_hosted = read_workflow("e2e-selfhosted.yml");
@@ -738,63 +856,120 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// The hardware-testing doc is a map of the self-hosted lanes, so every
+    /// expectation here is DERIVED from the workflows rather than restated in
+    /// the test source. A list copied into the test only proves the test and the
+    /// doc agree with each other; it says nothing about the YAML they describe,
+    /// and both can go stale together while the guard stays green.
     #[test]
     fn hardware_testing_docs_cover_all_self_hosted_platforms() {
-        let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
-            .expect("read hardware testing docs");
-        let rows = markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |");
-        let self_hosted_job_platforms: Vec<(String, String)> = rows
-            .into_iter()
-            .filter(|row| {
-                row.get(1)
-                    .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
-            })
-            .map(|row| (row[0].clone(), row[2].clone()))
-            .collect();
-        assert_eq!(
-            self_hosted_job_platforms,
-            vec![
-                (
-                    "`e2e-gpu`".to_owned(),
-                    "MI300X (AMD Instinct, bare-metal Linux)".to_owned(),
-                ),
-                (
-                    "`e2e-gpu-strix-ubuntu`".to_owned(),
-                    "Strix Halo (gfx1151) on Ubuntu".to_owned(),
-                ),
-                (
-                    "`e2e-gpu-strix-windows`".to_owned(),
-                    "Strix Halo (gfx1151) on native Windows 11".to_owned(),
-                ),
-                (
-                    "`e2e-wsl`".to_owned(),
-                    "Strix Halo (gfx1151) on Ubuntu under WSL2".to_owned(),
-                ),
-                (
-                    "`e2e-gpu-rad3`".to_owned(),
-                    "Radeon AI PRO R9700 (gfx1201) on Linux".to_owned(),
-                ),
-            ],
-            "hardware testing table must document every actual self-hosted job/platform row"
+        let self_hosted = read_workflow("e2e-selfhosted.yml");
+        let lanes = self_hosted_e2e_jobs(&self_hosted);
+        assert!(
+            !lanes.is_empty(),
+            "expected at least one self-hosted job in e2e-selfhosted.yml (extractor sanity check)"
         );
 
-        let artifacts = backticked_list_between(
+        let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
+            .expect("read hardware testing docs");
+        let documented: Vec<Vec<String>> =
+            markdown_table_rows(&docs, "| Job | Workflow | Platform | Runner labels |")
+                .into_iter()
+                .filter(|row| {
+                    row.get(1)
+                        .is_some_and(|workflow| workflow == "`e2e-selfhosted.yml`")
+                })
+                .collect();
+
+        let documented_jobs: Vec<String> = documented.iter().map(|row| row[0].clone()).collect();
+        let declared_jobs: Vec<String> = lanes.iter().map(|(job, _)| format!("`{job}`")).collect();
+        assert_eq!(
+            documented_jobs, declared_jobs,
+            "the hardware testing table must have one row per self-hosted job in \
+             e2e-selfhosted.yml, in workflow order"
+        );
+
+        for (row, (job, runs_on)) in documented.iter().zip(&lanes) {
+            assert!(
+                !row[2].is_empty(),
+                "the Platform cell for `{job}` describes the hardware in prose (it is not \
+                 derivable from the workflow), so it must at least be non-empty"
+            );
+            let cell = &row[3];
+            let quoted = backticked_items(cell);
+            assert_eq!(
+                quoted.len(),
+                1,
+                "the Runner labels cell for `{job}` must quote exactly one label list: `{cell}`"
+            );
+            assert_eq!(
+                flattened_list_items(&quoted[0]),
+                flattened_list_items(runs_on),
+                "the documented runner labels for `{job}` must match its actual runs-on"
+            );
+        }
+
+        // Derived from the same scan `every_uploaded_e2e_artifact_has_a_name_the_report_can_label`
+        // asserts on, so a new lane's artifact has to reach the doc too. The
+        // consolidated artifacts are report outputs, not per-platform inputs.
+        let mut declared_artifacts: Vec<String> = ["ci.yml", "e2e-selfhosted.yml", "nightly.yml"]
+            .into_iter()
+            .flat_map(|workflow| {
+                crate::e2e_report::uploaded_e2e_artifacts(
+                    &repo_root().join(".github/workflows").join(workflow),
+                )
+            })
+            .filter(|name| !name.starts_with("e2e-consolidated-report"))
+            .collect();
+        declared_artifacts.sort();
+        declared_artifacts.dedup();
+        let mut documented_artifacts = backticked_list_between(
             &docs,
             "The lane artifacts are named canonically (",
             ") in every workflow",
         );
+        // Sorted, not deduplicated: a name listed twice must still fail.
+        documented_artifacts.sort();
         assert_eq!(
-            artifacts,
-            vec![
-                "e2e-report",
-                "e2e-gpu-report",
-                "e2e-gpu-rad3-report",
-                "e2e-gpu-strix-ubuntu-report",
-                "e2e-gpu-strix-windows-report",
-                "e2e-gpu-strix-wsl-report",
-            ],
-            "the canonical artifact list must enumerate every report platform exactly once"
+            documented_artifacts, declared_artifacts,
+            "the canonical artifact list must enumerate every uploaded report artifact exactly once"
         );
+
+        let platform_input = nested_block(
+            &top_level_block(&self_hosted, "on"),
+            "      platform:", // workflow_dispatch.inputs.platform
+        );
+        let mut options = flattened_values(&platform_input, "options");
+        assert_eq!(
+            options.len(),
+            1,
+            "the dispatch `platform` input declares exactly one options list"
+        );
+        let declared_options = flattened_list_items(&options.pop().expect("length just asserted"));
+        assert_eq!(
+            backticked_list_between(
+                &docs,
+                "- `platform` (choice: ",
+                ") — which self-hosted job(s) to run",
+            ),
+            declared_options,
+            "the documented dispatch choices must match workflow_dispatch.inputs.platform.options"
+        );
+
+        // Prose enumerations of the lanes. Nothing read these before, so adding
+        // a lane and updating only the table left them quietly wrong.
+        let declared_ids: Vec<String> = lanes.iter().map(|(job, _)| job.clone()).collect();
+        for (prefix, suffix) in [
+            ("The self-hosted jobs (", ") run on AMD GPU systems"),
+            ("The self-hosted jobs — ", " — all run with"),
+        ] {
+            assert_eq!(
+                backticked_list_between(&docs, prefix, suffix),
+                declared_ids,
+                "the `{prefix}…{suffix}` sentence must name every self-hosted lane, in \
+                 workflow order"
+            );
+        }
 
         let readme = std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/README.md"))
             .expect("read E2E README");
@@ -889,6 +1064,55 @@ jobs:
         assert!(vals[1].contains("self-hosted") && vals[1].contains("amd-gpu"));
         // The flow list split across lines must be joined so `strix-halo` is seen.
         assert!(vals[2].contains("self-hosted") && vals[2].contains("strix-halo"));
+    }
+
+    #[test]
+    fn self_hosted_jobs_extractor_reads_ids_from_the_jobs_block_only() {
+        let yaml = "\
+name: X
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: x
+
+jobs:
+  # A comment sits at job indent and is not a job id.
+  hosted:
+    runs-on: ubuntu-latest
+  gpu:
+    runs-on: [self-hosted, linux, amd-gpu]
+    steps:
+      - name: irrelevant
+        run: echo hi
+  strix:
+    runs-on:
+      - self-hosted
+      - windows
+      - strix-halo
+  reusable:
+    uses: ./.github/workflows/other.yml
+";
+        assert_eq!(
+            self_hosted_e2e_jobs(yaml),
+            vec![
+                ("gpu".to_owned(), "[self-hosted, linux, amd-gpu]".to_owned()),
+                (
+                    "strix".to_owned(),
+                    "- self-hosted - windows - strix-halo".to_owned()
+                ),
+            ],
+            "only jobs are considered (not `push:`/`group:` at the same indent), only \
+             self-hosted runs-on values are kept, and both list spellings are flattened"
+        );
+        assert_eq!(
+            flattened_list_items("- self-hosted - windows - strix-halo"),
+            flattened_list_items("[self-hosted, windows, strix-halo]"),
+            "the two sequence spellings must compare equal"
+        );
     }
 
     #[test]
