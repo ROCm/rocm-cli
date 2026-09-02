@@ -259,8 +259,9 @@ jobs:
           export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
           # Share ONE installed managed runtime across the serve/chat scenarios so
           # `rocm install sdk` runs once per runner, not once per scenario (the
-          # per-scenario install count — each a multi-GiB TheRock SDK whose probe
-          # unpacks an ~8.8 GiB devel tarball — is what blew the time cap). The
+          # per-scenario install count — each a multi-GiB TheRock SDK, plus an
+          # additional ~8.8 GiB compiler/headers tarball on any scenario passing
+          # `--devel` — is what blew the time cap). The
           # "a managed runtime is active" precondition symlinks each scenario's
           # data/runtimes here (see use_shared_runtimes); clean-slate scenarios
           # stay isolated. Persisted across runs on RUNNER_WORKSPACE and refreshed
