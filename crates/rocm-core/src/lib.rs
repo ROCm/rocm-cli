@@ -1049,6 +1049,14 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
             {
                 bail!("timed out reading HTTP response");
             }
+            // A signal delivered to this thread aborts the read with `EINTR`.
+            // `SA_RESTART` does not save us: Linux never restarts a socket read
+            // that has a receive timeout set, and this loop sets one on every
+            // pass (see signal(7), "Interruption of system calls"). Any handler
+            // in the process is enough — `crossterm`'s `SIGWINCH` hook is linked
+            // into the CLI. Nothing is wrong with the connection, so read again;
+            // `deadline` still bounds the total wait.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error).context("failed to read TCP stream"),
         }
     }
@@ -8443,6 +8451,104 @@ mod tests {
         );
 
         let _ = server.join();
+        Ok(())
+    }
+
+    /// A signal arriving mid-response must not fail the request.
+    ///
+    /// A signal delivered while the client is parked in `read` aborts it with
+    /// `EINTR`. `SA_RESTART` does not save us: Linux never restarts a socket read
+    /// that has a receive timeout set, and this client sets one on every pass.
+    /// Any handler in the process is enough to trigger it — `crossterm`'s
+    /// `SIGWINCH` hook is linked into the CLI — so treating `EINTR` as a
+    /// transport error turned an unrelated signal into a spurious "endpoint
+    /// unreachable".
+    ///
+    /// Linux-only on purpose. The guarantee being exercised — a receive timeout
+    /// defeats `SA_RESTART` — is documented for Linux; BSD-derived kernels may
+    /// restart the read instead, which would leave this passing without ever
+    /// reaching the retry. CI has no macOS runner to tell the difference.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn http_read_survives_a_signal_arriving_mid_response() -> Result<()> {
+        extern "C" fn noop_handler(_signal: libc::c_int) {}
+
+        let body = r#"{"data":[{"id":"qwen"}]}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            // Answer late, so the client is blocked in `read` while the signals
+            // land rather than racing them.
+            std::thread::sleep(Duration::from_millis(400));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        // Install the handler with SA_RESTART set, to show that the flag is not
+        // what protects this read.
+        //
+        // The handler is left installed rather than restored: the default
+        // disposition for SIGUSR1 is to kill the process, so putting it back
+        // would let a signal still in flight take the whole test binary down.
+        // Leaving a no-op handler is inert — nothing else here raises SIGUSR1,
+        // and the signals below are aimed at this thread alone, so no other
+        // test sharing this process can observe either one.
+        #[allow(unsafe_code)] // libc FFI
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_handler as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()),
+                0,
+                "failed to install the SIGUSR1 handler"
+            );
+        }
+
+        // Target this thread specifically: a process-directed signal could land
+        // on any thread and disturb an unrelated test sharing this process.
+        #[allow(unsafe_code)] // libc FFI
+        let reader = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signaller = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // Let the connect and the request write finish first; only the
+                // response read is under test.
+                std::thread::sleep(Duration::from_millis(50));
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    #[allow(unsafe_code)] // libc FFI
+                    unsafe {
+                        libc::pthread_kill(reader, libc::SIGUSR1);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+        let response =
+            http_get_text_with_auth(&endpoint, "/v1/models", None, Duration::from_secs(5));
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        signaller.join().expect("signaller thread should not panic");
+        server.join().expect("server thread should not panic")?;
+
+        assert_eq!(
+            response?, body,
+            "an interrupted read is retryable, not a failed request"
+        );
         Ok(())
     }
 
