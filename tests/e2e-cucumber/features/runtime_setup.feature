@@ -39,7 +39,7 @@ Feature: Runtime configuration
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
   @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
-  Scenario: 4 - Reinstalling the SDK leaves the installed engine able to use the GPU
+  Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
     Then the runtime can still use the GPU
@@ -71,7 +71,7 @@ Feature: Runtime configuration
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
   # because only vLLM shares the runtime environment the alignment writes into.
   @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @nightly
-  Scenario: 9 - Opting out of the torch alignment keeps the torch the user installed
+  Scenario: runtime-04 - Opting out of the torch alignment keeps the torch the user installed
     Given a managed runtime with an inference engine already installed
     And the user has opted out of realigning torch
     When the user installs the SDK again
@@ -89,7 +89,7 @@ Feature: Runtime configuration
   # already-installed shared runtime. `status=error` is an ACCEPTED outcome, so an
   # offline runner reports honestly instead of flaking.
   @id:runtime-update-reports-freshness @requires-gpu
-  Scenario: 5 - The update check reports the active runtime's freshness
+  Scenario: runtime-05 - The update check reports the active runtime's freshness
     Given a managed runtime is active
     When the user checks for runtime updates
     Then the report states the runtime's freshness against the channel index
@@ -115,7 +115,7 @@ Feature: Runtime configuration
   # under load, which is their own problem to fix; until then this runs on the
   # nightly lanes, where a GPU is present and scenarios are serialized.
   @id:runtime-install-records-the-real-folder @nightly
-  Scenario: 8 - Previewing an install through a linked runtimes folder names the real folder
+  Scenario: runtime-06 - Previewing an install through a linked runtimes folder names the real folder
     Given a machine whose runtimes folder is a link to somewhere else
     When the user previews an SDK install
     Then the planned runtime folder is inside the folder the link points at
@@ -126,7 +126,7 @@ Feature: Runtime configuration
   # to a bogus `C:/usr/bin/python3` and errors on the missing path before it can
   # emit the install-type guidance), so the scenario's premise doesn't hold there.
   @id:runtime-adopt-preexisting-rejected @requires-os:linux
-  Scenario: runtime-03 - Adopting a pre-existing ROCm install is rejected with guidance
+  Scenario: runtime-07 - Adopting a pre-existing ROCm install is rejected with guidance
     Given a machine with a standard ROCm install
     When the user tries to adopt the existing install
     Then the adoption is refused

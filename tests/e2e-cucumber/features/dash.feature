@@ -111,8 +111,8 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:launcher-shows-live-serving-instance @requires-os:linux
-  Scenario: 10 - The launcher front door shows a live serving model rather than idle
+  @id:dash-launcher-shows-live-serving-instance @requires-os:linux
+  Scenario: dash-10 - The launcher front door shows a live serving model rather than idle
     # EAI-8190 regression: bare `rocm` opens the launcher front door, which
     # reads the managed-service registry (`launcher_serving_instances`) the same
     # way `rocm services` does. A model already serving must surface as

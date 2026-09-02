@@ -35,7 +35,7 @@ Feature: Native HTTP networking
   # first thing `serve` does, before any engine or model work — so it needs no GPU
   # and runs on the mock lane every PR.
   @id:networking-public-bind-requires-opt-in
-  Scenario: 3 - Binding to a public interface without opt-in is refused up front
+  Scenario: networking-03 - Binding to a public interface without opt-in is refused up front
     When the user serves a model bound to a public interface without allowing public binding
     Then serving is refused before any engine starts
     And the user is told to allow public binding first

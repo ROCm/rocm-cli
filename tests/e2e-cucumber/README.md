@@ -109,9 +109,14 @@ matrix, then reconciles the actual result against that expectation.
 ### Naming
 
 Each feature file has a short **key** that prefixes both its scenario names and
-its ids. The key is usually the file's stem, but not always — `install_lifecycle`
-uses `lifecycle` and `model_serving` uses `serve` — so `FEATURE_KEYS` in
-`tests/feature_naming.rs` is the list, not this page:
+its ids. The key is usually the file's stem in kebab-case, but not always —
+`install_lifecycle` uses `lifecycle`, `model_serving` uses `serve`, and
+`dependency_guard` uses `deps-guard` — so `FEATURE_KEYS` in
+`tests/feature_naming.rs` is the list, not this page.
+
+Keys must also be **distinct between files**: `runtime_setup` owns `runtime`, so
+`runtime_lifecycle` takes `runtime-lifecycle`. Two files sharing a key would emit
+the same `<key>-01` index twice, which is exactly what the key exists to prevent.
 
 - **Scenario name** — `Scenario: <key>-<NN> - <description>`, numbered
   sequentially in declaration order. The report sorts the grid's rows by this

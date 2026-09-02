@@ -118,7 +118,7 @@ Feature: GPU detection and system inspection
   # would actually pull. The plan is rendered on every Linux host regardless of
   # GPU (the driver is not yet installed when you preview it), so the mock lane
   # pins this without hardware.
-  @id:install-driver-dry-run-resolves-repo-version @requires-os:linux
-  Scenario: 12 - The driver install dry-run shows the effective repo version
+  @id:examine-install-driver-dry-run-resolves-repo-version @requires-os:linux
+  Scenario: examine-12 - The driver install dry-run shows the effective repo version
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder

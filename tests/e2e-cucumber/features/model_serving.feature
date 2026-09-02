@@ -141,7 +141,7 @@ Feature: Model serving
   # check runs inside argument parsing, before engine selection or any GPU
   # pre-flight, so it needs no GPU and no engine and gates every PR (ungated).
   @id:serve-negative-temperature-rejected
-  Scenario: 15 - Serving with a temperature below zero is refused with a clear reason
+  Scenario: serve-14 - Serving with a temperature below zero is refused with a clear reason
     When the user serves a model with a negative sampling temperature
     Then serving is refused before any engine starts
     And the CLI explains that temperature cannot be negative
@@ -150,7 +150,7 @@ Feature: Model serving
   # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
   # GPU hardware (Strix Halo / Instinct).
   @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
-  Scenario: serve-14 - Serving is refused when every GPU is masked from view
+  Scenario: serve-15 - Serving is refused when every GPU is masked from view
     When the user serves a model with every GPU masked from view
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -161,7 +161,7 @@ Feature: Model serving
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
-  Scenario: serve-15 - Serving pinned to a GPU that does not exist is refused
+  Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
@@ -171,7 +171,7 @@ Feature: Model serving
   # during argument parsing — before any engine or GPU work. No device needed, so
   # this runs on the mock lane every PR.
   @id:serve-runtime-and-env-selectors-conflict
-  Scenario: 15 - Selecting both a runtime and an environment at once is refused
+  Scenario: serve-17 - Selecting both a runtime and an environment at once is refused
     When the user serves a model selecting both a runtime and an environment
     Then serving is refused before any engine starts
     And the user is told the two selectors cannot be combined
@@ -182,7 +182,7 @@ Feature: Model serving
   # deterministic on the blocking no-GPU lane rather than relying on a real 3 GiB
   # transfer to fail at just the right moment.
   @id:serve-lemonade-preparation-recovery @requires-no-gpu
-  Scenario: 16 - Repeated Lemonade preparation failure gives the user a recovery path
+  Scenario: serve-18 - Repeated Lemonade preparation failure gives the user a recovery path
     Given Lemonade preparation cannot complete
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry

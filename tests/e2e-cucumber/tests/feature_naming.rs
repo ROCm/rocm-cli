@@ -22,16 +22,24 @@ use std::path::{Path, PathBuf};
 /// so a new file can't quietly opt out of the convention.
 const FEATURE_KEYS: &[(&str, &str)] = &[
     ("artifact_prefetch.feature", "artifact-prefetch"),
+    ("automations.feature", "automations"),
     ("bench.feature", "bench"),
     ("chat.feature", "chat"),
+    ("config.feature", "config"),
     ("dash.feature", "dash"),
+    ("dependency_guard.feature", "deps-guard"),
     ("diagnose.feature", "diagnose"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
+    // Not `runtime`: `runtime_setup.feature` owns that key, and two files
+    // sharing one key would collide on every index (`runtime-01` in both).
+    ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
+    ("update.feature", "update"),
 ];
 
 fn features_dir() -> PathBuf {
