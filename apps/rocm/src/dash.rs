@@ -94,9 +94,9 @@ fn chat_api_key_from_env() -> Option<String> {
 /// unavailable store yields `None` (the dash still launches; switching to the
 /// Anthropic provider then surfaces an actionable error turn).
 fn anthropic_api_key_for_dash() -> Option<String> {
-    crate::provider_keys::resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY")
+    crate::provider_keys::provider_credential("anthropic", "ANTHROPIC_API_KEY")
         .ok()
-        .map(|k| k.value)
+        .map(crate::provider_keys::ProviderCredential::into_value)
 }
 
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the

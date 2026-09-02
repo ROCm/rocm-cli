@@ -21,17 +21,23 @@ pub(crate) struct ProviderKeyStatus {
     pub source: String,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ProviderApiKey {
-    pub value: String,
-    pub source: String,
+pub(crate) struct ProviderCredential(String);
+
+impl ProviderCredential {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_value(self) -> String {
+        self.0
+    }
 }
 
 pub(crate) trait ProviderKeyStore: Send + Sync {
     fn label(&self) -> &'static str;
-    fn get_secret(&self, provider: &str) -> Result<Option<Vec<u8>>>;
-    fn set_secret(&self, provider: &str, secret: &[u8]) -> Result<()>;
-    fn clear_secret(&self, provider: &str) -> Result<()>;
+    fn get_entry(&self, provider: &str) -> Result<Option<Vec<u8>>>;
+    fn store_entry(&self, provider: &str, value: &[u8]) -> Result<()>;
+    fn remove_entry(&self, provider: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,9 +55,9 @@ pub(crate) fn provider_key_status(provider: &str, env_name: &str) -> ProviderKey
     )
 }
 
-pub(crate) fn resolve_provider_api_key(provider: &str, env_name: &str) -> Result<ProviderApiKey> {
+pub(crate) fn provider_credential(provider: &str, env_name: &str) -> Result<ProviderCredential> {
     let store = NativeProviderKeyStore;
-    resolve_provider_api_key_with_store(
+    provider_credential_with_store(
         &store,
         provider,
         env_name,
@@ -61,12 +67,12 @@ pub(crate) fn resolve_provider_api_key(provider: &str, env_name: &str) -> Result
     )
 }
 
-pub(crate) fn set_provider_api_key(provider: &str, value: &str) -> Result<ProviderKeyStatus> {
+pub(crate) fn store_provider_credential(provider: &str, value: &str) -> Result<ProviderKeyStatus> {
     let store = NativeProviderKeyStore;
-    set_provider_api_key_with_store(&store, provider, value)
+    store_provider_credential_with_store(&store, provider, value)
 }
 
-pub(crate) fn set_provider_api_key_with_store(
+pub(crate) fn store_provider_credential_with_store(
     store: &dyn ProviderKeyStore,
     provider: &str,
     value: &str,
@@ -77,7 +83,7 @@ pub(crate) fn set_provider_api_key_with_store(
     }
     ensure_cloud_provider(provider)?;
     store
-        .set_secret(provider, trimmed.as_bytes())
+        .store_entry(provider, trimmed.as_bytes())
         .with_context(|| format!("failed to save {provider} API key in secure storage"))?;
     Ok(ProviderKeyStatus {
         state: ProviderKeyState::Configured,
@@ -85,18 +91,18 @@ pub(crate) fn set_provider_api_key_with_store(
     })
 }
 
-pub(crate) fn clear_provider_api_key(provider: &str) -> Result<ProviderKeyStatus> {
+pub(crate) fn remove_provider_credential(provider: &str) -> Result<ProviderKeyStatus> {
     let store = NativeProviderKeyStore;
-    clear_provider_api_key_with_store(&store, provider)
+    remove_provider_credential_with_store(&store, provider)
 }
 
-pub(crate) fn clear_provider_api_key_with_store(
+pub(crate) fn remove_provider_credential_with_store(
     store: &dyn ProviderKeyStore,
     provider: &str,
 ) -> Result<ProviderKeyStatus> {
     ensure_cloud_provider(provider)?;
     store
-        .clear_secret(provider)
+        .remove_entry(provider)
         .with_context(|| format!("failed to clear {provider} API key from secure storage"))?;
     Ok(ProviderKeyStatus {
         state: ProviderKeyState::Missing,
@@ -138,8 +144,8 @@ fn provider_key_status_with_store(
             source: format!("env:{env_name}"),
         };
     }
-    match store.get_secret(provider) {
-        Ok(Some(secret)) if !secret.is_empty() => ProviderKeyStatus {
+    match store.get_entry(provider) {
+        Ok(Some(value)) if !value.is_empty() => ProviderKeyStatus {
             state: ProviderKeyState::Configured,
             source: secure_source_label(store.label()),
         },
@@ -154,32 +160,26 @@ fn provider_key_status_with_store(
     }
 }
 
-fn resolve_provider_api_key_with_store(
+fn provider_credential_with_store(
     store: &dyn ProviderKeyStore,
     provider: &str,
     env_name: &str,
     env_value: Option<String>,
-) -> Result<ProviderApiKey> {
+) -> Result<ProviderCredential> {
     ensure_cloud_provider(provider)?;
     if let Some(value) = env_value {
-        return Ok(ProviderApiKey {
-            value,
-            source: format!("env:{env_name}"),
-        });
+        return Ok(ProviderCredential(value));
     }
-    match store.get_secret(provider) {
-        Ok(Some(secret)) if !secret.is_empty() => {
-            let value = String::from_utf8(secret)
+    match store.get_entry(provider) {
+        Ok(Some(value)) if !value.is_empty() => {
+            let value = String::from_utf8(value)
                 .context("stored provider API key was not valid UTF-8")?
                 .trim()
                 .to_owned();
             if value.is_empty() {
                 bail!("{provider} API key in secure storage is empty");
             }
-            Ok(ProviderApiKey {
-                value,
-                source: secure_source_label(store.label()),
-            })
+            Ok(ProviderCredential(value))
         }
         Ok(_) => bail!(
             "{provider} provider requires a saved API key; run `rocm config set-provider-key {provider}` or set {env_name} for this session"
@@ -207,21 +207,21 @@ impl ProviderKeyStore for NativeProviderKeyStore {
         native_store_label()
     }
 
-    fn get_secret(&self, provider: &str) -> Result<Option<Vec<u8>>> {
+    fn get_entry(&self, provider: &str) -> Result<Option<Vec<u8>>> {
         with_native_entry(provider, |entry| match entry.get_secret() {
-            Ok(secret) => Ok(Some(secret)),
+            Ok(value) => Ok(Some(value)),
             Err(KeyringError::NoEntry) => Ok(None),
             Err(error) => Err(keyring_anyhow(error)),
         })
     }
 
-    fn set_secret(&self, provider: &str, secret: &[u8]) -> Result<()> {
+    fn store_entry(&self, provider: &str, value: &[u8]) -> Result<()> {
         with_native_entry(provider, |entry| {
-            entry.set_secret(secret).map_err(keyring_anyhow)
+            entry.set_secret(value).map_err(keyring_anyhow)
         })
     }
 
-    fn clear_secret(&self, provider: &str) -> Result<()> {
+    fn remove_entry(&self, provider: &str) -> Result<()> {
         with_native_entry(provider, |entry| match entry.delete_credential() {
             Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
             Err(error) => Err(keyring_anyhow(error)),
@@ -236,7 +236,7 @@ impl ProviderKeyStore for NativeProviderKeyStore {
 /// runtime *context* is already entered on the calling thread, that nested
 /// `block_on` panics with "Cannot start a runtime from within a runtime". The
 /// dash resolves keys off-runtime, but this is the single chokepoint for every
-/// store op (get/set/clear) and for `resolve_provider_api_key` /
+/// store op (get/store/remove) and for `provider_credential` /
 /// `provider_key_status`, so guard the whole class here: when a runtime is
 /// active, run the entry build *and* the action on a fresh OS thread that has no
 /// runtime entered.
@@ -348,22 +348,22 @@ mod tests {
             "test keychain"
         }
 
-        fn get_secret(&self, provider: &str) -> Result<Option<Vec<u8>>> {
+        fn get_entry(&self, provider: &str) -> Result<Option<Vec<u8>>> {
             if let Some(fail) = self.fail {
                 bail!("{fail}");
             }
             Ok(self.secrets.lock().unwrap().get(provider).cloned())
         }
 
-        fn set_secret(&self, provider: &str, secret: &[u8]) -> Result<()> {
+        fn store_entry(&self, provider: &str, value: &[u8]) -> Result<()> {
             self.secrets
                 .lock()
                 .unwrap()
-                .insert(provider.to_owned(), secret.to_vec());
+                .insert(provider.to_owned(), value.to_vec());
             Ok(())
         }
 
-        fn clear_secret(&self, provider: &str) -> Result<()> {
+        fn remove_entry(&self, provider: &str) -> Result<()> {
             self.secrets.lock().unwrap().remove(provider);
             Ok(())
         }
@@ -392,19 +392,20 @@ mod tests {
     }
 
     #[test]
-    fn provider_key_store_round_trips_without_exposing_value_in_status() -> Result<()> {
+    fn provider_credential_round_trip_keeps_secret_out_of_status() -> Result<()> {
         let store = MemoryKeyStore::default();
-        store.set_secret("openai", b"sk-secret-sentinel")?;
+        store_provider_credential_with_store(&store, "openai", "sk-secret-sentinel")?;
 
         let status = provider_key_status_with_store(&store, "openai", "OPENAI_API_KEY", None);
-        let resolved =
-            resolve_provider_api_key_with_store(&store, "openai", "OPENAI_API_KEY", None)?;
+        let credential = provider_credential_with_store(&store, "openai", "OPENAI_API_KEY", None)?;
 
         assert_eq!(status.state, ProviderKeyState::Configured);
         assert_eq!(status.source, "secure:test keychain");
         assert!(!provider_key_status_label(&status).contains("sk-secret"));
-        assert_eq!(resolved.value, "sk-secret-sentinel");
-        assert_eq!(resolved.source, "secure:test keychain");
+        assert_eq!(credential.as_str(), "sk-secret-sentinel");
+
+        remove_provider_credential_with_store(&store, "openai")?;
+        assert!(store.get_entry("openai")?.is_none());
         Ok(())
     }
 
@@ -415,9 +416,10 @@ mod tests {
             ..MemoryKeyStore::default()
         };
 
-        let error = resolve_provider_api_key_with_store(&store, "openai", "OPENAI_API_KEY", None)
-            .unwrap_err()
-            .to_string();
+        let error = match provider_credential_with_store(&store, "openai", "OPENAI_API_KEY", None) {
+            Ok(_) => panic!("credential resolution should fail when storage is unavailable"),
+            Err(error) => error.to_string(),
+        };
 
         assert!(error.contains("secure API-key storage is unavailable"));
         assert!(error.contains("no plaintext fallback was used"));
@@ -428,9 +430,10 @@ mod tests {
         let store = MemoryKeyStore::default();
 
         let error =
-            resolve_provider_api_key_with_store(&store, "anthropic", "ANTHROPIC_API_KEY", None)
-                .unwrap_err()
-                .to_string();
+            match provider_credential_with_store(&store, "anthropic", "ANTHROPIC_API_KEY", None) {
+                Ok(_) => panic!("credential resolution should fail when no credential is stored"),
+                Err(error) => error.to_string(),
+            };
 
         assert!(error.contains("requires a saved API key"));
         assert!(error.contains("rocm config set-provider-key anthropic"));
@@ -455,7 +458,7 @@ mod tests {
         let outcome = rt.block_on(async {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Read-only: never writes to a real keychain on dev machines.
-                NativeProviderKeyStore.get_secret("anthropic")
+                NativeProviderKeyStore.get_entry("anthropic")
             }))
         });
         assert!(

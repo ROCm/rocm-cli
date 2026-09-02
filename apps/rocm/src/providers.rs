@@ -114,7 +114,7 @@ struct LocalProvider<'a> {
 
 struct RemoteProvider {
     provider: &'static str,
-    api_key_env: &'static str,
+    credential_env: &'static str,
     model_env: &'static str,
     endpoint_env: &'static str,
     default_endpoint: &'static str,
@@ -261,14 +261,14 @@ fn provider_adapter<'a>(
         "local" => Box::new(LocalProvider { paths }),
         "openai" => Box::new(RemoteProvider {
             provider: "openai",
-            api_key_env: "OPENAI_API_KEY",
+            credential_env: "OPENAI_API_KEY",
             model_env: "ROCM_CLI_OPENAI_MODEL",
             endpoint_env: "OPENAI_BASE_URL",
             default_endpoint: "https://api.openai.com/v1/chat/completions",
         }),
         "anthropic" => Box::new(RemoteProvider {
             provider: "anthropic",
-            api_key_env: "ANTHROPIC_API_KEY",
+            credential_env: "ANTHROPIC_API_KEY",
             model_env: "ROCM_CLI_ANTHROPIC_MODEL",
             endpoint_env: "ANTHROPIC_BASE_URL",
             default_endpoint: "https://api.anthropic.com/v1/messages",
@@ -366,7 +366,8 @@ impl ProviderAdapter for RemoteProvider {
             .filter(|value| !value.trim().is_empty())
             .into_iter()
             .collect::<Vec<_>>();
-        let key_status = crate::provider_keys::provider_key_status(self.provider, self.api_key_env);
+        let key_status =
+            crate::provider_keys::provider_key_status(self.provider, self.credential_env);
         Ok(ProviderStatus {
             provider: self.provider.to_owned(),
             auth_status: crate::provider_keys::provider_key_status_label(&key_status),
@@ -376,8 +377,8 @@ impl ProviderAdapter for RemoteProvider {
     }
 
     fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
-        let api_key =
-            crate::provider_keys::resolve_provider_api_key(self.provider, self.api_key_env)?;
+        let credential =
+            crate::provider_keys::provider_credential(self.provider, self.credential_env)?;
         let model = resolve_remote_model(self.provider, self.model_env, request.model.as_deref())?;
         let endpoint = remote_endpoint(self.endpoint_env, self.default_endpoint);
         let (content, tool_calls) = match self.provider {
@@ -386,7 +387,7 @@ impl ProviderAdapter for RemoteProvider {
                 let json = post_json_with_headers(
                     &endpoint,
                     &[
-                        ("Authorization", format!("Bearer {}", api_key.value)),
+                        ("Authorization", format!("Bearer {}", credential.as_str())),
                         ("Content-Type", "application/json".to_owned()),
                     ],
                     &body,
@@ -398,7 +399,7 @@ impl ProviderAdapter for RemoteProvider {
                 let json = post_json_with_headers(
                     &endpoint,
                     &[
-                        ("x-api-key", api_key.value),
+                        ("x-api-key", credential.into_value()),
                         ("anthropic-version", "2023-06-01".to_owned()),
                         ("Content-Type", "application/json".to_owned()),
                     ],
@@ -421,8 +422,8 @@ impl ProviderAdapter for RemoteProvider {
         request: &ChatRequest,
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
     ) -> Result<ChatStreamSummary> {
-        let api_key =
-            crate::provider_keys::resolve_provider_api_key(self.provider, self.api_key_env)?;
+        let credential =
+            crate::provider_keys::provider_credential(self.provider, self.credential_env)?;
         let model = resolve_remote_model(self.provider, self.model_env, request.model.as_deref())?;
         let endpoint = remote_endpoint(self.endpoint_env, self.default_endpoint);
         match self.provider {
@@ -432,7 +433,7 @@ impl ProviderAdapter for RemoteProvider {
                 stream_json_with_headers(
                     &endpoint,
                     &[
-                        ("Authorization", format!("Bearer {}", api_key.value)),
+                        ("Authorization", format!("Bearer {}", credential.as_str())),
                         ("Content-Type", "application/json".to_owned()),
                         ("Accept", "text/event-stream".to_owned()),
                     ],
@@ -447,7 +448,7 @@ impl ProviderAdapter for RemoteProvider {
                 stream_json_with_headers(
                     &endpoint,
                     &[
-                        ("x-api-key", api_key.value),
+                        ("x-api-key", credential.into_value()),
                         ("anthropic-version", "2023-06-01".to_owned()),
                         ("Content-Type", "application/json".to_owned()),
                         ("Accept", "text/event-stream".to_owned()),

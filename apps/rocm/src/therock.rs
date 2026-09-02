@@ -266,6 +266,14 @@ pub(crate) struct InstalledRuntimeManifest {
     pub pip_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub rocm_sdk: Option<RocmSdkPythonProbe>,
+    /// The torch this SDK install wrote, e.g. `2.11.0+rocm7.13.0`.
+    ///
+    /// Recorded because an engine install later overwrites torch in the same
+    /// environment. Reading the environment afterwards tells you what is there
+    /// now, not which build belongs to these libraries; only the manifest still
+    /// knows that, and it has to survive repeat installs to be worth anything.
+    #[serde(default)]
+    pub sdk_torch: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -977,6 +985,7 @@ fn install_wheel_runtime(
         python_executable: Some(env_python.display().to_string()),
         pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
+        sdk_torch: Some(resolution.package_versions.torch.clone()),
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1105,6 +1114,7 @@ fn install_tarball_runtime(
         python_executable: None,
         pip_cache_dir: None,
         rocm_sdk: None,
+        sdk_torch: None,
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -2630,6 +2640,270 @@ fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
     serde_json::from_str(output.trim()).context("failed to parse rocm_sdk probe output")
 }
 
+/// What the runtime's torch reports about the GPUs it can actually open, and
+/// whether those GPUs can actually run a kernel.
+///
+/// [`validate_rocm_sdk_runtime_probe`] establishes that the SDK's libraries are
+/// present and resolvable. That is not the same question as whether the torch
+/// sharing the venv can enumerate a device: a torch built against a different
+/// HIP version loads happily against those libraries and then reports no
+/// devices at all.
+///
+/// Enumeration succeeding is in turn not the same question as the device being
+/// usable. A torch built against a different HIP version can enumerate the
+/// GPUs and then fault on the first kernel it launches, so the two failures are
+/// reported separately and must not be conflated.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct RuntimeDeviceProbe {
+    pub import_ok: bool,
+    pub torch_version: Option<String>,
+    pub hip_version: Option<String>,
+    /// `None` when torch never imported, so "unknown" stays distinct from "zero".
+    pub device_count: Option<u32>,
+    /// An import or enumeration failure. Never a kernel failure.
+    pub error: Option<String>,
+    /// A GPU kernel failure observed *after* devices enumerated successfully.
+    /// `None` when no kernel was attempted (no devices, or enumeration failed).
+    #[serde(default)]
+    pub kernel_error: Option<String>,
+}
+
+/// Ask the runtime's own interpreter how many devices its torch can open.
+///
+/// `library_paths` must be the runtime's recorded ROCm library directories (see
+/// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
+/// `LD_LIBRARY_PATH` for the child, which is how a served process resolves them.
+///
+/// This cannot be replaced with an in-process `rocm_sdk.initialize_process()`
+/// call in the probe script. Measured on MI300X against a runtime that serves
+/// correctly: with the library directories on `LD_LIBRARY_PATH` torch reports 8
+/// devices, and with `initialize_process()` alone it reports 0. A probe built on
+/// the latter would fail healthy runtimes and send people to reinstall them,
+/// which is the operation that breaks them.
+pub(crate) fn probe_runtime_devices(
+    python_executable: &Path,
+    library_paths: &[PathBuf],
+) -> Result<RuntimeDeviceProbe> {
+    let mut env = Vec::new();
+    if !library_paths.is_empty() {
+        let mut entries = library_paths.to_vec();
+        if let Some(existing) = std::env::var_os(LIBRARY_PATH_ENV) {
+            entries.extend(split_runtime_path(&existing));
+        }
+        let joined = std::env::join_paths(entries)
+            .context("failed to compose the runtime library path for the device probe")?;
+        env.push((
+            LIBRARY_PATH_ENV.to_owned(),
+            joined.to_string_lossy().into_owned(),
+        ));
+    }
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        RUNTIME_DEVICE_PROBE_SCRIPT,
+        &env,
+        "launch runtime device probe",
+    )
+    .with_context(|| {
+        format!(
+            "failed to launch runtime device probe via {}",
+            python_executable.display()
+        )
+    })?;
+    parse_runtime_device_probe(&text)
+}
+
+fn parse_runtime_device_probe(output: &str) -> Result<RuntimeDeviceProbe> {
+    serde_json::from_str(output.trim()).context("failed to parse runtime device probe output")
+}
+
+/// The loader search-path variable used to expose the runtime's ROCm libraries.
+#[cfg(windows)]
+const LIBRARY_PATH_ENV: &str = "PATH";
+#[cfg(not(windows))]
+const LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
+
+/// Reports what torch sees, never raising: an unusable runtime must be
+/// described, not turned into a probe crash.
+const RUNTIME_DEVICE_PROBE_SCRIPT: &str = r#"
+import json
+
+out = {
+    "import_ok": False,
+    "torch_version": None,
+    "hip_version": None,
+    "device_count": None,
+    "error": None,
+    "kernel_error": None,
+}
+
+try:
+    import torch
+
+    out["import_ok"] = True
+    out["torch_version"] = getattr(torch, "__version__", None)
+    out["hip_version"] = getattr(getattr(torch, "version", None), "hip", None)
+    out["device_count"] = int(torch.cuda.device_count())
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ": " + str(exc)
+
+# Enumeration is not execution. A runtime whose torch and HIP disagree can
+# report devices and then fault on the first kernel, so the kernel is launched
+# under its own guard and its failure is recorded in its own field. Only run it
+# once enumeration actually produced a device: with no devices there is nothing
+# to execute on, and a failed import has already been described.
+if out["error"] is None and (out["device_count"] or 0) > 0:
+    try:
+        probe = torch.ones(32, device="cuda")
+        probe.add_(1.0)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        out["kernel_error"] = type(exc).__name__ + ": " + str(exc)
+
+print(json.dumps(out))
+"#;
+
+/// What torch is installed, and what torch the engine's metadata demands.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct TorchAlignmentProbe {
+    /// The installed torch, e.g. `2.11.0+rocm7.13.0`. `None` if torch is absent.
+    pub installed_torch: Option<String>,
+    /// The engine's pinned requirement, e.g. `torch==2.11.0+gitd0c8b1f`. `None`
+    /// when the engine is not installed yet or does not pin torch.
+    pub engine_requires_torch: Option<String>,
+}
+
+/// Read installed/required torch from distribution metadata, without importing
+/// torch. Metadata questions must not depend on the runtime being usable — this
+/// is called both before and after an engine install, and in the broken state
+/// importing torch is exactly what fails.
+pub(crate) fn probe_torch_alignment(
+    python_executable: &Path,
+    engine_distribution: &str,
+) -> Result<TorchAlignmentProbe> {
+    let env = vec![(
+        "ROCM_CLI_PROBE_DIST".to_owned(),
+        engine_distribution.to_owned(),
+    )];
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        TORCH_ALIGNMENT_PROBE_SCRIPT,
+        &env,
+        "launch torch alignment probe",
+    )?;
+    serde_json::from_str(text.trim()).context("failed to parse torch alignment probe output")
+}
+
+const TORCH_ALIGNMENT_PROBE_SCRIPT: &str = r#"
+import json
+import os
+import re
+import importlib.metadata as md
+
+out = {"installed_torch": None, "engine_requires_torch": None}
+
+try:
+    out["installed_torch"] = md.version("torch")
+except Exception:
+    pass
+
+try:
+    for raw in md.requires(os.environ.get("ROCM_CLI_PROBE_DIST", "vllm")) or []:
+        # `Requires-Dist` entries carry environment markers after ';'. Only the
+        # requirement itself matters here.
+        requirement = raw.split(";")[0].strip()
+        # The distribution name runs up to the first specifier, extra or space —
+        # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
+        matched = re.match(r"[A-Za-z0-9._-]+", requirement)
+        if matched is None:
+            continue
+        if matched.group(0).lower().replace("_", "-") == "torch":
+            out["engine_requires_torch"] = requirement
+            break
+except Exception:
+    pass
+
+print(json.dumps(out))
+"#;
+
+/// Split a version into its public part and its local segment.
+///
+/// `2.11.0+rocm7.13.0` -> `("2.11.0", Some("rocm7.13.0"))`. The local segment is
+/// the build identifier: for TheRock wheels it names the ROCm build, and for the
+/// engine's own index it is an opaque commit tag.
+///
+/// Defined in `rocm-core` because the vLLM engine has to make the same split to
+/// recognise a runtime the CLI deliberately realigned; two copies of this would be
+/// two places for the two sides to drift apart.
+pub(crate) fn split_local_version(version: &str) -> (&str, Option<&str>) {
+    rocm_core::uv::split_local_version(version)
+}
+
+/// The version pinned by a `==` requirement, e.g. `torch==2.11.0+git…` -> the
+/// version. Returns `None` for any looser requirement, since only an exact pin
+/// tells us which release the engine was built against.
+pub(crate) fn requirement_pinned_version(requirement: &str) -> Option<&str> {
+    let (_, version) = requirement.split_once("==")?;
+    let version = version.trim();
+    if version.is_empty() || version.contains(',') {
+        return None;
+    }
+    Some(version)
+}
+
+/// Install one exact package version from `index_url` into `python_executable`.
+///
+/// Used to put the SDK's build of a package back after another installer has
+/// replaced it. `--reinstall-package` is required: without it uv treats the
+/// already-present distribution as satisfying the request and does nothing.
+///
+/// `--index-url`, not `--extra-index-url`, so the SDK index is the only place a
+/// candidate can come from. This matches how `install_therock_runtime` installs
+/// from the same index, and it is load-bearing rather than cosmetic: with PyPI
+/// left in the candidate set, a `+rocm` build the SDK index does not publish can
+/// resolve against PyPI instead, and the caller's `Unavailable` classification —
+/// the whole point of which is to say "the SDK index has no such build" — never
+/// gets the resolver error it keys on.
+///
+/// `--no-deps` because this is a surgical swap of one build for another build of
+/// the *same release*: the environment already carries a resolved dependency tree
+/// and re-resolving it here is free to move `torchvision`/`torchaudio` as a side
+/// effect, which is the mixed stack this change is trying not to create. A build
+/// that genuinely needs a different dependency is not silently ignored — the
+/// `uv pip check` that runs immediately after reports it as a violation.
+pub(crate) fn install_pinned_package(
+    paths: &AppPaths,
+    python_executable: &Path,
+    index_url: &str,
+    package: &str,
+    requirement: &str,
+) -> Result<()> {
+    let uv = rocm_core::uv::ensure_uv_binary(paths)
+        .context("failed to acquire uv binary for the torch alignment install")?;
+    let mut args = rocm_core::uv::uv_pip_install_base(python_executable);
+    args.push("--index-url".to_owned());
+    args.push(index_url.to_owned());
+    args.push("--no-deps".to_owned());
+    args.push("--reinstall-package".to_owned());
+    args.push(package.to_owned());
+    args.push(requirement.to_owned());
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    // `run_command_with_env`, not `run_command`, for two reasons. The uv environment
+    // carries `UV_HTTP_TIMEOUT` (uv has no `--timeout` flag) and `UV_CACHE_DIR`;
+    // without the latter uv falls back to `$HOME/.cache/uv`, loses hardlinking when
+    // that is on another filesystem, and silently copies the whole torch stack per
+    // environment — and the e2e lanes' shared cache is threaded through the same
+    // helper. It also captures stderr on every platform, where `run_command`'s
+    // Windows branch reports only an exit status; the caller classifies this
+    // install's outcome by matching the resolver's message, so on Windows an
+    // unpublished build would otherwise be reported as a generic failure.
+    run_command_with_env(
+        &uv,
+        &borrowed,
+        &rocm_core::uv::uv_command_env(paths),
+        "install the SDK build of the engine's torch",
+    )
+}
+
 pub(crate) fn validate_rocm_sdk_runtime_probe(probe: &RocmSdkPythonProbe) -> Result<()> {
     if !probe.import_ok {
         bail!(
@@ -2833,6 +3107,50 @@ fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Resu
         stdout,
         stderr,
     })
+}
+
+/// Run a probe script with extra environment set and return its stdout.
+///
+/// The script goes to a temp file rather than `python -c`, because the loader
+/// search path this exists to set must reach the child through its environment,
+/// and a file keeps the invocation identical on every platform.
+fn capture_python_stdout_with_env(
+    python_executable: &Path,
+    script: &str,
+    env: &[(String, String)],
+    context_text: &str,
+) -> Result<String> {
+    let temp_root = if runtime_is_windows() {
+        windows_temp_dir("rocm-cli-python-probe")?
+    } else {
+        linux_temp_dir("rocm-cli-python-probe")?
+    };
+    let script_path = temp_root.join("probe.py");
+    fs::write(&script_path, script)
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+
+    let mut command = Command::new(python_executable);
+    command.arg(&script_path);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch {}", python_executable.display()));
+    let _ = fs::remove_dir_all(&temp_root);
+    let output = output?;
+
+    if !output.status.success() {
+        bail!(
+            "{context_text}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("{context_text}: failed to decode Python output"))
 }
 
 fn capture_python_stdout(
@@ -5319,6 +5637,7 @@ echo Python 3.12.10
             python_executable: Some("python".to_owned()),
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -5350,6 +5669,106 @@ echo Python 3.12.10
             runtime_version_build_date("7.14.0a20260230"),
             None,
             "invalid calendar dates should not be displayed"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_without_kernel_error_field_still_parses() {
+        // Output produced before the kernel probe existed must not become a parse
+        // failure: an older runtime's probe is still a valid "no kernel attempted".
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null}"#,
+        )
+        .expect("probe without kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(probe.kernel_error, None);
+    }
+
+    #[test]
+    fn runtime_device_probe_keeps_kernel_failures_out_of_the_enumeration_error() {
+        // The distinction the caller acts on: devices were found, so this is not a
+        // "no devices" runtime, but the GPU cannot run work.
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null,
+                "kernel_error":"RuntimeError: HIP error: invalid device function"}"#,
+        )
+        .expect("probe with kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(
+            probe.kernel_error.as_deref(),
+            Some("RuntimeError: HIP error: invalid device function")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_reports_import_failures_only_as_enumeration_errors() {
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":false,"torch_version":null,"hip_version":null,
+                "device_count":null,"error":"ImportError: no module named torch",
+                "kernel_error":null}"#,
+        )
+        .expect("failed-import probe should parse");
+
+        assert!(!probe.import_ok);
+        assert_eq!(probe.device_count, None);
+        assert_eq!(probe.kernel_error, None);
+        assert_eq!(
+            probe.error.as_deref(),
+            Some("ImportError: no module named torch")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_guards_the_kernel_behind_successful_enumeration() {
+        // The script is the contract: a kernel must never be launched when the
+        // import or enumeration already failed, or when there is no device to launch
+        // it on. Getting this wrong turns a "no devices" runtime into a crash.
+        assert!(
+            RUNTIME_DEVICE_PROBE_SCRIPT
+                .contains(r#"if out["error"] is None and (out["device_count"] or 0) > 0:"#),
+            "the kernel attempt must be gated on a clean enumeration with devices"
+        );
+
+        let guard = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .0;
+        assert!(
+            !guard.contains("device=\"cuda\"") && !guard.contains("synchronize"),
+            "no kernel work may run before the guard"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_records_kernel_failures_in_their_own_field() {
+        let kernel_section = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .1;
+
+        // Allocate, mutate, and synchronize: an unusable GPU commonly survives the
+        // allocation and only faults once work is actually launched and awaited.
+        assert!(kernel_section.contains(r#"torch.ones(32, device="cuda")"#));
+        assert!(kernel_section.contains("probe.add_(1.0)"));
+        assert!(kernel_section.contains("torch.cuda.synchronize()"));
+
+        assert!(
+            kernel_section.contains(r#"out["kernel_error"] = type(exc).__name__"#),
+            "a kernel failure must be recorded in kernel_error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["error"] ="#),
+            "the kernel attempt must never overwrite the enumeration error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["device_count"] ="#),
+            "a kernel failure must preserve the enumerated device count"
         );
     }
 }

@@ -269,6 +269,69 @@ impl RuntimeEntry {
     }
 }
 
+/// The active-runtime selector the config still records after the runtime it
+/// names has gone, if the report says so.
+///
+/// This is the OTHER way the shared tree goes stale, and it is the one that kills
+/// the lane outright. [`assess`] finds a runtime the registry has but the tree
+/// does not; this finds a pointer the config has but the registry does not. The
+/// two are independent: removing a runtime through
+/// `rocm runtimes uninstall` clears the config pointers with it, so a dangling
+/// pointer means something removed the tree WITHOUT the CLI — a hand cleanup on
+/// the runner, or a scenario that deleted a folder it had symlinked in.
+///
+/// `rocm engines install` resolves the runtime to build against as
+/// `--runtime` → `config.active_runtime_key` → `config.default_runtime_id`, so a
+/// dangling pointer in either field fails that resolution before anything else
+/// runs:
+///
+/// ```text
+/// pre-warm: ensuring the vllm engine is installed
+/// Error: runtime selector `release-wheel-gfx94x-dcgpu-7-14-0` from engine install
+///        runtime selection is not an exact usable runtime: installed runtime not found
+/// ```
+///
+/// Nine seconds in, before a single scenario, and the message names neither the
+/// pre-warm nor the tree it is about. Detecting it is free because
+/// `render_runtimes_text` already reports it, and reporting it is all the CLI
+/// does — there is no verb that clears a pointer, so the repair has to be
+/// activating something that exists.
+///
+/// Only `config.json` is read this way. `engines.<name>.last_installed_runtime_id`
+/// can dangle too, but nothing resolves through it — it is displayed, not
+/// followed — so healing it would be motion without a failure behind it.
+#[must_use]
+pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
+    runtimes_list_report.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix("active_status: missing manifest for ")?;
+        // Whichever field held the dead name — the key when one was activated, the
+        // id when only a default was ever set. Both are selectors the engine
+        // install would resolve, and both fail it the same way.
+        let (_, selector) = rest.split_once('=')?;
+        let selector = selector.trim();
+        (!selector.is_empty()).then_some(selector)
+    })
+}
+
+/// Managed runtimes the tree could be pointed at instead, in report order.
+///
+/// Read-only entries are excluded on purpose. `runtimes adopt` records a folder
+/// the pre-warm does not own, and quietly making somebody's external ROCm install
+/// the default for every GPU scenario on the runner is a larger decision than
+/// repairing a pointer. If the tree holds nothing else, the caller leaves the
+/// pointer dangling and the install path replaces it.
+#[must_use]
+pub fn activation_candidates(runtimes_list_report: &str) -> Vec<String> {
+    runtimes_list_report
+        .lines()
+        .filter_map(RuntimeEntry::parse)
+        .filter(|entry| !entry.read_only)
+        .map(|entry| entry.runtime_key)
+        .collect()
+}
+
 /// One `  runtime <key> format=… channel=… … status=…` line from `rocm update`.
 ///
 /// Both shapes that renderer emits are handled: the full report line, and the
@@ -320,6 +383,11 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     // Repairing first means `decide` reads a registry with nothing dead in it.
     repair_poisoned_runtimes(&rocm, prewarm_dir)?;
 
+    // And point the tree at something that exists before anything resolves the
+    // active runtime. Must run after the repair above, which can itself remove
+    // the runtime the pointer names.
+    repair_dangling_active_runtime(&rocm, prewarm_dir)?;
+
     let decision = match probe(&rocm, prewarm_dir) {
         Ok(report) => decide(&report, channel),
         Err(error) => {
@@ -360,8 +428,23 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         }
         Decision::Reuse { reason } => {
             println!("pre-warm: reusing the shared {channel} runtime ({reason})");
-            return Ok(());
         }
+    }
+
+    // Unconditional, and deliberately BEFORE the reuse early return below. The
+    // runtime and the serving engine are installed separately: `install sdk`
+    // lays down the ROCm runtime, `engines install` builds the engine venv
+    // against it. `decide` only ever reasons about the runtime, so a tree whose
+    // runtime is current but whose engine was never installed — or was left
+    // behind with an older runtime — resolves to `Reuse`, which used to return
+    // here having done nothing. The shared tree then served every GPU scenario a
+    // runtime with no engine, which is the one thing those lanes exist to
+    // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
+    // `engines install` on a ready engine installs nothing.
+    ensure_default_engine(&rocm, prewarm_dir)?;
+
+    if !runtime_changed(&decision) {
+        return Ok(());
     }
 
     // An install/update that exits 0 without leaving a registry behind is the
@@ -392,6 +475,59 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         println!("pre-warm: pruning old installs failed ({error:#}); continuing");
     }
     Ok(())
+}
+
+/// Whether `decision` put a new runtime in the tree, and so whether the registry
+/// check and the retention prune at the end of [`run`] have anything to do.
+///
+/// Read AFTER the engine check, never inside the decision's own match arm: the
+/// engine is installed separately from the runtime, so every decision — reuse
+/// most of all, since it is the one a warm runner takes every time — has to
+/// reach that check before this can end the pre-warm early.
+const fn runtime_changed(decision: &Decision) -> bool {
+    !matches!(decision, Decision::Reuse { .. })
+}
+
+/// Install the engine the active runtime would serve on, so the shared tree has
+/// one before a scenario asks it to serve.
+///
+/// Which engine that is comes from the CLI rather than from a constant here:
+/// `rocm engines list` marks the engine `serve` picks for the detected GPU with
+/// `* ` (vLLM on Instinct, Lemonade on Strix), and the pre-warm must agree with
+/// `serve` on every runner without this file learning the hardware map.
+///
+/// Fatal on failure, like [`repair_poisoned_runtimes`] and unlike the freshness
+/// path: reusing a stale-but-working runtime keeps a lane meaningful, whereas
+/// serving with no engine fails every GPU scenario later and for reasons that
+/// name none of this.
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["engines", "list"])
+        .output()
+        .context("failed to run `rocm engines list`")?;
+    if !output.status.success() {
+        bail!("`rocm engines list` exited with {}", output.status);
+    }
+    let inventory = String::from_utf8_lossy(&output.stdout);
+    let engine = default_engine_from_inventory(&inventory)
+        .context("`rocm engines list` did not identify a default engine")?;
+    println!("pre-warm: ensuring the {engine} engine is installed");
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", engine, "--yes"])
+        .status_ok("rocm engines install")
+}
+
+/// The engine `rocm engines list` marks as the default for this host, if any.
+///
+/// The inventory renders one line per engine as `{marker} {name:10} {note}` with
+/// the marker in column 0, then indents that engine's detail lines (`    adapter:
+/// …`, `    runtime: …`) beneath it. Matching `* ` at the start of the line
+/// unindented is therefore what separates the default engine's own line from
+/// everything else the report prints.
+fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
+    inventory
+        .lines()
+        .find_map(|line| line.strip_prefix("* ")?.split_whitespace().next())
 }
 
 /// Drop any managed runtime in the shared tree that records an install root
@@ -464,6 +600,82 @@ fn repair_poisoned_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Re-point the shared tree's active runtime when it names one that is gone, so
+/// the engine install resolves instead of dying nine seconds into the lane.
+///
+/// See [`dangling_active_runtime`] for how the pointer goes stale and why this is
+/// worth healing here. The repair is `rocm runtimes activate`: the CLI has no verb
+/// that clears a pointer, so the only way out is to name something that exists.
+/// Candidates are tried in report order and the first that takes it wins — which
+/// may be an older runtime than the tree would ideally serve, and that is fine.
+/// `decide` runs next, and the `Update` arm re-activates the newest as part of
+/// updating to it.
+///
+/// Doing nothing is correct when the tree holds no managed runtime at all: the
+/// install path activates whatever it installs, and it runs before
+/// `ensure_default_engine` — which is the only thing that would have tripped over
+/// the pointer. The case that has to be handled here is the one that self-healing
+/// misses: a pointer dangling while OTHER runtimes are sitting right there, where
+/// `decide` says `Reuse`, nothing installs, and nothing re-activates.
+fn repair_dangling_active_runtime(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    if !prewarm_dir.join("data").join("runtimes").is_dir() {
+        return Ok(());
+    }
+
+    // Deliberately a second listing rather than one shared with the repair above:
+    // that repair uninstalls, which rewrites exactly the pointers read here.
+    let listing = match list_runtimes(rocm, prewarm_dir) {
+        Ok(listing) => listing,
+        Err(error) => {
+            println!(
+                "pre-warm: could not list runtimes ({error:#}); leaving the active runtime as it is"
+            );
+            return Ok(());
+        }
+    };
+
+    let Some(dangling) = dangling_active_runtime(&listing) else {
+        return Ok(());
+    };
+
+    let candidates = activation_candidates(&listing);
+    if candidates.is_empty() {
+        println!(
+            "pre-warm: the active runtime {dangling} is gone and nothing is installed to take \
+             its place; the install below will set it"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "::warning::pre-warm: the shared tree still points at the runtime {dangling}, which is \
+         no longer installed — something removed it without going through \
+         `rocm runtimes uninstall`. Engine installs resolve through that pointer, so re-pointing \
+         it at an installed runtime. See rocm-cli#314."
+    );
+
+    for candidate in &candidates {
+        let activated = rocm_command(rocm, prewarm_dir)
+            .args(["runtimes", "activate", candidate])
+            .status()
+            .with_context(|| format!("failed to run `rocm runtimes activate {candidate}`"))?;
+        if activated.success() {
+            println!("pre-warm: active runtime is now {candidate}");
+            return Ok(());
+        }
+        // An installed runtime can still be refused — `activate` validates the
+        // manifest. Try the next one rather than taking the whole lane down for
+        // one bad entry.
+        println!("pre-warm: could not activate {candidate}; trying the next runtime");
+    }
+
+    bail!(
+        "the shared pre-warm tree points at the runtime `{dangling}`, which is not installed, and \
+         none of its {} installed runtime(s) could be activated in its place",
+        candidates.len()
+    )
 }
 
 /// Ask the CLI what it has registered. Read-only.
@@ -630,6 +842,29 @@ registered ROCm runtimes
   next step: rocm install sdk --channel release --format wheel
 ";
 
+    /// A real `rocm runtimes list` on the tree that killed the lane: the config
+    /// still names the 7.14.0 runtime that was removed out of band, while two
+    /// runtimes it could be pointed at sit right there.
+    ///
+    /// Note there is no `*` marker on any entry — the renderer only marks the
+    /// active one by matching `active_runtime_key` against a manifest, and that is
+    /// exactly the match that fails here. The `active_status:` line is the only
+    /// thing in the document that says so.
+    const DANGLING_ACTIVE: &str = "\
+registered ROCm runtimes
+  active_runtime_id: therock-release:gfx94X-dcgpu
+  active_runtime_key: release-wheel-gfx94x-dcgpu-7-14-0
+  previous_runtime_key: release-wheel-gfx94x-dcgpu-7-13-0
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  active_status: missing manifest for active_runtime_key=release-wheel-gfx94x-dcgpu-7-14-0
+  installed:
+    adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
+      install_root: /opt/external-rocm
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+";
+
     fn prewarm_runtimes_dir() -> &'static Path {
         Path::new("/w/e2e-prewarm/data/runtimes")
     }
@@ -677,6 +912,65 @@ registered ROCm runtimes
     #[test]
     fn an_empty_tree_has_nothing_to_repair() {
         assert!(assess(NO_RUNTIMES, prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn an_active_runtime_that_is_gone_is_reported_by_name() {
+        assert_eq!(
+            dangling_active_runtime(DANGLING_ACTIVE),
+            Some("release-wheel-gfx94x-dcgpu-7-14-0")
+        );
+    }
+
+    #[test]
+    fn a_default_runtime_id_that_is_gone_dangles_the_same_way() {
+        // The other field the engine install resolves through, reported by the
+        // renderer under the same key when no runtime_key was ever activated.
+        let text = "registered ROCm runtimes\n  active_runtime_id: therock-release:gfx94X-dcgpu\n  \
+active_runtime_key: <unset>\n  \
+active_status: missing manifest for active_runtime_id=therock-release:gfx94X-dcgpu\n";
+        assert_eq!(
+            dangling_active_runtime(text),
+            Some("therock-release:gfx94X-dcgpu")
+        );
+    }
+
+    #[test]
+    fn a_tree_whose_active_runtime_is_installed_is_left_alone() {
+        // No active_status line at all is the healthy shape — MIXED has a dead
+        // runtime in it, but nothing points AT the dead one.
+        assert_eq!(dangling_active_runtime(MIXED), None);
+        assert_eq!(dangling_active_runtime(NO_RUNTIMES), None);
+        assert_eq!(dangling_active_runtime(""), None);
+    }
+
+    #[test]
+    fn an_ambiguous_runtime_id_is_not_a_dangling_pointer() {
+        // Same `active_status:` prefix, entirely different condition: the runtimes
+        // are all there, one runtime_id just names several of them. Activating
+        // something would be a guess, and the engine install resolves it fine.
+        let text = "registered ROCm runtimes\n  \
+active_status: ambiguous runtime_id=therock-release:gfx94X-dcgpu; activate one runtime_key: a, b\n";
+        assert_eq!(dangling_active_runtime(text), None);
+    }
+
+    #[test]
+    fn only_managed_runtimes_are_offered_as_replacements() {
+        // The read-only adopted entry is installed and usable, and still excluded:
+        // making somebody's external ROCm the default for every GPU scenario is a
+        // bigger decision than repairing a pointer.
+        assert_eq!(
+            activation_candidates(DANGLING_ACTIVE),
+            vec!["release-wheel-gfx94x-dcgpu-7-13-0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_tree_with_nothing_installed_offers_no_replacement() {
+        // The caller leaves the pointer dangling here rather than failing: the
+        // install that follows activates whatever it installs.
+        assert!(activation_candidates(NO_RUNTIMES).is_empty());
+        assert!(activation_candidates("").is_empty());
     }
 
     #[test]
@@ -729,6 +1023,73 @@ mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/
         let poisoned = assess(text, prewarm_runtimes_dir());
         assert_eq!(poisoned.len(), 1);
         assert_eq!(poisoned[0].format, "tarball");
+    }
+
+    /// A real `rocm engines list` on an Instinct host, captured verbatim: the
+    /// default engine's line carries the `* ` marker in column 0, and its own
+    /// detail lines are indented beneath it.
+    const ENGINES_READY: &str = "\
+Local model engines
+  Built-in engines are included with rocm-cli. External plugins are optional.
+  ROCm GPU execution is required.
+  Plugin folders:
+    1. /w/e2e-prewarm/data/engines/plugins (primary)
+  lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    runtime: not found
+* vllm       Linux/WSL ROCm GPU serving engine through external vLLM
+    adapter: built-in
+    runtime: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+  protocol: 0.1.0
+";
+
+    #[test]
+    fn the_marked_engine_is_the_one_pre_warmed() {
+        // Which engine to install comes from the CLI's own host detection, not
+        // from a hardware map duplicated here.
+        assert_eq!(default_engine_from_inventory(ENGINES_READY), Some("vllm"));
+    }
+
+    #[test]
+    fn an_indented_detail_line_is_not_read_as_the_default() {
+        // Every engine's detail lines are indented under it, and a note may well
+        // start with a bullet. Only the marker in column 0 names the default.
+        let inventory = "\
+Local model engines
+* lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    * not a marker
+";
+        assert_eq!(default_engine_from_inventory(inventory), Some("lemonade"));
+    }
+
+    #[test]
+    fn an_inventory_without_a_default_engine_names_none() {
+        // `ensure_default_engine` turns this into an error rather than guessing an
+        // engine: installing the wrong one costs a multi-GiB build and still
+        // leaves the lane with nothing to serve on.
+        assert_eq!(default_engine_from_inventory(""), None);
+        assert_eq!(
+            default_engine_from_inventory("Local model engines\n  lemonade   embedded\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn reusing_the_shared_runtime_still_reaches_the_engine_check() {
+        // The regression this guards: `Reuse` — the decision EVERY warm runner
+        // takes, run after run — used to end `run` with a `return` inside its own
+        // match arm, before anything looked at the engine. The early return is now
+        // this predicate, read only AFTER `ensure_default_engine`, so reuse cannot
+        // skip the engine. Reuse must still install and update NOTHING, which is
+        // what keeps it cheap enough to re-check the engine on every run.
+        assert!(!runtime_changed(&Decision::Reuse {
+            reason: "up to date".to_owned()
+        }));
+        assert!(runtime_changed(&Decision::Install));
+        assert!(runtime_changed(&Decision::Update {
+            runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+        }));
     }
 
     #[test]
