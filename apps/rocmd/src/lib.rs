@@ -1212,21 +1212,33 @@ fn sandbox_check_updates_value(output: CommandCapture) -> Value {
 fn update_check_status(output: &CommandCapture) -> &'static str {
     if output.exit_status != 0 {
         "error"
-    } else if update_output_reports_update_available(&output.stdout) {
+    } else if update_output_reports_status(&output.stdout, "update_available") {
         "update_available"
+    } else if update_output_reports_status(&output.stdout, "repair_available") {
+        "repair_available"
     } else {
         "checked"
     }
 }
 
+fn update_output_reports_status(stdout: &str, status: &str) -> bool {
+    let expected = format!("status={status}");
+    stdout.split_whitespace().any(|part| part == expected)
+}
+
 fn update_output_reports_update_available(stdout: &str) -> bool {
-    stdout
-        .split_whitespace()
-        .any(|part| part == "status=update_available" || part == "update_available=true")
+    update_output_reports_status(stdout, "update_available")
+        || update_output_reports_status(stdout, "repair_available")
+        || stdout
+            .split_whitespace()
+            .any(|part| part == "update_available=true")
 }
 
 fn update_check_message(status: &str) -> &'static str {
     match status {
+        "repair_available" => {
+            "ran read-only `rocm update`; a ROCm runtime repair is available because its package composition changed; no updates were applied"
+        }
         "update_available" => {
             "ran read-only `rocm update`; a ROCm runtime update is available; no updates were applied"
         }
@@ -3847,7 +3859,7 @@ where
                         None,
                     )?;
                     if result.update_available {
-                        record_update_available_notification(paths, state)?;
+                        record_update_available_notification(paths, state, result.status)?;
                     }
                 }
                 Err(error) => {
@@ -3903,7 +3915,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
     let update_available = value
         .get("update_available")
         .and_then(Value::as_bool)
-        .unwrap_or(status == "update_available");
+        .unwrap_or(matches!(status, "update_available" | "repair_available"));
     let exit_status = value
         .get("exit_status")
         .and_then(Value::as_i64)
@@ -3918,9 +3930,13 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
 fn record_update_available_notification(
     paths: &AppPaths,
     state: &mut AutomationRuntimeState,
+    status: &str,
 ) -> Result<()> {
-    let message =
-        "A ROCm runtime update is available. Preview it before applying. No updates were applied.";
+    let message = if status == "repair_available" {
+        "A ROCm runtime repair is available because its package composition changed. Preview it before applying. No updates were applied."
+    } else {
+        "A ROCm runtime update is available. Preview it before applying. No updates were applied."
+    };
     record_event(
         paths,
         state,
@@ -7918,7 +7934,7 @@ mod tests {
             }],
         };
 
-        record_update_available_notification(&paths, &mut state)?;
+        record_update_available_notification(&paths, &mut state, "update_available")?;
 
         let audit_text = fs::read_to_string(paths.audit_events_path())?;
         let audit = audit_text
@@ -8008,6 +8024,46 @@ mod tests {
                 .get("stdout")
                 .and_then(Value::as_str)
                 .is_some_and(|stdout| stdout.contains("status=update_available"))
+        );
+    }
+
+    #[test]
+    fn sandbox_check_updates_value_marks_runtime_repair_available() {
+        let value = sandbox_check_updates_value(CommandCapture {
+            argv: vec!["rocm".to_owned(), "update".to_owned()],
+            exit_status: 0,
+            stdout: "update\n  runtime release-wheel-multi-arch-7-14-0 status=repair_available installed=7.14.0 latest=7.14.0\n".to_owned(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("repair_available")
+        );
+        assert_eq!(
+            value.get("update_available").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("runtime repair is available"))
+        );
+    }
+
+    #[test]
+    fn newer_version_takes_priority_over_composition_repair() {
+        let value = sandbox_check_updates_value(CommandCapture {
+            argv: vec!["rocm".to_owned(), "update".to_owned()],
+            exit_status: 0,
+            stdout: "update\n  runtime old status=repair_available installed=7.14.0 latest=7.14.0\n  runtime stale status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("update_available")
         );
     }
 

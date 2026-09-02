@@ -155,24 +155,31 @@ tree's own `active.json`, which lives inside the shared tree and is therefore
 visible through the symlink. Without that, a serve fails with `no active ROCm
 runtime is configured` while the precondition still passes.
 
-It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
+It is a **cache with invalidation and repair**, not a one-shot install. Each
+self-hosted lane calls:
 
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
 
-before the suite, which asks `rocm update` whether the channel index has published
-a newer version and then:
+before the suite. `rocm update` compares both the channel version and the wheel
+composition recorded in the runtime manifest (source-layout generation and exact
+pinned package specs). A deterministic composition fingerprint is part of each new
+wheel runtime key, so a repair is installed beside—not over—the old environment.
+Pre-warm then:
 
 - installs the SDK when nothing is present for that channel;
-- installs the newer runtime **side-by-side** and activates it
-  (`rocm update --apply --runtime <key> --activate`) when the index is ahead;
+- installs a newer runtime **side-by-side** and activates it when the index is
+  ahead;
+- replaces a same-version runtime side-by-side when its manifest has an older or
+  missing wheel composition, then activates the composition-keyed replacement;
+- ensures the default engine is installed even when the runtime itself is reused;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
   (a pinned build newer than the index must not be rolled back), or when freshness
   cannot be established at all — an unreachable index reuses and warns rather than
   re-downloading gigabytes or failing the lane;
-- prunes with `rocm storage remove-old-installs` after any install or update, so
-  the multi-version cache stays bounded.
+- prunes with `rocm storage remove-old-installs` after any install, update, or
+  repair, so the multi-version cache stays bounded.
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every

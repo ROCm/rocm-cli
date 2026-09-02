@@ -556,7 +556,13 @@ fn active_runtime_key(world: &E2eWorld) -> Option<String> {
 /// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
 /// exactly these, so a rename here must break this scenario rather than silently
 /// turn every pre-warm into a no-op reuse.
-const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_index", "error"];
+const UPDATE_STATUSES: [&str; 5] = [
+    "up_to_date",
+    "update_available",
+    "repair_available",
+    "ahead_of_index",
+    "error",
+];
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {

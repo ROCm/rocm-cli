@@ -557,10 +557,10 @@ mod tests {
 
     #[test]
     fn canonical_wheel_runtime_key_ignores_markers_and_legacy_entries() {
-        let inventory = "registered ROCm runtimes\n  active_runtime_key: <unset>\n  installed:\n    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu\n  * release-wheel-multi-arch-7-14-0 runtime_id=therock-release:gfx94X-dcgpu\n";
+        let inventory = "registered ROCm runtimes\n  active_runtime_key: <unset>\n  installed:\n    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu\n  * release-wheel-multi-arch-7-14-0-0123456789abcdef runtime_id=therock-release:gfx94X-dcgpu\n";
         assert_eq!(
             canonical_wheel_runtime_key(inventory),
-            Some("release-wheel-multi-arch-7-14-0")
+            Some("release-wheel-multi-arch-7-14-0-0123456789abcdef")
         );
     }
 
