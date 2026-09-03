@@ -335,10 +335,7 @@ jobs:
     timeout-minutes: 35
     # `native` disambiguates the two Linux Strix runners: the WSL host also
     # carries `strix-halo`, but the paths below exist only on the native one.
-    # TEMPORARY: `ubuntu-26.04` pins this to strix-halo-ubuntu-2 specifically,
-    # to confirm the timeout_connect fix on the runner that actually hit the
-    # egress stall. Revert before merge.
-    runs-on: [self-hosted, linux, strix-halo, native, ubuntu-26.04]
+    runs-on: [self-hosted, linux, strix-halo, native]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
     if: >-
