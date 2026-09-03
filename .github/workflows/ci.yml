@@ -388,12 +388,40 @@ jobs:
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
         # Windows install lifecycle (packaging + native-crypto verify + user-PATH
         # + loopback HTTP + isolated smoke + uninstall) as opt-in @lifecycle E2E.
+        #
+        # Hand the suite the binaries the Build step already produced. Without
+        # this `cargo xtask e2e` builds `rocm`/`rocmd` for itself, and because it
+        # adds `--features rocm/e2e-test-hooks` the feature resolution differs
+        # from the Build step's — so cargo recompiles the whole release graph
+        # rather than reusing it. That second release build cost 3-4 minutes on
+        # every run, on the job that alone determines when CI goes green.
+        #
+        # Deliberately NOT built with `rocm/e2e-test-hooks`, unlike the prebuilt
+        # lanes in e2e-selfhosted.yml / nightly.yml. Those run the full suite,
+        # whose scripted failure seams are compiled out without the feature.
+        # `E2E_ONLY_LIFECYCLE` restricts this lane to @lifecycle scenarios, none
+        # of which touch a seam — and this lane packages and installs the binary
+        # through the real installer, so it should ship exactly what a release
+        # ships rather than a build carrying test hooks.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-        run: cargo xtask e2e
+        run: |
+          $env:ROCM_CLI_BINARY = "$PWD\target\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$PWD\target\release\rocmd.exe"
+          # Fail here, naming the missing binary, rather than letting a scenario
+          # die on a "failed to run" deep in the suite. These paths assume the
+          # default target dir; if a future change sets CARGO_TARGET_DIR they
+          # must follow it.
+          foreach ($bin in $env:ROCM_CLI_BINARY, $env:ROCM_CLI_ROCMD_BINARY) {
+            if (-not (Test-Path $bin)) {
+              throw "expected the Build step to have produced $bin"
+            }
+          }
+          cargo xtask e2e
 
   prek:
     # The fast lint gate: every toolchain-light lint/hygiene check, run from the

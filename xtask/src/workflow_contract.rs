@@ -1041,6 +1041,58 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
     }
 
+    /// The Windows lane must hand its lifecycle E2E run the release binaries the
+    /// Build step already produced.
+    ///
+    /// Without `ROCM_CLI_BINARY`, `cargo xtask e2e` builds `rocm`/`rocmd` for
+    /// itself WITH `--features rocm/e2e-test-hooks`. That is a different feature
+    /// resolution than the Build step's, so cargo rebuilds the entire release
+    /// graph instead of reusing it — a second 3-4 minute release build on the one
+    /// job that alone determines total CI wall clock.
+    ///
+    /// Note this is the mirror image of
+    /// [`assert_prebuilt_e2e_lanes_enable_test_hooks`]: lanes running the FULL
+    /// suite must build WITH the hooks, while this lifecycle-only lane must build
+    /// WITHOUT them. `E2E_ONLY_LIFECYCLE` keeps it to @lifecycle scenarios, none
+    /// of which use a scripted seam, and the lane packages and installs the
+    /// binary through the real installer — so it must ship what a release ships.
+    #[test]
+    fn ci_windows_lifecycle_lane_reuses_the_binaries_it_built() {
+        let ci = read_workflow("ci.yml");
+        let windows = job_block(&ci, "windows-build-and-test");
+
+        assert!(
+            windows.contains("cargo build --release -p rocm -p rocmd"),
+            "the Windows lane must pre-build the release binaries"
+        );
+
+        assert!(
+            windows.contains("cargo xtask e2e"),
+            "the Windows lane must run the lifecycle E2E suite"
+        );
+
+        // A bare `run: cargo xtask e2e` is exactly the regression this guards:
+        // no run block can export the binaries, so xtask rebuilds them itself.
+        let lifecycle = multiline_run_blocks(windows)
+            .into_iter()
+            .find(|block| invokes_e2e(block))
+            .unwrap_or_default();
+
+        for var in ["ROCM_CLI_BINARY", "ROCM_CLI_ROCMD_BINARY"] {
+            assert!(
+                lifecycle.contains(var),
+                "the Windows lifecycle lane must export {var} so `cargo xtask e2e` \
+                 reuses the already-built release binaries instead of recompiling \
+                 the whole release graph under a different feature set:\n{lifecycle}"
+            );
+        }
+        assert!(
+            !lifecycle.contains("e2e-test-hooks"),
+            "the lifecycle-only lane packages and installs what a release ships, \
+             so it must NOT carry the test hooks:\n{lifecycle}"
+        );
+    }
+
     // Extractor guards: prove the helpers actually parse multiline forms, so the
     // contract tests above can't silently false-pass on a shape they don't handle.
     #[test]
