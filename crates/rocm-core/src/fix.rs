@@ -394,6 +394,25 @@ fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
 
+/// Test-only view of a recipe's actionable remediation: its `verify` command,
+/// its `notes`, and its *executable* command lines (comment/prose lines
+/// stripped). Lets the diagnosis catalog cross-check that the Fix it emits for a
+/// shared `fix_id` has not silently diverged from this recipe.
+#[cfg(test)]
+pub(crate) fn recipe_verify_notes_and_run_commands(
+    fix_id: &str,
+) -> Option<(&'static str, &'static [&'static str], Vec<&'static str>)> {
+    find_recipe(fix_id).map(|recipe| {
+        let run_commands = recipe
+            .commands
+            .iter()
+            .copied()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>();
+        (recipe.verify, recipe.notes, run_commands)
+    })
+}
+
 const fn current_os() -> &'static str {
     if runtime_is_windows() {
         "windows"

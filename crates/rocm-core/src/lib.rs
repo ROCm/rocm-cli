@@ -36,8 +36,8 @@ pub mod proc_lifecycle;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
-    render_report_text as render_diagnose_text,
+    DiagnoseReport, Diagnosis, Fix, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    render_report_text as render_diagnose_text, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
