@@ -61,6 +61,16 @@ pub struct RuntimeSummary {
     pub rollback: bool,
 }
 
+/// Marker shown beside the active runtime in the list. Every place *in this
+/// module* that renders this glyph MUST use this constant so it can't drift
+/// out of sync with the legend rendered in `draw_runtime_manager`. Other
+/// modules (e.g. the compact runtime preview in `tabs/pane.rs`) render the
+/// same active/inactive concept independently and are not bound by this.
+const ACTIVE_MARKER: &str = "● ";
+/// Marker shown beside the rollback-target runtime in the list. See
+/// [`ACTIVE_MARKER`].
+const ROLLBACK_MARKER: &str = "↺ ";
+
 /// The mutating lifecycle verbs (everything except the read-only refresh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeAction {
@@ -355,14 +365,32 @@ pub fn draw_runtime_manager(
         return;
     }
 
+    // No legend row when there's nothing to explain — collapse it to zero
+    // height instead of always reserving it, so the empty-state hint isn't
+    // pushed down by a blank line.
+    let legend_height = u16::from(!runtimes.is_empty());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(legend_height),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(inner);
+
+    if !runtimes.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(ACTIVE_MARKER, Style::default().fg(theme.ok)),
+                Span::styled("= active", Style::default().fg(theme.muted)),
+                Span::styled(" · ", Style::default().fg(theme.muted)),
+                Span::styled(ROLLBACK_MARKER, Style::default().fg(theme.warn)),
+                Span::styled("= rollback target", Style::default().fg(theme.muted)),
+            ])),
+            rows[0],
+        );
+    }
 
     if runtimes.is_empty() {
         f.render_widget(
@@ -371,16 +399,16 @@ pub fn draw_runtime_manager(
                  i to import a manifest, or l to refresh.",
                 Style::default().fg(theme.muted),
             ))),
-            rows[0],
+            rows[1],
         );
     } else {
         let items: Vec<ListItem> = runtimes
             .iter()
             .map(|rt| {
                 let marker = if rt.active {
-                    "● "
+                    ACTIVE_MARKER
                 } else if rt.rollback {
-                    "↺ "
+                    ROLLBACK_MARKER
                 } else {
                     "  "
                 };
@@ -418,9 +446,9 @@ pub fn draw_runtime_manager(
         );
         let list_area = panel::vertical_scrollbar(
             f,
-            rows[0],
+            rows[1],
             runtimes.len(),
-            rows[0].height as usize,
+            rows[1].height as usize,
             r.selected,
             theme,
         );
@@ -433,7 +461,7 @@ pub fn draw_runtime_manager(
             msg.to_string(),
             Style::default().fg(theme.err),
         ))),
-        rows[1],
+        rows[2],
     );
 
     f.render_widget(
@@ -441,7 +469,7 @@ pub fn draw_runtime_manager(
             "↑↓ select · Enter/a activate · r rollback · x uninstall · o adopt · i import · l refresh · Esc close",
             Style::default().fg(theme.muted),
         ))),
-        rows[2],
+        rows[3],
     );
 
     if let Some(fb) = &r.browser {
@@ -772,6 +800,35 @@ mod tests {
         assert!(out.contains("Runtimes"));
         assert!(out.contains("therock-release-gfx94"));
         assert!(out.contains("activate"));
+        assert!(out.contains("= active"));
+        assert!(out.contains("= rollback target"));
+    }
+
+    #[test]
+    fn snapshot_legend_markers_are_color_matched() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(120, 22);
+        let mut term = Terminal::new(backend).unwrap();
+        let r = RuntimeManagerState::default();
+        let rts = runtimes();
+        let jobs = State::default();
+        term.draw(|f| draw_runtime_manager(f, f.area(), &r, &rts, &jobs, &theme))
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let active_cell = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == ACTIVE_MARKER.trim())
+            .expect("active marker glyph should render");
+        assert_eq!(active_cell.fg, theme.ok);
+        let rollback_cell = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == ROLLBACK_MARKER.trim())
+            .expect("rollback marker glyph should render");
+        assert_eq!(rollback_cell.fg, theme.warn);
     }
 
     #[test]
@@ -793,5 +850,30 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("No runtimes registered"));
+    }
+
+    #[test]
+    fn draws_without_panicking_at_minimum_height_with_runtimes() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A non-empty runtime list now needs 4 inner rows (legend + list +
+        // message + footer), one more than before the legend row existed. At
+        // height 6 the bento border/padding leaves only 3 inner rows, so the
+        // layout must shrink gracefully instead of panicking.
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let r = RuntimeManagerState::default();
+        let rts = runtimes();
+        let jobs = State::default();
+        term.draw(|f| draw_runtime_manager(f, f.area(), &r, &rts, &jobs, &theme))
+            .unwrap();
+    }
+
+    #[test]
+    fn runtime_markers_are_non_empty_and_distinct() {
+        assert!(!ACTIVE_MARKER.trim().is_empty());
+        assert!(!ROLLBACK_MARKER.trim().is_empty());
+        assert_ne!(ACTIVE_MARKER, ROLLBACK_MARKER);
     }
 }
