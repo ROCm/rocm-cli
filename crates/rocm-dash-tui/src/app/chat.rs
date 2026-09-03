@@ -303,6 +303,57 @@ pub(super) const fn startup_chat_outcome(
     }
 }
 
+/// Whether startup should offer to replace a stale persisted `chat_url`.
+///
+/// The replacement is keyless, so only an unreachable configured URL with no
+/// credentials is eligible. Keeping this decision pure makes the full startup
+/// guard independently testable before the caller performs another probe.
+pub(super) fn should_revalidate_stale_chat_url(
+    startup_outcome: StartupChatOutcome,
+    configured_probe_ok: bool,
+    chat_url: Option<&str>,
+    chat_api_key: Option<&str>,
+    chat_auth_header: Option<&str>,
+) -> bool {
+    startup_outcome == StartupChatOutcome::Configured
+        && !configured_probe_ok
+        && chat_url.is_some()
+        && chat_api_key.is_none()
+        && chat_auth_header.is_none()
+}
+
+/// Return a newly detected endpoint only when it differs from the stale one.
+///
+/// The caller invokes this after `resolve_llm_config` and routes the result
+/// through [`AppState::set_detect_result`], preserving the existing
+/// accept/save/dismiss flow instead of silently replacing the active config.
+pub(super) fn stale_chat_url_replacement(
+    configured_base_url: &str,
+    live: Option<crate::llm::LlmConfig>,
+) -> Option<crate::llm::LlmConfig> {
+    let configured = normalize_base_url(configured_base_url);
+    live.filter(|candidate| normalize_base_url(&candidate.base_url) != configured)
+}
+
+/// Normalize a local OpenAI-style base URL for change detection.
+///
+/// Trailing `/` and `/v1` are formatting-only. `localhost` and `127.0.0.1`
+/// identify the same loopback server; canonicalizing that spelling avoids a
+/// false server-change offer. The common path remains borrowed.
+fn normalize_base_url(base_url: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let normalized = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    for prefix in ["http://localhost", "https://localhost"] {
+        if let Some(rest) = normalized.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+        {
+            let scheme = &prefix[..prefix.len() - "localhost".len()];
+            return format!("{scheme}127.0.0.1{rest}").into();
+        }
+    }
+    normalized.into()
+}
+
 /// Persist an accepted local endpoint to the user's `config.toml`: load the
 /// existing config (or defaults), set `tui.chat_url`/`tui.chat_model`, and write
 /// it back. Best-effort — returns a human error string on failure.
@@ -665,5 +716,100 @@ mod tests {
             startup_chat_outcome(false, false),
             StartupChatOutcome::Configured
         );
+    }
+
+    fn live(base_url: &str) -> crate::llm::LlmConfig {
+        crate::llm::detected_llm_config(base_url, "m")
+    }
+
+    #[test]
+    fn stale_revalidation_requires_unreachable_uncredentialed_persisted_url() {
+        assert!(should_revalidate_stale_chat_url(
+            StartupChatOutcome::Configured,
+            false,
+            Some("http://127.0.0.1:9/v1"),
+            None,
+            None,
+        ));
+
+        for (outcome, probe_ok, url, key, header) in [
+            (
+                StartupChatOutcome::Local,
+                false,
+                Some("http://x"),
+                None,
+                None,
+            ),
+            (
+                StartupChatOutcome::Configured,
+                true,
+                Some("http://x"),
+                None,
+                None,
+            ),
+            (StartupChatOutcome::Configured, false, None, None, None),
+            (
+                StartupChatOutcome::Configured,
+                false,
+                Some("http://x"),
+                Some("k"),
+                None,
+            ),
+            (
+                StartupChatOutcome::Configured,
+                false,
+                Some("http://x"),
+                None,
+                Some("Authorization"),
+            ),
+        ] {
+            assert!(!should_revalidate_stale_chat_url(
+                outcome, probe_ok, url, key, header
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_none_when_nothing_live_found() {
+        assert_eq!(
+            stale_chat_url_replacement("http://127.0.0.1:9/v1", None),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_none_when_live_matches_configured() {
+        let url = "http://127.0.0.1:11435/v1";
+        assert_eq!(stale_chat_url_replacement(url, Some(live(url))), None);
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_offers_a_different_live_endpoint() {
+        let found = live("http://127.0.0.1:13305/v1");
+        let replacement = stale_chat_url_replacement("http://127.0.0.1:9/v1", Some(found.clone()))
+            .expect("a different live endpoint is offered");
+        assert_eq!(replacement.base_url, found.base_url);
+    }
+
+    #[test]
+    fn stale_chat_url_replacement_normalizes_equivalent_urls() {
+        for (configured, found) in [
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1/"),
+            ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000"),
+            ("http://localhost:8000/v1", "http://127.0.0.1:8000/v1"),
+        ] {
+            assert_eq!(
+                stale_chat_url_replacement(configured, Some(live(found))),
+                None,
+                "{configured} vs {found} must be treated as the same endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_base_url_strips_suffixes_without_allocating() {
+        let normalized = normalize_base_url("http://h:8000/v1/");
+        assert_eq!(normalized, "http://h:8000");
+        assert!(matches!(normalized, std::borrow::Cow::Borrowed(_)));
     }
 }

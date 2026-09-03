@@ -40,7 +40,8 @@ mod summary;
 
 use chat::{
     StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
-    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
+    discover_configured_chat_model, persist_chat_endpoint, should_revalidate_stale_chat_url,
+    stale_chat_url_replacement, startup_chat_outcome,
 };
 use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
@@ -79,9 +80,12 @@ pub struct ResolvedArgs {
     /// exit back to the launcher when the overlay is closed at its root. `None`
     /// (the default) is the normal full dashboard — every path stays unchanged.
     pub focus: Option<Focus>,
-    /// Chat endpoint base URL, CLI-flag value already merged over config.
+    /// Chat endpoint base URL, sourced from persisted config (`tui.chat_url`).
+    /// There is no `--chat-url` CLI flag today, so this tier is exactly the
+    /// persisted config — which is what startup revalidates when it goes stale.
     pub chat_url: Option<String>,
-    /// Chat model, CLI-flag value already merged over config.
+    /// Chat model sourced from persisted config (`tui.chat_model`). There is
+    /// no `--chat-model` CLI flag today.
     pub chat_model: Option<String>,
     /// Custom auth header NAME (CLI-flag value merged over config), e.g.
     /// `Ocp-Apim-Subscription-Key` for Azure APIM gateways.
@@ -1768,11 +1772,16 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         let probe_ok = match startup_outcome {
             StartupChatOutcome::Local => true,
             StartupChatOutcome::OAuth => false,
-            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
-                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
-            })
-            .await
-            .unwrap_or(false),
+            StartupChatOutcome::Configured => {
+                // Clone so `probe_target` stays available for the EAI-7360
+                // stale-URL recovery and its notice below.
+                let target = probe_target.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::llm::probe_endpoint(&target, crate::llm::PROBE_TIMEOUT)
+                })
+                .await
+                .unwrap_or(false)
+            }
         };
         let llm = detected.or_else(|| {
             crate::llm::resolve_llm_config(
@@ -1800,7 +1809,29 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             ),
             other => other,
         };
+        // EAI-7360: a persisted `tui.chat_url` can go stale. Only re-probe an
+        // unreachable configured URL without credentials; a keyless local
+        // offer must never replace a credentialed gateway. `chat_env_url` is a
+        // separate tier, and the resolver's CLI>config>env>probe precedence is
+        // unchanged.
+        let stale_offer = if should_revalidate_stale_chat_url(
+            startup_outcome,
+            probe_ok,
+            args.chat_url.as_deref(),
+            args.chat_api_key.as_deref(),
+            args.chat_auth_header.as_deref(),
+        ) {
+            let live = detect_local_chat(state.tool_executor.clone()).await;
+            stale_chat_url_replacement(&probe_target, live)
+        } else {
+            None
+        };
         state.set_chat_config(llm, args.chat_auto_consent);
+        if let Some(live) = stale_offer {
+            // Reuse the existing offer reducer so accept, save, and dismiss all
+            // work exactly as they do after an explicit `/detect` probe.
+            state.set_detect_result(Some(live));
+        }
         // No reachable local endpoint AND no key/url configured → the no-key
         // ChatGPT OAuth default (device-code login surfaced in the chat tab).
         // This restores the no-key login the vendored Codex path provided; it
@@ -4802,6 +4833,30 @@ mod tests {
             "accept raises the rebuild edge carrying the previous provider"
         );
         assert_eq!(s.active_provider, ChatProvider::Local);
+    }
+
+    #[test]
+    fn stale_startup_endpoint_uses_actionable_detect_offer() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        let stale = crate::llm::detected_llm_config("http://127.0.0.1:9/v1", "old");
+        let live = crate::llm::detected_llm_config("http://localhost:13305/v1", "new");
+
+        // Match event_loop ordering: retain the configured endpoint, then offer
+        // the newly detected one through the established reducer.
+        s.set_chat_config(Some(stale.clone()), true);
+        s.set_detect_result(Some(live.clone()));
+
+        assert_eq!(s.chat_llm.as_ref(), Some(&stale));
+        assert_eq!(s.chat_detect_offer.as_ref(), Some(&live));
+        assert!(
+            s.chat
+                .iter()
+                .any(|turn| turn.content.contains("/detect save"))
+        );
+
+        apply_action(&mut s, KeyAction::ChatDetectSave);
+        assert_eq!(s.chat_llm.as_ref(), Some(&live));
+        assert!(s.chat_persist_dispatch);
     }
 
     #[test]

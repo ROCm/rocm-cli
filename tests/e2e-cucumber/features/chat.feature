@@ -75,3 +75,12 @@ Feature: Chat and endpoint detection
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  @id:chat-stale-endpoint-offers-live-engine @requires-os:linux
+  Scenario: 8 - A stale saved endpoint offers the live local engine
+    Given a running managed model is available locally
+    And chat has a stale saved endpoint
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user quits interactive chat
+    Then interactive chat exits successfully
