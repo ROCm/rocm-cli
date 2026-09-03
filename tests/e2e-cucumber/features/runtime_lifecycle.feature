@@ -37,3 +37,16 @@ Feature: Runtime lifecycle state machine
     Then the CLI refuses because it already exists
     When the user imports it again allowing replacement
     Then the import succeeds
+
+  # `rocm runtimes list` prefixes each row with `*`/`-`/a blank to mark active,
+  # rollback-target, and neither, with nothing else on the page explaining what
+  # they mean. This asserts the printed legend actually names both glyphs, so the
+  # rendered marker and its explanation can't drift apart silently.
+  @id:runtime-list-shows-marker-legend
+  Scenario: 5 - Listing runtimes explains the active and rollback markers
+    Given two registered runtimes with the second active after the first
+    When the user rolls back
+    And the user lists the registered runtimes
+    Then the listing explains the active and rollback markers
+    And the first runtime is marked active
+    And the second runtime is marked as the rollback target
