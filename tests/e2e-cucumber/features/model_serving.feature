@@ -187,3 +187,37 @@ Feature: Model serving
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
+
+  # Visible-ordinal correctness (EAI-7194): a `--gpu` index that physically EXISTS
+  # on the host but is hidden by an active visibility mask
+  # (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES) must be validated against the
+  # VISIBLE set and refused — never silently remapped onto a visible device. This
+  # is distinct from scenario 13 (an index beyond the device count): here the index
+  # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
+  # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
+  # rejection directly; on a single-GPU host the same request is simply out of
+  # range. Both are an honest refusal rather than a remap, which is what this
+  # asserts. Runs on GPU hardware.
+  @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
+  Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
+    When the user serves a model pinned to a GPU hidden by the visibility mask
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable
+
+  # ROCR-vs-HIP ordinal space (EAI-7194): `ROCR_VISIBLE_DEVICES` masks at the ROCr
+  # level and HIP re-indexes the surviving devices as 0..N, whereas rocm-cli pins
+  # and exports its choice through `HIP_VISIBLE_DEVICES`. So a `--gpu` index must
+  # be validated in that re-indexed HIP space, not against the physical ROCR
+  # tokens. On a multi-GPU host `ROCR_VISIBLE_DEVICES=1` leaves one device that HIP
+  # sees as ordinal 0; `--gpu 1` is therefore out of the visible set and must be
+  # refused — before the fix it was read as the physical token 1, wrongly accepted,
+  # then exported as HIP ordinal 1 that no longer binds. On a single-GPU host the
+  # same request is simply out of range. Either way an honest refusal, never a
+  # broken bind. The complementary accept-path (`--gpu 0` binding the surviving
+  # physical device) needs live multi-GPU hardware and is covered by the
+  # `usable_amd_gpu_indices_from` unit tests. Runs on GPU hardware.
+  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-os:linux
+  Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
+    When the user serves a model pinned past the ROCR-reindexed visible set
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable

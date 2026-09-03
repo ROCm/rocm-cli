@@ -1427,6 +1427,62 @@ pub fn process_is_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// An advisory, cross-process exclusive lock backed by a lock file.
+///
+/// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
+/// holds between *separate `rocm` processes*, not just threads: each caller opens
+/// the same lock-file path and only one can hold the lock at a time. It exists to
+/// serialize check-then-act sequences over shared on-disk state — the daemon
+/// autostart decision and the managed-serve GPU select-then-claim — so two
+/// concurrent invocations cannot both pass the same TOCTOU check.
+///
+/// The lock is released when the guard is dropped, and by the OS if the process
+/// exits while holding it (so a crashed holder never wedges the next caller).
+#[derive(Debug)]
+pub struct FileLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Acquire an exclusive lock on `path`, creating the lock file and any
+    /// missing parent directories first. Blocks until the lock is available.
+    ///
+    /// The lock file itself carries no data; it is a rendezvous point, so an
+    /// existing file is reused (never truncated) and its contents are ignored.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// The lock file backing this guard.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Best-effort: an unlock failure only means the OS releases it slightly
+        // later (at the latest when the file handle closes), never a lost lock.
+        let _ = self.file.unlock();
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // libc FFI (pre_exec/setsid)
 pub fn detach_command_session(command: &mut Command) {
@@ -1708,6 +1764,14 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Lock file serializing the managed-serve GPU select-then-claim sequence, so
+    /// two concurrent `rocm serve` invocations cannot read the same free GPU and
+    /// both launch on it. Held from auto-selection through the claiming service
+    /// record write (see [`FileLock`]).
+    pub fn managed_launch_lock_path(&self) -> PathBuf {
+        self.services_dir().join("launch.lock")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -1722,6 +1786,22 @@ impl AppPaths {
 
     pub fn automation_state_path(&self) -> PathBuf {
         self.automations_dir().join("runtime-state.json")
+    }
+
+    /// Lock file serializing the daemon autostart check-then-spawn, so two
+    /// concurrent callers cannot both observe "not running" and each spawn a
+    /// background automation daemon (see [`FileLock`]).
+    pub fn automation_autostart_lock_path(&self) -> PathBuf {
+        self.automations_dir().join("autostart.lock")
+    }
+
+    /// Short-lived claim written by the autostart holder right after it spawns
+    /// the daemon, recording the child PID and spawn time. It bridges the gap
+    /// between `spawn()` and the child publishing its runtime state: a concurrent
+    /// caller that acquires the autostart lock in that window sees the claim and
+    /// defers instead of spawning a duplicate daemon.
+    pub fn automation_autostart_claim_path(&self) -> PathBuf {
+        self.automations_dir().join("autostart.claim")
     }
 
     pub fn automation_events_path(&self) -> PathBuf {
@@ -4847,37 +4927,71 @@ fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
         .is_ok_and(|version| version != 0)
 }
 
+/// A GPU visibility mask read from the environment, tagged with which variable
+/// produced it. The source matters for how the surviving devices are numbered:
+/// `ROCR_VISIBLE_DEVICES` masks at the ROCr level and HIP then re-indexes the
+/// survivors as `0..N`, whereas `HIP_VISIBLE_DEVICES` values are already in that
+/// HIP-ordinal space. See [`usable_amd_gpu_indices_from`].
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+struct GpuVisibilityMask {
+    value: String,
+    /// True when the mask came from `ROCR_VISIBLE_DEVICES` (with no
+    /// `HIP_VISIBLE_DEVICES` override), so its physical token ordinals must be
+    /// re-indexed into HIP space before they can be selected/exported.
+    rocr_reindexed: bool,
+}
+
 /// The active GPU visibility mask, preferring `HIP_VISIBLE_DEVICES` then
 /// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
-/// is returned as `Some("")` so callers can distinguish "unset" (all visible)
-/// from "set to nothing" (all masked out).
+/// is returned with an empty string so callers can distinguish "unset" (all
+/// visible) from "set to nothing" (all masked out). The returned mask records
+/// whether it came from `ROCR_VISIBLE_DEVICES`, which decides whether its
+/// ordinals need HIP re-indexing.
 ///
 /// Linux-only: its sole caller is the Linux probe. (Not `+ test` — no test
 /// references it directly, so compiling it into a non-Linux test build would be
 /// dead code, which the workspace lints deny.)
 #[cfg(target_os = "linux")]
-fn visibility_mask_from_env() -> Option<String> {
-    ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]
-        .into_iter()
-        .find_map(std::env::var_os)
-        .map(|value| value.to_string_lossy().into_owned())
+fn visibility_mask_from_env() -> Option<GpuVisibilityMask> {
+    if let Some(value) = std::env::var_os("HIP_VISIBLE_DEVICES") {
+        return Some(GpuVisibilityMask {
+            value: value.to_string_lossy().into_owned(),
+            rocr_reindexed: false,
+        });
+    }
+    std::env::var_os("ROCR_VISIBLE_DEVICES").map(|value| GpuVisibilityMask {
+        value: value.to_string_lossy().into_owned(),
+        rocr_reindexed: true,
+    })
 }
 
-/// Apply a `HIP_VISIBLE_DEVICES`-style `mask` to the present device ordinals
-/// (`0..present`). `None` means no mask is set (every present device is visible).
-/// An empty value hides every device. A nonempty mask containing UUIDs or invalid
-/// ordinals returns `None`: the ordinal-only probe cannot interpret it
-/// authoritatively, so callers must not mistake it for "no GPU".
+/// Apply a visibility `mask` to the present device ordinals (`0..present`).
+/// `None` means no mask is set (every present device is visible). An empty value
+/// hides every device. A nonempty mask containing UUIDs or invalid ordinals
+/// returns `None`: the ordinal-only probe cannot interpret it authoritatively,
+/// so callers must not mistake it for "no GPU".
+///
+/// The returned ordinals are always in HIP space — the space rocm-cli pins its
+/// selection through `HIP_VISIBLE_DEVICES`. For a `HIP_VISIBLE_DEVICES` mask the
+/// tokens are already HIP ordinals and are kept as-is. For a
+/// `ROCR_VISIBLE_DEVICES` mask the tokens are physical ordinals that ROCr hides
+/// below HIP, which then re-indexes the survivors as `0..N`; returning the raw
+/// physical tokens would make `--gpu` validation reject the ordinals that
+/// actually bind and accept ones that do not, so they are re-indexed here.
 #[cfg(any(target_os = "linux", test))]
-fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<Vec<u32>> {
+fn usable_amd_gpu_indices_from(
+    present: usize,
+    mask: Option<GpuVisibilityMask>,
+) -> Option<Vec<u32>> {
     let Some(mask) = mask else {
         return Some((0..present as u32).collect());
     };
-    if mask.is_empty() {
+    if mask.value.is_empty() {
         return Some(Vec::new());
     }
     let mut visible = Vec::new();
-    for token in mask.split(',') {
+    for token in mask.value.split(',') {
         let index = token.trim().parse::<u32>().ok()?;
         if (index as usize) >= present {
             return None;
@@ -4885,6 +4999,12 @@ fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<V
         if !visible.contains(&index) {
             visible.push(index);
         }
+    }
+    if mask.rocr_reindexed {
+        // ROCR-hidden survivors are seen by HIP as 0..N, and rocm-cli selects and
+        // exports through HIP_VISIBLE_DEVICES on top of ROCR, so the selectable
+        // ordinals are those HIP positions, not the physical ROCR token values.
+        return Some((0..visible.len() as u32).collect());
     }
     Some(visible)
 }
@@ -7491,6 +7611,86 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[test]
+    fn file_lock_creates_missing_parent_dirs_and_lock_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("nested").join("child").join("guard.lock");
+        assert!(!lock_path.exists(), "precondition: lock file absent");
+
+        let guard = FileLock::acquire(&lock_path).expect("acquire creates parents");
+        assert!(lock_path.is_file(), "lock file is created on acquire");
+        assert_eq!(guard.path(), lock_path.as_path());
+        drop(guard);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_serializes_concurrent_holders() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-excl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("guard.lock");
+
+        // First holder takes the lock and keeps it until we explicitly release it.
+        let held = FileLock::acquire(&lock_path).expect("first acquire");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread_path = lock_path;
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal about-to-acquire");
+            // Blocks until the main thread drops `held`.
+            let _guard = FileLock::acquire(&thread_path).expect("second acquire");
+            acquired_tx.send(()).expect("signal acquired");
+        });
+
+        // Ensure the contender has reached its acquire call before we assert it
+        // is blocked, so the negative check below is about the lock, not
+        // scheduling latency.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "second acquire must block while the first lock is still held"
+        );
+
+        // Releasing the first lock lets the contender proceed promptly.
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second acquire proceeds once the first lock is released");
+        handle.join().expect("contender thread joins");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_distinct_paths_do_not_contend() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-filelock-distinct-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Two different lock files are independent; holding one must not block the
+        // other in the same process.
+        let a = FileLock::acquire(dir.join("a.lock")).expect("acquire a");
+        let b = FileLock::acquire(dir.join("b.lock")).expect("acquire b");
+        drop(a);
+        drop(b);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn service_id_accepts_generated_and_plain_ids() {
@@ -11614,7 +11814,13 @@ last_installed_runtime_id = "therock-release"
         // An explicit empty mask still wins, so a user can opt out on WSL as
         // anywhere — HIP_VISIBLE_DEVICES="" hides the device.
         assert_eq!(
-            usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
+            usable_amd_gpu_indices_from(
+                usize::from(true),
+                Some(GpuVisibilityMask {
+                    value: String::new(),
+                    rocr_reindexed: false
+                })
+            ),
             Some(vec![])
         );
     }
@@ -11650,11 +11856,34 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(usable_amd_gpu_indices_from(3, None), Some(vec![0, 1, 2]));
     }
 
+    /// A `HIP_VISIBLE_DEVICES`-sourced mask: its ordinals are already in HIP space
+    /// and are used as-is.
+    fn hip_mask(value: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            value: value.to_owned(),
+            rocr_reindexed: false,
+        })
+    }
+
+    /// A `ROCR_VISIBLE_DEVICES`-sourced mask: its physical ordinals are
+    /// re-indexed into HIP space (survivors become `0..N`).
+    fn rocr_mask(value: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            value: value.to_owned(),
+            rocr_reindexed: true,
+        })
+    }
+
     #[test]
     fn usable_gpu_indices_empty_mask_hides_every_device() {
         // The masked-device path: GPUs are present but fully masked out.
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some(String::new())),
+            usable_amd_gpu_indices_from(2, hip_mask("")),
+            Some(Vec::new())
+        );
+        // An empty ROCR mask hides every device too.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, rocr_mask("")),
             Some(Vec::new())
         );
     }
@@ -11662,22 +11891,47 @@ last_installed_runtime_id = "therock-release"
     #[test]
     fn usable_gpu_indices_honors_valid_ordinal_masks() {
         assert_eq!(
-            usable_amd_gpu_indices_from(4, Some("2,0".to_owned())),
+            usable_amd_gpu_indices_from(4, hip_mask("2,0")),
             Some(vec![2, 0])
         );
         // Duplicates are collapsed.
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("1,1".to_owned())),
+            usable_amd_gpu_indices_from(2, hip_mask("1,1")),
             Some(vec![1])
         );
     }
 
     #[test]
     fn usable_gpu_indices_treats_unsupported_masks_as_unprobeable() {
-        assert_eq!(usable_amd_gpu_indices_from(2, Some("0,5".to_owned())), None);
+        assert_eq!(usable_amd_gpu_indices_from(2, hip_mask("0,5")), None);
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
+            usable_amd_gpu_indices_from(2, hip_mask("GPU-deadbeef")),
             None
         );
+    }
+
+    #[test]
+    fn a_hip_mask_keeps_its_ordinals_but_a_rocr_mask_is_reindexed_to_hip_space() {
+        // A HIP_VISIBLE_DEVICES mask is already in the HIP-ordinal space rocm-cli
+        // exports through, so its tokens are used as-is.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, hip_mask("2,3")),
+            Some(vec![2, 3])
+        );
+        // A ROCR_VISIBLE_DEVICES mask hides physical devices below HIP, which then
+        // re-indexes the survivors as 0..N. On a 4-GPU host, ROCR=2,3 leaves two
+        // devices that HIP sees as ordinals 0 and 1 — the values that actually
+        // bind when exported via HIP_VISIBLE_DEVICES — not the physical 2 and 3.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_mask("2,3")),
+            Some(vec![0, 1])
+        );
+        // A single-device ROCR mask re-indexes to just ordinal 0.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_mask("3")),
+            Some(vec![0])
+        );
+        // An out-of-range token is still "cannot interpret", regardless of source.
+        assert_eq!(usable_amd_gpu_indices_from(2, rocr_mask("5")), None);
     }
 }
