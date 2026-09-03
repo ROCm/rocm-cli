@@ -45,7 +45,9 @@ pub use disk_space::{
     mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
 };
 use examine::extract_rocm_version;
-pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
+pub use examine::{
+    Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
+};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
@@ -2355,13 +2357,76 @@ fn normalize_cpu_model(value: &str) -> String {
 /// route-out note, a false negative runs bare-metal driver checks against a
 /// platform that has no amdgpu module and reports nonsense.
 #[must_use]
-pub(crate) fn is_wsl_host() -> bool {
+pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
             std::env::var_os("WSL_DISTRO_NAME").is_some(),
             &fs::read_to_string("/proc/version").unwrap_or_default(),
         )
+}
+
+/// Whether the host runs WSL 1 rather than WSL 2.
+///
+/// WSL 1 translates syscalls instead of running a real kernel, so it has no
+/// `/dev/dxg` and no GPU path at all. Without this the catalog would tell a WSL 1
+/// user to update a Windows driver that could never help them.
+///
+/// WSL 1 reports a kernel ending in `-Microsoft`, as in `4.4.0-19041-Microsoft`.
+/// WSL 2 builds all carry `microsoft-standard`, with the `-WSL2` suffix added
+/// later — `4.19.104-microsoft-standard` was the original and has no `WSL2` in
+/// it at all.
+///
+/// So the test is the `standard` marker and the trailing position, not the
+/// absence of `WSL2`. Keying on `WSL2` alone called every early WSL 2 kernel
+/// "WSL 1", which is the asymmetric error [`crate::examine::WslFacts::version`]
+/// documents as the one to avoid: it tells the user to convert a distribution
+/// that is already converted, at high confidence, while suppressing every other
+/// check. Anything unrecognised is read as WSL 2 for the same reason.
+#[must_use]
+pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
+    let kernel = kernel_release.trim().to_ascii_lowercase();
+    kernel.ends_with("-microsoft") && !kernel.contains("standard")
+}
+
+/// Whether `relative` exists under any ROCm install on this host.
+///
+/// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
+/// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
+/// package that was in fact installed. Ask the same resolver the rest of the CLI
+/// uses, and keep the conventional root as a fallback for the case where
+/// discovery finds nothing.
+/// The dynamic linker cache, or `None` when `ldconfig` could not be run.
+///
+/// `ldconfig` lives in `/sbin`, which is not on a non-root user's `PATH` on
+/// Debian and derivatives. Looking it up by bare name there yields nothing, and
+/// an empty cache is indistinguishable from a cache that does not list the
+/// library — so a correctly installed ROCDXG read as "not registered with the
+/// linker" and the catalog told the user to run `ldconfig` on a working install.
+///
+/// Search the conventional locations, and report "could not ask" as `None`
+/// rather than as an empty answer.
+fn ldconfig_cache() -> Option<String> {
+    for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
+        if let Some(text) = capture_optional_command(program, &["-p"]) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether the linker cache lists ROCDXG, or `None` if it could not be read.
+pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
+    ldconfig_cache().map(|text| text.contains("librocdxg.so"))
+}
+
+fn rocm_relative_file_exists(relative: &str) -> bool {
+    if Path::new("/opt/rocm").join(relative).exists() {
+        return true;
+    }
+    discover_rocm_installs()
+        .iter()
+        .any(|install| install.path.join(relative).exists())
 }
 
 /// The predicate itself, separated from reading the machine so the union can be
@@ -2383,10 +2448,12 @@ fn detect_wsl_summary() -> Option<WslSummary> {
     let is_wsl = true;
 
     let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
-    let librocdxg = Path::new("/opt/rocm/lib/librocdxg.so").exists();
-    let rocdxg_dids = Path::new("/opt/rocm/share/rocdxg/dids.conf").exists();
-    let ldconfig_text = capture_optional_command("ldconfig", &["-p"]).unwrap_or_default();
-    let ldconfig_librocdxg = ldconfig_text.contains("librocdxg.so");
+    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let ldconfig_text = ldconfig_cache();
+    let ldconfig_librocdxg = ldconfig_text
+        .as_deref()
+        .is_some_and(|text| text.contains("librocdxg.so"));
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
     let mut missing = Vec::new();
@@ -2397,7 +2464,9 @@ fn detect_wsl_summary() -> Option<WslSummary> {
         missing.push("/usr/lib/wsl/lib/libdxcore.so");
     }
     if !librocdxg {
-        missing.push("/opt/rocm/lib/librocdxg.so");
+        // Named without a directory: the file is looked up across every ROCm
+        // install, so quoting one root would misreport where it was not found.
+        missing.push("librocdxg.so");
     }
     if !ldconfig_librocdxg {
         missing.push("ldconfig:librocdxg.so");
@@ -3075,7 +3144,7 @@ pub fn detect_host_gpu_diagnostics() -> String {
                 .as_deref()
                 .unwrap_or("<not found>")
         );
-        if is_wsl_environment_fast() {
+        if is_wsl_host() {
             let wsl_probe = detect_wsl_windows_display_probe_text().unwrap_or_default();
             let _ = writeln!(
                 output,
@@ -4267,8 +4336,81 @@ fn detect_wsl_windows_display_name_fast() -> Option<String> {
         .and_then(parse_windows_display_name)
 }
 
+/// What the guest was able to learn about the Windows host's AMD display driver.
+///
+/// Three states, not two. Reaching the host requires WSL interop, which the user
+/// can switch off and which is absent entirely inside a container running on WSL.
+/// Collapsing "could not ask" into "no driver found" would make the catalog blame
+/// a Windows driver on every locked-down or containerised host, so the two stay
+/// distinct and the check abstains on [`Unreachable`](Self::Unreachable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WslHostDriverProbe {
+    /// WSL interop is unavailable, so the host was never asked.
+    Unreachable,
+    /// The host answered but reported no AMD display adapter.
+    NoAmdDisplay,
+    /// The host's AMD display driver version.
+    Version(String),
+}
+
+/// The AMD display driver of the machine this is running on.
+///
+/// The host-side counterpart to [`detect_wsl_host_driver`]: when `rocm` runs on
+/// Windows and inspects a WSL distribution, the driver is a local question and
+/// needs no interop to answer.
+///
+/// Returns the same tri-state, and for the same reason. An earlier version
+/// collapsed it to `Option<String>` and defaulted the `None`, so "this is not
+/// Windows" and "the inventory query failed" both arrived as an empty version --
+/// which the catalog reads as "the host has no AMD adapter" and reports as a
+/// missing driver on a machine it never managed to look at.
+pub(crate) fn detect_local_windows_host_driver() -> WslHostDriverProbe {
+    if !runtime_is_windows() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(inventory) = detect_windows_examine_inventory() else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    inventory
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
+/// Ask the Windows host, from inside the distro, which AMD display driver it runs.
+pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
+    if !is_wsl_host() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(output) = capture_optional_command_with_timeout(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    ) else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    parse_windows_examine_inventory(&output)
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
 fn detect_wsl_windows_display_probe_text() -> Option<String> {
-    if !is_wsl_environment_fast() {
+    if !is_wsl_host() {
         return None;
     }
 
@@ -4290,15 +4432,6 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
             .to_owned()
     })
     .filter(|output| !output.is_empty())
-}
-
-fn is_wsl_environment_fast() -> bool {
-    if !runtime_is_linux() {
-        return false;
-    }
-    Path::new("/dev/dxg").exists()
-        || fs::read_to_string("/proc/version")
-            .is_ok_and(|text| text.to_ascii_lowercase().contains("microsoft"))
 }
 
 #[cfg(target_os = "linux")]
@@ -11564,6 +11697,39 @@ last_installed_runtime_id = "therock-release"
             false,
             "MICROSOFT-STANDARD-WSL2"
         ));
+    }
+
+    #[test]
+    fn wsl1_is_told_apart_from_wsl2_by_the_kernel_release() {
+        // The two are the same string family, distinguished only by the WSL2
+        // marker. Getting this backwards would send a WSL 1 user chasing a
+        // Windows driver update that can never give them a GPU, or hide the
+        // conversion advice from the one platform that needs it.
+        for wsl1 in [
+            "4.4.0-19041-Microsoft",
+            "4.4.0-18362-MICROSOFT",
+            "4.4.0-17763-microsoft",
+        ] {
+            assert!(is_wsl1_kernel(wsl1), "{wsl1} is a WSL 1 kernel");
+        }
+        for wsl2 in [
+            "6.6.87.2-microsoft-standard-WSL2",
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.18.33.2-MICROSOFT-STANDARD-WSL2",
+            // The `-WSL2` suffix is not the marker. These are the earlier WSL 2
+            // kernels, which carry `microsoft-standard` and no `WSL2` at all --
+            // testing for the absence of `WSL2` called every one of them WSL 1.
+            "4.19.104-microsoft-standard",
+            "4.19.128-microsoft-standard",
+            "5.10.16.3-microsoft-standard",
+        ] {
+            assert!(!is_wsl1_kernel(wsl2), "{wsl2} is a WSL 2 kernel");
+        }
+        // A bare-metal kernel is neither, and must not read as WSL 1 -- the
+        // caller only asks on a host already known to be WSL, but answering
+        // "yes" here would be wrong if that ever changed.
+        assert!(!is_wsl1_kernel("6.8.0-51-generic"));
+        assert!(!is_wsl1_kernel(""));
     }
 
     #[test]

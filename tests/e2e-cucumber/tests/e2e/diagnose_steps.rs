@@ -57,6 +57,13 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
+    "fix-wsl-1-gpu-not-exposed",
+    "fix-wsl-2-dxcore-missing",
+    "fix-wsl-3-rocdxg-missing",
+    "fix-wsl-4-rocdxg-not-linked",
+    "fix-wsl-5-distro-too-old",
+    "fix-wsl-6-host-driver-too-old",
+    "fix-wsl-7-wsl1",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -67,6 +74,29 @@ const AUTO_APPLICABLE_FIX_IDS: &[&str] = &[
     "fix-4-render-group",
     "fix-6-path",
     "fix-9-igpu-dgpu",
+];
+
+/// A WSL distribution name no host will have. Deliberately not a plausible one:
+/// the scenario must fail for "this machine does not exist", never because the
+/// runner happened to have a distro by that name.
+const UNREACHABLE_DISTRO: &str = "rocm-cli-e2e-no-such-distro";
+
+/// The WSL entry whose remedy is entirely on the Windows host, so the CLI can
+/// only ever explain it. Applies on WSL, which is what makes the scenario a test
+/// of "explained, not attempted" rather than of the wrong-OS refusal.
+const WSL_HOST_SIDE_FIX_ID: &str = "fix-wsl-6-host-driver-too-old";
+
+/// Causes that can only exist on bare-metal Linux: they name the amdgpu module,
+/// /dev/kfd, the render group, or the distro package manager, none of which
+/// govern anything under WSL2.
+const BARE_METAL_ONLY_FIX_IDS: &[&str] = &[
+    "fix-3-rocm-kernel",
+    "fix-4-render-group",
+    "fix-5-amdgpu-load",
+    "fix-7-stale-repos",
+    "fix-10-container",
+    "fix-11-iommu",
+    "fix-12-installer",
 ];
 
 /// A catalog entry that cannot apply on the host running the suite, whichever
@@ -140,6 +170,11 @@ async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
     world.model_name = Some(fix_id_for_the_other_os().to_string());
 }
 
+#[given("a user who has chosen a WSL remedy that belongs on the Windows host")]
+async fn user_chose_wsl_host_remedy(world: &mut E2eWorld) {
+    world.model_name = Some(WSL_HOST_SIDE_FIX_ID.to_string());
+}
+
 #[given("a user who refers to a cause by its position in the diagnosis")]
 async fn user_named_diagnosis_position(world: &mut E2eWorld) {
     // Quoted deliberately: unquoted, the shell treats `#1` as a comment and the
@@ -149,6 +184,21 @@ async fn user_named_diagnosis_position(world: &mut E2eWorld) {
 }
 
 // ── When ───────────────────────────────────────────────────────────
+
+#[given("a user who asks to diagnose a machine that does not exist")]
+async fn user_named_a_missing_machine(world: &mut E2eWorld) {
+    world.model_name = Some(UNREACHABLE_DISTRO.to_string());
+}
+
+#[when("the user asks the CLI to diagnose that machine")]
+async fn user_diagnoses_named_machine(world: &mut E2eWorld) {
+    let distro = world.model_name.clone().expect("no machine named");
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--distro", &distro]);
+    // The refusal goes to stderr; keep both so the assertions can read whichever
+    // stream carried it without caring which.
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
 
 #[when("the user asks the CLI to diagnose that symptom")]
 async fn user_diagnoses(world: &mut E2eWorld) {
@@ -407,9 +457,12 @@ async fn assert_json_states_platform_scope(world: &mut E2eWorld) {
     // skip_serializing_if, so serde emits it either way and its mere presence
     // proves nothing. Cross-check the verdict against the one the host report
     // gives for the same machine — the same trick `examine-both-forms-agree-on-gpu`
-    // uses, and the only version of this assertion that can fail on a covered
-    // host. The two are computed by different code paths off the same probe, so
+    // uses. The two are computed by different code paths off the same probe, so
     // this is a cross-check rather than a tautology.
+    //
+    // This used to read `status == "wsl"` as "uncovered". WSL2 has its own
+    // catalog entries now, so the two questions came apart: the platforms with no
+    // entries are the ones that are neither Linux, Windows, nor WSL.
     let (examine, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     assert_eq!(rc, 0, "examine should exit 0 (it is an inspector)");
     let host: serde_json::Value =
@@ -417,13 +470,104 @@ async fn assert_json_states_platform_scope(world: &mut E2eWorld) {
     let host_says_uncovered = host
         .get("status")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|status| status == "wsl");
+        .is_some_and(|status| status == "unsupported-os");
     let diagnosis_says_uncovered = report.get("out_of_scope").is_some_and(|v| !v.is_null());
     assert_eq!(
         diagnosis_says_uncovered, host_says_uncovered,
         "the diagnosis and the host report disagree about whether this platform \
          is covered (diagnosis={diagnosis_says_uncovered}, host={host_says_uncovered})\
          \n{output}\n{examine}"
+    );
+}
+
+#[then("no reported cause is one that only exists on bare-metal Linux")]
+async fn assert_no_bare_metal_cause(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let matched = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array");
+    for entry in matched {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !BARE_METAL_ONLY_FIX_IDS.contains(&id),
+            "{id} names something WSL2 does not have (amdgpu module, /dev/kfd, \
+             render group), so reporting it here would send the user after a \
+             fault that cannot exist on this platform:\n{output}"
+        );
+    }
+}
+
+#[then("the CLI refuses and explains that it could not reach that machine")]
+async fn assert_unreachable_machine_refused(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let rc = world.cli_rc.expect("no exit code recorded");
+    assert_ne!(
+        rc, 0,
+        "asking about an unreachable machine must fail:\n{output}"
+    );
+    // Not `contains("wsl")`: that matches essentially any message this code path
+    // can emit, so it would pass on a refusal that never said what went wrong.
+    // The refusal has to name the machine the user asked about, or say that
+    // reaching another machine is not possible from here at all.
+    let lowered = output.to_lowercase();
+    assert!(
+        lowered.contains(&UNREACHABLE_DISTRO.to_lowercase())
+            || lowered.contains("wsl.exe was not found"),
+        "the refusal must name the machine it could not reach, or say why no \
+         machine could be reached:\n{output}"
+    );
+}
+
+#[then("no diagnosis of this machine is reported")]
+async fn assert_no_local_diagnosis_substituted(world: &mut E2eWorld) {
+    // The failure this guards is a silent substitution: reporting on the local
+    // machine when the user asked about another one. A diagnosis is recognisable
+    // by its `id:` line and its `apply with:` call to action, so neither may be
+    // present.
+    let output = world.cli_output.clone().unwrap_or_default();
+    for marker in ["id: fix-", "apply with:"] {
+        assert!(
+            !output.contains(marker),
+            "a request about another machine must not be answered with this \
+             one's diagnosis (found {marker:?}):\n{output}"
+        );
+    }
+}
+
+#[then("the result says this platform is covered")]
+async fn assert_platform_is_covered(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let out_of_scope = report.get("out_of_scope");
+    assert!(
+        out_of_scope.is_none_or(serde_json::Value::is_null),
+        "this platform has catalog entries, so it must not be reported as \
+         uncovered:\n{output}"
+    );
+}
+
+#[then("the CLI explains the remedy instead of carrying it out")]
+async fn assert_remedy_explained_not_applied(world: &mut E2eWorld) {
+    let fix_id = world
+        .model_name
+        .clone()
+        .expect("scenario did not choose a fix");
+    let (output, _, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    // 0, not the 3 a wrong-OS refusal gives: this fix does apply here. It is
+    // print-only because the change belongs to the Windows host, and the two
+    // outcomes must stay distinguishable to a caller.
+    assert_eq!(
+        rc, 0,
+        "{fix_id} applies on this host and is print-only, so it must succeed \
+         without acting:\n{output}"
+    );
+    let lowered = output.to_lowercase();
+    assert!(
+        lowered.contains("print-only"),
+        "the CLI must say it only printed a plan:\n{output}"
     );
 }
 

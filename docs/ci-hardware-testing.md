@@ -61,9 +61,14 @@ execution boundary, and whatever GPU access WSL exposes on that machine. The
 GPU preflight is advisory here precisely because GPU-on-WSL is what the lane is
 proving out: where it is unavailable the capability probe resolves those
 scenarios to not-applicable and the rest of the suite still runs. Scenarios the
-product deliberately routes around on WSL carry `@requires-bare-metal`; the one
-scenario whose premise *is* a WSL host carries `@requires-wsl`, and this is the
-only lane that runs it.
+product deliberately routes around on WSL carry `@requires-bare-metal`;
+scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
+only lane that runs them.
+
+`rocm diagnose` is no longer one of the things routed around: it carries a WSL
+catalog of its own, so the `@requires-wsl` diagnose scenarios — that a WSL host
+is never given a bare-metal cause, and that a WSL remedy is explained rather
+than carried out — are proven here and nowhere else.
 
 ### What the WSL distro needs
 
