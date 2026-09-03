@@ -2252,7 +2252,15 @@ fn http_get(
     let timeout = max_time_secs
         .filter(|value| *value > 0)
         .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    // Connecting should always be fast if the host is reachable at all, so cap it
+    // independently of the (possibly very generous, e.g. 10-minute default) overall
+    // timeout. Without this, a blackholed host stalls the connect phase for the full
+    // overall timeout on every request instead of failing fast.
+    let connect_timeout = timeout.min(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(connect_timeout)
+        .timeout(timeout)
+        .build();
     let mut request = agent.get(url).set("User-Agent", "rocm-cli");
     for (name, value) in headers {
         request = request.set(name, value);
