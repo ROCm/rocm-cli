@@ -2252,7 +2252,13 @@ fn http_get(
     let timeout = max_time_secs
         .filter(|value| *value > 0)
         .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::AgentBuilder::new()
+        // `timeout_connect` takes precedence over `timeout` and defaults to 30s,
+        // so without it a host that blackholes rather than refuses would stall
+        // the request well past the intended ceiling.
+        .timeout_connect(timeout)
+        .timeout(timeout)
+        .build();
     let mut request = agent.get(url).set("User-Agent", "rocm-cli");
     for (name, value) in headers {
         request = request.set(name, value);
