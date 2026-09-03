@@ -1777,6 +1777,16 @@ fn dispatch(cli: Cli) -> Result<()> {
                     },
                 );
             }
+            // Resolve the prompt from `--prompt` or, when it is omitted and
+            // stdin is not a terminal, from piped standard input — the
+            // documented `echo "…" | rocm chat` path. Only when neither
+            // supplies a prompt do we fall back to the status screen (stdin is
+            // an interactive TTY here, since the piped/interactive branches
+            // above already handled the other cases).
+            let prompt = match prompt {
+                Some(prompt) => Some(prompt),
+                None => read_piped_prompt()?,
+            };
             match prompt {
                 Some(prompt) => print!(
                     "{}",
@@ -9585,6 +9595,31 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
         "  note: launch from an interactive terminal to enter the TUI."
     );
     output
+}
+
+/// Read a one-shot chat prompt from standard input when it is piped in.
+///
+/// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
+/// and stdin is not a terminal, the piped text becomes the prompt. Returns
+/// `None` when stdin is an interactive TTY or the piped input is empty, so the
+/// caller falls back to the status screen instead of blocking on input nobody
+/// can supply.
+fn read_piped_prompt() -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read chat prompt from standard input")?;
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_owned()))
+    }
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
@@ -29863,6 +29898,21 @@ ID_LIKE="suse opensuse"
         assert!(
             body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn command_chat_reads_prompt_from_piped_stdin() {
+        // Regression for the documented `echo "…" | rocm chat` path: when
+        // `--prompt` is omitted the handler must read stdin via
+        // `read_piped_prompt` and route the piped text through
+        // `render_chat_prompt_text`, rather than dropping straight to the
+        // status screen (`render_chat_text`) and ignoring stdin.
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("read_piped_prompt("),
+            "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
         );
     }
 }
