@@ -82,6 +82,28 @@ pub fn default_timeout() -> Duration {
     )
 }
 
+/// A termination signal a scenario can deliver to the live TUI, paired with the
+/// conventional `128 + signo` exit code the dashboard's signal handler reports
+/// after restoring the terminal (SIGINT → 130, SIGTERM → 143).
+#[derive(Debug, Clone, Copy)]
+pub enum TermSignal {
+    /// SIGTERM — a supervisor stopping the dashboard (`kill <pid>`).
+    Term,
+    /// SIGINT — the interactive Ctrl-C gesture delivered as a signal.
+    Int,
+}
+
+impl TermSignal {
+    /// The `kill(1)` name (`TERM`/`INT`), used to deliver the signal to the
+    /// child by pid.
+    const fn kill_name(self) -> &'static str {
+        match self {
+            Self::Term => "TERM",
+            Self::Int => "INT",
+        }
+    }
+}
+
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
     child: Box<dyn Child + Send + Sync>,
@@ -107,6 +129,9 @@ pub struct TuiSession {
     is_chat: bool,
     scenario: Option<String>,
     argv: Vec<String>,
+    /// Exit code observed by [`deliver_signal_and_wait`], read back by the
+    /// signal scenarios' `Then` steps once the child has been reaped.
+    observed_exit_code: Option<i32>,
 }
 
 impl std::fmt::Debug for TuiSession {
@@ -224,6 +249,7 @@ impl TuiSession {
             is_chat: args.first() == Some(&"chat"),
             scenario: world.current_scenario.clone(),
             argv: args.iter().map(|s| (*s).to_string()).collect(),
+            observed_exit_code: None,
         })
     }
 
@@ -505,6 +531,134 @@ impl TuiSession {
         self.recorded = true;
         let argv: Vec<&str> = self.argv.iter().map(String::as_str).collect();
         crate::record_command(self.scenario.as_deref(), &argv, rc, "");
+    }
+
+    /// Deliver `signal` to the child, then wait for it to exit and stash the
+    /// observed exit code for the scenario's `Then` steps. Only harness faults
+    /// (no pid, a failed `kill`, a reader panic, or a timeout) are surfaced as
+    /// `Err`; asserting the exit *value* and terminal restoration is left to the
+    /// scenario's `Then` steps, which read the code back via
+    /// [`observed_exit_code`](Self::observed_exit_code) and call
+    /// [`expect_terminal_restored`](Self::expect_terminal_restored).
+    pub async fn deliver_signal_and_wait(
+        &mut self,
+        signal: TermSignal,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let pid = self
+            .child
+            .process_id()
+            .ok_or_else(|| "the TUI child has no pid; cannot deliver a signal".to_string())?;
+        // The signal scenarios are `@requires-os:linux`, so shelling out to
+        // `kill(1)` avoids pulling a `libc`/`nix` dependency into the harness
+        // just to reach `kill(2)`.
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{}", signal.kill_name()))
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("failed to run `kill -{} {pid}`: {e}", signal.kill_name()))?;
+        if !status.success() {
+            return Err(format!(
+                "`kill -{} {pid}` exited unsuccessfully ({status})",
+                signal.kill_name()
+            ));
+        }
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
+    /// The exit code recorded by the most recent
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait), read back by
+    /// the scenario's `Then` step to assert the conventional `128 + signo` value.
+    #[must_use]
+    pub const fn observed_exit_code(&self) -> Option<i32> {
+        self.observed_exit_code
+    }
+
+    /// Assert the terminal was restored on exit: the child left the alternate
+    /// screen and made the cursor visible again. A dashboard that dies on a
+    /// signal without running its restore path leaves both inverted (still on
+    /// the alt-screen, cursor hidden) — the broken state that needs a `reset`.
+    pub fn expect_terminal_restored(&self) -> Result<(), String> {
+        let on_alt = self.on_alternate_screen();
+        let cursor_hidden = self.cursor_hidden();
+        if on_alt || cursor_hidden {
+            return Err(format!(
+                "terminal was not restored on exit (alternate_screen={on_alt}, cursor_hidden={cursor_hidden}); expected the dashboard to leave the alt-screen and show the cursor.\n{}",
+                self.framed_screen()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the emulated screen is currently on the alternate screen.
+    fn on_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Whether the emulated cursor is currently hidden.
+    fn cursor_hidden(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .hide_cursor()
+    }
+
+    /// Poll until the child exits and return its exit code, giving the reader a
+    /// bounded window to consume the final frame — the terminal-restore
+    /// sequences the signal handler emits arrive immediately before the process
+    /// exits, so the parser must see them before restoration is asserted.
+    async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finished = true;
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                    self.record_once(code);
+                    self.drain_final_frame().await;
+                    return Ok(code);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Let the reader thread consume any bytes still buffered after the child
+    /// exits (its final restore sequences) for a short bounded window, so the
+    /// emulated screen reflects the terminal's final state before it is read.
+    async fn drain_final_frame(&mut self) {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 }
 

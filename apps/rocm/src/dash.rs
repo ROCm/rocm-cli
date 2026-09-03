@@ -360,6 +360,32 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let theme = config.dashboard.tui.theme;
+
+    // Bare `rocm` is a persistent hub: it outlives each session's Tokio runtime
+    // and returns to a synchronous, raw-mode launcher menu between flows. Each
+    // session builds and drops its own runtime, and Tokio never unregisters the
+    // libc signal handler it installs — so once a session's runtime is dropped
+    // nothing drains the signal pipe and a per-session watcher goes deaf. The
+    // menu would then hold the terminal in raw mode while SIGTERM/SIGINT are
+    // caught-and-discarded: an unkillable, worse form of the very bug this
+    // fixes. Keep ONE runtime alive for the whole hub and spawn a single
+    // process-lifetime watcher on it, so every window — the menu and each
+    // session alike — has a live reactor to restore the terminal and exit
+    // `128 + signo`. The watcher is registered before the first menu paint, so
+    // even the very first launcher screen is covered.
+    let signal_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("building the launcher signal runtime")?;
+    // Register + spawn inside the runtime context; the returned watcher handle is
+    // dropped on purpose (dropping a `JoinHandle` detaches the task, it does not
+    // abort it), so the hub keeps `signal_rt`'s worker draining the signal pipe
+    // for the whole loop below and the watcher lives for the process.
+    let _watcher = signal_rt
+        .block_on(async { rocm_dash_tui::app::spawn_termination_watcher() })
+        .map_err(|e| anyhow::anyhow!("installing launcher termination-signal handlers: {e}"))?;
+
     loop {
         // Re-read the managed-service registry on each pass so the front door
         // reflects models started (or stopped) during a prior flow. This is a
