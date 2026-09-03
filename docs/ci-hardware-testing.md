@@ -37,6 +37,7 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
 | `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
+| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
 
 The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
@@ -47,10 +48,10 @@ WSL lane pins `wsl` for the same reason, from the other side.
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
-The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3`) run on AMD GPU systems, so they exercise
-host/GPU detection, engine `detect`/`capabilities`, and live serving scenarios
-that the mock job cannot. GPU availability is advisory in the WSL lane, as
+The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
+`e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p`) run on AMD GPU systems, so they
+exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
+scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
 
 `e2e-wsl` runs on an Ubuntu distro hosted in WSL2 on the Strix Halo Windows box
@@ -92,10 +93,11 @@ reports — including partial or failed runs — by scenario id into one HTML re
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
-`e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
-platform's name and OS from the artifact name. An unrecognised name renders as a
-guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
+`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
+because the report derives each platform's name and OS from the artifact name.
+An unrecognised name renders as a guessed platform on Linux, which would report
+a Windows lane as Linux; `xtask`'s
 `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
 ## Triggers
@@ -120,11 +122,11 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
-  `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `rad3` to
-  `e2e-gpu-rad3`. (The mock lane has its own `platform` input on `ci.yml`; it is
-  not part of this workflow.)
+  `strix-wsl`, `rad3`, `mi350p`) — which self-hosted job(s) to run. `app-dev-gpu`
+  maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
+  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3` to
+  `e2e-gpu-rad3`, and `mi350p` to `e2e-gpu-mi350p`. (The mock lane has its own
+  `platform` input on `ci.yml`; it is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -188,8 +190,9 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3` — all run with `continue-on-error: true`, so a
-hardware failure that RUNS never gates a PR merge. Their results still surface
+`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
+`continue-on-error: true`, so a hardware failure that RUNS never gates a PR
+merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
 ### Timeouts on the shared Strix box

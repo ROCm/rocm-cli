@@ -33,7 +33,7 @@ on:
         type: choice
         default: all
         # Each value also selectable on its own; `all` covers every lane below.
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, rad3]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, rad3, mi350p]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -952,6 +952,132 @@ jobs:
           name: e2e-gpu-rad3-report
           path: tests/e2e-cucumber/results/
 
+  e2e-gpu-mi350p:
+    name: E2E tests (MI350P)
+    # 90min: matches the other Instinct lane — same collapsed suite.
+    timeout-minutes: 90
+    # `mi350p` names the hardware rather than reusing the generic `amd-gpu`:
+    # GitHub matches a job to any runner whose labels are a superset, so a shared
+    # label would let this card pick up MI300X-targeted work and vice versa.
+    runs-on: [self-hosted, linux, mi350p]
+    needs: [changes]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.changes.outputs.serve == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'mi350p'))
+      )
+    continue-on-error: true
+    env:
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Full serve matrix at the merge-queue gate, like every other lane (see e2e-gpu).
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The pod is usually fresh (the runner scales to zero between jobs), but the
+      # work volume is not, and two jobs can share one pod's life. Same reclaim as
+      # e2e-gpu, scoped to e2e leftovers only.
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # Bounded wait, as in e2e-gpu. The pod is admitted for exactly one card, so
+      # rocm-smi sees that card alone. The floor matches the other Instinct lane
+      # rather than scaling with the 144GB capacity: it only has to be high enough
+      # to catch a leftover serve still holding the card, and low enough that a
+      # clean pod passes on the first poll.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      # cache: false for the same reason as e2e-gpu — the build cache is kept in
+      # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run E2E tests on MI350P
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that survives the runner being scaled
+          # away, so the cargo target dir and the shared caches are still warm on
+          # the next job even though the container is not.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # A SEPARATE volume is mounted at exactly this path by the runner's
+          # deployment. Keeping the ~23GB uv cache off the work volume is
+          # deliberate; if you change this path, change that deployment too.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Pre-warm one shared runtime in place before the suite. Not an
+          # optimization — `install sdk` bakes absolute paths into the runtime
+          # manifest, so installing anywhere temporary breaks every later serve.
+          # See e2e-gpu for the full rationale.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
+          # what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has moved on — the tree is a cache, not a one-shot.
+          # See the e2e-gpu lane and `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+
+          # Optional scenario-name filter for a scoped manual dispatch — a cheap
+          # way to exercise this lane against a single scenario without the full suite.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-mi350p-report
+          path: tests/e2e-cucumber/results/
+
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
   # required `E2E consolidated report` so it does NOT collide with that required
@@ -969,6 +1095,7 @@ jobs:
       - e2e-gpu-strix-windows
       - e2e-wsl
       - e2e-gpu-rad3
+      - e2e-gpu-mi350p
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
     # produced. On dispatch `serve` is unset, so also run when the trigger was
