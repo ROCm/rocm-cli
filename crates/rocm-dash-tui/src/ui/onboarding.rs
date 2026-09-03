@@ -190,6 +190,10 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         cfg.channel.as_arg().to_string(),
         "--format".to_string(),
         "wheel".to_string(),
+        // Onboarding installs are spawned with null stdin, so a would-be
+        // overwrite prompt cannot be answered and the install would refuse.
+        // `--yes` keeps the first-run install non-interactive.
+        "--yes".to_string(),
     ];
     let pin = cfg.pin_value.trim();
     if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
@@ -671,7 +675,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--yes"
             ],
             "default Release path must stay byte-identical to the pre-toggle args"
         );
@@ -918,7 +923,8 @@ mod tests {
                 "--channel",
                 "nightly",
                 "--format",
-                "wheel"
+                "wheel",
+                "--yes"
             ]
         );
     }
@@ -948,6 +954,7 @@ mod tests {
                 "nightly",
                 "--format",
                 "wheel",
+                "--yes",
                 "--build-date",
                 "2026-06-05"
             ]
@@ -983,7 +990,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--yes"
             ],
             "an empty pin must not add a flag"
         );

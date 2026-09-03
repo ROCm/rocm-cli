@@ -1214,10 +1214,15 @@ fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
 /// the newer-than decision is unit-testable without a real legacy ROCm on disk.
 fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
     let host_version = host_version?;
-    match compare_version_strings(&host_version, resolved_version) {
-        Ordering::Greater => Some(host_version),
-        _ => None,
-    }
+    // Only claim the host is newer when BOTH versions parse and the host is
+    // strictly greater. An unparseable host string — an odd build suffix
+    // (`7.2.4-98`) or a truncated two-component report (`7.4`) — is "can't
+    // tell", not "newer". Falling back to a lexicographic compare here wrongly
+    // ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at the third
+    // char), inventing a host-newer note that misleads the user.
+    let host_parsed = parse_host_version(&host_version)?;
+    let resolved_parsed = parse_host_version(resolved_version)?;
+    (host_parsed > resolved_parsed).then_some(host_version)
 }
 
 /// The wheel-path `version_note` body explaining why a host-newer legacy ROCm is
@@ -4045,6 +4050,54 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
+/// Lenient parse of a host-reported ROCm version for the "is the host newer?"
+/// decision. Unlike [`parse_version`], this tolerates the shapes a legacy/system
+/// ROCm actually reports: a build suffix (`7.2.4-98`) and a missing patch
+/// component (`7.4`). Major and minor are required; patch defaults to 0 when
+/// absent and may still carry an `rc`/`a` stage suffix. Returns `None` when
+/// major/minor cannot be read so an unparseable host string is treated as
+/// "can't tell" instead of being compared lexicographically.
+fn parse_host_version(value: &str) -> Option<ParsedVersion> {
+    // Drop build/local metadata: `7.2.4-98`, `7.2.4+local` -> `7.2.4`.
+    let value = value.split(['+', '-']).next().unwrap_or(value).trim();
+    let mut parts = value.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let (patch, stage, stage_number) = match parts.next() {
+        // Two-component report (`7.4`) -> treat as `7.4.0`.
+        None => (0, VersionStage::Stable, 0),
+        Some(patch_and_rest) => {
+            let patch_len = patch_and_rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .count();
+            if patch_len == 0 {
+                return None;
+            }
+            let patch = patch_and_rest[..patch_len].parse().ok()?;
+            let suffix = &patch_and_rest[patch_len..];
+            let (stage, stage_number) = if suffix.is_empty() {
+                (VersionStage::Stable, 0)
+            } else if let Some(rest) = suffix.strip_prefix("rc") {
+                (VersionStage::Rc, rest.parse().ok()?)
+            } else if let Some(rest) = suffix.strip_prefix('a') {
+                (VersionStage::Alpha, rest.parse().ok()?)
+            } else {
+                return None;
+            };
+            (patch, stage, stage_number)
+        }
+    };
+
+    Some(ParsedVersion {
+        major,
+        minor,
+        patch,
+        stage,
+        stage_number,
+    })
+}
+
 fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
     match channel {
         TheRockChannel::Release => vec![
@@ -6066,6 +6119,25 @@ echo Python 3.12.10
         assert!(host_version_newer_than(Some("7.12.0".to_owned()), "7.13.0").is_none());
         // No legacy ROCm detected on the host -> nothing to explain.
         assert!(host_version_newer_than(None, "7.13.0").is_none());
+
+        // A build-suffixed host version must not be lexicographically ranked
+        // above the resolved version: `7.2.4-98` is numerically OLDER than
+        // `7.13.0`, so no host-newer note. (This is the reported regression:
+        // char-compare put `7.2…` above `7.13…`.)
+        assert!(host_version_newer_than(Some("7.2.4-98".to_owned()), "7.13.0").is_none());
+        // Two-component host reports are parsed as `.0`; still older here.
+        assert!(host_version_newer_than(Some("7.4".to_owned()), "7.13.0").is_none());
+        assert!(host_version_newer_than(Some("7.9".to_owned()), "7.13.0").is_none());
+        // A build suffix on an equal version is not "newer".
+        assert!(host_version_newer_than(Some("7.13.0-56".to_owned()), "7.13.0").is_none());
+        // A genuinely newer build-suffixed host is surfaced, keeping the
+        // original reported string (suffix included) for the user-facing note.
+        assert_eq!(
+            host_version_newer_than(Some("7.20.1-33".to_owned()), "7.13.0").as_deref(),
+            Some("7.20.1-33")
+        );
+        // A host string we cannot parse is "can't tell", never "newer".
+        assert!(host_version_newer_than(Some("unknown".to_owned()), "7.13.0").is_none());
     }
 
     #[test]

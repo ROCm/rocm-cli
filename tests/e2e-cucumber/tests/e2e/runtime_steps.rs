@@ -467,6 +467,21 @@ async fn assert_runtime_active(world: &mut E2eWorld) {
     );
 }
 
+#[then("the install reports overwriting the existing runtime")]
+async fn assert_install_overwrote_existing(world: &mut E2eWorld) {
+    // The registered-and-active Thens are true from the `Given` alone, so they
+    // cannot tell an overwrite from a no-op. This asserts the overwrite branch
+    // was actually taken: with `--yes` the approval gate resolves to
+    // `ProceedApproved`, whose only externally visible signal is this line. If
+    // `--yes` regressed to a refusal, or the install silently took the fresh
+    // path, this line is absent and the scenario fails.
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output.contains("Overwriting existing ROCm SDK"),
+        "reinstall with --yes did not report overwriting the existing runtime:\n{output}"
+    );
+}
+
 #[then("the runtime includes an inference engine")]
 async fn assert_runtime_has_stack(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
