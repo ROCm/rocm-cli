@@ -273,7 +273,7 @@ jobs:
           # instantly (observed on run 29320025393). Installing in place keeps the
           # baked paths valid, and each scenario's data/runtimes symlink resolves to
           # this same real tree.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries ONCE and reuse them for both the
@@ -448,7 +448,7 @@ jobs:
           # is missing)` and fails (diagnosed on the box 2026-07-15). Installing in
           # place, directly into the persistent shared dir, keeps the baked paths
           # valid for all scenarios and for the end-of-run version probe.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
@@ -599,7 +599,7 @@ jobs:
           # every later serve sees status=unusable and fails (diagnosed on the Linux
           # box 2026-07-15; the Windows scenario-8 cold-download failure is the same
           # class). Install in place so the baked paths stay valid for all scenarios.
-          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
@@ -788,7 +788,7 @@ jobs:
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
@@ -918,7 +918,7 @@ jobs:
           # optimization — `install sdk` bakes absolute paths into the runtime
           # manifest, so installing anywhere temporary breaks every later serve.
           # See e2e-gpu for the full rationale.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane for why the e2e-test-hooks feature must match

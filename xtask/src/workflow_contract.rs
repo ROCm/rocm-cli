@@ -1041,6 +1041,24 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
     }
 
+    #[test]
+    fn gpu_prewarm_caches_are_namespaced_by_source_layout() {
+        for workflow_name in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let workflow = read_workflow(workflow_name);
+            assert!(
+                workflow.contains("e2e-prewarm-multi-arch-v2"),
+                "{workflow_name} must isolate the canonical multi-arch runtime tree"
+            );
+            assert!(
+                !workflow.lines().any(|line| {
+                    line.trim_end().ends_with("e2e-prewarm\"")
+                        || line.trim_end().ends_with("e2e-prewarm'")
+                }),
+                "{workflow_name} still uses the generation-agnostic pre-warm tree"
+            );
+        }
+    }
+
     // Extractor guards: prove the helpers actually parse multiline forms, so the
     // contract tests above can't silently false-pass on a shape they don't handle.
     #[test]

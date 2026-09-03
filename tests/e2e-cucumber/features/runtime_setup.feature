@@ -131,3 +131,8 @@ Feature: Runtime configuration
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  @id:runtime-resolve-canonical-nightly @nightly
+  Scenario: 6 - Previewing a nightly SDK install reports canonical provenance
+    When the user dry-runs a nightly SDK install for a known family
+    Then the SDK preview reports canonical nightly provenance

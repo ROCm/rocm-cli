@@ -4,20 +4,21 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
+    detect_host_gpu_diagnostics, detect_host_therock_family, detect_managed_therock_family,
+    disk_space, ensure_uv_binary, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
     generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -27,11 +28,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
-const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl";
-const THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
+const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
@@ -51,6 +52,13 @@ const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 enum TheRockChannel {
     Release,
     Nightly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalSource {
+    wheel_index: &'static str,
+    tarball_catalog: &'static str,
+    layout_generation: &'static str,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -112,12 +120,53 @@ impl TheRockChannel {
         }
     }
 
-    const fn tarball_base_url(self) -> &'static str {
-        match self {
-            Self::Release => THEROCK_RELEASE_TARBALL_BASE,
-            Self::Nightly => THEROCK_NIGHTLY_TARBALL_BASE,
-        }
+    const fn canonical_source(self) -> CanonicalSource {
+        canonical_source(self)
     }
+}
+
+const fn canonical_source(channel: TheRockChannel) -> CanonicalSource {
+    match channel {
+        TheRockChannel::Release => CanonicalSource {
+            wheel_index: THEROCK_RELEASE_PIP_INDEX_BASE,
+            tarball_catalog: THEROCK_RELEASE_TARBALL_BASE,
+            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
+        },
+        TheRockChannel::Nightly => CanonicalSource {
+            wheel_index: THEROCK_NIGHTLY_PIP_INDEX_BASE,
+            tarball_catalog: THEROCK_NIGHTLY_TARBALL_BASE,
+            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
+        },
+    }
+}
+
+fn render_canonical_provenance(
+    output: &mut String,
+    channel: TheRockChannel,
+    source_url: &str,
+    layout_generation: &str,
+    version: &str,
+) {
+    let build_date = runtime_version_build_date(version)
+        .unwrap_or_else(|| "not encoded in stable version".to_owned());
+    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let _ = writeln!(output, "  canonical_source: {source_url}");
+    let _ = writeln!(output, "  selected_rocm_version: {version}");
+    let _ = writeln!(output, "  build_date: {build_date}");
+    let _ = writeln!(output, "  source_layout_generation: {layout_generation}");
+}
+
+fn validate_aggregate_index_layout(html: &str) -> Result<()> {
+    let required_packages = ["rocm/", "torch/", "torchvision/", "torchaudio/"];
+    if required_packages
+        .iter()
+        .all(|package| html.contains(package))
+    {
+        return Ok(());
+    }
+    bail!(
+        "unknown canonical TheRock aggregate index layout: expected package links for rocm, torch, torchvision, and torchaudio"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +289,51 @@ pub(crate) struct RuntimeUpdatePlan {
     pub latest_source: String,
     pub format: String,
     pub status: String,
+    pub target_runtime_key: String,
+    pub repair_required: bool,
     pub update_available: bool,
+}
+
+/// Exact canonical wheel install intent last applied successfully to a runtime.
+///
+/// Version alone cannot identify a reusable environment: adding a required ROCm
+/// extra at the same release version must make an older cache repairable.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WheelRuntimeComposition {
+    pub source_layout_generation: String,
+    pub package_specs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RuntimeFreshness {
+    UpToDate,
+    UpdateAvailable,
+    RepairAvailable,
+    AheadOfIndex,
+}
+
+impl RuntimeFreshness {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::UpToDate => "up_to_date",
+            Self::UpdateAvailable => "update_available",
+            Self::RepairAvailable => "repair_available",
+            Self::AheadOfIndex => "ahead_of_index",
+        }
+    }
+
+    const fn update_available(self) -> bool {
+        matches!(self, Self::UpdateAvailable | Self::RepairAvailable)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRuntimeUpdate {
+    latest_version: String,
+    latest_source: String,
+    target_runtime_key: String,
+    format: String,
+    wheel_composition: Option<WheelRuntimeComposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +367,10 @@ pub(crate) struct InstalledRuntimeManifest {
     /// knows that, and it has to survive repeat installs to be worth anything.
     #[serde(default)]
     pub sdk_torch: Option<String>,
+    /// Missing on manifests written before composition-aware freshness. Such a
+    /// managed wheel runtime is repaired once and rewritten with this field.
+    #[serde(default)]
+    pub wheel_composition: Option<WheelRuntimeComposition>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -535,8 +632,8 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         return Ok(output);
     }
 
-    for manifest in manifests {
-        let plan = match runtime_update_plan(paths, &manifest) {
+    for manifest in &manifests {
+        let plan = match runtime_update_plan(paths, manifest, &manifests) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -569,14 +666,21 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         );
         let _ = writeln!(output, "    source: {}", plan.latest_source);
         if plan.update_available {
+            let next_step = if plan.repair_required {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install a composition-keyed replacement side-by-side",
+                    manifest.runtime_key
+                )
+            } else {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
+                    manifest.runtime_key
+                )
+            };
+            let _ = writeln!(output, "    next step: {next_step}");
             let _ = writeln!(
                 output,
-                "    next step: run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
-                manifest.runtime_key
-            );
-            let _ = writeln!(
-                output,
-                "    activate: add `--activate` to make the newly installed runtime the default after install"
+                "    activate: add `--activate` to make the installed runtime the default after install"
             );
         }
     }
@@ -584,23 +688,96 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
+fn replacement_runtime_is_installed(
+    manifests: &[InstalledRuntimeManifest],
+    source: &InstalledRuntimeManifest,
+    target_runtime_key: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+) -> bool {
+    // `RepairAvailable` currently implies a wheel composition, but keep this
+    // helper total if a future freshness state reaches it without one.
+    let Some(required_composition) = required_composition else {
+        return false;
+    };
+    manifests.iter().any(|candidate| {
+        !candidate.read_only
+            && candidate.runtime_key == target_runtime_key
+            && candidate.channel == source.channel
+            && candidate.format == source.format
+            && candidate.family == source.family
+            && candidate.wheel_composition.as_ref() == Some(required_composition)
+    })
+}
+
+fn runtime_freshness(
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    match compare_version_strings(&manifest.version, latest_version) {
+        Ordering::Less => RuntimeFreshness::UpdateAvailable,
+        Ordering::Greater => RuntimeFreshness::AheadOfIndex,
+        Ordering::Equal
+            if !manifest.read_only
+                && required_composition.is_some()
+                && (manifest.wheel_composition.as_ref() != required_composition
+                    || manifest.runtime_key != target_runtime_key) =>
+        {
+            RuntimeFreshness::RepairAvailable
+        }
+        Ordering::Equal => RuntimeFreshness::UpToDate,
+    }
+}
+
+fn runtime_freshness_with_manifests(
+    manifests: &[InstalledRuntimeManifest],
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    let freshness = runtime_freshness(
+        manifest,
+        latest_version,
+        required_composition,
+        target_runtime_key,
+    );
+    if freshness == RuntimeFreshness::RepairAvailable
+        && replacement_runtime_is_installed(
+            manifests,
+            manifest,
+            target_runtime_key,
+            required_composition,
+        )
+    {
+        RuntimeFreshness::UpToDate
+    } else {
+        freshness
+    }
+}
+
 pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
 ) -> Result<RuntimeUpdatePlan> {
-    let (latest_version, latest_source, format) =
-        resolve_latest_for_manifest(paths, manifest, None)?;
-    let status = match compare_version_strings(&manifest.version, &latest_version) {
-        Ordering::Less => "update_available",
-        Ordering::Equal => "up_to_date",
-        Ordering::Greater => "ahead_of_index",
-    };
+    let latest = resolve_latest_for_manifest(paths, manifest, None)?;
+    let freshness = runtime_freshness_with_manifests(
+        manifests,
+        manifest,
+        &latest.latest_version,
+        latest.wheel_composition.as_ref(),
+        &latest.target_runtime_key,
+    );
     Ok(RuntimeUpdatePlan {
-        latest_version,
-        latest_source,
-        format,
-        status: status.to_owned(),
-        update_available: status == "update_available",
+        latest_version: latest.latest_version,
+        latest_source: latest.latest_source,
+        format: latest.format,
+        status: freshness.status().to_owned(),
+        target_runtime_key: latest.target_runtime_key,
+        repair_required: freshness == RuntimeFreshness::RepairAvailable,
+        update_available: freshness.update_available(),
     })
 }
 
@@ -608,7 +785,7 @@ fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     download_timeout_secs: Option<u64>,
-) -> Result<(String, String, String)> {
+) -> Result<ResolvedRuntimeUpdate> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
     match manifest.format.as_str() {
         "wheel" => {
@@ -635,11 +812,30 @@ fn resolve_latest_for_manifest(
                 None,
                 download_timeout_secs,
             )?;
-            Ok((
-                resolution.latest_version,
-                resolution.index_url,
-                "wheel".to_owned(),
-            ))
+            let device_target =
+                wheel_composition_device_target(manifest.wheel_composition.as_ref())
+                    .and_then(|target| {
+                        canonical_aggregate_device_target(target, &resolution.family)
+                    })
+                    .map_or_else(
+                        || {
+                            required_aggregate_device_target(
+                                detect_host_gfx_target().as_deref(),
+                                &resolution.family,
+                            )
+                        },
+                        Ok,
+                    )?;
+            let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
+            let target_runtime_key =
+                wheel_runtime_key(channel, &resolution.latest_version, &wheel_composition);
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: resolution.latest_version,
+                latest_source: resolution.index_url,
+                target_runtime_key,
+                format: "wheel".to_owned(),
+                wheel_composition: Some(wheel_composition),
+            })
         }
         "tarball" => {
             let artifact = resolve_tarball_artifact_with_timeout(
@@ -648,7 +844,19 @@ fn resolve_latest_for_manifest(
                 Some(manifest.family.as_str()),
                 download_timeout_secs,
             )?;
-            Ok((artifact.version, artifact.url, "tarball".to_owned()))
+            let target_runtime_key = runtime_key(
+                channel,
+                "tarball",
+                &artifact.family,
+                Some(&artifact.version),
+            );
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: artifact.version,
+                latest_source: artifact.url,
+                target_runtime_key,
+                format: "tarball".to_owned(),
+                wheel_composition: None,
+            })
         }
         other => bail!("unknown manifest format `{other}`"),
     }
@@ -685,6 +893,7 @@ fn maybe_refresh_startup_update_check_at(
     let record = build_startup_update_check_record(
         paths,
         manifest,
+        &manifests,
         now_unix_ms,
         Some(STARTUP_UPDATE_CHECK_TIMEOUT_SECS),
     );
@@ -716,25 +925,28 @@ fn select_startup_update_manifest<'a>(
 fn build_startup_update_check_record(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
     now_unix_ms: u128,
     download_timeout_secs: Option<u64>,
 ) -> StartupUpdateCheckRecord {
     match resolve_latest_for_manifest(paths, manifest, download_timeout_secs) {
-        Ok((latest_version, _latest_source, kind)) => {
-            let status = match compare_version_strings(&manifest.version, &latest_version) {
-                Ordering::Less => "update_available",
-                Ordering::Equal => "up_to_date",
-                Ordering::Greater => "ahead_of_index",
-            };
+        Ok(latest) => {
+            let freshness = runtime_freshness_with_manifests(
+                manifests,
+                manifest,
+                &latest.latest_version,
+                latest.wheel_composition.as_ref(),
+                &latest.target_runtime_key,
+            );
             StartupUpdateCheckRecord {
                 runtime_key: manifest.runtime_key.clone(),
                 runtime_id: manifest.runtime_id.clone(),
                 channel: manifest.channel.clone(),
-                format: kind,
+                format: latest.format,
                 family: manifest.family.clone(),
                 installed_version: manifest.version.clone(),
-                latest_version: Some(latest_version),
-                status: status.to_owned(),
+                latest_version: Some(latest.latest_version),
+                status: freshness.status().to_owned(),
                 message: None,
                 checked_at_unix_ms: now_unix_ms,
             }
@@ -830,15 +1042,33 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
     )?;
+    // An explicit-family preview may run on a host without that GPU. Keep the
+    // preview non-mutating and honest about the unresolved device package; an
+    // actual install still requires an exact host target before any files change.
+    let detected_target = detect_host_gfx_target();
+    let device_target =
+        match required_aggregate_device_target(detected_target.as_deref(), &resolution.family) {
+            Ok(target) => Some(target),
+            Err(_) if dry_run => None,
+            Err(error) => return Err(error),
+        };
+    let wheel_composition = device_target
+        .as_deref()
+        .map(|target| wheel_runtime_composition(&resolution, target));
     progress_line(format!(
-        "Found TheRock package family {} version {} with a matching PyTorch stack.",
-        resolution.family, resolution.latest_version
+        "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
+        resolution.latest_version, resolution.family
     ));
-    let runtime_key = runtime_key(
-        channel,
-        "wheel",
-        &resolution.family,
-        Some(&resolution.latest_version),
+    let runtime_key = wheel_composition.as_ref().map_or_else(
+        || {
+            runtime_key(
+                channel,
+                "wheel-preview",
+                &resolution.family,
+                Some(&resolution.latest_version),
+            )
+        },
+        |composition| wheel_runtime_key(channel, &resolution.latest_version, composition),
     );
     let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
@@ -849,13 +1079,31 @@ fn install_wheel_runtime(
         output,
         "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
     );
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let source = channel.canonical_source();
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        source.wheel_index,
+        source.layout_generation,
+        &resolution.latest_version,
+    );
     let _ = writeln!(output, "  format: wheel");
     if let Some(selector) = version_selector {
         let _ = writeln!(output, "  requested: {}", selector.describe());
     }
-    let _ = writeln!(output, "  family: {}", resolution.family);
-    let _ = writeln!(output, "  family_source: {}", resolution.family_source);
+    let _ = writeln!(output, "  target_family: {}", resolution.family);
+    let _ = writeln!(
+        output,
+        "  target_family_source: {}",
+        resolution.family_source
+    );
+    let _ = writeln!(
+        output,
+        "  device_target: {}",
+        device_target
+            .as_deref()
+            .unwrap_or("<undetermined during dry-run>")
+    );
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
     let _ = writeln!(
         output,
@@ -888,36 +1136,45 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" ")
+        wheel_composition.as_ref().map_or_else(
+            || "<requires exact GPU target>".to_owned(),
+            |composition| composition.package_specs.join(" "),
+        )
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned target-complete rocm, torch, torchvision, and torchaudio versions in one uv transaction"
     );
     if dry_run {
-        let env_python = venv_python_path(&install_root);
-        let mut install_args = uv_pip_install_base(&env_python);
-        install_args.extend(["--index-url".to_owned(), resolution.index_url.clone()]);
-        if matches!(channel, TheRockChannel::Nightly) {
-            install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
-        }
-        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
-        let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
-        let venv_args_display = venv_args
-            .iter()
-            .map(|arg| quote_display_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let install_args_display = install_args
-            .iter()
-            .map(|arg| quote_display_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
         let _ = writeln!(output, "  mode: dry-run");
-        let _ = writeln!(
-            output,
-            "  command: uv {venv_args_display} && uv {install_args_display}"
-        );
+        if let Some(wheel_composition) = wheel_composition.as_ref() {
+            let env_python = venv_python_path(&install_root);
+            let mut install_args = uv_pip_install_base(&env_python);
+            install_args.extend(["--index-url".to_owned(), resolution.index_url.clone()]);
+            if matches!(channel, TheRockChannel::Nightly) {
+                install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
+            }
+            install_args.extend(wheel_composition.package_specs.iter().cloned());
+            let venv_args_display = uv_venv_args(&python_launcher.executable, &install_root)
+                .iter()
+                .map(|arg| quote_display_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let install_args_display = install_args
+                .iter()
+                .map(|arg| quote_display_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(
+                output,
+                "  command: uv {venv_args_display} && uv {install_args_display}"
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "  command: <requires an exact GPU target before installation>"
+            );
+        }
         let _ = writeln!(
             output,
             "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
@@ -925,6 +1182,10 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
         return Ok(output);
     }
+    let device_target =
+        device_target.context("exact GPU target was not resolved for installation")?;
+    let wheel_composition =
+        wheel_composition.context("wheel package composition was not resolved for installation")?;
 
     let uv = ensure_uv_binary(paths)?;
     fs::create_dir_all(
@@ -941,7 +1202,7 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        wheel_composition.package_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -949,7 +1210,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+    install_args.extend(wheel_composition.package_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,
@@ -962,7 +1223,7 @@ fn install_wheel_runtime(
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
-    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
+    let rocm_sdk_probe = probe_rocm_sdk_runtime_for_target(&env_python, Some(&device_target))
         .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
     let installed_version = rocm_sdk_probe
@@ -986,6 +1247,7 @@ fn install_wheel_runtime(
         pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
         sdk_torch: Some(resolution.package_versions.torch.clone()),
+        wheel_composition: Some(wheel_composition),
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1021,13 +1283,68 @@ fn install_wheel_runtime(
     Ok(output)
 }
 
-fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    rocm_extras: &str,
+) -> Vec<String> {
     vec![
-        format!("rocm[libraries,devel]=={}", package_versions.rocm),
+        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch=={}", package_versions.torch),
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
+}
+
+fn wheel_runtime_composition(
+    resolution: &PipRuntimeResolution,
+    device_target: &str,
+) -> WheelRuntimeComposition {
+    WheelRuntimeComposition {
+        source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
+        package_specs: therock_pip_package_specs(
+            &resolution.package_versions,
+            &format!("libraries,devel,device-{device_target}"),
+        ),
+    }
+}
+
+fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>) -> Option<&str> {
+    composition?.package_specs.iter().find_map(|spec| {
+        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+        extras
+            .split(',')
+            .map(str::trim)
+            .find_map(|extra| extra.strip_prefix("device-"))
+    })
+}
+
+fn required_aggregate_device_target(detected: Option<&str>, family: &str) -> Result<String> {
+    let detected = detected.with_context(|| {
+        format!(
+            "unable to detect an exact GPU target for canonical aggregate family `{family}`; refusing to install every device payload"
+        )
+    })?;
+    canonical_aggregate_device_target(detected, family).with_context(|| {
+        format!(
+            "detected GPU target `{detected}` does not match resolved family `{family}`; refusing to install every device payload"
+        )
+    })
+}
+
+fn canonical_aggregate_device_target(detected: &str, family: &str) -> Option<String> {
+    if normalize_therock_family(detected).as_deref() != Some(family) {
+        return None;
+    }
+    let target = detected
+        .split(':')
+        .next()
+        .unwrap_or(detected)
+        .to_ascii_lowercase();
+    if target.starts_with("gfx94") {
+        Some("gfx942".to_owned())
+    } else {
+        Some(target)
+    }
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -1062,7 +1379,14 @@ fn install_tarball_runtime(
 
     let mut output = String::new();
     let _ = writeln!(output, "sdk install");
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let source = channel.canonical_source();
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        source.tarball_catalog,
+        source.layout_generation,
+        &artifact.version,
+    );
     let _ = writeln!(output, "  format: tarball");
     let _ = writeln!(output, "  family: {}", artifact.family);
     let _ = writeln!(output, "  family_source: {}", artifact.family_source);
@@ -1115,6 +1439,7 @@ fn install_tarball_runtime(
         pip_cache_dir: None,
         rocm_sdk: None,
         sdk_torch: None,
+        wheel_composition: None,
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1152,33 +1477,39 @@ fn resolve_pip_runtime_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let index_urls = therock_index_urls(channel, &family_resolution.family);
-    let mut errors = Vec::new();
-    for index_url in index_urls {
-        match resolve_pip_runtime_from_index(
-            paths,
-            channel,
-            &family_resolution,
-            &index_url,
-            wheel_compatibility,
-            version_selector,
-            download_timeout_secs,
-        ) {
-            Ok(resolution) => return Ok(resolution),
-            Err(error) => errors.push(format!("{index_url}: {error}")),
-        }
-    }
-    bail!(
-        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}\n\n{}",
-        channel.as_str(),
-        errors.join("\n  - "),
-        family_resolution_hint(
-            &family_resolution.source,
-            &family_resolution.family,
-            channel,
-            "wheel",
+    let source = channel.canonical_source();
+    let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
+    let root_html = download_text_cached(
+        paths,
+        &format!("canonical-wheel-root-{}", channel.as_str()),
+        &root_url,
+        download_timeout_secs,
+    )?
+    .text;
+    validate_aggregate_index_layout(&root_html).with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}",
+            channel.as_str(),
+            source.wheel_index
         )
+    })?;
+    resolve_pip_runtime_from_index(
+        paths,
+        channel,
+        &family_resolution,
+        source.wheel_index,
+        wheel_compatibility,
+        version_selector,
+        download_timeout_secs,
     )
+    .with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}\n\n{}",
+            channel.as_str(),
+            source.wheel_index,
+            canonical_wheel_resolution_hint(channel)
+        )
+    })
 }
 
 fn resolve_pip_runtime_from_index(
@@ -1234,7 +1565,7 @@ fn resolve_pip_runtime_from_index(
     .with_context(|| {
         let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
         format!(
-            "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            "no mutually compatible target-complete TheRock ROCm SDK, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
         )
     })?;
     let latest_version = package_versions.rocm.clone();
@@ -1262,28 +1593,64 @@ fn resolve_tarball_artifact_with_timeout(
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
+    let source = channel.canonical_source();
     let html = download_text_cached(
         paths,
         &format!("tarball-index-{}", channel.as_str()),
-        channel.tarball_base_url(),
+        source.tarball_catalog,
         download_timeout_secs,
     )?
     .text;
-    let files = parse_tarball_index_html(&html)?;
-    let prefix = format!(
-        "therock-dist-{}-{}-",
-        platform_tarball_token(),
-        family_resolution.family
-    );
+    let files = parse_tarball_index_html(&html).with_context(|| {
+        format!(
+            "unknown canonical TheRock tarball catalog layout at {}",
+            source.tarball_catalog
+        )
+    })?;
+    let (file, version) = select_tarball_candidate(&files, channel, &family_resolution.family)
+        .with_context(|| {
+            format!(
+                "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
+                channel.as_str(),
+                family_resolution_hint(
+                    &family_resolution.source,
+                    &family_resolution.family,
+                    channel,
+                    "tarball",
+                )
+            )
+        })?;
+    Ok(TarballArtifact {
+        family: family_resolution.family,
+        family_source: family_resolution.source,
+        url: format!(
+            "{}/{}",
+            source.tarball_catalog.trim_end_matches('/'),
+            file.name
+        ),
+        file_name: file.name,
+        version,
+    })
+}
+
+fn select_tarball_candidate(
+    files: &[TarballIndexFile],
+    channel: TheRockChannel,
+    family: &str,
+) -> Option<(TarballIndexFile, String)> {
+    let prefix = format!("therock-dist-{}-{family}-", platform_tarball_token());
     let mut candidates = files
-        .into_iter()
+        .iter()
         .filter_map(|file| {
             let version = file
                 .name
                 .strip_prefix(&prefix)?
                 .strip_suffix(".tar.gz")?
                 .to_owned();
-            Some((file, version))
+            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            Some((file.clone(), version))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
@@ -1293,28 +1660,7 @@ fn resolve_tarball_artifact_with_timeout(
             .unwrap_or(Ordering::Equal)
             .then_with(|| compare_version_strings(&left.1, &right.1))
     });
-    let (file, version) = candidates.pop().with_context(|| {
-        format!(
-            "no matching TheRock tarball artifact was found for the resolved GPU family\n\n{}",
-            family_resolution_hint(
-                &family_resolution.source,
-                &family_resolution.family,
-                channel,
-                "tarball",
-            )
-        )
-    })?;
-    Ok(TarballArtifact {
-        family: family_resolution.family,
-        family_source: family_resolution.source,
-        url: format!(
-            "{}/{}",
-            channel.tarball_base_url().trim_end_matches('/'),
-            file.name
-        ),
-        file_name: file.name,
-        version,
-    })
+    candidates.pop()
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
@@ -2622,17 +2968,28 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
 }
 
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    let text = capture_python_stdout(
-        python_executable,
-        ROCM_SDK_PROBE_SCRIPT,
-        "launch rocm_sdk probe",
-    )
-    .with_context(|| {
-        format!(
-            "failed to launch rocm_sdk probe via {}",
-            python_executable.display()
-        )
-    })?;
+    probe_rocm_sdk_runtime_for_target(python_executable, None)
+}
+
+fn probe_rocm_sdk_runtime_for_target(
+    python_executable: &Path,
+    device_target: Option<&str>,
+) -> Result<RocmSdkPythonProbe> {
+    let script = device_target.map_or_else(
+        || ROCM_SDK_PROBE_SCRIPT.to_owned(),
+        |target| {
+            format!(
+                "import os\nos.environ['ROCM_SDK_TARGET_FAMILY'] = {target:?}\n{ROCM_SDK_PROBE_SCRIPT}"
+            )
+        },
+    );
+    let text = capture_python_stdout(python_executable, &script, "launch rocm_sdk probe")
+        .with_context(|| {
+            format!(
+                "failed to launch rocm_sdk probe via {}",
+                python_executable.display()
+            )
+        })?;
     parse_rocm_sdk_probe(&text)
 }
 
@@ -2668,7 +3025,7 @@ pub(crate) struct RuntimeDeviceProbe {
     pub kernel_error: Option<String>,
 }
 
-/// Ask the runtime's own interpreter how many devices its torch can open.
+/// Ask the runtime's own interpreter whether torch can execute a GPU kernel.
 ///
 /// `library_paths` must be the runtime's recorded ROCm library directories (see
 /// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
@@ -2742,7 +3099,8 @@ try:
     out["import_ok"] = True
     out["torch_version"] = getattr(torch, "__version__", None)
     out["hip_version"] = getattr(getattr(torch, "version", None), "hip", None)
-    out["device_count"] = int(torch.cuda.device_count())
+    device_count = int(torch.cuda.device_count())
+    out["device_count"] = device_count
 except Exception as exc:
     out["error"] = type(exc).__name__ + ": " + str(exc)
 
@@ -3684,16 +4042,6 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
-    match channel {
-        TheRockChannel::Release => vec![
-            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
-            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
-        ],
-        TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
-    }
-}
-
 /// Recovery guidance appended to family/index resolution failures so a clean
 /// first run can recover without the user having to guess a `--family`.
 ///
@@ -3703,6 +4051,41 @@ fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
 /// so an auto-detected miss points the user at `--family`, while a user-supplied
 /// miss confirms the family they already named. Both point at the other channel
 /// and, where valid for the platform, the other install format.
+fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
+    let other_channel = match channel {
+        TheRockChannel::Release => "nightly",
+        TheRockChannel::Nightly => "release",
+    };
+    let mut hint = format!(
+        "No complete compatible package stack was found in the canonical {} aggregate stream. Try `--channel {other_channel}`",
+        channel.as_str()
+    );
+    if !runtime_is_windows() {
+        hint.push_str(" or `--format tarball`");
+    }
+    hint.push('.');
+    hint
+}
+
+fn wheel_runtime_key(
+    channel: TheRockChannel,
+    version: &str,
+    composition: &WheelRuntimeComposition,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(composition.source_layout_generation.as_bytes());
+    for package_spec in &composition.package_specs {
+        hasher.update([0]);
+        hasher.update(package_spec.as_bytes());
+    }
+    let fingerprint = format!("{:x}", hasher.finalize());
+    slugify(&format!(
+        "{}-wheel-multi-arch-{version}-{}",
+        channel.as_str(),
+        &fingerprint[..16]
+    ))
+}
+
 fn family_resolution_hint(
     source: &str,
     family: &str,
@@ -4375,7 +4758,241 @@ mod tests {
     }
 
     #[test]
-    fn pip_runtime_installs_pinned_devel_and_torch_stack_from_therock_index() {
+    fn canonical_channels_use_only_their_aggregate_streams() {
+        let release = canonical_source(TheRockChannel::Release);
+        assert_eq!(
+            release.wheel_index,
+            "https://repo.amd.com/rocm/whl-multi-arch"
+        );
+        assert_eq!(
+            release.tarball_catalog,
+            "https://repo.amd.com/rocm/tarball/"
+        );
+        assert_eq!(release.layout_generation, "multi-arch-v2");
+
+        let nightly = canonical_source(TheRockChannel::Nightly);
+        assert_eq!(
+            nightly.wheel_index,
+            "https://rocm.nightlies.amd.com/whl-multi-arch"
+        );
+        assert_eq!(
+            nightly.tarball_catalog,
+            "https://rocm.nightlies.amd.com/tarball/"
+        );
+        assert_eq!(nightly.layout_generation, "multi-arch-v2");
+    }
+
+    #[test]
+    fn nightly_accepts_future_prerelease_major_without_cli_changes() {
+        let selected = select_matching_pip_package_versions(
+            TheRockChannel::Nightly,
+            &["10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            &["0.27.0+rocm10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            None,
+        )
+        .expect("future nightly major should resolve");
+
+        assert_eq!(selected.rocm, "10.1.0a20260822");
+    }
+
+    #[test]
+    fn tarball_selection_never_crosses_channels() {
+        let platform = platform_tarball_token();
+        let files = vec![
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-7.14.0.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.0a20260822.tar.gz"),
+                mtime: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            select_tarball_candidate(&files, TheRockChannel::Release, "gfx120X-all")
+                .map(|(_, version)| version),
+            Some("7.14.0".to_owned())
+        );
+        assert_eq!(
+            select_tarball_candidate(&files, TheRockChannel::Nightly, "gfx120X-all")
+                .map(|(_, version)| version),
+            Some("10.1.0a20260822".to_owned())
+        );
+    }
+
+    #[test]
+    fn canonical_provenance_reports_required_dry_run_fields() {
+        let source = canonical_source(TheRockChannel::Nightly);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Nightly,
+            source.wheel_index,
+            source.layout_generation,
+            "10.1.0a20260822",
+        );
+
+        assert!(output.contains("channel: nightly"));
+        assert!(output.contains("canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch"));
+        assert!(output.contains("selected_rocm_version: 10.1.0a20260822"));
+        assert!(output.contains("build_date: 2026-08-22"));
+        assert!(output.contains("source_layout_generation: multi-arch-v2"));
+    }
+
+    #[test]
+    fn aggregate_device_target_maps_aliases_and_preserves_published_chips() {
+        assert_eq!(
+            canonical_aggregate_device_target("gfx943", "gfx94X-dcgpu").as_deref(),
+            Some("gfx942")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1151", "gfx1151").as_deref(),
+            Some("gfx1151")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1103", "gfx110X-all").as_deref(),
+            Some("gfx1103")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1201", "gfx120X-all").as_deref(),
+            Some("gfx1201")
+        );
+        assert_eq!(
+            canonical_aggregate_device_target("gfx1151", "gfx120X-all"),
+            None
+        );
+
+        let composition = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec![
+                "rocm[libraries,devel,device-gfx1103]==7.14.1".to_owned(),
+                "torch==2.11.0+rocm7.14.1".to_owned(),
+            ],
+        };
+        assert_eq!(
+            wheel_composition_device_target(Some(&composition)),
+            Some("gfx1103"),
+            "update planning must recover the installed target without probing the current host"
+        );
+    }
+
+    #[test]
+    fn aggregate_wheel_install_requires_one_detected_device_payload() {
+        assert_eq!(
+            required_aggregate_device_target(Some("gfx943"), "gfx94X-dcgpu").unwrap(),
+            "gfx942"
+        );
+
+        let missing = required_aggregate_device_target(None, "gfx94X-dcgpu")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("refusing to install every device payload"));
+
+        let mismatched = required_aggregate_device_target(Some("gfx1151"), "gfx120X-all")
+            .unwrap_err()
+            .to_string();
+        assert!(mismatched.contains("does not match resolved family"));
+    }
+
+    #[test]
+    fn same_version_old_composition_cache_requires_repair() {
+        let mut old_cache: InstalledRuntimeManifest = serde_json::from_value(serde_json::json!({
+            "runtime_key": "release-wheel-multi-arch-7-14-0",
+            "runtime_id": "therock-release:gfx94X-dcgpu",
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx94X-dcgpu",
+            "family_source": "managed-runtime",
+            "version": "7.14.0",
+            "install_root": "/tmp/release-wheel-multi-arch-7-14-0",
+            "selected_artifact_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "index_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "tarball_file_name": null,
+            "python_launcher": "/usr/bin/python3",
+            "python_executable": "/tmp/release-wheel-multi-arch-7-14-0/bin/python",
+            "pip_cache_dir": null,
+            "rocm_sdk": null,
+            "read_only": false,
+            "imported_from": null,
+            "installed_at_unix_ms": 1
+        }))
+        .unwrap();
+        let required = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec![
+                "rocm[libraries,devel,device-gfx942]==7.14.0".to_owned(),
+                "torch==2.11.0+rocm7.14.0".to_owned(),
+                "torchvision==0.26.0+rocm7.14.0".to_owned(),
+                "torchaudio==2.11.0+rocm7.14.0".to_owned(),
+            ],
+        };
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+
+        assert_eq!(old_cache.wheel_composition, None);
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key,),
+            RuntimeFreshness::RepairAvailable
+        );
+
+        old_cache.wheel_composition = Some(required.clone());
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key,),
+            RuntimeFreshness::RepairAvailable,
+            "a manifest with the right packages but the legacy identity still needs side-by-side migration"
+        );
+
+        old_cache.runtime_key = target_runtime_key.clone();
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key,),
+            RuntimeFreshness::UpToDate
+        );
+    }
+
+    #[test]
+    fn completed_composition_repair_suppresses_repeat_repair() {
+        let required = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx942]==7.14.0".to_owned()],
+        };
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+        let mut source = test_runtime_manifest(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        source.version = "7.14.0".to_owned();
+        let mut replacement =
+            test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
+        replacement.version = "7.14.0".to_owned();
+        replacement.wheel_composition = Some(required.clone());
+        let manifests = vec![source.clone(), replacement];
+
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &manifests,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::UpToDate,
+        );
+    }
+
+    #[test]
+    fn unknown_aggregate_layout_is_rejected_clearly() {
+        let error =
+            validate_aggregate_index_layout("<html><a href=\"gfx120X-all/\">legacy</a></html>")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unknown canonical TheRock aggregate index layout"));
+    }
+
+    #[test]
+    fn pip_runtime_installs_pinned_target_complete_stack_from_aggregate_index() {
         let package_versions = TheRockPipPackageVersions {
             rocm: "7.13.0a20260513".to_owned(),
             torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
@@ -4383,12 +5000,13 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions);
+        let package_specs =
+            therock_pip_package_specs(&package_versions, "libraries,devel,device-gfx942");
 
         assert_eq!(
             package_specs,
             vec![
-                "rocm[libraries,devel]==7.13.0a20260513".to_owned(),
+                "rocm[libraries,devel,device-gfx942]==7.13.0a20260513".to_owned(),
                 "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
                 "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
@@ -4698,7 +5316,7 @@ mod tests {
     #[test]
     fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
-        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+        let runtime_key = "release-wheel-multi-arch-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
         assert!(install_root.starts_with(&paths.data_dir));
         // Without --prefix the generated runtime folder is itself under the data dir, so
@@ -4959,16 +5577,46 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn runtime_key_includes_version_for_side_by_side_installs() {
-        assert_eq!(
-            runtime_key(
-                TheRockChannel::Release,
-                "wheel",
-                "gfx120X-all",
-                Some("7.13.0a20260416")
-            ),
-            "release-wheel-gfx120x-all-7-13-0a20260416"
+    fn aggregate_wheel_runtime_key_includes_package_composition() {
+        let base = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx942]==7.14.0".to_owned()],
+        };
+        let changed = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx950]==7.14.0".to_owned()],
+        };
+
+        let base_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base);
+        let changed_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &changed);
+
+        assert!(base_key.starts_with("release-wheel-multi-arch-7-14-0-"));
+        assert_ne!(base_key, changed_key);
+    }
+
+    #[test]
+    fn aggregate_wheel_resolution_hint_does_not_recommend_family_override() {
+        let hint = canonical_wheel_resolution_hint(TheRockChannel::Release);
+        assert!(!hint.contains("--family"));
+        assert!(hint.contains("--channel nightly"));
+        if !runtime_is_windows() {
+            assert!(hint.contains("--format tarball"));
+        }
+    }
+
+    #[test]
+    fn stable_provenance_uses_neutral_build_date_wording() {
+        let source = canonical_source(TheRockChannel::Release);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Release,
+            source.wheel_index,
+            source.layout_generation,
+            "7.14.0",
         );
+        assert!(output.contains("build_date: not encoded in stable version"));
+        assert!(!output.contains("not published"));
     }
 
     #[test]
@@ -5638,6 +6286,7 @@ echo Python 3.12.10
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,

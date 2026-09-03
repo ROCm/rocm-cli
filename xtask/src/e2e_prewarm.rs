@@ -21,16 +21,16 @@
 //! shared tree and what a fresh install produces was therefore untested, and
 //! widened silently.
 //!
-//! This keeps the cache and invalidates it only when the channel index actually
-//! publishes something newer, reusing the primitives the CLI already ships
-//! rather than reimplementing version resolution in workflow shell:
+//! This keeps the cache and repairs it when either the channel index publishes
+//! something newer or the required package composition changes, reusing the
+//! primitives the CLI already ships rather than reimplementing resolution in
+//! workflow shell:
 //!
 //! * `rocm update` reports, per installed runtime, `status=up_to_date |
-//!   update_available | ahead_of_index` by comparing against the channel index.
-//! * `rocm update --apply --runtime <key> --activate` installs the newer runtime
-//!   SIDE BY SIDE and makes it the default. Side-by-side matters: `install sdk`
-//!   bakes ABSOLUTE paths into the runtime manifest, so a runtime must be created
-//!   in its final location and never moved afterwards.
+//!   update_available | repair_available | ahead_of_index` by comparing both the
+//!   channel version and the recorded wheel composition.
+//! * `rocm update --apply --runtime <key> --activate` installs a newer runtime
+//!   side by side, or repairs a same-version runtime in place.
 //! * `rocm storage remove-old-installs --keep N` bounds the resulting multi-version
 //!   cache with a per-channel/format/family retention policy.
 //!
@@ -56,6 +56,9 @@ pub enum Decision {
     /// The channel index has a newer version than the installed one; install it
     /// alongside and activate it.
     Update { runtime_key: String },
+    /// The version is current, but its recorded package composition is stale or
+    /// absent. Install a composition-keyed replacement alongside it.
+    Repair { runtime_key: String },
     /// The tree is current, or its freshness could not be established. Serve
     /// against what is already there.
     Reuse { reason: String },
@@ -109,9 +112,34 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
         return Decision::Install;
     }
 
-    if let Some(stale) = runtimes
+    let channel_runtimes = runtimes
         .iter()
         .filter(|line| line.channel.as_deref() == Some(channel))
+        .collect::<Vec<_>>();
+
+    // A current composition already in the shared tree satisfies the lane even
+    // when an older same-channel entry remains until the retention pass removes it.
+    if channel_runtimes
+        .iter()
+        .any(|line| line.status.as_deref() == Some("up_to_date"))
+    {
+        return Decision::Reuse {
+            reason: "runtime is up to date with the channel index".to_owned(),
+        };
+    }
+
+    // A pinned or hand-placed build newer than the index must not be rolled back.
+    if channel_runtimes
+        .iter()
+        .any(|line| line.status.as_deref() == Some("ahead_of_index"))
+    {
+        return Decision::Reuse {
+            reason: "installed runtime is ahead of the channel index".to_owned(),
+        };
+    }
+
+    if let Some(stale) = channel_runtimes
+        .iter()
         .find(|line| line.status.as_deref() == Some("update_available"))
     {
         return Decision::Update {
@@ -119,27 +147,18 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
         };
     }
 
-    // `ahead_of_index` means the installed runtime is NEWER than anything the
-    // index offers (a hand-placed or pinned build). Reuse it rather than
-    // "updating" backwards.
-    let reason = if runtimes
+    if let Some(stale) = channel_runtimes
         .iter()
-        .filter(|line| line.channel.as_deref() == Some(channel))
-        .any(|line| line.status.as_deref() == Some("up_to_date"))
+        .find(|line| line.status.as_deref() == Some("repair_available"))
     {
-        "runtime is up to date with the channel index"
-    } else if runtimes
-        .iter()
-        .filter(|line| line.channel.as_deref() == Some(channel))
-        .any(|line| line.status.as_deref() == Some("ahead_of_index"))
-    {
-        "installed runtime is ahead of the channel index"
-    } else {
-        // Only `status=error` (or a shape this does not recognise) remains.
-        "could not establish runtime freshness; leaving the shared tree untouched"
-    };
+        return Decision::Repair {
+            runtime_key: stale.runtime_key.clone(),
+        };
+    }
+
     Decision::Reuse {
-        reason: reason.to_owned(),
+        reason: "could not establish runtime freshness; leaving the shared tree untouched"
+            .to_owned(),
     }
 }
 
@@ -367,8 +386,8 @@ impl RuntimeLine {
     }
 }
 
-/// Bring the shared pre-warm tree at `prewarm_dir` to the newest runtime the
-/// `channel` index offers, keeping `keep` recent installs per channel/format/family.
+/// Bring the shared pre-warm tree at `prewarm_dir` to the runtime state required
+/// by `channel`, keeping `keep` recent installs per channel/format/family.
 pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     let rocm = resolve_rocm_binary()?;
     for sub in ["config", "data", "cache"] {
@@ -426,28 +445,27 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
                 .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
                 .status_ok("rocm update --apply")?;
         }
+        Decision::Repair { runtime_key } => {
+            println!(
+                "pre-warm: {runtime_key} has stale package composition; installing its replacement alongside it"
+            );
+            rocm_command(&rocm, prewarm_dir)
+                .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
+                .status_ok("rocm update --apply")?;
+        }
         Decision::Reuse { reason } => {
             println!("pre-warm: reusing the shared {channel} runtime ({reason})");
         }
     }
 
-    // Unconditional, and deliberately BEFORE the reuse early return below. The
-    // runtime and the serving engine are installed separately: `install sdk`
-    // lays down the ROCm runtime, `engines install` builds the engine venv
-    // against it. `decide` only ever reasons about the runtime, so a tree whose
-    // runtime is current but whose engine was never installed — or was left
-    // behind with an older runtime — resolves to `Reuse`, which used to return
-    // here having done nothing. The shared tree then served every GPU scenario a
-    // runtime with no engine, which is the one thing those lanes exist to
-    // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
-    // `engines install` on a ready engine installs nothing.
+    // Every runtime used by the serving scenarios needs its default engine,
+    // including a current runtime reached through the reuse path.
     ensure_default_engine(&rocm, prewarm_dir)?;
-
     if !runtime_changed(&decision) {
         return Ok(());
     }
 
-    // An install/update that exits 0 without leaving a registry behind is the
+    // An install/update/repair that exits 0 without leaving a registry behind is the
     // confusing case the lanes used to call out by hand: every scenario then falls
     // back to installing its own runtime and the job quietly blows its time cap.
     // Say so loudly, but do not fail — the suite can still run.
@@ -459,8 +477,8 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         );
     }
 
-    // Only reached after an install or update actually added a tree. Housekeeping:
-    // a failure here wastes disk but leaves a correct runtime in place, so it must
+    // Only reached after an install, update, or repair changed the tree. Housekeeping
+    // failure wastes disk but leaves a correct runtime in place, so it must
     // not fail the lane.
     let pruned = rocm_command(&rocm, prewarm_dir)
         .args([
@@ -476,7 +494,6 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 /// Whether `decision` put a new runtime in the tree, and so whether the registry
 /// check and the retention prune at the end of [`run`] have anything to do.
 ///
@@ -1093,6 +1110,13 @@ Local model engines
     }
 
     #[test]
+    fn parses_default_engine_from_inventory() {
+        let inventory =
+            "Local model engines\n* vllm       Linux ROCm engine\n  lemonade   embedded engine\n";
+        assert_eq!(default_engine_from_inventory(inventory), Some("vllm"));
+    }
+
+    #[test]
     fn no_managed_runtime_installs() {
         assert_eq!(decide(EMPTY, "release"), Decision::Install);
     }
@@ -1105,6 +1129,30 @@ Local model engines
                 runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn same_version_runtime_with_old_composition_is_repaired() {
+        assert_eq!(
+            decide(&report("repair_available", "release"), "release"),
+            Decision::Repair {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn current_composition_wins_over_obsolete_same_channel_cache() {
+        let text = format!(
+            "{}{}",
+            report("repair_available", "release"),
+            report("up_to_date", "release")
+        );
+
+        let Decision::Reuse { reason } = decide(&text, "release") else {
+            panic!("an installed current composition must prevent repeated repair");
+        };
+        assert!(reason.contains("up to date"), "{reason}");
     }
 
     #[test]

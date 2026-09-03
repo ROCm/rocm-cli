@@ -128,6 +128,8 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Name the runtime rather than leaving the CLI to infer it: the shared tree
     // grows a second runtime whenever the channel index publishes one, and the
@@ -137,7 +139,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.activate_shared_runtime();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
-        !stdout.contains("installed: none"),
+        !stdout.contains("active_runtime_key: <unset>"),
         "no managed runtime is active:\n{stdout}"
     );
 }
@@ -152,6 +154,8 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Same reason as `a managed runtime is active`: pin the runtime explicitly,
     // or the serve that follows refuses to pick one. Not for `assert_engine_ready`
@@ -159,6 +163,17 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     // the active key, which is exactly why it cannot stand in for this call.
     world.activate_shared_runtime();
     assert_engine_ready(world);
+}
+
+fn activate_shared_runtime_if_unset(world: &mut E2eWorld, runtimes: &str) {
+    if !runtimes.contains("active_runtime_key: <unset>") {
+        return;
+    }
+    let runtime_key = e2e_cucumber::capability::canonical_wheel_runtime_key(runtimes)
+        .unwrap_or_else(|| {
+            panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
+        });
+    crate::run_rocm_ok(world, &["runtimes", "activate", runtime_key]);
 }
 
 /// Record the torch-alignment opt-out for this scenario's next `rocm` command.
@@ -409,6 +424,40 @@ fn assert_engine_ready(world: &mut E2eWorld) {
         "no engine runtime is ready:\n{stdout}"
     );
 }
+#[when("the user dry-runs a nightly SDK install for a known family")]
+async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx120X-all",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the SDK preview reports canonical nightly provenance")]
+async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no SDK preview output");
+    for expected in [
+        "channel: nightly",
+        "canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch",
+        "selected_rocm_version:",
+        "build_date:",
+        "source_layout_generation: multi-arch-v2",
+        "device_target:",
+    ] {
+        assert!(
+            output.contains(expected),
+            "SDK preview omitted `{expected}`:\n{output}"
+        );
+    }
+}
 
 #[when("the user tries to adopt the existing install")]
 async fn user_tries_adopt(world: &mut E2eWorld) {
@@ -508,7 +557,13 @@ fn active_runtime_key(world: &E2eWorld) -> Option<String> {
 /// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
 /// exactly these, so a rename here must break this scenario rather than silently
 /// turn every pre-warm into a no-op reuse.
-const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_index", "error"];
+const UPDATE_STATUSES: [&str; 5] = [
+    "up_to_date",
+    "update_available",
+    "repair_available",
+    "ahead_of_index",
+    "error",
+];
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {

@@ -244,6 +244,17 @@ fn active_runtime_install_root(
     Some((version, root))
 }
 
+/// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
+///
+/// The list is newest-first, so the first matching key is the runtime installed
+/// by the pre-warm refresh when legacy family-keyed entries coexist with it.
+pub fn canonical_wheel_runtime_key(inventory: &str) -> Option<&str> {
+    inventory.lines().find_map(|line| {
+        line.split_whitespace()
+            .find(|field| field.contains("-wheel-multi-arch-"))
+    })
+}
+
 /// Parse the vLLM version from the `vllm-<ver>.dist-info` directory in the
 /// runtime venv's site-packages (works without importing vllm).
 ///
@@ -543,6 +554,25 @@ fn os_normalized(os_family: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_wheel_runtime_key_ignores_markers_and_legacy_entries() {
+        let inventory = "registered ROCm runtimes\n  active_runtime_key: <unset>\n  installed:\n    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu\n  * release-wheel-multi-arch-7-14-0-0123456789abcdef runtime_id=therock-release:gfx94X-dcgpu\n";
+        assert_eq!(
+            canonical_wheel_runtime_key(inventory),
+            Some("release-wheel-multi-arch-7-14-0-0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn canonical_wheel_runtime_key_returns_none_without_canonical_entry() {
+        assert_eq!(
+            canonical_wheel_runtime_key(
+                "  release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu"
+            ),
+            None
+        );
+    }
 
     // Drift guard (decision #1): these pin the re-implemented rule to the
     // product's known behaviour. When task #16 lands a product probe field,

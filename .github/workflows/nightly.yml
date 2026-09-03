@@ -421,7 +421,7 @@ jobs:
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
           # post-install mv invalidates the absolute paths install sdk bakes into
           # the runtime manifest and every serve fails instantly (run 29320025393).
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build both binaries once; reuse them for pre-warm + suite.
@@ -523,7 +523,7 @@ jobs:
           # Separate PVC mounted at exactly this path by the runner's cluster
           # overlay; if you change this path, change the overlay that mounts it too.
           export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -619,7 +619,7 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -715,7 +715,7 @@ jobs:
           # Install the shared runtime in place because its manifest contains
           # absolute paths. The persistent runner workspace keeps those paths valid
           # across scenarios and subsequent runs.
-          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -869,7 +869,7 @@ jobs:
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the

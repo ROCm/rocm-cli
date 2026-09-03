@@ -3799,6 +3799,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             if response.managed_env == Some(false) {
                 println!("  note: external runtime");
             } else {
+                settle_engine_install(&paths, &engine, &runtime_id, &response)?;
                 let engine_config = config.engine_config_mut(&engine);
                 engine_config.last_installed_runtime_id = Some(runtime_id.clone());
                 engine_config.last_installed_env_id = Some(response.env_id.clone());
@@ -7595,12 +7596,11 @@ fn runtime_index_url_for_key(paths: &AppPaths, runtime_key: &str) -> Option<Stri
     manifest.index_url.clone()
 }
 
-/// Which torch a runtime should hold once an engine has been installed into it.
+/// Which torch a managed vLLM runtime should hold after engine installation.
 ///
 /// Two installers write torch into the same environment. The SDK install writes
-/// TheRock's build; the engine then writes the build from its own index, pinned
-/// to an exact version. Letting either side win unconditionally is wrong, and
-/// both failures have been observed in the field:
+/// TheRock's build; vLLM then writes the build from its own index, pinned to an
+/// exact version. Neither source is universally compatible with every GPU:
 ///
 /// * If the engine's build always wins, the runtime can end up with a torch that
 ///   loads against the installed SDK and then enumerates no devices, so serving
@@ -8693,10 +8693,17 @@ fn classify_dependency_details(
     };
     // A line whose subject cannot be parsed is not evidence of a divergence, so it
     // stays a violation: the conservative side keeps saying something is wrong.
+    // Replacing torch also resolves torch's pinned triton dependency from the same
+    // SDK index. That companion version can therefore diverge from the engine pin
+    // for the same deliberate reason as torch itself. This is one-way: realigning
+    // triton alone does not make a torch divergence expected.
     let (expected, violations): (Vec<String>, Vec<String>) =
         details.into_iter().partition(|detail| {
-            rocm_core::violation_subject(detail)
-                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+            rocm_core::violation_subject(detail).is_some_and(|subject| {
+                subject.package.eq_ignore_ascii_case(package)
+                    || (package.eq_ignore_ascii_case("torch")
+                        && subject.package.eq_ignore_ascii_case("triton"))
+            })
         });
     if violations.is_empty() {
         EngineDependencyCheck::ExpectedDivergence(expected)
@@ -9056,6 +9063,7 @@ fn adopt_runtime_from_probe(
         // Adoption does not install torch, so the build is derived from the SDK
         // version instead.
         sdk_torch: None,
+        wheel_composition: None,
         read_only: true,
         imported_from: Some(install_root),
         installed_at_unix_ms: rocm_core::unix_time_millis(),
@@ -15657,6 +15665,10 @@ fn append_update_surfaces(output: &mut String) {
     );
 }
 
+const fn source_family_for_update(source: &therock::InstalledRuntimeManifest) -> &str {
+    source.family.as_str()
+}
+
 fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -15666,7 +15678,8 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source)?;
+    let family_override = Some(source_family_for_update(source));
+    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15699,7 +15712,7 @@ fn apply_runtime_update(
             &source.format,
             None,
             None,
-            None,
+            family_override,
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15715,12 +15728,12 @@ fn apply_runtime_update(
         &source.format,
         None,
         None,
-        None,
+        family_override,
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
-    let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
-        .context("updated runtime install completed but the new runtime manifest was not found")?;
+    let installed = select_installed_update_runtime(&manifests_after, &plan.target_runtime_key)
+        .context("runtime install completed but the target runtime manifest was not found")?;
     let _ = writeln!(output, "  installed_runtime_key: {}", installed.runtime_key);
     let _ = writeln!(
         output,
@@ -15785,15 +15798,11 @@ fn select_runtime_update_source<'a>(
 
 fn select_installed_update_runtime<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
-    source: &therock::InstalledRuntimeManifest,
-    latest_version: &str,
+    target_runtime_key: &str,
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests.iter().find(|manifest| {
-        manifest.channel == source.channel
-            && manifest.format == source.format
-            && manifest.family == source.family
-            && manifest.version == latest_version
-    })
+    manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key == target_runtime_key)
 }
 
 pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
@@ -27239,6 +27248,24 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn torch_realignment_treats_its_triton_repin_as_expected_divergence() {
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.14.0` is installed".to_owned(),
+                "The package `vllm` requires `triton==3.6.0`, but `3.7.1+git0263a6a6.rocm7.14.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        let EngineDependencyCheck::ExpectedDivergence(details) = &outcome else {
+            panic!("the coupled torch/triton change is expected: {outcome:?}");
+        };
+        assert_eq!(details.len(), 2);
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(!rendered.contains("action: rocm engines install vllm --reinstall"));
+    }
+
+    #[test]
     fn a_divergence_on_any_other_package_is_still_a_violation() {
         // The unrelated violation is real and must keep saying so, but it does not
         // make the deliberate torch divergence one too — and the reinstall that
@@ -29333,30 +29360,41 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn installed_update_runtime_matches_latest_version_and_family() {
-        let mut source = test_runtime_manifest_for_update(
-            "old-gfx120",
+    fn runtime_updates_preserve_the_source_family() {
+        let source = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.13.0a20260416",
+            "7.14.0",
         );
-        source.channel = "release".to_owned();
+
+        assert_eq!(source_family_for_update(&source), "gfx120X-all");
+    }
+
+    #[test]
+    fn installed_update_runtime_matches_target_runtime_key() {
+        let old = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx120X-all",
+            "gfx120X-all",
+            "7.14.0",
+        );
         let wrong_family = test_runtime_manifest_for_update(
-            "new-gfx110",
+            "release-wheel-multi-arch-7-14-0-wrong",
             "therock-release:gfx110X-all",
             "gfx110X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
         let target = test_runtime_manifest_for_update(
-            "new-gfx120",
+            "release-wheel-multi-arch-7-14-0-composition",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let manifests = vec![wrong_family, target.clone()];
+        let manifests = vec![old, wrong_family, target.clone()];
 
-        let selected = select_installed_update_runtime(&manifests, &source, "7.14.0a20260531")
-            .expect("matching updated runtime should be selected");
+        let selected = select_installed_update_runtime(&manifests, &target.runtime_key)
+            .expect("the side-by-side repair runtime should be selected by its exact key");
 
         assert_eq!(selected.runtime_key, target.runtime_key);
     }
@@ -29432,6 +29470,7 @@ ID_LIKE="suse opensuse"
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -29471,6 +29510,7 @@ ID_LIKE="suse opensuse"
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 1,
