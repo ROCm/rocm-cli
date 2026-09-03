@@ -548,6 +548,95 @@ jobs:
           name: e2e-gpu-rad3-report
           path: tests/e2e-cucumber/results/
 
+  e2e-gpu-nightly-mi350p:
+    name: E2E tests (MI350P, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, mi350p]
+    continue-on-error: true
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reclaim GPU from stray E2E processes
+        run: |
+          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
+          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
+          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
+          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
+          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
+          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+          echo "reclaimed"
+
+      # Bounded wait for a free GPU. Floor matches the per-PR MI350P lane and the
+      # other Instinct lane — high enough to catch a leftover serve, low enough
+      # that a clean pod passes on the first poll.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run full E2E on MI350P (incl. nightly-only)
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that survives the runner being scaled
+          # away, so the cargo target dir and shared caches stay warm.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Separate volume mounted at exactly this path by the runner's
+          # deployment; if you change this path, change that deployment too.
+          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has published a newer runtime — the tree is a cache,
+          # not a one-shot. See `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-mi350p-report
+          path: tests/e2e-cucumber/results/
+
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
   # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
@@ -909,6 +998,7 @@ jobs:
     needs:
       - e2e-gpu-nightly
       - e2e-gpu-nightly-rad3
+      - e2e-gpu-nightly-mi350p
       - e2e-gpu-nightly-strix
       - e2e-gpu-nightly-strix-windows
       - e2e-wsl-nightly
