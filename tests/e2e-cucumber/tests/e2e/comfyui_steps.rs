@@ -8,10 +8,12 @@
 //! ready and none is activated, rather than guessing which one to install into.
 //! These steps plant two ready wheel runtimes on disk (readiness is filesystem
 //! and manifest state, so no GPU is needed) and assert the refusal is actionable
-//! on both the CLI (`--runtime-id`, `rocm runtimes activate`) and the TUI
-//! (`/runtimes`) surfaces it reaches. Black-box: the planted registry manifests
-//! are plain JSON matching the CLI's on-disk schema, not typed imports from the
-//! product crates.
+//! in `rocm comfyui install`'s command output (`--runtime-id`,
+//! `rocm runtimes activate`, and the `/runtimes` pointer). The text is CLI-only
+//! today: approval-gated slash commands in the TUI collapse the command envelope
+//! via `summarize_json_value`, so `/comfyui install` does not surface it in the
+//! chat. Black-box: the planted registry manifests are plain JSON matching the
+//! CLI's on-disk schema, not typed imports from the product crates.
 
 use std::path::{Path, PathBuf};
 

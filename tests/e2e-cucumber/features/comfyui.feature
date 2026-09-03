@@ -7,10 +7,12 @@ Feature: ComfyUI runtime selection is actionable
   # `rocm comfyui install` picks the ROCm runtime to install into. When more than
   # one managed runtime is ready and none is activated as the default, the CLI
   # refuses to guess — the same all-or-nothing policy `serve` uses. That refusal
-  # has to be actionable on both surfaces it reaches: the CLI, where
-  # `--runtime-id` and `rocm runtimes activate` apply, and the TUI, where
-  # `/comfyui install` renders this text into the chat and the fix is the
-  # `/runtimes` picker.
+  # is surfaced in `rocm comfyui install`'s command output, where `--runtime-id`
+  # and `rocm runtimes activate` apply and the `/runtimes` pointer is for the same
+  # text read from a terminal. It is CLI-only today: approval-gated slash commands
+  # in the TUI render only a collapsed envelope (`content: [1 items]`) via
+  # `summarize_json_value`, so `/comfyui install` does not surface this text in the
+  # chat. This scenario therefore asserts the CLI surface only.
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the
   # scenario plants two ready wheel runtimes and asserts the refusal names every
