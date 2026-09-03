@@ -602,7 +602,10 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        /// Approve overwriting an existing ROCm SDK (and required system-package
+        /// installs such as OpenMPI for vLLM) without prompting; required to
+        /// overwrite an existing SDK outside an interactive terminal. A fresh
+        /// install (no existing SDK) never prompts.
         #[arg(long)]
         yes: bool,
     },
@@ -2436,12 +2439,14 @@ fn install(target: InstallTarget) -> Result<()> {
                 version_selector,
                 family.as_deref(),
                 dry_run,
+                yes,
             ) {
-                Ok(output) => {
-                    let finalized = if dry_run {
-                        None
-                    } else {
+                Ok(result) => {
+                    let therock::SdkInstallResult { output, mutated } = result;
+                    let finalized = if mutated {
                         finalize_successful_sdk_install(&paths)?
+                    } else {
+                        None
                     };
                     print!("{output}");
                     if let Some(finalized) = &finalized {
@@ -2462,9 +2467,20 @@ fn install(target: InstallTarget) -> Result<()> {
                         } else {
                             "install_sdk"
                         },
-                        format!(
-                            "sdk install completed channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
-                        ),
+                        {
+                            // A real install that did not mutate the system was
+                            // declined at the approval prompt; recording it as
+                            // "completed" would lie in the audit trail. Dry-run
+                            // never mutates but legitimately completes a preview.
+                            let status = if dry_run || mutated {
+                                "completed"
+                            } else {
+                                "cancelled"
+                            };
+                            format!(
+                                "sdk install {status} channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
+                            )
+                        },
                         |paths, finalized| {
                             maybe_auto_install_sdk_preferred_engine(paths, finalized, yes)
                         },
@@ -11519,6 +11535,12 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("install") if second.as_deref() == Some("sdk") => {
+            // The chat/MCP surfaces spawn `rocm` with null stdin, so
+            // `interactive_terminal()` is false and an overwrite prompt would
+            // refuse with "re-run with `--yes`" — a flag the user cannot supply
+            // through chat. Add it here, matching the `install driver` and
+            // `services stop/restart` arms below.
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ROCm".to_owned(),
@@ -12967,7 +12989,7 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    Ok(therock::install_sdk(paths, channel, format, prefix, selector, None, true, true)?.output)
 }
 
 fn run_command_with_timeout(
@@ -13335,6 +13357,10 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
                 json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
+                // The MCP surface runs `rocm` with null stdin, so an overwrite
+                // prompt would refuse; `--yes` keeps the tool non-interactive,
+                // matching the chat `install sdk` arm and `stop_server`.
+                "--yes".to_owned(),
             ];
             if let Some(prefix) = json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
@@ -15701,9 +15727,10 @@ fn apply_runtime_update(
             None,
             None,
             true,
+            true,
         )?;
         let _ = writeln!(output, "  install_plan:");
-        for line in install_plan.lines() {
+        for line in install_plan.output.lines() {
             let _ = writeln!(output, "    {line}");
         }
         return Ok(output);
@@ -15717,6 +15744,7 @@ fn apply_runtime_update(
         None,
         None,
         false,
+        true,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
@@ -15755,7 +15783,7 @@ fn apply_runtime_update(
         );
     }
     let _ = writeln!(output, "  install_output:");
-    for line in install_output.lines() {
+    for line in install_output.output.lines() {
         let _ = writeln!(output, "    {line}");
     }
     Ok(output)
@@ -21363,7 +21391,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --yes --prefix D:\\ROCm\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -21386,6 +21414,7 @@ mod tests {
                 "release".to_owned(),
                 "--format".to_owned(),
                 "wheel".to_owned(),
+                "--yes".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\ROCm\\therock_venvs".to_owned(),
             ]
@@ -21408,7 +21437,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --yes"
             )
         );
         let approval =
@@ -21428,6 +21457,7 @@ mod tests {
                 "D:\\ROCm\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
                 "06052026".to_owned(),
+                "--yes".to_owned(),
             ]
         );
     }
@@ -21805,7 +21835,7 @@ model recipes
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --yes --prefix D:\\ROCm\\therock_venvs",
                 ),
                 false,
             ),
