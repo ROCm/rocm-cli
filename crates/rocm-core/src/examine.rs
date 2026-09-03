@@ -29,6 +29,8 @@ const ENV_VALUE_MAX_CHARS: usize = 16_000;
 
 const TRACKED_ENV_VARS: &[&str] = &[
     "HSA_OVERRIDE_GFX_VERSION",
+    // Legacy ROCm releases need this to find the GPU through DXG under WSL.
+    "HSA_ENABLE_DXG_DETECTION",
     "HIP_VISIBLE_DEVICES",
     "ROCR_VISIBLE_DEVICES",
     "CUDA_VISIBLE_DEVICES",
@@ -93,9 +95,70 @@ pub struct Device {
     pub user_can_write: Option<bool>,
 }
 
-/// Structured machine state consumed by the diagnosis catalog. Field order and
-/// names mirror `examine.py`'s `Examination` dataclass so the JSON contract is
-/// identical.
+/// The oldest distro release the WSL path supports.
+///
+/// Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor
+/// every published Lemonade embeddable is linked against, so the engine cannot
+/// start there. See `docs/wsl.md`.
+pub const WSL_MIN_UBUNTU: (u32, u32) = (24, 4);
+
+/// WSL2-specific machine state. `None` on every other platform.
+///
+/// WSL reaches the GPU through `/dev/dxg` and the Windows host driver rather than
+/// the in-tree `amdgpu` module, so none of the bare-metal driver fields describe
+/// it. These are the facts the WSL half of the catalog reasons over.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WslFacts {
+    /// `1` or `2`. A kernel release that names neither is read as `2`: WSL 2 has
+    /// been the default for years, and the cost of the two errors is not
+    /// symmetric — calling a WSL 2 host "WSL 1" tells the user to convert a
+    /// distro that is already converted. `0` only in the default value, which
+    /// stands for "the probe did not run".
+    pub version: u8,
+    pub dxg_device: bool,
+    pub dxcore: bool,
+    pub wsl_lib_dir: bool,
+    pub librocdxg: bool,
+    pub rocdxg_dids: bool,
+    /// Whether the linker cache lists ROCDXG.
+    ///
+    /// `None` when `ldconfig` could not be run at all — on Debian and its
+    /// derivatives it lives in `/sbin`, off a non-root user's `PATH`. An
+    /// unreadable cache is not an unregistered library, and reporting it as one
+    /// told users with a working install to re-run `ldconfig`.
+    pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `rocminfo` is on PATH.
+    pub rocminfo: bool,
+    /// Whether ROCm can actually enumerate a GPU here.
+    ///
+    /// `None` when `rocminfo` is absent, so the question could not be asked. This
+    /// is the only WSL-collected evidence that the plumbing is complete yet no
+    /// device is reachable, which is what distinguishes an out-of-date Windows
+    /// host driver from a distro-side fault. The bare-metal `has_amd_gpu` cannot
+    /// stand in: the probes that populate it are skipped here, so it is always
+    /// false on WSL and reads as "no GPU" on a perfectly healthy machine.
+    pub rocm_sees_gpu: Option<bool>,
+    /// `None` when the distro release could not be parsed, which fails closed:
+    /// an unreadable release is not evidence of a supported one.
+    pub distro_supported: Option<bool>,
+    /// `None` when WSL interop could not reach the Windows host — distinct from
+    /// a host that answered and reported no AMD adapter, which is `Some("")`.
+    pub host_driver_version: Option<String>,
+    pub host_reachable: bool,
+    /// Whether these facts were gathered from inside the distribution.
+    ///
+    /// `false` when inspected from the Windows host over `wsl.exe`, which sees
+    /// the GPU stack but no environment — so the checks that read one cannot
+    /// run, and a caller must say so rather than let "nothing matched" read as
+    /// a clean bill of health.
+    pub locally_probed: bool,
+}
+
+/// Structured machine state consumed by the diagnosis catalog.
+///
+/// Field order and names mirror `examine.py`'s `Examination` dataclass so the
+/// JSON contract is identical, except for the `wsl` section, which has no
+/// `examine.py` analogue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Examination {
     // platform
@@ -106,6 +169,8 @@ pub struct Examination {
     pub kernel_release: String,
     pub kernel_cmdline: String,
     pub is_wsl: bool,
+    /// Populated only when `is_wsl`; see [`WslFacts`].
+    pub wsl: Option<WslFacts>,
 
     // hardware
     pub cpu_vendor: String,
@@ -183,6 +248,7 @@ impl Default for Examination {
             kernel_release: String::new(),
             kernel_cmdline: String::new(),
             is_wsl: false,
+            wsl: None,
             cpu_vendor: "unknown".to_owned(),
             cpu_model: String::new(),
             gpus: Vec::new(),
@@ -230,9 +296,14 @@ impl Default for Examination {
     }
 }
 
-/// Route-out guidance shown when WSL2 is detected (out of scope for this
-/// catalog, which targets bare-metal Linux). Mirrors `examine.py`.
-pub const WSL_ROUTE_OUT_NOTE: &str = "Detected WSL2. rocm examine does not cover the ROCm-on-WSL flow (it requires Adrenalin Pro + the WSL kernel update on the Windows host). Either run `rocm examine` on the native Linux host, or follow AMD's WSL guide directly: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
+/// Guidance shown when WSL2 is detected.
+///
+/// Named for what it does. It used to be a route-out — `rocm examine` did not
+/// cover the ROCm-on-WSL flow and sent the user elsewhere — and it kept that
+/// name for a while after it stopped routing anyone anywhere. It now explains
+/// which checks are skipped on this platform and points at the one that covers
+/// it.
+pub const WSL_PLATFORM_NOTE: &str = "Detected WSL2. The GPU is reached through /dev/dxg and the Windows host driver, so the bare-metal driver checks do not apply and are skipped. Run `rocm diagnose` for the WSL-specific checks. Setup guide: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
 /// Which framework probe to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,20 +323,23 @@ impl Examination {
         let mut e = Self::default();
         probe_os(&mut e);
         if e.is_wsl {
-            // WSL2 is out of scope for the *driver* probes: it uses /dev/dxg and
-            // the Windows host driver, not the in-tree amdgpu module or
-            // /dev/kfd, so asking about modprobe, the render group or /dev/kfd
-            // would only mislead. The "wsl" status carries that verdict.
+            // WSL2 keeps the *driver* probes skipped: it reaches the GPU through
+            // /dev/dxg and the Windows host driver, not the in-tree amdgpu module
+            // or /dev/kfd, so asking about modprobe, the render group or
+            // /dev/kfd would only mislead.
             //
-            // The frameworks are a different matter. PyTorch on WSL2 is a
-            // supported, documented configuration, and stopping before the
-            // framework probe meant `--json` could never tell a WSL user which
-            // ROCm build their torch was compiled against -- a question that has
-            // nothing to do with the kernel module. So run that one, and only
-            // that one, before routing out.
+            // Everything else applies. This used to return here after the
+            // framework probe alone, which left `env`, the container fields and
+            // the ROCm install at their defaults -- so the WSL half of the
+            // catalog had nothing to read and questions with no kernel-module
+            // component, like "is HSA_OVERRIDE_GFX_VERSION set", went unanswered
+            // on the one platform most likely to need them.
+            probe_wsl(&mut e);
+            probe_rocm_install(&mut e);
+            probe_env(&mut e);
+            probe_container(&mut e);
             probe_framework(&mut e, framework);
-            e.notes.push(WSL_ROUTE_OUT_NOTE.to_owned());
-            e.status = "wsl".to_owned();
+            e.status = e.compute_status();
             return e;
         }
         if e.os_family == "linux" {
@@ -328,6 +402,16 @@ impl Examination {
 /// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is `127`
 /// when the program can't be spawned and `124` on timeout.
 pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, String, String) {
+    let (rc, stdout, stderr) = run_raw(program, args, timeout);
+    (
+        rc,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+/// [`run`] without the UTF-8 assumption, for output that is not UTF-8.
+fn run_raw(program: &str, args: &[&str], timeout: Duration) -> (i32, Vec<u8>, Vec<u8>) {
     let Ok(mut child) = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -335,19 +419,23 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
         .stderr(Stdio::piped())
         .spawn()
     else {
-        return (127, String::new(), String::new());
+        return (127, Vec::new(), Vec::new());
     };
+    // Bytes, then a lossy conversion at the end. `read_to_string` FAILS on
+    // invalid UTF-8 and the error was discarded, so a single stray byte silently
+    // emptied the whole capture — which reads downstream as "the command printed
+    // nothing", not as "the output could not be decoded".
     let stdout_handle = child.stdout.take().map(|mut stdout| {
         thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
             buf
         })
     });
     let stderr_handle = child.stderr.take().map(|mut stderr| {
         thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
             buf
         })
     });
@@ -366,10 +454,10 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
             Err(_) => break None,
         }
     };
-    let stdout = stdout_handle
+    let stdout: Vec<u8> = stdout_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let stderr = stderr_handle
+    let stderr: Vec<u8> = stderr_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
     let rc = match status {
@@ -377,6 +465,28 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
         None => 124,
     };
     (rc, stdout, stderr)
+}
+
+/// Run a command whose output is UTF-16LE, as `wsl.exe`'s is.
+///
+/// Decoding is by declaration, not detection. Sniffing the encoding cannot work
+/// here: UTF-16LE text in a Latin or Cyrillic script is made entirely of bytes
+/// below 0x80, so it is *valid UTF-8* and decodes without error straight into
+/// mojibake — no NUL-density or validity test can tell the two apart. The one
+/// reliable fact is which program produced the bytes.
+fn run_utf16le(program: &str, args: &[&str], timeout: Duration) -> (i32, String) {
+    let (rc, stdout, _) = run_raw(program, args, timeout);
+    (rc, decode_utf16le(&stdout))
+}
+
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    // `chunks_exact` drops a trailing odd byte rather than panicking on it.
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn read_text(path: &str) -> String {
@@ -456,6 +566,280 @@ fn probe_os(e: &mut Examination) {
     } else {
         e.os_family = "other".to_owned();
     }
+}
+
+/// Collect the WSL-specific facts the WSL half of the catalog reasons over.
+///
+/// Reuses [`crate::detect_wsl_summary`] for the plumbing it already probes rather
+/// than restating those paths, and adds the facts no existing caller needed: the
+/// WSL major version, whether the distro release clears the supported floor, and
+/// the Windows host driver version.
+fn probe_wsl(e: &mut Examination) {
+    let summary = crate::detect_wsl_summary();
+    let (host_reachable, host_driver_version) = host_driver_fields(crate::detect_wsl_host_driver());
+    let rocminfo = which("rocminfo");
+    e.wsl = Some(WslFacts {
+        version: if crate::is_wsl1_kernel(&e.kernel_release) {
+            1
+        } else {
+            2
+        },
+        dxg_device: summary.as_ref().is_some_and(|s| s.dxg_device),
+        dxcore: summary.as_ref().is_some_and(|s| s.dxcore),
+        wsl_lib_dir: Path::new("/usr/lib/wsl/lib").is_dir(),
+        librocdxg: summary.as_ref().is_some_and(|s| s.librocdxg),
+        rocdxg_dids: summary.as_ref().is_some_and(|s| s.rocdxg_dids),
+        // `None` when ldconfig itself could not be run, which the summary's
+        // bool cannot express -- recover it from the same source the summary used.
+        ldconfig_librocdxg: crate::ldconfig_lists_librocdxg(),
+        rocminfo,
+        rocm_sees_gpu: rocminfo.then(probe_rocminfo_sees_gpu),
+        distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
+        host_driver_version,
+        host_reachable,
+        locally_probed: true,
+    });
+    sync_shared_fields_from_wsl(e);
+    e.notes.push(WSL_PLATFORM_NOTE.to_owned());
+}
+
+/// Flatten a host-driver probe into the two [`WslFacts`] fields that carry it.
+///
+/// One place, so the in-guest and host-side probes cannot drift on the point
+/// that matters: `None` means the question went unanswered, and `Some("")` means
+/// it was answered with "no AMD adapter". Only the second is evidence.
+fn host_driver_fields(probe: crate::WslHostDriverProbe) -> (bool, Option<String>) {
+    match probe {
+        crate::WslHostDriverProbe::Unreachable => (false, None),
+        crate::WslHostDriverProbe::NoAmdDisplay => (true, Some(String::new())),
+        crate::WslHostDriverProbe::Version(version) => (true, Some(version)),
+    }
+}
+
+/// Collect the WSL facts from *outside* the distro, over `wsl.exe`.
+///
+/// Emits `key=value` lines rather than JSON so the guest side needs nothing but
+/// a POSIX shell. The Python preflight this replaces injected a Python program
+/// and so required `python3` in the distro — on a machine being checked precisely
+/// because it is not set up yet.
+///
+/// `librocdxg` is globbed across `/opt/rocm*` for the same reason the in-guest
+/// probe resolves it across installs: a versioned root must not read as missing.
+const WSL_REMOTE_PROBE: &str = r#"
+echo "kernel=$(uname -r 2>/dev/null)"
+if [ -e /dev/dxg ]; then echo dxg=1; else echo dxg=0; fi
+if [ -e /usr/lib/wsl/lib/libdxcore.so ]; then echo dxcore=1; else echo dxcore=0; fi
+if [ -d /usr/lib/wsl/lib ]; then echo wsllib=1; else echo wsllib=0; fi
+if ls /opt/rocm*/lib/librocdxg.so >/dev/null 2>&1 \
+  || ls /usr/local/rocm*/lib/librocdxg.so >/dev/null 2>&1; then echo librocdxg=1; else echo librocdxg=0; fi
+if ls /opt/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1 \
+  || ls /usr/local/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1; then echo dids=1; else echo dids=0; fi
+for ldc in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+  if cache=$(command -v "$ldc" >/dev/null 2>&1 && "$ldc" -p 2>/dev/null); then
+    case "$cache" in *librocdxg.so*) echo ldconfig=1 ;; *) echo ldconfig=0 ;; esac
+    break
+  fi
+done
+if command -v rocminfo >/dev/null 2>&1; then
+  echo rocminfo=1
+  if rocminfo 2>/dev/null | grep -qi gfx; then echo rocmgfx=1; else echo rocmgfx=0; fi
+else
+  echo rocminfo=0
+fi
+. /etc/os-release 2>/dev/null
+echo "id=${ID}"
+echo "version=${VERSION_ID}"
+"#;
+
+/// Parse `wsl.exe -l -q` into distribution names.
+///
+/// `-q` prints one bare name per line, so the whole line is the name. It is NOT
+/// split on whitespace: `wsl --import "My Distro"` is legal, and truncating that
+/// to `My` would both fail to match what the user asked for and hand a wrong
+/// name to `wsl.exe -d`.
+///
+/// The header and `*` handling below is for tolerance only — `-q` emits neither,
+/// but a caller passing `-l -v` should not silently get its header row back as a
+/// distribution.
+#[must_use]
+pub fn parse_wsl_distro_list(text: &str) -> Vec<String> {
+    text.replace('\u{0}', "")
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.trim();
+            if line.is_empty() || line.to_uppercase().starts_with("NAME") {
+                return None;
+            }
+            let line = line.strip_prefix('*').map_or(line, str::trim);
+            (!line.is_empty()).then(|| line.to_owned())
+        })
+        .collect()
+}
+
+fn parse_remote_flag(fields: &BTreeMap<String, String>, key: &str) -> bool {
+    fields.get(key).is_some_and(|value| value == "1")
+}
+
+/// A remote flag that can also report that the question went unanswered.
+fn parse_remote_tristate(fields: &BTreeMap<String, String>, key: &str) -> Option<bool> {
+    match fields.get(key).map(String::as_str) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Inspect a WSL distribution from the Windows host.
+///
+/// Returns an [`Examination`] the ordinary catalog can be run against, so the
+/// host-side check and the in-distro one share a single set of rules. Nothing
+/// needs to be installed in the target distro.
+///
+/// # Errors
+///
+/// When `wsl.exe` is unavailable, no distribution matches, or the probe cannot
+/// be run inside the selected distribution.
+pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, String> {
+    if !which("wsl.exe") {
+        return Err(
+            "wsl.exe was not found; inspecting a distribution this way only works from the Windows host"
+                .to_owned(),
+        );
+    }
+    // `-q` prints names only. `-l -v` adds a header row that is localised, and a
+    // header the parser fails to recognise is not skipped -- it is taken for a
+    // distribution name.
+    let (rc, listed) = run_utf16le("wsl.exe", &["-l", "-q"], MEDIUM);
+    if rc != 0 {
+        return Err("could not list WSL distributions".to_owned());
+    }
+    let distros = parse_wsl_distro_list(&listed);
+    let selected = match distro {
+        Some(name) => {
+            if !distros.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+                return Err(format!(
+                    "no WSL distribution named '{name}'; found: {}",
+                    distros.join(", ")
+                ));
+            }
+            name.to_owned()
+        }
+        None => match distros.as_slice() {
+            [] => return Err("no WSL distributions were found".to_owned()),
+            [only] => only.clone(),
+            many => {
+                return Err(format!(
+                    "several WSL distributions are installed; name one with --distro: {}",
+                    many.join(", ")
+                ));
+            }
+        },
+    };
+
+    let (rc, out, _) = run(
+        "wsl.exe",
+        &["-d", &selected, "--exec", "/bin/sh", "-c", WSL_REMOTE_PROBE],
+        Duration::from_secs(30),
+    );
+    if rc != 0 {
+        return Err(format!(
+            "could not inspect '{selected}'; the distribution may be stopped or unreachable"
+        ));
+    }
+    let fields: BTreeMap<String, String> = out
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    let (host_reachable, host_driver_version) =
+        host_driver_fields(crate::detect_local_windows_host_driver());
+
+    let mut e = Examination {
+        os_family: "linux".to_owned(),
+        is_wsl: true,
+        kernel_release: fields.get("kernel").cloned().unwrap_or_default(),
+        distro_id: fields.get("id").cloned().unwrap_or_default(),
+        distro_version: fields.get("version").cloned().unwrap_or_default(),
+        ..Examination::default()
+    };
+    let rocminfo = parse_remote_flag(&fields, "rocminfo");
+    e.wsl = Some(WslFacts {
+        version: if crate::is_wsl1_kernel(&e.kernel_release) {
+            1
+        } else {
+            2
+        },
+        dxg_device: parse_remote_flag(&fields, "dxg"),
+        dxcore: parse_remote_flag(&fields, "dxcore"),
+        wsl_lib_dir: parse_remote_flag(&fields, "wsllib"),
+        librocdxg: parse_remote_flag(&fields, "librocdxg"),
+        rocdxg_dids: parse_remote_flag(&fields, "dids"),
+        ldconfig_librocdxg: parse_remote_tristate(&fields, "ldconfig"),
+        rocminfo,
+        rocm_sees_gpu: rocminfo.then(|| parse_remote_flag(&fields, "rocmgfx")),
+        distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
+        // Running on the host, the driver is a local question rather than one
+        // that has to cross the interop boundary. It can still go unanswered —
+        // the inventory query can fail — and that must stay distinguishable from
+        // "the host has no AMD adapter", which is a finding.
+        host_driver_version,
+        host_reachable,
+        locally_probed: false,
+    });
+    sync_shared_fields_from_wsl(&mut e);
+    e.status = "wsl".to_owned();
+    Ok(e)
+}
+
+/// Whether `rocminfo` enumerates a GPU agent.
+///
+/// Only the yes/no answer is taken. Parsing the agents into `gpus` is the job of
+/// the bare-metal probe, which stays skipped here — this exists so the WSL
+/// catalog can tell "the plumbing is complete but no device is reachable" from
+/// "the plumbing is incomplete", which is the difference between blaming the
+/// Windows host driver and blaming the distro.
+fn probe_rocminfo_sees_gpu() -> bool {
+    let (rc, out, _) = run("rocminfo", &[], MEDIUM);
+    rc == 0 && out.to_lowercase().contains("gfx")
+}
+
+/// Mirror the WSL facts onto the shared fields the cross-platform checks read.
+///
+/// Those checks (PATH, the wheel/ROCm pairing) are valid on WSL and enabled
+/// there, but they read fields the bare-metal GPU probe populates — and that
+/// probe is skipped here. Left at their defaults they do not read as "unknown",
+/// they read as "absent": `rocminfo_present: false` made the PATH check score 50
+/// on every WSL host that had ROCm installed.
+fn sync_shared_fields_from_wsl(e: &mut Examination) {
+    let Some(wsl) = e.wsl.as_ref() else {
+        return;
+    };
+    e.rocminfo_present = wsl.rocminfo;
+    e.rocminfo_status = match (wsl.rocminfo, wsl.rocm_sees_gpu) {
+        (false, _) => "missing".to_owned(),
+        (true, Some(true)) => "ok".to_owned(),
+        (true, Some(false)) => "no-agents".to_owned(),
+        (true, None) => "unknown".to_owned(),
+    };
+}
+
+/// Whether the distro release clears the WSL floor in [`WSL_MIN_UBUNTU`].
+///
+/// `None` means the release could not be read as a `major.minor` pair. That is
+/// deliberately not "supported": an unparseable release is not evidence of a good
+/// one, and reporting a perfect host on a release nobody could identify is how a
+/// user ends up chasing a GPU fault that is really a glibc floor.
+///
+/// Only Ubuntu carries a floor today, because that is the only distro the WSL
+/// path documents. Anything else returns `None` rather than a false verdict.
+fn distro_clears_wsl_floor(distro_id: &str, distro_version: &str) -> Option<bool> {
+    if !distro_id.eq_ignore_ascii_case("ubuntu") {
+        return None;
+    }
+    let (major, minor) = distro_version.split_once('.')?;
+    let major: u32 = major.parse().ok()?;
+    let minor: u32 = minor.parse().ok()?;
+    Some((major, minor) >= WSL_MIN_UBUNTU)
 }
 
 /// Extract the value of `iommu=<value>` from a kernel cmdline string.
@@ -1450,6 +1834,163 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 mod tests {
     use super::*;
 
+    /// Ported from the Python preflight this replaced, whose `wsl.exe` parser
+    /// was covered by a self-test that CI ran on both lanes. That coverage has to
+    /// land here, or deleting the script quietly drops it.
+    #[test]
+    fn the_distro_list_survives_the_markers_wsl_puts_around_it() {
+        // `-l -q` prints one bare name per line, which is what the probe asks
+        // for.
+        assert_eq!(
+            parse_wsl_distro_list("Ubuntu\nDebian\n"),
+            vec!["Ubuntu", "Debian"]
+        );
+        assert_eq!(
+            parse_wsl_distro_list("Ubuntu-24.04\n"),
+            vec!["Ubuntu-24.04"]
+        );
+
+        // A name may contain spaces: `wsl --import "My Distro"` is legal.
+        // Splitting on whitespace truncated it to "My", which then neither
+        // matched what the user asked for nor named a real distribution when
+        // handed back to `wsl.exe -d`.
+        assert_eq!(
+            parse_wsl_distro_list("My Distro\nUbuntu\n"),
+            vec!["My Distro", "Ubuntu"]
+        );
+
+        // The NUL padding of the raw UTF-16 output must not become part of a
+        // name, and blank lines are not distributions.
+        assert_eq!(
+            parse_wsl_distro_list("\0U\0b\0u\0n\0t\0u\0\n\0"),
+            vec!["Ubuntu"]
+        );
+        assert!(parse_wsl_distro_list("").is_empty());
+        assert!(parse_wsl_distro_list("\n\n  \n").is_empty());
+
+        // Tolerance only: `-q` emits no header, but a `-l -v` header must never
+        // come back as a distribution named "NAME".
+        assert!(parse_wsl_distro_list("  NAME   STATE   VERSION\n").is_empty());
+    }
+
+    #[test]
+    fn a_host_that_could_not_be_queried_is_unknown_not_driverless() {
+        use crate::WslHostDriverProbe;
+
+        // The distinction the catalog acts on. An earlier version flattened this
+        // to `Option<String>` and defaulted the `None`, so "could not ask the
+        // host" arrived as `Some("")` -- which reads as "the host has no AMD
+        // adapter" and reported a missing driver on a machine never looked at.
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::Unreachable),
+            (false, None),
+            "unreachable must stay unknown"
+        );
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::NoAmdDisplay),
+            (true, Some(String::new())),
+            "answered with no adapter is evidence, and is not the same thing"
+        );
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::Version("32.0.1".to_owned())),
+            (true, Some("32.0.1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_distro_list_decodes_as_utf16_whatever_script_it_is_in() {
+        fn utf16le(text: &str, bom: bool) -> Vec<u8> {
+            let mut bytes = if bom { vec![0xFF, 0xFE] } else { Vec::new() };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+
+        assert_eq!(decode_utf16le(&utf16le("Ubuntu\n", true)), "Ubuntu\n");
+        assert_eq!(decode_utf16le(&utf16le("Ubuntu\n", false)), "Ubuntu\n");
+        assert_eq!(decode_utf16le(b""), "");
+
+        // The reason this is decoded by declaration rather than sniffed: in a
+        // Latin or Cyrillic script every UTF-16LE byte is below 0x80, so the
+        // bytes are *valid UTF-8* and decode without error into mojibake. Read
+        // as UTF-8 these names come back as "#\u{4}1\u{4}..." rather than
+        // failing, so no validity or NUL-density test could catch them.
+        for name in [
+            "Ubuntu-24.04\nÉtat\n",
+            "Ubuntu\nУбунту\n",
+            "Ubuntu\n日本語\n",
+        ] {
+            assert_eq!(decode_utf16le(&utf16le(name, true)), name);
+            assert_eq!(decode_utf16le(&utf16le(name, false)), name);
+        }
+
+        // A non-ASCII name must survive all the way through the parser.
+        assert_eq!(
+            parse_wsl_distro_list(&decode_utf16le(&utf16le("Ubuntu\nУбунту\n", true))),
+            vec!["Ubuntu", "Убунту"]
+        );
+
+        // An odd trailing byte is dropped rather than panicking.
+        let mut truncated = utf16le("Ubuntu", false);
+        truncated.push(0x00);
+        assert_eq!(decode_utf16le(&truncated), "Ubuntu");
+    }
+
+    #[test]
+    fn command_output_that_is_not_utf8_is_kept_rather_than_dropped() {
+        // `read_to_string` fails on invalid UTF-8, and the error was discarded --
+        // so one stray byte emptied a whole capture, which every caller then read
+        // as "the command printed nothing".
+        let (rc, out, _) = run("printf", &["ok\\xffdone"], SHORT);
+        if rc == 127 {
+            return; // no `printf` binary on this host
+        }
+        assert!(
+            out.starts_with("ok") && out.ends_with("done"),
+            "the undecodable byte must not take the rest of the output with it: {out:?}"
+        );
+    }
+
+    /// Ported from the same Python preflight, which owned this rule until the
+    /// catalog took it over. Its version was well covered and its tests went with
+    /// it, so the coverage has to live here or the floor becomes an untested
+    /// constant.
+    #[test]
+    fn the_distro_floor_fails_closed_on_anything_it_cannot_read() {
+        for supported in ["24.04", "24.10", "25.04", "26.04", "28.04"] {
+            assert_eq!(
+                distro_clears_wsl_floor("ubuntu", supported),
+                Some(true),
+                "ubuntu {supported} clears the floor"
+            );
+        }
+        // 22.04 ships glibc 2.35, below the 2.38 / GLIBCXX_3.4.32 floor the
+        // engines are linked against, so it cannot run them at all.
+        assert_eq!(distro_clears_wsl_floor("ubuntu", "22.04"), Some(false));
+        assert_eq!(distro_clears_wsl_floor("ubuntu", "20.04"), Some(false));
+
+        // Unreadable is `None`, never `Some(true)`. Reporting a release nobody
+        // could parse as supported is how a user ends up chasing a GPU fault
+        // that is really a glibc floor -- but claiming it is too old would send
+        // them to reinstall a perfectly good distro, so neither answer is safe.
+        for unreadable in ["24.04.1", "unknown", "", "24", "24.x", "..", "24.04.1.2"] {
+            assert_eq!(
+                distro_clears_wsl_floor("ubuntu", unreadable),
+                None,
+                "{unreadable:?} cannot be read as a release"
+            );
+        }
+
+        // Only Ubuntu carries a documented floor. Anything else abstains rather
+        // than applying Ubuntu's numbering to a distro that does not share it --
+        // Debian 12 is not "below 24.04".
+        for other in ["debian", "fedora", "arch", ""] {
+            assert_eq!(distro_clears_wsl_floor(other, "12.0"), None, "{other}");
+        }
+        assert_eq!(distro_clears_wsl_floor("UBUNTU", "24.04"), Some(true));
+    }
+
     #[test]
     fn examination_serializes_expected_keys() {
         let e = Examination::default();
@@ -1475,10 +2016,14 @@ mod tests {
 
     #[test]
     fn examination_top_level_keys_match_examine_py_contract() {
-        // The field set examine.py emits, plus the CLI-only `status` addition.
-        // diagnose.py reads against these names, so this is the frozen wire
-        // contract — adding/removing/renaming a top-level field is a contract
-        // change and must be intentional.
+        // The field set examine.py emits, plus the CLI-only `status` and `wsl`
+        // additions. diagnose.py reads against these names, so this is the frozen
+        // wire contract — adding/removing/renaming a top-level field is a
+        // contract change and must be intentional.
+        //
+        // `wsl` is one of the intentional ones: WSL2 has no examine.py analogue,
+        // and nesting its facts under a single key keeps the rest of the contract
+        // byte-identical instead of scattering ten flat `wsl_*` fields through it.
         let expected: std::collections::BTreeSet<&str> = [
             "os_family",
             "os_version",
@@ -1487,6 +2032,7 @@ mod tests {
             "kernel_release",
             "kernel_cmdline",
             "is_wsl",
+            "wsl",
             "cpu_vendor",
             "cpu_model",
             "gpus",

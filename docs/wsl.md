@@ -21,19 +21,33 @@ The AMD WSL path is:
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by `rocm-cli` into a managed Python venv.
 
-Useful read-only preflight:
+Useful read-only preflight, from inside the distro:
 
 ```bash
-python scripts/wsl_preflight.py
-python scripts/wsl_preflight.py --json
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose
+rocm diagnose --json
 ```
 
-From Windows PowerShell, target a specific distro:
+From Windows PowerShell, inspect a distro without installing anything in it:
 
 ```powershell
-python scripts\wsl_preflight.py --distro Ubuntu
+rocm diagnose --distro          # the only distro installed
+rocm diagnose --distro Ubuntu   # a named one
 ```
+
+The host-side form collects the facts over `wsl.exe` and runs the same catalog.
+It needs no `rocm-cli`, and no Python, inside the target distro — which is the
+point, since the distro being checked is usually the one that is not set up yet.
+
+It sees less than a run from inside, so prefer the in-distro form where you can:
+
+- It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
+  cannot honour a `$ROCM_PATH` pointing elsewhere. `wsl.exe --exec` runs a
+  non-login, non-interactive shell, so nothing exported from a shell profile is
+  set.
+- For the same reason it collects no environment, so the checks that read one —
+  `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework/ROCm version pairing —
+  do not run. It reports on the WSL GPU stack, not on the whole installation.
 
 ## Install ROCDXG In WSL
 
@@ -57,7 +71,7 @@ From this repo inside WSL, the same supported path is wrapped as:
 
 ```bash
 bash scripts/wsl_setup_rocdxg.sh
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose
 ```
 
 To require checksum verification before installing the downloaded `.deb`, set
@@ -127,19 +141,65 @@ For `rocm-cli`, the command itself should resolve the managed runtime manifest
 and apply that environment before launching HIP apps such as Lemonade's bundled
 `llama.cpp` backend. Users should not have to hand-export these values.
 
-## Examine And Install UX Recommendations
+## Diagnosing A WSL Host
 
-`rocm examine` should detect WSL cheaply and report:
+`rocm diagnose` carries a WSL catalog, separate from the bare-metal Linux one.
+The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
+never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
+naming one would send you after a fault that cannot exist on this platform.
+
+```bash
+rocm diagnose
+rocm diagnose --json
+```
+
+The WSL entries, in the order a broken stack usually reveals them:
+
+| Fix id | Reported when |
+| --- | --- |
+| `fix-wsl-7-wsl1` | The distro runs under WSL 1, which has no GPU path at all |
+| `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
+| `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
+| `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
+| `fix-wsl-5-distro-too-old` | The distro release is below the floor in the prerequisites above |
+| `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
+
+Every WSL remedy is print-only. `rocm fix <id>` shows the commands and does not
+run them: they either install packages with `sudo`, edit loader configuration, or
+belong to the Windows host, and none of that meets the bar the four
+auto-applicable fixes clear.
+
+Two deliberate silences, so a report can be trusted:
+
+- `fix-wsl-6` **abstains** when WSL interop cannot reach the Windows host, rather
+  than reading "could not ask" as "driver is too old". Inside a container, or
+  with interop switched off, the host driver is reported as unknown and no
+  finding blames it.
+- `fix-wsl-5` **abstains** when the distro release cannot be parsed. An
+  unreadable release is not evidence of a supported one, but it is not evidence
+  of an old one either.
+
+## What `rocm examine` Reports On WSL
+
+`rocm examine` detects WSL cheaply and reports:
 
 - `wsl: true`
-- WSL distro/version
+- WSL distro/version, and whether the release clears the supported floor
+- WSL major version (1 or 2)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
-- `/opt/rocm/lib/librocdxg.so` presence
+- `librocdxg.so` presence, resolved across every ROCm install rather than
+  assuming `/opt/rocm`
 - `librocdxg` linker-cache visibility from `ldconfig -p`
-- `rocminfo` from the active TheRock runtime after activation
-- whether `HSA_ENABLE_DXG_DETECTION` is needed or set
+- the Windows host AMD driver version, when WSL interop can reach the host
+- whether `HSA_ENABLE_DXG_DETECTION` is set
 - managed TheRock runtime count and active/default runtime
+
+The driver, device-node and group probes stay skipped, so `has_amd_gpu` and
+`gpus` describe the bare-metal view and are not populated here.
+
+## Install UX Recommendations
 
 `rocm install sdk` inside WSL should:
 
@@ -164,9 +224,9 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 Safe tests that do not mutate global WSL state:
 
-- `python scripts/wsl_preflight.py --self-test`
-- `python scripts/wsl_preflight.py --json`
-- `python scripts/wsl_preflight.py --require-ready` on a prepared WSL machine
+- `rocm diagnose --json`
+- `rocm diagnose --distro <name>` from the Windows host
+- `cargo test -p rocm-core wsl` for the catalog's own tests
 - `rocm install sdk --channel release --format wheel --dry-run` inside WSL with
   isolated `ROCM_CLI_*` directories
 
