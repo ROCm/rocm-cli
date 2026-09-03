@@ -131,3 +131,23 @@ Feature: Runtime configuration
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  # Regression guard for the bug where the release-channel multi-arch pip index
+  # was queried with a per-family path segment (.../whl-multi-arch/{family}/),
+  # which 403s because that index is flat and 404/403-ed straight into the
+  # stale classic index every time, silently pinning every install to
+  # whatever version predated the migration. `--family` bypasses GPU
+  # auto-detection so this needs no GPU, and `--dry-run` resolves the real
+  # index without installing anything.
+  #
+  # `@nightly` for the same reason as scenario 8 above: this dry-run still
+  # resolves the real channel index over the network (dry-run only skips the
+  # venv/download, not index resolution), and the no-GPU mock lane's 64-way
+  # concurrency from that extra network work is what pushes
+  # `eai-7960-gen-tps-held-after-scrape-failure` and
+  # `eai-7960-gen-tps-expiry-boundary` past their validity window. Runs on the
+  # nightly lanes instead, where scenarios are serialized.
+  @id:runtime-install-sdk-release-index-shape @nightly
+  Scenario: 4 - Resolving the SDK from the release channel never uses the broken multi-arch URL shape
+    When the user dry-runs installing the SDK for a known family
+    Then the resolved package index is not the broken per-family multi-arch path
