@@ -927,6 +927,24 @@ async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve pinned to GPU ordinal 1 while `ROCR_VISIBLE_DEVICES=1` hides every
+/// device except the physical ordinal 1. ROCr re-indexes that survivor to HIP
+/// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
+/// (EAI-7194) — not read as the physical token and wrongly accepted. On a
+/// single-GPU host the same ordinal is out of range. Either way an honest refusal.
+#[when("the user serves a model pinned past the ROCR-reindexed visible set")]
+async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("ROCR_VISIBLE_DEVICES", "1")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the user is told to allow public binding first")]
 async fn assert_public_bind_message(world: &mut E2eWorld) {
     let output = serve_output(world);

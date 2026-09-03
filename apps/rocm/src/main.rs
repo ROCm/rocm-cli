@@ -5932,6 +5932,22 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
+    // The lock alone does not close the window: the spawned daemon does not
+    // publish its `running` runtime state until well after `spawn()` (clap parse,
+    // runtime build, config load, banner flush). A second caller that acquires
+    // this lock during that gap still sees "not running" and would spawn a
+    // duplicate. Bridge the gap with a short-lived claim recording the child PID
+    // and spawn time: a holder that finds a live, recent claim defers instead.
+    let claim_path = paths.automation_autostart_claim_path();
+    if autostart_spawn_in_flight(
+        read_autostart_claim(&claim_path),
+        now_unix_millis(),
+        AUTOSTART_CLAIM_TTL_MS,
+        rocm_core::process_is_running,
+    ) {
+        return Ok(());
+    }
+
     let exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
     let args = vec!["daemon".to_owned()];
@@ -5939,7 +5955,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
     let spawn_result = {
         let env_values = app_path_env_var_values(&paths, None);
         let env_refs = app_path_env_var_refs(&env_values);
-        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs).map(|_| ())
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
     };
     #[cfg(not(windows))]
     let spawn_result = {
@@ -5948,17 +5964,93 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         attach_background_stdio(&mut command, None)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, &paths);
-        command.spawn().map(|_| ())
+        command.spawn().map(|child| child.id())
     };
     match spawn_result {
-        Ok(()) if !quiet => println!("  helper: started background automation daemon"),
-        Ok(()) => {}
+        Ok(daemon_pid) => {
+            // Record the claim before returning (and thus releasing the lock) so a
+            // concurrent holder in the spawn→publish window defers. Best-effort: a
+            // failed write only reopens the original, already-tolerated race.
+            let _ = write_autostart_claim(
+                &claim_path,
+                AutostartClaim {
+                    daemon_pid,
+                    spawned_at_ms: now_unix_millis(),
+                },
+            );
+            if !quiet {
+                println!("  helper: started background automation daemon");
+            }
+        }
         Err(error) if !quiet => {
             println!("  helper: could not start background automation daemon: {error}");
         }
         Err(_) => {}
     }
     Ok(())
+}
+
+/// How long an autostart claim is honoured before it is treated as stale even if
+/// its recorded PID is still alive. Comfortably longer than a cold daemon boot
+/// (clap parse → runtime build → config load → state publish) yet short enough
+/// that a crashed spawn cannot suppress autostart for long.
+const AUTOSTART_CLAIM_TTL_MS: u128 = 30_000;
+
+/// A just-spawned daemon's autostart claim: the child PID and the wall-clock time
+/// (milliseconds since the Unix epoch) the spawn was recorded. It lets a
+/// concurrent autostart holder distinguish a live, in-flight spawn from a stale
+/// leftover. Serialized as a single `"<pid> <ms>"` line — no dependency and
+/// trivially forward-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutostartClaim {
+    daemon_pid: u32,
+    spawned_at_ms: u128,
+}
+
+/// Milliseconds since the Unix epoch, or `0` if the clock is before the epoch
+/// (which only makes a fresh claim look old — safe, it just permits a respawn).
+fn now_unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
+}
+
+/// Read an autostart claim, returning `None` when the file is absent or
+/// unparseable (either is treated as "no claim", so a respawn is permitted).
+fn read_autostart_claim(path: &Path) -> Option<AutostartClaim> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let daemon_pid = parts.next()?.parse().ok()?;
+    let spawned_at_ms = parts.next()?.parse().ok()?;
+    Some(AutostartClaim {
+        daemon_pid,
+        spawned_at_ms,
+    })
+}
+
+/// Write an autostart claim as `"<pid> <ms>"`. Best-effort at the call site.
+fn write_autostart_claim(path: &Path, claim: AutostartClaim) -> std::io::Result<()> {
+    std::fs::write(
+        path,
+        format!("{} {}", claim.daemon_pid, claim.spawned_at_ms),
+    )
+}
+
+/// Whether an existing autostart `claim` means a daemon spawn is still in flight,
+/// so the current lock holder should defer rather than spawn a duplicate. A claim
+/// counts as in-flight only while its child PID is alive *and* it is younger than
+/// `ttl_ms` — the TTL bounds how long a crashed spawn (or a PID later reused by an
+/// unrelated process) can suppress autostart. `pid_alive` is injected so the
+/// decision is unit-testable without a live process.
+fn autostart_spawn_in_flight(
+    claim: Option<AutostartClaim>,
+    now_ms: u128,
+    ttl_ms: u128,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    claim.is_some_and(|claim| {
+        now_ms.saturating_sub(claim.spawned_at_ms) < ttl_ms && pid_alive(claim.daemon_pid)
+    })
 }
 
 /// What ended an attached (`--verbose`/`--foreground`) streaming session. Kept
@@ -18334,43 +18426,56 @@ fn resolve_gpu_indices(
     }
 }
 
-/// Validate an explicit `--gpu <index>` against the detected GPU count and the
-/// active visibility mask, returning the single pinned ordinal. Errors when the
-/// index is out of range for a known device count, or when the active mask has
-/// hidden it. An unknown count / unprobeable host (`detected` / `visible` are
-/// `None`) is allowed through so serving can still proceed where GPU probing is
-/// not possible.
+/// Validate an explicit `--gpu <index>` against the active visibility set,
+/// returning the single pinned ordinal. `visible` is the set of HIP ordinals
+/// still usable after the visibility mask (see
+/// [`rocm_core::usable_amd_gpu_indices`]) — already in the same space the index
+/// is exported through — so it is the authoritative answer whenever it could be
+/// enumerated. `detected` is only a fallback range check for hosts where the
+/// visible set is unknown (`visible` is `None`). Both `None` (an unprobeable
+/// host) is allowed through so serving can still proceed.
 fn validate_pinned_gpu_index(
     index: u32,
     detected: Option<usize>,
     visible: Option<&[u32]>,
 ) -> Result<Vec<u32>> {
+    // Prefer the visibility-resolved set. It is authoritative and already in the
+    // HIP-ordinal space `--gpu` is exported through, so it settles both range and
+    // mask membership in one comparison — avoiding the earlier bug of checking
+    // the index against `detected` (a differently-probed physical count) and
+    // `visible` (HIP space) as if they shared one ordinal space.
+    if let Some(visible) = visible {
+        if visible.is_empty() {
+            // An empty set is authoritative "no GPU usable" (every device masked
+            // out), not "could not enumerate" — that is `None`. serve()'s
+            // no-usable-GPU fail-fast normally reports this first with a fuller
+            // message; reject here too so a bad `--gpu` can never slip through.
+            bail!(
+                "no usable AMD GPU is available under the active visibility mask \
+                 (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); `--gpu {index}` cannot be honoured"
+            );
+        }
+        if !visible.contains(&index) {
+            let list = visible
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "--gpu index {index} is not available under the active visibility mask \
+                 (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
+            );
+        }
+        return Ok(vec![index]);
+    }
+    // No visible set could be enumerated: fall back to the raw detected count so
+    // an obviously out-of-range index is still refused.
     if let Some(count) = detected
         && (index as usize) >= count
     {
         bail!(
             "--gpu index {index} is out of range; {count} GPU(s) detected (valid indices 0..{})",
             count - 1
-        );
-    }
-    // Reject a device the active visibility mask has hidden, so the failure is an
-    // early, actionable CLI error rather than a late engine "not available"
-    // reject. Permissive when the host is unprobeable (`visible` is `None`); an
-    // all-masked host is already caught by the no-usable-GPU fail-fast in
-    // `serve()`, so an empty `visible` here means "could not enumerate" and is
-    // left to the count check above.
-    if let Some(visible) = visible
-        && !visible.is_empty()
-        && !visible.contains(&index)
-    {
-        let list = visible
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "--gpu index {index} is not available under the active visibility mask \
-             (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
         );
     }
     Ok(vec![index])
@@ -25540,8 +25645,8 @@ install therock";
 
     #[test]
     fn validate_pinned_gpu_index_rejects_masked_out_device() {
-        // Index is within the detected count but hidden by the active mask: reject
-        // early with the usable set, rather than deferring to a late engine error.
+        // The visible set is authoritative: an index outside it is rejected early
+        // with the usable set, rather than deferring to a late engine error.
         let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]))
             .expect_err("masked-out device must be rejected");
         let message = error.to_string();
@@ -25552,11 +25657,32 @@ install therock";
             validate_pinned_gpu_index(2, Some(4), Some(&[2, 3])).unwrap(),
             vec![2]
         );
-        // An empty visible set means "could not enumerate", so it is not used to
-        // reject; the count check governs instead.
+        // An empty visible set is authoritative "no GPU usable" (every device
+        // masked out), not "could not enumerate" — the latter is `None`, per the
+        // `usable_amd_gpu_indices` contract. So it rejects rather than falling
+        // through to the count check; the detected count must not override it.
+        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]))
+            .expect_err("an all-masked host must reject an explicit --gpu index");
+        assert!(
+            masked_out
+                .to_string()
+                .contains("no usable AMD GPU is available")
+        );
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_prefers_visible_set_over_detected_count() {
+        // detected and visible come from different probes. When both are known the
+        // visible set wins, so an index inside the detected count but outside the
+        // HIP-visible set is still rejected (and vice versa), instead of the two
+        // being compared as one ordinal space.
         assert_eq!(
-            validate_pinned_gpu_index(1, Some(4), Some(&[])).unwrap(),
+            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1])).unwrap(),
             vec![1]
+        );
+        assert!(
+            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1])).is_err(),
+            "index within the detected count but outside the visible set must reject"
         );
     }
 
@@ -29872,6 +29998,62 @@ ID_LIKE="suse opensuse"
             !background_helper_already_running(&paths).expect("not-running flag ⇒ ok"),
             "running=false ⇒ not running even with a live pid"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn autostart_spawn_in_flight_defers_only_for_a_live_recent_claim() {
+        let claim = AutostartClaim {
+            daemon_pid: 4242,
+            spawned_at_ms: 1_000,
+        };
+        // A recent claim whose PID is still alive ⇒ a spawn is in flight, defer.
+        assert!(autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + 5_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+        // Same claim but the child PID is gone (crashed spawn) ⇒ respawn.
+        assert!(!autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + 5_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| false,
+        ));
+        // Older than the TTL, even with a live PID (possible PID reuse) ⇒ respawn.
+        assert!(!autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + AUTOSTART_CLAIM_TTL_MS,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+        // No claim at all ⇒ nothing in flight, spawn.
+        assert!(!autostart_spawn_in_flight(
+            None,
+            1_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn autostart_claim_round_trips_and_absent_or_garbage_reads_as_none() {
+        let (root, paths) = test_paths("autostart-claim-roundtrip");
+        let path = paths.automation_autostart_claim_path();
+        fs::create_dir_all(path.parent().expect("claim parent")).expect("mkdir claim dir");
+        // Absent file ⇒ no claim.
+        assert_eq!(read_autostart_claim(&path), None);
+        // Round-trip a written claim.
+        let claim = AutostartClaim {
+            daemon_pid: 9987,
+            spawned_at_ms: 1_726_000_000_123,
+        };
+        write_autostart_claim(&path, claim).expect("write claim");
+        assert_eq!(read_autostart_claim(&path), Some(claim));
+        // Garbage / partial content ⇒ no claim (permits a respawn, never panics).
+        fs::write(&path, "not-a-pid").expect("write garbage");
+        assert_eq!(read_autostart_claim(&path), None);
         let _ = fs::remove_dir_all(&root);
     }
 
