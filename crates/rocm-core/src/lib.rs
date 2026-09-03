@@ -3362,10 +3362,6 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn detect_host_therock_family() -> Option<String> {
-    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
-}
-
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
 }
@@ -3955,6 +3951,7 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
         value if value.starts_with("gfx90a") => Some("gfx90a".to_owned()),
         value if value.starts_with("gfx950") => Some("gfx950-dcgpu".to_owned()),
+        value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
         value
             if value.starts_with("gfx942")
                 || value.starts_with("gfx94")
@@ -3990,6 +3987,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx950-dcgpu",
         "gfx101X-dgpu",
         "gfx103X-dgpu",
+        "gfx125X-dcgpu",
         "gfx110X-all",
         "gfx1150",
         "gfx1151",
@@ -9006,6 +9004,29 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
+        );
+    }
+
+    // Characterizes pre-existing behavior: `starts_with("gfx103")` already
+    // aliases both of these to the canonical dgpu label with no dedicated
+    // "gfx103X-all" match arm needed.
+    #[test]
+    fn normalize_therock_family_aliases_gfx103x_all_to_canonical_dgpu_label() {
+        assert_eq!(
+            normalize_therock_family("gfx103X-all"),
+            Some("gfx103X-dgpu".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx1030"),
+            Some("gfx103X-dgpu".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_therock_family_maps_gfx1250_to_gfx125x_dcgpu() {
+        assert_eq!(
+            normalize_therock_family("gfx1250"),
+            Some("gfx125X-dcgpu".to_owned())
         );
     }
 

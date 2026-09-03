@@ -959,6 +959,7 @@ mod tests {
             format: "wheel".to_owned(),
             family: family.to_owned(),
             family_source: "test".to_owned(),
+            raw_arch: None,
             version: version.to_owned(),
             install_root: PathBuf::from("rocm-storage-test").join(runtime_key),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
