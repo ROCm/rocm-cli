@@ -935,20 +935,29 @@ Reference: [TheRock Windows install tools](https://github.com/ROCm/TheRock/blob/
 Read-only WSL/ROCDXG preflight:
 
 ```bash
-python scripts/wsl_preflight.py --json
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose --json
 ```
 
-`--require-ready` checks WSL, `/dev/dxg`, DXCore, ROCDXG, `python3 -m venv`,
-and library registration. Source-build tools such as Windows SDK headers,
-CMake, and compilers are optional for runtime acceptance; add
-`--require-build-tools` only when validating a WSL source-build environment.
+The WSL catalog covers `/dev/dxg`, the DXCore handoff, ROCDXG and its linker
+entry, the distro release floor, the Windows host driver, and WSL 1. A clean run
+reports no findings; anything it does report carries a `fix-wsl-*` id and a plan.
+
+From the Windows host, to inspect a distro without installing anything in it:
+
+```powershell
+rocm diagnose --distro          # the only distro installed
+rocm diagnose --distro Ubuntu   # a named one
+```
+
+Both forms run the same catalog. The host-side one collects its facts over
+`wsl.exe` with a POSIX shell, so the target distro needs neither `rocm-cli` nor
+Python.
 
 Interactive ROCDXG install inside WSL:
 
 ```bash
 bash scripts/wsl_setup_rocdxg.sh
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose
 ```
 
 To require checksum verification for the downloaded ROCDXG `.deb`, provide the

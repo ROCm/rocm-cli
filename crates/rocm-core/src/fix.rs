@@ -49,9 +49,17 @@ struct FixRecipe {
     runner: Option<fn(&FixOptions) -> i32>,
 }
 
+/// Valid on bare-metal Linux, Windows and WSL alike.
+///
+/// WSL is named explicitly rather than folded into `linux`: the default for a
+/// bare-metal recipe has to be "does not apply on WSL", because the platform has
+/// no amdgpu module, no /dev/kfd and no render group. Recipes that survive the
+/// move are the ones about wheels, environment variables and PATH.
+const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
 const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
+const WSL_ONLY: &[&str] = &["wsl"];
 
 /// The recipe registry. Mirrors the diagnosis catalog; only the four small,
 /// safe fixes carry a `runner` and are auto-applicable.
@@ -79,7 +87,7 @@ const RECIPES: &[FixRecipe] = &[
             "TheRock per-gfx wheels are the recommended fallback when the official pytorch index does not yet cover your gfx (and the only first-party option on Windows AMD).",
             "HSA_OVERRIDE_GFX_VERSION is NOT the right fix here -- it papers over the mismatch and risks page faults at runtime.",
         ],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -100,7 +108,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: Some(run_unset_override),
     },
     FixRecipe {
@@ -173,7 +181,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "rocminfo | head -n 5 && hipcc --version",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: Some(run_path_export),
     },
     FixRecipe {
@@ -213,7 +221,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())\"",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -364,17 +372,167 @@ const RECIPES: &[FixRecipe] = &[
         applies_on: WINDOWS_ONLY,
         runner: None,
     },
+    // WSL2 recipes. All print-only: every one of them either installs a package
+    // with sudo, edits loader configuration, or belongs to the Windows host, and
+    // none of that meets the bar the four auto-applicable fixes clear (small,
+    // reversible, user-scoped, verifiable in one line).
+    FixRecipe {
+        fix_id: "fix-wsl-1-gpu-not-exposed",
+        title: "Expose the GPU to the WSL distro (/dev/dxg)",
+        rationale: "WSL reaches the GPU through /dev/dxg, provided by the Windows host driver via GPU-PV. Without that device nothing else in the ROCm stack can work, so this comes before any package or loader question. In a container the device has to be passed in explicitly; on a host it means the Windows driver or the WSL kernel needs attention.",
+        auto_applicable: false,
+        commands: &[
+            "# In a container, pass the device and the WSL libraries in:",
+            "#   --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl",
+            "# On a WSL host, update WSL and the Windows AMD driver, then:",
+            "#   wsl --update",
+            "#   wsl --shutdown",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ls -l /dev/dxg",
+        notes: &[
+            "A container running on WSL2 reports itself as WSL but sees /dev/dxg only when it was started with the device. Check that before touching the Windows driver.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-2-dxcore-missing",
+        title: "Restore the WSL DXCore libraries",
+        rationale: "/usr/lib/wsl/lib holds the DXCore shims the ROCm runtime uses to talk to the Windows host driver. WSL mounts that directory itself, so a distro package manager can neither install nor repair it -- the fix is on the Windows side, plus a loader-path entry inside the distro.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows, refresh the WSL runtime that provides these libraries:",
+            "#   wsl --update",
+            "#   wsl --shutdown",
+            "# Inside the distro, put them on the loader path:",
+            "echo /usr/lib/wsl/lib | sudo tee /etc/ld.so.conf.d/wsl.conf",
+            "sudo ldconfig",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore",
+        notes: &["apt cannot repair /usr/lib/wsl: it is a mount supplied by WSL, not a package."],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-3-rocdxg-missing",
+        title: "Install ROCDXG in the WSL distro",
+        rationale: "ROCDXG (librocdxg) is the ROCm-to-DXCore shim the WSL path runs on. It is a distro-side package, so unlike the driver and DXCore pieces this one is entirely in the user's hands.",
+        auto_applicable: false,
+        commands: &[
+            "bash scripts/wsl_setup_rocdxg.sh",
+            "# To verify the download against a digest you trust:",
+            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ldconfig -p | grep librocdxg",
+        notes: &[
+            "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. rocm-cli does not run that for you, and the script does not bake in a production checksum -- set ROCDXG_SHA256 to one you trust.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-4-rocdxg-not-linked",
+        title: "Refresh the linker cache so ROCDXG is loadable",
+        rationale: "librocdxg is installed but absent from the linker cache, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
+        auto_applicable: false,
+        commands: &["sudo ldconfig"],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ldconfig -p | grep librocdxg",
+        notes: &[
+            "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-5-distro-too-old",
+        title: "Move to a distro release the WSL path supports",
+        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows, install a supported distro alongside the current one:",
+            "#   wsl --install -d Ubuntu-24.04",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "grep VERSION_ID /etc/os-release",
+        notes: &[
+            "Distros install side by side, so the current one can stay until the new one is set up.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-6-host-driver-too-old",
+        title: "Update the AMD driver on the Windows host",
+        rationale: "Under WSL the GPU kernel-mode driver lives on the Windows host, not in the distro. When the distro-side plumbing is complete and ROCm still sees no GPU, the host driver is the remaining variable.",
+        auto_applicable: false,
+        commands: &[
+            "# On the Windows host, not in this distro:",
+            "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocminfo | head -n 20",
+        notes: &[
+            "Nothing inside the distro can carry this out, which is why it prints rather than runs.",
+            "The ROCm release and the Adrenalin release are paired; check the WSL install guide for the version that matches your ROCm.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-7-wsl1",
+        title: "Convert the distro from WSL 1 to WSL 2",
+        rationale: "WSL 1 translates syscalls rather than running a kernel, and exposes no GPU device at all. No driver or package work can give it ROCm support; the distro has to be converted.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows PowerShell:",
+            "#   wsl --set-version <distro> 2",
+            "#   wsl --set-default-version 2",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "uname -r",
+        notes: &[
+            "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
 ];
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
 
-const fn current_os() -> &'static str {
+/// The platform family a recipe's `applies_on` is matched against.
+///
+/// WSL2 is its own family rather than `linux`, mirroring `diagnose`. That is what
+/// makes `rocm fix fix-4-render-group` on a WSL host refuse with "wrong OS"
+/// instead of running `usermod` for a group that governs nothing there — and it
+/// is why recipes valid on both platforms have to name `wsl` explicitly.
+///
+/// Not `const fn`: unlike the OS, WSL has to be probed at runtime.
+fn current_os() -> &'static str {
     if runtime_is_windows() {
         "windows"
     } else if runtime_is_linux() {
-        "linux"
+        if crate::is_wsl_host() { "wsl" } else { "linux" }
     } else {
         "other"
     }
@@ -1076,7 +1234,17 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        assert_eq!(count, 15, "expected 15 catalog entries");
+        // 15 bare-metal/Windows entries plus the 7 WSL ones.
+        assert_eq!(count, 22, "expected 22 catalog entries");
+    }
+
+    /// Whether a recipe applies on the platform the test is running on.
+    ///
+    /// Tests used to gate on `runtime_is_linux()`, which stopped being the same
+    /// question once WSL became its own family: a WSL host is Linux, but a
+    /// `LINUX_ONLY` recipe is correctly refused there.
+    fn recipe_applies_here(fix_id: &str) -> bool {
+        find_recipe(fix_id).is_some_and(|r| r.applies_on.contains(&current_os()))
     }
 
     #[test]
@@ -1136,6 +1304,12 @@ mod tests {
         // query that identifies the dGPU, so it is a print-only preview and
         // must return 0 -- not the environment/OS code 3. A dry-run without the
         // argument must likewise succeed, since the runner never mutates.
+        //
+        // fix-9 does not apply on WSL (no per-device topology to collide over),
+        // where the correct answer is the OS refusal this test exists to rule out.
+        if !recipe_applies_here("fix-9-igpu-dgpu") {
+            return;
+        }
         for dry_run in [false, true] {
             let opts = FixOptions {
                 dry_run,
@@ -1151,11 +1325,17 @@ mod tests {
 
     #[test]
     fn print_only_fix_returns_zero() {
-        if !runtime_is_linux() {
-            return;
-        }
-        let code = apply("fix-5-amdgpu-load", &FixOptions::default());
-        assert_eq!(code, 0);
+        // Pick a recipe that applies on THIS platform rather than naming a Linux
+        // one: the assertion is about print-only recipes succeeding, and hunting
+        // for an applicable one keeps that meaningful on every lane instead of
+        // skipping wherever the hardcoded id happens not to apply.
+        let fix_id = RECIPES
+            .iter()
+            .find(|r| !r.auto_applicable && r.applies_on.contains(&current_os()))
+            .map(|r| r.fix_id)
+            .expect("every supported platform has at least one print-only recipe");
+        let code = apply(fix_id, &FixOptions::default());
+        assert_eq!(code, 0, "{fix_id} is print-only here and must succeed");
     }
 
     #[test]

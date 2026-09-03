@@ -231,7 +231,6 @@ jobs:
           python scripts/comfyui_therock_gpu_test.py --self-test
           python scripts/local_assistant_therock_gpu_test.py --self-test
           python scripts/vllm_therock_gpu_test.py --self-test
-          python scripts/wsl_preflight.py --self-test
 
       - name: Portable WSL build deps self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -368,7 +367,6 @@ jobs:
           python .\scripts\comfyui_therock_gpu_test.py --self-test
           python .\scripts\local_assistant_therock_gpu_test.py --self-test
           python .\scripts\vllm_therock_gpu_test.py --self-test
-          python .\scripts\wsl_preflight.py --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'

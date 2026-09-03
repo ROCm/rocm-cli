@@ -819,6 +819,44 @@ serve_timeout_secs = 90
         }
     }
 
+    #[test]
+    fn combining_requires_os_and_requires_bare_metal_narrows_to_native_linux() {
+        // diagnose-08's exact tag set. It needs a Linux host (the assertion reads
+        // back a shell rc file) that is ALSO not WSL (the only auto-applicable
+        // fix reaching the consent gate does not apply there). Neither tag says
+        // that alone, so the pair has to compose — and a `-n` filtered local run
+        // bypasses this resolution entirely, which makes it worth pinning here
+        // rather than trusting a hand-run of the suite.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:diagnose-fix-requires-agreement-before-changing-anything",
+            "requires-os:linux",
+            "requires-bare-metal",
+        ]);
+        for wsl in ["wsl", "wsl2"] {
+            assert!(
+                matches!(
+                    resolve(&d, &cap(wsl), &m, false, false, false),
+                    Expectation::Skip { .. }
+                ),
+                "{wsl} is linux but not bare metal, so the scenario has no premise"
+            );
+        }
+        assert!(matches!(
+            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            Expectation::Skip { .. }
+        ));
+        // `mock` is deliberately absent: the fixture models it as os_family
+        // "other", so it cannot stand for the real mock lane here.
+        for host in ["mi300x", "strix-ubuntu"] {
+            assert_eq!(
+                resolve(&d, &cap(host), &m, false, false, false),
+                Expectation::ExpectPass,
+                "{host} is native Linux and must still run the scenario"
+            );
+        }
+    }
+
     /// The exact inverse of the tag above: proving both directions keeps the
     /// pair from silently collapsing into one predicate.
     #[test]

@@ -15,7 +15,7 @@
 //! data; the per-check logic mirrors `diagnose.py` field-for-field so the two
 //! stay behaviorally identical.
 
-use crate::examine::Examination;
+use crate::examine::{Examination, WslFacts};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -1271,18 +1271,455 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
-/// A checker plus the OS families it applies to.
+// ---------------------------------------------------------------------------
+// WSL2 catalog
+//
+// A parallel catalog, not a port of the bare-metal one. WSL2 reaches the GPU
+// through /dev/dxg and the Windows host driver (dxgkrnl), so the questions worth
+// asking are about the DXCore handoff, the ROCDXG userspace, and the host — none
+// of which the bare-metal checks know anything about.
+// ---------------------------------------------------------------------------
+
+const KEYWORDS_WSL_NO_DEVICE: KeywordTable = &[
+    (
+        "no rocm-capable device",
+        40,
+        "error mentions no ROCm-capable device",
+    ),
+    (
+        "no hip-capable device",
+        40,
+        "error mentions no HIP-capable device",
+    ),
+    (r"/dev/dxg", 45, "error mentions /dev/dxg"),
+    (
+        "hsa_status_error_out_of_resources",
+        25,
+        "error mentions HSA_STATUS_ERROR_OUT_OF_RESOURCES",
+    ),
+    (
+        "no amd gpus? (?:were )?(?:found|detected)",
+        35,
+        "error mentions no AMD GPU found",
+    ),
+];
+
+const KEYWORDS_WSL_LOADER: KeywordTable = &[
+    (r"librocdxg\.so", 50, "error names librocdxg.so"),
+    (r"libdxcore\.so", 50, "error names libdxcore.so"),
+    (
+        "cannot open shared object file",
+        30,
+        "error mentions a shared object that could not be opened",
+    ),
+    (
+        "error while loading shared libraries",
+        35,
+        "error mentions a shared library load failure",
+    ),
+];
+
+/// The WSL facts, or a default set when the probe did not populate them.
+///
+/// A WSL host whose `wsl` section is missing is a probe failure, not a healthy
+/// machine, so every field reads false and the checks fire on the missing
+/// plumbing rather than silently passing.
+fn wsl_facts(e: &Examination) -> WslFacts {
+    e.wsl.clone().unwrap_or_default()
+}
+
+fn check_wsl_1_gpu_not_exposed(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    if w.dxg_device {
+        return zero("fix-wsl-1-gpu-not-exposed", "GPU not exposed to the distro");
+    }
+    // WSL 1 has no GPU path at all; fix-wsl-7 says so in terms the user can act
+    // on, and two findings for one cause is noise.
+    if w.version == 1 {
+        return zero("fix-wsl-1-gpu-not-exposed", "GPU not exposed to the distro");
+    }
+    let mut score = 55;
+    let mut evidence = vec!["/dev/dxg is missing, so the distro has no GPU path".to_owned()];
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_NO_DEVICE);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    // Three different causes produce the same missing device, and they need
+    // different actions. Naming which one this is spares the user from updating a
+    // Windows driver that was never the problem.
+    let (cause, commands, notes) = if e.in_container {
+        (
+            "this is a container, and containers only see /dev/dxg when it is passed in",
+            vec![
+                "# Re-run the container with the WSL GPU device and libraries:".to_owned(),
+                "#   --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl".to_owned(),
+                "# and add /usr/lib/wsl/lib to the loader path inside it.".to_owned(),
+            ],
+            vec![
+                "The Windows host driver is probably fine here: the device is missing because this container was not given it, not because the host lacks GPU support.".to_owned(),
+            ],
+        )
+    } else if !w.wsl_lib_dir {
+        (
+            "/usr/lib/wsl is absent too, so this distro never had WSL GPU support wired in",
+            vec![
+                "# Update WSL itself, then restart the distro from Windows:".to_owned(),
+                "#   wsl --update".to_owned(),
+                "#   wsl --shutdown".to_owned(),
+            ],
+            Vec::new(),
+        )
+    } else {
+        (
+            "/usr/lib/wsl is present but the device is not, which points at the Windows host driver or the WSL kernel",
+            vec![
+                "# On the Windows host: install a WSL-capable AMD Adrenalin driver,".to_owned(),
+                "# then update the WSL kernel and restart the distro:".to_owned(),
+                "#   wsl --update".to_owned(),
+                "#   wsl --shutdown".to_owned(),
+            ],
+            vec![format!("Driver and WSL setup steps: {WSL_DOCS_URL}")],
+        )
+    };
+    evidence.push(cause.to_owned());
+
+    let fix = Fix {
+        summary: "Expose the GPU to the distro: /dev/dxg is how WSL reaches it, and nothing works until it is there.".to_owned(),
+        commands,
+        fix_id: "fix-wsl-1-gpu-not-exposed".to_owned(),
+        auto_applicable: false,
+        verify: "ls -l /dev/dxg".to_owned(),
+        notes,
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-1-gpu-not-exposed",
+        "GPU not exposed to the distro (/dev/dxg missing)",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_2_dxcore_missing(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Without the device there is nothing for DXCore to talk to; fix-wsl-1 is the
+    // cause and this would only add a second finding for it.
+    if w.dxcore || !w.dxg_device {
+        return zero("fix-wsl-2-dxcore-missing", "WSL DXCore libraries missing");
+    }
+    let mut score = 50;
+    let mut evidence =
+        vec!["/usr/lib/wsl/lib/libdxcore.so is missing, so the ROCm runtime cannot reach the host driver".to_owned()];
+    if !w.wsl_lib_dir {
+        score += 15;
+        evidence.push("/usr/lib/wsl/lib does not exist at all".to_owned());
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Restore the WSL DXCore libraries, then make sure they are on the loader path."
+            .to_owned(),
+        commands: vec![
+            "# From Windows, refresh the WSL runtime that ships these libraries:".to_owned(),
+            "#   wsl --update".to_owned(),
+            "#   wsl --shutdown".to_owned(),
+            "# Inside the distro, confirm the loader can see them:".to_owned(),
+            "echo /usr/lib/wsl/lib | sudo tee /etc/ld.so.conf.d/wsl.conf".to_owned(),
+            "sudo ldconfig".to_owned(),
+        ],
+        needs_sudo: true,
+        fix_id: "fix-wsl-2-dxcore-missing".to_owned(),
+        auto_applicable: false,
+        verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore".to_owned(),
+        notes: vec![
+            "/usr/lib/wsl is mounted by WSL itself, not installed by the distro's package manager, so apt cannot repair it -- the fix is on the Windows side.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-2-dxcore-missing",
+        "WSL DXCore libraries missing or not on the loader path",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    if w.librocdxg || !w.dxg_device {
+        return zero("fix-wsl-3-rocdxg-missing", "ROCDXG not installed");
+    }
+    let mut score = 50;
+    let mut evidence = vec!["librocdxg.so was not found under any ROCm install".to_owned()];
+    if w.dxcore {
+        // The host side is ready and only the distro-side package is absent, which
+        // is both the most common case and the one the user can fix alone.
+        score += 15;
+        evidence.push(
+            "the WSL DXCore handoff is present, so only the distro-side ROCDXG is missing"
+                .to_owned(),
+        );
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Install ROCDXG inside the distro: it is the ROCm-to-DXCore shim the WSL path runs on.".to_owned(),
+        commands: vec![
+            "bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+            "# Or, to pin the package you install:".to_owned(),
+            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+        ],
+        needs_sudo: true,
+        fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
+        auto_applicable: false,
+        verify: "ldconfig -p | grep librocdxg".to_owned(),
+        notes: vec![
+            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. Set ROCDXG_SHA256 to verify the download against a digest you trust.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-3-rocdxg-missing",
+        "ROCDXG not installed in the distro",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Only meaningful once the library is actually on disk: when it is not,
+    // fix-wsl-3 is the finding and the missing linker entry is a consequence.
+    //
+    // The device guard matches its siblings. librocdxg can be installed while
+    // /dev/dxg is absent, and running `ldconfig` fixes nothing then -- offering
+    // it beside the real cause just leaves the user to guess which to act on.
+    // `Some(false)` only: `None` means ldconfig could not be run, and an
+    // unreadable linker cache is not an unregistered library.
+    if !w.librocdxg || w.ldconfig_librocdxg != Some(false) || !w.dxg_device {
+        return zero(
+            "fix-wsl-4-rocdxg-not-linked",
+            "ROCDXG installed but not on the loader path",
+        );
+    }
+    let mut score = 55;
+    let mut evidence = vec![
+        "librocdxg.so is installed but does not appear in `ldconfig -p`, so the runtime will not load it".to_owned(),
+    ];
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Refresh the linker cache so the installed ROCDXG becomes loadable.".to_owned(),
+        commands: vec!["sudo ldconfig".to_owned()],
+        needs_sudo: true,
+        fix_id: "fix-wsl-4-rocdxg-not-linked".to_owned(),
+        auto_applicable: false,
+        verify: "ldconfig -p | grep librocdxg".to_owned(),
+        notes: vec![
+            "If `ldconfig` alone does not fix it, the install went somewhere outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-4-rocdxg-not-linked",
+        "ROCDXG installed but invisible to the dynamic linker",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // `None` means the release could not be read. That is not evidence of an old
+    // distro, so this stays silent rather than guessing.
+    if w.distro_supported != Some(false) {
+        return zero("fix-wsl-5-distro-too-old", "Distro release below the floor");
+    }
+    let (major, minor) = crate::examine::WSL_MIN_UBUNTU;
+    let evidence = vec![format!(
+        "distro is {} {}, below the {major}.{minor:02} floor the WSL path requires",
+        e.distro_id, e.distro_version
+    )];
+    let fix = Fix {
+        summary: format!(
+            "Move to Ubuntu {major}.{minor:02} or newer: older releases ship a glibc the engines cannot run against."
+        ),
+        commands: vec![
+            "# From Windows, install a supported distro alongside the current one:".to_owned(),
+            "#   wsl --install -d Ubuntu-24.04".to_owned(),
+        ],
+        fix_id: "fix-wsl-5-distro-too-old".to_owned(),
+        auto_applicable: false,
+        verify: "grep VERSION_ID /etc/os-release".to_owned(),
+        notes: vec![
+            "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-5-distro-too-old",
+        "Distro release is below the supported floor for WSL",
+        70,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Abstain unless the host was actually reached. Treating "could not ask" as
+    // "driver is old" would fire on every host with interop switched off and on
+    // every container, where the question is unanswerable rather than answered.
+    //
+    // WSL 1 abstains too: it has no GPU path for any driver to serve, so the
+    // host's driver version cannot be the reason anything failed. Without this
+    // the symptom keywords alone were enough to raise it alongside fix-wsl-7,
+    // pointing the user at a Windows driver that could never have helped.
+    if !w.host_reachable || w.version == 1 {
+        return zero(
+            "fix-wsl-6-host-driver-too-old",
+            "Windows host GPU driver too old",
+        );
+    }
+    let mut score = 0;
+    let mut evidence = Vec::new();
+    match w.host_driver_version.as_deref() {
+        // Guarded on the device like its siblings: without /dev/dxg, fix-wsl-1
+        // is the finding, and adding a second one for the same root cause just
+        // leaves the user choosing between them.
+        Some("") if w.dxg_device => {
+            score += 45;
+            evidence.push(
+                "the Windows host reports no AMD display adapter, so no WSL-capable AMD driver is installed there"
+                    .to_owned(),
+            );
+        }
+        // The plumbing is present but the runtime still cannot see a GPU, which
+        // on a machine with a working DXCore handoff points at the host driver.
+        //
+        // `rocm_sees_gpu`, not `has_amd_gpu`: the probes that populate the latter
+        // are skipped on WSL, so it reads false on every host here, healthy or
+        // not, and this check fired on a complete working stack. `Some(false)`
+        // specifically -- `None` means rocminfo was absent so the question went
+        // unasked, which is not evidence of anything.
+        Some(version)
+            if w.dxg_device && w.dxcore && w.librocdxg && w.rocm_sees_gpu == Some(false) =>
+        {
+            score += 40;
+            evidence.push(format!(
+                "host AMD display driver {version} is installed and the distro plumbing is complete, but rocminfo enumerates no GPU"
+            ));
+        }
+        Some(_) | None => {}
+    }
+
+    // Symptom keywords only ever CORROBORATE machine evidence here; they cannot
+    // stand alone. Every other WSL entry either carries a base score from a fact
+    // or returns before scoring keywords, so this was the one place where the
+    // words a user typed could clear the threshold by themselves -- and the
+    // table it shares with fix-wsl-1 is generic enough ("/dev/dxg", "no
+    // HIP-capable device") that an ordinary description of any GPU failure hit
+    // 85 on a completely healthy machine, outranking the check that had found
+    // the real fault. The WSL-1 guard above was one instance of this; the floor
+    // is the general fix.
+    if score <= 0 {
+        return zero(
+            "fix-wsl-6-host-driver-too-old",
+            "Windows host GPU driver too old",
+        );
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_NO_DEVICE);
+    score += kw_score;
+    evidence.extend(kw_ev);
+    let fix = Fix {
+        summary: "Update the AMD driver on the Windows host: the GPU driver WSL uses lives there, not in the distro.".to_owned(),
+        commands: vec![
+            "# On the Windows host, not in this distro:".to_owned(),
+            "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.".to_owned(),
+        ],
+        fix_id: "fix-wsl-6-host-driver-too-old".to_owned(),
+        auto_applicable: false,
+        verify: "rocminfo | head -n 20".to_owned(),
+        notes: vec![
+            format!("Driver and ROCm version pairing: {WSL_DOCS_URL}"),
+            "Nothing inside the distro can carry this out -- `rocm fix` prints the steps because the change belongs to the Windows host.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-6-host-driver-too-old",
+        "Windows host AMD driver missing or too old for ROCm on WSL",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_7_wsl1(e: &Examination, _symptom: &str) -> Diagnosis {
+    if wsl_facts(e).version != 1 {
+        return zero("fix-wsl-7-wsl1", "Distro is running under WSL 1");
+    }
+    let evidence = vec![format!(
+        "kernel '{}' is a WSL 1 kernel; WSL 1 translates syscalls and exposes no GPU device at all",
+        e.kernel_release
+    )];
+    let fix = Fix {
+        summary: "Convert the distro to WSL 2: WSL 1 has no GPU path, so no amount of driver or package work will help.".to_owned(),
+        commands: vec![
+            "# From Windows PowerShell:".to_owned(),
+            "#   wsl --set-version <distro> 2".to_owned(),
+            "#   wsl --set-default-version 2".to_owned(),
+        ],
+        fix_id: "fix-wsl-7-wsl1".to_owned(),
+        auto_applicable: false,
+        verify: "uname -r".to_owned(),
+        notes: vec![
+            "Converting rewrites the distro's filesystem and can take a while on a large install; back up anything you cannot lose first.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-7-wsl1",
+        "Distro is running under WSL 1, which has no GPU support",
+        80,
+        evidence,
+        fix,
+    )
+}
+
+/// A checker plus the platform families it applies to.
 type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
 
+// The `wsl` entries below run on less evidence than on bare metal: WSL collects
+// no GPU topology (`gpus` is empty, because the probes that fill it read KFD and
+// DRM), so the parts of those checks that compare a detected gfx target against a
+// wheel's arch list cannot contribute. They still fire on the evidence WSL does
+// have -- environment, ROCm install, symptom keywords -- which is strictly better
+// than the previous behaviour of not running at all.
+//
+// The degradation is one-directional and must stay that way: less evidence means
+// a check may miss a real fault, never that it invents one. Pinned by
+// `the_shared_checks_under_report_on_wsl_rather_than_over_report`.
 const CHECKERS: &[Checker] = &[
-    (check_1_arch_not_in_wheel, &["linux", "windows"]),
-    (check_2_hsa_override_unneeded, &["linux", "windows"]),
+    (check_1_arch_not_in_wheel, &["linux", "windows", "wsl"]),
+    (check_2_hsa_override_unneeded, &["linux", "windows", "wsl"]),
     (check_3_rocm_kernel_unsupported, &["linux"]),
     (check_4_render_group, &["linux"]),
     (check_5_amdgpu_blacklisted, &["linux"]),
-    (check_6_path_missing, &["linux", "windows"]),
+    (check_6_path_missing, &["linux", "windows", "wsl"]),
     (check_7_stale_repos, &["linux"]),
-    (check_8_wheel_rocm_mismatch, &["linux", "windows"]),
+    (check_8_wheel_rocm_mismatch, &["linux", "windows", "wsl"]),
+    // Not "wsl": WSL2 exposes no per-device topology to collide over.
     (check_9_igpu_dgpu_collision, &["linux", "windows"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
@@ -1290,25 +1727,62 @@ const CHECKERS: &[Checker] = &[
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
+    (check_wsl_1_gpu_not_exposed, WSL_ONLY),
+    (check_wsl_2_dxcore_missing, WSL_ONLY),
+    (check_wsl_3_rocdxg_missing, WSL_ONLY),
+    (check_wsl_4_rocdxg_not_linked, WSL_ONLY),
+    (check_wsl_5_distro_too_old, WSL_ONLY),
+    (check_wsl_6_host_driver_too_old, WSL_ONLY),
+    (check_wsl_7_wsl1, WSL_ONLY),
 ];
+
+const WSL_ONLY: &[&str] = &["wsl"];
+
+/// The platform family a catalog entry is selected by.
+///
+/// This is deliberately NOT `Examination::os_family`. WSL2 reports an `os_family`
+/// of `linux` and must keep doing so — `install`, `serve` and the engine crates
+/// branch on it — but it is a different platform for diagnosis: it reaches the
+/// GPU through `/dev/dxg` and the Windows host driver, with no `amdgpu` module
+/// and no `/dev/kfd`.
+///
+/// Resolving the family here rather than in each check is what makes the split
+/// safe. Every bare-metal entry is tagged `linux` only, so it stops applying on
+/// WSL automatically; an entry that genuinely applies to both opts in by naming
+/// `wsl` as well. That preserves the property the old wholesale WSL short-circuit
+/// bought — no `fix-4-render-group` on a healthy WSL box — without also
+/// suppressing the checks that were always valid there.
+const fn platform_family(e: &Examination) -> &str {
+    if e.is_wsl {
+        return "wsl";
+    }
+    if e.os_family.is_empty() {
+        return "linux";
+    }
+    e.os_family.as_str()
+}
 
 /// Run every applicable checker, drop zero-score results, sort by score
 /// descending (stable, so ties keep catalog order).
 fn run_all_checks(e: &Examination, symptom: &str) -> Vec<Diagnosis> {
-    let os_family = if e.os_family.is_empty() {
-        "linux"
-    } else {
-        e.os_family.as_str()
-    };
+    let family = platform_family(e);
     let mut results: Vec<Diagnosis> = CHECKERS
         .iter()
-        .filter(|(_, applicable)| applicable.contains(&os_family))
+        .filter(|(_, applicable)| applicable.contains(&family))
         .map(|(check, _)| check(e, symptom))
         .filter(|d| d.score > 0)
         .collect();
     // Stable sort by score descending: ties keep catalog order.
     results.sort_by_key(|d| std::cmp::Reverse(d.score));
     results
+}
+
+/// Whether any catalog entry at all applies to this platform.
+fn catalog_covers(e: &Examination) -> bool {
+    let family = platform_family(e);
+    CHECKERS
+        .iter()
+        .any(|(_, applicable)| applicable.contains(&family))
 }
 
 fn route_when_no_match(e: &Examination) -> Route {
@@ -1329,12 +1803,15 @@ fn route_when_no_match(e: &Examination) -> Route {
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
-    // WSL2 is a distinct platform (it uses /dev/dxg + the Windows host driver,
-    // not the in-tree amdgpu module or /dev/kfd), and `examine` already treats
-    // it as out of scope (exit_code() == 2). Mirror that here: skip the
-    // bare-metal Linux catalog entirely so we don't emit false positives like
-    // fix-4-render-group / fix-5-amdgpu-load on a healthy WSL2 box.
-    let out_of_scope = wsl_out_of_scope_message(e);
+    // WSL2 used to be short-circuited here as out of scope. It is a real platform
+    // in the catalog now, with its own entries; what keeps the bare-metal checks
+    // off it is `platform_family`, not a special case at this level.
+    //
+    // `out_of_scope` still exists, for the platforms that genuinely have no
+    // entries. That case used to fall through to an empty catalog and report "no
+    // known misconfiguration", which reads as "your machine looks fine" when the
+    // truth is that nothing was ever checked.
+    let out_of_scope = uncovered_platform_message(e);
     let matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
@@ -1353,15 +1830,19 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
 /// ROCm-on-WSL2 setup guidance (distinct from the bare-metal catalog).
 const WSL_DOCS_URL: &str = "https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
-fn wsl_out_of_scope_message(e: &Examination) -> Option<String> {
-    e.is_wsl.then(|| {
-        format!(
-            "ROCm on WSL2 is a distinct platform: it uses /dev/dxg and the Windows host \
-             driver (dxgkrnl), not the in-tree amdgpu kernel module or /dev/kfd. This catalog \
-             targets bare-metal Linux, so its checks (render group, /dev/kfd, modprobe amdgpu) \
-             do not apply here. For ROCm-on-WSL2 setup, see {WSL_DOCS_URL}"
-        )
-    })
+/// Say so when the catalog has no entries for the running platform.
+///
+/// Returning `None` here means the platform is covered, not that it is healthy.
+fn uncovered_platform_message(e: &Examination) -> Option<String> {
+    if catalog_covers(e) {
+        return None;
+    }
+    Some(format!(
+        "rocm diagnose covers Linux, Windows and WSL2. This host reports '{}', which the \
+         catalog has no entries for, so nothing was checked -- this is not a clean bill of \
+         health. Run `rocm examine --json` and report the platform upstream.",
+        e.os_family
+    ))
 }
 
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
@@ -1763,29 +2244,474 @@ mod tests {
         assert!(report.matched.iter().all(|d| d.id != "fix-1-arch"));
     }
 
-    #[test]
-    fn wsl2_is_out_of_scope_and_emits_no_false_positives() {
+    /// A WSL2 host with the GPU stack fully in place.
+    fn wsl_base() -> Examination {
         let mut e = linux_base();
         e.is_wsl = true;
-        // Signals that WOULD fire fix-4/fix-5/fix-3/fix-6 on bare-metal Linux —
-        // all normal/irrelevant on WSL2, so none must surface.
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.kernel_release = "6.6.87.2-microsoft-standard-WSL2".to_owned();
+        e.wsl = Some(WslFacts {
+            version: 2,
+            dxg_device: true,
+            dxcore: true,
+            wsl_lib_dir: true,
+            librocdxg: true,
+            rocdxg_dids: true,
+            ldconfig_librocdxg: Some(true),
+            rocminfo: true,
+            rocm_sees_gpu: Some(true),
+            distro_supported: Some(true),
+            host_driver_version: Some("32.0.12033.1030".to_owned()),
+            host_reachable: true,
+            locally_probed: true,
+        });
+        // The shared cross-platform checks read these, and on a real WSL host
+        // `probe_wsl` fills them from the WSL facts. A fixture that left them at
+        // their defaults would be a healthier machine than any real one.
+        e.rocminfo_present = true;
+        e.rocminfo_status = "ok".to_owned();
+        e
+    }
+
+    #[test]
+    fn wsl2_never_runs_the_bare_metal_catalog() {
+        // The property the old wholesale WSL short-circuit bought, kept after
+        // WSL became a real platform in the catalog. Every signal below WOULD
+        // fire a bare-metal check; none of them mean anything on WSL2, where
+        // there is no amdgpu module, no /dev/kfd and no render group.
+        let mut e = wsl_base();
         e.in_render_group = Some(false);
         e.in_video_group = Some(false);
         e.amdgpu_loaded = Some(false);
         e.rocm_version = "6.4.1".to_owned();
-        e.rocm_path = "/opt/rocm".to_owned();
-        e.rocminfo_present = false;
+        e.amdgpu_blacklisted_in = vec!["/etc/modprobe.d/blacklist.conf".to_owned()];
+        e.rocm_repos_seen = vec![
+            "repo.radeon.com/rocm/6.2".to_owned(),
+            "repo.radeon.com/rocm/6.4".to_owned(),
+        ];
         let report = diagnose(&e, "unable to open /dev/kfd permission denied");
+        for bare_metal in [
+            "fix-3-rocm-kernel",
+            "fix-4-render-group",
+            "fix-5-amdgpu-load",
+            "fix-7-stale-repos",
+            "fix-10-container",
+            "fix-11-iommu",
+            "fix-12-installer",
+        ] {
+            assert!(
+                !report.matched.iter().any(|d| d.id == bare_metal),
+                "{bare_metal} must not fire on WSL2"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_checks_never_fire_on_bare_metal() {
+        // The converse guard. A bare-metal host has no WSL facts at all, and the
+        // WSL checks read those facts as false -- so without the family gate they
+        // would report a missing /dev/dxg on every ordinary Linux box.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        assert!(
+            !report.matched.iter().any(|d| d.id.starts_with("fix-wsl-")),
+            "no WSL entry may fire on bare metal: {:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_healthy_wsl_host_gets_no_diagnosis() {
+        // Scenario 2: the platform is covered, so `out_of_scope` stays clear, and
+        // a symptom the catalog does not recognise must not manufacture a cause.
+        let report = diagnose(&wsl_base(), "the model output looks wrong");
+        assert!(
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform now"
+        );
+        // Emptiness, not just `!has_match()`. A sub-threshold finding is still
+        // printed and still tells the user something is wrong with their machine,
+        // so a healthy host must produce NO entries at all. Asserting only on the
+        // verdict let a permanent score-40 false positive through: the host-driver
+        // check read a field the WSL probe never populates.
         assert!(
             report.matched.is_empty(),
-            "WSL2 must not run the bare-metal catalog"
-        );
-        assert!(
-            report.out_of_scope.is_some(),
-            "WSL2 should be flagged out of scope"
+            "a healthy WSL host must produce no findings at all, got: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
         );
         assert!(!report.has_match());
-        assert!(report.out_of_scope.as_deref().unwrap().contains("WSL2"));
+        assert!(!report.route_when_no_match.url.is_empty());
+    }
+
+    #[test]
+    fn an_installed_rocm_is_not_reported_as_missing_from_path_on_wsl() {
+        // `rocminfo_present` is set by the bare-metal GPU probe, which WSL skips.
+        // Left at its default it read as "rocminfo is not on PATH", so fix-6 --
+        // enabled on WSL because PATH problems are real there -- scored 50 on
+        // every WSL host that had ROCm installed.
+        let mut e = wsl_base();
+        e.rocm_path = "/opt/rocm".to_owned();
+        e.rocminfo_present = true;
+        e.env
+            .insert("PATH".to_owned(), "/opt/rocm/bin:/usr/bin:/bin".to_owned());
+        let report = diagnose(&e, "");
+        assert!(
+            !report.matched.iter().any(|d| d.id == "fix-6-path"),
+            "ROCm is installed and on PATH here: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_is_not_reported_when_the_device_is_missing() {
+        // librocdxg can be installed while /dev/dxg is absent. Running `ldconfig`
+        // then fixes nothing, and offering it alongside the real cause leaves the
+        // user to guess which to act on -- the same reason the DXCore and ROCDXG
+        // checks already stand down without the device.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_dxg_device_is_the_top_finding() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").dxg_device = false;
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-1-gpu-not-exposed");
+        assert!(top.score >= HIGH_CONFIDENCE, "score {}", top.score);
+    }
+
+    #[test]
+    fn a_container_without_the_device_is_not_blamed_on_the_windows_driver() {
+        // A container on WSL2 reports itself as WSL but only sees /dev/dxg when
+        // it was started with it. Telling that user to update a Windows driver
+        // sends them to fix a machine that was never broken.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").dxg_device = false;
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-1-gpu-not-exposed");
+        assert!(
+            top.evidence.iter().any(|line| line.contains("container")),
+            "evidence must name the container as the reason: {:?}",
+            top.evidence
+        );
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("host driver is probably fine")),
+            "must say the Windows driver is not the suspect: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn only_the_root_cause_of_a_broken_stack_is_reported() {
+        // With no device, the missing DXCore shim and the missing ROCDXG package
+        // are consequences, not causes. Reporting all three would leave the user
+        // to guess which one to act on.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.dxcore = false;
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_rocdxg_package_is_reported_when_the_host_side_is_ready() {
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-3-rocdxg-missing");
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            !fix.auto_applicable,
+            "installing a .deb with sudo must stay print-only"
+        );
+        assert!(
+            fix.notes.iter().any(|n| n.contains("ROCDXG_SHA256")),
+            "must offer the checksum option: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn an_installed_but_unlinked_rocdxg_is_a_distinct_finding() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-4-rocdxg-not-linked");
+    }
+
+    #[test]
+    fn a_distro_below_the_floor_is_reported() {
+        let mut e = wsl_base();
+        e.distro_version = "22.04".to_owned();
+        e.wsl.as_mut().expect("wsl facts").distro_supported = Some(false);
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-5-distro-too-old");
+        assert!(
+            top.evidence[0].contains("22.04"),
+            "evidence must name the release found: {:?}",
+            top.evidence
+        );
+    }
+
+    #[test]
+    fn an_unreadable_distro_release_is_not_reported_as_too_old() {
+        // `None` means the release could not be parsed. That is not evidence of
+        // an old distro, and a finding here would send the user to reinstall a
+        // perfectly supported one.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").distro_supported = None;
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-5-distro-too-old"),
+            "must not guess: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_typed_symptom_alone_never_blames_the_windows_host_driver() {
+        // The host-driver check shares a generic keyword table with fix-wsl-1
+        // ("/dev/dxg", "no HIP-capable device"), and unlike every other WSL entry
+        // it has no base score from a fact. Scoring keywords before checking that
+        // anything was actually measured let an ordinary description of a GPU
+        // problem reach 85 -- HIGH confidence -- on a fully healthy machine,
+        // with both evidence lines being the user's own words.
+        let symptom = "no hip-capable device found, see /dev/dxg";
+        let report = diagnose(&wsl_base(), symptom);
+        assert!(
+            report.matched.is_empty(),
+            "a healthy host must stay silent whatever the user typed: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // And the real cause must outrank a keyword-only guess. With ROCDXG
+        // missing, the driver check previously scored 85 against fix-wsl-3's 65
+        // and sent the user to reinstall a current driver.
+        let mut broken = wsl_base();
+        let w = broken.wsl.as_mut().expect("wsl facts");
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&broken, symptom);
+        assert_eq!(
+            report.matched[0].id,
+            "fix-wsl-3-rocdxg-missing",
+            "the measured fault must rank first: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_linker_cache_is_not_an_unregistered_library() {
+        // `ldconfig` lives in /sbin, off a non-root user's PATH on Debian. When
+        // it cannot be run the cache is unknown, not empty -- reading it as empty
+        // told users with a correctly installed ROCDXG to re-run `ldconfig`.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").ldconfig_librocdxg = None;
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-4-rocdxg-not-linked"),
+            "unknown must not be reported as not-linked: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_amd_adapter_is_not_reported_twice_with_the_device_missing() {
+        // Without /dev/dxg, fix-wsl-1 is the cause. The driver check's
+        // no-adapter arm lacked the device guard its siblings carry, so both
+        // fired for one root cause.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.host_driver_version = Some(String::new());
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_dxcore_shim_is_reported_when_the_device_is_present() {
+        // The only WSL entry with no fire-case test: both existing tests that
+        // clear `dxcore` also clear `dxg_device`, so they exercised the abstain
+        // path and an inverted condition here would have passed CI.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxcore = false;
+        w.wsl_lib_dir = false;
+        let report = diagnose(&e, "libdxcore.so: cannot open shared object file");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-2-dxcore-missing");
+        assert!(top.score >= MIN_SCORE_FOR_MATCH, "score {}", top.score);
+    }
+
+    #[test]
+    fn an_unreachable_windows_host_never_blames_the_host_driver() {
+        // Scenario 6. Interop is off or this is a container, so the host driver
+        // is unknown -- and unknown must not read as "too old".
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.host_reachable = false;
+        w.host_driver_version = None;
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-6-host-driver-too-old"),
+            "the check must abstain when the host was never asked: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_amd_adapter_is_reported() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").host_driver_version = Some(String::new());
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-6-host-driver-too-old");
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("Nothing inside the distro")),
+            "must say the remedy belongs to the Windows host: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn wsl1_is_reported_instead_of_a_missing_device() {
+        // WSL 1 has no GPU path at all, so "install a driver" is the wrong advice
+        // and fix-wsl-1 must stand down in favour of the conversion.
+        let mut e = wsl_base();
+        e.kernel_release = "4.4.0-19041-Microsoft".to_owned();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.version = 1;
+        w.dxg_device = false;
+        w.dxcore = false;
+        w.wsl_lib_dir = false;
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-7-wsl1"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn the_shared_checks_under_report_on_wsl_rather_than_over_report() {
+        // WSL does not collect GPU topology: `gpus` stays empty because the
+        // probes that fill it read KFD and DRM, which do not exist there. The
+        // cross-platform checks enabled on WSL read those fields, so they run on
+        // less evidence here than on bare metal.
+        //
+        // That degradation has to be one-directional. Missing topology must mean
+        // a check cannot reach its threshold on structure alone -- never that it
+        // invents a fault. This pins the direction: on a healthy host with a
+        // framework installed, no shared check may fire at all.
+        let mut e = wsl_base();
+        e.framework = "pytorch".to_owned();
+        e.framework_version = "2.6.0".to_owned();
+        e.framework_rocm_version = "6.4".to_owned();
+        e.rocm_version = "6.4.1".to_owned();
+        e.framework_arch_list = vec!["gfx1100".to_owned(), "gfx1151".to_owned()];
+        e.rocm_path = "/opt/rocm".to_owned();
+        e.env
+            .insert("PATH".to_owned(), "/opt/rocm/bin:/usr/bin".to_owned());
+        assert!(e.gpus.is_empty(), "WSL collects no GPU topology");
+
+        let report = diagnose(&e, "");
+        assert!(
+            report.matched.is_empty(),
+            "no shared check may fire without topology: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_environment_override_is_still_diagnosed_on_wsl() {
+        // The gain from the family split: HSA_OVERRIDE_GFX_VERSION has nothing to
+        // do with the kernel module, so it was always a valid question on WSL --
+        // but the old wholesale skip meant it went unanswered there.
+        let mut e = wsl_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        let report = diagnose(&e, "memory access fault page fault");
+        assert!(
+            report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-2-unset-override"),
+            "matched: {:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_platform_with_no_catalog_entries_says_nothing_was_checked() {
+        // Previously only WSL set this. An unsupported OS fell through to an
+        // empty catalog and reported "no known misconfiguration", which reads as
+        // a clean bill of health when in truth nothing ran.
+        let mut e = linux_base();
+        e.os_family = "other".to_owned();
+        let report = diagnose(&e, "anything at all");
+        let reason = report
+            .out_of_scope
+            .as_deref()
+            .expect("an uncovered platform must say so");
+        assert!(reason.contains("other"), "must name the platform: {reason}");
+        assert!(
+            reason.contains("not a clean bill of health"),
+            "must not be mistaken for a pass: {reason}"
+        );
+        assert!(report.matched.is_empty());
+        assert!(!report.has_match());
     }
 
     #[test]
