@@ -15328,6 +15328,86 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     }))
 }
 
+/// What [`stop_managed_services_before_uninstall`] managed to do, so the caller
+/// can report the services it stopped and refuse to proceed while any is still
+/// alive.
+#[derive(Debug, Default)]
+struct ManagedServiceStopReport {
+    /// Services confirmed stopped (every recorded process observed gone).
+    stopped: Vec<String>,
+    /// Services that could not be confirmed stopped — a still-serving endpoint
+    /// or an unverifiable process. Uninstall must abort rather than remove the
+    /// tooling that stops them.
+    failed: Vec<String>,
+}
+
+/// Stop every live managed service before uninstall removes the binaries and
+/// service records needed to stop them.
+///
+/// The defect this closes (EAI-8014): uninstall reported success while a
+/// publicly-bound, GPU-holding managed server kept serving, and deleted the
+/// `rocm`/`rocmd` binaries and service manifests — so the supported
+/// `rocm services stop` path was gone and only a manual PID kill remained.
+///
+/// A service is only counted stopped when [`stop_internal_managed_service`]
+/// confirms every recorded process is gone (its `status` reaches `stopped`);
+/// anything else lands in `failed` so the caller aborts and keeps the tooling.
+///
+/// Fail-closed on discovery too: if the services directory exists but cannot be
+/// enumerated, the error propagates so uninstall aborts rather than deleting the
+/// tooling while blind to what it manages. (`load_managed_services` returns an
+/// empty list — not an error — when no services directory exists, so a clean
+/// install still uninstalls.)
+fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedServiceStopReport> {
+    let mut report = ManagedServiceStopReport::default();
+    for record in load_managed_services(paths)? {
+        if !managed_service_is_live(&record) {
+            continue;
+        }
+        let stopped = stop_internal_managed_service(paths, &record.service_id)
+            .ok()
+            .and_then(|result| {
+                result
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|status| status == "stopped")
+            })
+            .unwrap_or(false);
+        if stopped {
+            report.stopped.push(record.service_id);
+        } else {
+            report.failed.push(record.service_id);
+        }
+    }
+    Ok(report)
+}
+
+/// Decide whether uninstall may proceed to remove files, given the outcome of
+/// stopping managed services.
+///
+/// Returns an optional line to print before removal proceeds, or an error that
+/// aborts uninstall with nothing removed when a service could not be stopped —
+/// so the binaries and service records needed to recover stay in place. Kept
+/// separate from the removal it guards so the abort branch (the core safety
+/// guarantee) is unit-testable without an unkillable process.
+fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Result<Option<String>> {
+    if !report.failed.is_empty() {
+        bail!(
+            "uninstall aborted: could not stop managed service(s): {}. Their endpoints may still \
+             be serving and holding the GPU. Stop them with `rocm services stop <id> --yes`, then \
+             re-run uninstall. No files were removed.",
+            report.failed.join(", ")
+        );
+    }
+    if report.stopped.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "stopped {} managed service(s) before removal",
+        report.stopped.len()
+    )))
+}
+
 fn unload_lemonade_service_model(record: &ManagedServiceRecord) -> Result<()> {
     let body = serde_json::json!({
         "model_name": record.canonical_model_id,
@@ -17575,7 +17655,7 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
     let managed_services = load_managed_services(paths).unwrap_or_default();
     if !managed_services.is_empty() {
         plan.warnings.push(format!(
-            "{} managed service record(s) exist under {}; background processes are not stopped automatically in this pass",
+            "{} managed service record(s) exist under {}; their servers will be stopped before removal",
             managed_services.len(),
             paths.services_dir().display()
         ));
@@ -29592,6 +29672,122 @@ ID_LIKE="suse opensuse"
             "the verified process must be terminated"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    // Linux-only, not merely unix: these rely on `process_start_ticks` (Some on
+    // Linux, None elsewhere) and zombie-state detection in `terminate_verified`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_stops_live_managed_service_and_reports_it() {
+        // EAI-8014: a live managed server must be stopped before uninstall
+        // removes the tooling that stops it, and reported so the operator knows.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn managed server");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-stops-live");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = managed_record_for_pid(&paths, pid, Some(real));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(report.failed.is_empty(), "nothing should fail: {report:?}");
+        assert_eq!(report.stopped, vec![record.service_id]);
+        // Reap our own child so the liveness check does not observe a zombie.
+        let mut child = child;
+        let _ = child.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the managed server must be stopped before uninstall proceeds"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_skips_already_dead_managed_service() {
+        // A service whose process already crashed is not live; it must neither be
+        // counted as stopped by us nor fail the abort gate that keeps the tooling.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the process must be gone before the record is loaded"
+        );
+        let (root, paths) = test_paths("uninstall-skips-dead");
+        let mut record = managed_record_for_pid(&paths, pid, None);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.stopped.is_empty() && report.failed.is_empty(),
+            "a crashed service must not abort uninstall: {report:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_removal_gate_aborts_when_a_service_cannot_be_stopped() {
+        // The core safety guarantee: a service that could not be confirmed stopped
+        // aborts uninstall (Err, so the removal loop never runs — nothing removed),
+        // and the message names the offending service and points at the recovery
+        // path. Guards against a regression that would delete the tooling while a
+        // GPU-holding endpoint keeps serving (EAI-8014).
+        let report = ManagedServiceStopReport {
+            stopped: vec!["svc-stopped".to_owned()],
+            failed: vec!["svc-stuck".to_owned()],
+        };
+        let error = uninstall_removal_gate(&report)
+            .expect_err("a non-empty `failed` must abort uninstall")
+            .to_string();
+        assert!(
+            error.contains("svc-stuck"),
+            "names the stuck service: {error}"
+        );
+        assert!(
+            error.contains("rocm services stop"),
+            "points at the recovery path: {error}"
+        );
+        assert!(
+            error.contains("No files were removed"),
+            "states nothing was deleted: {error}"
+        );
+    }
+
+    #[test]
+    fn uninstall_removal_gate_reports_count_when_all_stopped() {
+        let report = ManagedServiceStopReport {
+            stopped: vec!["a".to_owned(), "b".to_owned()],
+            failed: Vec::new(),
+        };
+        let line = uninstall_removal_gate(&report).expect("all stopped must proceed");
+        assert_eq!(
+            line.as_deref(),
+            Some("stopped 2 managed service(s) before removal")
+        );
+    }
+
+    #[test]
+    fn uninstall_removal_gate_is_silent_with_nothing_to_stop() {
+        let report = ManagedServiceStopReport::default();
+        assert!(
+            uninstall_removal_gate(&report)
+                .expect("no services must proceed")
+                .is_none(),
+            "no managed services means no line to print"
+        );
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
