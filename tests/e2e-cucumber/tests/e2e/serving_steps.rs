@@ -986,7 +986,6 @@ async fn open_oom_serve_summary(world: &mut E2eWorld) {
         .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
     world.tui = Some(session);
 }
-}
 
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
@@ -1134,8 +1133,13 @@ async fn assert_no_oom_memory_guidance(world: &mut E2eWorld) {
         .as_ref()
         .expect("no interactive serve summary")
         .screen_text();
+    // Match whitespace-insensitively, exactly as the positive assertions do: the
+    // note is a long line the 80-column PTY wraps across grid rows, so a literal
+    // `contains("ran out of GPU memory")` would never match the rendered note and
+    // this negative check would pass even if the note WERE wrongly shown. Collapse
+    // whitespace so a mis-rendered note is actually caught.
     assert!(
-        !screen.contains("ran out of GPU memory"),
+        !screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
         "reusing an already-running service must not blame this invocation for \
          another process's OOM:\n{screen}"
     );

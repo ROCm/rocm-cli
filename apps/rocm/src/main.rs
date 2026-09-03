@@ -5069,6 +5069,20 @@ fn serve(args: ServeArgs) -> Result<()> {
             policy = device_policy_name(&device_policy)
         );
     }
+    // Validate the pinned `--gpu` index and resolve the GPU set BEFORE any
+    // runtime or engine work, so an index that does not exist on the host is
+    // rejected up front (`serve-absent-gpu-index-rejected`: "refused before any
+    // engine starts") rather than after `ensure_self_managed_engine_ready` has
+    // begun preparing the engine. It sits after the no-usable-GPU pre-flight so a
+    // GPU-less host still refuses with "no usable AMD GPU" before the index is
+    // ever inspected. A reuse pins no GPU, but validating the index here is
+    // side-effect-free and keeps a bad `--gpu` from being silently ignored.
+    let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
+    let gpu_indices = if cpu_only {
+        Vec::new()
+    } else {
+        resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
+    };
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
         && resolved_selection.env_id.is_none()
@@ -5085,12 +5099,6 @@ fn serve(args: ServeArgs) -> Result<()> {
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
-    let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
-    let gpu_indices = if cpu_only {
-        Vec::new()
-    } else {
-        resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
-    };
     let resolve = match resolved_model {
         Some(resolve) => resolve,
         None => engine_request::<_, ResolveModelResponse>(
