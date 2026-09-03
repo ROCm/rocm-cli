@@ -22,6 +22,8 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::engine_registry::EngineKind;
+
 /// Timeout for /metrics scrapes (short; must never stall the cell sweep).
 const METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -390,12 +392,25 @@ async fn run_cell_with_clients(
             (Some(running), Some(waiting))
         });
 
-    // TTFT/TPOT deltas come from the before/after histogram scrapes (unchanged).
-    let (_, _, ttft_ms, tpot_ms) = prom_deltas(prom_before.as_ref(), prom_after.as_ref());
+    // TTFT/TPOT latency from the before/after histogram scrapes: the windowed
+    // mean over just the requests this cell issued. A field stays blank when the
+    // window is not measurable (a scrape missing, the counter flat, or a reset)
+    // rather than borrowing the endpoint's lifetime average, which would fold in
+    // traffic from earlier ramp cells or other clients.
+    let (ttft_ms, tpot_ms) = prom_latency(prom_before.as_ref(), prom_after.as_ref());
+
+    // The `/metrics` scraper only understands vLLM's `vllm:` series, so a
+    // recognisable sample is proof the endpoint is vLLM; a non-vLLM endpoint
+    // leaves the column blank rather than guessing. `engine` is a new column:
+    // rows appended before this change have it blank, and since `engine` is a
+    // rollup key, a shared `results.csv` spanning the upgrade splits a cell's
+    // trials into blank and `vllm` groups — rotate the file to regroup them.
+    let engine = detect_engine(prom_before.as_ref(), prom_after.as_ref());
 
     let row = BenchmarkRow {
         cell: format!("bench-c{concurrency}"),
         run: 1,
+        engine,
         model: Some(spec.model.clone()),
         concurrency: Some(concurrency),
         input_len: Some(spec.input_len),
@@ -423,32 +438,85 @@ async fn run_cell_with_clients(
     })
 }
 
-/// Compute latency deltas from two Prometheus samples.
+/// Best-effort engine label for the CSV `engine` column from a scrape pair.
 ///
-/// Returns `((), (), ttft_ms, tpot_ms)` — the first two elements are `None`
-/// placeholder for the deprecated peak fields (peaks now come from the
-/// mid-cell poller; this function only computes histogram deltas).
-/// If either sample is `None`, both latency fields are `None`.
-fn prom_deltas(
+/// The load generator's only view of the backend is its Prometheus `/metrics`
+/// endpoint, and [`crate::vllm_prom::parse`] only recognises vLLM's `vllm:`
+/// series. A sample carrying any recognised field is therefore proof the
+/// endpoint is vLLM. Returns `None` when neither scrape produced a recognisable
+/// sample (a non-vLLM endpoint, a 404, or a malformed body), leaving the column
+/// blank rather than guessing.
+fn detect_engine(
     before: Option<&InstanceSample>,
     after: Option<&InstanceSample>,
-) -> (Option<u32>, Option<u32>, Option<f64>, Option<f64>) {
-    let (Some(b), Some(a)) = (before, after) else {
-        return (None, None, None, None);
-    };
-
-    let ttft_ms = latency_delta_ms(b.ttft_sum_s, b.ttft_count, a.ttft_sum_s, a.ttft_count);
-    let tpot_ms = latency_delta_ms(b.tpot_sum_s, b.tpot_count, a.tpot_sum_s, a.tpot_count);
-
-    (None, None, ttft_ms, tpot_ms)
+) -> Option<String> {
+    let recognised = [after, before].into_iter().flatten().any(sample_is_vllm);
+    // Take the label from the registry (`engine_registry.rs`) rather than
+    // respelling it here: `engine` is a rollup key, so a spelling that drifted
+    // from the registry would silently split rollup groups.
+    recognised.then(|| EngineKind::Vllm.label().to_string())
 }
 
-/// Compute `Δsum / Δcount * 1000` (ms).
+/// Whether a parsed sample carries any vLLM-specific field.
 ///
-/// Returns `None` if either input is `None`, if the count delta is not
-/// positive (avoids division by zero and nonsense from stale counters),
-/// or if the sum delta is negative (counter reset).
-fn latency_delta_ms(
+/// `gen_tps` is deliberately excluded: it is the rate-reporting seam other
+/// engines (e.g. Lemonade) populate, not a vLLM signal, and the vLLM parser
+/// never sets it.
+const fn sample_is_vllm(s: &InstanceSample) -> bool {
+    s.kv_cache_usage_pct.is_some()
+        || s.running_reqs.is_some()
+        || s.waiting_reqs.is_some()
+        || s.gen_tokens_total.is_some()
+        || s.ttft_sum_s.is_some()
+        || s.ttft_count.is_some()
+        || s.tpot_sum_s.is_some()
+        || s.tpot_count.is_some()
+}
+
+/// Compute TTFT/TPOT latency (ms) from two Prometheus samples.
+///
+/// Returns `(ttft_ms, tpot_ms)`, each the windowed mean over just the requests
+/// this cell issued (see [`latency_ms`]). Either field is `None` when its
+/// window is not measurable — including a flat TPOT counter, which for vLLM
+/// means no inter-token gap was recorded in the window, i.e. the value is
+/// genuinely unmeasured for this cell rather than zero.
+fn prom_latency(
+    before: Option<&InstanceSample>,
+    after: Option<&InstanceSample>,
+) -> (Option<f64>, Option<f64>) {
+    let ttft_ms = latency_ms(
+        before.and_then(|s| s.ttft_sum_s),
+        before.and_then(|s| s.ttft_count),
+        after.and_then(|s| s.ttft_sum_s),
+        after.and_then(|s| s.ttft_count),
+    );
+    let tpot_ms = latency_ms(
+        before.and_then(|s| s.tpot_sum_s),
+        before.and_then(|s| s.tpot_count),
+        after.and_then(|s| s.tpot_sum_s),
+        after.and_then(|s| s.tpot_count),
+    );
+    (ttft_ms, tpot_ms)
+}
+
+/// Windowed latency (ms) across the cell's two histogram scrapes.
+///
+/// Computes `Δsum/Δcount × 1000` — the mean latency of just the requests this
+/// cell issued between the before- and after-scrape. Returns `None` when the
+/// window cannot be measured: either scrape missing, the observation count did
+/// not advance (`Δcount ≤ 0`, no request recorded this metric in the window),
+/// or the counter reset (`Δsum < 0`, a server restart).
+///
+/// The value is deliberately *not* backfilled from the after-scrape's lifetime
+/// `sum/count` average. That average covers every request the server process
+/// ever handled — earlier ramp cells and other clients included — so writing it
+/// into this cell's immutable CSV row would describe a different population than
+/// the row names, with nothing to flag it. A blank column therefore honestly
+/// means "not measured for this cell". (This is narrower than the telemetry
+/// daemon's `avg_ms_from_histogram`, which *does* fall back: it is a repeated
+/// live poll with a rolling baseline that self-corrects on the next tick and
+/// persists nothing, so the trade-offs differ.)
+fn latency_ms(
     sum_before: Option<f64>,
     count_before: Option<f64>,
     sum_after: Option<f64>,
@@ -456,10 +524,8 @@ fn latency_delta_ms(
 ) -> Option<f64> {
     let delta_sum = sum_after? - sum_before?;
     let delta_count = count_after? - count_before?;
-    if delta_count <= 0.0 || delta_sum < 0.0 {
-        return None;
-    }
-    Some(delta_sum / delta_count * 1000.0)
+    // Guard division by zero (flat counter) and counter resets.
+    (delta_count > 0.0 && delta_sum >= 0.0).then_some(delta_sum / delta_count * 1000.0)
 }
 
 /// Concurrency levels tried by [`run_auto_ramp`] in order.
@@ -1067,6 +1133,10 @@ mod tests {
         );
         assert_eq!(row.ttft_ms, None, "ttft_ms should be None for 404 /metrics");
         assert_eq!(row.tpot_ms, None, "tpot_ms should be None for 404 /metrics");
+        assert_eq!(
+            row.engine, None,
+            "engine should be blank for a non-vLLM (404 /metrics) endpoint"
+        );
         assert!(
             row.gen_tps.unwrap_or(0.0) > 0.0,
             "gen_tps must still be positive"
@@ -1505,5 +1575,224 @@ mod tests {
             reason.contains("usage"),
             "the reason should name the missing field, got: {reason}"
         );
+    }
+
+    // ---------- engine + tpot column population ----------
+
+    fn sample_with_tpot(
+        ttft_sum: Option<f64>,
+        ttft_count: Option<f64>,
+        tpot_sum: Option<f64>,
+        tpot_count: Option<f64>,
+    ) -> InstanceSample {
+        InstanceSample {
+            running_reqs: Some(1),
+            ttft_sum_s: ttft_sum,
+            ttft_count,
+            tpot_sum_s: tpot_sum,
+            tpot_count,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn latency_ms_prefers_the_window_when_the_counter_advanced() {
+        // Δsum=1.0s over Δcount=2 → 500 ms.
+        assert_eq!(
+            latency_ms(Some(1.0), Some(10.0), Some(2.0), Some(12.0)),
+            Some(500.0)
+        );
+    }
+
+    #[test]
+    fn latency_ms_is_none_when_the_counter_did_not_advance() {
+        // A flat window (Δcount = 0) is unmeasured for this cell, not the
+        // endpoint's lifetime average. For vLLM's TPOT this is the load-bearing
+        // case: a flat counter means zero inter-token gaps were recorded here,
+        // so a blank column is the honest answer.
+        assert_eq!(
+            latency_ms(Some(2.0), Some(100.0), Some(2.0), Some(100.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn latency_ms_is_none_when_the_before_scrape_is_missing() {
+        // With no baseline there was never a window over this cell; the row must
+        // not borrow the after-scrape's lifetime average.
+        assert_eq!(latency_ms(None, None, Some(3.0), Some(30.0)), None);
+    }
+
+    #[test]
+    fn latency_ms_is_none_on_a_counter_reset() {
+        // sum dropped (server restart) → the negative window is discarded and
+        // the row stays blank rather than reporting an average from a different
+        // process lifetime.
+        assert_eq!(
+            latency_ms(Some(10.0), Some(100.0), Some(0.2), Some(2.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn latency_ms_is_none_without_any_data() {
+        assert_eq!(latency_ms(None, None, None, None), None);
+        // count == 0 is not divisible → None, never a divide-by-zero number.
+        assert_eq!(latency_ms(None, None, Some(0.0), Some(0.0)), None);
+    }
+
+    #[test]
+    fn prom_latency_computes_ttft_and_tpot_independently() {
+        // ttft advanced (windowed → 500 ms); tpot flat across the window, so it
+        // is genuinely unmeasured for this cell and stays blank rather than
+        // reporting the endpoint's lifetime average.
+        let before = sample_with_tpot(Some(1.0), Some(10.0), Some(2.0), Some(100.0));
+        let after = sample_with_tpot(Some(2.0), Some(12.0), Some(2.0), Some(100.0));
+        let (ttft_ms, tpot_ms) = prom_latency(Some(&before), Some(&after));
+        assert_eq!(ttft_ms, Some(500.0));
+        assert_eq!(tpot_ms, None);
+    }
+
+    #[test]
+    fn prom_latency_reports_tpot_when_the_counter_advances() {
+        // The window advances for both histograms → both populated. ttft:
+        // (2.0-1.0)/(12-10)*1000 = 500 ms; tpot: (2.4-2.0)/(120-100)*1000 = 20 ms.
+        let before = sample_with_tpot(Some(1.0), Some(10.0), Some(2.0), Some(100.0));
+        let after = sample_with_tpot(Some(2.0), Some(12.0), Some(2.4), Some(120.0));
+        let (ttft_ms, tpot_ms) = prom_latency(Some(&before), Some(&after));
+        assert_eq!(ttft_ms, Some(500.0));
+        let tpot = tpot_ms.expect("tpot_ms should be Some when the counter advances");
+        assert!((tpot - 20.0).abs() < 1e-9, "expected tpot≈20 got {tpot}");
+    }
+
+    #[test]
+    fn detect_engine_labels_a_recognised_sample_vllm() {
+        let sample = sample_with_tpot(Some(1.0), Some(10.0), Some(2.0), Some(100.0));
+        assert_eq!(detect_engine(Some(&sample), None).as_deref(), Some("vllm"));
+        assert_eq!(detect_engine(None, Some(&sample)).as_deref(), Some("vllm"));
+    }
+
+    #[test]
+    fn detect_engine_leaves_an_unrecognised_endpoint_blank() {
+        // No scrape at all (404 / non-vLLM), and an all-`None` (malformed body)
+        // sample must both leave the column blank rather than guess "vllm".
+        assert_eq!(detect_engine(None, None), None);
+        let empty = InstanceSample::default();
+        assert_eq!(detect_engine(Some(&empty), Some(&empty)), None);
+    }
+
+    fn prom_body_full(
+        running: u32,
+        waiting: u32,
+        ttft_sum: f64,
+        ttft_count: f64,
+        tpot_sum: f64,
+        tpot_count: f64,
+    ) -> String {
+        format!(
+            "vllm:num_requests_running {running}\n\
+             vllm:num_requests_waiting {waiting}\n\
+             vllm:time_to_first_token_seconds_sum {ttft_sum}\n\
+             vllm:time_to_first_token_seconds_count {ttft_count}\n\
+             vllm:time_per_output_token_seconds_sum {tpot_sum}\n\
+             vllm:time_per_output_token_seconds_count {tpot_count}\n"
+        )
+    }
+
+    // A vLLM endpoint whose TPOT counter did not advance between the before and
+    // after scrapes (while TTFT did): the `engine` column is populated from the
+    // recognised scrape, `ttft_ms` carries its windowed value, and `tpot_ms`
+    // stays blank — a flat TPOT window is unmeasured for this cell, not a value
+    // borrowed from the endpoint's lifetime average.
+    #[tokio::test]
+    async fn bench_row_labels_engine_and_leaves_flat_tpot_blank() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .mount(&server)
+            .await;
+
+        // Before scrape: ttft cumulative 1.0s/10, tpot cumulative 2.0s/100.
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(prom_body_full(5, 2, 1.0, 10.0, 2.0, 100.0)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // After/poller: ttft advanced (sum 2.0/count 12) but tpot counter is
+        // unchanged (still 2.0/100) — the exact real-vLLM symptom.
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(prom_body_full(8, 1, 2.0, 12.0, 2.0, 100.0)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut spec = make_spec(&server.uri());
+        spec.requests = 2;
+        let row = run_cell(&spec, 1).await.unwrap().row;
+
+        assert_eq!(
+            row.engine.as_deref(),
+            Some("vllm"),
+            "engine must be labelled from the recognised vLLM scrape"
+        );
+        // ttft: windowed (2.0-1.0)/(12-10)*1000 = 500 ms.
+        let ttft = row.ttft_ms.expect("ttft_ms should be Some");
+        assert!((ttft - 500.0).abs() < 0.01, "expected ttft≈500 got {ttft}");
+        // tpot: flat window → genuinely unmeasured for this cell → blank.
+        assert_eq!(
+            row.tpot_ms, None,
+            "a flat TPOT window must stay blank, not borrow the lifetime average"
+        );
+    }
+
+    // When the TPOT counter advances across the cell's scrapes, the windowed
+    // value is populated — the ordinary served case.
+    #[tokio::test]
+    async fn bench_row_populates_tpot_when_the_counter_advances() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .mount(&server)
+            .await;
+
+        // Before: tpot cumulative 2.0s/100. After: 2.4s/120 → Δ 0.4s/20 = 20 ms.
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(prom_body_full(5, 2, 1.0, 10.0, 2.0, 100.0)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(prom_body_full(8, 1, 2.0, 12.0, 2.4, 120.0)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut spec = make_spec(&server.uri());
+        spec.requests = 2;
+        let row = run_cell(&spec, 1).await.unwrap().row;
+
+        assert_eq!(row.engine.as_deref(), Some("vllm"));
+        let tpot = row
+            .tpot_ms
+            .expect("tpot_ms must be populated when the counter advanced");
+        assert!((tpot - 20.0).abs() < 0.01, "expected tpot≈20 got {tpot}");
     }
 }
