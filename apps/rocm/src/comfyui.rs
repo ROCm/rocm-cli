@@ -1026,12 +1026,12 @@ fn select_runtime(
     };
     if runtime_usability_status(&manifest) != "ready" {
         bail!(
-            "The selected ROCm install is not ready: {}",
+            "The selected ROCm runtime is not ready: {}",
             runtime_usability_status(&manifest)
         );
     }
     if manifest.format != "wheel" {
-        bail!("ComfyUI installs require a rocm-cli managed Python ROCm install.");
+        bail!("ComfyUI installs require a rocm-cli managed Python ROCm runtime.");
     }
     let python = manifest
         .python_executable
@@ -1055,6 +1055,26 @@ fn format_available_runtime_keys<'a>(
         .join(", ")
 }
 
+/// Render each known runtime as `` `key` (status) `` for the "none ready"
+/// error, surfacing the per-manifest reason `runtime_usability_status` already
+/// computed (e.g. `unusable (install root is missing: …)`) instead of dropping
+/// it and printing a generic "no runtime is ready".
+fn format_runtime_statuses<'a>(
+    manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
+) -> String {
+    manifests
+        .into_iter()
+        .map(|manifest| {
+            format!(
+                "`{}` ({})",
+                manifest.runtime_key,
+                runtime_usability_status(manifest)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn select_default_runtime<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
@@ -1074,7 +1094,7 @@ fn select_default_runtime<'a>(
         [] => {
             let available = format_available_runtime_keys(manifests);
             bail!(
-                "The configured default ROCm runtime was not found. Re-activate one with `rocm runtimes activate <key>` or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "The configured default ROCm runtime was not found. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
             )
         }
         _ => {
@@ -1095,9 +1115,12 @@ fn select_single_ready_runtime(
         .collect::<Vec<_>>();
     match ready.as_slice() {
         [manifest] => Ok(*manifest),
-        [] => bail!(
-            "No ROCm runtime is ready. Set up ROCm first from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI."
-        ),
+        [] => {
+            let statuses = format_runtime_statuses(manifests);
+            bail!(
+                "No ROCm runtime is ready. Set up ROCm first from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
+            )
+        }
         _ => {
             let available = format_available_runtime_keys(ready.iter().copied());
             bail!(
@@ -1126,13 +1149,13 @@ fn select_runtime_by_selector<'a>(
         [] => {
             let available = format_available_runtime_keys(manifests);
             bail!(
-                "ROCm runtime not found: `{selector}`. Re-activate one with `rocm runtimes activate <key>` or pass a runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "ROCm runtime not found: `{selector}`. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
             )
         }
         _ => {
             let available = format_available_runtime_keys(matches.iter().copied());
             bail!(
-                "More than one ROCm runtime matches `{selector}`. Pass the exact runtime key with `--runtime-id <key>` or pick one in `/runtimes`. Available: {available}. See `rocm runtimes list`."
+                "More than one ROCm runtime matches `{selector}`. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
             )
         }
     }
@@ -2158,6 +2181,40 @@ mod tests {
         Ok(())
     }
 
+    /// Every ambiguity / not-found remediation message must steer the user to a
+    /// concrete next step: the TUI picker, the durable activate command, the
+    /// per-invocation flag, and the discovery command. Asserted centrally so a
+    /// future reworded branch that silently drops one is caught.
+    fn assert_actionable(message: &str) {
+        for needle in [
+            "/runtimes",
+            "rocm runtimes activate",
+            "--runtime-id <key>",
+            "rocm runtimes list",
+        ] {
+            assert!(
+                message.contains(needle),
+                "actionable error must mention {needle:?}, got: {message}"
+            );
+        }
+    }
+
+    /// Build a runtime that registers but is not usable, so the "no ready
+    /// runtime" path has a per-manifest reason to surface. A missing install
+    /// root fails `validate_runtime_manifest_for_activation`'s first on-disk
+    /// check, yielding `unusable (install root is missing: …)`.
+    fn unusable_runtime_manifest(
+        paths: &AppPaths,
+        runtime_key: &str,
+    ) -> Result<therock::InstalledRuntimeManifest> {
+        let mut manifest = ready_runtime_manifest(paths, runtime_key)?;
+        manifest.install_root = paths
+            .data_dir
+            .join("missing-runtime-root")
+            .join(runtime_key);
+        Ok(manifest)
+    }
+
     #[test]
     fn ambiguous_ready_runtimes_name_flag_and_list_keys() -> Result<()> {
         let paths = test_paths("comfyui-ambiguous-ready-runtimes");
@@ -2169,27 +2226,109 @@ mod tests {
             .expect_err("two ready runtimes should be ambiguous");
         let message = error.to_string();
 
-        assert!(
-            message.contains("--runtime-id <key>"),
-            "error should name the real flag, got: {message}"
-        );
+        assert_actionable(&message);
         assert!(
             message.contains("release-wheel-gfx94x-dcgpu-7-13-0")
                 && message.contains("nightly-wheel-gfx94x-dcgpu-7-14-0"),
             "error should list the available runtime keys, got: {message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn no_ready_runtime_lists_each_key_and_reason() -> Result<()> {
+        // The "none ready" branch used to duplicate the zero-runtime advice and
+        // drop the reason each runtime is unusable. It must now name the key and
+        // surface the reason `runtime_usability_status` already computed.
+        let paths = test_paths("comfyui-no-ready-runtime");
+        let unusable = unusable_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+
+        let manifests = [unusable];
+        let error = select_default_runtime(&RocmCliConfig::default(), &manifests)
+            .expect_err("an unusable runtime is not ready");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("release-wheel-gfx94x-dcgpu-7-13-0"),
+            "error should name the unusable runtime key, got: {message}"
+        );
+        assert!(
+            message.contains("install root is missing"),
+            "error should surface the per-manifest unusable reason, got: {message}"
+        );
         assert!(
             message.contains("rocm runtimes list"),
             "error should point to `rocm runtimes list`, got: {message}"
         );
-        assert!(
-            message.contains("/runtimes"),
-            "error should offer the TUI `/runtimes` remediation, got: {message}"
-        );
-        assert!(
-            message.contains("rocm runtimes activate"),
-            "error should offer the durable `rocm runtimes activate` remediation, got: {message}"
-        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_default_not_found_is_actionable() -> Result<()> {
+        let paths = test_paths("comfyui-default-not-found");
+        let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+
+        let manifests = [runtime];
+        let config = RocmCliConfig {
+            default_runtime_id: Some("no-such-runtime-id".to_owned()),
+            ..Default::default()
+        };
+        let error = select_default_runtime(&config, &manifests)
+            .expect_err("configured default id matches nothing");
+
+        assert_actionable(&error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_configured_default_matches_is_actionable() -> Result<()> {
+        // `ready_runtime_manifest` hardcodes the same runtime_id for every key,
+        // so a configured default resolving to that id matches both entries and
+        // exercises `select_default_runtime`'s own ambiguity arm (distinct from
+        // the single-ready arm the other test hits).
+        let paths = test_paths("comfyui-default-ambiguous");
+        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
+
+        let manifests = [release, nightly];
+        let config = RocmCliConfig {
+            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            ..Default::default()
+        };
+        let error = select_default_runtime(&config, &manifests)
+            .expect_err("two manifests share the configured default id");
+
+        assert_actionable(&error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_selector_is_actionable() -> Result<()> {
+        let paths = test_paths("comfyui-selector-not-found");
+        let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+
+        let manifests = [runtime];
+        let error = select_runtime_by_selector(&manifests, "no-such-key")
+            .expect_err("selector matches no runtime");
+
+        assert_actionable(&error.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_selector_is_actionable() -> Result<()> {
+        // Both manifests share runtime_id `therock-release:gfx120X-all`; neither
+        // runtime_key equals it, so selection falls through to the id filter and
+        // matches both, hitting `select_runtime_by_selector`'s ambiguity arm.
+        let paths = test_paths("comfyui-selector-ambiguous");
+        let release = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let nightly = ready_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
+
+        let manifests = [release, nightly];
+        let error = select_runtime_by_selector(&manifests, "therock-release:gfx120X-all")
+            .expect_err("selector id matches two runtimes");
+
+        assert_actionable(&error.to_string());
         Ok(())
     }
 

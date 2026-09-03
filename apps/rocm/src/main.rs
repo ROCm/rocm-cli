@@ -667,22 +667,22 @@ rocm engines install vllm --reinstall")]
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
-    /// Show ROCm installs known to ROCm CLI.
+    /// Show ROCm runtimes known to ROCm CLI.
     List,
-    /// Use the selected ROCm install by default.
+    /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Switch back to the previously selected ROCm install.
+    /// Switch back to the previously selected ROCm runtime.
     Rollback,
-    /// Remove a ROCm install from ROCm CLI.
+    /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Add a ROCm install from a saved manifest file.
+    /// Add a ROCm runtime from a saved manifest file.
     Import {
         /// Manifest file path.
         manifest: PathBuf,
