@@ -2762,7 +2762,10 @@ mod tests {
             "CUDA out of memory",
         ];
         for line in accepted_lines {
-            assert!(log_tail_shows_oom(line), "detector must accept: {line}");
+            assert!(
+                rocm_core::vllm_log_shows_oom(line),
+                "detector must accept: {line}"
+            );
             let hint = oom_utilization_hint(line);
             let symptom = hint
                 .split("--symptom '")
