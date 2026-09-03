@@ -28,6 +28,7 @@ const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_OOM_FAULT_INJECTION_TAG: &str = "requires-oom-fault-injection";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -85,6 +86,16 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
+    /// `@requires-oom-fault-injection`: the scenario drives the test-only
+    /// `e2e-oom-fault-injection` hook (armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+    /// to fabricate a GPU-less OOM launch, so it can only run against a binary
+    /// compiled with that feature. `xtask e2e` builds it in when it builds the
+    /// binary itself (the GitHub-hosted mock lane), but the self-hosted lanes
+    /// test a prebuilt shipping release binary that has the hook compiled out —
+    /// there the real GPU-required serve pre-flight would run instead. Skipped
+    /// when [`HostCapability::oom_fault_injection`] is false so those lanes do
+    /// not report the missing hook as a regression.
+    pub requires_oom_fault_injection: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -123,6 +134,7 @@ impl ScenarioDecl {
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
+        let mut requires_oom_fault_injection = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -150,6 +162,8 @@ impl ScenarioDecl {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_OOM_FAULT_INJECTION_TAG {
+                requires_oom_fault_injection = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -164,6 +178,7 @@ impl ScenarioDecl {
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
+            requires_oom_fault_injection,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -423,6 +438,13 @@ pub fn resolve(
             reason: "requires WSL; this host is not running under WSL".to_owned(),
         };
     }
+    if decl.requires_oom_fault_injection && !cap.oom_fault_injection {
+        return Expectation::Skip {
+            reason: "requires the e2e-oom-fault-injection build; this binary has \
+                     the hook compiled out"
+                .to_owned(),
+        };
+    }
     if let Some(os) = &decl.requires_os
         && !os.eq_ignore_ascii_case(&cap.os_family)
     {
@@ -508,6 +530,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
+                oom_fault_injection: false,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -517,6 +540,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -526,6 +550,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                oom_fault_injection: false,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -539,6 +564,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -551,6 +577,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
+                oom_fault_injection: false,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -562,6 +589,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                oom_fault_injection: false,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -571,6 +599,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
+                oom_fault_injection: false,
             },
         }
     }
@@ -820,6 +849,36 @@ serve_timeout_secs = 90
                 Expectation::Skip { .. }
             ));
         }
+    }
+
+    /// The fault-injection gate keys on the *binary's* build, not the host, so
+    /// the same mock lane runs it or skips it depending only on whether the hook
+    /// was compiled in. Proving both directions keeps a feature-less prebuilt
+    /// binary (the self-hosted lanes) from reporting the missing hook as a bug.
+    #[test]
+    fn requires_oom_fault_injection_runs_only_when_the_hook_is_built_in() {
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:serve-oom-launch-memory-guidance",
+            "requires-oom-fault-injection",
+        ]);
+        assert!(d.requires_oom_fault_injection);
+
+        // Binary built without the feature (default fixtures) — skip.
+        let without_hook = cap("mock");
+        assert!(!without_hook.oom_fault_injection);
+        assert!(matches!(
+            resolve(&d, &without_hook, &m, false, false, false),
+            Expectation::Skip { .. }
+        ));
+
+        // Same host, but the binary carries the hook — run.
+        let mut with_hook = cap("mock");
+        with_hook.oom_fault_injection = true;
+        assert_eq!(
+            resolve(&d, &with_hook, &m, false, false, false),
+            Expectation::ExpectPass
+        );
     }
 
     #[test]
