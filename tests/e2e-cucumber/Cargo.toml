@@ -16,6 +16,12 @@ workspace = true
 name = "rocm-demo-env"
 path = "src/bin/rocm-demo-env.rs"
 
+# Stand-in for the Tailscale CLI, put on PATH by the `rocm remote` scenarios so
+# they do not depend on the developer's own machine being on a tailnet.
+[[bin]]
+name = "fake-tailscale"
+path = "src/bin/fake-tailscale.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
