@@ -2230,18 +2230,28 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     if !log_tail_shows_oom(log_tail) {
         return String::new();
     }
-    // Route the user's *actual* failing line into the `--symptom` example
-    // rather than a canned string, prefixed with a `vllm:` anchor so the
-    // diagnose checker attributes it to this failure mode.
+    // Route the user's *actual* failing line into the `--symptom` example when
+    // the diagnose checker would actually score it; otherwise fall back to the
+    // canonical symptom so the printed command always reports a cause. The
+    // detector here is a coarse substring scan that accepts lines the scorer
+    // rates sub-threshold (e.g. a bare "... out of memory"), so without this
+    // fallback the diagnose command could report nothing -- which reads as "the
+    // tool checked and there's no known cause", worse than not printing it.
     let symptom_line = log_tail
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty() && log_tail_shows_oom(line))
         .unwrap_or("out of memory");
+    let candidate = format!("vllm: {symptom_line}");
+    let symptom = if rocm_core::vllm_oom_symptom_is_diagnosable(&candidate) {
+        candidate
+    } else {
+        rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
+    };
     format!(
-        "\n\nDetected an out-of-memory failure. {}\n\
-         For conditional remediation, run `rocm diagnose --symptom 'vllm: {symptom_line}'`.",
+        "\n\nDetected an out-of-memory failure ({symptom_line}). {}\n\
+         For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
         rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
     )
 }
@@ -2739,6 +2749,36 @@ mod tests {
         // Detection is case-insensitive and also matches the spaced phrasing.
         assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
         assert!(log_tail_shows_oom("RuntimeError: CUDA out of memory"));
+    }
+
+    #[test]
+    fn every_emitted_oom_symptom_is_diagnosable() {
+        // Closes the loop between the two layers: the engine prints
+        // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
+        // actually score for the diagnose checker -- including for lines the
+        // coarse substring detector accepts but the scorer rates sub-threshold
+        // on their own (those fall back to the canonical symptom).
+        let accepted_lines = [
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            "RuntimeError: hipErrorOutOfMemory",
+            "torch.cuda.OutOfMemoryError",
+            "HIP error: out of memory",
+            "the process was killed: out of memory",
+            "CUDA out of memory",
+        ];
+        for line in accepted_lines {
+            assert!(log_tail_shows_oom(line), "detector must accept: {line}");
+            let hint = oom_utilization_hint(line);
+            let symptom = hint
+                .split("--symptom '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("hint must carry a --symptom value");
+            assert!(
+                rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
+                "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
+            );
+        }
     }
 
     #[test]
