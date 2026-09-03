@@ -294,8 +294,54 @@ fn prune_stale_demo_sessions(dir: &Path, keep: &Path) {
     }
 }
 
+/// Validate a user-supplied `--replay` path before the dashboard takes over the
+/// terminal. Fails fast with a clear error (and, via the returned `Err`, a
+/// non-zero exit) when the file is missing, is a directory, or is not readable —
+/// rather than entering the alt-screen and only then surfacing a disconnect
+/// inside the TUI. Pure filesystem check → unit-testable without a terminal.
+///
+/// Only a *directory* is rejected on shape, not "not a regular file": the replay
+/// reader is `std::fs::read_to_string`, which happily reads FIFOs, `/dev/stdin`,
+/// and process-substitution paths (`--replay <(zcat rec.ndjson.gz)`), all of
+/// which `metadata().is_file()` would reject. A missing-vs-unreadable distinction
+/// is made by matching the `metadata` error kind, so a permission-denied parent
+/// is not mislabelled "not found".
+fn validate_replay_path(path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!("replay file not found: {}", path.display())
+        }
+        _ => anyhow::anyhow!("cannot read replay file: {}: {err}", path.display()),
+    })?;
+    if meta.is_dir() {
+        anyhow::bail!(
+            "replay path is a directory, not a recording: {}",
+            path.display()
+        );
+    }
+    // Confirm a *regular* file actually opens for reading — a successful `stat`
+    // only needs a traversable parent, not a readable file — so a mode-0
+    // recording fails here instead of after the alt-screen has taken over. Only
+    // regular files are pre-opened: opening a FIFO / `/dev/stdin` / process
+    // substitution would block on, or consume, the one-shot stream the replay
+    // reader (`read_to_string`) is about to read, so those are left to the reader.
+    if meta.is_file() {
+        std::fs::File::open(path)
+            .with_context(|| format!("replay file is not readable: {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
+    // Validate a user-supplied `--replay` path up front — before building the
+    // runtime or entering the alt-screen — so a missing/unreadable file fails
+    // fast with a clear error and non-zero exit instead of silently taking over
+    // the terminal and surfacing a disconnect inside the TUI. `--demo` writes
+    // its own session below, so it is exempt.
+    if !demo && let Some(path) = replay.as_deref() {
+        validate_replay_path(path)?;
+    }
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
     // `--demo` writes a synthetic session and replays it, so the dashboard shows
@@ -1018,5 +1064,111 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// EAI-8366 regression: `rocm dash --replay <missing>` must fail the upfront
+    /// validation with a clear "not found" error (→ non-zero exit) instead of
+    /// entering the alt-screen and surfacing a disconnect inside the TUI.
+    #[test]
+    fn validate_replay_path_rejects_missing_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-missing-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        // Guard against a pre-existing file from a prior crashed run.
+        let _ = std::fs::remove_file(&missing);
+
+        let err = validate_replay_path(&missing).expect_err("missing file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("replay file not found"),
+            "error must name the missing replay file: {msg}"
+        );
+    }
+
+    /// A directory passed to `--replay` is present but is not a replayable
+    /// recording; validation must reject it up front rather than in the TUI.
+    #[test]
+    fn validate_replay_path_rejects_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-dir-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = validate_replay_path(&dir).expect_err("a directory must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is a directory"),
+            "error must explain the path is a directory: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EAI-8366 regression for the readability branch the PR advertises but did
+    /// not cover: a present, regular recording that cannot be opened (mode 0o000)
+    /// must be rejected up front — not after the alt-screen has taken over. Unix
+    /// only (Windows has no equivalent open-time read bit) and skipped as root,
+    /// where the mode is not enforced.
+    #[cfg(unix)]
+    #[test]
+    fn validate_replay_path_rejects_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rocm_core::openmpi::running_as_root() {
+            // Mode 0o000 is not enforced for uid 0, so the open would succeed and
+            // the branch under test cannot be exercised.
+            return;
+        }
+
+        let file = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-unreadable-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::write(&file, "{}\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = validate_replay_path(&file).expect_err("an unreadable file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not readable") || msg.contains("Permission denied"),
+            "error must explain the file is not readable: {msg}"
+        );
+
+        // Restore permissions so cleanup can remove the file.
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// EAI-8366 regression: a readable *non-regular* input (here `/dev/null`, a
+    /// character device — a stand-in for the FIFO / `/dev/stdin` / process-
+    /// substitution paths the replay reader handles) must NOT be rejected on
+    /// shape. Only a directory is a shape error; requiring a regular file would
+    /// break streaming replays.
+    #[cfg(unix)]
+    #[test]
+    fn validate_replay_path_accepts_non_regular_readable_input() {
+        validate_replay_path(Path::new("/dev/null"))
+            .expect("a readable non-regular input must pass validation");
+    }
+
+    /// A present, readable recording passes validation so the normal replay
+    /// flow proceeds into the dashboard unchanged.
+    #[test]
+    fn validate_replay_path_accepts_readable_file() {
+        let file = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-ok-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::write(&file, "{}\n").unwrap();
+
+        validate_replay_path(&file).expect("a readable file must pass validation");
+
+        let _ = std::fs::remove_file(&file);
     }
 }

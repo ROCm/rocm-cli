@@ -123,3 +123,14 @@ Feature: Interactive dashboard
     Then the launcher shows the model serving
     When the user quits the launcher
     Then the launcher exits successfully
+
+  # EAI-8366: `--replay <missing>` must fail fast — validate the path BEFORE the
+  # dashboard takes over the terminal, printing a clear error and exiting
+  # non-zero. Driven through a PTY (like the rest of this file): the fail-fast
+  # property is unobservable through a pipe, and under a real terminal the pre-fix
+  # binary enters the alt-screen and hangs, which this scenario pins.
+  @id:dash-replay-missing-file-fails-fast @requires-os:linux
+  Scenario: dash-11 - Replaying a missing recording fails before entering the dashboard
+    When the user replays a recording that does not exist
+    Then the dashboard is refused before taking over the terminal
+    And the user is told the replay file was not found

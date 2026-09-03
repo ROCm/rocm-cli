@@ -495,6 +495,80 @@ impl TuiSession {
         }
     }
 
+    /// Whether the emulated terminal is currently in the alternate screen — the
+    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
+    /// refusal that never takes over the terminal this must stay `false`.
+    #[must_use]
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
+    /// fast refusal contract. Unlike [`wait_for_exit`](Self::wait_for_exit) (which
+    /// requires success), this fails if the child exits 0, and — crucially — if it
+    /// does not exit within `timeout`: the pre-fix `dash --replay <missing>`
+    /// enters the alt-screen and hangs under a real PTY, so a timeout here is the
+    /// regression, not an infrastructure flake.
+    pub async fn wait_for_refusal(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finished = true;
+                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                    return if status.success() {
+                        Err(format!(
+                            "expected `dash --replay <missing>` to be refused, but it exited 0.\n{}",
+                            self.framed_screen()
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for refusal: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for `dash --replay <missing>` to be \
+                     refused — it did not exit (pre-fix regression: the dashboard took over the \
+                     terminal and hung).\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// After the child has exited (e.g. via [`wait_for_refusal`](Self::wait_for_refusal)),
+    /// wait a bounded time for the reader thread to commit the final buffered
+    /// frame, then return the visible screen. Lets a sibling assertion read the
+    /// last error line without racing the reader draining the PTY after exit.
+    pub async fn drain_final_screen(&mut self) -> String {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        self.screen_text()
+    }
+
     /// Record this invocation once for the command-coverage report (so `rocm
     /// dash` / `rocm chat` count as covered), tied to the scenario for the
     /// pass/fail join. Best-effort and idempotent.

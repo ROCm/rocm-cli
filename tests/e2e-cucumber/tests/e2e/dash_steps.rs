@@ -80,6 +80,26 @@ async fn running_managed_model(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
+#[when("the user replays a recording that does not exist")]
+async fn replay_missing_recording(world: &mut E2eWorld) {
+    // Drive this under a real pseudo-terminal, not a pipe. The point of the fix is
+    // fail-fast *before the terminal takeover*, and that property is unobservable
+    // through a pipe: a piped `dash` can't enter the alt-screen either way (and
+    // the pre-fix binary already exits non-zero through a pipe when raw-mode
+    // fails, so a piped run detects nothing). Under a PTY the pre-fix binary
+    // enters the alt-screen (`ESC[?1049h`) and hangs — that is the regression this
+    // scenario pins.
+    let missing = std::env::temp_dir().join(format!(
+        "rocm-cli-e2e-no-such-recording-eai-8366-{}.ndjson",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    let path = missing.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to spawn dash under a pty: {e}"));
+    world.tui = Some(session);
+}
+
 #[when("the user opens the dashboard with demo data")]
 async fn open_dashboard_demo(world: &mut E2eWorld) {
     // `--demo` replays a deterministic synthetic session, so the dashboard
@@ -241,6 +261,39 @@ async fn quit_launcher(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the dashboard is refused before taking over the terminal")]
+async fn dashboard_refused_before_takeover(world: &mut E2eWorld) {
+    // Fail-fast contract: the child must exit non-zero *promptly*. Under a PTY the
+    // pre-fix binary takes over the terminal and hangs, so `wait_for_refusal`
+    // times out there — the timeout IS the regression, not a flake.
+    let tui = session(world);
+    tui.wait_for_refusal(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    // And it never entered the alt-screen: the refusal happened before the
+    // dashboard could take over the terminal.
+    assert!(
+        !tui.in_alternate_screen(),
+        "dash entered the alt-screen before refusing a missing replay file:\n{}",
+        tui.screen_text(),
+    );
+    // Snapshot the drained final frame for the sibling message assertion.
+    let screen = tui.drain_final_screen().await;
+    world.cli_output = Some(screen);
+}
+
+#[then("the user is told the replay file was not found")]
+async fn told_replay_file_not_found(world: &mut E2eWorld) {
+    let output = world
+        .cli_output
+        .as_deref()
+        .expect("no dash screen captured");
+    assert!(
+        output.to_lowercase().contains("replay file not found"),
+        "expected a clear 'replay file not found' error on screen, got:\n{output}"
+    );
+}
 
 #[then("the dashboard home view is displayed")]
 async fn home_view_displayed(world: &mut E2eWorld) {
