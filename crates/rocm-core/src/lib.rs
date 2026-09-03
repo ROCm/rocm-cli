@@ -7351,6 +7351,30 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
      <0-1>` (e.g. 0.1 for a small model), or target a less-busy GPU with `--gpu <index>`.";
 
+/// Whether a vLLM/PyTorch log excerpt carries a startup out-of-memory
+/// signature.
+///
+/// Deliberately excludes vLLM's generic "engine core initialization failed"
+/// wrapper: vLLM emits that line as the terminal message for *any* EngineCore
+/// startup crash (unsupported architecture, shm size, tensor-parallel
+/// misconfiguration, missing weights, and OOM alike), and being the last line
+/// it reliably lands in a truncated log tail — treating it as an OOM signature
+/// would misreport unrelated startup failures as memory exhaustion.
+///
+/// The two signatures are complementary, not redundant: `outofmemory` (the
+/// space-free form, matched after lowercasing) catches the allocator error
+/// types whichever module path they carry — `torch.OutOfMemoryError`,
+/// `torch.cuda.OutOfMemoryError`, `hipErrorOutOfMemory` — while `out of memory`
+/// catches the spaced runtime phrasing (`HIP out of memory`, `CUDA out of
+/// memory`). An earlier `hip out of memory` entry was dead code, since any log
+/// containing it already contains `out of memory`.
+pub fn vllm_log_shows_oom(log: &str) -> bool {
+    const SIGNATURES: &[&str] = &["outofmemory", "out of memory"];
+
+    let lower = log.to_ascii_lowercase();
+    SIGNATURES.iter().any(|signature| lower.contains(signature))
+}
+
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
 /// (under the SDK `bin_path` and/or the venv `install_root/bin`) and is not on
@@ -11629,6 +11653,28 @@ last_installed_runtime_id = "therock-release"
             usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures() {
+        // Space-free allocator error types, whatever module path they carry.
+        assert!(vllm_log_shows_oom(
+            "torch.OutOfMemoryError: HIP out of memory."
+        ));
+        assert!(vllm_log_shows_oom(
+            "raise torch.cuda.OutOfMemoryError(msg)  # CUDA path"
+        ));
+        assert!(vllm_log_shows_oom("RuntimeError: hipErrorOutOfMemory"));
+        // Spaced runtime phrasing on its own (no `OutOfMemoryError` token).
+        assert!(vllm_log_shows_oom("HIP error: out of memory"));
+        // Case-insensitive.
+        assert!(vllm_log_shows_oom("TORCH.OUTOFMEMORYERROR"));
+        // The generic EngineCore wrapper is NOT an OOM signature.
+        assert!(!vllm_log_shows_oom(
+            "EngineCore failed: engine core initialization failed"
+        ));
+        assert!(!vllm_log_shows_oom("OSError: model weights not found"));
+        assert!(!vllm_log_shows_oom(""));
     }
 
     #[test]

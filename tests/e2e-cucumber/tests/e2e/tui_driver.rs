@@ -126,6 +126,21 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
+    /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
+    ///
+    /// Used by scenarios that must set a variable the CLI reads at startup (e.g.
+    /// the test-only `ROCM_E2E_SIMULATE_OOM_LAUNCH` fault-injection switch). The
+    /// vars are applied per-child on the `CommandBuilder`, never via the shared
+    /// process environment, so concurrent scenarios on the no-GPU lane cannot
+    /// observe each other's overrides.
+    pub fn spawn_with_env(
+        world: &E2eWorld,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+    }
+
     /// Spawn a specific `rocm` binary under a fresh PTY.
     ///
     /// Most scenarios use [`spawn`](Self::spawn) and exercise the harness-built
@@ -135,6 +150,18 @@ impl TuiSession {
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, binary, args, &[])
+    }
+
+    /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
+    /// `binary <args>` under a PTY with the isolated environment, then overlay
+    /// `extra_env` on the child.
+    pub fn spawn_binary_with_env(
+        world: &E2eWorld,
+        binary: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -176,6 +203,12 @@ impl TuiSession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLUMNS", COLS.to_string());
         cmd.env("LINES", ROWS.to_string());
+
+        // Per-child overrides last, so a scenario's explicit variable wins over
+        // the inherited/isolation environment.
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
 
         let mut child = pair
             .slave

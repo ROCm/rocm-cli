@@ -12,6 +12,12 @@ workspace = true
 
 [features]
 e2e-test-hooks = ["rocm-engine-lemonade/e2e-test-hooks"]
+# Test-only fault injection for the e2e suite. Enabled ONLY by the `xtask e2e`
+# mock-lane build (never by the release build), it compiles in a `rocm serve`
+# hook that simulates a managed vLLM launch which OOM'd and never became ready,
+# so the positive OOM-guidance summary can be verified on a GPU-less CI host.
+# See `e2e_simulate_oom_launch` / `simulate_oom_managed_launch` in `main.rs`.
+e2e-oom-fault-injection = []
 
 [dependencies]
 anyhow.workspace = true
