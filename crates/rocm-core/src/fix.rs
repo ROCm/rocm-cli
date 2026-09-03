@@ -364,10 +364,53 @@ const RECIPES: &[FixRecipe] = &[
         applies_on: WINDOWS_ONLY,
         runner: None,
     },
+    FixRecipe {
+        fix_id: "fix-16-vllm-oom",
+        title: "vLLM ran the GPU out of memory at startup",
+        rationale: "vLLM reserves a fixed fraction (~90%) of each GPU's TOTAL VRAM for its KV cache by default, regardless of the model size or how much is currently free. Two different faults surface the same OOM, and they need opposite responses. If the GPU is shared or already busy, that reservation collides with memory in use and lowering it (or moving to a less-busy GPU) is the fix. If the model genuinely does not fit in this GPU's VRAM, lowering the reservation only trades an earlier OOM for a later one -- use a smaller or quantized model instead (rocm-cli serves one model on a single GPU; it does not shard a model across GPUs).",
+        auto_applicable: false,
+        commands: &[
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,",
+            "# or steer vLLM onto a less-busy device:",
+            "rocm serve <model> --gpu-memory-utilization 0.5",
+            "rocm serve <model> --gpu <index>",
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the",
+            "# problem; pick a smaller or quantized model (single-GPU serving only).",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup",
+        notes: &[
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.",
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).",
+        ],
+        applies_on: LINUX_ONLY,
+        runner: None,
+    },
 ];
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
+}
+
+/// Test-only view of a recipe's actionable remediation: its `verify` command,
+/// its `notes`, and its *executable* command lines (comment/prose lines
+/// stripped). Lets the diagnosis catalog cross-check that the Fix it emits for a
+/// shared `fix_id` has not silently diverged from this recipe.
+#[cfg(test)]
+pub(crate) fn recipe_verify_notes_and_run_commands(
+    fix_id: &str,
+) -> Option<(&'static str, &'static [&'static str], Vec<&'static str>)> {
+    find_recipe(fix_id).map(|recipe| {
+        let run_commands = recipe
+            .commands
+            .iter()
+            .copied()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>();
+        (recipe.verify, recipe.notes, run_commands)
+    })
 }
 
 const fn current_os() -> &'static str {
@@ -459,7 +502,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
-            // does not line up with the catalog's `fix-1 … fix-15` either, so a
+            // does not line up with the catalog's `fix-1 … fix-16` either, so a
             // bare "unknown id" left them with nothing to correct.
             eprintln!(
                 "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
@@ -1076,7 +1119,7 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        assert_eq!(count, 15, "expected 15 catalog entries");
+        assert_eq!(count, 16, "expected 16 catalog entries");
     }
 
     #[test]
@@ -1107,6 +1150,12 @@ mod tests {
                 "fix-9-igpu-dgpu"
             ]
         );
+        // fix-16-vllm-oom carries a workaround the user must weigh (lowering the
+        // VRAM reservation is wrong for a model that genuinely does not fit), so
+        // it is deliberately PRINT-ONLY and must never join the AUTO set.
+        let oom = find_recipe("fix-16-vllm-oom").expect("OOM recipe is in the catalog");
+        assert!(!oom.auto_applicable, "fix-16-vllm-oom must stay PRINT-ONLY");
+        assert!(oom.runner.is_none(), "a PRINT-ONLY recipe has no runner");
     }
 
     #[test]

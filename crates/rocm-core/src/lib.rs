@@ -36,8 +36,8 @@ pub mod proc_lifecycle;
 pub mod runtime;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
-    render_report_text as render_diagnose_text,
+    DiagnoseReport, Diagnosis, Fix, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    render_report_text as render_diagnose_text, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
@@ -7338,6 +7338,18 @@ pub fn resolve_amd_smi_binary() -> OsString {
     }
     resolve_amd_smi_binary_in_home(runtime_home_dir().as_deref())
 }
+
+/// The `--gpu-memory-utilization` workaround for a shared/busy GPU.
+///
+/// Shared by both the `rocm` CLI (pre-launch low-VRAM note) and the vLLM engine
+/// adapter (post-failure OOM hint) so the two surfaces never drift into
+/// different wording for the same fix. vLLM reserves a fixed fraction of each
+/// GPU's *total* VRAM by default (~0.9), independent of the model size or how
+/// much is currently free, so on a shared or busy card that reservation
+/// collides with memory already in use and the engine OOMs even a tiny model.
+pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
+     collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
+     <0-1>` (e.g. 0.1 for a small model), or target a less-busy GPU with `--gpu <index>`.";
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
