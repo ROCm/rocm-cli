@@ -18,9 +18,32 @@ use crate::E2eWorld;
 /// on throughput accuracy, and the GPU lane pays real inference time for each.
 const BENCH_REQUESTS: &str = "2";
 
+/// Deterministic path, inside the scenario's isolated root, that the CSV-content
+/// scenario writes to via `--out` and reads back — so the `then` step can assert
+/// on the emitted row without depending on the default `<data_dir>` layout.
+fn bench_out_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root for the benchmark output")
+        .path()
+        .join("bench-results.csv")
+}
+
 #[given("an endpoint that rejects every request")]
 async fn setup_rejecting_endpoint(world: &mut E2eWorld) {
     let mock = MockServer::start_rejecting().await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some("TestModel/E2E-1B".to_string());
+    world.mock = Some(mock);
+}
+
+#[given("a model is being served with a metrics endpoint")]
+async fn setup_model_server_with_metrics(world: &mut E2eWorld) {
+    // `start_with_metrics` exposes a vLLM-flavoured `/metrics` route whose
+    // TTFT/TPOT histograms advance every scrape, so the bench cell's before/
+    // after window measures a real per-output-token latency (not a flat one).
+    let mock = MockServer::start_with_metrics("TestModel/E2E-1B").await;
     world.endpoint = Some(mock.base_url());
     world.model_name = Some("TestModel/E2E-1B".to_string());
     world.mock = Some(mock);
@@ -88,6 +111,88 @@ fn run_bench(world: &mut E2eWorld, endpoint: &str) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// Benchmark the metrics-backed endpoint, writing the row to a known `--out`
+/// file so the row's `engine`/`tpot_ms` columns can be asserted directly.
+#[when("the user benchmarks the served endpoint recording results to a file")]
+async fn benchmark_recording_results(world: &mut E2eWorld) {
+    let endpoint = world
+        .endpoint
+        .clone()
+        .expect("no endpoint configured for the benchmark");
+    let model = world
+        .model_name
+        .clone()
+        .expect("no model configured for the benchmark");
+    let out = bench_out_path(world);
+    let out = out.to_str().expect("bench output path is not valid UTF-8");
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "bench",
+            "load",
+            "--endpoint",
+            endpoint.as_str(),
+            "--model",
+            &model,
+            "--concurrency",
+            "1",
+            "--isl",
+            "8",
+            "--osl",
+            "4",
+            "--requests",
+            BENCH_REQUESTS,
+            "--out",
+            out,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the recorded benchmark row is labelled the vLLM engine with a per-output-token latency")]
+async fn assert_row_engine_and_tpot(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let rc = world.cli_rc.expect("no command was run");
+    assert!(
+        rc == 0,
+        "rocm bench load failed (rc={rc}):\n{stdout}{stderr}"
+    );
+
+    let path = bench_out_path(world);
+    let csv = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read bench CSV {}: {e}", path.display()));
+    let mut lines = csv.lines();
+    let header = lines
+        .next()
+        .unwrap_or_else(|| panic!("bench CSV is empty:\n{csv}"));
+    let data = lines
+        .next()
+        .unwrap_or_else(|| panic!("bench CSV has no data row:\n{csv}"));
+
+    let cols: Vec<&str> = header.split(',').collect();
+    let col = |name: &str| {
+        let idx = cols
+            .iter()
+            .position(|c| *c == name)
+            .unwrap_or_else(|| panic!("no `{name}` column in header: {header}"));
+        data.split(',').nth(idx).unwrap_or("")
+    };
+
+    assert_eq!(
+        col("engine"),
+        "vllm",
+        "the emitted row must carry engine=vllm from the recognised /metrics scrape:\n{data}"
+    );
+    let tpot = col("tpot_ms");
+    assert!(
+        tpot.parse::<f64>().is_ok_and(|v| v > 0.0),
+        "the emitted row must carry a positive tpot_ms from the advancing counter, got {tpot:?}:\n{data}"
+    );
 }
 
 #[then("the benchmark reports measured throughput")]
