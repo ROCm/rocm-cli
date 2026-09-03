@@ -197,18 +197,36 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # sccache caches each rustc invocation (keyed by source + deps + flags) in the
-    # GitHub Actions cache, so unchanged workspace crates are restored instead of
+    # sccache caches each rustc invocation (keyed by source + deps + flags) in an
+    # Azure blob container, so unchanged workspace crates are restored instead of
     # recompiled across runs. It layers on top of setup-rust-toolchain's rust-cache,
     # which restores the registry and dependency target/ but deliberately does not
     # cache workspace crates — the bulk of the build time here. rust-cache also sets
-    # CARGO_INCREMENTAL=0 (which sccache requires) for these steps. These env vars
-    # only take effect where the "Set up sccache" step and the cargo steps run
-    # (both gated on `heavy`), so a skipped/non-heavy run never invokes a missing
-    # sccache binary.
+    # CARGO_INCREMENTAL=0 (which sccache requires) for these steps.
+    #
+    # The backend is Azure rather than the GitHub Actions cache because the GHA
+    # cache is capped at 10 GB per repository and this repo already sits at that
+    # ceiling: rust-cache's per-job lanes (two OSes, several jobs) fill it, so
+    # GitHub continuously evicts least-recently-used entries. sccache adds
+    # thousands of small per-artifact entries on top of that, which under a full
+    # cache are evicted before the next run reads them — leaving the cold-cache
+    # penalty (a populating run compiles everything twice over) without the warm
+    # benefit. An external store has no such cap, so entries survive between runs.
+    #
+    # RUSTC_WRAPPER is set unconditionally rather than only when the backend is
+    # reachable: rust-cache hashes every environment variable starting with
+    # "RUST" into its cache key, so a wrapper that comes and goes would change
+    # that key and force a full cold dependency rebuild on the run after any
+    # backend hiccup. Keeping it constant makes the probe below turn the *remote*
+    # backend off (leaving sccache on its local disk cache, which always starts)
+    # instead of the wrapper itself.
     env:
       RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      # Namespaced so the Linux and Windows lanes cannot collide, and so the
+      # container stays legible if it is ever shared with another consumer.
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
@@ -221,14 +239,64 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
 
-      # Installs the sccache binary and wires it to the GitHub Actions cache
-      # backend. Runs BEFORE setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at
-      # the job level, and setup-rust-toolchain's rust-cache runs `cargo metadata`
-      # (which honours RUSTC_WRAPPER) during setup — so sccache must already be on
-      # PATH by then. Same `heavy` gate as the cargo steps below.
+      # Installs the sccache binary. Both this and the probe below run BEFORE
+      # setup-rust-toolchain, because its rust-cache step runs `cargo metadata`,
+      # which honours RUSTC_WRAPPER — the wrapper must be resolvable by then.
+      # `version` is pinned: the action defaults to whatever the latest sccache
+      # release happens to be, which would let the compiler wrapper float.
+      #
+      # continue-on-error, because RUSTC_WRAPPER is set for the whole job: if the
+      # download fails (a release blip, a checksum mismatch) the probe below
+      # notices the missing binary and clears the wrapper, rather than the job
+      # dying on an unavailable cache.
       - name: Set up sccache
         if: needs.changes.outputs.heavy == 'true'
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it actually answers.
+      #
+      # sccache verifies the store when its server starts: it reads a probe
+      # object and, for anything other than "not found" or a rate limit, aborts
+      # with a non-zero exit. That aborted startup surfaces as a failure of the
+      # first cargo invocation, so a missing, expired, or rotated credential
+      # would take down every compile-heavy required check at once — turning a
+      # caching problem into a merge-blocking outage.
+      #
+      # Starting the server here converts that into a soft failure. On any
+      # problem the Azure variables are blanked for later steps, which leaves
+      # sccache running against its local disk cache: still a valid wrapper (so
+      # the rust-cache key stays put) that always starts, just without cross-run
+      # reuse. Pull requests from forks get empty secrets and take the same path,
+      # since sccache treats an empty value as unset.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.heavy == 'true'
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if sccache --start-server; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
@@ -243,9 +311,10 @@ jobs:
         run: cargo build --workspace
 
       # Surface the cache hit rate for the workspace compile so the effect is
-      # visible in the logs.
+      # visible in the logs. Skipped when the probe left the wrapper off, where
+      # there are no statistics to report.
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache_probe.outputs.enabled == 'true'
         run: sccache --show-stats
 
       - name: Local no-fallback smoke
@@ -362,11 +431,13 @@ jobs:
       # Cache each rustc invocation across runs; the full-workspace build is the
       # dominant cost on this runner and rust-cache does not cache workspace
       # crates. CARGO_INCREMENTAL=0 above is required for (and assumed by) sccache.
-      # These vars only take effect where the "Set up sccache" step and the cargo
-      # steps run (both gated on `heavy`), so a non-heavy run never invokes a
-      # missing sccache binary.
+      # See build-and-test for why the backend is Azure rather than the GitHub
+      # Actions cache, and why the probe below disables the backend rather than
+      # the wrapper.
       RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/windows-build-and-test
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
@@ -374,13 +445,55 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Installs sccache and wires it to the GitHub Actions cache. Runs BEFORE
-      # setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at the job level and
-      # setup-rust-toolchain's rust-cache runs `cargo metadata` (which honours
-      # RUSTC_WRAPPER) during setup, so sccache must already be on PATH by then.
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
       - name: Set up sccache
         if: needs.changes.outputs.heavy == 'true'
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          # This script decides whether to use the cache; a non-zero status from
+          # the commands it runs is an answer, not a job failure. Pin the native
+          # error preference off so a future runner default cannot turn a failed
+          # probe into a failed step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Disable-Backend {
+            "SCCACHE_AZURE_CONNECTION_STRING=" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "SCCACHE_AZURE_BLOB_CONTAINER=" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
+            Write-Output "::warning::sccache is not installed; compiling without it."
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 0
+          }
+          if (-not $env:SCCACHE_AZURE_CONNECTION_STRING) {
+            Write-Output "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            Disable-Backend
+            exit 0
+          }
+          sccache --start-server
+          if ($LASTEXITCODE -eq 0) {
+            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Output "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server *> $null
+            Disable-Backend
+          }
+          exit 0
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
@@ -400,9 +513,10 @@ jobs:
         run: cargo test --workspace --all-targets
 
       # Surface the cache hit rate for the workspace build/test so the effect is
-      # visible in the logs.
+      # visible in the logs. Skipped when the probe left the wrapper off, where
+      # there are no statistics to report.
       - name: sccache stats
-        if: needs.changes.outputs.heavy == 'true'
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache_probe.outputs.enabled == 'true'
         shell: pwsh
         run: sccache --show-stats
 
@@ -484,28 +598,71 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # sccache caches each rustc invocation across runs (see build-and-test). clippy
-    # compiles the whole workspace with --all-targets, so it benefits too.
-    # rust-cache sets CARGO_INCREMENTAL=0 (required by sccache) for these steps.
-    # These vars only take effect where the "Set up sccache" step and the cargo
-    # steps run (both gated on `rust`), so a non-rust run never invokes a missing
-    # sccache binary.
+    # sccache caches each rustc invocation across runs (see build-and-test for the
+    # choice of backend and the probe). clippy compiles the whole workspace with
+    # --all-targets, so it benefits too. rust-cache sets CARGO_INCREMENTAL=0
+    # (required by sccache) for these steps.
+    #
+    # This job shares build-and-test's key prefix: both compile the same crates
+    # for the same Linux target, so what one caches the other can read. The
+    # overlap is narrower than it looks — clippy builds dependencies without
+    # `--emit=link`, which gives most of them a different cache key than the
+    # build job's, and workspace crates go through clippy-driver, whose hash
+    # differs from rustc's. Crates that must be fully linked for both (proc
+    # macros, and anything a build script needs) do hit. Sharing cannot poison
+    # either job: the compiler binary is part of every key.
     env:
       RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Installs sccache and wires it to the GitHub Actions cache. Runs BEFORE
-      # setup-rust-toolchain: RUSTC_WRAPPER=sccache is set at the job level and
-      # setup-rust-toolchain's rust-cache runs `cargo metadata` (which honours
-      # RUSTC_WRAPPER) during setup, so sccache must already be on PATH by then.
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
       - name: Set up sccache
         if: needs.changes.outputs.rust == 'true'
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.rust == 'true'
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if sccache --start-server; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.rust == 'true'
@@ -527,9 +684,10 @@ jobs:
         run: cargo xtask manifest --check
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
-      # in the logs.
+      # in the logs. Skipped when the probe left the wrapper off, where there are
+      # no statistics to report.
       - name: sccache stats
-        if: needs.changes.outputs.rust == 'true'
+        if: needs.changes.outputs.rust == 'true' && steps.sccache_probe.outputs.enabled == 'true'
         run: sccache --show-stats
 
   third-party-notices:
