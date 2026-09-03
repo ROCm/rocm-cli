@@ -188,6 +188,39 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     out
 }
 
+/// Whether a managed service's recorded status means it *failed to become
+/// ready* — the only state the post-failure OOM note should fire on.
+///
+/// The status vocabulary from `status_for_readiness` is `ready` (serving),
+/// `running` (endpoint up, model still loading — healthy, deliberately kept
+/// distinct from `starting` so `rocmd` does not restart a slow-loading model),
+/// and `starting` (endpoint never came up). Only `starting` is a failure; a
+/// bare `!= "ready"` check would wrongly treat a healthy still-loading `running`
+/// service as a failed launch.
+pub(crate) fn serve_failed_to_become_ready(status: &str) -> bool {
+    status == "starting"
+}
+
+/// Builds the actionable memory-knob note for a serve that failed to become
+/// ready with an out-of-memory signature in its engine log. Returns `None` when
+/// the serve became ready or the log carries no OOM signature, so healthy
+/// deployments and unrelated failures are never cluttered with memory advice.
+///
+/// The note names `--gpu-memory-utilization` and `--gpu` and is worded for the
+/// shared-node case rather than as unconditional advice — vLLM reserves a
+/// fraction of *total* VRAM, so a value good for a shared card would degrade a
+/// dedicated one. It shares [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] with
+/// the pre-launch low-VRAM note so both surfaces point at the same fix.
+pub(crate) fn oom_memory_note(status: &str, log_tail: &str) -> Option<String> {
+    if !serve_failed_to_become_ready(status) || !rocm_core::vllm_log_shows_oom(log_tail) {
+        return None;
+    }
+    Some(format!(
+        "the serve attempt ran out of GPU memory. {}",
+        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
+    ))
+}
+
 /// Run a single small chat completion against the just-started local server and
 /// measure time-to-first-token and generation throughput. Best-effort: any error
 /// (server not OpenAI-compatible, refused, timed out) yields empty metrics rather
@@ -484,6 +517,71 @@ mod tests {
         let mut summary = base_summary();
         summary.notes = vec!["selected GPU 0 has low free VRAM".to_owned()];
         assert!(render_summary(&summary).contains("note: selected GPU 0 has low free VRAM"));
+    }
+
+    #[test]
+    fn oom_signatures_are_detected_case_insensitively() {
+        // The signatures the ticket calls out, plus casing variants the engine
+        // log can emit.
+        assert!(rocm_core::vllm_log_shows_oom(
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+        assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
+        assert!(rocm_core::vllm_log_shows_oom(
+            "RuntimeError: CUDA out of memory"
+        ));
+    }
+
+    #[test]
+    fn unrelated_failures_are_not_flagged_as_oom() {
+        assert!(!rocm_core::vllm_log_shows_oom(
+            "OSError: model weights not found; check the model id"
+        ));
+        assert!(!rocm_core::vllm_log_shows_oom(""));
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash, not just OOM; treating it as an OOM signature would
+        // misreport unrelated failures as memory exhaustion.
+        assert!(!rocm_core::vllm_log_shows_oom(
+            "ERROR Engine core initialization failed"
+        ));
+    }
+
+    #[test]
+    fn oom_note_names_both_memory_knobs_on_a_failed_serve() {
+        let note = oom_memory_note(
+            "starting",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        )
+        .expect("an OOM failure must produce a note");
+        assert!(note.contains("--gpu-memory-utilization"), "{note}");
+        assert!(note.contains("--gpu <index>"), "{note}");
+        assert!(note.contains("ran out of GPU memory"), "{note}");
+    }
+
+    #[test]
+    fn oom_note_is_withheld_for_a_ready_serve_or_a_clean_log() {
+        // A serve that became ready is healthy even if the log mentions memory.
+        assert_eq!(
+            oom_memory_note("ready", "torch.OutOfMemoryError: HIP out of memory"),
+            None
+        );
+        // A failure with no OOM signature must not be given memory advice.
+        assert_eq!(
+            oom_memory_note("starting", "OSError: model weights not found"),
+            None
+        );
+    }
+
+    #[test]
+    fn oom_note_renders_in_the_summary_notes() {
+        let mut summary = base_summary();
+        summary.status = "starting".to_owned();
+        if let Some(note) = oom_memory_note(&summary.status, "torch.OutOfMemoryError") {
+            summary.notes.push(note);
+        }
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("note: the serve attempt ran out of GPU memory"));
+        assert!(rendered.contains("--gpu-memory-utilization"));
     }
 
     #[test]

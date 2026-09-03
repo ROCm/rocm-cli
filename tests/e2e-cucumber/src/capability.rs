@@ -115,7 +115,21 @@ pub struct HostCapability {
     /// Stable platform identity derived from hardware, not from an artifact name:
     /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
     pub platform_slug: String,
+    /// Whether the `rocm` binary under test carries the test-only
+    /// `e2e-oom-fault-injection` hook, so `@requires-oom-fault-injection`
+    /// scenarios can simulate a GPU-less OOM launch. It is compiled out of the
+    /// shipping binary, and the harness cannot probe for it (no product command
+    /// exposes it), so `xtask e2e` reports it via the [`OOM_FAULT_INJECTION_ENV`]
+    /// environment variable — set only when xtask built the binary itself with
+    /// the feature, and absent for a prebuilt `ROCM_CLI_BINARY` (the self-hosted
+    /// lanes' shipping release build). See [`probe_host_capability`].
+    pub oom_fault_injection: bool,
 }
+
+/// Environment variable `xtask e2e` sets to `1` when it compiled the binary
+/// under test with the `rocm/e2e-oom-fault-injection` feature. Kept in sync with
+/// the same name in `xtask::e2e`.
+pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
 
 impl HostCapability {
     /// Whether a given engine can actually START on this host. Distinct from
@@ -339,6 +353,12 @@ fn probe_host_capability() -> HostCapability {
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
+    // The fault-injection hook is a compile-time feature the harness can't probe
+    // for, so trust the signal `xtask e2e` sets only when it built the binary
+    // with that feature. Absent for a prebuilt `ROCM_CLI_BINARY` (shipping
+    // release build), so those runs skip `@requires-oom-fault-injection`.
+    let oom_fault_injection =
+        std::env::var_os(OOM_FAULT_INJECTION_ENV).is_some_and(|value| value == "1");
 
     HostCapability {
         os_family,
@@ -348,6 +368,7 @@ fn probe_host_capability() -> HostCapability {
         available_engines,
         effective_serve_engine,
         platform_slug,
+        oom_fault_injection,
     }
 }
 
@@ -600,6 +621,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
+            oom_fault_injection: false,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -613,6 +635,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
+            oom_fault_injection: false,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));

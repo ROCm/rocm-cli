@@ -18,6 +18,13 @@ use anyhow::{Context, Result, bail};
 
 use crate::paths::{binary_name, target_dir, workspace_root};
 
+/// Signal to the e2e-cucumber harness that the binary under test carries the
+/// `rocm/e2e-oom-fault-injection` hook. Set to `1` only when this xtask built
+/// the binary itself with that feature; a prebuilt `ROCM_CLI_BINARY` (the
+/// self-hosted lanes' shipping release) has the hook compiled out. Kept in sync
+/// with `e2e_cucumber::capability::OOM_FAULT_INJECTION_ENV`.
+const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+
 #[derive(Debug, PartialEq, Eq)]
 struct E2eBinaries {
     rocm: PathBuf,
@@ -62,6 +69,15 @@ fn configure_harness_env(command: &mut Command, binaries: &E2eBinaries) {
     } else {
         command.env_remove("ROCM_CLI_ROCMD_BINARY");
     }
+    // Only an xtask-built binary carries the fault-injection hook (see `run`);
+    // a prebuilt `ROCM_CLI_BINARY` does not, so clear any inherited value there
+    // rather than letting the harness run `@requires-oom-fault-injection`
+    // scenarios against a binary that has the hook compiled out.
+    if binaries.build_release {
+        command.env(OOM_FAULT_INJECTION_ENV, "1");
+    } else {
+        command.env_remove(OOM_FAULT_INJECTION_ENV);
+    }
 }
 
 /// Build the release binaries and run the E2E suite, forwarding `args` to the
@@ -85,6 +101,15 @@ pub fn run(args: &[String]) -> Result<()> {
 
     if binaries.build_release {
         let status = Command::new(&cargo)
+            // `--features rocm/e2e-oom-fault-injection` compiles in the test-only
+            // `rocm serve` OOM-launch fault injection used by the positive
+            // `serve-oom-launch-memory-guidance` scenario. It is scoped to the
+            // `rocm` package (rocmd has no such feature) and to this e2e build
+            // only — the release build never enables it, so shipped binaries
+            // carry no fault-injection hook. It joins `rocm/e2e-test-hooks`
+            // (the general e2e hook surface) in a single space-separated
+            // `--features` value; cargo takes one `--features` argument, so both
+            // must be listed together rather than in two overriding flags.
             .args([
                 "build",
                 "--release",
@@ -93,7 +118,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 "-p",
                 "rocmd",
                 "--features",
-                "rocm/e2e-test-hooks",
+                "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection",
             ])
             .current_dir(&root)
             .status()
@@ -170,6 +195,12 @@ mod tests {
             command_env(&command, "ROCM_CLI_ROCMD_BINARY"),
             binaries.rocmd.map(PathBuf::into_os_string)
         );
+        // xtask built this binary with the fault-injection feature, so tell the
+        // harness the hook is present.
+        assert_eq!(
+            command_env(&command, "ROCM_E2E_OOM_FAULT_INJECTION"),
+            Some(OsString::from("1"))
+        );
     }
 
     #[test]
@@ -193,6 +224,9 @@ mod tests {
             command_env(&command, "ROCM_CLI_ROCMD_BINARY"),
             binaries.rocmd.map(PathBuf::into_os_string)
         );
+        // A prebuilt binary has the fault-injection hook compiled out, so the
+        // signal must be cleared, not inherited from the ambient environment.
+        assert_eq!(command_env(&command, "ROCM_E2E_OOM_FAULT_INJECTION"), None);
     }
 
     #[test]
