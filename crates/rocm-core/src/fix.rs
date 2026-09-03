@@ -981,11 +981,30 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
 /// It now asks the same resolver as `examine`, which also means `$ROCM_PATH` is
 /// honoured here for the first time.
 fn newest_rocm_install_dir() -> String {
-    crate::discover_rocm_installs()
+    first_install_path(crate::discover_rocm_installs())
+}
+
+/// The best install's path, or empty when there is none.
+fn first_install_path(installs: Vec<crate::RocmInstall>) -> String {
+    installs
         .into_iter()
         .next()
         .map(|install| install.path.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// [`newest_rocm_install_dir`] against a caller-supplied `$ROCM_PATH` and
+/// search roots, so a test can drive it without touching the process
+/// environment. Same seam as [`crate::discover_rocm_installs_in`].
+#[cfg(test)]
+fn newest_rocm_install_dir_in(
+    search_dirs: &[std::path::PathBuf],
+    env_override: Option<&std::path::Path>,
+) -> String {
+    first_install_path(crate::discover_rocm_installs_on_host_in(
+        search_dirs,
+        env_override,
+    ))
 }
 
 #[cfg(test)]
@@ -1001,7 +1020,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_finds_the_install_the_rest_of_the_cli_found() {
         // Discriminating on purpose: the scanner this replaces looked only in
         // two hardcoded `C:\Program Files` directories and ignored $ROCM_PATH
@@ -1016,17 +1034,12 @@ mod tests {
         let install = root.join("rocm-6.10.0");
         plant_install(&install);
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &install);
-        }
-        let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        // The override goes in as an argument rather than through
+        // `std::env::set_var`: the environment is process-global, so a sibling
+        // test mutating $ROCM_PATH between this set and its read used to make
+        // this assertion fail on whichever test lost the race.
+        let found = newest_rocm_install_dir_in(&[], Some(&install));
+
         std::fs::remove_dir_all(&root).ok();
 
         assert_eq!(
@@ -1037,7 +1050,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
@@ -1050,17 +1062,8 @@ mod tests {
         let empty = root.join("6.10");
         std::fs::create_dir_all(&empty).expect("create empty dir");
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &empty);
-        }
-        let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        let found = newest_rocm_install_dir_in(&[], Some(&empty));
+
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
