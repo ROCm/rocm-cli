@@ -860,22 +860,22 @@ Apache License 2.0
 ================================================================================
 
 The following component(s) are licensed under Apache License 2.0:
-  - windows-core 0.57.0 <https://github.com/microsoft/windows-rs>
+  - windows-collections 0.3.2 <https://github.com/microsoft/windows-rs>
   - windows-core 0.62.2 <https://github.com/microsoft/windows-rs>
-  - windows-implement 0.57.0 <https://github.com/microsoft/windows-rs>
+  - windows-future 0.3.2 <https://github.com/microsoft/windows-rs>
   - windows-implement 0.60.2 <https://github.com/microsoft/windows-rs>
-  - windows-interface 0.57.0 <https://github.com/microsoft/windows-rs>
   - windows-interface 0.59.3 <https://github.com/microsoft/windows-rs>
   - windows-link 0.2.1 <https://github.com/microsoft/windows-rs>
+  - windows-numerics 0.3.1 <https://github.com/microsoft/windows-rs>
   - windows-registry 0.6.1 <https://github.com/microsoft/windows-rs>
-  - windows-result 0.1.2 <https://github.com/microsoft/windows-rs>
   - windows-result 0.4.1 <https://github.com/microsoft/windows-rs>
   - windows-strings 0.5.1 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.52.0 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.59.0 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.61.2 <https://github.com/microsoft/windows-rs>
   - windows-targets 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows 0.57.0 <https://github.com/microsoft/windows-rs>
+  - windows-threading 0.2.1 <https://github.com/microsoft/windows-rs>
+  - windows 0.62.2 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
   - windows_i686_gnu 0.52.6 <https://github.com/microsoft/windows-rs>
@@ -8172,6 +8172,8 @@ The following component(s) are licensed under Apache License 2.0:
   - miniz_oxide 0.8.9 <https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide>
   - num-conv 0.2.2 <https://github.com/jhpratt/num-conv>
   - objc2-core-foundation 0.3.2 <https://github.com/madsmtm/objc2>
+  - objc2-io-kit 0.3.2 <https://github.com/madsmtm/objc2>
+  - objc2-open-directory 0.3.2 <https://github.com/madsmtm/objc2>
   - pin-project-internal 1.1.13 <https://github.com/taiki-e/pin-project>
   - pin-project-lite 0.2.17 <https://github.com/taiki-e/pin-project-lite>
   - pin-project 1.1.13 <https://github.com/taiki-e/pin-project>
@@ -10564,6 +10566,9 @@ The following component(s) are licensed under MIT License:
   - async-stream-impl 0.3.6 <https://github.com/tokio-rs/async-stream>
   - async-stream 0.3.6 <https://github.com/tokio-rs/async-stream>
   - libm 0.2.16 <https://github.com/rust-lang/compiler-builtins>
+  - objc2-encode 4.1.0 <https://github.com/madsmtm/objc2>
+  - objc2-foundation 0.3.2 <https://github.com/madsmtm/objc2>
+  - objc2 0.6.4 <https://github.com/madsmtm/objc2>
   - peg-macros 0.6.3 <https://github.com/kevinmehall/rust-peg>
   - peg-runtime 0.6.3 <https://github.com/kevinmehall/rust-peg>
 
@@ -10907,7 +10912,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - sysinfo 0.34.2 <https://github.com/GuillaumeGomez/sysinfo>
+  - sysinfo 0.39.6 <https://github.com/GuillaumeGomez/sysinfo>
 
 The MIT License (MIT)
 
