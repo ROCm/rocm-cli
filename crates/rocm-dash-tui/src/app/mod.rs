@@ -1608,6 +1608,16 @@ fn open_overlay_for_focus(
 }
 
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
+    // Install the termination-signal watcher BEFORE switching the terminal into
+    // raw/alternate-screen mode. A signal that arrives during startup must find
+    // the listeners already registered; otherwise it takes the default
+    // disposition and kills the process while the terminal is still in raw mode
+    // — the exact broken-terminal state this guards against. Registration
+    // failure is propagated here (via `?`), before any terminal state is
+    // mutated, so we never enter raw mode without a working restore path. See
+    // `spawn_termination_watcher` for the exit-code and no-unwind semantics.
+    let signal_task = spawn_termination_watcher()?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1616,19 +1626,158 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 
     let res = event_loop(&mut terminal, &args).await;
 
-    // Best-effort terminal restoration: never let teardown failures override the
-    // session result. If the controlling terminal already went away (e.g. the
-    // PTY closed on quit), these writes can fail with a broken pipe — that must
-    // not turn a clean exit into a non-zero one.
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
+    // The session ended on its own — the signal watcher is no longer needed and
+    // must not linger to fire (and re-restore/exit) after a clean return.
+    signal_task.abort();
+
+    // Best-effort terminal restoration, reusing the exact teardown the signal
+    // path runs so the two cannot drift. Never let teardown failures override
+    // the session result: if the controlling terminal already went away (e.g.
+    // the PTY closed on quit), these writes can fail with a broken pipe — that
+    // must not turn a clean exit into a non-zero one (every step inside is
+    // best-effort).
+    restore_terminal();
     res
 }
+
+/// Best-effort teardown of the terminal modes `run` set up. Disables raw mode
+/// (process-global terminal state, so this can safely run from the signal
+/// watcher even though the [`Terminal`] backend owns its own `stdout` clone),
+/// then writes the alt-screen/mouse/cursor restore sequences to a fresh
+/// `stdout`. Every step is best-effort: on a signal we are about to exit anyway,
+/// and a vanished controlling terminal must not turn teardown into a panic.
+fn restore_terminal() {
+    // `disable_raw_mode` mutates the real terminal (there is no in-memory
+    // equivalent), so it stays outside the testable sequence writer below.
+    let _ = disable_raw_mode();
+    let _ = write_restore_sequences(&mut io::stdout());
+}
+
+/// Write the escape sequences that undo `run`'s terminal setup — leave the
+/// alternate screen, disable mouse capture, show the cursor — to `out`. Split
+/// from [`restore_terminal`] so a unit test can drive an in-memory sink and
+/// assert the emitted bytes, rather than writing to the process's shared stdout
+/// (which races every other test in the single-process `cargo test` lane).
+fn write_restore_sequences<W: io::Write>(out: &mut W) -> io::Result<()> {
+    execute!(
+        out,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    )
+}
+
+/// Register the termination-signal listeners on the current Tokio runtime and
+/// spawn a detached watcher that restores the terminal and exits `128 + signo`.
+///
+/// Returns the task handle so a caller whose process ends with the session
+/// (`rocm dash`) can `abort()` it on a clean return; the persistent launcher hub
+/// instead keeps its runtime alive and drops the handle, letting the watcher
+/// live for the whole process so bare `rocm` stays killable across the sessions
+/// it builds and drops (Tokio never unregisters its libc handler, so a
+/// per-session watcher would go deaf the moment its runtime is dropped — see
+/// `dash::run_launcher`).
+///
+/// Registration happens here, synchronously, and is surfaced via `?`; callers
+/// invoke this BEFORE entering raw/alternate-screen mode so a failure never
+/// leaves the terminal switched with no restore path, and a signal arriving
+/// during startup is latched by the already-installed OS handlers.
+///
+/// The watcher ends the process with [`std::process::exit`], which does not
+/// unwind — this is deliberate. SIGTERM/SIGINT means "stop now", so we restore
+/// the terminal and leave promptly rather than racing an orderly teardown
+/// against an imminent default-disposition kill. Two consequences are accepted
+/// as the intended behavior: (1) an in-flight focused install/serve child is
+/// left to the OS rather than reaped via `kill_on_drop`, matching the
+/// pre-existing default disposition and avoiding truncating a mid-write child on
+/// the way out; and (2) `run_async`'s embedded-daemon socket is not unlinked
+/// here, but the daemon unlinks a stale socket on its next bind, so it self-heals.
+pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle<()>> {
+    let termination = TerminationSignals::register()?;
+    Ok(tokio::spawn(async move {
+        let code = termination.recv().await;
+        restore_terminal();
+        std::process::exit(code);
+    }))
+}
+
+/// Termination-signal listeners, registered up front so a signal that arrives
+/// during terminal setup is latched by the OS/Tokio rather than taking the
+/// default disposition.
+///
+/// [`TerminationSignals::register`] installs the OS handlers and is called
+/// BEFORE the terminal is switched into raw/alternate-screen mode, so a
+/// registration failure is surfaced (via `?`) before any terminal state is
+/// mutated. [`TerminationSignals::recv`] then parks the watcher task until a
+/// signal fires, returning the conventional `128 + signo` exit code the process
+/// should report (SIGINT → 130, SIGTERM → 143).
+#[cfg(unix)]
+struct TerminationSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn register() -> color_eyre::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // Register both handlers before entering raw mode. `?` on each
+        // propagates a setup failure instead of parking forever; and if the
+        // second registration fails, the first is dropped (unregistered) as we
+        // return the error, so we never leave one signal silently swallowed.
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())?,
+            sigint: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn recv(mut self) -> i32 {
+        tokio::select! {
+            _ = self.sigterm.recv() => EXIT_CODE_SIGTERM,
+            _ = self.sigint.recv() => EXIT_CODE_SIGINT,
+        }
+    }
+}
+
+/// Windows analog: Ctrl-C and Ctrl-Break arrive as console control events (not
+/// key events) and would otherwise skip terminal restoration the same way.
+/// Tokio exposes the two as separate streams, so BOTH are registered —
+/// `ctrl_c()` subscribes only to `CTRL_C_EVENT` and would miss a Ctrl-Break.
+/// Ctrl-Break is the harder "terminate" gesture and maps to the SIGTERM code;
+/// Ctrl-C maps to the SIGINT code.
+#[cfg(windows)]
+struct TerminationSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl TerminationSignals {
+    fn register() -> color_eyre::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c};
+
+        // `?` propagates a registration failure before raw mode is entered,
+        // rather than the old `let _ = ctrl_c().await` which treated a failed
+        // registration as a received Ctrl-C and exited immediately.
+        Ok(Self {
+            ctrl_c: ctrl_c()?,
+            ctrl_break: ctrl_break()?,
+        })
+    }
+
+    async fn recv(mut self) -> i32 {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => EXIT_CODE_SIGINT,
+            _ = self.ctrl_break.recv() => EXIT_CODE_SIGTERM,
+        }
+    }
+}
+
+/// Conventional shell exit code for a process terminated by SIGINT (128 + 2).
+const EXIT_CODE_SIGINT: i32 = 130;
+/// Conventional shell exit code for a process terminated by SIGTERM (128 + 15).
+const EXIT_CODE_SIGTERM: i32 = 143;
 
 async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -3512,6 +3661,42 @@ mod tests {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
         // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
+    }
+
+    #[test]
+    fn signal_exit_codes_follow_shell_convention() {
+        // The signal-handler task exits with the conventional 128 + signo code so
+        // a supervisor sees the right termination reason. SIGINT is signal 2,
+        // SIGTERM is signal 15.
+        assert_eq!(EXIT_CODE_SIGINT, 128 + 2);
+        assert_eq!(EXIT_CODE_SIGTERM, 128 + 15);
+    }
+
+    // Unix-only: crossterm emits ANSI escape sequences to a generic writer on
+    // Unix, so an in-memory sink captures the real bytes. On Windows crossterm
+    // drives the console via the WinAPI backend instead of writing ANSI, and
+    // `execute!` to a `Vec` errors with "Initial console modes not set" — there
+    // is no console to configure. Production `restore_terminal()` passes a real
+    // stdout handle, so the Windows path is exercised there, not by this sink.
+    #[cfg(unix)]
+    #[test]
+    fn write_restore_sequences_leaves_alt_screen_and_shows_cursor() {
+        // The restore path must leave the alternate screen and show the cursor.
+        // Driving an in-memory sink asserts the actual emitted bytes without
+        // touching the process's shared terminal state — the global
+        // `disable_raw_mode()` half is deliberately outside this function, so
+        // nothing here races other tests in the single-process `cargo test` lane.
+        let mut sink: Vec<u8> = Vec::new();
+        write_restore_sequences(&mut sink).expect("writing to a Vec cannot fail");
+        let emitted = String::from_utf8(sink).expect("restore sequences are ASCII escapes");
+        assert!(
+            emitted.contains("\x1b[?1049l"),
+            "expected the leave-alt-screen sequence in {emitted:?}"
+        );
+        assert!(
+            emitted.contains("\x1b[?25h"),
+            "expected the show-cursor sequence in {emitted:?}"
+        );
     }
 
     #[test]

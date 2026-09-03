@@ -12,8 +12,7 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{TuiSession, default_timeout};
-
+use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
@@ -240,6 +239,63 @@ async fn quit_launcher(world: &mut E2eWorld) {
     quit_tui(world, "the launcher").await;
 }
 
+/// Deliver a termination signal to the running dashboard and wait for it to
+/// exit, stashing the observed exit code for the `Then` steps. Shared by the
+/// SIGTERM/SIGINT `When` steps so the two cannot drift.
+async fn signal_dashboard(world: &mut E2eWorld, signal: TermSignal) {
+    session(world)
+        .deliver_signal_and_wait(signal, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not exit after {signal:?}: {e}"));
+}
+
+#[when("the user opens the dashboard from the launcher")]
+async fn open_dashboard_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the launcher front door before sending a key, so `d` is not
+    // swallowed before the launcher's synchronous event loop is reading input.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // `d` escalates straight into the full dashboard (LauncherChoice::OpenDashboard),
+    // which builds and then, on quit, drops its own Tokio runtime.
+    tui.send("d")
+        .unwrap_or_else(|e| panic!("failed to open the dashboard from the launcher: {e}"));
+    tui.wait_for_screen("Updates", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not open from the launcher: {e}"));
+}
+
+#[when("the user quits back to the launcher")]
+async fn quit_back_to_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // `q` quits the dashboard; the hub loop drops the session runtime and
+    // redraws the launcher front door — the exact "back at the menu after a
+    // session" state where a per-session signal watcher would have gone deaf.
+    tui.send("q")
+        .unwrap_or_else(|e| panic!("failed to quit the dashboard: {e}"));
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the launcher front door did not return after the session: {e}")
+        });
+}
+
+#[when("the launcher receives a SIGTERM")]
+async fn launcher_receives_sigterm(world: &mut E2eWorld) {
+    signal_dashboard(world, TermSignal::Term).await;
+}
+
+#[when("the dashboard receives a SIGTERM")]
+async fn dashboard_receives_sigterm(world: &mut E2eWorld) {
+    signal_dashboard(world, TermSignal::Term).await;
+}
+
+#[when("the dashboard receives a SIGINT")]
+async fn dashboard_receives_sigint(world: &mut E2eWorld) {
+    signal_dashboard(world, TermSignal::Int).await;
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the dashboard home view is displayed")]
@@ -420,6 +476,27 @@ fn assert_tui_opened(world: &E2eWorld) {
 #[then("the dashboard exits successfully")]
 async fn dashboard_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
+}
+
+#[then(expr = "the dashboard exits from the signal with code {int}")]
+async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+    let observed = session(world)
+        .observed_exit_code()
+        .expect("no signal exit code was recorded; deliver the signal first");
+    assert_eq!(
+        observed, expected,
+        "dashboard exited with {observed} after the signal, expected {expected}"
+    );
+}
+
+#[then("the terminal is restored to the normal screen")]
+async fn terminal_restored(world: &mut E2eWorld) {
+    // The dashboard's signal handler must leave the alternate screen and show
+    // the cursor before exiting; otherwise the shell is left in the broken
+    // raw/alt-screen state that needs a `reset`.
+    session(world)
+        .expect_terminal_restored()
+        .unwrap_or_else(|e| panic!("{e}"));
 }
 
 #[then("the launcher shows the model serving")]
