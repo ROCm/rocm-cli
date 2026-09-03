@@ -80,6 +80,23 @@ async fn user_sends_oneshot_chat(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user pipes a one-shot chat prompt through the CLI")]
+async fn user_pipes_oneshot_chat(world: &mut E2eWorld) {
+    // Drive `rocm chat` with the prompt on stdin and no `--prompt`, matching the
+    // documented `echo "…" | rocm chat` path. `run_rocm_with_stdin` pipes stdin,
+    // so the child sees a non-terminal stdin and must read the prompt from it.
+    // Passing the served model id avoids depending on default-model resolution.
+    let model = world.model_name.clone().expect("no model name set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
+        world,
+        &["chat", "--provider", "local", "--model", &model],
+        "Hello",
+        &[],
+    );
+    assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
+    world.cli_output = Some(stdout);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the served model is listed")]

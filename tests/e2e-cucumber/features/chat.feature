@@ -75,3 +75,14 @@ Feature: Chat and endpoint detection
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  # `rocm chat --help` documents `echo "…" | rocm chat` — the prompt is read
+  # from stdin when `--prompt` is omitted. This drives that path (piped stdin,
+  # no `--prompt`) and asserts the assistant reply is produced, proving stdin is
+  # consumed and routed through the same send path as `--prompt`.
+  @id:chat-cli-stdin-prompt
+  Scenario: 8 - The chat CLI reads a one-shot prompt from stdin
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user pipes a one-shot chat prompt through the CLI
+    Then the CLI prints the assistant's reply
