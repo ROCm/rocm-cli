@@ -317,6 +317,19 @@ impl Expectation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedScenario {
     pub id: String,
+    /// The `Feature:` this scenario belongs to. Recorded here because a SKIPPED
+    /// scenario never reaches `report.json`, so the report has no other way to
+    /// place it under its feature in the grouped grid.
+    ///
+    /// No `#[serde(default)]` here: this struct only derives `Serialize`, so a
+    /// deserialization attribute would be dead. Backward compatibility for
+    /// artifacts written before these fields existed lives entirely on the
+    /// consuming side — `ManifestExpectation` in the `e2e-report` crate.
+    pub feature: String,
+    /// The scenario's own name (`<key>-<NN> - <description>`). Carries the
+    /// per-feature index the report sorts rows by, and gives skipped scenarios a
+    /// human label they'd otherwise lack.
+    pub scenario: String,
     pub effective_engine: String,
     /// "pass" | "xfail" | "skip".
     pub expected: String,
@@ -329,7 +342,13 @@ pub struct ResolvedScenario {
 }
 
 impl ResolvedScenario {
-    pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
+    pub fn new(
+        id: &str,
+        feature: &str,
+        scenario: &str,
+        effective_engine: &str,
+        expectation: &Expectation,
+    ) -> Self {
         let (bug, reason, flaky) = match expectation {
             Expectation::ExpectXfail { bug, reason, flaky } => {
                 (Some(bug.clone()), Some(reason.clone()), *flaky)
@@ -339,6 +358,8 @@ impl ResolvedScenario {
         };
         Self {
             id: id.to_owned(),
+            feature: feature.to_owned(),
+            scenario: scenario.to_owned(),
             effective_engine: effective_engine.to_owned(),
             expected: expectation.label().to_owned(),
             bug,
@@ -856,7 +877,7 @@ reason = "unrelated open bug"
     #[test]
     fn vllm_pinned_scenario_skips_where_vllm_cannot_start() {
         let m = Expectations::default();
-        // Scenario 5-style: pins vLLM.
+        // The feature-qualified `serve-vllm-inference` scenario pins vLLM.
         let d = decl(&[
             "id:serve-vllm-inference",
             "requires-gpu",

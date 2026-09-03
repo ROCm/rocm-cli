@@ -15,7 +15,7 @@ Feature: Engine shell
   # Windows, and the runner's own $SHELL varies, which would otherwise decide
   # whether a marker appears at all.
   @id:engine-shell-marks-the-prompt @requires-os:linux
-  Scenario: 1 - Entering an engine shell is visibly different from the shell you left
+  Scenario: engine-shell-01 - Entering an engine shell is visibly different from the shell you left
     Given a machine with an installed engine environment
     When the user opens a shell for that engine
     Then the shell is visibly marked as that engine's shell
