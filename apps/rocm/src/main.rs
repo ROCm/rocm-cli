@@ -18314,8 +18314,8 @@ fn validate_pinned_gpu_index_against(
         && !usable.contains(&index)
     {
         bail!(
-            "--gpu index {index} is not among the usable AMD GPU(s) [{}]; \
-             it may be hidden by HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES",
+            "--gpu index {index} is not available; the usable AMD GPU(s) are [{}] \
+             (others may be hidden by HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES)",
             usable
                 .iter()
                 .map(u32::to_string)
@@ -18398,12 +18398,24 @@ fn select_auto_gpu_index(
         // or fail fast under the GPU-required policy (no GPU-0 fallback).
         return Vec::new();
     }
-    let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
+    // Candidate ordinals to rank, lowest first. When VRAM telemetry is present,
+    // drive the scan from the *actual* row indices it reports rather than a
+    // synthetic `0..count` range: amd-smi metric (and the DRM sysfs fallback)
+    // can report non-contiguous ordinals when devices are hidden by a
+    // visibility mask, so `0..count` would look up rows that do not exist and
+    // miss the real ones. Without telemetry, fall back to the dense detected
+    // range so service-state-only selection still has candidates.
+    let mut candidate_indices: Vec<u32> = match vram {
+        Some(rows) => rows.iter().map(|row| row.index).collect(),
+        None => (0..count as u32).collect(),
+    };
+    candidate_indices.sort_unstable();
+    candidate_indices.retain(|index| !busy.contains(index));
     let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
 
     if vram.is_some() {
         // Pass 1: lowest-index idle GPU.
-        for index in candidates() {
+        for &index in &candidate_indices {
             if let Some(free) = usage_for(index).and_then(|usage| usage.free_fraction())
                 && free >= AUTO_FREE_VRAM_FRACTION
             {
@@ -18413,9 +18425,9 @@ fn select_auto_gpu_index(
         // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
         // (not free percentage, which can favor a smaller GPU on heterogeneous
         // VRAM systems).
-        if let Some(index) = candidates().max_by(|left, right| {
-            let left_free = usage_for(*left).map(|usage| usage.free_mb());
-            let right_free = usage_for(*right).map(|usage| usage.free_mb());
+        if let Some(&index) = candidate_indices.iter().max_by(|left, right| {
+            let left_free = usage_for(**left).map(|usage| usage.free_mb());
+            let right_free = usage_for(**right).map(|usage| usage.free_mb());
             left_free
                 .cmp(&right_free)
                 // Break ties toward the lowest index.
@@ -18427,7 +18439,7 @@ fn select_auto_gpu_index(
     }
 
     // Pass 3: no VRAM telemetry; first GPU not pinned by a managed service.
-    if let Some(index) = candidates().next() {
+    if let Some(&index) = candidate_indices.first() {
         return vec![index];
     }
     // Every detected GPU is pinned by a running service. We still return GPU 0
@@ -25618,6 +25630,28 @@ install therock";
     }
 
     #[test]
+    fn auto_selection_ranks_the_actual_reported_row_indices() {
+        // A visibility mask hides GPUs 0 and 1, so amd-smi metric reports only
+        // the surviving devices with their absolute, non-contiguous ordinals
+        // [2, 3] -- there is no row at index 0 or 1. Auto-selection must scan
+        // those real indices, not a synthetic `0..count` range (which would
+        // look up absent rows and fall through to a bogus GPU 0).
+        let usage = [vram(2, 182_000, 192_000), vram(3, 1_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(None, &[], Some(&usage)),
+            vec![3],
+            "should skip the busy GPU 2 and pick the idle GPU 3 by its real ordinal"
+        );
+        // With GPU 3 also pinned by a managed service, pass 3 still returns a
+        // real reported ordinal (GPU 2), never a fabricated index 0.
+        assert_eq!(
+            select_auto_gpu_index(None, &[3], Some(&usage)),
+            vec![2],
+            "the sole non-busy reported GPU must be selected by its real ordinal"
+        );
+    }
+
+    #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected amd-smi count is rejected.
         let error = validate_pinned_gpu_index_against(4, Some(4), None)
@@ -25694,7 +25728,8 @@ install therock";
         );
         let error = validate_pinned_gpu_index_against(0, None, Some(&[2, 3]))
             .expect_err("index 0 is hidden by the visibility mask");
-        assert!(error.to_string().contains("not among the usable"));
+        assert!(error.to_string().contains("not available"));
+        assert!(error.to_string().contains("[2, 3]"));
         // An empty usable set is not authoritative here (the caller's GPU
         // fail-fast owns the "no usable GPU" message), so it does not reject.
         assert_eq!(
