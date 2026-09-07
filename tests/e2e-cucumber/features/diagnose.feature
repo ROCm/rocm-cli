@@ -140,3 +140,16 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI which fixes it offers
     Then every fix the catalog documents is listed
     And only the fixes the CLI can carry out itself are marked as such
+
+  # diagnose-08/-11 cover the refusal branches (no agreement, wrong OS); this
+  # covers the third failure shape a fix can hit -- an approved, applicable fix
+  # whose underlying command itself fails (e.g. `usermod` exiting non-zero).
+  # Until now that branch of `fix-4-render-group` had no e2e coverage: a
+  # regression could move the explanation back to stdout, or off exit code 4,
+  # while every other listed scenario kept passing. Linux-only because the
+  # recipe itself is `applies_on: LINUX_ONLY`.
+  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux
+  Scenario: diagnose-13 - A fix whose helper command fails explains why, on stderr, with exit code 4
+    Given a user who has approved a fix whose helper command will fail
+    When the user asks the CLI to apply the approved fix
+    Then the CLI reports the command failure on stderr with exit code 4

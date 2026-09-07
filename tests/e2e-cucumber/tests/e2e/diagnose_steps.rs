@@ -30,6 +30,15 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 
+/// The recipe used to prove a failed helper command is explained on stderr with
+/// exit code 4. `fix-4-render-group` is the only AUTO recipe whose command-failure
+/// branch this suite can force deterministically: its helper (`usermod`, run
+/// directly as root or via `sudo` otherwise) is resolved off `$PATH`, so a
+/// scenario-controlled `$PATH` (see `command_fails_bin_dir`) can stand a fake
+/// `usermod`/`sudo` in for it, unconditionally failing, without needing real
+/// root or touching real group membership.
+const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
+
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
 /// A duplicate of the catalog, on purpose: a test that derived this list from
@@ -105,6 +114,18 @@ fn fix_rc_file(world: &E2eWorld) -> std::path::PathBuf {
     fix_home(world).join(".bashrc")
 }
 
+/// The directory this scenario stands in for `$PATH`, holding the fake
+/// `usermod`/`sudo` scripts. Scoped under the scenario's isolated root so it is
+/// cleaned up with everything else.
+fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin")
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a user who hit a known ROCm failure")]
@@ -138,6 +159,34 @@ async fn user_chose_mutating_fix(world: &mut E2eWorld) {
 #[given("a user who has chosen a fix meant for a different operating system")]
 async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
     world.model_name = Some(fix_id_for_the_other_os().to_string());
+}
+
+#[given("a user who has approved a fix whose helper command will fail")]
+async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
+    let bin_dir = command_fails_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
+    // `usermod` only has to exist for the `which` probe; the command actually run
+    // -- `usermod` directly if already root, `sudo usermod ...` otherwise -- goes
+    // through one of these two scripts either way, and both fail unconditionally.
+    for name in ["usermod", "sudo"] {
+        let script = bin_dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+            .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
+        }
+    }
+    // Restricting `$PATH` to only the fakes above also makes the recipe's
+    // root-detection deterministic: it shells out to `id -u`, which is not on
+    // this PATH, so the spawn itself fails and reads as "not root" regardless of
+    // who runs the suite -- the same `sudo usermod` branch fails on every host,
+    // CI or developer machine, root or not.
+    world.command_env.push(("PATH", bin_dir.into_os_string()));
+    world.command_env.push(("USER", "e2e-test-user".into()));
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
 #[given("a user who refers to a cause by its position in the diagnosis")]
@@ -202,6 +251,15 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
         &["fix", &fix_id, "--device-index", "1"],
         &[("HOME", home.as_str()), ("SHELL", "/bin/bash")],
     );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply the approved fix")]
+async fn user_applies_approved_fix(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -665,5 +723,26 @@ async fn assert_rc_file_untouched(world: &mut E2eWorld) {
         PLANTED_RC,
         "declining the fix must leave {} byte-for-byte unchanged",
         rc_file.display()
+    );
+}
+
+#[then("the CLI reports the command failure on stderr with exit code 4")]
+async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
+    // 4 is its own outcome: a command that ran and failed, distinct from 3
+    // (does not apply here) and 5 (user declined).
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a fix whose helper command fails should exit 4"
+    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert!(
+        stderr.contains("usermod exited") && stderr.contains("group membership NOT changed"),
+        "the command-failure explanation must be on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("group membership NOT changed"),
+        "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }
