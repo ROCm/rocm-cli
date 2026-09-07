@@ -242,6 +242,20 @@ pub struct DownloadOutcome {
 /// matching length proves nothing about the bytes — do not read a successful
 /// return as "the artifact is genuine" unless a digest was supplied.
 pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<DownloadOutcome> {
+    download_file_streaming_with_progress(request, &mut |_written, _total| {})
+}
+
+/// As [`download_file_streaming`], but reports progress via `on_progress`.
+///
+/// `on_progress` is called with the cumulative bytes written and, when
+/// known, the total size — once before the transfer starts (already
+/// resume-aware, so a resumed attempt reports its true starting offset
+/// rather than 0) and once after every chunk is written to disk. Callers
+/// that don't need progress should use [`download_file_streaming`] instead.
+pub fn download_file_streaming_with_progress(
+    request: &DownloadRequest<'_>,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<DownloadOutcome> {
     if let Some(parent) = request.destination.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -257,7 +271,7 @@ pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<Download
     let mut backoff = Backoff::default();
     let mut attempt = 1;
     let outcome = loop {
-        match download_attempt(request, &partial_path) {
+        match download_attempt(request, &partial_path, on_progress) {
             Ok(outcome) => break outcome,
             Err(error) => {
                 let retryable = error.retryable && attempt < DOWNLOAD_MAX_ATTEMPTS;
@@ -318,6 +332,7 @@ const fn status_is_retryable(status: u16) -> bool {
 fn download_attempt(
     request: &DownloadRequest<'_>,
     partial_path: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<DownloadOutcome, DownloadAttemptError> {
     // Resume from whatever a previous attempt already wrote. A missing file is
     // simply a fresh start.
@@ -417,6 +432,8 @@ fn download_attempt(
         })?
     };
 
+    on_progress(written, total_len);
+
     let mut reader = response.into_reader();
     let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
     loop {
@@ -454,6 +471,7 @@ fn download_attempt(
         if let Err(error) = file.write_all(&buffer[..read]) {
             return Err(permanent(disk_space::map_write_error(error, partial_path)));
         }
+        on_progress(written, total_len);
     }
     if let Err(error) = file.sync_all() {
         return Err(permanent(disk_space::map_write_error(error, partial_path)));
@@ -519,6 +537,21 @@ fn content_range_start(response: &ureq::Response) -> Option<u64> {
 
 pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
     download_file_streaming(&DownloadRequest::new(url, destination, timeout))?;
+    Ok(())
+}
+
+/// As [`download_file_to_path`], but reports progress via `on_progress`. See
+/// [`download_file_streaming_with_progress`] for callback semantics.
+pub fn download_file_to_path_with_progress(
+    url: &str,
+    destination: &Path,
+    timeout: Duration,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_streaming_with_progress(
+        &DownloadRequest::new(url, destination, timeout),
+        on_progress,
+    )?;
     Ok(())
 }
 
@@ -8029,6 +8062,101 @@ mod tests {
         assert_eq!(outcome.bytes_written, body.len() as u64);
         assert_eq!(outcome.sha256, expected_digest);
         assert!(leftovers.is_empty(), "the .part file must not survive");
+        Ok(())
+    }
+
+    #[test]
+    fn download_with_progress_reports_cumulative_bytes_across_chunks() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("progress");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert_eq!(
+            calls.first(),
+            Some(&(0, total)),
+            "the first call must fire before any bytes are read, already knowing the total: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "cumulative bytes must never go backwards: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total must stay constant across an attempt: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn download_with_progress_stays_continuous_across_a_resumed_attempt() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::Resume,
+            ],
+        )?;
+        let dir = download_scratch("progress-resume");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress across a retried attempt, e.g. reset to 0: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(written, _)| written == 5000),
+            "the resumed attempt must report the byte count already on disk before reading more: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total size must stay stable across the retry: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
         Ok(())
     }
 
