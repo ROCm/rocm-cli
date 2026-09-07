@@ -675,6 +675,10 @@ enum RuntimesCommand {
         runtime: String,
     },
     /// Switch back to the previously selected ROCm install.
+    #[command(
+        after_help = "NOTE: rollback has no history — rolling back twice just toggles \
+between the same two runtimes."
+    )]
     Rollback,
     /// Remove a ROCm install from ROCm CLI.
     #[command(alias = "remove")]
@@ -19363,6 +19367,26 @@ mod tests {
                 "`{command}` is marked preview, so it must not headline the examples:\n{examples}"
             );
         }
+    }
+
+    /// `rollback_runtime` hard-errors when no previous runtime is recorded (see
+    /// `update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists`
+    /// above) because it can only ever undo one step, not walk a history. A user
+    /// who expects a multi-step undo would be surprised by that, so the limit must
+    /// be stated up front in `--help`, not discovered via an error message.
+    #[test]
+    fn rollback_help_states_the_single_level_limit() {
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .find_subcommand_mut("rollback")
+            .expect("rollback subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("rollback has no history"),
+            "`rocm runtimes rollback --help` must state the single-level limit:\n{help}"
+        );
     }
 
     /// An `ExamineSummary` with the install-reporting fields under test and
