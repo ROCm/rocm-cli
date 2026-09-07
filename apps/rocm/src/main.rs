@@ -15789,7 +15789,7 @@ fn render_update_activate_summary(activation: &RuntimeActivationResult) -> Strin
     if activation.previous_runtime_key.is_some() {
         let _ = writeln!(
             output,
-            "  rollback: if this update causes problems, run `rocm runtimes rollback`"
+            "  next step: if this update causes problems, run `rocm runtimes rollback`"
         );
     }
     output
@@ -19388,7 +19388,7 @@ mod tests {
 
     /// `rollback_runtime` hard-errors when no previous runtime is recorded (see
     /// `update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists`
-    /// above) because it can only ever undo one step, not walk a history. A user
+    /// below) because it can only ever undo one step, not walk a history. A user
     /// who expects a multi-step undo would be surprised by that, so the limit must
     /// be stated up front in `--help`, not discovered via an error message.
     #[test]
@@ -29455,8 +29455,9 @@ ID_LIKE="suse opensuse"
         };
         let rendered = render_update_activate_summary(&with_previous);
         assert!(
-            rendered
-                .contains("rollback: if this update causes problems, run `rocm runtimes rollback`"),
+            rendered.contains(
+                "next step: if this update causes problems, run `rocm runtimes rollback`"
+            ),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
         );
 
@@ -29467,7 +29468,7 @@ ID_LIKE="suse opensuse"
         };
         let rendered = render_update_activate_summary(&without_previous);
         assert!(
-            !rendered.contains("rollback:"),
+            !rendered.contains("rocm runtimes rollback"),
             "no previous runtime is recorded, so `rocm runtimes rollback` would hard-error; \
              must not hint at a command that immediately fails:\n{rendered}"
         );
