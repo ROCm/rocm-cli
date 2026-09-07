@@ -147,9 +147,11 @@ fn meaningful_cache_dir(value: Option<&OsStr>) -> Option<PathBuf> {
 /// populates.
 ///
 /// Without a cache inside the managed root, `uv` caches under `$HOME/.cache/uv`; when
-/// that is on a different filesystem from the data directory, `uv` cannot hardlink and
+/// reaching that from the data directory crosses a mount point, `uv` cannot hardlink and
 /// silently copies every file, so each environment carries a full duplicate of the SDK
-/// and torch stack.
+/// and torch stack. Note it is the mount, not the filesystem: Linux refuses a hardlink
+/// across two mounts even when both resolve to the same underlying filesystem, so a bind
+/// mount or a `subPath` volume is enough to trigger the copy fallback.
 ///
 /// Note this colocates with the *data directory*, not with a `--prefix` install root; see
 /// the `--prefix` caveat in `docs/manual-testing.md`.
