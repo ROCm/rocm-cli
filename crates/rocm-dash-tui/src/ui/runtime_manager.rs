@@ -367,8 +367,11 @@ pub fn draw_runtime_manager(
 
     // No legend row when there's nothing to explain — collapse it to zero
     // height instead of always reserving it, so the empty-state hint isn't
-    // pushed down by a blank line.
-    let legend_height = u16::from(!runtimes.is_empty());
+    // pushed down by a blank line. "Nothing to explain" means no row actually
+    // carries a marker yet (mirrors the HELD_LEGEND/any_held precedent in
+    // format.rs / tabs/observe.rs), not merely a non-empty list.
+    let any_marked = runtimes.iter().any(|rt| rt.active || rt.rollback);
+    let legend_height = u16::from(any_marked);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -379,7 +382,7 @@ pub fn draw_runtime_manager(
         ])
         .split(inner);
 
-    if !runtimes.is_empty() {
+    if any_marked {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(ACTIVE_MARKER, Style::default().fg(theme.ok)),
@@ -805,6 +808,39 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_legend_collapses_when_no_runtime_is_marked() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(120, 22);
+        let mut term = Terminal::new(backend).unwrap();
+        let r = RuntimeManagerState::default();
+        // Non-empty list, but nothing active or rollback-marked — the legend
+        // has nothing to explain, so it must collapse just like the empty case.
+        let rts: Vec<RuntimeSummary> = runtimes()
+            .into_iter()
+            .map(|mut rt| {
+                rt.active = false;
+                rt.rollback = false;
+                rt
+            })
+            .collect();
+        let jobs = State::default();
+        term.draw(|f| draw_runtime_manager(f, f.area(), &r, &rts, &jobs, &theme))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains("therock-release-gfx94"));
+        assert!(!out.contains("= active"));
+        assert!(!out.contains("= rollback target"));
+    }
+
+    #[test]
     fn snapshot_legend_markers_are_color_matched() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -817,17 +853,23 @@ mod tests {
         term.draw(|f| draw_runtime_manager(f, f.area(), &r, &rts, &jobs, &theme))
             .unwrap();
         let buffer = term.backend().buffer();
+        // `Buffer::content()` is row-major (index = y*width + x) and the legend
+        // renders above the list, so a plain `.find()` always hits the legend's
+        // own glyph first and never actually reaches the list row — making this
+        // assertion tautological. Take the LAST match instead: since the list
+        // is laid out below the legend, the last occurrence in iteration order
+        // is guaranteed to come from a list row, not the legend.
         let active_cell = buffer
             .content()
             .iter()
-            .find(|cell| cell.symbol() == ACTIVE_MARKER.trim())
-            .expect("active marker glyph should render");
+            .rfind(|cell| cell.symbol() == ACTIVE_MARKER.trim())
+            .expect("active marker glyph should render in the list");
         assert_eq!(active_cell.fg, theme.ok);
         let rollback_cell = buffer
             .content()
             .iter()
-            .find(|cell| cell.symbol() == ROLLBACK_MARKER.trim())
-            .expect("rollback marker glyph should render");
+            .rfind(|cell| cell.symbol() == ROLLBACK_MARKER.trim())
+            .expect("rollback marker glyph should render in the list");
         assert_eq!(rollback_cell.fg, theme.warn);
     }
 
@@ -850,6 +892,10 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect();
         assert!(out.contains("No runtimes registered"));
+        // The legend explains markers that don't exist yet on an empty list —
+        // it must be collapsed away entirely, not merely scrolled off.
+        assert!(!out.contains("= active"));
+        assert!(!out.contains("= rollback target"));
     }
 
     #[test]
