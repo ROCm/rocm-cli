@@ -20231,6 +20231,65 @@ mod tests {
     }
 
     #[test]
+    fn lemonade_stop_unload_is_bounded_by_the_request_timeout() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the stall this PR fixes: a peer that trickles the
+        // response one byte at a time, never framing or closing, used to stall
+        // `read_tcp_stream_to_string`'s read-to-EOF loop indefinitely. That hung
+        // `unload_lemonade_service_model` past its 5s timeout during scenario
+        // teardown, showing up as an unexplained multi-minute gap. The unload
+        // call must now return an error at (not far past) its 5s budget.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer);
+            let body = b"{\"status\":\"success\",\"message\":\"ok\"}";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            // One byte every 300ms never finishes framing the 36-byte body
+            // inside the 5s unload timeout below, so the bound under test is
+            // the deadline firing, not the response completing early.
+            for byte in body {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+
+        let (_root, paths) = test_paths("lemonade-stop-unload-dribble");
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-qwen",
+            "lemonade",
+            "qwen",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            Some("therock-release".to_owned()),
+            Some("lemonade-embeddable-10.6.0".to_owned()),
+            Some("gpu_required".to_owned()),
+        );
+        let started = Instant::now();
+        assert!(unload_lemonade_service_model(&record).is_err());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        Ok(())
+    }
+
+    #[test]
     fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -20330,6 +20389,69 @@ mod tests {
 
         assert_eq!(readiness, EndpointReadiness::Serving);
         assert_eq!(status_for_readiness(readiness), "ready");
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_readiness_ready_verdict_does_not_wait_for_the_peer_to_close() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the other half of this PR's fix: a response is
+        // read to completion by its own framing, not by waiting for the peer
+        // to close. Before this fix, `read_tcp_stream_to_string` blocked
+        // until EOF, so a keep-alive engine that answers correctly but never
+        // closes the socket looked identical to a hung one — the readiness
+        // probe ran out its timeout and reported not-ready even though the
+        // answer had already arrived.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buffer = [0_u8; 1024];
+                    let Ok(read) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let body = if request.starts_with("POST /v1/chat/completions ") {
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                    } else {
+                        r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    // Hold the connection open well past the readiness wait's
+                    // timeout below, and deliberately omit `Connection:
+                    // close`. The client must not need EOF to recognize the
+                    // response as complete.
+                    thread::sleep(Duration::from_secs(10));
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a complete response must be recognized without waiting on the peer to close"
+        );
         drop(server);
         Ok(())
     }
