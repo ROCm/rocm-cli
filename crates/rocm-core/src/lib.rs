@@ -1028,7 +1028,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 /// slow-drip responder could stretch the total wait to an arbitrary multiple of
 /// what the caller asked for. This returns as soon as the response is complete by
 /// its own framing, and never runs past `deadline` in total.
-fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !http_response_is_complete(&response) {

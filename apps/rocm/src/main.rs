@@ -40,7 +40,7 @@ use rocm_core::{
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
-    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    read_http_response_bounded, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
     shell_command_for_host, uv_cache_source, write_all_tcp_stream,
@@ -18875,6 +18875,7 @@ fn http_get_local_service(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     // Authenticate the probe when the endpoint is protected; loopback endpoints
@@ -18888,7 +18889,7 @@ fn http_get_local_service(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service readiness request")?;
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .context("failed to read service readiness response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -18909,6 +18910,7 @@ fn http_post_local_service_json(
     body: &serde_json::Value,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     let body = serde_json::to_string(body).context("failed to serialize service request")?;
@@ -18919,8 +18921,8 @@ fn http_post_local_service_json(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service request")?;
-    let response =
-        read_tcp_stream_to_string(&mut stream).context("failed to read service response")?;
+    let response = read_http_response_bounded(&mut stream, deadline)
+        .context("failed to read service response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .unwrap_or((response.as_str(), ""));
