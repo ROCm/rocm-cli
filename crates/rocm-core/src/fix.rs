@@ -743,12 +743,12 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     // Same resolver `examine` uses, so the line we append names the install the
     // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
     let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
-        println!("No ROCm install found; nothing to add to PATH.");
+        eprintln!("No ROCm install found; nothing to add to PATH.");
         return 3;
     };
     let bin_path = install.path.join("bin");
     if !bin_path.is_dir() {
-        println!(
+        eprintln!(
             "{} does not exist; nothing to add to PATH.",
             bin_path.display()
         );
@@ -803,12 +803,12 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         sdk_path = newest_rocm_install_dir();
     }
     if sdk_path.is_empty() {
-        println!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
+        eprintln!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
         return 3;
     }
     let bin_dir = Path::new(&sdk_path).join("bin");
     if !bin_dir.is_dir() {
-        println!(
+        eprintln!(
             "{} does not exist on disk; HIP SDK install looks incomplete.",
             bin_dir.display()
         );
