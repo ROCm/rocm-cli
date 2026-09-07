@@ -477,7 +477,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 
     let os = current_os();
     if !recipe.applies_on.contains(&os) {
-        println!(
+        eprintln!(
             "This fix only applies on: {}. Running OS is: {os}.",
             recipe.applies_on.join(", ")
         );
@@ -510,7 +510,7 @@ fn confirm(prompt: &str, assume_yes: bool) -> bool {
         return true;
     }
     if !std::io::stdin().is_terminal() {
-        println!("Non-interactive shell and --yes not passed; refusing to apply.");
+        eprintln!("Non-interactive shell and --yes not passed; refusing to apply.");
         return false;
     }
     print!("{prompt} [y/N]: ");
@@ -565,16 +565,16 @@ fn run_render_group(opts: &FixOptions) -> i32 {
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default();
     if user.is_empty() {
-        println!("Could not determine current user from $USER/$LOGNAME.");
+        eprintln!("Could not determine current user from $USER/$LOGNAME.");
         return 3;
     }
     if !which("usermod") {
-        println!("`usermod` not on PATH; cannot add groups.");
+        eprintln!("`usermod` not on PATH; cannot add groups.");
         return 3;
     }
     let root = is_root();
     if !which("sudo") && !root {
-        println!("`sudo` is not on PATH and we are not root; cannot add groups.");
+        eprintln!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return 3;
     }
     let (program, args): (&str, Vec<String>) = if root {
@@ -612,7 +612,7 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        println!("usermod exited {rc}; group membership NOT changed.");
+        eprintln!("usermod exited {rc}; group membership NOT changed.");
         return 4;
     }
     println!("Added {user} to render,video.");
@@ -710,7 +710,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
             print!("{out}");
             eprint!("{err}");
             if rc != 0 {
-                println!("setx exited {rc}; User scope NOT changed.");
+                eprintln!("setx exited {rc}; User scope NOT changed.");
                 return 4;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
@@ -757,7 +757,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     let bin_dir_owned = bin_path.to_string_lossy().into_owned();
     let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
-        println!("Could not determine your home directory.");
+        eprintln!("Could not determine your home directory.");
         return 3;
     };
     let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
@@ -786,7 +786,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         "# Added by rocm examine (fix-6-path)",
         &export_line,
     ) {
-        println!("Failed to write {}: {exc}", rc_file.display());
+        eprintln!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -838,7 +838,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        println!("setx exited {rc}; User PATH NOT changed.");
+        eprintln!("setx exited {rc}; User PATH NOT changed.");
         return 4;
     }
     println!(
@@ -850,7 +850,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
     if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
-        println!("--device-index must be >= 0 (got {idx}).");
+        eprintln!("--device-index must be >= 0 (got {idx}).");
         return 3;
     }
     if runtime_is_windows() {
@@ -870,7 +870,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         return 0;
     };
     let Some(rc_file) = shell_rc_file() else {
-        println!("Could not determine your home directory.");
+        eprintln!("Could not determine your home directory.");
         return 3;
     };
     let export_line = format!("export HIP_VISIBLE_DEVICES={idx}");
@@ -897,7 +897,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         "# Added by rocm examine (fix-9-igpu-dgpu)",
         &export_line,
     ) {
-        println!("Failed to write {}: {exc}", rc_file.display());
+        eprintln!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -944,7 +944,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        println!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
+        eprintln!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
         return 4;
     }
     println!(

@@ -480,10 +480,14 @@ async fn assert_inapplicable_fix_declined(world: &mut E2eWorld) {
         Some(3),
         "a fix that does not apply here should exit 3, distinct from 2/4/5"
     );
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let combined = format!(
+        "{}{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
     assert!(
-        output.contains("This fix only applies on:"),
-        "the refusal must say which platforms the fix is for:\n{output}"
+        combined.contains("This fix only applies on:"),
+        "the refusal must say which platforms the fix is for:\n{combined}"
     );
 }
 
@@ -627,23 +631,27 @@ async fn assert_position_argument_corrected(world: &mut E2eWorld) {
 
 #[then("the CLI refuses and explains that it needs agreement")]
 async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let combined = format!(
+        "{}{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
     // The refusal has to say *why* and how to proceed. A bare non-zero exit
     // reads as a broken fix rather than a deliberate stop.
     assert!(
-        output.contains("--yes"),
-        "the refusal must name what to pass to proceed:\n{output}"
+        combined.contains("--yes"),
+        "the refusal must name what to pass to proceed:\n{combined}"
     );
     assert!(
-        output.contains("refusing to apply"),
-        "the refusal must say it did not apply the fix:\n{output}"
+        combined.contains("refusing to apply"),
+        "the refusal must say it did not apply the fix:\n{combined}"
     );
     // Distinct from the unknown-id refusal (2), so a script can tell "you did
     // not agree" apart from "no such fix".
     assert_eq!(
         world.cli_rc,
         Some(5),
-        "declining to apply is its own outcome, not an error:\n{output}"
+        "declining to apply is its own outcome, not an error:\n{combined}"
     );
 }
 
