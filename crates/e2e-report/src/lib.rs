@@ -733,6 +733,21 @@ impl CellOutcome {
     }
 }
 
+/// One (outcome, human explanation) entry per glyph, in the grid legend's
+/// display order. Shared by the HTML and Markdown legends so a new
+/// `CellOutcome` variant can't update one copy and leave the other stale.
+const LEGEND_ENTRIES: &[(CellOutcome, &str)] = &[
+    (CellOutcome::Pass, "pass"),
+    (CellOutcome::Xfail, "known bug, failed as expected (xfail)"),
+    (CellOutcome::Skip, "not applicable here"),
+    (CellOutcome::UnexpectedFail, "regression"),
+    (CellOutcome::Xpass, "bug fixed here (stale entry)"),
+    (CellOutcome::FlakyXpass, "known flaky bug passed this run"),
+    (CellOutcome::RanWhenNa, "ran despite being marked n/a"),
+    (CellOutcome::Absent, "expected to run but no result recorded"),
+    (CellOutcome::Missing, "no data."),
+];
+
 /// One platform column of the reconciled (scenario-id × platform) grid.
 struct GridColumn {
     /// Platform identity from the manifest (e.g. "mi300x", "strix-halo", "mock").
@@ -1351,14 +1366,16 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
     html! {
         h2 { "Expectation grid (scenario × platform)" }
         p.grid-legend {
-            "✅ pass · "
-            span.status-xfail { "✗" } " known bug, failed as expected (xfail) · "
-            "n/a not applicable here · "
-            span.status-fail { "❌FAIL" } " regression · "
-            "⚠️XPASS bug fixed here (stale entry) · "
-            "✅XPASS (flaky) known flaky bug passed this run · "
-            "⚠️n/a-ran ran despite being marked n/a · "
-            "⚠️no-result expected to run but no result recorded · · no data."
+            @for (i, (outcome, text)) in LEGEND_ENTRIES.iter().copied().enumerate() {
+                @if i > 0 { " · " }
+                @match outcome {
+                    CellOutcome::Xfail | CellOutcome::UnexpectedFail => {
+                        span class=(outcome.grid_class()) { (outcome.glyph()) }
+                    }
+                    _ => { (outcome.glyph()) }
+                }
+                " " (text)
+            }
         }
         // One table per feature, so a reader can scan a single area of the CLI
         // instead of one undivided 60-row block.
@@ -1440,13 +1457,12 @@ fn expectation_grid_markdown(
     }
 
     let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
-    out.push_str(
-        "_✅ pass · ✗ known bug (failed as expected, i.e. xfail) · n/a not applicable here · \
-         ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · \
-         ✅XPASS (flaky) known flaky bug passed this run · \
-         ⚠️n/a-ran ran despite being marked n/a · \
-         ⚠️no-result expected to run but no result recorded · · no data._\n\n",
-    );
+    let legend = LEGEND_ENTRIES
+        .iter()
+        .map(|(outcome, text)| format!("{} {text}", outcome.glyph()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let _ = writeln!(out, "_{legend}_\n");
 
     // One table per feature, under its own heading — a single undivided table of
     // every scenario in the suite is unreadable, and gives no clue where one area
