@@ -6629,6 +6629,14 @@ struct RuntimeUninstallResult {
     was_active: bool,
 }
 
+/// Marker shown beside the active runtime in `rocm runtimes list`. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const ACTIVE_RUNTIME_MARKER: &str = "*";
+/// Marker shown beside the rollback-target runtime. See
+/// [`ACTIVE_RUNTIME_MARKER`].
+const ROLLBACK_RUNTIME_MARKER: &str = "-";
+
 pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
     recover_setup_runtime_registration(paths, config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
@@ -6708,6 +6716,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
     drop(default_runtime_matches);
 
     let _ = writeln!(output, "  installed:");
+    let _ = writeln!(
+        output,
+        "    legend: {ACTIVE_RUNTIME_MARKER} = active, {ROLLBACK_RUNTIME_MARKER} = rollback target"
+    );
+    let _ = writeln!(output);
     for manifest in manifests {
         let active = config
             .active_runtime_key
@@ -6719,9 +6732,9 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            "*"
+            ACTIVE_RUNTIME_MARKER
         } else if rollback {
-            "-"
+            ROLLBACK_RUNTIME_MARKER
         } else {
             " "
         };
@@ -26462,6 +26475,37 @@ ID_LIKE="suse opensuse"
         assert!(rendered.contains(
             "active_status: missing manifest for active_runtime_key=missing-runtime-key"
         ));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn render_runtimes_text_includes_marker_legend() -> Result<()> {
+        let (root, paths) = test_paths("runtime-marker-legend");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some("release-pip-gfx120x-all-7-13-0".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let legend = format!(
+            "legend: {ACTIVE_RUNTIME_MARKER} = active, {ROLLBACK_RUNTIME_MARKER} = rollback target\n\n"
+        );
+        let entry = format!("{ACTIVE_RUNTIME_MARKER} release-pip-gfx120x-all-7-13-0");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        let entry_pos = rendered.find(&entry).expect("active entry present");
+        assert!(
+            legend_pos < entry_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
