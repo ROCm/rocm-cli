@@ -10,9 +10,6 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-e2e-test-hooks = []
-
 [[bin]]
 name = "rocm-engine-lemonade"
 path = "src/main.rs"

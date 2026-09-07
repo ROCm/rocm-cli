@@ -242,17 +242,17 @@ mod tests {
     }
 
     /// Every lane that pre-builds `rocm` and hands it to the suite via
-    /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
-    /// enables when it builds for itself.
+    /// `ROCM_CLI_BINARY` must build it with exactly the invocation `cargo xtask
+    /// e2e` uses when it builds for itself.
     ///
-    /// The suite's deterministic failure seams (e.g. the scripted Lemonade
-    /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
-    /// that omits the feature ships a binary in which those seams do not exist,
-    /// so the scenarios relying on them cannot reach their premise and fail as
-    /// regressions — but only on whichever lane happens to select them, which is
-    /// what made this divergence so hard to read the first time. Pin it here so a
-    /// new lane copying an existing block cannot silently reintroduce it.
-    fn assert_prebuilt_e2e_lanes_enable_test_hooks(workflow: &str, text: &str) {
+    /// Exporting the binaries only saves the second build if cargo would have
+    /// produced the same artifacts. Any divergence — package set, profile,
+    /// features — re-resolves the graph, and the lane silently pays a full
+    /// release rebuild on top of the one it already did. That is exactly the
+    /// regression #342 fixed on the Windows lane, where the two invocations had
+    /// drifted apart by one feature flag. Pin it here so a new lane copying an
+    /// existing block cannot reintroduce the drift.
+    fn assert_prebuilt_e2e_lanes_match_xtask_build(workflow: &str, text: &str) {
         let blocks: Vec<_> = multiline_run_blocks(text)
             .into_iter()
             .filter(|block| block.contains("ROCM_CLI_BINARY") && invokes_e2e(block))
@@ -262,14 +262,16 @@ mod tests {
             "{workflow} must contain prebuilt E2E run blocks"
         );
         for block in blocks {
+            // Whole-line, not `contains`: a trailing `--features …` would
+            // satisfy a substring check while being exactly the drift this pins.
             assert!(
-                block.contains(
-                    "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks"
-                ),
-                "{workflow} prebuilt E2E lane must build with \
-                 `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                block
+                    .lines()
+                    .any(|line| line.trim() == "cargo build --release -p rocm -p rocmd"),
+                "{workflow} prebuilt E2E lane must build exactly \
+                 `cargo build --release -p rocm -p rocmd`, matching what `cargo xtask \
+                 e2e` builds for itself; anything else re-resolves the graph and the \
+                 lane pays a second full release build:\n{block}"
             );
         }
     }
@@ -1030,32 +1032,30 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
-    fn self_hosted_prebuilt_e2e_lanes_enable_test_hooks() {
+    fn self_hosted_prebuilt_e2e_lanes_match_xtask_build() {
         let workflow = read_workflow("e2e-selfhosted.yml");
-        assert_prebuilt_e2e_lanes_enable_test_hooks("e2e-selfhosted.yml", &workflow);
+        assert_prebuilt_e2e_lanes_match_xtask_build("e2e-selfhosted.yml", &workflow);
     }
 
     #[test]
-    fn nightly_prebuilt_e2e_lanes_enable_test_hooks() {
+    fn nightly_prebuilt_e2e_lanes_match_xtask_build() {
         let workflow = read_workflow("nightly.yml");
-        assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
+        assert_prebuilt_e2e_lanes_match_xtask_build("nightly.yml", &workflow);
     }
 
     /// The Windows lane must hand its lifecycle E2E run the release binaries the
     /// Build step already produced.
     ///
     /// Without `ROCM_CLI_BINARY`, `cargo xtask e2e` builds `rocm`/`rocmd` for
-    /// itself WITH `--features rocm/e2e-test-hooks`. That is a different feature
-    /// resolution than the Build step's, so cargo rebuilds the entire release
-    /// graph instead of reusing it — a second 3-4 minute release build on the one
-    /// job that alone determines total CI wall clock.
+    /// itself. Cargo reusing the Build step's artifacts then depends on the two
+    /// invocations agreeing on profile, package set, features and target dir; a
+    /// one-flag drift cost this job a second 3-4 minute release build on every
+    /// run — the one job that alone determines total CI wall clock. Exporting the
+    /// paths removes the dependence on that agreement instead of restating it.
     ///
-    /// Note this is the mirror image of
-    /// [`assert_prebuilt_e2e_lanes_enable_test_hooks`]: lanes running the FULL
-    /// suite must build WITH the hooks, while this lifecycle-only lane must build
-    /// WITHOUT them. `E2E_ONLY_LIFECYCLE` keeps it to @lifecycle scenarios, none
-    /// of which use a scripted seam, and the lane packages and installs the
-    /// binary through the real installer — so it must ship what a release ships.
+    /// [`assert_prebuilt_e2e_lanes_match_xtask_build`] pins the same invariant
+    /// from the other side for the self-hosted and nightly lanes, which pre-build
+    /// and must therefore match `xtask`'s own invocation.
     #[test]
     fn ci_windows_lifecycle_lane_reuses_the_binaries_it_built() {
         let ci = read_workflow("ci.yml");
@@ -1096,11 +1096,6 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             lifecycle.contains("$env:ROCM_CLI_ROCMD_BINARY = \"$targetDir\\release\\rocmd.exe\""),
             "the Windows lifecycle lane must export the RELEASE rocmd.exe path — the \
              binaries the Build step produced, not a debug or stale target dir:\n{lifecycle}"
-        );
-        assert!(
-            !lifecycle.contains("e2e-test-hooks"),
-            "the lifecycle-only lane packages and installs what a release ships, \
-             so it must NOT carry the test hooks:\n{lifecycle}"
         );
     }
 
