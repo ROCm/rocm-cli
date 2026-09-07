@@ -257,11 +257,21 @@ jobs:
           # scenario. Persistent path; service state stays isolated per scenario.
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
           # Share uv's wheel download/build cache so `rocm install sdk` is a warm
-          # ~34s per scenario instead of a cold ~160s (measured on MI300X). Kept
-          # OFF the RUNNER_WORKSPACE Longhorn PVC (near-full) and on the roomy `/`
-          # overlay; ~23GB, one cold fill per pod-life. Not git-cleaned (outside
-          # the checkout) and outside the reclaim step's /tmp/rocm-e2e-* glob.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # ~34s per scenario instead of a cold ~160s (measured on MI300X).
+          #
+          # On RUNNER_WORKSPACE, next to the runtimes it populates, because uv can
+          # only hardlink out of this cache into a managed environment when the two
+          # are reachable without crossing a mount point. Anywhere else and it
+          # silently falls back to copying every file, so each runtime carries its
+          # own full copy of the ROCm SDK and torch stack. uv exits 0 either way and
+          # two of the three install paths discard its warning, so the fallback is
+          # invisible unless you compare inodes.
+          #
+          # ~23GB per ROCm generation, and uv never evicts, so this shares the work
+          # volume's budget with e2e-target/e2e-shared/e2e-prewarm rather than
+          # having a quota of its own. The runner image reclaims it when the volume
+          # runs low; nothing here does.
+          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
           # Share ONE installed managed runtime across the serve/chat scenarios so
           # `rocm install sdk` runs once per runner, not once per scenario (the
           # per-scenario install count — each a multi-GiB TheRock SDK whose probe
@@ -916,10 +926,10 @@ jobs:
           # still warm on the next job even though the container is not.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # A SEPARATE PVC is mounted at exactly this path by the runner's cluster
-          # overlay. Keeping the ~23GB uv cache off the work PVC is deliberate; if
-          # you change this path, change the overlay that mounts it too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same volume as the runtimes it populates, so uv hardlinks into them
+          # instead of copying — see the e2e-gpu lane for why the distinction is
+          # invisible in the logs.
+          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
           # Pre-warm one shared runtime in place before the suite. Not an
           # optimization — `install sdk` bakes absolute paths into the runtime
           # manifest, so installing anywhere temporary breaks every later serve.
