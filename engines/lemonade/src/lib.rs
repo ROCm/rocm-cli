@@ -40,6 +40,14 @@ const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GG
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
+/// Records the extracted embeddable version next to the runtime tree itself
+/// (inside `lemonade_root`, not the CLI's own manifest) so the version check
+/// survives even when the manifest lives under a data dir that is not shared
+/// with the runtime tree (e.g. each e2e scenario's isolated data dir vs. a
+/// shared runtime tree). Without this, [`prepare_embeddable`] can never prove
+/// the shared tree is already current, wipes it, and re-extracts on every
+/// call — destroying any llama.cpp backend installed into it in the process.
+const RUNTIME_VERSION_MARKER: &str = "runtime-version.txt";
 #[cfg(feature = "e2e-test-hooks")]
 const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
 /// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
@@ -1076,10 +1084,18 @@ fn prepare_embeddable(
     // archive into a tree that already holds `lemond` from the previous
     // version. Without comparing versions the extraction would be skipped and
     // the old binaries reported as the new version.
-    let installed_version = read_manifest(paths)
+    //
+    // The version is read from a marker inside `root` (the same shared tree
+    // as `runtime_dir`), not from the CLI's own manifest: the manifest lives
+    // under `paths` (the per-invocation data dir), which is not guaranteed to
+    // be the same data dir that last extracted into this `runtime_dir` (e.g.
+    // each e2e scenario gets an isolated data dir but shares one runtime
+    // tree). Sourcing the check from the isolated manifest would report
+    // "unknown version" on every call, wipe the shared tree, and re-extract
+    // over it — destroying any llama.cpp backend already installed there.
+    let installed_version = fs::read_to_string(root.join(RUNTIME_VERSION_MARKER))
         .ok()
-        .filter(|manifest| manifest.runtime_dir == runtime_dir)
-        .map(|manifest| manifest.version);
+        .map(|s| s.trim().to_owned());
     if needs_extraction(
         reinstall,
         installed_version.as_deref(),
@@ -1098,6 +1114,12 @@ fn prepare_embeddable(
         let embeddable_root = find_embeddable_root(&extract_root)?;
         copy_tree(&embeddable_root, &runtime_dir)?;
         fs::remove_dir_all(&extract_root).ok();
+        fs::write(root.join(RUNTIME_VERSION_MARKER), &version).with_context(|| {
+            format!(
+                "failed to record installed Lemonade runtime version under {}",
+                root.display()
+            )
+        })?;
     }
     drop(archive_guard);
     let lemond = lemond_path_in(&runtime_dir);
@@ -5006,6 +5028,32 @@ mod tests {
         assert!(needs_extraction(false, None, pin, true));
         assert!(needs_extraction(false, Some(pin), pin, false));
         assert!(needs_extraction(true, Some(pin), pin, true));
+    }
+
+    #[test]
+    fn runtime_version_marker_survives_without_a_manifest() {
+        // The regression this guards: an isolated caller (e.g. a data dir that
+        // has never seen this `root` before) must still recognize a runtime
+        // tree extracted by a *different* caller sharing the same `root`, or
+        // `prepare_embeddable` wipes and re-extracts it on every call.
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-lemonade-marker-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(RUNTIME_VERSION_MARKER);
+
+        assert!(fs::read_to_string(&marker).is_err());
+
+        fs::write(&marker, "7.13.0\n").unwrap();
+        let installed = fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim().to_owned());
+        assert_eq!(installed.as_deref(), Some("7.13.0"));
+        assert!(!needs_extraction(false, installed.as_deref(), "7.13.0", true));
+        assert!(needs_extraction(false, installed.as_deref(), "7.14.0", true));
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

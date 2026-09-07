@@ -240,9 +240,13 @@ impl E2eWorld {
             // is content-addressed and re-fetchable (see storage::download_cache_dir /
             // tool_download_cache_dir). Route it through the same shared, persistent
             // dir as HF_HOME/PIP_CACHE_DIR below instead of this scenario's TempDir,
-            // so the ~3.3GB llamacpp:rocm backend archive is downloaded once per
-            // runner rather than once per scenario (EAI-8572). Local runs (no shared
-            // dir) keep the old fully-isolated cache.
+            // so therock SDK/tool archives are downloaded once per runner rather than
+            // once per scenario. Local runs (no shared dir) keep the old fully-isolated
+            // cache. This does NOT cover the ~3.3GB llamacpp:rocm Lemonade backend
+            // (EAI-8572) — that lives under the shared runtimes tree (see
+            // `use_shared_runtimes`) and was actually fixed by making
+            // `prepare_embeddable` stop wiping that shared tree on every scenario
+            // (rocm-engine-lemonade's `RUNTIME_VERSION_MARKER`).
             let cache_dir = shared_cache_dir()
                 .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
             env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
