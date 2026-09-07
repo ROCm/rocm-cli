@@ -1076,7 +1076,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let lifecycle = multiline_run_blocks(windows)
             .into_iter()
             .find(|block| invokes_e2e(block))
-            .unwrap_or_default();
+            .unwrap_or_else(|| "<no multiline run block invoking `cargo xtask e2e`>".to_owned());
 
         for var in ["ROCM_CLI_BINARY", "ROCM_CLI_ROCMD_BINARY"] {
             assert!(
@@ -1086,6 +1086,17 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                  the whole release graph under a different feature set:\n{lifecycle}"
             );
         }
+
+        // Naming the variables is not enough: pointing them at `target\debug\`
+        // would satisfy the check above while defeating the reuse this test is
+        // named for. Pin the whole assignment, exactly as
+        // `assert_prebuilt_e2e_lanes_export_rocmd` pins it for the other
+        // PowerShell prebuilt lanes.
+        assert!(
+            lifecycle.contains("$env:ROCM_CLI_ROCMD_BINARY = \"$targetDir\\release\\rocmd.exe\""),
+            "the Windows lifecycle lane must export the RELEASE rocmd.exe path — the \
+             binaries the Build step produced, not a debug or stale target dir:\n{lifecycle}"
+        );
         assert!(
             !lifecycle.contains("e2e-test-hooks"),
             "the lifecycle-only lane packages and installs what a release ships, \

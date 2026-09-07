@@ -410,14 +410,17 @@ jobs:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
         run: |
-          $env:ROCM_CLI_BINARY = "$PWD\target\release\rocm.exe"
-          $env:ROCM_CLI_ROCMD_BINARY = "$PWD\target\release\rocmd.exe"
+          # Derive from CARGO_TARGET_DIR when it is set, falling back to the
+          # default target dir — the same form the PowerShell prebuilt lanes in
+          # nightly.yml and e2e-selfhosted.yml use, so a future job-level
+          # CARGO_TARGET_DIR cannot leave this lane pointing at a stale path.
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
           # Fail here, naming the missing binary, rather than letting a scenario
-          # die on a "failed to run" deep in the suite. These paths assume the
-          # default target dir; if a future change sets CARGO_TARGET_DIR they
-          # must follow it.
+          # die on a "failed to run" deep in the suite.
           foreach ($bin in $env:ROCM_CLI_BINARY, $env:ROCM_CLI_ROCMD_BINARY) {
-            if (-not (Test-Path $bin)) {
+            if (-not (Test-Path -LiteralPath $bin)) {
               throw "expected the Build step to have produced $bin"
             }
           }
