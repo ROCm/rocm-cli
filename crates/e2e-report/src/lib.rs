@@ -1355,7 +1355,10 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
             span.status-xfail { "✗" } " known bug, failed as expected (xfail) · "
             "n/a not applicable here · "
             span.status-fail { "❌FAIL" } " regression · "
-            "⚠️XPASS bug fixed here (stale entry) · · no data."
+            "⚠️XPASS bug fixed here (stale entry) · "
+            "✅XPASS (flaky) known flaky bug passed this run · "
+            "⚠️n/a-ran ran despite being marked n/a · "
+            "⚠️no-result expected to run but no result recorded · · no data."
         }
         // One table per feature, so a reader can scan a single area of the CLI
         // instead of one undivided 60-row block.
@@ -1439,7 +1442,10 @@ fn expectation_grid_markdown(
     let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
     out.push_str(
         "_✅ pass · ✗ known bug (failed as expected, i.e. xfail) · n/a not applicable here · \
-         ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
+         ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · \
+         ✅XPASS (flaky) known flaky bug passed this run · \
+         ⚠️n/a-ran ran despite being marked n/a · \
+         ⚠️no-result expected to run but no result recorded · · no data._\n\n",
     );
 
     // One table per feature, under its own heading — a single undivided table of
@@ -2863,6 +2869,40 @@ mod tests {
             !md.contains("**XPASS** on"),
             "flaky XPASS must not need attention:\n{md}"
         );
+    }
+
+    #[test]
+    fn expectation_grid_legend_explains_every_glyph() {
+        // The legend must explain every glyph `CellOutcome::glyph()` can emit,
+        // not just the original pass/xfail/n-a/FAIL/XPASS/no-data set — flaky
+        // XPASS, ran-when-n/a, and absent results are real states a reader can
+        // land on and must not be left silently unexplained.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+
+        let md = consolidated_summary_markdown(&inputs);
+        for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
+            assert!(
+                md.contains(glyph),
+                "markdown grid legend must explain {glyph:?}:\n{md}"
+            );
+        }
+
+        let html = expectation_grid_html(&inputs).into_string();
+        for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
+            assert!(
+                html.contains(glyph),
+                "html grid legend must explain {glyph:?}:\n{html}"
+            );
+        }
     }
 
     #[test]
