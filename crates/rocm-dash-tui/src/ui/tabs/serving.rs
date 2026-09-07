@@ -139,6 +139,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::app::ActiveTab;
+    use crate::ui::format;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -233,6 +234,91 @@ mod tests {
         assert!(
             out.contains("Llama-3.1-8B"),
             "ready model not shown inline: {out:?}"
+        );
+    }
+
+    #[test]
+    fn serving_detail_shows_held_legend_when_gen_tps_held() {
+        use rocm_dash_core::metrics::{
+            Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+        };
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2; // "Running instances/services" → OpenServices
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: Some(42.0),
+                gen_tps_observation: Some(ObservationMetadata {
+                    observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                    freshness: ObservationFreshness::Held,
+                }),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when a shown instance's gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn serving_detail_hides_held_legend_when_all_fresh() {
+        use rocm_dash_core::metrics::{
+            Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+        };
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2;
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: Some(42.0),
+                gen_tps_observation: Some(ObservationMetadata {
+                    observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                    freshness: ObservationFreshness::Fresh,
+                }),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all shown instances are fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn serving_detail_hides_held_legend_for_legacy_none_metadata() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2;
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: Some(42.0),
+                gen_tps_observation: None,
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
         );
     }
 

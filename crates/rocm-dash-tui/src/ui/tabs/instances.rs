@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use rocm_dash_core::metrics::{Instance, InstanceStatus};
+use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
@@ -79,6 +79,23 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if inner.height == 0 {
         return;
     }
+
+    // Show HELD_LEGEND only when at least one displayed gen_tps is actually
+    // held — keeps the table quiet when data is fully fresh.
+    let any_held = instances.iter().any(|inst| {
+        inst.gen_tps_observation
+            .as_ref()
+            .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+    });
+    let (table_area, legend_area) = if any_held {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        (split[0], Some(split[1]))
+    } else {
+        (inner, None)
+    };
 
     let header = Row::new([
         "MODEL", "TOK/S", "TOK/W", "TTFT", "TPOT", "POWER", "QUEUE", "KV%",
@@ -149,7 +166,16 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Constraint::Length(5),
     ];
     let table = Table::new(rows, widths).header(header).column_spacing(1);
-    f.render_widget(table, inner);
+    f.render_widget(table, table_area);
+    if let Some(legend_area) = legend_area {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            legend_area,
+        );
+    }
 }
 
 /// How tall to make the heatmap block.
@@ -1321,6 +1347,65 @@ mod tests {
         assert!(
             out.contains("789") && !out.contains("789*"),
             "legacy (no metadata) must NOT show held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_visible_when_gen_tps_held() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "held",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when a shown gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_when_all_fresh() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "fresh",
+            Some(456.0),
+            Some(obs(ObservationFreshness::Fresh, 5)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all shown gen_tps are fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_for_legacy_none_metadata() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("legacy", Some(789.0), None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
         );
     }
 

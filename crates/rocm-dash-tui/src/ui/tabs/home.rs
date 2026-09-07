@@ -288,6 +288,17 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))),
         lh[4],
     );
+    // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
+    // held — keeps the hero quiet when data is fully fresh.
+    if any_tpw_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            lh[5],
+        );
+    }
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -375,6 +386,17 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         format!("{tps:.0}")
     };
     mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
+    // Show the shared HELD_LEGEND only when the tok/s aggregate is actually
+    // held — keeps the hero quiet when data is fully fresh.
+    if any_tps_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            rh[5],
+        );
+    }
 }
 
 fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -488,7 +510,10 @@ mod tests {
     use crate::app::ActiveTab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
+        ObservationMetadata, Snapshot, SystemMetrics,
+    };
 
     #[test]
     fn node_load_label_never_marks_simulated_live() {
@@ -583,5 +608,70 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    fn instance_with_obs(gen_tps: f64, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(gen_tps),
+            tokens_per_watt: Some(gen_tps / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    fn state_with_instance(inst: Instance) -> AppState {
+        let mut s = state_with_gpu();
+        s.instances.insert(inst.container_id.clone(), inst);
+        s
+    }
+
+    #[test]
+    fn home_held_legend_visible_when_tpw_and_tps_held() {
+        let out = render(&state_with_instance(instance_with_obs(300.0, Some(held_obs()))), 160, 30);
+        assert!(
+            out.contains(format::HELD_MARKER),
+            "HELD_MARKER must appear when instance data is held; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when instance data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_when_all_fresh() {
+        let out = render(&state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))), 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_for_legacy_none_metadata() {
+        let out = render(&state_with_instance(instance_with_obs(300.0, None)), 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
     }
 }

@@ -20,6 +20,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use rocm_dash_core::metrics::ObservationFreshness;
+
 use crate::app::{AppState, KeyAction, PaneFocus};
 use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
@@ -413,7 +415,12 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                     Style::default().fg(theme.muted),
                 )));
             } else {
+                let mut any_held = false;
                 for i in running.iter().take(5) {
+                    any_held |= i
+                        .gen_tps_observation
+                        .as_ref()
+                        .is_some_and(|m| m.freshness == ObservationFreshness::Held);
                     let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
@@ -431,6 +438,14 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                 if running.len() > 5 {
                     lines.push(Line::from(Span::styled(
                         format!("  …and {} more", running.len() - 5),
+                        Style::default().fg(theme.muted),
+                    )));
+                }
+                // Show HELD_LEGEND only when at least one displayed instance's
+                // gen_tps is actually held — keeps this pane quiet when fresh.
+                if any_held {
+                    lines.push(Line::from(Span::styled(
+                        format::HELD_LEGEND,
                         Style::default().fg(theme.muted),
                     )));
                 }
