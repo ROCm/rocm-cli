@@ -5036,10 +5036,8 @@ mod tests {
         // has never seen this `root` before) must still recognize a runtime
         // tree extracted by a *different* caller sharing the same `root`, or
         // `prepare_embeddable` wipes and re-extracts it on every call.
-        let dir = std::env::temp_dir().join(format!(
-            "rocm-lemonade-marker-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rocm-lemonade-marker-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(RUNTIME_VERSION_MARKER);
 
@@ -5050,8 +5048,18 @@ mod tests {
             .ok()
             .map(|s| s.trim().to_owned());
         assert_eq!(installed.as_deref(), Some("7.13.0"));
-        assert!(!needs_extraction(false, installed.as_deref(), "7.13.0", true));
-        assert!(needs_extraction(false, installed.as_deref(), "7.14.0", true));
+        assert!(!needs_extraction(
+            false,
+            installed.as_deref(),
+            "7.13.0",
+            true
+        ));
+        assert!(needs_extraction(
+            false,
+            installed.as_deref(),
+            "7.14.0",
+            true
+        ));
 
         fs::remove_dir_all(&dir).ok();
     }
