@@ -113,7 +113,14 @@ impl Spinner {
 pub(crate) fn format_download_progress(prefix: &str, bytes: u64, total: Option<u64>) -> String {
     match total {
         Some(total) if total > 0 => {
-            let pct = ((bytes.min(total) as f64 / total as f64) * 100.0).round() as u64;
+            // Floor rather than round: a multi-gigabyte transfer sitting at
+            // 99.5% must not be shown as "complete" while bytes are still
+            // outstanding. 100% is reserved for `bytes >= total`.
+            let pct = if bytes >= total {
+                100
+            } else {
+                ((bytes as f64 / total as f64) * 100.0).floor() as u64
+            };
             format!(
                 "{prefix} {} / {} ({pct}%)",
                 rocm_core::format_bytes(bytes),
@@ -153,6 +160,15 @@ mod tests {
         assert!(
             rendered.contains("(100%)"),
             "a server sending a few bytes past its declared length must not report over 100%: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_download_progress_does_not_round_up_to_100_before_completion() {
+        let rendered = format_download_progress("Downloading…", 995, Some(1000));
+        assert!(
+            rendered.contains("(99%)"),
+            "99.5% must floor to 99%, not round up to a premature 100%: {rendered}"
         );
     }
 

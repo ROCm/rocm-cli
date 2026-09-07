@@ -388,7 +388,11 @@ fn download_attempt(
     let remaining_len = header_u64(&response, "Content-Length");
     let total_len =
         remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
-    if let Some(total) = total_len.or(request.expected_len) {
+    // Fall back to the caller-supplied expected length when the server omits
+    // `Content-Length`, so progress reporting doesn't lose a total that's
+    // already known and already used for the preflight checks below.
+    let reported_total = total_len.or(request.expected_len);
+    if let Some(total) = reported_total {
         if let Some(max_bytes) = request.max_bytes
             && total > max_bytes
         {
@@ -432,7 +436,7 @@ fn download_attempt(
         })?
     };
 
-    on_progress(written, total_len);
+    on_progress(written, reported_total);
 
     let mut reader = response.into_reader();
     let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
@@ -446,7 +450,7 @@ fn download_attempt(
             // the user, so report the shortfall either way rather than a bare
             // transport error.
             Err(error) => {
-                let reason = total_len.or(request.expected_len).map_or_else(
+                let reason = reported_total.map_or_else(
                     || format!("failed while downloading {}", request.url),
                     |expected| {
                         format!(
@@ -471,7 +475,7 @@ fn download_attempt(
         if let Err(error) = file.write_all(&buffer[..read]) {
             return Err(permanent(disk_space::map_write_error(error, partial_path)));
         }
-        on_progress(written, total_len);
+        on_progress(written, reported_total);
     }
     if let Err(error) = file.sync_all() {
         return Err(permanent(disk_space::map_write_error(error, partial_path)));
