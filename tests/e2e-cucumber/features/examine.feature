@@ -122,3 +122,14 @@ Feature: GPU detection and system inspection
   Scenario: examine-12 - The driver install dry-run shows the effective repo version
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder
+
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing

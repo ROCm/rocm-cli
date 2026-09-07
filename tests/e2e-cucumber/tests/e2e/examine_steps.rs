@@ -178,6 +178,25 @@ async fn assert_all_engines_listed(world: &mut E2eWorld) {
     }
 }
 
+#[then("the engine listing explains the default-engine marker")]
+async fn engine_listing_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the listing")]
+async fn host_default_engine_marked_in_listing(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("* {expected}")),
+        "expected '{expected}' marked as the default engine, got:\n{output}"
+    );
+}
+
 #[then("the inspection reports Linux as the operating system")]
 async fn assert_linux_host(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
