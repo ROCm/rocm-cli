@@ -244,8 +244,7 @@ impl E2eWorld {
             // runner rather than once per scenario (EAI-8572). Local runs (no shared
             // dir) keep the old fully-isolated cache.
             let cache_dir = shared_cache_dir()
-                .map(|shared| shared.join("rocm-cli"))
-                .unwrap_or_else(|| root.join("cache"));
+                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
             env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
