@@ -130,13 +130,16 @@ fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
-/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
+/// (HF model weights, the pip cache, and the CLI's own therock/tool archive
+/// download cache — engine backends like `llamacpp:rocm`). Set by CI to a path
 /// on the runner's persistent disk; unset for local runs, where every scenario
 /// stays fully isolated (nothing shared).
 ///
-/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
-/// model weights per scenario. Only immutable artifacts are shared — service
-/// records, config, and per-service engine state stay isolated per scenario.
+/// Sharing these read-only artifacts avoids re-downloading multi-GB engine
+/// backends and model weights per scenario. Only immutable artifacts are
+/// shared — service records, config, and the runtimes registry stay isolated
+/// per scenario (see [`shared_runtimes_dir`] for the runtimes' own, opt-in,
+/// shared tree).
 fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
 }
@@ -232,7 +235,18 @@ impl E2eWorld {
             let root = root.path();
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
-            env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+            // The CLI's own therock/tool archive download cache (plus its HTTP/TUF
+            // metadata cache) holds nothing the suite asserts on — every byte in it
+            // is content-addressed and re-fetchable (see storage::download_cache_dir /
+            // tool_download_cache_dir). Route it through the same shared, persistent
+            // dir as HF_HOME/PIP_CACHE_DIR below instead of this scenario's TempDir,
+            // so the ~3.3GB llamacpp:rocm backend archive is downloaded once per
+            // runner rather than once per scenario (EAI-8572). Local runs (no shared
+            // dir) keep the old fully-isolated cache.
+            let cache_dir = shared_cache_dir()
+                .map(|shared| shared.join("rocm-cli"))
+                .unwrap_or_else(|| root.join("cache"));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
