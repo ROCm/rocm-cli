@@ -13521,6 +13521,12 @@ pub(crate) fn render_engine_inventory_text() -> String {
 /// character and the legend text stay in sync.
 const DEFAULT_ENGINE_MARKER: &str = "*";
 
+/// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
+/// engine-inventory renderers so the two copies cannot drift apart.
+fn write_default_engine_legend(output: &mut String) {
+    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+}
+
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
@@ -13542,7 +13548,7 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     } else {
         let _ = writeln!(output, "  Plugin folders: not checked");
     }
-    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+    write_default_engine_legend(&mut output);
     for (name, note) in engine_inventory() {
         let marker = if *name == default_engine {
             DEFAULT_ENGINE_MARKER
@@ -13709,7 +13715,7 @@ fn append_examine_engine_inventory(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+    write_default_engine_legend(output);
     for (engine, note) in engine_inventory() {
         let marker = if *engine == effective_default {
             DEFAULT_ENGINE_MARKER
