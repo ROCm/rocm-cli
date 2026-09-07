@@ -646,7 +646,11 @@ mod tests {
 
     #[test]
     fn home_held_legend_visible_when_tpw_and_tps_held() {
-        let out = render(&state_with_instance(instance_with_obs(300.0, Some(held_obs()))), 160, 30);
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(held_obs()))),
+            160,
+            30,
+        );
         assert!(
             out.contains(format::HELD_MARKER),
             "HELD_MARKER must appear when instance data is held; got:\n{out}"
@@ -659,7 +663,11 @@ mod tests {
 
     #[test]
     fn home_held_legend_absent_when_all_fresh() {
-        let out = render(&state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))), 160, 30);
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear when all fresh; got:\n{out}"
@@ -668,7 +676,11 @@ mod tests {
 
     #[test]
     fn home_held_legend_absent_for_legacy_none_metadata() {
-        let out = render(&state_with_instance(instance_with_obs(300.0, None)), 160, 30);
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, None)),
+            160,
+            30,
+        );
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"

@@ -744,7 +744,10 @@ const LEGEND_ENTRIES: &[(CellOutcome, &str)] = &[
     (CellOutcome::Xpass, "bug fixed here (stale entry)"),
     (CellOutcome::FlakyXpass, "known flaky bug passed this run"),
     (CellOutcome::RanWhenNa, "ran despite being marked n/a"),
-    (CellOutcome::Absent, "expected to run but no result recorded"),
+    (
+        CellOutcome::Absent,
+        "expected to run but no result recorded",
+    ),
     (CellOutcome::Missing, "no data."),
 ];
 
