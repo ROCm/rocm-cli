@@ -42,8 +42,8 @@ Feature: Runtime lifecycle state machine
   # rollback-target, and neither, with nothing else on the page explaining what
   # they mean. This asserts the printed legend actually names both glyphs, so the
   # rendered marker and its explanation can't drift apart silently.
-  @id:runtime-list-shows-marker-legend
-  Scenario: 5 - Listing runtimes explains the active and rollback markers
+  @id:runtime-lifecycle-list-shows-marker-legend
+  Scenario: runtime-lifecycle-05 - Listing runtimes explains the active and rollback markers
     Given two registered runtimes with the second active after the first
     When the user rolls back
     And the user lists the registered runtimes
