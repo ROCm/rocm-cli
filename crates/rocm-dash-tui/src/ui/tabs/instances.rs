@@ -83,9 +83,11 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Show HELD_LEGEND only when at least one displayed gen_tps is actually
     // held — keeps the table quiet when data is fully fresh.
     let any_held = instances.iter().any(|inst| {
-        inst.gen_tps_observation
-            .as_ref()
-            .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+        inst.gen_tps.is_some()
+            && inst
+                .gen_tps_observation
+                .as_ref()
+                .is_some_and(|m| m.freshness == ObservationFreshness::Held)
     });
     let (table_area, legend_area) = if any_held {
         let split = Layout::default()
