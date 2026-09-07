@@ -1150,7 +1150,11 @@ fn exit_code_for(result: Result<()>) -> ExitCode {
             if let Some(FixExitCode(code)) = e.downcast_ref::<FixExitCode>() {
                 ExitCode::from(*code as u8)
             } else {
-                eprintln!("Error: {e:?}");
+                // Match the standard `Result<(), E>` `Termination` behavior exactly:
+                // ignore a failed write here rather than `eprintln!`, which panics.
+                // A caller with a closed stderr pipe must still see exit code 1, not
+                // a panic that replaces it.
+                let _ = writeln!(io::stderr(), "Error: {e:?}");
                 ExitCode::FAILURE
             }
         }
