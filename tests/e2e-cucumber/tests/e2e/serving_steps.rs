@@ -792,15 +792,17 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
 
 #[given("Lemonade preparation cannot complete")]
 async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
-    world.command_env.push((
-        "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
-        "repeated".into(),
-    ));
+    // Plant a runtime whose `lemonade backends install` always exits non-zero,
+    // rather than compiling a failure seam into `rocm`. The CLI then fails at the
+    // same boundary a real broken install fails at — a non-zero child process —
+    // so what the scenario asserts is the product's real retry and recovery
+    // handling, not a test-only branch.
+    world.plant_failing_lemonade_runtime();
 }
 
 #[when("the user serves a model with Lemonade")]
 async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+    let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &[
             "serve",
@@ -951,17 +953,16 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         Some(0),
         "serve unexpectedly succeeded:\n{output}"
     );
-    // The scripted failure seam also waives serve's no-GPU pre-flight, so this
-    // refusal can only appear when the seam is compiled out. Name that cause:
-    // otherwise a lane that pre-builds `rocm` without the feature reports a
+    // Serve enforces its GPU-required policy before it touches the runtime, so a
+    // host without a usable device never reaches Lemonade preparation at all.
+    // Name that cause: the scenario is `@requires-gpu` precisely because of this
+    // pre-flight, and a lane that runs it anyway would otherwise report a
     // baffling "no retry announcement" instead of its real misconfiguration.
     assert!(
         !output.contains("no usable AMD GPU detected"),
-        "serve stopped at the no-GPU pre-flight, so the binary under test was \
-         built without the `rocm/e2e-test-hooks` feature and never reached \
-         Lemonade preparation. E2E lanes that pre-build `rocm` and export \
-         ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
-         what `cargo xtask e2e` builds for itself:\n{output}"
+        "serve stopped at the no-GPU pre-flight, so it never reached Lemonade \
+         preparation. This scenario is tagged @requires-gpu and needs a host with \
+         a usable AMD GPU:\n{output}"
     );
     assert_eq!(
         output.matches("retrying once").count(),

@@ -16,6 +16,16 @@ workspace = true
 name = "rocm-demo-env"
 path = "src/bin/rocm-demo-env.rs"
 
+# Stand-in for a Lemonade runtime's `lemonade`/`lemond` executables, planted by
+# the serve-preparation-recovery scenario. A bin target of this package so the
+# suite can reach it through `CARGO_BIN_EXE_fake-lemonade`, which cargo sets when
+# it builds the `e2e` test target — no xtask plumbing and no second copy of the
+# path to keep in step. It must be a real executable, not a script: the engine
+# spawns it by exact path, and Windows `CreateProcess` needs a PE image.
+[[bin]]
+name = "fake-lemonade"
+path = "src/bin/fake-lemonade.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }

@@ -40,8 +40,6 @@ const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GG
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
-#[cfg(feature = "e2e-test-hooks")]
-const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
 /// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
 /// we pick the highest-priority backend it considers supported on this host.
 /// GPU backends only — `cpu` is intentionally excluded so the router path never
@@ -428,14 +426,6 @@ fn detect_response() -> DetectResponse {
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
-    // Debug builds expose a deterministic failure seam for the black-box CLI
-    // scenario that pins retry count and terminal recovery guidance. Keep it at
-    // the backend phase: the real defect happens after the embeddable is ready,
-    // and exercising it must not download or alter a runtime on the test host.
-    #[cfg(feature = "e2e-test-hooks")]
-    if std::env::var_os(BACKEND_INSTALL_FAILURE_TEST_ENV).is_some() {
-        install_llamacpp_backend_with_retry(|| bail!("scripted Lemonade backend install failure"))?;
-    }
     eprintln!(
         "Preparing Lemonade embeddable {}...",
         rocm_deps::LEMONADE_VERSION
@@ -5099,6 +5089,41 @@ vllm                rocm        unsupported     Requires Linux                  
                 ("system".to_owned(), "unsupported".to_owned()),
                 ("vulkan".to_owned(), "installable".to_owned()),
             ]
+        );
+    }
+
+    /// The E2E fake runtime's `lemonade backends` table must drive this engine to
+    /// attempt a `llamacpp:rocm` install — that attempt is the whole premise of
+    /// `@id:serve-lemonade-preparation-recovery`.
+    ///
+    /// That scenario is `@requires-gpu`, so nothing on a GPU-less lane would
+    /// notice if a parser change stopped accepting the fixture's table: the
+    /// scenario would quietly stop reaching the failure it asserts, and only a
+    /// GPU lane would report it. Pin the coupling here, where every lane runs it.
+    /// Keep this table byte-identical to the one printed by
+    /// `tests/e2e-cucumber/src/bin/fake-lemonade.rs`.
+    #[test]
+    fn e2e_fake_runtime_table_drives_a_rocm_backend_install() {
+        let output = "\
+Recipe    Backend   Status
+--------  --------  -----------
+llamacpp  rocm      installable
+llamacpp  vulkan    unsupported
+";
+        let backends = parse_llamacpp_backend_statuses(output);
+        assert_eq!(
+            backends,
+            vec![
+                ("rocm".to_owned(), "installable".to_owned()),
+                ("vulkan".to_owned(), "unsupported".to_owned()),
+            ]
+        );
+        // `false` = not already installed, which is what makes the engine run the
+        // install the fixture then refuses. Reporting `installed` instead would
+        // skip the install and the scenario would never see a failure.
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), false))
         );
     }
 

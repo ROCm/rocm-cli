@@ -446,6 +446,74 @@ impl E2eWorld {
         self.legacy_rocm_path = Some(rocm);
     }
 
+    /// Plant a Lemonade runtime whose llama.cpp backend install always fails, so
+    /// `@id:serve-lemonade-preparation-recovery` can pin the retry count and the
+    /// terminal recovery guidance without downloading a real multi-gigabyte
+    /// runtime.
+    ///
+    /// This replaces a `#[cfg(feature = "e2e-test-hooks")]` seam that used to be
+    /// compiled into `rocm`. The seam made every full-suite lane test a binary
+    /// that differed from a release build; planting a runtime instead leaves
+    /// `rocm` byte-identical to what ships and moves the fake behind the
+    /// subprocess boundary the engine already talks to.
+    ///
+    /// Black-box, like [`Self::register_mock_service`]: the manifest is plain
+    /// JSON matching the engine's on-disk schema, not a typed import from the
+    /// engine crate. `resolve_runtime` accepts it as installed because it checks
+    /// only that the manifest parses and that `lemond` is a file — no checksum,
+    /// version, or signature is involved on this path, so nothing here weakens a
+    /// verification the product performs.
+    pub fn plant_failing_lemonade_runtime(&mut self) {
+        let root = self.isolated_root.as_ref().expect("no isolated root");
+        let engine = root.path().join("data").join("engines").join("lemonade");
+        let runtime_dir = engine.join("runtime");
+        // `serve` writes running state and a startup log beside the manifest and
+        // does not create these itself outside the install path.
+        for dir in [
+            &runtime_dir,
+            &engine.join("manifests"),
+            &engine.join("state"),
+            &engine.join("logs"),
+        ] {
+            std::fs::create_dir_all(dir)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
+        }
+
+        let exe = |name: &str| {
+            runtime_dir.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_owned()
+            })
+        };
+        let (lemond, lemonade) = (exe("lemond"), exe("lemonade"));
+        // One fixture, copied under both names — it takes its role from argv[0].
+        // Copied rather than linked so it works without the symlink privilege
+        // self-hosted Windows runners lack; `fs::copy` carries the Unix mode
+        // bits, so the copies stay executable.
+        for dest in [&lemond, &lemonade] {
+            std::fs::copy(env!("CARGO_BIN_EXE_fake-lemonade"), dest)
+                .unwrap_or_else(|e| panic!("failed to plant {}: {e}", dest.display()));
+        }
+
+        let manifest = serde_json::json!({
+            "env_id": "e2e-planted",
+            "version": "0.0.0-e2e",
+            "runtime_dir": runtime_dir,
+            "lemond": lemond,
+            "lemonade": lemonade,
+            "backend_recipe": "llamacpp",
+            "backend_name": "rocm",
+            "installed_at_unix_ms": 0,
+        });
+        let path = engine.join("manifests").join("runtime.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+        )
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+    }
+
     /// Register the running mock server with the CLI by writing a managed-service
     /// record into the isolated services directory (`<data>/services/`), exactly
     /// as `rocm serve --managed` would. This lets `rocm services list` and the
