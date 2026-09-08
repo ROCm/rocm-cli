@@ -27,9 +27,11 @@ use crate::E2eWorld;
 /// `diagnose_steps::KNOWN_SYMPTOM`.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
-/// Prose with no catalog keyword in it, so nothing scores and the report falls
-/// through to `route_when_no_match` — the branch the skill's "route upstream"
-/// rule depends on.
+/// Prose with no catalog keyword in it, so nothing scores *from the symptom*.
+///
+/// It does not follow that the report goes unexplained: several checkers score
+/// from host state alone, so a machine with a real problem still matches. The
+/// route is populated either way, which is what the scenario using this checks.
 const UNMATCHED_SYMPTOM: &str = "the office printer keeps jamming on page three";
 
 /// The reference states the auto-applicable set twice: once as `yes` cells in
@@ -443,7 +445,7 @@ async fn user_reports_known_failure(world: &mut E2eWorld) {
     world.skill_symptom = Some(KNOWN_SYMPTOM.to_owned());
 }
 
-#[given("a user who reports a failure the catalog does not cover")]
+#[given("a user who reports a failure with no catalog keyword in it")]
 async fn user_reports_unmatched_failure(world: &mut E2eWorld) {
     world.skill_symptom = Some(UNMATCHED_SYMPTOM.to_owned());
 }
@@ -620,23 +622,21 @@ async fn assert_route_is_documented(world: &mut E2eWorld) {
     let documented = documented_cli_routes(reference(world));
     let report = diagnosis(world);
 
-    // The `Given` says the catalog cannot explain the report, so assert that
-    // state rather than assume it: `route_when_no_match` is populated whether or
-    // not anything matched, so without this the scenario passes identically for
-    // a symptom that DID match and the behaviour it names is never exercised.
+    // Deliberately NOT asserting `has_match == false` here, even though the
+    // symptom carries no catalog keyword. `diagnose` scores several checkers
+    // from host state alone: the GitHub-hosted Linux runner ships
+    // /etc/modprobe.d/blacklist-radeon-instinct.conf with amdgpu unloaded, which
+    // is `fix-5-amdgpu-load` at score 90 whatever symptom is passed. No symptom
+    // can hold that premise still, so asserting it here only encodes the
+    // runner's state.
     //
-    // Asserted on every host. Where the catalog is out of scope (WSL2) it is not
-    // run at all, so `has_match` is false there too and the claim still holds —
-    // it is simply reached by a different route. The converse case, a symptom
-    // that matches, can only be produced on a host the catalog covers, so the
-    // no-GPU Linux lane is where this assertion earns its keep.
-    assert_eq!(
-        report.get("has_match").and_then(serde_json::Value::as_bool),
-        Some(false),
-        "this scenario is about the route taken when nothing was established, \
-         so the symptom must not have matched:\n{report:#}"
-    );
-
+    // The premise is pinned where the host can be held still instead --
+    // `diagnose::tests::sub_threshold_causes_leave_has_match_false_and_route_upstream`
+    // builds an Examination whose causes are all sub-threshold and asserts both
+    // that `has_match` is false and that the route names somewhere to go.
+    //
+    // What is left here is the half only this feature can check: that whatever
+    // target the CLI hands back is one the published document names.
     let route = report
         .get("route_when_no_match")
         .expect("diagnose JSON has no 'route_when_no_match'");
