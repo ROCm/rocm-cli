@@ -80,10 +80,20 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    // Show HELD_LEGEND only when at least one displayed gen_tps is actually
-    // held — keeps the table quiet when data is fully fresh.
-    let any_held = instances.iter().any(|inst| {
-        inst.gen_tps.is_some()
+    // Show HELD_LEGEND only when at least one *displayed* row would actually
+    // render a held marker. `Table` (no scroll state) draws rows from the
+    // start of `instances` until the area runs out of height, one row per
+    // instance after the header — so anything at or past `visible_rows`
+    // never reaches the screen and must not be allowed to conjure a legend.
+    // `inner.height - 1` (header only, legend not yet subtracted) is used as
+    // an upper bound: it can only ever overcount by the one row the legend
+    // itself would claim, which errs toward showing an explained legend
+    // rather than hiding one a visible marker needs.
+    // The finite check mirrors `gen_tps_cell`, which never prints a marker
+    // for `None`/non-finite `gen_tps` regardless of freshness metadata.
+    let visible_rows = inner.height.saturating_sub(1) as usize;
+    let any_held = instances.iter().take(visible_rows).any(|inst| {
+        inst.gen_tps.is_some_and(f64::is_finite)
             && inst
                 .gen_tps_observation
                 .as_ref()
@@ -1408,6 +1418,68 @@ mod tests {
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_for_non_finite_gen_tps() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // gen_tps_cell never prints HELD_MARKER for a non-finite value (it
+        // renders "—" instead), so held metadata here must not conjure a
+        // legend either.
+        let inst = mk_inst_obs(
+            "nonfinite",
+            Some(f64::NAN),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for a non-finite gen_tps; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_when_held_row_is_off_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Twenty instances, sorted by (zero-padded) name; only the very last
+        // one is held. A short viewport only fits a few rows, so that held
+        // row never reaches the screen and must not add a legend.
+        let mut m = HashMap::new();
+        for n in 0..20 {
+            let name = format!("n{n:02}");
+            let held = n == 19;
+            let inst = mk_inst_obs(
+                &name,
+                Some(1.0),
+                if held {
+                    Some(obs(ObservationFreshness::Held, 30))
+                } else {
+                    Some(obs(ObservationFreshness::Fresh, 5))
+                },
+            );
+            m.insert(inst.container_id.clone(), inst);
+        }
+        let state = mk_state(m, 0);
+        let mut term = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains("n19"),
+            "test setup assumption broken: the held row must be off-screen; got:\n{out}"
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the only held row is off-screen; got:\n{out}"
         );
     }
 

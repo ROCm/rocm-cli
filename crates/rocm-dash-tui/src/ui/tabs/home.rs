@@ -289,8 +289,10 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[4],
     );
     // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
-    // held — keeps the hero quiet when data is fully fresh.
-    if any_tpw_held {
+    // held AND rendered with a marker — `tpw > 0.0` mirrors the gate on
+    // `tpw_label` above so a zero-throughput aggregate (which prints
+    // "tokens / watt —" with no marker) never shows an unexplained legend.
+    if tpw > 0.0 && any_tpw_held {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format::HELD_LEGEND,
@@ -684,6 +686,29 @@ mod tests {
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_legend_absent_when_aggregate_is_zero_even_if_held() {
+        // tokens_per_watt sums to 0.0 (the "tokens / watt —" branch, no marker
+        // rendered) while gen_tps is absent (so the tok/s side never fires
+        // either). Held metadata alone must not add an unexplained legend.
+        let inst = Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.0),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let out = render(&state_with_instance(inst), 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
         );
     }
 }

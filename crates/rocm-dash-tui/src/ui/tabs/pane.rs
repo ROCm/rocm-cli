@@ -417,10 +417,15 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
             } else {
                 let mut any_held = false;
                 for i in running.iter().take(5) {
-                    any_held |= i
-                        .gen_tps_observation
-                        .as_ref()
-                        .is_some_and(|m| m.freshness == ObservationFreshness::Held);
+                    // `gen_tps_compact` only ever prints HELD_MARKER for a
+                    // finite `Some` gen_tps — mirror that condition here so
+                    // held metadata on a `None`/non-finite value (rendered
+                    // as "gen -" with no marker) can't add an unexplained
+                    // legend.
+                    any_held |= i.gen_tps.is_some_and(f64::is_finite)
+                        && i.gen_tps_observation
+                            .as_ref()
+                            .is_some_and(|m| m.freshness == ObservationFreshness::Held);
                     let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),

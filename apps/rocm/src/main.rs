@@ -13531,7 +13531,18 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    // A configured `default_engine` still wins over the host preference, mirroring
+    // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
+    // the legend could mark an engine `serve` will not actually default to.
+    let configured_default_engine = paths.and_then(|paths| {
+        RocmCliConfig::load(paths)
+            .ok()
+            .and_then(|config| config.default_engine)
+    });
+    let default_engine = configured_default_engine
+        .as_deref()
+        .unwrap_or(host_default_engine);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -28489,6 +28500,40 @@ ID_LIKE="suse opensuse"
         assert!(
             legend_pos < marker_pos,
             "legend must appear before the entries it explains:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
         );
     }
 

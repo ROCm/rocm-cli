@@ -323,6 +323,39 @@ mod tests {
     }
 
     #[test]
+    fn serving_detail_hides_held_legend_when_gen_tps_missing() {
+        // Regression: `gen_tps_compact` never prints HELD_MARKER for a
+        // `None`/non-finite gen_tps (it renders "gen -"), so held metadata
+        // alone must not add an unexplained legend.
+        use rocm_dash_core::metrics::{
+            Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+        };
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2;
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: None,
+                gen_tps_observation: Some(ObservationMetadata {
+                    observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                    freshness: ObservationFreshness::Held,
+                }),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when gen_tps is missing; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn serving_verb_action_maps_selection_to_seam() {
         assert_eq!(verb_action(0), KeyAction::OpenServeWizard);
         assert_eq!(verb_action(1), KeyAction::OpenEngineManager);
