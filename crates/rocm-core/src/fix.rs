@@ -1013,7 +1013,9 @@ mod tests {
         // outright, so it returned nothing here no matter what was planted.
         // Going through the shared resolver is what makes this pass -- and is
         // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-resolver-{}-{:?}",
             std::process::id(),
@@ -1048,7 +1050,9 @@ mod tests {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
         // marker.
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
