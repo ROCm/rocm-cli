@@ -110,30 +110,40 @@ pub fn draw_job_console(
         ])
         .split(inner);
 
-    // Header: status badge, plus an animated braille spinner and parsed
-    // percentage while the job runs so progress reads as live motion.
+    // Header: while running, a compact chip + animated braille spinner + parsed
+    // percentage (already visually distinct via motion). Once the job reaches a
+    // terminal state, render a full-width colored banner instead — a small chip
+    // is easy to miss against a whole popup of scrolled output.
     let (label, color) = status_label(job, theme);
-    let mut header = vec![
-        Span::styled(
+    let is_terminal = !matches!(job.status, JobStatus::Running);
+    let mut header = Vec::new();
+    if is_terminal {
+        let glyph = match job.status {
+            JobStatus::Failed { .. } => "✗ ",
+            JobStatus::Cancelled => "○ ",
+            JobStatus::Done { .. } | JobStatus::Running => "✓ ",
+        };
+        header.push(Span::styled(
+            format!(" {glyph}{label} "),
+            Style::default().fg(theme.bg).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        header.push(Span::styled(
             " status ",
             Style::default()
                 .fg(theme.bg)
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ];
-    if matches!(job.status, JobStatus::Running) {
+        ));
+        header.push(Span::raw(" "));
         header.push(Span::styled(
             format!("{} ", crate::ui::spinner::spinner_frame(tick_count)),
             Style::default().fg(theme.accent),
         ));
-    }
-    header.push(Span::styled(
-        label,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    ));
-    if matches!(job.status, JobStatus::Running) {
+        header.push(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
         // The most recent line carrying a percentage wins (later output is more
         // current than earlier); silently omit the figure when none is present.
         if let Some(pct) = job
@@ -150,7 +160,13 @@ pub fn draw_job_console(
             ));
         }
     }
-    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+    let header_para = Paragraph::new(Line::from(header));
+    let header_para = if is_terminal {
+        header_para.style(Style::default().bg(color))
+    } else {
+        header_para
+    };
+    f.render_widget(header_para, rows[0]);
 
     // Body: streamed output lines, with a scrollbar when the ring overflows the
     // viewport so the user can see there's more above/below.
@@ -303,5 +319,79 @@ mod tests {
             code: 0,
         });
         assert_eq!(status_label(s.job("j").unwrap(), &t).0, "done");
+    }
+
+    #[test]
+    fn terminal_status_fills_full_width_banner() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let filled = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(t.ok))
+            .count();
+        assert!(
+            filled > 50,
+            "expected a done job to paint a full-width header banner, only {filled} cells colored"
+        );
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains('✓'), "done banner missing glyph: {out:?}");
+    }
+
+    #[test]
+    fn running_status_keeps_compact_chip() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let filled = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(t.accent))
+            .count();
+        assert!(
+            filled < 20,
+            "a running job should keep the compact status chip, not a full-width banner: {filled} cells colored"
+        );
     }
 }
