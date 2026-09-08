@@ -6,7 +6,11 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+/// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
+///
+/// Shared with `runtime_steps`, which reads the same shape out of the `install
+/// sdk` preview.
+pub(crate) fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
     output.lines().find_map(|line| {
         let (name, value) = line.trim().split_once(':')?;
         (name == field).then(|| value.trim())

@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_host_therock_family, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, known_therock_families, managed_tools_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, known_therock_families,
+    managed_tools_dir, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
     runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
@@ -155,17 +155,156 @@ fn render_canonical_provenance(
     let _ = writeln!(output, "  source_layout_generation: {layout_generation}");
 }
 
-fn validate_aggregate_index_layout(html: &str) -> Result<()> {
-    let required_packages = ["rocm/", "torch/", "torchvision/", "torchaudio/"];
-    if required_packages
-        .iter()
-        .all(|package| html.contains(package))
-    {
-        return Ok(());
+/// The package names a canonical aggregate index links to, lowercased.
+///
+/// The simple index publishes one `<a href="<name>/">` per package. Matching on
+/// parsed names rather than on raw substrings keeps `rocm` from being satisfied
+/// by `rocm-sdk-core` and `torch` from being satisfied by
+/// `amd-torch-device-gfx1100`.
+fn parse_aggregate_package_links(html: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for tail in html.split("href=\"").skip(1) {
+        let Some(href) = tail.split('"').next() else {
+            continue;
+        };
+        let name = href.trim().trim_matches('/').to_ascii_lowercase();
+        if name.is_empty() || name.contains('/') {
+            continue;
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
-    bail!(
-        "unknown canonical TheRock aggregate index layout: expected package links for rocm, torch, torchvision, and torchaudio"
-    )
+    names
+}
+
+/// The exact GFX targets the canonical source publishes a device payload for.
+///
+/// This is the authoritative list rather than a table in this file: the
+/// aggregate `rocm` distribution declares one `device-<target>` extra per
+/// `rocm-sdk-device-<target>` package the index links, and `rocm_sdk` refuses
+/// any target outside that set. Reading it from the stream means a target the
+/// source adds or withdraws needs no CLI change, and a target it never
+/// published cannot be requested by accident.
+fn parse_aggregate_device_targets(html: &str) -> Vec<String> {
+    let mut targets = parse_aggregate_package_links(html)
+        .iter()
+        .filter_map(|name| name.strip_prefix("rocm-sdk-device-"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
+}
+
+fn validate_aggregate_index_layout(html: &str) -> Result<()> {
+    let names = parse_aggregate_package_links(html);
+    let missing = ["rocm", "torch", "torchvision", "torchaudio"]
+        .into_iter()
+        .filter(|package| !names.iter().any(|name| name == package))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "unknown canonical TheRock aggregate index layout: expected package links for rocm, torch, torchvision, and torchaudio, but {} not published",
+            missing.join(", ")
+        );
+    }
+    if !names
+        .iter()
+        .any(|name| name.starts_with("rocm-sdk-device-"))
+    {
+        bail!(
+            "unknown canonical TheRock aggregate index layout: no `rocm-sdk-device-*` payload packages are published, so no GPU backend could be selected"
+        );
+    }
+    Ok(())
+}
+
+/// Which device payload the canonical aggregate source must supply for this host.
+///
+/// The aggregate `rocm` distribution ships no GPU backend unless a `device-*`
+/// extra asks for one, so this choice decides whether the installed runtime can
+/// launch a kernel at all. Exactly one exact target is ever requested. The
+/// blanket `device-all` extra pulls every published payload — measured at 24
+/// wheels and 4451 MiB on an MI300X that needs one of them — and then leaves
+/// `rocm_sdk` to guess a target family out of that pile; a family-bucket alias
+/// such as `device-gfx120X-all` is not an extra the source declares at all.
+///
+/// When no exact target can be pinned the answer is [`Undetermined`] rather
+/// than a fallback: a preview still renders and says so, and a real install
+/// refuses instead of producing a runtime with no kernels.
+///
+/// [`Undetermined`]: AggregateDeviceTarget::Undetermined
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AggregateDeviceTarget {
+    /// The exact detected GFX target, published by the canonical source.
+    Exact(String),
+    /// No exact target could be pinned, and why.
+    Undetermined(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResolvedAggregateWheelSource {
+    index_url: &'static str,
+    device_target: AggregateDeviceTarget,
+}
+
+/// Stands in for a real target in a preview, so a plan that cannot be installed
+/// yet reads as incomplete rather than as installable.
+const UNDETERMINED_DEVICE_TARGET: &str = "<undetermined>";
+
+impl AggregateDeviceTarget {
+    fn resolve(detected: Option<&str>, family: &str, published: &[String]) -> Self {
+        let Some(detected) = detected else {
+            return Self::Undetermined("no AMD GPU target was detected on this host".to_owned());
+        };
+        // KFD reports feature suffixes (`gfx90a:sramecc+:xnack-`); published
+        // targets never carry them.
+        let Some(target) = extract_first_gfx_token(detected) else {
+            return Self::Undetermined(format!(
+                "detected GPU target `{detected}` is not a recognizable GFX target"
+            ));
+        };
+        match normalize_therock_family(&target) {
+            Some(detected_family) if detected_family == family => {}
+            Some(detected_family) => {
+                return Self::Undetermined(format!(
+                    "detected GPU target `{target}` belongs to family `{detected_family}`, not the resolved target family `{family}`"
+                ));
+            }
+            None => {
+                return Self::Undetermined(format!(
+                    "detected GPU target `{target}` belongs to no recognized package family"
+                ));
+            }
+        }
+        if !published.iter().any(|candidate| candidate == &target) {
+            return Self::Undetermined(format!(
+                "the canonical source publishes no `device-{target}` payload for detected GPU target `{target}` (published targets: {})",
+                published.join(", ")
+            ));
+        }
+        Self::Exact(target)
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Exact(target) => target,
+            Self::Undetermined(_) => UNDETERMINED_DEVICE_TARGET,
+        }
+    }
+
+    /// The `rocm` extras this target implies. Always three extras, so a plan
+    /// never reads as though the GPU backend were optional.
+    fn rocm_extras(&self) -> String {
+        format!("libraries,devel,device-{}", self.as_str())
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Undetermined(reason) => Some(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +320,9 @@ struct PipRuntimeResolution {
     index_url: String,
     latest_version: String,
     package_versions: TheRockPipPackageVersions,
+    /// The device payload the canonical source must supply for this host,
+    /// decided against the targets that source actually publishes.
+    device_target: AggregateDeviceTarget,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -878,17 +1020,13 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
     )?;
-    let device_target = aggregate_device_target(&resolution.family);
-    let rocm_extras = device_target.as_deref().map_or_else(
-        || "libraries,devel,device-all".to_owned(),
-        |target| format!("libraries,devel,device-{target}"),
-    );
+    let rocm_extras = resolution.device_target.rocm_extras();
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
     ));
     let runtime_key = wheel_runtime_key(channel, &resolution.latest_version);
-    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "wheel", &runtime_key));
+    let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
     let mut output = String::new();
@@ -915,6 +1053,14 @@ fn install_wheel_runtime(
         "  target_family_source: {}",
         resolution.family_source
     );
+    let _ = writeln!(
+        output,
+        "  device_target: {}",
+        resolution.device_target.as_str()
+    );
+    if let Some(reason) = resolution.device_target.reason() {
+        let _ = writeln!(output, "  device_target_reason: {reason}");
+    }
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
     let _ = writeln!(
         output,
@@ -988,6 +1134,20 @@ fn install_wheel_runtime(
         return Ok(output);
     }
 
+    // Past the preview, the plan has to be installable. A runtime composed
+    // without its exact device payload loads and then faults on the first
+    // kernel, so an undetermined target is refused here rather than papered
+    // over with every published payload.
+    if let Some(reason) = resolution.device_target.reason() {
+        bail!(
+            "cannot compose a canonical TheRock {} runtime: {reason}.\n\
+             The aggregate `rocm` distribution ships no GPU backend unless an exact `device-<target>` extra requests one, so this install would produce a runtime that cannot run a kernel.\n\
+             Re-run `rocm install sdk` on the target host, or preview the plan with `--dry-run`.\n\n{}",
+            channel.as_str(),
+            detect_host_gpu_diagnostics()
+        );
+    }
+
     let uv = ensure_uv_binary(paths)?;
     fs::create_dir_all(
         install_root
@@ -1027,7 +1187,7 @@ fn install_wheel_runtime(
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
-    let rocm_sdk_probe = probe_rocm_sdk_runtime_for_target(&env_python, device_target.as_deref())
+    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
         .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
     let installed_version = rocm_sdk_probe
@@ -1096,27 +1256,6 @@ fn therock_pip_package_specs(
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
-}
-
-fn aggregate_device_target(family: &str) -> Option<String> {
-    let detected = detect_host_gfx_target()?;
-    canonical_aggregate_device_target(&detected, family)
-}
-
-fn canonical_aggregate_device_target(detected: &str, family: &str) -> Option<String> {
-    if normalize_therock_family(detected).as_deref() != Some(family) {
-        return None;
-    }
-    let target = detected
-        .split(':')
-        .next()
-        .unwrap_or(detected)
-        .to_ascii_lowercase();
-    if target.starts_with("gfx94") {
-        Some("gfx942".to_owned())
-    } else {
-        Some(target)
-    }
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -1264,11 +1403,19 @@ fn resolve_pip_runtime_with_timeout(
             source.wheel_index
         )
     })?;
+    let source = ResolvedAggregateWheelSource {
+        index_url: source.wheel_index,
+        device_target: AggregateDeviceTarget::resolve(
+            detect_host_gfx_target().as_deref(),
+            &family_resolution.family,
+            &parse_aggregate_device_targets(&root_html),
+        ),
+    };
     resolve_pip_runtime_from_index(
         paths,
         channel,
         &family_resolution,
-        source.wheel_index,
+        &source,
         wheel_compatibility,
         version_selector,
         download_timeout_secs,
@@ -1277,7 +1424,7 @@ fn resolve_pip_runtime_with_timeout(
         format!(
             "failed to resolve TheRock {} wheel runtime from canonical source {}\n\n{}",
             channel.as_str(),
-            source.wheel_index,
+            source.index_url,
             canonical_wheel_resolution_hint(channel)
         )
     })
@@ -1287,11 +1434,12 @@ fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_resolution: &FamilyResolution,
-    index_url: &str,
+    source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
+    let index_url = source.index_url;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -1336,7 +1484,7 @@ fn resolve_pip_runtime_from_index(
     .with_context(|| {
         let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
         format!(
-            "no mutually compatible TheRock rocm[libraries,devel,device-all], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
         )
     })?;
     let latest_version = package_versions.rocm.clone();
@@ -1346,6 +1494,7 @@ fn resolve_pip_runtime_from_index(
         index_url: index_url.to_owned(),
         latest_version,
         package_versions,
+        device_target: source.device_target.clone(),
     })
 }
 
@@ -2746,29 +2895,25 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
     ]
 }
 
+/// What `rocm_sdk` reports about the runtime that was just installed.
+///
+/// Deliberately does not set `ROCM_SDK_TARGET_FAMILY`: forcing the target the
+/// installer chose would make `resolved_target_family` echo that choice back
+/// instead of reporting what the environment actually composed, which is the
+/// one signal that catches a runtime whose device payload does not match its
+/// host.
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    probe_rocm_sdk_runtime_for_target(python_executable, None)
-}
-
-fn probe_rocm_sdk_runtime_for_target(
-    python_executable: &Path,
-    device_target: Option<&str>,
-) -> Result<RocmSdkPythonProbe> {
-    let script = device_target.map_or_else(
-        || ROCM_SDK_PROBE_SCRIPT.to_owned(),
-        |target| {
-            format!(
-                "import os\nos.environ['ROCM_SDK_TARGET_FAMILY'] = {target:?}\n{ROCM_SDK_PROBE_SCRIPT}"
-            )
-        },
-    );
-    let text = capture_python_stdout(python_executable, &script, "launch rocm_sdk probe")
-        .with_context(|| {
-            format!(
-                "failed to launch rocm_sdk probe via {}",
-                python_executable.display()
-            )
-        })?;
+    let text = capture_python_stdout(
+        python_executable,
+        ROCM_SDK_PROBE_SCRIPT,
+        "launch rocm_sdk probe",
+    )
+    .with_context(|| {
+        format!(
+            "failed to launch rocm_sdk probe via {}",
+            python_executable.display()
+        )
+    })?;
     parse_rocm_sdk_probe(&text)
 }
 
@@ -4605,20 +4750,124 @@ mod tests {
         assert!(output.contains("source_layout_generation: multi-arch-v2"));
     }
 
+    /// A representative slice of what the canonical aggregate index publishes.
+    /// Notably it has no `gfx943`: MI300 steppings other than `gfx942` have no
+    /// payload of their own, which is exactly the case a remap used to hide.
+    const PUBLISHED_DEVICE_TARGETS_HTML: &str = r#"<!DOCTYPE html><html><body>
+<a href="rocm/">rocm</a><br/>
+<a href="torch/">torch</a><br/>
+<a href="torchvision/">torchvision</a><br/>
+<a href="torchaudio/">torchaudio</a><br/>
+<a href="rocm-sdk-core/">rocm-sdk-core</a><br/>
+<a href="amd-torch-device-gfx942/">amd-torch-device-gfx942</a><br/>
+<a href="rocm-sdk-device-gfx90a/">rocm-sdk-device-gfx90a</a><br/>
+<a href="rocm-sdk-device-gfx942/">rocm-sdk-device-gfx942</a><br/>
+<a href="rocm-sdk-device-gfx1151/">rocm-sdk-device-gfx1151</a><br/>
+<a href="rocm-sdk-device-gfx1201/">rocm-sdk-device-gfx1201</a><br/>
+</body></html>"#;
+
+    fn published_device_targets() -> Vec<String> {
+        parse_aggregate_device_targets(PUBLISHED_DEVICE_TARGETS_HTML)
+    }
+
     #[test]
-    fn aggregate_device_target_maps_mi300_gfx_alias_to_published_package() {
+    fn published_device_targets_come_from_the_sdk_payload_packages_only() {
+        // `amd-torch-device-*` and `rocm-sdk-core` share the page; only the
+        // `rocm-sdk-device-*` names name a `device-<target>` extra of `rocm`.
         assert_eq!(
-            canonical_aggregate_device_target("gfx943", "gfx94X-dcgpu").as_deref(),
-            Some("gfx942")
+            published_device_targets(),
+            vec![
+                "gfx1151".to_owned(),
+                "gfx1201".to_owned(),
+                "gfx90a".to_owned(),
+                "gfx942".to_owned(),
+            ]
         );
+    }
+
+    #[test]
+    fn device_extra_is_the_exact_detected_target_the_source_publishes() {
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx1201"),
+            "gfx120X-all",
+            &published_device_targets(),
+        );
+
+        assert_eq!(target, AggregateDeviceTarget::Exact("gfx1201".to_owned()));
+        assert_eq!(target.rocm_extras(), "libraries,devel,device-gfx1201");
+    }
+
+    #[test]
+    fn device_extra_drops_the_kfd_feature_suffix() {
         assert_eq!(
-            canonical_aggregate_device_target("gfx1151", "gfx1151").as_deref(),
-            Some("gfx1151")
+            AggregateDeviceTarget::resolve(
+                Some("gfx90a:sramecc+:xnack-"),
+                "gfx90a",
+                &published_device_targets(),
+            ),
+            AggregateDeviceTarget::Exact("gfx90a".to_owned())
         );
+    }
+
+    #[test]
+    fn unpublished_detected_target_is_undetermined_rather_than_remapped() {
+        // gfx943 normalizes to the same family as gfx942, so a family-level
+        // answer would silently install gfx942 kernels on a chip the source
+        // never published a payload for.
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx943"),
+            "gfx94X-dcgpu",
+            &published_device_targets(),
+        );
+
+        assert_eq!(target.as_str(), "<undetermined>");
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("no `device-gfx943` payload"))
+        );
+    }
+
+    #[test]
+    fn no_detected_gpu_yields_an_undetermined_target_not_a_blanket_payload() {
+        let target =
+            AggregateDeviceTarget::resolve(None, "gfx110X-all", &published_device_targets());
+
         assert_eq!(
-            canonical_aggregate_device_target("gfx1151", "gfx120X-all"),
-            None
+            target.rocm_extras(),
+            "libraries,devel,device-<undetermined>"
         );
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("no AMD GPU target was detected"))
+        );
+    }
+
+    #[test]
+    fn a_detected_target_from_another_family_is_undetermined() {
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx1151"),
+            "gfx120X-all",
+            &published_device_targets(),
+        );
+
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("not the resolved target family"))
+        );
+    }
+
+    #[test]
+    fn aggregate_layout_without_device_payloads_is_rejected() {
+        let error = validate_aggregate_index_layout(
+            r#"<a href="rocm/">rocm</a><a href="torch/">torch</a><a href="torchvision/">torchvision</a><a href="torchaudio/">torchaudio</a>"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no `rocm-sdk-device-*` payload packages"));
     }
 
     #[test]
@@ -4628,6 +4877,13 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("unknown canonical TheRock aggregate index layout"));
+        // `rocm-sdk-core/` must not satisfy the `rocm` requirement.
+        let error = validate_aggregate_index_layout(
+            r#"<a href="rocm-sdk-core/">rocm-sdk-core</a><a href="torch/">torch</a>"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rocm, torchvision, torchaudio not published"));
     }
 
     #[test]
