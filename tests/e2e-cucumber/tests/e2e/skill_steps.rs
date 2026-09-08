@@ -330,51 +330,61 @@ fn documented_verdicts(md: &str) -> BTreeSet<String> {
     verdicts
 }
 
-/// Upstream trackers the reference names, keyed by a normalised target name so
-/// the doc's prose labels (`LM Studio`, `ROCm core`) line up with the CLI's
-/// identifiers (`lm-studio`, `rocm-core`).
+/// The subset of Framework routing the reference attributes to the **CLI**.
 ///
-/// The value is the tracker URL where the reference gives one. `None` records a
-/// target the document names without a URL — PyTorch and llama.cpp are listed
-/// as in scope but their trackers are not written down, so there is nothing to
-/// compare against for those.
-fn documented_routes(md: &str) -> BTreeMap<String, Option<String>> {
+/// The section names two different things: trackers the *skill* hands over from
+/// its own table (Lemonade, Ollama, LM Studio — the host probe cannot detect
+/// them), and the targets `route_when_no_match` actually returns. Checking the
+/// CLI's route against the union of both lets a documented-but-dead CLI target
+/// pass silently, which is how the removed lemonade / ollama / lm-studio arms
+/// stayed in the document. So the CLI is held to its own list.
+fn documented_cli_routes(md: &str) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
+    let mut inside = false;
     for line in section(md, "Framework routing") {
-        if !line.trim_start().starts_with("- ") {
+        let trimmed = line.trim();
+        if trimmed.contains("`route_when_no_match`") && trimmed.ends_with(':') {
+            inside = true;
             continue;
         }
-        let url = line.find("https://").map(|at| {
-            line[at..]
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_owned()
-        });
-        let mut labels: Vec<String> = line
-            .split("**")
-            .skip(1)
-            .step_by(2)
-            .map(normalise_route_name)
-            .collect();
-        // The fallback row names its target after the arrow rather than in
-        // bold: `Otherwise → ROCm core: <url>`.
-        if labels.is_empty()
-            && let Some((_, after_arrow)) = line.split_once('→')
-            && let Some((name, _)) = after_arrow.split_once(':')
-            && !name.trim().starts_with("http")
-        {
-            labels.push(normalise_route_name(name));
+        if !inside || trimmed.is_empty() {
+            continue;
         }
-        for label in labels {
-            out.insert(label, url.clone());
-        }
+        let Some(bullet) = trimmed.strip_prefix("- ") else {
+            break;
+        };
+        let (Some(label), url) = (route_label(bullet), route_url(bullet)) else {
+            continue;
+        };
+        out.insert(label, url);
     }
     assert!(
         !out.is_empty(),
-        "no upstream trackers parsed out of reference.md"
+        "reference.md no longer lists the targets `route_when_no_match` returns; \
+         without that list the CLI's route can only be checked against the skill's \
+         own hand-off table, which is not the same claim"
     );
     out
+}
+
+/// The bolded target name on a routing bullet, or the one after the arrow.
+fn route_label(bullet: &str) -> Option<String> {
+    bullet
+        .split("**")
+        .nth(1)
+        .map(normalise_route_name)
+        .filter(|label| !label.is_empty())
+}
+
+/// The tracker URL on a routing bullet, where it gives one.
+fn route_url(bullet: &str) -> Option<String> {
+    bullet.find("https://").map(|at| {
+        bullet[at..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    })
 }
 
 /// Lowercase, alphanumerics only: `LM Studio`, `lm-studio` and `lm.studio` all
@@ -543,6 +553,26 @@ async fn assert_documented_fields_present(world: &mut E2eWorld) {
          follows it.\n{report:#}"
     );
 
+    // And the converse. Checking only `documented ⊆ emitted` cannot see a field
+    // the CLI emits that the document never mentions — which is how `has_match`
+    // stayed undocumented while the skill told agents to gate on `matched` being
+    // empty, the one substitute `rocm-core` documents as wrong. An agent reads
+    // the document, so a field absent from it does not exist as far as the skill
+    // is concerned.
+    let emitted = report
+        .as_object()
+        .expect("diagnose --json is not a JSON object");
+    let undocumented: Vec<&String> = emitted
+        .keys()
+        .filter(|field| !documented.contains(field.as_str()))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "diagnose --json emits {undocumented:?}, which skills/rocm-doctor/reference.md \
+         never names — so an agent following the skill will not read it.\n\
+         Document the field, or stop emitting it."
+    );
+
     let matched = report
         .get("matched")
         .and_then(serde_json::Value::as_array)
@@ -587,8 +617,26 @@ async fn assert_thresholds(world: &mut E2eWorld) {
 
 #[then("the CLI routes the report to a tracker the skill documents")]
 async fn assert_route_is_documented(world: &mut E2eWorld) {
-    let documented = documented_routes(reference(world));
+    let documented = documented_cli_routes(reference(world));
     let report = diagnosis(world);
+
+    // The `Given` says the catalog cannot explain the report, so assert that
+    // state rather than assume it: `route_when_no_match` is populated whether or
+    // not anything matched, so without this the scenario passes identically for
+    // a symptom that DID match and the behaviour it names is never exercised.
+    //
+    // Asserted on every host. Where the catalog is out of scope (WSL2) it is not
+    // run at all, so `has_match` is false there too and the claim still holds —
+    // it is simply reached by a different route. The converse case, a symptom
+    // that matches, can only be produced on a host the catalog covers, so the
+    // no-GPU Linux lane is where this assertion earns its keep.
+    assert_eq!(
+        report.get("has_match").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "this scenario is about the route taken when nothing was established, \
+         so the symptom must not have matched:\n{report:#}"
+    );
+
     let route = report
         .get("route_when_no_match")
         .expect("diagnose JSON has no 'route_when_no_match'");
