@@ -17,7 +17,9 @@
 //!   `///` are scanned. Ordinary code mentions `.md` files legitimately — a
 //!   `format!("{dist}/README.md")` naming an artifact that exists only after a
 //!   build, a shell command embedded in a workflow-contract test — and those are
-//!   not citations to resolve.
+//!   not citations to resolve. `////` is skipped because rustc does not treat it
+//!   as a doc comment either; the block forms `/*! … */` and `/** … */` are not
+//!   scanned at all, and none in this tree cites a file.
 //! - **No backtick requirement.** Citations in this tree appear both quoted and
 //!   bare (`docs/ux-guidelines.md` in `app/summary.rs` is bare), so requiring
 //!   backticks would miss the majority of them.
@@ -114,6 +116,9 @@ pub fn extract_citations(source: &str) -> Vec<(usize, String)> {
     let mut citations: Vec<(usize, String)> = Vec::new();
     for (index, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
+        if trimmed.starts_with("////") {
+            continue;
+        }
         let Some(text) = trimmed
             .strip_prefix("//!")
             .or_else(|| trimmed.strip_prefix("///"))
@@ -263,6 +268,14 @@ mod tests {
             "//! See https://example.com/docs/remote.md for the upstream note.\n",
             "/// Mirrored at <http://example.org/a/b.md>.\n",
         );
+        assert!(extract_citations(source).is_empty());
+    }
+
+    #[test]
+    fn ignores_a_four_slash_banner_comment() {
+        // rustc does not treat `////` as a doc comment, so rustdoc never renders
+        // a separator banner and a name inside one is not a citation.
+        let source = "//// section break, see docs/never-written.md\n";
         assert!(extract_citations(source).is_empty());
     }
 
