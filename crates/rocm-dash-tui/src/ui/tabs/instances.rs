@@ -922,6 +922,7 @@ mod tests {
             theme: Theme::default_dark(),
             theme_picker_sel: 0,
             bench_detail_scroll: 0,
+            help_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,

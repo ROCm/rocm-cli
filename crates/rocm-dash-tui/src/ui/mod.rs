@@ -42,7 +42,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
+use crate::app::{ActiveTab, AppState, ChatConsent, ConnState, FooterChip, KeyAction, Modal};
 use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -123,7 +123,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
+        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll),
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
@@ -137,7 +137,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme, state.help_scroll),
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -419,14 +419,32 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    // With a manager overlay open (any tab), Esc backs it out rather than
-    // opening the menu — advertise that instead of the (now wrong) select/open
-    // hints, which route to the manager, not the pane. Exactly one Esc chip is
-    // shown at all times: "back out" when an overlay is open, otherwise the
-    // uniform fallback "menu" (item #35).
-    if state.has_open_overlay() {
+    // Exactly one Esc chip is shown at all times, and it must match what Esc
+    // actually does — the real routing priority (highest first) is: a pending
+    // chat approval owns every key; then an open manager overlay backs itself
+    // out; then a `Modal::*` overlay closes; then a focused/gating Chat tab
+    // absorbs Esc; only once none of those apply does Esc fall through to the
+    // uniform "menu" fallback (item #35). Mirror that order here so the chip
+    // never advertises `menu` while a click on it would actually do something
+    // else.
+    if state.approval.is_some() {
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.has_open_overlay() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
+    } else if state.modal != Modal::None {
+        segs.push(Seg::Key("Esc", Some(KeyAction::CloseModal)));
+        segs.push(Seg::Sep(" close  "));
+    } else if state.active_tab == ActiveTab::Chat
+        && state.chat_detect_offer.is_some()
+        && state.chat_consent != ChatConsent::Accepted
+    {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatDetectDismiss)));
+        segs.push(Seg::Sep(" dismiss  "));
+    } else if state.active_tab == ActiveTab::Chat && state.chat_focused {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatBlur)));
+        segs.push(Seg::Sep(" unfocus  "));
     } else {
         segs.push(Seg::Key("Esc", Some(KeyAction::OpenMenu)));
         segs.push(Seg::Sep(" menu  "));

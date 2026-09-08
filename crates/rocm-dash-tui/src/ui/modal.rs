@@ -81,44 +81,30 @@ pub fn draw_scrollable_lines(
 
 /// Render the Help modal for the active tab.
 ///
-/// Shares chrome (dimmed backdrop, popup geometry, 2-column grouped layout)
-/// with `draw_global_help` so the two help screens read as one family; unlike
-/// that screen, this one's right column is dynamic — the active tab's own
-/// keys.
-pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
+/// Shares chrome (dimmed backdrop, popup geometry, scrollable single-column
+/// layout) with `draw_global_help` so the two help screens read as one
+/// family; unlike that screen, this one has an extra group — the active
+/// tab's own keys. `scroll` is the first visible line offset (see
+/// [`draw_scrollable_lines`]): a fixed two-column split used to clip content
+/// at small terminal sizes, since a group's rows could run past the popup's
+/// height with no way to reach them.
+pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scroll: u16) {
     grey_overlay(f);
     let popup = centered_rect(80, 80, 100, 26, area);
-    let inner = draw_popup_frame(f, popup, "Help", theme);
-    if inner.height == 0 {
-        return;
-    }
-    f.render_widget(Clear, inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
 
-    let left: &[(&str, &[(&str, &str)])] = &[
-        (
-            "GLOBAL",
-            &[
-                ("q", "quit"),
-                ("?", "toggle this help"),
-                ("Tab / Shift-Tab", "next / previous tab"),
-                ("1 .. 5", "jump to tab"),
-                ("t", "open theme picker"),
-                ("Esc", "open the main menu"),
-            ],
-        ),
-        (
-            "REPLAY",
-            &[
-                ("Space", "pause / resume"),
-                ("+ / -", "speed up / slow down"),
-                ("[ / ]", "jump ±10s"),
-                ("{ / }", "jump ±60s"),
-            ],
-        ),
+    let global: &[(&str, &str)] = &[
+        ("q", "quit"),
+        ("?", "toggle this help"),
+        ("Tab / Shift-Tab", "next / previous tab"),
+        ("1 .. 5", "jump to tab"),
+        ("t", "open theme picker"),
+        ("Esc", "open the main menu"),
+    ];
+    let replay: &[(&str, &str)] = &[
+        ("Space", "pause / resume"),
+        ("+ / -", "speed up / slow down"),
+        ("[ / ]", "jump ±10s"),
+        ("{ / }", "jump ±60s"),
     ];
     let tab_help: &[(&str, &str)] = match tab {
         ActiveTab::Home => &[("(no tab-specific keys — see the ROCm / Serving tabs)", "")],
@@ -155,10 +141,14 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         ],
     };
     let tab_title = format!("{tab:?}").to_uppercase();
-    let right: &[(&str, &[(&str, &str)])] = &[(tab_title.as_str(), tab_help)];
+    let groups: &[(&str, &[(&str, &str)])] = &[
+        ("GLOBAL", global),
+        (&tab_title, tab_help),
+        ("REPLAY", replay),
+    ];
 
-    render_help_groups(f, cols[0], left, theme);
-    render_help_groups(f, cols[1], right, theme);
+    let lines = help_group_lines(groups, theme);
+    draw_scrollable_lines(f, popup, "Help", lines, scroll, theme);
 }
 
 fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {
@@ -575,21 +565,16 @@ pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     }
 }
 
-/// Global 2-column keyboard reference (NAVIGATE / OVERLAYS / ACTIONS / CHAT /
-/// GLOBAL). Distinct from the contextual per-tab `?` help (`draw_help`).
-pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
+/// Global keyboard reference (NAVIGATE / OVERLAYS / ACTIONS / CHAT / GLOBAL).
+///
+/// Distinct from the contextual per-tab `?` help (`draw_help`), but shares its
+/// chrome — dimmed backdrop, popup geometry, and scrollable single-column
+/// layout (see [`draw_help`] for why). `scroll` is the first visible line
+/// offset (see [`draw_scrollable_lines`]).
+pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
     grey_overlay(f);
-    let modal = centered_rect(80, 80, 100, 26, area);
-    let inner = draw_popup_frame(f, modal, "Keyboard", theme);
-    if inner.height == 0 {
-        return;
-    }
-    f.render_widget(Clear, inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
-    let left: &[(&str, &[(&str, &str)])] = &[
+    let popup = centered_rect(80, 80, 100, 26, area);
+    let groups: &[(&str, &[(&str, &str)])] = &[
         (
             "NAVIGATE",
             &[
@@ -607,8 +592,6 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
                 ("t", "theme picker"),
             ],
         ),
-    ];
-    let right: &[(&str, &[(&str, &str)])] = &[
         (
             "ACTIONS",
             &[
@@ -622,16 +605,16 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
             &[("i / Enter", "focus chat input"), ("q", "quit")],
         ),
     ];
-    render_help_groups(f, cols[0], left, theme);
-    render_help_groups(f, cols[1], right, theme);
+    let lines = help_group_lines(groups, theme);
+    draw_scrollable_lines(f, popup, "Keyboard", lines, scroll, theme);
 }
 
-fn render_help_groups(
-    f: &mut Frame,
-    area: Rect,
-    groups: &[(&str, &[(&str, &str)])],
+/// Flatten keyboard-help groups into the `Vec<Line>` shape `draw_help` and
+/// `draw_global_help` both render via [`draw_scrollable_lines`].
+fn help_group_lines<'a>(
+    groups: &[(&'a str, &[(&'a str, &'a str)])],
     theme: &Theme,
-) {
+) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
     for (title, rows) in groups {
         lines.push(Line::from(Span::styled(
@@ -645,7 +628,7 @@ fn render_help_groups(
         }
         lines.push(Line::raw(""));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
 }
 
 // ===========================================================================
@@ -857,7 +840,7 @@ mod ported_chrome_tests {
         );
         assert!(options.contains("General"), "options missing tab label");
 
-        let help = render(&|f| super::draw_global_help(f, area, &theme));
+        let help = render(&|f| super::draw_global_help(f, area, &theme, 0));
         assert!(
             help.contains("Keyboard"),
             "global help missing title: {help:?}"

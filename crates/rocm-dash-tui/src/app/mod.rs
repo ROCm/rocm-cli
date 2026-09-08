@@ -497,6 +497,9 @@ pub struct AppState {
     pub theme_picker_sel: usize,
     /// Scroll offset (in lines) inside the Bench Detail modal. Reset on Open.
     pub bench_detail_scroll: u16,
+    /// Scroll offset (in lines) inside the Help / GlobalHelp overlays. Both
+    /// modals are mutually exclusive so one field suffices; reset on open.
+    pub help_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.
     /// Shared by whichever operational manager is showing its console; reset
     /// when an overlay opens (`close_overlays`).
@@ -693,6 +696,7 @@ impl AppState {
             theme,
             theme_picker_sel,
             bench_detail_scroll: 0,
+            help_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -1107,6 +1111,20 @@ impl AppState {
         let cur = i32::from(self.bench_detail_scroll);
         let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
         self.bench_detail_scroll = next;
+    }
+
+    /// Reset the Help / GlobalHelp scroll offset (called when opening either
+    /// modal, so a stale offset never carries over from a previous session).
+    pub const fn reset_help_scroll(&mut self) {
+        self.help_scroll = 0;
+    }
+
+    /// Adjust the Help / GlobalHelp scroll. `delta` is in lines; clamped at 0
+    /// (no upper bound — the renderer clamps against the actual line count).
+    pub fn scroll_help(&mut self, delta: i16) {
+        let cur = i32::from(self.help_scroll);
+        let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
+        self.help_scroll = next;
     }
 
     /// Install the resolved chat endpoint and set the initial consent state.
@@ -1717,12 +1735,27 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }),
             true,
         );
-        Some(
-            std::sync::Arc::new(crate::agent::MockAgentClient::with_tool_call(
+        Some(std::sync::Arc::new(
+            crate::agent::MockAgentClient::with_tool_call_and_approval_trigger(
                 "GPU-2 is running hot: 87% util, 71°C, drawing 250 W (90 GB/192 GB VRAM).",
                 "gpu_status",
-            )) as std::sync::Arc<dyn crate::agent::AgentClient>,
-        )
+                "install the sdk",
+                crate::tool_exec::ApprovalIntent {
+                    title: "Install TheRock ROCm SDK?".to_string(),
+                    body: vec![
+                        "install_sdk --channel release --format wheel --prefix ~/rocm-sdk"
+                            .to_string(),
+                    ],
+                    name: "install_sdk".to_string(),
+                    arguments: serde_json::json!({
+                        "channel": "release",
+                        "format": "wheel",
+                        "prefix": "~/rocm-sdk",
+                    }),
+                },
+                chat_tx.clone(),
+            ),
+        ) as std::sync::Arc<dyn crate::agent::AgentClient>)
     } else {
         // An endpoint we launched ourselves (managed-services registry) takes
         // priority over the well-known default port — this is how a tool-launched
@@ -2537,6 +2570,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.modal = if state.modal == Modal::Help {
                 Modal::None
             } else {
+                state.reset_help_scroll();
                 Modal::Help
             };
         }
@@ -2635,7 +2669,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                     state.modal = Modal::Options;
                     state.options_tab = 0;
                 }
-                1 => state.modal = Modal::GlobalHelp,
+                1 => {
+                    state.reset_help_scroll();
+                    state.modal = Modal::GlobalHelp;
+                }
                 _ => return true, // Quit
             },
             Modal::Palette => {
@@ -2647,8 +2684,11 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             _ => {}
         },
         // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
-        // (the only scrollable detail) is no longer reachable, so modal scroll
-        // is a no-op until/unless a scrollable Observe detail is wired.
+        // is no longer reachable, so Detail itself has nothing to scroll. Help
+        // and GlobalHelp are the only modals that currently use this action.
+        KeyAction::ScrollModal(delta) if matches!(state.modal, Modal::Help | Modal::GlobalHelp) => {
+            state.scroll_help(delta);
+        }
         KeyAction::ScrollModal(_) => {}
         KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
         KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
@@ -3303,19 +3343,34 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
             _ => KeyAction::Nothing,
         };
     }
-    // Help absorbs everything except quit / close / ? toggle.
+    // Help absorbs everything except quit / close / ? toggle / scroll — the
+    // body can run longer than the popup at small terminal sizes.
     if *modal == Modal::Help {
         return match k.code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::ScrollModal(-1),
+            KeyCode::PageDown => KeyAction::ScrollModal(10),
+            KeyCode::PageUp => KeyAction::ScrollModal(-10),
+            KeyCode::Char('g') | KeyCode::Home => KeyAction::ScrollModal(i16::MIN),
+            KeyCode::Char('G') | KeyCode::End => KeyAction::ScrollModal(i16::MAX),
             _ => KeyAction::Nothing,
         };
     }
-    // Global help overlay (opened from the Esc menu): close-only.
+    // Global help overlay (opened from the Esc menu): close + scroll, same as
+    // the contextual Help above (shares `help_scroll`, the two are mutually
+    // exclusive).
     if *modal == Modal::GlobalHelp {
         return match k.code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::ScrollModal(-1),
+            KeyCode::PageDown => KeyAction::ScrollModal(10),
+            KeyCode::PageUp => KeyAction::ScrollModal(-10),
+            KeyCode::Char('g') | KeyCode::Home => KeyAction::ScrollModal(i16::MIN),
+            KeyCode::Char('G') | KeyCode::End => KeyAction::ScrollModal(i16::MAX),
             _ => KeyAction::Nothing,
         };
     }
@@ -4595,12 +4650,47 @@ mod tests {
                 ChatKeyCtx::default(),
             )
         };
-        // j/k inside Help do nothing (Help has no scrollable body today).
-        assert_eq!(with_help(KeyCode::Char('j')), KeyAction::Nothing);
+        // j/k inside Help scroll its (now scrollable) body.
+        assert_eq!(with_help(KeyCode::Char('j')), KeyAction::ScrollModal(1));
+        assert_eq!(with_help(KeyCode::Char('k')), KeyAction::ScrollModal(-1));
         assert_eq!(with_help(KeyCode::Tab), KeyAction::Nothing);
         assert_eq!(with_help(KeyCode::Esc), KeyAction::CloseModal);
         assert_eq!(with_help(KeyCode::Enter), KeyAction::CloseModal);
         assert_eq!(with_help(KeyCode::Char('q')), KeyAction::Quit);
+    }
+
+    #[test]
+    fn global_help_modal_j_k_emit_scroll() {
+        let with_global_help = |c| {
+            handle_key(
+                press(c),
+                ActiveTab::Observe,
+                &Modal::GlobalHelp,
+                ChatKeyCtx::default(),
+            )
+        };
+        assert_eq!(
+            with_global_help(KeyCode::Char('j')),
+            KeyAction::ScrollModal(1)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('k')),
+            KeyAction::ScrollModal(-1)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::PageDown),
+            KeyAction::ScrollModal(10)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('g')),
+            KeyAction::ScrollModal(i16::MIN)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('G')),
+            KeyAction::ScrollModal(i16::MAX)
+        );
+        assert_eq!(with_global_help(KeyCode::Esc), KeyAction::CloseModal);
+        assert_eq!(with_global_help(KeyCode::Char('q')), KeyAction::Quit);
     }
 
     #[test]
