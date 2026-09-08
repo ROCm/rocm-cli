@@ -26,7 +26,8 @@
 //!   `docs/…` and bare `README.md`/`AGENTS.md` forms). Both are how the tree
 //!   actually cites files, and accepting either keeps the check free of
 //!   false positives without weakening it: a name that resolves under neither
-//!   root points at nothing.
+//!   root points at nothing. Neither root accepts a path that climbs out of the
+//!   workspace, so what sits next to the checkout cannot decide the result.
 //! - **Lines, not tokens.** The scan is line-based, so a multi-line string
 //!   literal whose continuation lines start with `//!` or `///` reads as a doc
 //!   comment. The fixtures below use `concat!` to keep that prefix off the start
@@ -39,7 +40,7 @@
 //! set as-is; the pure helpers take their inputs as parameters so they are
 //! unit-testable without touching process-global state.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -131,10 +132,38 @@ pub fn extract_citations(source: &str) -> Vec<(usize, String)> {
     citations
 }
 
+/// Lexically resolve `.` and `..` in `path` without touching the filesystem.
+///
+/// `canonicalize` is unusable here: it fails on the paths this check cares about
+/// most, the ones that do not exist.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// Whether `candidate` names a file, resolved either next to the citing file or
 /// against the workspace root.
+///
+/// A candidate that climbs out of the workspace never resolves, even if a file
+/// happens to sit there. Whether a directory exists beside the checkout is a
+/// property of one machine, not of the tree, and a citation that resolved only
+/// on the author's disk would pass review and fail CI.
 pub fn resolve(candidate: &str, file_dir: &Path, root: &Path) -> bool {
-    file_dir.join(candidate).is_file() || root.join(candidate).is_file()
+    [file_dir.join(candidate), root.join(candidate)]
+        .iter()
+        .map(|path| normalize(path))
+        .any(|path| path.starts_with(root) && path.is_file())
 }
 
 /// All tracked `*.rs` files, excluding `third_party/`, as paths relative to `root`.
@@ -284,6 +313,23 @@ mod tests {
         assert!(!resolve("docs", &file_dir, root));
         assert!(!resolve("../elsewhere/foo.md", &file_dir, root));
         assert!(!resolve("foo.md", &file_dir, root));
+    }
+
+    #[test]
+    fn refuses_to_resolve_a_path_that_climbs_out_of_the_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outside = temp.path();
+        let root = outside.join("workspace");
+        std::fs::create_dir_all(root.join("crates/thing/src")).expect("src dir");
+        std::fs::create_dir_all(outside.join("beside")).expect("neighbour dir");
+        std::fs::write(outside.join("beside/note.md"), "note").expect("neighbour file");
+        let file_dir = root.join("crates/thing/src");
+
+        // The file really is there, but it is outside the checkout: resolving it
+        // would make the check pass on this machine and fail on any other.
+        assert!(outside.join("beside/note.md").is_file());
+        assert!(!resolve("../beside/note.md", &root, &root));
+        assert!(!resolve("../../../../beside/note.md", &file_dir, &root));
     }
 
     #[test]
