@@ -30,18 +30,18 @@ ignore = [
     # the `too_many_lines` allow that Cargo.toml grants clippy for the same reason.
     "PLR0911", # too-many-return-statements: early returns beat a nested result variable
     "PLR0912", # too-many-branches: entry-point and validation flows are deliberately linear
-    "PLR0913", # too-many-arguments: keyword-only config/subprocess/HTTP helpers take many named fields
-    "PLR0915", # too-many-statements: splitting these entry points adds no clarity
+    "PLR0913", # too-many-arguments: mostly keyword-only subprocess, HTTP, workflow-builder and config helpers
+    "PLR0915", # too-many-statements: splitting these entry points and self-tests adds no clarity
     "PLR2004", # magic-value-comparison: HTTP statuses, byte sizes, mode bits, lengths, time budgets and self-test literals are clearer inline
 ]
 
 [lint.per-file-ignores]
-# Blind excepts in the GPU and TUI test harnesses are intentional last-resort
-# handlers: each reports the error, hands it to the owning thread, keeps it for
-# the eventual timeout message, or — in a teardown path — deliberately ignores
-# it, so a probe or cleanup failure degrades gracefully instead of crashing the
-# harness. Scoped per file so a blind except added to the build, release or docs
-# config still fails lint.
+# Blind excepts in the GPU, SDK-install and TUI test harnesses are intentional
+# last-resort handlers: each reports the error, hands it to the owning thread,
+# keeps it for the eventual timeout message, or — in a teardown path —
+# deliberately ignores it, so a probe or cleanup failure ends in a clear
+# diagnostic instead of an unhandled traceback. Scoped per file so a blind
+# except added to the build, release or docs config still fails lint.
 "scripts/comfyui_therock_gpu_test.py" = ["BLE001"] # blind-except
 "scripts/therock_sdk_install_test.py" = ["BLE001"] # blind-except
 "scripts/vllm_therock_gpu_test.py" = ["BLE001"]    # blind-except
