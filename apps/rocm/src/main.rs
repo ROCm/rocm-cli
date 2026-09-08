@@ -30053,7 +30053,7 @@ ID_LIKE="suse opensuse"
             "gfx120X-all",
             "7.14.0",
         );
-        let manifests = vec![stale.clone(), wrong_family, repaired.clone()];
+        let manifests = vec![stale, wrong_family, repaired.clone()];
 
         let selected = select_installed_update_runtime(&manifests, &repaired.runtime_key)
             .expect("the side-by-side repair must be selected by its exact key");

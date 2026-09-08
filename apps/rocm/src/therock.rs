@@ -247,6 +247,7 @@ enum AggregateDeviceTarget {
 struct ResolvedAggregateWheelSource {
     index_url: &'static str,
     device_target: AggregateDeviceTarget,
+    published_device_targets: Vec<String>,
 }
 
 /// Stands in for a real target in a preview, so a plan that cannot be installed
@@ -324,6 +325,8 @@ struct PipRuntimeResolution {
     /// The device payload the canonical source must supply for this host,
     /// decided against the targets that source actually publishes.
     device_target: AggregateDeviceTarget,
+    /// Exact device payloads advertised by the canonical aggregate source.
+    published_device_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -979,14 +982,16 @@ fn resolve_latest_for_manifest(
             // produce, and re-probing would disagree with the installed runtime on
             // any host whose GPU is absent, hidden, or simply a second card.
             let device_target =
-                wheel_composition_device_target(manifest.wheel_composition.as_ref())
-                    .and_then(|target| {
-                        canonical_aggregate_device_target(target, &resolution.family)
-                    })
-                    .map_or_else(
-                        || resolution.device_target.clone(),
-                        AggregateDeviceTarget::Exact,
-                    );
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
+                    || resolution.device_target.clone(),
+                    |target| {
+                        AggregateDeviceTarget::resolve(
+                            Some(target),
+                            &resolution.family,
+                            &resolution.published_device_targets,
+                        )
+                    },
+                );
             // No exact target means no reproducible composition, so freshness
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
@@ -1629,13 +1634,15 @@ fn resolve_pip_runtime_with_timeout(
             source.wheel_index
         )
     })?;
+    let published_device_targets = parse_aggregate_device_targets(&root_html);
     let source = ResolvedAggregateWheelSource {
         index_url: source.wheel_index,
         device_target: AggregateDeviceTarget::resolve(
             detect_host_gfx_target().as_deref(),
             &family_resolution.family,
-            &parse_aggregate_device_targets(&root_html),
+            &published_device_targets,
         ),
+        published_device_targets,
     };
     resolve_pip_runtime_from_index(
         paths,
@@ -1721,6 +1728,7 @@ fn resolve_pip_runtime_from_index(
         latest_version,
         package_versions,
         device_target: source.device_target.clone(),
+        published_device_targets: source.published_device_targets.clone(),
     })
 }
 
