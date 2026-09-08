@@ -1322,9 +1322,13 @@ fn run_all_checks(e: &Examination, symptom: &str) -> Vec<Diagnosis> {
 ///
 /// Keyed off the *host-detected* framework, which `Examination::probe` only
 /// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
-/// named arms plus the ROCm-core default are the whole reachable set. If a probe
-/// for another framework is added, add its arm here and in [`upstream_tracker`];
-/// `routing_targets_cover_every_framework_the_probe_reports` will flag it.
+/// named arms plus the ROCm-core default are the whole reachable set.
+///
+/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
+/// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
+/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
         "pytorch" => "pytorch",
@@ -1675,10 +1679,14 @@ mod tests {
     /// Routing must stay defined for every framework the probe can report, and
     /// must not claim targets it can never reach.
     ///
-    /// `Examination::probe` sets `framework` to exactly these four values (see
-    /// `examine.rs`). The catalog docs previously advertised lemonade / ollama /
-    /// lm-studio routing that no probe could ever trigger; this pins the
-    /// reachable set so a re-added arm has to come with a probe that reaches it.
+    /// The catalog docs previously advertised lemonade / ollama / lm-studio
+    /// routing that no probe could ever trigger; this pins the reachable set so
+    /// a re-added arm has to come with a probe that reaches it.
+    ///
+    /// The framework list below is **hand-maintained** to match what
+    /// `Examination::probe` sets in `examine.rs`. It is not derived from that
+    /// code, so adding a fifth framework there will not fail this test — see
+    /// the note on [`route_when_no_match`] for the three places to edit.
     #[test]
     fn routing_targets_cover_every_framework_the_probe_reports() {
         let mut targets = Vec::new();

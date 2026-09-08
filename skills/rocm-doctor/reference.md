@@ -23,9 +23,15 @@ the result from `--json`:
 
 - `matched[]` — ranked `{ id, title, score, evidence[], fix }`. Tiers:
   `>= 75` high confidence, `50–74` likely, `< 50` weak.
+- `has_match` — whether any entry cleared `min_score_for_match`. **This is the
+  gate, not whether `matched` is empty.** Several checkers open with a nonzero
+  base score for a merely *potentially* relevant situation (running in a
+  container, an APU alongside a discrete GPU), so a healthy host produces a
+  non-empty `matched` full of sub-threshold entries. Gating on emptiness
+  proposes a fix for a machine with nothing wrong and never routes upstream.
 - `min_score_for_match` (50), `high_confidence_threshold` (75).
 - `out_of_scope` — set when the host is off-catalog (e.g. WSL2); `matched` is empty.
-- `route_when_no_match` — `{ target, url }` upstream tracker to use when nothing matched.
+- `route_when_no_match` — `{ target, url }` upstream tracker to use when `has_match` is false.
 
 ### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N]`
 
