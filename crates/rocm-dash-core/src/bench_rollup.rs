@@ -8,18 +8,20 @@
 //! it whenever the row set changes rather than relying on the upstream
 //! `pass_n_of_n` / `pass_at_n` CSV columns.
 //!
-//! Rows are grouped by `(cell, model, backend, concurrency)`; each group of N
-//! trials yields two verdicts — strict (all N passed) and lenient (at least
-//! one passed).
+//! Rows are grouped by `(cell, model, engine, tp, dtype, concurrency)` — every
+//! field that defines the run except the trial itself; each group of N trials
+//! yields two verdicts — strict (all N passed) and lenient (at least one
+//! passed).
 
 use std::collections::BTreeMap;
 
 use crate::bench_schema::{BenchmarkRow, PassFail};
 
-/// Effective verdict for one row: prefer the rolled-up `pass_fail`, fall back
+/// Effective verdict for one row.
 ///
-/// to the judge verdict when the rollup is `Unknown`. A row that is `Unknown`
-/// under both returns `Unknown` and never counts as a pass.
+/// Prefers the rolled-up `pass_fail`, falling back to the judge verdict when the
+/// rollup is `Unknown`. A row that is `Unknown` under both returns `Unknown` and
+/// never counts as a pass.
 #[must_use]
 pub const fn row_verdict(row: &BenchmarkRow) -> PassFail {
     match row.pass_fail {
