@@ -215,7 +215,8 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
             rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
-            _ => ("⋯ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Cancelled => ("⊘ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
         };
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::default().fg(color)),
@@ -232,7 +233,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // so it never displaces real activity on a squeezed card.
     if (feed.height as usize) > lines.len() {
         lines.push(Line::from(Span::styled(
-            "● live  ✓ done  ✗ failed  ⋯ running",
+            "● live  ✓ done  ✗ failed  ⋯ running  ⊘ cancelled",
             Style::default().fg(theme.muted),
         )));
     }
@@ -501,10 +502,13 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // "Checking…", never a fabricated "Up to date".
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        // "Checking…" only applies while not connected (initial/connecting, or
-        // disconnected — any non-simulated state short of `Connected`); every
-        // other reachable state has no update feed to report, so it's "unknown".
-        let text = if !state.simulated && !matches!(state.conn, ConnState::Connected { .. }) {
+        // "Checking…" only applies while still trying to reach the daemon
+        // (Initial/Connecting). Once `Connected` or `Disconnected`, there is
+        // no update feed to report, so it's "unknown" rather than a stuck
+        // "Checking…" during retry backoff.
+        let text = if !state.simulated
+            && matches!(state.conn, ConnState::Initial | ConnState::Connecting)
+        {
             "Checking…"
         } else {
             "unknown"
@@ -641,6 +645,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn updates_tile_shows_unknown_not_checking_when_disconnected() {
+        // Disconnected (e.g. retry backoff after the daemon drops) is not the
+        // same as still trying to connect — it must not get stuck on the
+        // transitional "Checking…" label forever.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Disconnected {
+            reason: "connection reset".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("unknown"),
+            "Updates tile should show unknown once disconnected: {out:?}"
+        );
+        assert!(
+            !out.contains("Checking…"),
+            "must not claim to still be checking once disconnected: {out:?}"
+        );
+    }
+
     fn instance_with_obs(name: &str, obs: Option<ObservationMetadata>) -> Instance {
         Instance {
             container_id: name.into(),
@@ -723,6 +747,22 @@ mod tests {
             out.contains("live") && out.contains("done") && out.contains("failed"),
             "activity glyph key missing: {out:?}"
         );
+        assert!(
+            out.contains("cancelled"),
+            "activity glyph key must document the cancelled glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_job_renders_distinct_glyph_from_running() {
+        // Cancelled must not be silently folded into the `⋯ running` glyph —
+        // it has its own entry in the match and the key.
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("cancel-me".into(), job("long task", JobStatus::Cancelled));
+        let out = render(&s, 160, 30);
+        assert!(out.contains('⊘'), "cancelled job should render ⊘: {out:?}");
     }
 
     #[test]
@@ -738,7 +778,7 @@ mod tests {
         }
         let out = render(&s, 160, 30);
         assert!(
-            !out.contains("● live  ✓ done  ✗ failed  ⋯ running"),
+            !out.contains("● live  ✓ done  ✗ failed  ⋯ running  ⊘ cancelled"),
             "glyph key must not appear when the feed has no spare room: {out:?}"
         );
     }
