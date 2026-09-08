@@ -128,6 +128,8 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Name the runtime rather than leaving the CLI to infer it: the shared tree
     // grows a second runtime whenever the channel index publishes one, and the
@@ -137,7 +139,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.activate_shared_runtime();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
-        !stdout.contains("installed: none"),
+        !stdout.contains("active_runtime_key: <unset>"),
         "no managed runtime is active:\n{stdout}"
     );
 }
@@ -152,6 +154,8 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Same reason as `a managed runtime is active`: pin the runtime explicitly,
     // or the serve that follows refuses to pick one. Not for `assert_engine_ready`
@@ -159,6 +163,26 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     // the active key, which is exactly why it cannot stand in for this call.
     world.activate_shared_runtime();
     assert_engine_ready(world);
+}
+
+/// Point a pre-warmed shared tree at its canonical runtime when nothing is
+/// active yet.
+///
+/// The pre-warm activates what it installs, but the marker lives in the shared
+/// tree while `active_runtime_key` is read per scenario, and a repaired tree
+/// holds a superseded runtime beside its replacement. Left unset, the CLI
+/// refuses to auto-select from more than one runtime and every serve behind this
+/// precondition fails for a reason that names none of this.
+fn activate_shared_runtime_if_unset(world: &mut E2eWorld, runtimes: &str) {
+    if !runtimes.contains("active_runtime_key: <unset>") {
+        return;
+    }
+    let runtime_key = e2e_cucumber::capability::canonical_wheel_runtime_key(runtimes)
+        .unwrap_or_else(|| {
+            panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
+        })
+        .to_owned();
+    crate::run_rocm_ok(world, &["runtimes", "activate", &runtime_key]);
 }
 
 /// Record the torch-alignment opt-out for this scenario's next `rocm` command.
@@ -713,7 +737,13 @@ fn active_runtime_key(world: &E2eWorld) -> Option<String> {
 /// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
 /// exactly these, so a rename here must break this scenario rather than silently
 /// turn every pre-warm into a no-op reuse.
-const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_index", "error"];
+const UPDATE_STATUSES: [&str; 5] = [
+    "up_to_date",
+    "update_available",
+    "repair_available",
+    "ahead_of_index",
+    "error",
+];
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {

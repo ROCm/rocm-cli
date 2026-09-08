@@ -18,6 +18,7 @@ use rocm_core::{
     generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -430,7 +431,54 @@ pub(crate) struct RuntimeUpdatePlan {
     pub latest_source: String,
     pub format: String,
     pub status: String,
+    /// The runtime key the applied install will produce. Update apply selects
+    /// the resulting manifest by this key rather than by version, because a
+    /// same-version repair produces a sibling that version alone cannot name.
+    pub target_runtime_key: String,
+    pub repair_required: bool,
     pub update_available: bool,
+}
+
+/// Exact canonical wheel install intent last applied successfully to a runtime.
+///
+/// Version alone cannot identify a reusable environment: adding a required ROCm
+/// extra at the same release version must make an older cache repairable.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WheelRuntimeComposition {
+    pub source_layout_generation: String,
+    pub package_specs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RuntimeFreshness {
+    UpToDate,
+    UpdateAvailable,
+    RepairAvailable,
+    AheadOfIndex,
+}
+
+impl RuntimeFreshness {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::UpToDate => "up_to_date",
+            Self::UpdateAvailable => "update_available",
+            Self::RepairAvailable => "repair_available",
+            Self::AheadOfIndex => "ahead_of_index",
+        }
+    }
+
+    const fn update_available(self) -> bool {
+        matches!(self, Self::UpdateAvailable | Self::RepairAvailable)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRuntimeUpdate {
+    latest_version: String,
+    latest_source: String,
+    target_runtime_key: String,
+    format: String,
+    wheel_composition: Option<WheelRuntimeComposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +512,10 @@ pub(crate) struct InstalledRuntimeManifest {
     /// knows that, and it has to survive repeat installs to be worth anything.
     #[serde(default)]
     pub sdk_torch: Option<String>,
+    /// Missing on manifests written before composition-aware freshness. Such a
+    /// managed wheel runtime is repaired once and rewritten with this field.
+    #[serde(default)]
+    pub wheel_composition: Option<WheelRuntimeComposition>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -725,8 +777,8 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         return Ok(output);
     }
 
-    for manifest in manifests {
-        let plan = match runtime_update_plan(paths, &manifest) {
+    for manifest in &manifests {
+        let plan = match runtime_update_plan(paths, manifest, &manifests) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -741,16 +793,21 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         let Some(plan) = plan else {
             continue;
         };
+        // `target=` names the runtime key an apply from this line would produce.
+        // For a superseded legacy manifest that is its already-installed
+        // replacement, which is how a reader — `xtask e2e-prewarm` above all —
+        // learns which sibling to activate without re-deriving the composition.
         let _ = writeln!(
             output,
-            "  runtime {} format={} channel={} family={} installed={} latest={} status={}",
+            "  runtime {} format={} channel={} family={} installed={} latest={} status={} target={}",
             manifest.runtime_key,
             plan.format,
             manifest.channel,
             manifest.family,
             runtime_version_display(&manifest.version),
             runtime_version_display(&plan.latest_version),
-            plan.status
+            plan.status,
+            plan.target_runtime_key
         );
         let _ = writeln!(
             output,
@@ -759,14 +816,21 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         );
         let _ = writeln!(output, "    source: {}", plan.latest_source);
         if plan.update_available {
+            let next_step = if plan.repair_required {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install a composition-keyed replacement side-by-side",
+                    manifest.runtime_key
+                )
+            } else {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
+                    manifest.runtime_key
+                )
+            };
+            let _ = writeln!(output, "    next step: {next_step}");
             let _ = writeln!(
                 output,
-                "    next step: run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
-                manifest.runtime_key
-            );
-            let _ = writeln!(
-                output,
-                "    activate: add `--activate` to make the newly installed runtime the default after install"
+                "    activate: add `--activate` to make the installed runtime the default after install"
             );
         }
     }
@@ -774,23 +838,108 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
+/// Whether the composition-keyed replacement for `source` is already installed.
+///
+/// A repair installs a sibling and leaves the legacy manifest in place until the
+/// retention pass removes it. Without this, that retained manifest keeps
+/// reporting `repair_available` forever, so every pre-warm reinstalls a runtime
+/// that is already there and every startup check re-notifies.
+fn replacement_runtime_is_installed(
+    manifests: &[InstalledRuntimeManifest],
+    source: &InstalledRuntimeManifest,
+    target_runtime_key: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+) -> bool {
+    // `RepairAvailable` currently implies a wheel composition, but keep this
+    // helper total if a future freshness state reaches it without one.
+    let Some(required_composition) = required_composition else {
+        return false;
+    };
+    manifests.iter().any(|candidate| {
+        !candidate.read_only
+            && candidate.runtime_key == target_runtime_key
+            && candidate.channel == source.channel
+            && candidate.format == source.format
+            && candidate.family == source.family
+            && candidate.wheel_composition.as_ref() == Some(required_composition)
+    })
+}
+
+/// Freshness of one runtime against the index, ignoring its siblings.
+///
+/// An installed version newer than the index is [`RuntimeFreshness::AheadOfIndex`]
+/// before any composition is considered: that build cannot be reproduced from the
+/// index at all, so calling it repairable would promise an install that must
+/// either fail or silently roll the runtime back.
+fn runtime_freshness(
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    match compare_version_strings(&manifest.version, latest_version) {
+        Ordering::Less => RuntimeFreshness::UpdateAvailable,
+        Ordering::Greater => RuntimeFreshness::AheadOfIndex,
+        Ordering::Equal
+            if !manifest.read_only
+                && required_composition.is_some()
+                && (manifest.wheel_composition.as_ref() != required_composition
+                    || manifest.runtime_key != target_runtime_key) =>
+        {
+            RuntimeFreshness::RepairAvailable
+        }
+        Ordering::Equal => RuntimeFreshness::UpToDate,
+    }
+}
+
+fn runtime_freshness_with_manifests(
+    manifests: &[InstalledRuntimeManifest],
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    let freshness = runtime_freshness(
+        manifest,
+        latest_version,
+        required_composition,
+        target_runtime_key,
+    );
+    if freshness == RuntimeFreshness::RepairAvailable
+        && replacement_runtime_is_installed(
+            manifests,
+            manifest,
+            target_runtime_key,
+            required_composition,
+        )
+    {
+        RuntimeFreshness::UpToDate
+    } else {
+        freshness
+    }
+}
+
 pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
 ) -> Result<RuntimeUpdatePlan> {
-    let (latest_version, latest_source, format) =
-        resolve_latest_for_manifest(paths, manifest, None)?;
-    let status = match compare_version_strings(&manifest.version, &latest_version) {
-        Ordering::Less => "update_available",
-        Ordering::Equal => "up_to_date",
-        Ordering::Greater => "ahead_of_index",
-    };
+    let latest = resolve_latest_for_manifest(paths, manifest, None)?;
+    let freshness = runtime_freshness_with_manifests(
+        manifests,
+        manifest,
+        &latest.latest_version,
+        latest.wheel_composition.as_ref(),
+        &latest.target_runtime_key,
+    );
     Ok(RuntimeUpdatePlan {
-        latest_version,
-        latest_source,
-        format,
-        status: status.to_owned(),
-        update_available: status == "update_available",
+        latest_version: latest.latest_version,
+        latest_source: latest.latest_source,
+        format: latest.format,
+        status: freshness.status().to_owned(),
+        target_runtime_key: latest.target_runtime_key,
+        repair_required: freshness == RuntimeFreshness::RepairAvailable,
+        update_available: freshness.update_available(),
     })
 }
 
@@ -798,7 +947,7 @@ fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     download_timeout_secs: Option<u64>,
-) -> Result<(String, String, String)> {
+) -> Result<ResolvedRuntimeUpdate> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
     match manifest.format.as_str() {
         "wheel" => {
@@ -825,11 +974,40 @@ fn resolve_latest_for_manifest(
                 None,
                 download_timeout_secs,
             )?;
-            Ok((
-                resolution.latest_version,
-                resolution.index_url,
-                "wheel".to_owned(),
-            ))
+            // Prefer the device payload this runtime was actually built with over
+            // a fresh host probe. Planning must predict the key an apply will
+            // produce, and re-probing would disagree with the installed runtime on
+            // any host whose GPU is absent, hidden, or simply a second card.
+            let device_target =
+                wheel_composition_device_target(manifest.wheel_composition.as_ref())
+                    .and_then(|target| {
+                        canonical_aggregate_device_target(target, &resolution.family)
+                    })
+                    .map_or_else(
+                        || resolution.device_target.clone(),
+                        AggregateDeviceTarget::Exact,
+                    );
+            // No exact target means no reproducible composition, so freshness
+            // falls back to the version comparison rather than demanding a repair
+            // this host could not perform.
+            let wheel_composition = match &device_target {
+                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
+                    &resolution,
+                    &device_target.rocm_extras(),
+                )),
+                AggregateDeviceTarget::Undetermined(_) => None,
+            };
+            let target_runtime_key = wheel_composition.as_ref().map_or_else(
+                || manifest.runtime_key.clone(),
+                |composition| wheel_runtime_key(channel, &resolution.latest_version, composition),
+            );
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: resolution.latest_version,
+                latest_source: resolution.index_url,
+                target_runtime_key,
+                format: "wheel".to_owned(),
+                wheel_composition,
+            })
         }
         "tarball" => {
             let artifact = resolve_tarball_artifact_with_timeout(
@@ -838,7 +1016,19 @@ fn resolve_latest_for_manifest(
                 Some(manifest.family.as_str()),
                 download_timeout_secs,
             )?;
-            Ok((artifact.version, artifact.url, "tarball".to_owned()))
+            let target_runtime_key = runtime_key(
+                channel,
+                "tarball",
+                &artifact.family,
+                Some(&artifact.version),
+            );
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: artifact.version,
+                latest_source: artifact.url,
+                target_runtime_key,
+                format: "tarball".to_owned(),
+                wheel_composition: None,
+            })
         }
         other => bail!("unknown manifest format `{other}`"),
     }
@@ -875,6 +1065,7 @@ fn maybe_refresh_startup_update_check_at(
     let record = build_startup_update_check_record(
         paths,
         manifest,
+        &manifests,
         now_unix_ms,
         Some(STARTUP_UPDATE_CHECK_TIMEOUT_SECS),
     );
@@ -906,25 +1097,28 @@ fn select_startup_update_manifest<'a>(
 fn build_startup_update_check_record(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
     now_unix_ms: u128,
     download_timeout_secs: Option<u64>,
 ) -> StartupUpdateCheckRecord {
     match resolve_latest_for_manifest(paths, manifest, download_timeout_secs) {
-        Ok((latest_version, _latest_source, kind)) => {
-            let status = match compare_version_strings(&manifest.version, &latest_version) {
-                Ordering::Less => "update_available",
-                Ordering::Equal => "up_to_date",
-                Ordering::Greater => "ahead_of_index",
-            };
+        Ok(latest) => {
+            let freshness = runtime_freshness_with_manifests(
+                manifests,
+                manifest,
+                &latest.latest_version,
+                latest.wheel_composition.as_ref(),
+                &latest.target_runtime_key,
+            );
             StartupUpdateCheckRecord {
                 runtime_key: manifest.runtime_key.clone(),
                 runtime_id: manifest.runtime_id.clone(),
                 channel: manifest.channel.clone(),
-                format: kind,
+                format: latest.format,
                 family: manifest.family.clone(),
                 installed_version: manifest.version.clone(),
-                latest_version: Some(latest_version),
-                status: status.to_owned(),
+                latest_version: Some(latest.latest_version),
+                status: freshness.status().to_owned(),
                 message: None,
                 checked_at_unix_ms: now_unix_ms,
             }
@@ -1020,12 +1214,18 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
     )?;
-    let rocm_extras = resolution.device_target.rocm_extras();
+    // The exact device payload, not the version alone, decides what this runtime
+    // can run, so it is what identifies the runtime. A preview on a host with no
+    // usable target still composes a key here — from the `<undetermined>` extras
+    // — which no real install can ever produce, and the refusal below stops it
+    // from reaching a manifest.
+    let wheel_composition =
+        wheel_runtime_composition(&resolution, &resolution.device_target.rocm_extras());
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
     ));
-    let runtime_key = wheel_runtime_key(channel, &resolution.latest_version);
+    let runtime_key = wheel_runtime_key(channel, &resolution.latest_version, &wheel_composition);
     let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
@@ -1093,7 +1293,7 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" ")
+        wheel_composition.package_specs.join(" ")
     );
     let _ = writeln!(
         output,
@@ -1106,10 +1306,7 @@ fn install_wheel_runtime(
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
-        install_args.extend(therock_pip_package_specs(
-            &resolution.package_versions,
-            &rocm_extras,
-        ));
+        install_args.extend(wheel_composition.package_specs.iter().cloned());
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
         let venv_args_display = venv_args
             .iter()
@@ -1163,7 +1360,7 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions, &rocm_extras).join(" "),
+        wheel_composition.package_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -1171,10 +1368,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(
-        &resolution.package_versions,
-        &rocm_extras,
-    ));
+    install_args.extend(wheel_composition.package_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,
@@ -1211,6 +1405,7 @@ fn install_wheel_runtime(
         pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
         sdk_torch: Some(resolution.package_versions.torch.clone()),
+        wheel_composition: Some(wheel_composition),
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1256,6 +1451,36 @@ fn therock_pip_package_specs(
         format!("torchvision=={}", package_versions.torchvision),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
+}
+
+/// The exact install intent for `resolution` under `rocm_extras`.
+///
+/// Kept beside [`therock_pip_package_specs`] so the specs that identify a
+/// runtime are, by construction, the specs that get installed.
+fn wheel_runtime_composition(
+    resolution: &PipRuntimeResolution,
+    rocm_extras: &str,
+) -> WheelRuntimeComposition {
+    WheelRuntimeComposition {
+        source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
+        package_specs: therock_pip_package_specs(&resolution.package_versions, rocm_extras),
+    }
+}
+
+/// The GFX target a recorded composition installed, read back out of its
+/// `rocm[...,device-<target>]` requirement.
+///
+/// Update planning needs the target the runtime was built with, not the one this
+/// host happens to report now; storing the specs verbatim means that answer
+/// survives without a second manifest field to keep in sync.
+fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>) -> Option<&str> {
+    composition?.package_specs.iter().find_map(|spec| {
+        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+        extras
+            .split(',')
+            .map(str::trim)
+            .find_map(|extra| extra.strip_prefix("device-"))
+    })
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -1350,6 +1575,7 @@ fn install_tarball_runtime(
         pip_cache_dir: None,
         rocm_sdk: None,
         sdk_torch: None,
+        wheel_composition: None,
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -3990,8 +4216,35 @@ fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
     hint
 }
 
-fn wheel_runtime_key(channel: TheRockChannel, version: &str) -> String {
-    slugify(&format!("{}-wheel-multi-arch-{version}", channel.as_str()))
+/// Identify a wheel runtime by channel, version, AND the exact composition it
+/// was installed from.
+///
+/// Two installs of the same version that request different device payloads are
+/// different runtimes: one can run this host's kernels and the other cannot. A
+/// version-only key gave them the same name, so a corrected composition
+/// overwrote the old tree in place — the one thing side-by-side installs exist
+/// to avoid — and left no way to tell the two apart afterwards.
+///
+/// The fingerprint is a truncated SHA-256 over the generation and the specs,
+/// length-delimited so no regrouping of the same characters collides. Truncation
+/// is safe here: this names sibling directories, it does not authenticate them.
+fn wheel_runtime_key(
+    channel: TheRockChannel,
+    version: &str,
+    composition: &WheelRuntimeComposition,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(composition.source_layout_generation.as_bytes());
+    for package_spec in &composition.package_specs {
+        hasher.update([0]);
+        hasher.update(package_spec.as_bytes());
+    }
+    let fingerprint = format!("{:x}", hasher.finalize());
+    slugify(&format!(
+        "{}-wheel-multi-arch-{version}-{}",
+        channel.as_str(),
+        &fingerprint[..16]
+    ))
 }
 
 fn family_resolution_hint(
@@ -4859,6 +5112,194 @@ mod tests {
         );
     }
 
+    fn test_wheel_composition(device_target: &str) -> WheelRuntimeComposition {
+        WheelRuntimeComposition {
+            source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
+            package_specs: vec![
+                format!("rocm[libraries,devel,device-{device_target}]==7.14.0"),
+                "torch==2.11.0+rocm7.14.0".to_owned(),
+                "torchvision==0.26.0+rocm7.14.0".to_owned(),
+                "torchaudio==2.11.0+rocm7.14.0".to_owned(),
+            ],
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_without_a_composition_is_repaired_once_then_settles() {
+        // Exactly what a runtime installed before composition-aware freshness
+        // deserializes to: no `wheel_composition`, and a version-only key.
+        let mut old_cache: InstalledRuntimeManifest = serde_json::from_value(serde_json::json!({
+            "runtime_key": "release-wheel-multi-arch-7-14-0",
+            "runtime_id": "therock-release:gfx94X-dcgpu",
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx94X-dcgpu",
+            "family_source": "managed-runtime",
+            "version": "7.14.0",
+            "install_root": "/tmp/release-wheel-multi-arch-7-14-0",
+            "selected_artifact_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "index_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "tarball_file_name": null,
+            "python_launcher": "/usr/bin/python3",
+            "python_executable": "/tmp/release-wheel-multi-arch-7-14-0/bin/python",
+            "pip_cache_dir": null,
+            "rocm_sdk": null,
+            "read_only": false,
+            "imported_from": null,
+            "installed_at_unix_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            old_cache.wheel_composition, None,
+            "a pre-composition manifest must still load"
+        );
+
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::RepairAvailable
+        );
+
+        old_cache.wheel_composition = Some(required.clone());
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::RepairAvailable,
+            "the right packages under the legacy identity still need side-by-side migration"
+        );
+
+        old_cache.runtime_key = target_runtime_key.clone();
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::UpToDate
+        );
+    }
+
+    #[test]
+    fn a_newer_index_version_outranks_a_composition_repair() {
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-multi-arch-7-13-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        manifest.version = "7.13.0".to_owned();
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &manifest,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::UpdateAvailable
+        );
+    }
+
+    #[test]
+    fn an_ahead_of_index_runtime_is_never_offered_an_unreproducible_repair() {
+        // Its version is not in the index, so no install could reproduce it. A
+        // repair here would have to roll the runtime back to the older index
+        // build, which is exactly what `ahead_of_index` exists to prevent.
+        let mut pinned = test_runtime_manifest(
+            "release-wheel-multi-arch-7-15-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        pinned.version = "7.15.0".to_owned();
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &pinned,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::AheadOfIndex
+        );
+    }
+
+    #[test]
+    fn a_read_only_runtime_is_never_repaired() {
+        // `runtimes import` / `adopt` point at a folder this CLI does not own,
+        // so a side-by-side "replacement" would be an install the user never
+        // asked for, against packages they did not choose.
+        let mut adopted =
+            test_runtime_manifest("imported-rocm-7-14-0", "therock-release:gfx94X-dcgpu", 1);
+        adopted.version = "7.14.0".to_owned();
+        adopted.read_only = true;
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &adopted,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::UpToDate
+        );
+    }
+
+    #[test]
+    fn an_installed_replacement_sibling_suppresses_repeat_repair() {
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+        let mut source = test_runtime_manifest(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        source.version = "7.14.0".to_owned();
+        let mut replacement =
+            test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
+        replacement.version = "7.14.0".to_owned();
+        replacement.wheel_composition = Some(required.clone());
+
+        let alone = vec![source.clone()];
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &alone,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable,
+            "the legacy runtime alone still has to be replaced"
+        );
+
+        let migrated = vec![source.clone(), replacement.clone()];
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &migrated,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::UpToDate,
+            "the retained legacy manifest must not keep re-triggering the same repair"
+        );
+
+        // A sibling that merely shares the key without the composition is not the
+        // replacement: accepting it would strand the tree one repair short.
+        let mut impostor = replacement;
+        impostor.wheel_composition = Some(test_wheel_composition("gfx950"));
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &[source.clone(), impostor],
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable
+        );
+    }
+
     #[test]
     fn aggregate_layout_without_device_payloads_is_rejected() {
         let error = validate_aggregate_index_layout(
@@ -5472,11 +5913,61 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn aggregate_wheel_runtime_key_ignores_target_family() {
-        assert_eq!(
-            wheel_runtime_key(TheRockChannel::Release, "7.13.0a20260416"),
-            "release-wheel-multi-arch-7-13-0a20260416"
+    fn aggregate_wheel_runtime_key_separates_device_payloads_at_one_version() {
+        let base = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx942]==7.14.0".to_owned()],
+        };
+        let other_payload = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx950]==7.14.0".to_owned()],
+        };
+        let other_generation = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v3".to_owned(),
+            package_specs: base.package_specs.clone(),
+        };
+
+        let base_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base);
+
+        // Still names its channel and version: the retention policy and every
+        // human reading `runtimes list` group on that prefix.
+        assert!(
+            base_key.starts_with("release-wheel-multi-arch-7-14-0-"),
+            "{base_key}"
         );
+        assert_eq!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base),
+            "the same composition must always name the same runtime"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &other_payload),
+            "a different device payload is a different runtime, not an overwrite"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &other_generation),
+            "a source-layout generation change must not reuse the old tree"
+        );
+    }
+
+    #[test]
+    fn recorded_composition_names_the_device_payload_it_installed() {
+        let composition = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec![
+                "rocm[libraries,devel,device-gfx1103]==7.14.1".to_owned(),
+                "torch==2.11.0+rocm7.14.1".to_owned(),
+            ],
+        };
+
+        assert_eq!(
+            wheel_composition_device_target(Some(&composition)),
+            Some("gfx1103"),
+            "update planning must recover the installed target without probing the current host"
+        );
+        assert_eq!(wheel_composition_device_target(None), None);
     }
 
     #[test]
@@ -6171,6 +6662,7 @@ echo Python 3.12.10
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
