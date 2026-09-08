@@ -647,14 +647,10 @@ async fn assert_unknown_fix_refused(world: &mut E2eWorld) {
         Some(2),
         "unknown fix-id should exit 2 (unknown id)"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("Unknown fix-id"),
-        "expected an 'Unknown fix-id' message:\n{combined}"
+        stderr.contains("Unknown fix-id"),
+        "expected an 'Unknown fix-id' message on stderr:\n{stderr}"
     );
 }
 
@@ -667,19 +663,15 @@ async fn assert_position_argument_corrected(world: &mut E2eWorld) {
         Some(2),
         "a position argument should exit 2 like any unknown id"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("position"),
-        "the refusal must say the argument was read as a position:\n{combined}"
+        stderr.contains("position"),
+        "the refusal must say the argument was read as a position, on stderr:\n{stderr}"
     );
     // And it must point at what to use instead, or the correction is useless.
     assert!(
-        combined.contains("id:"),
-        "the refusal must name the identifier to use instead:\n{combined}"
+        stderr.contains("id:"),
+        "the refusal must name the identifier to use instead, on stderr:\n{stderr}"
     );
 }
 
