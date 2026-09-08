@@ -1124,6 +1124,12 @@ fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
 /// Marker error carrying `rocm fix`'s exit code back through `main()`'s
 /// ordinary return path, instead of calling `std::process::exit` mid-stack
 /// and skipping the `_log_guard` destructor held in `run()`.
+///
+/// `exit_code_for` recovers the code via `downcast_ref`, which only works if
+/// this error reaches it unwrapped. Do not wrap the `fix()` call (e.g. with
+/// `.context(...)`) between where it's constructed and `exit_code_for` — that
+/// would break the downcast and silently fall through to the generic
+/// "Error: ..." branch instead of the carried exit code.
 #[derive(Debug)]
 struct FixExitCode(i32);
 
