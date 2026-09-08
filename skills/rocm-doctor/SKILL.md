@@ -139,10 +139,17 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only the four auto-applicable fixes prompt and mutate. The other 11 are
-   **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm fix
-   <id>` just prints the plan for the user to run themselves — no prompt, and the
-   CLI never performs those.
+   Only the four auto-applicable fixes are ones the CLI runs itself. The other 11
+   are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
+   fix <id>` just prints the plan for the user to run themselves — no prompt, and
+   the CLI never performs those.
+
+   Of the four, one does not mutate on every platform: **`fix-2-unset-override`
+   mutates on Windows only.** On Linux it reports where the override is set and
+   which rc files carry it, then stops — it will not edit the user's dotfiles. So
+   there is no prompt to answer and nothing for `--dry-run` to preview. Tell the
+   Linux user what to edit; do not describe it as a change the CLI made or
+   previewed.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 

@@ -105,7 +105,6 @@ impl DiagnoseReport {
     }
 }
 
-/// Upstream tracker for a framework key.
 /// Upstream tracker for a routing target.
 ///
 /// Only the targets [`route_when_no_match`] can actually produce are listed.
