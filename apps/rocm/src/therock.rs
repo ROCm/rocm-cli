@@ -438,6 +438,8 @@ pub(crate) struct RuntimeUpdatePlan {
     /// the resulting manifest by this key rather than by version, because a
     /// same-version repair produces a sibling that version alone cannot name.
     pub target_runtime_key: String,
+    /// Exact device payload encoded in the planned wheel composition.
+    pub device_target: Option<String>,
     pub repair_required: bool,
     pub update_available: bool,
 }
@@ -729,6 +731,7 @@ pub(crate) fn install_sdk(
             channel,
             prefix,
             family_override,
+            None,
             version_selector.as_ref(),
             dry_run,
         ),
@@ -738,6 +741,32 @@ pub(crate) fn install_sdk(
             }
             install_tarball_runtime(paths, channel, prefix, family_override, dry_run)
         }
+        other => bail!("unsupported install format: {other}"),
+    }
+}
+
+/// Apply an update using the exact family and device payload resolved by its plan.
+pub(crate) fn install_sdk_for_update(
+    paths: &AppPaths,
+    channel: &str,
+    format: &str,
+    family: &str,
+    device_target: Option<&str>,
+    dry_run: bool,
+) -> Result<String> {
+    let channel = TheRockChannel::parse(channel)?;
+    ensure_install_format_supported(format)?;
+    match format {
+        "wheel" => install_wheel_runtime(
+            paths,
+            channel,
+            None,
+            Some(family),
+            device_target,
+            None,
+            dry_run,
+        ),
+        "tarball" => install_tarball_runtime(paths, channel, None, Some(family), dry_run),
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -865,6 +894,7 @@ fn replacement_runtime_is_installed(
             && candidate.format == source.format
             && candidate.family == source.family
             && candidate.wheel_composition.as_ref() == Some(required_composition)
+            && has_nontrivial_directory_contents(&candidate.install_root).unwrap_or(false)
     })
 }
 
@@ -935,12 +965,18 @@ pub(crate) fn runtime_update_plan(
         latest.wheel_composition.as_ref(),
         &latest.target_runtime_key,
     );
+    let device_target = latest
+        .wheel_composition
+        .as_ref()
+        .and_then(|composition| wheel_composition_device_target(Some(composition)))
+        .map(str::to_owned);
     Ok(RuntimeUpdatePlan {
         latest_version: latest.latest_version,
         latest_source: latest.latest_source,
         format: latest.format,
         status: freshness.status().to_owned(),
         target_runtime_key: latest.target_runtime_key,
+        device_target,
         repair_required: freshness == RuntimeFreshness::RepairAvailable,
         update_available: freshness.update_available(),
     })
@@ -1181,6 +1217,7 @@ fn install_wheel_runtime(
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
     family_override: Option<&str>,
+    device_target_override: Option<&str>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
 ) -> Result<String> {
@@ -1219,13 +1256,22 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
     )?;
+    let device_target = device_target_override.map_or_else(
+        || resolution.device_target.clone(),
+        |target| {
+            AggregateDeviceTarget::resolve(
+                Some(target),
+                &resolution.family,
+                &resolution.published_device_targets,
+            )
+        },
+    );
     // The exact device payload, not the version alone, decides what this runtime
     // can run, so it is what identifies the runtime. A preview on a host with no
     // usable target still composes a key here — from the `<undetermined>` extras
     // — which no real install can ever produce, and the refusal below stops it
     // from reaching a manifest.
-    let wheel_composition =
-        wheel_runtime_composition(&resolution, &resolution.device_target.rocm_extras());
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target.rocm_extras());
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -1258,12 +1304,8 @@ fn install_wheel_runtime(
         "  target_family_source: {}",
         resolution.family_source
     );
-    let _ = writeln!(
-        output,
-        "  device_target: {}",
-        resolution.device_target.as_str()
-    );
-    if let Some(reason) = resolution.device_target.reason() {
+    let _ = writeln!(output, "  device_target: {}", device_target.as_str());
+    if let Some(reason) = device_target.reason() {
         let _ = writeln!(output, "  device_target_reason: {reason}");
     }
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
@@ -1340,7 +1382,7 @@ fn install_wheel_runtime(
     // without its exact device payload loads and then faults on the first
     // kernel, so an undetermined target is refused here rather than papered
     // over with every published payload.
-    if let Some(reason) = resolution.device_target.reason() {
+    if let Some(reason) = device_target.reason() {
         bail!(
             "cannot compose a canonical TheRock {} runtime: {reason}.\n\
              The aggregate `rocm` distribution ships no GPU backend unless an exact `device-<target>` extra requests one, so this install would produce a runtime that cannot run a kernel.\n\
@@ -5265,6 +5307,10 @@ mod tests {
             test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
         replacement.version = "7.14.0".to_owned();
         replacement.wheel_composition = Some(required.clone());
+        let (root, _) = test_paths("installed-replacement-sibling");
+        replacement.install_root = root.join("replacement");
+        fs::create_dir_all(&replacement.install_root).unwrap();
+        fs::write(replacement.install_root.join("installed.marker"), b"ok").unwrap();
 
         let alone = vec![source.clone()];
         assert_eq!(
@@ -5294,7 +5340,7 @@ mod tests {
 
         // A sibling that merely shares the key without the composition is not the
         // replacement: accepting it would strand the tree one repair short.
-        let mut impostor = replacement;
+        let mut impostor = replacement.clone();
         impostor.wheel_composition = Some(test_wheel_composition("gfx950"));
         assert_eq!(
             runtime_freshness_with_manifests(
@@ -5306,6 +5352,21 @@ mod tests {
             ),
             RuntimeFreshness::RepairAvailable
         );
+
+        // A correct manifest is not an installed replacement after its runtime
+        // directory disappears; accepting it would suppress every repair.
+        fs::remove_dir_all(&replacement.install_root).unwrap();
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &[source.clone(), replacement],
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

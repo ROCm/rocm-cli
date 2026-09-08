@@ -15823,11 +15823,6 @@ fn apply_runtime_update(
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
     let plan = therock::runtime_update_plan(paths, source, &manifests)?;
-    // The plan resolved the index for the SOURCE runtime's family; letting the
-    // install re-detect one would compose a different runtime than the plan just
-    // predicted whenever this host's GPU disagrees with the runtime being
-    // updated, and the key lookup below would then find nothing.
-    let family_override = Some(source.family.as_str());
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15855,13 +15850,12 @@ fn apply_runtime_update(
 
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
-        let install_plan = therock::install_sdk(
+        let install_plan = therock::install_sdk_for_update(
             paths,
             &source.channel,
             &source.format,
-            None,
-            None,
-            family_override,
+            &source.family,
+            plan.device_target.as_deref(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15871,13 +15865,12 @@ fn apply_runtime_update(
         return Ok(output);
     }
 
-    let install_output = therock::install_sdk(
+    let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
         &source.format,
-        None,
-        None,
-        family_override,
+        &source.family,
+        plan.device_target.as_deref(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
