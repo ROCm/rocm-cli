@@ -258,13 +258,18 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Tokens/watt: summed across running instances when available.
     // Mark held if any contributing instance has a held gen_tps observation
     // (tok/W derives from gen_tps; aggregate inherits held status).
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (and, for `any_tpw_held`, count as held without ever being displayed) —
+    // filtered out the same way `tokens_per_watt` is guarded per-instance
+    // elsewhere in this tab.
     let tpw: f64 = state
         .instances
         .values()
         .filter_map(|i| i.tokens_per_watt)
+        .filter(|v| v.is_finite())
         .sum();
     let any_tpw_held = state.instances.values().any(|i| {
-        i.tokens_per_watt.is_some()
+        i.tokens_per_watt.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -375,9 +380,18 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         false,
         theme,
     );
-    let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
+    // without ever contributing a displayed value — guarded the same way
+    // `gen_tps_cell` guards a single instance's value.
+    let tps: f64 = state
+        .instances
+        .values()
+        .filter_map(|i| i.gen_tps)
+        .filter(|v| v.is_finite())
+        .sum();
     let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some()
+        i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -709,6 +723,87 @@ mod tests {
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tps_aggregate_ignores_nonfinite_instance() {
+        // A NaN `gen_tps` on one instance must not poison the summed hero
+        // value for every other (finite) instance, nor suppress the held
+        // marker/legend a genuinely held finite instance still earns.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(150.0),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(f64::NAN),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("NaN"),
+            "a non-finite instance must not poison the tok/s aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_MARKER) && out.contains(format::HELD_LEGEND),
+            "the finite held instance must still mark and explain the aggregate; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_aggregate_ignores_nonfinite_instance() {
+        // Symmetric with the tok/s case above: an infinite `tokens_per_watt`
+        // on one instance must not poison the summed tok/W aggregate.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.5),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(f64::INFINITY),
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("0.5 tokens / watt"),
+            "a non-finite instance must not poison the tok/W aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the finite held instance must still explain the aggregate; got:\n{out}"
         );
     }
 }
