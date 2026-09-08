@@ -20257,7 +20257,7 @@ mod tests {
                 body.len()
             );
             let _ = stream.write_all(header.as_bytes());
-            // One byte every 300ms never finishes framing the 36-byte body
+            // One byte every 300ms never finishes framing the 35-byte body
             // inside the 5s unload timeout below, so the bound under test is
             // the deadline firing, not the response completing early.
             for byte in body {
@@ -20285,7 +20285,12 @@ mod tests {
         );
         let started = Instant::now();
         assert!(unload_lemonade_service_model(&record).is_err());
-        assert!(started.elapsed() < Duration::from_secs(8));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "bounded BY the 5s deadline, not failing early: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
         Ok(())
     }
 
@@ -20452,6 +20457,8 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "a complete response must be recognized without waiting on the peer to close"
         );
+        // `server`'s accept loop runs forever; dropping the JoinHandle detaches
+        // it rather than joining, and the thread dies with the test process.
         drop(server);
         Ok(())
     }
