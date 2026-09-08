@@ -25,23 +25,27 @@ ignore = [
     "E501", # line length is enforced by the formatter; long comments/URLs are fine
     #
     # Pylint refactor metrics. These are standalone operational scripts: their
-    # `main()` flows are deliberately linear and their helpers thread
-    # argparse-derived config through. Mirrors the `too_many_lines` allow that
-    # Cargo.toml grants clippy for the same reason.
+    # entry points, self-tests and archive/probe validation helpers are
+    # deliberately long and linear rather than split behind indirection. Mirrors
+    # the `too_many_lines` allow that Cargo.toml grants clippy for the same reason.
     "PLR0911", # too-many-return-statements: early returns beat a nested result variable
-    "PLR0912", # too-many-branches: script `main()` flows are deliberately linear
-    "PLR0913", # too-many-arguments: CLI helpers thread argparse-derived config through
+    "PLR0912", # too-many-branches: entry-point and validation flows are deliberately linear
+    "PLR0913", # too-many-arguments: keyword-only config/subprocess/HTTP helpers take many named fields
     "PLR0915", # too-many-statements: splitting these entry points adds no clarity
-    "PLR2004", # magic-value-comparison: HTTP statuses, size/mode bits and retry counts read better inline
-    #
-    # Blind excepts are intentional last-resort handlers in these scripts: each
-    # either reports the error, requeues it to the owning thread, or — in a
-    # teardown path — deliberately ignores it, so a probe or cleanup failure
-    # degrades gracefully instead of crashing the test harness.
-    "BLE001", # blind-except
+    "PLR2004", # magic-value-comparison: HTTP statuses, byte sizes, mode bits, lengths, time budgets and self-test literals are clearer inline
 ]
 
 [lint.per-file-ignores]
-# The PTY harness imports winpty on Windows and fcntl/pty/struct/termios on
-# POSIX inside the platform branch; neither set can be imported on the other OS.
-"scripts/tui_e2e_smoke.py" = ["PLC0415"] # import-outside-top-level
+# Blind excepts in the GPU and TUI test harnesses are intentional last-resort
+# handlers: each reports the error, hands it to the owning thread, keeps it for
+# the eventual timeout message, or — in a teardown path — deliberately ignores
+# it, so a probe or cleanup failure degrades gracefully instead of crashing the
+# harness. Scoped per file so a blind except added to the build, release or docs
+# config still fails lint.
+"scripts/comfyui_therock_gpu_test.py" = ["BLE001"] # blind-except
+"scripts/therock_sdk_install_test.py" = ["BLE001"] # blind-except
+"scripts/vllm_therock_gpu_test.py" = ["BLE001"]    # blind-except
+# The PTY harness needs the same allowance, and additionally imports winpty on
+# Windows and fcntl/pty/struct/termios on POSIX inside the platform branch;
+# neither set can be imported on the other OS.
+"scripts/tui_e2e_smoke.py" = ["BLE001", "PLC0415"] # blind-except + import-outside-top-level
