@@ -330,13 +330,9 @@ jobs:
   # Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
-    # 90min: matches e2e-gpu — same collapsed suite (all serves + per-scenario
-    # install sdk in one job), so the cap must give it the same room to finish
-    # and write platform.json. This lane ran at 35min from its introduction
-    # despite mirroring e2e-gpu's design; a cold-cache engine backend download
-    # (observed live: a multi-GB therock-dist tarball pull, several minutes,
-    # legitimate and not a hang) can push the collapsed suite past that cap.
-    timeout-minutes: 90
+    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # install sdk; the cap must exceed the run so the job writes platform.json.
+    timeout-minutes: 35
     # `native` disambiguates the two Linux Strix runners: the WSL host also
     # carries `strix-halo`, but the paths below exist only on the native one.
     runs-on: [self-hosted, linux, strix-halo, native]
