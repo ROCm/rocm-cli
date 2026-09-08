@@ -79,22 +79,44 @@ pub fn draw_scrollable_lines(
     f.render_widget(p, inner);
 }
 
-/// Render the Help modal for the active tab.
+/// Render the Help modal for the active tab. Shares chrome (dimmed backdrop,
+/// popup geometry, 2-column grouped layout) with `draw_global_help` so the
+/// two help screens read as one family; unlike that screen, this one's right
+/// column is dynamic — the active tab's own keys.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
-    let popup = centered_rect(70, 70, 80, 22, area);
+    grey_overlay(f);
+    let popup = centered_rect(80, 80, 100, 26, area);
     let inner = draw_popup_frame(f, popup, "Help", theme);
+    if inner.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
 
-    let mut lines: Vec<Line> = vec![
-        key_line("q", "quit", theme),
-        key_line("?", "toggle this help", theme),
-        key_line("Tab / Shift-Tab", "next / previous tab", theme),
-        key_line("1 .. 5", "jump to tab", theme),
-        key_line("t", "open theme picker", theme),
-        key_line("Space", "pause / resume (replay only)", theme),
-        key_line("+ / -", "speed up / slow down (replay only)", theme),
-        key_line("[ / ]", "jump ±10s (replay only)", theme),
-        key_line("{ / }", "jump ±60s (replay only)", theme),
-        Line::raw(""),
+    let left: &[(&str, &[(&str, &str)])] = &[
+        (
+            "GLOBAL",
+            &[
+                ("q", "quit"),
+                ("?", "toggle this help"),
+                ("Tab / Shift-Tab", "next / previous tab"),
+                ("1 .. 5", "jump to tab"),
+                ("t", "open theme picker"),
+                ("Esc", "open the main menu"),
+            ],
+        ),
+        (
+            "REPLAY",
+            &[
+                ("Space", "pause / resume"),
+                ("+ / -", "speed up / slow down"),
+                ("[ / ]", "jump ±10s"),
+                ("{ / }", "jump ±60s"),
+            ],
+        ),
     ];
     let tab_help: &[(&str, &str)] = match tab {
         ActiveTab::Home => &[("(no tab-specific keys — see the ROCm / Serving tabs)", "")],
@@ -130,18 +152,11 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
             ("Backspace", "delete a character (while focused)"),
         ],
     };
-    lines.push(Line::from(Span::styled(
-        format!("— {tab:?} tab —"),
-        Style::default()
-            .fg(theme.muted)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for (k, desc) in tab_help {
-        lines.push(key_line(k, desc, theme));
-    }
+    let tab_title = format!("{tab:?}").to_uppercase();
+    let right: &[(&str, &[(&str, &str)])] = &[(tab_title.as_str(), tab_help)];
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(p, inner);
+    render_help_groups(f, cols[0], left, theme);
+    render_help_groups(f, cols[1], right, theme);
 }
 
 fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {

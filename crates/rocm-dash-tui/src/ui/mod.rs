@@ -421,21 +421,27 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     ];
     // On a domain tab with a manager open inline, the pane keys route to the
     // manager — advertise the back-out instead of the (now wrong) select/open.
+    // Exactly one Esc chip is shown at all times: "back out" when an overlay
+    // is open, otherwise the uniform fallback "menu" (item #35).
     if is_action_tab && state.has_open_overlay() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
-    } else if matches!(
-        state.active_tab,
-        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-    ) {
-        segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
-        segs.push(Seg::Sep(" select  "));
-        segs.push(Seg::Key("Enter", Some(enter_action)));
-        segs.push(Seg::Sep(if is_action_tab {
-            " open  "
-        } else {
-            " detail  "
-        }));
+    } else {
+        segs.push(Seg::Key("Esc", Some(KeyAction::OpenMenu)));
+        segs.push(Seg::Sep(" menu  "));
+        if matches!(
+            state.active_tab,
+            ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+        ) {
+            segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
+            segs.push(Seg::Sep(" select  "));
+            segs.push(Seg::Key("Enter", Some(enter_action)));
+            segs.push(Seg::Sep(if is_action_tab {
+                " open  "
+            } else {
+                " detail  "
+            }));
+        }
     }
     // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
     // ROCm/Serving the Actions list is the single path, so no letter chips.
@@ -551,5 +557,26 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+
+    #[test]
+    fn footer_shows_esc_menu_chip_when_no_overlay_open() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let state = AppState::new("t".into(), "default-dark".into());
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        let esc = chips
+            .iter()
+            .find(|c| c.action == KeyAction::OpenMenu)
+            .expect("a fallback Esc chip opening the menu must always be present");
+        let _ = esc;
     }
 }

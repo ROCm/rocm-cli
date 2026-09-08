@@ -1332,7 +1332,7 @@ impl AppState {
         self.close_overlays();
         self.approval = Some(PendingApproval {
             req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
-            choice: crate::ui::approval::ApprovalChoice::Approve,
+            choice: crate::ui::approval::ApprovalChoice::default(),
             name: intent.name,
             arguments: intent.arguments,
         });
@@ -3342,15 +3342,14 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
     }
     match k.code {
         KeyCode::Char('q') => KeyAction::Quit,
-        // Esc opens the main menu when idle, except on Chat (where Esc keeps its
-        // existing chat meaning) — managers/approval are routed upstream.
+        // Esc opens the main menu when idle — managers/approval are routed
+        // upstream, and Chat-focused Esc is handled by the short-circuit above.
         // On ROCm/Serving, Esc first steps out of the detail pane (resolved
         // against focus in `apply_action`); elsewhere it opens the main menu.
         KeyCode::Esc if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
             KeyAction::PaneEscape
         }
-        KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
-        KeyCode::Esc => KeyAction::Nothing,
+        KeyCode::Esc => KeyAction::OpenMenu,
         KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
@@ -3510,7 +3509,7 @@ mod tests {
     #[test]
     fn q_quits_esc_does_not() {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
-        // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
+        // P4: Esc opens the main menu (it never quits).
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
     }
 
@@ -4332,12 +4331,12 @@ mod tests {
     }
 
     #[test]
-    fn esc_opens_menu_when_idle_but_not_on_chat() {
-        // Idle (non-Chat) tabs: Esc opens the btop main menu.
+    fn esc_opens_menu_when_idle_on_any_tab() {
+        // Idle tabs: Esc opens the btop main menu, Chat included when unfocused
+        // (Chat-focused Esc is handled by the short-circuit above this match).
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Home), KeyAction::OpenMenu);
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
-        // Chat keeps its existing Esc meaning (no menu).
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::OpenMenu);
         // While an overlay modal owns the screen, Esc closes it (not OpenMenu).
         assert_eq!(
             handle_key(
@@ -6471,7 +6470,8 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
         });
-        // Enter on the default (Approve) choice yields an Approve verdict.
+        // The modal defaults to Deny (item #16); move to Approve, then confirm.
+        s.on_approval_key(crossterm::event::KeyCode::Tab);
         let verdict = s.on_approval_key(crossterm::event::KeyCode::Enter);
         assert_eq!(verdict, Some(crate::ui::approval::ApprovalVerdict::Approve));
         let (name, args) = s.take_approval().expect("approval taken on approve");
@@ -6598,16 +6598,21 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({}),
         });
-        // Tab toggles the cursor to Deny without producing a verdict.
-        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        // Defaults to Deny (the safer default; see item #16).
         assert_eq!(
             s.approval.as_ref().unwrap().choice,
             crate::ui::approval::ApprovalChoice::Deny
         );
-        // Enter now confirms Deny.
+        // Tab toggles the cursor to Approve without producing a verdict.
+        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        assert_eq!(
+            s.approval.as_ref().unwrap().choice,
+            crate::ui::approval::ApprovalChoice::Approve
+        );
+        // Enter now confirms Approve.
         assert_eq!(
             s.on_approval_key(crossterm::event::KeyCode::Enter),
-            Some(crate::ui::approval::ApprovalVerdict::Deny)
+            Some(crate::ui::approval::ApprovalVerdict::Approve)
         );
     }
 
