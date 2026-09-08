@@ -86,9 +86,17 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // instance after the header — so anything at or past `visible_rows`
     // never reaches the screen and must not be allowed to conjure a legend.
     // `inner.height - 1` (header only, legend not yet subtracted) is used as
-    // an upper bound: it can only ever overcount by the one row the legend
-    // itself would claim, which errs toward showing an explained legend
-    // rather than hiding one a visible marker needs.
+    // an upper bound. This can overcount by exactly the one row the legend
+    // itself claims: if the *only* held row sits at that last scanned index,
+    // showing the legend consumes a row and pushes that exact row off-screen,
+    // so the legend ends up explaining a marker that is no longer visible
+    // (see `table_held_legend_shown_even_when_boundary_row_scrolls_off`).
+    // That is intentional and the safe direction: the alternative (scanning
+    // a tighter bound that already accounts for the legend's own row) can
+    // never overcount, but can then *undercount* instead — a genuinely
+    // visible marker with no legend at all, which is the failure mode this
+    // mechanism exists to prevent. Overcounting by one boundary row is the
+    // accepted cost of never doing that.
     // The finite check mirrors `gen_tps_cell`, which never prints a marker
     // for `None`/non-finite `gen_tps` regardless of freshness metadata.
     let visible_rows = inner.height.saturating_sub(1) as usize;
@@ -1480,6 +1488,50 @@ mod tests {
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear when the only held row is off-screen; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_shown_even_when_boundary_row_scrolls_off() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Nine instances in a viewport sized so the any_held scan bound
+        // (`inner.height - 1`) is exactly 9, i.e. its last scanned index is
+        // 8 — the *only* held row. The scan finds it and shows the legend,
+        // but showing the legend claims a row, shrinking the actual visible
+        // data rows to 8 (indices 0..=7) and pushing this row off-screen.
+        // This is the documented, accepted trade-off (see the comment above
+        // `visible_rows` in `draw_table`): never hide a legend a visible
+        // marker needs, even if that means occasionally showing one whose
+        // triggering row is no longer on screen.
+        let mut m = HashMap::new();
+        for n in 0..9 {
+            let name = format!("n{n:02}");
+            let held = n == 8;
+            let inst = mk_inst_obs(
+                &name,
+                Some(1.0),
+                if held {
+                    Some(obs(ObservationFreshness::Held, 30))
+                } else {
+                    Some(obs(ObservationFreshness::Fresh, 5))
+                },
+            );
+            m.insert(inst.container_id.clone(), inst);
+        }
+        let state = mk_state(m, 0);
+        let mut term = Terminal::new(TestBackend::new(160, 13)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains("n08"),
+            "test setup assumption broken: the boundary row must scroll off once the legend claims its row; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must still show for a boundary-row match, even though that row is no longer visible; got:\n{out}"
         );
     }
 
