@@ -239,6 +239,22 @@ impl TuiSession {
         self.screen_snapshot().0
     }
 
+    /// Whether the top-left cell carries the dimmed-backdrop wash a popup
+    /// overlay paints behind itself (`grey_overlay`'s fixed RGB(0x1c, 0x1e,
+    /// 0x22)). Popups drawn via `centered_rect` always leave a pad outside
+    /// the frame, and the top-left corner falls in that pad, so this is a
+    /// reliable proxy for "the screen behind the popup was dimmed" without
+    /// importing the product crate's own color constant. Unlike
+    /// `screen_text`, this deliberately inspects style, not just text content.
+    pub fn corner_backdrop_is_dimmed(&self) -> bool {
+        const WASH: vt100::Color = vt100::Color::Rgb(0x1c, 0x1e, 0x22);
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.screen().cell(0, 0).is_some_and(|c| c.bgcolor() == WASH)
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while
@@ -437,6 +453,40 @@ impl TuiSession {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for {marker:?}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait until `marker` no longer appears on screen — the inverse of
+    /// [`wait_for_screen`](Self::wait_for_screen). Use this after a keystroke
+    /// that should dismiss an overlay whose absence is the only signal of
+    /// success (there is no positive marker for "menu didn't open").
+    pub async fn wait_until_gone(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.screen_text().contains(marker) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
                     self.framed_screen()
                 ));
             }

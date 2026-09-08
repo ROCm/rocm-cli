@@ -46,8 +46,42 @@ Feature: Interactive dashboard
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
+    When the user scrolls to the end of dashboard help
+    Then replay controls guidance is displayed
     When the user closes dashboard help
     And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-manager-escape-closes-without-menu @requires-os:linux
+  Scenario: dash-11 - Escape closes a non-domain-tab manager overlay instead of opening the menu
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed without opening the menu
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-chat-approval-defaults-to-deny @requires-os:linux
+  Scenario: dash-12 - A surfaced tool call defaults to Deny and confirming without moving denies it
+    Given interactive chat uses an offline assistant
+    When the user opens interactive chat
+    And the user sends a message that triggers a tool approval
+    Then a tool approval prompt is displayed
+    When the user confirms the approval prompt without moving the cursor
+    Then the tool call is shown as declined
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+
+  @id:dash-instance-detail-dims-backdrop @requires-os:linux
+  Scenario: dash-13 - Opening instance detail dims the screen behind the popup
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens instance detail
+    Then instance details are displayed
+    And the backdrop behind the popup is dimmed
+    When the user quits the dashboard
     Then the dashboard exits successfully
 
   @id:dash-command-palette-navigation @requires-os:linux
