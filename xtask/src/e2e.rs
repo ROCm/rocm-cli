@@ -18,12 +18,16 @@ use anyhow::{Context, Result, bail};
 
 use crate::paths::{binary_name, target_dir, workspace_root};
 
-/// Signal to the e2e-cucumber harness that the binary under test carries the
-/// `rocm/e2e-oom-fault-injection` hook. Set to `1` only when this xtask built
-/// the binary itself with that feature; a prebuilt `ROCM_CLI_BINARY` (the
-/// self-hosted lanes' shipping release) has the hook compiled out. Kept in sync
-/// with `e2e_cucumber::capability::OOM_FAULT_INJECTION_ENV`.
-const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+/// Environment variable that signals to the e2e-cucumber harness that the binary
+/// under test carries the `rocm/e2e-oom-fault-injection` hook. Set to `1` only
+/// when this xtask built the binary itself with that feature; a prebuilt
+/// `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release) has the hook
+/// compiled out.
+///
+/// The literal is defined once in `e2e-report` and consumed there by the harness
+/// (`e2e_cucumber::capability::OOM_FAULT_INJECTION_ENV`) so producer and consumer
+/// cannot drift.
+use e2e_report::OOM_FAULT_INJECTION_ENV;
 
 #[derive(Debug, PartialEq, Eq)]
 struct E2eBinaries {

@@ -127,9 +127,11 @@ pub struct HostCapability {
 }
 
 /// Environment variable `xtask e2e` sets to `1` when it compiled the binary
-/// under test with the `rocm/e2e-oom-fault-injection` feature. Kept in sync with
-/// the same name in `xtask::e2e`.
-pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+/// under test with the `rocm/e2e-oom-fault-injection` feature.
+///
+/// Re-exported from `e2e-report` — the single source of truth shared with the
+/// producer (`xtask::e2e`) — so the two sides cannot drift out of sync.
+pub use e2e_report::OOM_FAULT_INJECTION_ENV;
 
 impl HostCapability {
     /// Whether a given engine can actually START on this host. Distinct from

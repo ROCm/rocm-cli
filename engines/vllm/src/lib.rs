@@ -2230,25 +2230,13 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     if !rocm_core::vllm_log_shows_oom(log_tail) {
         return String::new();
     }
-    // Route the user's *actual* failing line into the `--symptom` example when
-    // the diagnose checker would actually score it; otherwise fall back to the
-    // canonical symptom so the printed command always reports a cause. The
-    // detector here is a coarse substring scan that accepts lines the scorer
-    // rates sub-threshold (e.g. a bare "... out of memory"), so without this
-    // fallback the diagnose command could report nothing -- which reads as "the
-    // tool checked and there's no known cause", worse than not printing it.
-    let symptom_line = log_tail
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && rocm_core::vllm_log_shows_oom(line))
-        .unwrap_or("out of memory");
-    let candidate = format!("vllm: {symptom_line}");
-    let symptom = if rocm_core::vllm_oom_symptom_is_diagnosable(&candidate) {
-        candidate
-    } else {
-        rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
-    };
+    // Pick the `--symptom` line with the shared helper so this surface and the
+    // `rocm` CLI serve summary route to `rocm diagnose` identically instead of
+    // hand-rolling the selection twice. `vllm_log_shows_oom` now classifies each
+    // line with the *same* rule the diagnose checker uses, so the chosen line is
+    // guaranteed to score for that checker.
+    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
+    let symptom_line = symptom.strip_prefix("vllm: ").unwrap_or(symptom.as_str());
     format!(
         "\n\nDetected an out-of-memory failure ({symptom_line}). {}\n\
          For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
@@ -2750,15 +2738,13 @@ mod tests {
     fn every_emitted_oom_symptom_is_diagnosable() {
         // Closes the loop between the two layers: the engine prints
         // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
-        // actually score for the diagnose checker -- including for lines the
-        // coarse substring detector accepts but the scorer rates sub-threshold
-        // on their own (those fall back to the canonical symptom).
+        // actually score for the diagnose checker. Since the detector now
+        // classifies each line with the *same* rule the checker uses, an accepted
+        // line is diagnosable by construction -- this guards that invariant.
         let accepted_lines = [
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
             "RuntimeError: hipErrorOutOfMemory",
-            "torch.cuda.OutOfMemoryError",
-            "HIP error: out of memory",
-            "the process was killed: out of memory",
+            "torch.cuda.OutOfMemoryError: CUDA out of memory",
             "CUDA out of memory",
         ];
         for line in accepted_lines {
@@ -2775,6 +2761,30 @@ mod tests {
             assert!(
                 rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
                 "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
+            );
+        }
+
+        // The reconciled detector rejects sub-threshold lines the loose scan used
+        // to accept -- exactly the false positives the diagnose checker's
+        // threshold guards against. Rejecting them here keeps the two layers from
+        // disagreeing (the engine must not print a `--symptom` the checker would
+        // then score as "no known cause").
+        let rejected_lines = [
+            // The bare exception class every PyTorch OOM raises, uncorroborated.
+            "torch.cuda.OutOfMemoryError",
+            // A spaced "out of memory" with no allocator anchor phrase.
+            "HIP error: out of memory",
+            // A kernel OOM-killer line from an unrelated subprocess.
+            "the process was killed: out of memory",
+        ];
+        for line in rejected_lines {
+            assert!(
+                !rocm_core::vllm_log_shows_oom(line),
+                "detector must reject sub-threshold line: {line}"
+            );
+            assert!(
+                oom_utilization_hint(line).is_empty(),
+                "a sub-threshold line must not carry a memory hint: {line}"
             );
         }
     }

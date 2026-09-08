@@ -209,14 +209,23 @@ pub(crate) fn serve_failed_to_become_ready(status: &str) -> bool {
 /// The note names `--gpu-memory-utilization` and `--gpu` and is worded for the
 /// shared-node case rather than as unconditional advice — vLLM reserves a
 /// fraction of *total* VRAM, so a value good for a shared card would degrade a
-/// dedicated one. It shares [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] with
-/// the pre-launch low-VRAM note so both surfaces point at the same fix.
+/// dedicated one. When the model simply does not fit, it says so and points at a
+/// smaller/quantized model instead of the knob (which would only trade an
+/// earlier OOM for a later one), matching the `rocm diagnose` vLLM-OOM entry it
+/// then routes the user to. It shares
+/// [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] verbatim with the pre-launch
+/// low-VRAM note so both surfaces point at the same fix and the pre-launch
+/// warning can dedup against it.
 pub(crate) fn oom_memory_note(status: &str, log_tail: &str) -> Option<String> {
     if !serve_failed_to_become_ready(status) || !rocm_core::vllm_log_shows_oom(log_tail) {
         return None;
     }
+    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
     Some(format!(
-        "the serve attempt ran out of GPU memory. {}",
+        "the serve attempt ran out of GPU memory. {} If the model simply does not fit in this \
+         GPU's VRAM, lowering the reservation will not help — serve a smaller or quantized model \
+         instead (rocm-cli serves one model on a single GPU). To have the tool pick the \
+         case-appropriate fix, run `rocm diagnose --symptom '{symptom}'`.",
         rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
     ))
 }
@@ -556,6 +565,17 @@ mod tests {
         assert!(note.contains("--gpu-memory-utilization"), "{note}");
         assert!(note.contains("--gpu <index>"), "{note}");
         assert!(note.contains("ran out of GPU memory"), "{note}");
+        // The knob is not unconditional: when the model simply does not fit, the
+        // note must say lowering the reservation will not help and point at a
+        // smaller/quantized model, matching the `rocm diagnose` vLLM-OOM entry.
+        assert!(
+            note.contains("smaller or quantized model"),
+            "the note must carry the model-too-large caveat: {note}"
+        );
+        assert!(
+            note.contains("rocm diagnose --symptom"),
+            "the note must route the user to the conditional diagnose entry: {note}"
+        );
     }
 
     #[test]
@@ -576,7 +596,10 @@ mod tests {
     fn oom_note_renders_in_the_summary_notes() {
         let mut summary = base_summary();
         summary.status = "starting".to_owned();
-        if let Some(note) = oom_memory_note(&summary.status, "torch.OutOfMemoryError") {
+        if let Some(note) = oom_memory_note(
+            &summary.status,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        ) {
             summary.notes.push(note);
         }
         let rendered = render_summary(&summary);
