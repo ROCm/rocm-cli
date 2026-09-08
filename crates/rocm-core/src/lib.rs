@@ -1009,14 +1009,6 @@ pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> 
         .context("failed to write to TCP stream")
 }
 
-pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read TCP stream")?;
-    Ok(response)
-}
-
 /// Read one HTTP response, bounded by a wall-clock deadline.
 ///
 /// Two problems with reading to end-of-stream instead. A response is only
@@ -1028,7 +1020,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 /// slow-drip responder could stretch the total wait to an arbitrary multiple of
 /// what the caller asked for. This returns as soon as the response is complete by
 /// its own framing, and never runs past `deadline` in total.
-fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !http_response_is_complete(&response) {
@@ -1069,10 +1061,17 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
 /// those are delimited by the connection closing, so the caller must keep reading
 /// until EOF.
 fn http_response_is_complete(response: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(response);
-    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+    // Headers are ASCII by the HTTP spec, so it is safe to lossy-decode just
+    // that slice to parse them. The body length check below stays on raw
+    // bytes: lossy-decoding a body that ends mid multi-byte UTF-8 sequence
+    // replaces the truncated tail with a 3-byte U+FFFD, which can inflate a
+    // partial body's *decoded* length past the declared Content-Length and
+    // report completeness one read early.
+    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end + 4..];
     let header_value = |name: &str| {
         headers.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -1089,7 +1088,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
     if header_value("Transfer-Encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
-        return body.ends_with("0\r\n\r\n");
+        return body.ends_with(b"0\r\n\r\n");
     }
     false
 }
@@ -8503,6 +8502,25 @@ mod tests {
 
         let _ = server.join();
         Ok(())
+    }
+
+    #[test]
+    fn http_response_is_complete_does_not_miscount_a_split_multibyte_char() {
+        // A body ending in a multi-byte UTF-8 character can arrive one byte
+        // short of the declared Content-Length. Lossy-decoding the whole
+        // buffer to check completeness turns that dangling partial sequence
+        // into a 3-byte U+FFFD replacement, inflating the decoded length past
+        // the declared one and reporting completeness a read early.
+        let body = "hi \u{2603}"; // snowman is a 3-byte UTF-8 character
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let truncated = &full[..full.len() - 1];
+
+        assert!(!http_response_is_complete(truncated));
+        assert!(http_response_is_complete(&full));
     }
 
     /// A signal arriving mid-response must not fail the request.
