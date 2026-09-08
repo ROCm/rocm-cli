@@ -756,13 +756,23 @@ mod tests {
     #[test]
     fn cancelled_job_renders_distinct_glyph_from_running() {
         // Cancelled must not be silently folded into the `⋯ running` glyph —
-        // it has its own entry in the match and the key.
+        // it has its own entry in the match and the key. Assert on the job's
+        // own rendered line (not just presence of '⊘' anywhere in the frame —
+        // the glyph key appended below the feed also contains '⊘', so that
+        // alone wouldn't catch a regression back to the shared wildcard arm).
         let mut s = state_with_gpu();
         s.jobs
             .jobs
             .insert("cancel-me".into(), job("long task", JobStatus::Cancelled));
         let out = render(&s, 160, 30);
-        assert!(out.contains('⊘'), "cancelled job should render ⊘: {out:?}");
+        assert!(
+            out.contains("⊘ long task"),
+            "cancelled job should render its own ⊘ glyph: {out:?}"
+        );
+        assert!(
+            !out.contains("⋯ long task"),
+            "cancelled job must not render the running glyph: {out:?}"
+        );
     }
 
     #[test]
