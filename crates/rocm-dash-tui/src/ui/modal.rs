@@ -185,6 +185,7 @@ pub fn draw_theme_picker(
     current_name: &str,
     active_theme: &Theme,
 ) {
+    grey_overlay(f);
     let popup = centered_rect(80, 80, 110, 30, area);
     let inner = draw_popup_frame(
         f,
