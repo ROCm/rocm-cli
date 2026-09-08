@@ -91,7 +91,7 @@ repos:
         name: license header check (hawkeye)
         entry: hawkeye check --config licenserc.toml
         language: system
-        types_or: [rust, python, shell]
+        types_or: [rust, python, shell, powershell]
         pass_filenames: false
         groups: [local-tools] # runs in the dedicated `license-headers` CI job (hawkeye action)
 

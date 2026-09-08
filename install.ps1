@@ -1,3 +1,7 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
 param(
     [Parameter(Position = 0)]
     [string] $Channel = $env:ROCM_CLI_CHANNEL,
