@@ -168,6 +168,7 @@ When changing assistant-adjacent behavior, keep consistency with:
 
 - `docs/llm-tool-use.md`
 - `skills/rocm-cli-assistant/SKILL.md`
+- `skills/rocm-doctor/SKILL.md` and `skills/rocm-doctor/reference.md`
 
 Required consistency points:
 
@@ -175,6 +176,29 @@ Required consistency points:
 - mutating actions require approval flow
 - avoid invented shell/package-manager commands in assistant behavior paths
 - preserve built-in assistant constraints and no-CPU-fallback policy
+
+### `skills/rocm-doctor/` — published from here, and a test fixture
+
+`skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
+(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+on two counts, and both change how you edit it:
+
+- **This repo is its source of truth.** The skill is a thin driver over the
+  `rocm` binary, so it is versioned with the binary and lives here. The
+  [`amd/skills`](https://github.com/amd/skills) catalog federates it: a nightly
+  job vendors the folder from `main` and opens a pull request there. So edit it
+  here, and never edit the catalog's copy — the next federation run overwrites
+  it. Federation does not carry the skill's `evals/` folder, which is why the
+  catalog keeps a dataset of its own.
+- **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
+  parses its closed-catalog table and compares it to what `rocm fix` reports.
+  The catalog is authoritative in `crates/rocm-core/src/fix.rs` — adding,
+  renaming, or re-scoping a failure mode means changing the CLI **first**, then
+  the two docs. That feature is what catches you if you forget.
+
+The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
+frontmatter for the skill loader, and the catalog's skills carry no headers.
+The licence is stated in `skill-card.md` instead.
 
 ## 8) Verification Matrix For This Repo
 
