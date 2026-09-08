@@ -58,13 +58,23 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The pooled Linux GPU lane's artifact name (`e2e-gpu-linux` in
+/// `e2e-selfhosted.yml`): MI300X, Strix Halo Ubuntu, and rad3 all share one
+/// `runs-on` label, so this fixed name carries no real hardware identity by
+/// itself — unlike every other lane's name, which names one specific box.
+/// `discover()` special-cases it below to recover the real identity from
+/// `platform.json` instead of trusting the name.
+const POOLED_LINUX_ARTIFACT_NAME: &str = "e2e-gpu-linux-report";
+
 /// Return `(label, report_json_path)` for each platform report under `dir`,
 /// sorted by label for stable output.
 ///
 /// Two layouts are handled, because `actions/download-artifact@v8` does NOT
 /// always create a per-artifact subdirectory:
 ///   * multi-artifact download → `dir/<artifact-name>/report.json` (one subdir
-///     per artifact); the subdir name is the label.
+///     per artifact); the subdir name is the label — EXCEPT for the pooled
+///     Linux lane's artifact, which is relabeled from `platform.json` (see
+///     `POOLED_LINUX_ARTIFACT_NAME`).
 ///   * single-artifact download → `dir/report.json` at the ROOT. When exactly
 ///     one artifact matches the download `pattern`, v8 extracts it straight into
 ///     the `path` (its source picks `resolvedPath` when `artifacts.length === 1`,
@@ -85,7 +95,7 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     // Single-artifact layout: a report.json sits directly in `dir`.
     let root_report = dir.join("report.json");
     if root_report.is_file() {
-        inputs.push((label_for_root_report(dir), root_report));
+        inputs.push((label_from_platform_slug(dir), root_report));
     }
 
     for entry in entries {
@@ -96,10 +106,18 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         let subdir = entry.path();
         let report = subdir.join("report.json");
         if report.is_file() {
-            // Pass the raw artifact/dir name through; the e2e-report crate parses
-            // it into Platform / OS / Tier and owns all display formatting.
+            // Pass the raw artifact/dir name through — the e2e-report crate
+            // parses it into Platform / OS / Tier and owns all display
+            // formatting — EXCEPT the pooled Linux lane's fixed name, which
+            // could have been served by any of three real boxes and must be
+            // relabeled from its own `platform.json` instead.
             let raw = entry.file_name().to_string_lossy().into_owned();
-            inputs.push((raw, report));
+            let label = if raw == POOLED_LINUX_ARTIFACT_NAME {
+                label_from_platform_slug(&subdir)
+            } else {
+                raw
+            };
+            inputs.push((label, report));
         }
     }
 
@@ -107,10 +125,10 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(inputs)
 }
 
-/// Label for a root-level (single-artifact) `report.json`. Recovers the platform
-/// from the sibling `platform.json`'s `platform_slug` and maps it to the same
-/// artifact-name shape `e2e_report::parse_descriptor` expects, so a flattened
-/// download renders identically to a per-subdir one.
+/// Recover a platform's canonical artifact-name-shaped label from the
+/// `platform_slug` in `dir/platform.json`, so both the single-artifact
+/// (flattened) layout and the pooled Linux lane's subdir render identically to
+/// a normally-named per-subdir artifact.
 ///
 /// The sidecar can be ABSENT even for a GPU run: the harness writes `report.json`
 /// first and, on a parsing/hook error, exits BEFORE writing `platform.json` (see
@@ -119,7 +137,7 @@ fn discover(dir: &Path) -> Result<Vec<(String, PathBuf)>> {
 /// the grid. Only an explicit `mock` slug maps to the mock artifact; anything
 /// missing or unknown gets a neutral `e2e-unknown-report`, which
 /// `parse_descriptor` renders as "Unknown" rather than claiming a real platform.
-fn label_for_root_report(dir: &Path) -> String {
+fn label_from_platform_slug(dir: &Path) -> String {
     let slug = std::fs::read_to_string(dir.join("platform.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -179,11 +197,17 @@ mod tests {
     /// Linux, which is how a Windows lane comes to be reported as Linux.
     ///
     /// `e2e-unknown-report` is deliberately absent despite being recognised.
-    /// It is a runtime-only sentinel: [`label_for_root_report`] emits it for a
+    /// It is a runtime-only sentinel: [`label_from_platform_slug`] emits it for a
     /// report whose `platform.json` was missing or carried an unknown slug, and
     /// `parse_descriptor` maps it to Unknown/Unknown precisely so it escapes the
     /// Linux default. No workflow can name it, so a workflow that did would be
     /// claiming an identity it has no business asserting.
+    ///
+    /// `e2e-gpu-linux-report` is the pooled Linux lane's fixed artifact name
+    /// (`e2e-selfhosted.yml` only — `nightly.yml` still uploads the three real
+    /// per-box names below unpooled). It resolves to one of those three real
+    /// identities at runtime via `platform.json`, never rendering under its own
+    /// literal name — see `discover()`'s `POOLED_LINUX_ARTIFACT_NAME` handling.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
         "e2e-gpu-report",
@@ -191,6 +215,7 @@ mod tests {
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-windows-report",
         "e2e-gpu-strix-wsl-report",
+        "e2e-gpu-linux-report",
     ];
 
     /// Every workflow in `.github/workflows`, so a new one cannot upload under a
@@ -249,6 +274,19 @@ mod tests {
         // The nightly workflow exists to run *more* scenarios on the *same*
         // platforms. If the two ever diverge, the nightly grid is comparing
         // different hardware than the PR grid without saying so.
+        //
+        // `e2e-gpu-linux` (PR-side) is a pool: at runtime it can resolve, via
+        // its own `platform.json`, to any of the three real identities below
+        // (see `POOLED_LINUX_ARTIFACT_NAME`). So it can't be compared by literal
+        // name — nightly must still individually publish all three, or full
+        // hardware coverage would quietly shrink to "whichever box happened to
+        // serve the last PR". Every OTHER (non-pooled) PR artifact must still
+        // match nightly 1:1, same as before pooling existed.
+        const POOLED_LINUX_IDENTITIES: &[&str] = &[
+            "e2e-gpu-report",
+            "e2e-gpu-rad3-report",
+            "e2e-gpu-strix-ubuntu-report",
+        ];
         let lanes = |file: &str| {
             let mut names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -261,7 +299,24 @@ mod tests {
             names.sort();
             names
         };
-        assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
+        let nightly = lanes("nightly.yml");
+        for name in POOLED_LINUX_IDENTITIES {
+            assert!(
+                nightly.iter().any(|n| n == name),
+                "nightly.yml must still individually publish `{name}` — the pooled \
+                 e2e-gpu-linux lane can resolve to it at runtime, so nightly is the \
+                 only place that hardware is tested exhaustively"
+            );
+        }
+        for name in lanes("e2e-selfhosted.yml") {
+            if name == POOLED_LINUX_ARTIFACT_NAME {
+                continue;
+            }
+            assert!(
+                nightly.iter().any(|n| *n == name),
+                "nightly.yml is missing the non-pooled per-PR lane `{name}`"
+            );
+        }
     }
 
     #[test]
@@ -318,6 +373,71 @@ mod tests {
             let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(names, vec![expected], "slug {slug}");
         }
+    }
+
+    // A subdir named after the pooled Linux lane's fixed artifact name is
+    // relabeled from its own platform.json, just like the root-level
+    // (flattened) case — since the pool can be served by any of three real
+    // boxes, the fixed name itself carries no identity to trust.
+    #[test]
+    fn discover_finds_pooled_linux_subdir_labeled_from_slug() {
+        for (slug, expected) in [
+            ("mi300x", "e2e-gpu-report"),
+            ("gfx1201", "e2e-gpu-rad3-report"),
+            ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path();
+            let pooled = root.join(POOLED_LINUX_ARTIFACT_NAME);
+            std::fs::create_dir_all(&pooled).unwrap();
+            std::fs::write(pooled.join("report.json"), "[]").unwrap();
+            std::fs::write(
+                pooled.join("platform.json"),
+                format!(r#"{{"platform_slug":"{slug}"}}"#),
+            )
+            .unwrap();
+
+            let got = discover(root).expect("discover");
+            let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec![expected], "slug {slug}");
+        }
+    }
+
+    // A pooled-lane subdir with no platform.json (or an unrecognized slug)
+    // still resolves to the neutral unknown label, not its own literal name —
+    // the whole point of relabeling it is that the fixed name is never a real
+    // identity, so falling back to it would silently reintroduce the bug.
+    #[test]
+    fn discover_pooled_linux_subdir_without_sidecar_is_neutral() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let pooled = root.join(POOLED_LINUX_ARTIFACT_NAME);
+        std::fs::create_dir_all(&pooled).unwrap();
+        std::fs::write(pooled.join("report.json"), "[]").unwrap();
+
+        let got = discover(root).expect("discover");
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["e2e-unknown-report"]);
+    }
+
+    // Every OTHER (non-pooled) subdir name is passed through raw, even if its
+    // platform.json carries a mismatched or unexpected slug — proving the
+    // pooled-name special case in `discover()` doesn't regress the
+    // well-working per-box lanes, which already carry a correct, meaningful
+    // name and need no runtime relabeling.
+    #[test]
+    fn discover_non_pooled_subdir_ignores_platform_json_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let d = root.join("e2e-gpu-strix-windows-report");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("report.json"), "[]").unwrap();
+        // Deliberately mismatched slug — a non-pooled lane's name must win.
+        std::fs::write(d.join("platform.json"), r#"{"platform_slug":"mi300x"}"#).unwrap();
+
+        let got = discover(root).expect("discover");
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["e2e-gpu-strix-windows-report"]);
     }
 
     // A root report.json with no platform.json still resolves (rather than being
