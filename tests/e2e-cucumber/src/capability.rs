@@ -801,17 +801,28 @@ Local model engines
     #[test]
     fn platform_slug_derivation() {
         assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
-        assert_eq!(
-            derive_platform_slug(true, Some("gfx942"), "linux", false),
-            "mi300x"
-        );
         // gfx950 normalizes to a `-dcgpu` family like gfx94x does, but it is a
         // different part with its own lane and report column — it must not be
         // slugged as mi300x.
-        assert_eq!(
-            derive_platform_slug(true, Some("gfx950"), "linux", false),
-            "mi350p"
-        );
+        //
+        // Cover every form that reaches `platform_hardware_slug`, not just the
+        // bare target the probe happens to emit today: the family label takes
+        // `normalize_family`'s early `-dcgpu` return, while the suffixed form
+        // depends on its `starts_with` — an `==` "tidy-up" there would silently
+        // send a real gfx950 host back into the `mi300x` column.
+        for (gfx_target, expected) in [
+            ("gfx950", "mi350p"),
+            ("gfx950-dcgpu", "mi350p"),
+            ("gfx950:sramecc+:xnack-", "mi350p"),
+            ("gfx942", "mi300x"),
+            ("gfx94X-dcgpu", "mi300x"),
+        ] {
+            assert_eq!(
+                derive_platform_slug(true, Some(gfx_target), "linux", false),
+                expected,
+                "gfx target `{gfx_target}` must slug as `{expected}`"
+            );
+        }
         // Strix Halo: same gfx1151 silicon on both OSes → distinct slugs so the
         // report grid gets a column per platform, not a collision.
         assert_eq!(
