@@ -136,6 +136,11 @@ jobs:
               # The containerised control-channel lane; its Dockerfile matches
               # none of the extension globs above.
               - 'tests/remote-ssh/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # the E2E job, which gates on `heavy`.
+              - 'skills/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
