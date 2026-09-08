@@ -20,7 +20,7 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::app::{ScrollTarget, ScrollbarHandle};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, readable_text_on};
 
 /// What a console keypress means to the owning screen.
 ///
@@ -128,13 +128,15 @@ pub fn draw_job_console(
         };
         header.push(Span::styled(
             format!(" {glyph}{label} "),
-            Style::default().fg(theme.bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(readable_text_on(color))
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         header.push(Span::styled(
             " status ",
             Style::default()
-                .fg(theme.bg)
+                .fg(readable_text_on(color))
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
         ));
