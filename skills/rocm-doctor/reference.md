@@ -49,9 +49,20 @@ Apply a fix by id (run with no id to list). Exit codes:
 Only four fixes are auto-applicable — `fix-2-unset-override`,
 `fix-4-render-group`, `fix-6-path`, `fix-9-igpu-dgpu` — and the rest print their
 plan for the user to run. Pass the **full** id (`rocm fix fix-2-unset-override`,
-not `rocm fix fix-2`; a short id returns exit 2, unknown fix-id). Auto fixes
-print the exact command, honor `--dry-run`, refuse on a non-interactive shell
-without `--yes`, and confirm before mutating.
+not `rocm fix fix-2`; a short id returns exit 2, unknown fix-id).
+
+**Auto-fix** in the catalog below means only what the CLI reports in
+`rocm fix`'s listing: the CLI has a runner for it and will carry it out itself,
+rather than printing a plan for the user. It is not a promise that the runner
+mutates anything.
+
+The ones that do mutate print the exact command, honor `--dry-run`, refuse on a
+non-interactive shell without `--yes`, and confirm first. **One exception:
+`fix-2-unset-override` mutates on Windows only.** Its Linux runner reports where
+the override is set and which rc files carry it, then stops — it will not edit
+your dotfiles. So on Linux it never prompts, `--dry-run` has nothing to preview,
+and `--yes` is never read. Do not tell a Linux user a dry run previewed a change
+that was never going to happen.
 
 ## Closed catalog (15 failure modes)
 
