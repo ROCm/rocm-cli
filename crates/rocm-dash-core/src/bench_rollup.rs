@@ -8,10 +8,9 @@
 //! it whenever the row set changes rather than relying on the upstream
 //! `pass_n_of_n` / `pass_at_n` CSV columns.
 //!
-//! Rows are grouped by `(cell, model, engine, tp, dtype, concurrency)` — every
-//! field that defines the run except the trial itself; each group of N trials
-//! yields two verdicts — strict (all N passed) and lenient (at least one
-//! passed).
+//! Rows are grouped by `(cell, model, engine, tp, dtype, concurrency)`, and
+//! each group of N trials yields two verdicts — strict (all N passed) and
+//! lenient (at least one passed).
 
 use std::collections::BTreeMap;
 
@@ -30,9 +29,11 @@ pub const fn row_verdict(row: &BenchmarkRow) -> PassFail {
     }
 }
 
-/// Grouping key for a trial set. Trials within a group differ only by `run`
-/// (and `trial_index`); everything that defines the backend config is held
-/// fixed so Pass^N / Pass@N compare like-for-like.
+/// Grouping key for a trial set: the fields Pass^N / Pass@N compare over.
+///
+/// Rows differing only in `run` and `trial_index` fall into the same group.
+/// Columns outside the key do not split one either: rows that differ in, say,
+/// `input_len` or `attention_backend` are folded into the same trial set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RollupKey {
     cell: String,
