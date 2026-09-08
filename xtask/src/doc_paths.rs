@@ -313,6 +313,15 @@ mod tests {
         // out, so the case fails if that check is ever dropped.
         let source = "//! Writes `{version}CHANGELOG.md` beside the archive.\n";
         assert!(extract_citations(source).is_empty());
+        // The same, for the angle-bracket pair. The first case above has an
+        // empty stem and so is ruled out twice over; this one has a stem, so
+        // adjacency is all that stands between it and a false positive.
+        let source = "//! Writes `<name>-notes.md` next to the log.\n";
+        assert!(extract_citations(source).is_empty());
+        // A bare extension is the tail of a split placeholder, not a path, and
+        // nothing sits next to it: only the empty-stem check rejects this one.
+        let source = "//! The extension is .md by convention.\n";
+        assert!(extract_citations(source).is_empty());
     }
 
     #[test]
