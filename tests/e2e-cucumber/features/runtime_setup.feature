@@ -165,11 +165,11 @@ Feature: Runtime configuration
   # and then requesting every device wheel ROCm publishes. Only the second Then
   # separates them.
   #
-  # `@requires-gpu` because a device payload can only be exact about a chip that
-  # is there; it also keeps this off the 64-way mock lane whose concurrency forced
-  # runtime-06 to `@nightly`, since GPU lanes run one scenario at a time.
-  # `--dry-run` keeps it to a plan: no venv, no download.
-  @id:runtime-resolve-canonical-release @requires-gpu
+  # `@requires-gfx-target` is narrower than `@requires-gpu`: this preview only
+  # needs a detected chip name and never opens the device. It therefore runs on
+  # WSL hosts that can read the Windows-side target before ROCm passthrough is
+  # ready, while mock hosts with no target skip it.
+  @id:runtime-resolve-canonical-release @requires-gfx-target
   Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
     Given a machine with an AMD GPU
     When the user dry-runs a release SDK install for this host
