@@ -1297,13 +1297,14 @@ fn download_and_extract_source(
         )?;
     } else {
         writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
-        let mut spinner = Spinner::new("Fetching ComfyUI source archive…");
+        let download_label = "Fetching ComfyUI source archive…";
+        let mut spinner = Spinner::new(download_label);
         spinner.tick();
         let download_result = download_file(
             COMFYUI_SOURCE_ARCHIVE_URL,
             &archive_path,
             &mut |bytes, total| {
-                spinner.set_progress("Fetching ComfyUI source archive…", bytes, total);
+                spinner.set_progress(download_label, bytes, total);
             },
         );
         spinner.clear();

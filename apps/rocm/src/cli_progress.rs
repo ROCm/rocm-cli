@@ -59,8 +59,10 @@ impl Spinner {
     }
 
     /// Repaint with a byte-progress label. Throttled to at most one repaint
-    /// per [`MIN_PROGRESS_REPAINT_INTERVAL`], except the final chunk (`bytes
-    /// >= total`) always repaints, so the last frame shown is never stale.
+    /// per [`MIN_PROGRESS_REPAINT_INTERVAL`], except the very first call
+    /// (`last_progress_paint` starts unset) and the final chunk (`bytes >=
+    /// total`) always repaint, so the first and last frames shown are never
+    /// stale.
     ///
     /// `bytes` is clamped to a high-water mark: a retried transfer that
     /// restarts from zero (or resumes from an earlier offset than what was
