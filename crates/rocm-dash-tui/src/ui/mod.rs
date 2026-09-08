@@ -419,11 +419,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    // On a domain tab with a manager open inline, the pane keys route to the
-    // manager — advertise the back-out instead of the (now wrong) select/open.
-    // Exactly one Esc chip is shown at all times: "back out" when an overlay
-    // is open, otherwise the uniform fallback "menu" (item #35).
-    if is_action_tab && state.has_open_overlay() {
+    // With a manager overlay open (any tab), Esc backs it out rather than
+    // opening the menu — advertise that instead of the (now wrong) select/open
+    // hints, which route to the manager, not the pane. Exactly one Esc chip is
+    // shown at all times: "back out" when an overlay is open, otherwise the
+    // uniform fallback "menu" (item #35).
+    if state.has_open_overlay() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
     } else {

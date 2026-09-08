@@ -368,7 +368,7 @@ async fn navigation_guidance_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
     let screen = tui.screen_text();
     assert!(
-        screen.contains("next / previous tab") && screen.contains("Home tab"),
+        screen.contains("next / previous tab") && screen.contains("HOME"),
         "navigation or contextual guidance missing:\n{screen}"
     );
 }

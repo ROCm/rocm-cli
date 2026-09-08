@@ -47,10 +47,18 @@ impl ApprovalRequest {
 }
 
 /// Which button the cursor is on.
+///
+/// `Approve` is the shared default — it governs the ten manager-embedded
+/// approval flows (install/stop/reinstall/etc., each via their own
+/// `ApprovalChoice::default()` call) where the user just explicitly
+/// requested the action being confirmed. The chat/tool-call approval flow
+/// (`AppState::open_approval`) is a different case — an unreviewed tool
+/// call the model wants to run — and opts into `Deny` explicitly there
+/// instead of moving this shared default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApprovalChoice {
-    Approve,
     #[default]
+    Approve,
     Deny,
 }
 

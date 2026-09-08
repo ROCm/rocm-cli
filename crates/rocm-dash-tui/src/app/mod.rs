@@ -1037,10 +1037,17 @@ impl AppState {
     }
 
     /// Whether an `Esc` keypress should back out of an inline manager: true on
-    /// ROCm/Serving while a manager overlay is open AND that manager is at its
-    /// root screen. The event loop closes the manager and returns focus to the
+    /// any tab while a manager overlay is open AND that manager is at its root
+    /// screen. The event loop closes the manager and returns focus to the
     /// Actions list when this holds. Pure read so it is unit-testable (the
     /// mutation lives in the event-loop arm).
+    ///
+    /// Not just ROCm/Serving: a manager can be opened from a non-domain tab
+    /// (e.g. `examine_manager` from an Observe hotkey), and Esc must be able to
+    /// close it there too — otherwise it falls through to the global `OpenMenu`
+    /// arm while the manager overlay keeps rendering on top, leaving `Modal`
+    /// set but invisible. `pane_focus` is meaningless outside Rocm/Serving, so
+    /// resetting it there is a harmless no-op.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -1052,8 +1059,7 @@ impl AppState {
     /// returns focus from the Details preview to the Actions list via the normal
     /// `PaneFocusActions` key path.
     pub(crate) fn should_pane_back_out(&self, code: crossterm::event::KeyCode) -> bool {
-        matches!(self.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-            && self.has_open_overlay()
+        self.has_open_overlay()
             && self.active_overlay_at_root()
             && matches!(code, crossterm::event::KeyCode::Esc)
     }
@@ -1332,7 +1338,9 @@ impl AppState {
         self.close_overlays();
         self.approval = Some(PendingApproval {
             req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
-            choice: crate::ui::approval::ApprovalChoice::default(),
+            // An unreviewed tool call the model wants to run defaults to Deny,
+            // unlike the shared `ApprovalChoice` default (see its doc comment).
+            choice: crate::ui::approval::ApprovalChoice::Deny,
             name: intent.name,
             arguments: intent.arguments,
         });
@@ -3655,17 +3663,18 @@ mod tests {
     }
 
     #[test]
-    fn back_out_only_on_domain_tabs_with_a_manager() {
+    fn back_out_requires_an_open_manager_on_any_tab() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // No manager open → never backs out, even on a domain tab.
         s.active_tab = ActiveTab::Rocm;
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
-        // Manager open but on a non-domain tab (opened from Observe hotkey) →
-        // the manager keeps its own Esc handling; no domain back-out.
+        // Manager open on a non-domain tab (opened from Observe hotkey) →
+        // Esc still backs out, closing the manager (item #35: no dead corner
+        // where an overlay survives a tab switch and swallows Esc silently).
         s.active_tab = ActiveTab::Observe;
         s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         assert!(s.has_open_overlay());
-        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
 
     #[test]

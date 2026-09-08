@@ -79,10 +79,12 @@ pub fn draw_scrollable_lines(
     f.render_widget(p, inner);
 }
 
-/// Render the Help modal for the active tab. Shares chrome (dimmed backdrop,
-/// popup geometry, 2-column grouped layout) with `draw_global_help` so the
-/// two help screens read as one family; unlike that screen, this one's right
-/// column is dynamic — the active tab's own keys.
+/// Render the Help modal for the active tab.
+///
+/// Shares chrome (dimmed backdrop, popup geometry, 2-column grouped layout)
+/// with `draw_global_help` so the two help screens read as one family; unlike
+/// that screen, this one's right column is dynamic — the active tab's own
+/// keys.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     grey_overlay(f);
     let popup = centered_rect(80, 80, 100, 26, area);
