@@ -20,6 +20,12 @@
 //!   not citations to resolve. `////` is skipped because rustc does not treat it
 //!   as a doc comment either; the block forms `/*! … */` and `/** … */` are not
 //!   scanned at all, and none in this tree cites a file.
+//! - **URLs, by whole token.** A whitespace-separated token containing `://` is
+//!   dropped, so an external link ending in `.md` is never read as a path in the
+//!   tree. Two shapes fall outside that rule: a link written without a scheme,
+//!   as a bare host and path, is still read as a path and reported, and a real
+//!   citation glued to a URL with no space between them is dropped along with
+//!   it. Neither occurs here — write the scheme, and a space after the comma.
 //! - **No backtick requirement.** Citations in this tree appear both quoted and
 //!   bare (`docs/ux-guidelines.md` in `app/summary.rs` is bare), so requiring
 //!   backticks would miss the majority of them.
@@ -171,6 +177,27 @@ pub fn resolve(candidate: &str, file_dir: &Path, root: &Path) -> bool {
         .any(|path| path.starts_with(root) && path.is_file())
 }
 
+/// Citations checked in `source`, and a violation line for each that does not
+/// resolve.
+///
+/// Every miss is collected rather than returned at the first, so one CI run is
+/// enough to fix a whole file.
+fn check_source(file: &Path, source: &str, file_dir: &Path, root: &Path) -> (usize, Vec<String>) {
+    let citations = extract_citations(source);
+    let violations = citations
+        .iter()
+        .filter(|(_, candidate)| !resolve(candidate, file_dir, root))
+        .map(|(line, candidate)| {
+            format!(
+                "{}:{line}: doc comment cites `{candidate}`, which does not resolve to a file in \
+                 the tree",
+                file.display()
+            )
+        })
+        .collect();
+    (citations.len(), violations)
+}
+
 /// All tracked `*.rs` files, excluding `third_party/`, as paths relative to `root`.
 fn discover_rust_files(root: &Path) -> Result<Vec<PathBuf>> {
     let output = Command::new("git")
@@ -206,16 +233,9 @@ pub fn run() -> Result<()> {
         let file_dir = path
             .parent()
             .map_or_else(|| root.clone(), Path::to_path_buf);
-        for (line, candidate) in extract_citations(&source) {
-            checked += 1;
-            if !resolve(&candidate, &file_dir, &root) {
-                violations.push(format!(
-                    "{}:{line}: doc comment cites `{candidate}`, which does not resolve to a \
-                     file in the tree",
-                    file.display()
-                ));
-            }
-        }
+        let (count, found) = check_source(file, &source, &file_dir, &root);
+        checked += count;
+        violations.extend(found);
     }
 
     if !violations.is_empty() {
@@ -267,6 +287,11 @@ mod tests {
         let source = concat!(
             "//! See https://example.com/docs/remote.md for the upstream note.\n",
             "/// Mirrored at <http://example.org/a/b.md>.\n",
+            // The scheme's `//` leads the run in the two forms above, so the
+            // absolute-path guard would reject them even without the URL
+            // filter. An anchor puts a bare relative path inside the token, so
+            // only dropping the whole token keeps this line quiet.
+            "//! Anchored at https://example.com/page#docs/section.md as well.\n",
         );
         assert!(extract_citations(source).is_empty());
     }
@@ -360,15 +385,19 @@ mod tests {
             "//! And `never-written-agreement.md`.\n",
             "//! And README.md, which is fine.\n",
         );
-        let unresolved: Vec<_> = extract_citations(source)
-            .into_iter()
-            .filter(|(_, candidate)| !resolve(candidate, &file_dir, root))
-            .collect();
+        let file = Path::new("crates/thing/src/lib.rs");
+        let (checked, violations) = check_source(file, source, &file_dir, root);
+
+        assert_eq!(checked, 3);
         assert_eq!(
-            unresolved,
+            violations,
             vec![
-                (1, "../elsewhere/concepts/registry.md".to_owned()),
-                (2, "never-written-agreement.md".to_owned()),
+                "crates/thing/src/lib.rs:1: doc comment cites \
+                 `../elsewhere/concepts/registry.md`, which does not resolve to a file in the tree"
+                    .to_owned(),
+                "crates/thing/src/lib.rs:2: doc comment cites `never-written-agreement.md`, which \
+                 does not resolve to a file in the tree"
+                    .to_owned(),
             ]
         );
     }
