@@ -147,8 +147,10 @@ pub fn on_key(
     // 3) List navigation + action requests.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *engines = None,
-        KeyCode::Up | KeyCode::Char('k') => em.selected = em.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            em.selected = em.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
             em.selected = (em.selected + 1).min(ENGINE_CATALOG.len() - 1);
         }
         KeyCode::Char('u') => request_op(em, EngineAction::Use),
@@ -335,6 +337,20 @@ mod tests {
         assert_eq!(em.as_ref().unwrap().selected, ENGINE_CATALOG.len() - 1);
         for _ in 0..ENGINE_CATALOG.len() + 3 {
             on_key(&mut em, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(em.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut em = Some(EngineManagerState::default());
+        let mut jobs = State::default();
+        for _ in 0..ENGINE_CATALOG.len() + 3 {
+            on_key(&mut em, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(em.as_ref().unwrap().selected, ENGINE_CATALOG.len() - 1);
+        for _ in 0..ENGINE_CATALOG.len() + 3 {
+            on_key(&mut em, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(em.as_ref().unwrap().selected, 0);
     }

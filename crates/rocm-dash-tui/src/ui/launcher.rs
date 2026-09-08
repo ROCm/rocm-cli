@@ -301,8 +301,10 @@ pub fn run_launcher(
             KeyCode::Char('q') | KeyCode::Esc => break None,
             KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
             KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % row_count(),
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                sel = (sel + 1) % row_count();
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
                 sel = (sel + row_count() - 1) % row_count();
             }
             _ => {}

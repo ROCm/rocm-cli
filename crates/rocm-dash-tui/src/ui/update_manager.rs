@@ -147,8 +147,10 @@ pub fn on_key(
     // 3) Menu navigation + action.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *update = None,
-        KeyCode::Up | KeyCode::Char('k') => u.selected = u.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            u.selected = u.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
             u.selected = (u.selected + 1).min(ACTIONS.len() - 1);
         }
         KeyCode::Enter => return activate_selected(u, jobs),
@@ -390,6 +392,20 @@ mod tests {
         assert_eq!(u.as_ref().unwrap().selected, ACTIONS.len() - 1);
         for _ in 0..10 {
             on_key(&mut u, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(u.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut u = Some(UpdateManagerState::default());
+        let mut jobs = State::default();
+        for _ in 0..10 {
+            on_key(&mut u, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(u.as_ref().unwrap().selected, ACTIONS.len() - 1);
+        for _ in 0..10 {
+            on_key(&mut u, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(u.as_ref().unwrap().selected, 0);
     }

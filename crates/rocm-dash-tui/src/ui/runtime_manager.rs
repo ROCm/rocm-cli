@@ -242,8 +242,10 @@ pub fn on_key(
     // 5) List navigation + actions.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *rm = None,
-        KeyCode::Up | KeyCode::Char('k') => r.selected = r.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') if !runtimes.is_empty() => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            r.selected = r.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right if !runtimes.is_empty() => {
             r.selected = (r.selected + 1).min(runtimes.len() - 1);
         }
         KeyCode::Char('l') => return spawn_refresh(r, jobs),
@@ -735,6 +737,21 @@ mod tests {
         assert_eq!(rm.as_ref().unwrap().selected, rts.len() - 1);
         for _ in 0..10 {
             on_key(&mut rm, &rts, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(rm.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut rm = Some(RuntimeManagerState::default());
+        let mut jobs = State::default();
+        let rts = runtimes();
+        for _ in 0..10 {
+            on_key(&mut rm, &rts, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(rm.as_ref().unwrap().selected, rts.len() - 1);
+        for _ in 0..10 {
+            on_key(&mut rm, &rts, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(rm.as_ref().unwrap().selected, 0);
     }
