@@ -98,11 +98,10 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file.
-              - 'MANIFEST.md'
-              # clippy also runs `cargo xtask verify-doc-paths`, so deleting or
-              # renaming a doc file can break a doc-comment citation with no
-              # *.rs file in the change.
+              # clippy runs `cargo xtask manifest --check` against MANIFEST.md
+              # and `cargo xtask verify-doc-paths` over every doc-comment
+              # citation, so deleting or renaming any markdown file can break a
+              # Rust check with no *.rs file in the change.
               - '**/*.md'
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
