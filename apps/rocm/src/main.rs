@@ -15747,7 +15747,7 @@ fn apply_runtime_update(
     if activate {
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
         config.save(paths)?;
-        output.push_str(&render_update_activate_summary(&activation));
+        append_update_activate_summary(&mut output, &activation);
     } else {
         let _ = writeln!(
             output,
@@ -15762,13 +15762,12 @@ fn apply_runtime_update(
     Ok(output)
 }
 
-/// Renders the `--activate` branch of the `update --apply` summary. The
+/// Appends the `--activate` branch of the `update --apply` summary. The
 /// rollback hint is only shown when a previous runtime was actually recorded —
 /// `rocm runtimes rollback` hard-errors otherwise (no prior runtime to return
 /// to), so hinting it unconditionally would point users at a command that
 /// immediately fails on their very first activation.
-fn render_update_activate_summary(activation: &RuntimeActivationResult) -> String {
-    let mut output = String::new();
+fn append_update_activate_summary(output: &mut String, activation: &RuntimeActivationResult) {
     let _ = writeln!(
         output,
         "  activated_runtime_key: {}",
@@ -15789,10 +15788,10 @@ fn render_update_activate_summary(activation: &RuntimeActivationResult) -> Strin
     if activation.previous_runtime_key.is_some() {
         let _ = writeln!(
             output,
-            "  next step: if this update causes problems, run `rocm runtimes rollback`"
+            "  next step: if this update causes problems, run `rocm runtimes rollback` \
+(undoes only this one activation)"
         );
     }
-    output
 }
 
 fn select_runtime_update_source<'a>(
@@ -29453,12 +29452,17 @@ ID_LIKE="suse opensuse"
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
         };
-        let rendered = render_update_activate_summary(&with_previous);
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &with_previous);
         assert!(
             rendered.contains(
                 "next step: if this update causes problems, run `rocm runtimes rollback`"
             ),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("undoes only this one activation"),
+            "the hint should state the single-step limit up front, not just in --help:\n{rendered}"
         );
 
         let without_previous = RuntimeActivationResult {
@@ -29466,7 +29470,8 @@ ID_LIKE="suse opensuse"
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: None,
         };
-        let rendered = render_update_activate_summary(&without_previous);
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &without_previous);
         assert!(
             !rendered.contains("rocm runtimes rollback"),
             "no previous runtime is recorded, so `rocm runtimes rollback` would hard-error; \
