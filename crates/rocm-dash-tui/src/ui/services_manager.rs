@@ -316,7 +316,7 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · s stop · r restart · Esc close",
+            "↑↓←→ select · s stop · r restart · Esc close",
             Style::default().fg(theme.muted),
         ))),
         body[1],

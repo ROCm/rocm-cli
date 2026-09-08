@@ -278,7 +278,7 @@ pub fn draw_update_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · Enter run · Esc close",
+            "↑↓←→ select · Enter run · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],

@@ -471,7 +471,7 @@ pub fn draw_runtime_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · Enter/a activate · r rollback · x uninstall · o adopt · i import · l refresh · Esc close",
+            "↑↓←→ select · Enter/a activate · r rollback · x uninstall · o adopt · i import · l refresh · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[3],

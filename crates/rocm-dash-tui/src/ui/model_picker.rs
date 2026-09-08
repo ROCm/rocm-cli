@@ -185,7 +185,7 @@ pub fn draw_model_picker(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "type filter · ↑↓ select · Enter choose · Esc cancel",
+            "type filter · ↑↓←→ select · Enter choose · Esc cancel",
             Style::default().fg(theme.muted),
         ))),
         rows[2],

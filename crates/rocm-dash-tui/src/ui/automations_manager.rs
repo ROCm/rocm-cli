@@ -317,7 +317,7 @@ pub fn draw_automations_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · Enter/Space toggle (needs approval) · l refresh · Esc close",
+            "↑↓←→ select · Enter/Space toggle (needs approval) · l refresh · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],

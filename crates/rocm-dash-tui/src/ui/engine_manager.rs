@@ -287,7 +287,7 @@ pub fn draw_engine_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · u use · i install · r reinstall · Esc close",
+            "↑↓←→ select · u use · i install · r reinstall · Esc close",
             Style::default().fg(theme.muted),
         ))),
         body[2],
