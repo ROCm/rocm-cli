@@ -5033,6 +5033,14 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
+    // Whether *any* visibility mask is active. The visible set alone cannot say:
+    // with no mask it is just `0..present`, indistinguishable from a HIP mask
+    // that happens to list the low ordinals. `validate_pinned_gpu_index` uses
+    // this only to word its rejection — "under the active visibility mask" when a
+    // mask is set, "not present on this host" when none is — so an out-of-range
+    // `--gpu` on an unmasked host is not blamed on a mask the user never set.
+    let visibility_mask_active =
+        rocr_visible_devices_set || std::env::var_os("HIP_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
     // Validate an explicit `--gpu <index>` up front — before engine/runtime
     // resolution — so an out-of-range or masked-out ordinal produces a
@@ -5046,6 +5054,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             *index,
             detect_gpu_count(),
             visible_gpu_indices.as_deref(),
+            visibility_mask_active,
         )?)
     } else {
         None
@@ -5112,6 +5121,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             detect_gpu_count(),
             visible_gpu_indices.as_deref(),
             gpu_vram.as_deref(),
+            visibility_mask_active,
         )?
     };
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
@@ -18419,9 +18429,12 @@ fn resolve_gpu_indices(
     detected: Option<usize>,
     visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
+    mask_active: bool,
 ) -> Result<Vec<u32>> {
     match selection {
-        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected, visible),
+        GpuSelection::Index(index) => {
+            validate_pinned_gpu_index(*index, detected, visible, mask_active)
+        }
         GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, visible, vram)),
     }
 }
@@ -18438,22 +18451,32 @@ fn validate_pinned_gpu_index(
     index: u32,
     detected: Option<usize>,
     visible: Option<&[u32]>,
+    mask_active: bool,
 ) -> Result<Vec<u32>> {
     // Prefer the visibility-resolved set. It is authoritative and already in the
     // HIP-ordinal space `--gpu` is exported through, so it settles both range and
     // mask membership in one comparison — avoiding the earlier bug of checking
     // the index against `detected` (a differently-probed physical count) and
     // `visible` (HIP space) as if they shared one ordinal space.
+    //
+    // `mask_active` only shapes the message, not the accept/reject decision: with
+    // no mask set the visible set is just `0..present`, so an index outside it is
+    // simply absent from the host, and blaming HIP/ROCR variables the user never
+    // set sends them chasing an environment problem that does not exist.
     if let Some(visible) = visible {
         if visible.is_empty() {
             // An empty set is authoritative "no GPU usable" (every device masked
-            // out), not "could not enumerate" — that is `None`. serve()'s
-            // no-usable-GPU fail-fast normally reports this first with a fuller
-            // message; reject here too so a bad `--gpu` can never slip through.
-            bail!(
-                "no usable AMD GPU is available under the active visibility mask \
-                 (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); `--gpu {index}` cannot be honoured"
-            );
+            // out, or none present), not "could not enumerate" — that is `None`.
+            // serve()'s no-usable-GPU fail-fast normally reports this first with a
+            // fuller message; reject here too so a bad `--gpu` can never slip
+            // through.
+            if mask_active {
+                bail!(
+                    "no usable AMD GPU is available under the active visibility mask \
+                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); `--gpu {index}` cannot be honoured"
+                );
+            }
+            bail!("no usable AMD GPU is present on this host; `--gpu {index}` cannot be honoured");
         }
         if !visible.contains(&index) {
             let list = visible
@@ -18461,10 +18484,13 @@ fn validate_pinned_gpu_index(
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
-                "--gpu index {index} is not available under the active visibility mask \
-                 (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
-            );
+            if mask_active {
+                bail!(
+                    "--gpu index {index} is not available under the active visibility mask \
+                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
+                );
+            }
+            bail!("--gpu index {index} is not present on this host; usable GPU indices: [{list}]");
         }
         return Ok(vec![index]);
     }
@@ -25622,46 +25648,50 @@ install therock";
     #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
-        let error =
-            validate_pinned_gpu_index(4, Some(4), None).expect_err("index 4 is out of range");
+        let error = validate_pinned_gpu_index(4, Some(4), None, false)
+            .expect_err("index 4 is out of range");
         assert!(error.to_string().contains("out of range"));
-        assert!(validate_pinned_gpu_index(9, Some(2), None).is_err());
+        assert!(validate_pinned_gpu_index(9, Some(2), None, false).is_err());
     }
 
     #[test]
     fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
         // In-range index pins exactly that ordinal.
         assert_eq!(
-            validate_pinned_gpu_index(0, Some(1), None).unwrap(),
+            validate_pinned_gpu_index(0, Some(1), None, false).unwrap(),
             vec![0]
         );
         assert_eq!(
-            validate_pinned_gpu_index(3, Some(4), None).unwrap(),
+            validate_pinned_gpu_index(3, Some(4), None, false).unwrap(),
             vec![3]
         );
         // Unknown count (amd-smi unavailable) is allowed through unvalidated.
-        assert_eq!(validate_pinned_gpu_index(7, None, None).unwrap(), vec![7]);
+        assert_eq!(
+            validate_pinned_gpu_index(7, None, None, false).unwrap(),
+            vec![7]
+        );
     }
 
     #[test]
     fn validate_pinned_gpu_index_rejects_masked_out_device() {
         // The visible set is authoritative: an index outside it is rejected early
-        // with the usable set, rather than deferring to a late engine error.
-        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]))
+        // with the usable set, rather than deferring to a late engine error. A
+        // mask is set here, so the message names the visibility variables.
+        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]), true)
             .expect_err("masked-out device must be rejected");
         let message = error.to_string();
         assert!(message.contains("not available under the active visibility mask"));
         assert!(message.contains("[2, 3]"));
         // A visible index still pins exactly that ordinal.
         assert_eq!(
-            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3])).unwrap(),
+            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3]), true).unwrap(),
             vec![2]
         );
         // An empty visible set is authoritative "no GPU usable" (every device
         // masked out), not "could not enumerate" — the latter is `None`, per the
         // `usable_amd_gpu_indices` contract. So it rejects rather than falling
         // through to the count check; the detected count must not override it.
-        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]))
+        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]), true)
             .expect_err("an all-masked host must reject an explicit --gpu index");
         assert!(
             masked_out
@@ -25671,17 +25701,46 @@ install therock";
     }
 
     #[test]
+    fn validate_pinned_gpu_index_absent_index_without_mask_reads_as_not_present() {
+        // No visibility mask is set, yet amd-smi counts more devices than the
+        // KFD/DRM probe finds, so the authoritative visible set (0..present) is
+        // shorter than `detected`. An index in that gap is genuinely absent from
+        // the host — the rejection must say so and must NOT blame HIP/ROCR
+        // variables the user never set (that message sends them debugging a mask
+        // that does not exist).
+        let error = validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), false)
+            .expect_err("an index past the visible set must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not present on this host"),
+            "unmasked rejection should read as not-present, got: {message}"
+        );
+        assert!(
+            !message.contains("visibility mask"),
+            "must not blame a mask when none is set, got: {message}"
+        );
+        assert!(message.contains("[0, 1]"));
+
+        // The all-empty visible set with no mask is a not-present message too,
+        // never a spurious mask advisory.
+        let empty = validate_pinned_gpu_index(0, Some(2), Some(&[]), false)
+            .expect_err("no present GPU must refuse an explicit --gpu index");
+        assert!(empty.to_string().contains("present on this host"));
+        assert!(!empty.to_string().contains("visibility mask"));
+    }
+
+    #[test]
     fn validate_pinned_gpu_index_prefers_visible_set_over_detected_count() {
         // detected and visible come from different probes. When both are known the
         // visible set wins, so an index inside the detected count but outside the
         // HIP-visible set is still rejected (and vice versa), instead of the two
         // being compared as one ordinal space.
         assert_eq!(
-            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1])).unwrap(),
+            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1]), true).unwrap(),
             vec![1]
         );
         assert!(
-            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1])).is_err(),
+            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), true).is_err(),
             "index within the detected count but outside the visible set must reject"
         );
     }
@@ -30108,9 +30167,15 @@ ID_LIKE="suse opensuse"
                             .expect("acquire launch lock");
                         // Same call `serve()` makes under the launch lock. `None`
                         // visibility keeps selection mask-unaware for the test host.
-                        let gpu =
-                            resolve_gpu_indices(paths, &GpuSelection::Auto, detected, None, None)
-                                .expect("auto GPU selection");
+                        let gpu = resolve_gpu_indices(
+                            paths,
+                            &GpuSelection::Auto,
+                            detected,
+                            None,
+                            None,
+                            false,
+                        )
+                        .expect("auto GPU selection");
                         // Widen the select→claim window so an unlocked variant
                         // would deterministically double-book GPU 0; under the
                         // lock the second thread cannot enter until we claim.
