@@ -37,25 +37,25 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # they all run on the blocking mock lane and need no capability tags.
 
   @id:skill-catalog-ids-match-cli
-  Scenario: 1 - Every remediation the skill documents is one the CLI still offers
+  Scenario: skill-01 - Every remediation the skill documents is one the CLI still offers
     Given the ROCm Doctor skill as it is published
     When an agent asks the CLI which remediations it knows
     Then the skill and the CLI describe the same set of remediations
 
   @id:skill-auto-fix-set-matches-cli
-  Scenario: 2 - The skill agrees with the CLI about which remediations the CLI will run itself
+  Scenario: skill-02 - The skill agrees with the CLI about which remediations the CLI will run itself
     Given the ROCm Doctor skill as it is published
     When an agent asks the CLI which remediations it knows
     Then the skill and the CLI agree on which ones the CLI applies without help
 
   @id:skill-os-scope-matches-cli
-  Scenario: 3 - The skill agrees with the CLI about which machines each remediation applies to
+  Scenario: skill-03 - The skill agrees with the CLI about which machines each remediation applies to
     Given the ROCm Doctor skill as it is published
     When an agent asks the CLI which remediations it knows
     Then the skill and the CLI agree on which machines each remediation is for
 
   @id:skill-diagnosis-matches-what-the-skill-documents
-  Scenario: 4 - A diagnosis carries everything the skill tells an agent to read
+  Scenario: skill-04 - A diagnosis carries everything the skill tells an agent to read
     Given the ROCm Doctor skill as it is published
     And a user who reports a recognised ROCm failure
     When an agent asks the CLI to diagnose that report for tooling
@@ -63,7 +63,7 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
     And its confidence thresholds are the ones the skill reasons about
 
   @id:skill-examine-verdicts-are-documented
-  Scenario: 5 - Inspecting the machine returns a verdict the skill documents
+  Scenario: skill-05 - Inspecting the machine returns a verdict the skill documents
     Given the ROCm Doctor skill as it is published
     When an agent inspects the machine for tooling
     Then the inspection succeeds whatever it finds
@@ -71,11 +71,18 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
 
   # The skill's standing rule is "never invent a fix — if nothing matched, route
   # the user upstream". That rule is only followable if the address the CLI hands
-  # over is the one the skill's own routing table gives, so this is the last
-  # claim in the document that the binary can be held to.
+  # over is one the skill's own routing table gives, so this is the last claim in
+  # the document that the binary can be held to.
+  #
+  # The scenario is about the ADDRESS, not about nothing having matched. Whether
+  # a report goes unexplained is not a property this suite can hold still: the
+  # catalog scores several checkers from host state alone, so a runner with (for
+  # instance) amdgpu blacklisted explains the host whatever symptom it is given.
+  # That half is pinned in `crates/rocm-core/src/diagnose.rs`, where the host can
+  # be constructed instead of probed.
   @id:skill-escalation-target-matches-cli
-  Scenario: 6 - A report the catalog cannot explain is routed where the skill says
+  Scenario: skill-06 - The upstream tracker the CLI hands back is one the skill documents
     Given the ROCm Doctor skill as it is published
-    And a user who reports a failure the catalog does not cover
+    And a user who reports a failure with no catalog keyword in it
     When an agent asks the CLI to diagnose that report for tooling
     Then the CLI routes the report to a tracker the skill documents
