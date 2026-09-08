@@ -6,10 +6,10 @@
 //! resolves to a file in the tree.
 //!
 //! Doc comments accumulated citations of markdown files that had never existed
-//! (a whole `../wiki/…` tree of them). Nothing pointed the reader anywhere:
-//! `rustdoc` does not resolve a bare path in prose, so a dangling citation is
-//! invisible to the compiler, to clippy, and to review. This check makes the
-//! next one fail CI instead.
+//! — a whole tree of them, under a directory this repository never had. Nothing
+//! pointed the reader anywhere: `rustdoc` does not resolve a bare path in prose,
+//! so a dangling citation is invisible to the compiler, to clippy, and to
+//! review. This check makes the next one fail CI instead.
 //!
 //! Design notes:
 //!
@@ -27,6 +27,11 @@
 //!   actually cites files, and accepting either keeps the check free of
 //!   false positives without weakening it: a name that resolves under neither
 //!   root points at nothing.
+//! - **Lines, not tokens.** The scan is line-based, so a multi-line string
+//!   literal whose continuation lines start with `//!` or `///` reads as a doc
+//!   comment. The fixtures below use `concat!` to keep that prefix off the start
+//!   of a line; a doc comment inside a fenced code block is scanned for the same
+//!   reason, and none in this tree names a `.md` file.
 //! - **Every violation, once.** Failures are collected and reported together.
 //!   Reporting only the first would cost one CI round trip per dangling path.
 //!
@@ -199,10 +204,12 @@ mod tests {
 
     #[test]
     fn extracts_from_doc_lines_only() {
-        let source = "//! Module doc, see docs/a.md for details.\n\
-                      /// Item doc, see `docs/b.md`.\n\
-                      // Ordinary comment about docs/c.md.\n\
-                      let path = docs_d_md;\n";
+        let source = concat!(
+            "//! Module doc, see docs/a.md for details.\n",
+            "/// Item doc, see `docs/b.md`.\n",
+            "// Ordinary comment about docs/c.md.\n",
+            "let path = docs_d_md;\n",
+        );
         assert_eq!(
             extract_citations(source),
             vec![(1, "docs/a.md".to_owned()), (2, "docs/b.md".to_owned())]
@@ -213,22 +220,31 @@ mod tests {
     fn ignores_md_in_a_string_literal_on_a_code_line() {
         // The shape that made a naive whole-file scan unusable: real code names
         // build artifacts and shell commands that are not citations.
-        let source = "let readme = format!(\"{dist}/README.md\");\n\
-                      assert!(jobs.contains(\"base64 -w0 regenerated/MANIFEST.md > manifest.b64\"));\n\
-                      let inputs = [\"docs/guide.md\".to_string()];\n";
+        let source = concat!(
+            "let readme = format!(\"{dist}/README.md\");\n",
+            "assert!(jobs.contains(\"base64 -w0 regenerated/MANIFEST.md > manifest.b64\"));\n",
+            "let inputs = [\"docs/guide.md\".to_string()];\n",
+        );
         assert!(extract_citations(source).is_empty());
     }
 
     #[test]
     fn ignores_urls_ending_in_md() {
-        let source = "//! See https://example.com/docs/remote.md for the upstream note.\n\
-                      /// Mirrored at <http://example.org/a/b.md>.\n";
+        let source = concat!(
+            "//! See https://example.com/docs/remote.md for the upstream note.\n",
+            "/// Mirrored at <http://example.org/a/b.md>.\n",
+        );
         assert!(extract_citations(source).is_empty());
     }
 
     #[test]
     fn ignores_placeholder_and_absolute_paths() {
         let source = "//! Writes `<name>.md` under the bundle, or /etc/motd.md on request.\n";
+        assert!(extract_citations(source).is_empty());
+        // A placeholder butting straight up against a filename, with no path
+        // separator to end the run: adjacency is the only thing that rules this
+        // out, so the case fails if that check is ever dropped.
+        let source = "//! Writes `{version}CHANGELOG.md` beside the archive.\n";
         assert!(extract_citations(source).is_empty());
     }
 
@@ -266,13 +282,13 @@ mod tests {
         assert!(resolve("README.md", &file_dir, root));
         // A directory is not a file, and neither form of a missing path resolves.
         assert!(!resolve("docs", &file_dir, root));
-        assert!(!resolve("../wiki/foo.md", &file_dir, root));
+        assert!(!resolve("../elsewhere/foo.md", &file_dir, root));
         assert!(!resolve("foo.md", &file_dir, root));
     }
 
     #[test]
     fn flags_every_unresolvable_citation_not_just_the_first() {
-        // The regression this check exists for: a `../wiki/…` tree that never
+        // The regression this check exists for: a relative tree that never
         // existed, plus a bare filename that resolves against neither root.
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path();
@@ -280,9 +296,11 @@ mod tests {
         std::fs::write(root.join("README.md"), "readme").expect("readme");
         let file_dir = root.join("crates/thing/src");
 
-        let source = "//! See `../wiki/concepts/metric-registry.md`.\n\
-                      //! And `rocm-cli-unification-working-agreements.md`.\n\
-                      //! And README.md, which is fine.\n";
+        let source = concat!(
+            "//! See `../elsewhere/concepts/registry.md`.\n",
+            "//! And `never-written-agreement.md`.\n",
+            "//! And README.md, which is fine.\n",
+        );
         let unresolved: Vec<_> = extract_citations(source)
             .into_iter()
             .filter(|(_, candidate)| !resolve(candidate, &file_dir, root))
@@ -290,8 +308,8 @@ mod tests {
         assert_eq!(
             unresolved,
             vec![
-                (1, "../wiki/concepts/metric-registry.md".to_owned()),
-                (2, "rocm-cli-unification-working-agreements.md".to_owned()),
+                (1, "../elsewhere/concepts/registry.md".to_owned()),
+                (2, "never-written-agreement.md".to_owned()),
             ]
         );
     }
