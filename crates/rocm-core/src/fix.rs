@@ -673,15 +673,26 @@ fn run_unset_override_linux() -> i32 {
     let Some(home) = home_dir() else {
         return 0;
     };
-    let candidates = [
+    report_persistent_override(&[
         home.join(".bashrc"),
         home.join(".bash_profile"),
         home.join(".zshrc"),
         home.join(".profile"),
         home.join(".config").join("fish").join("config.fish"),
-    ];
-    let hits: Vec<PathBuf> = candidates
-        .into_iter()
+    ])
+}
+
+/// Report which of `candidates` persist `HSA_OVERRIDE_GFX_VERSION`, and leave
+/// every one of them exactly as it was.
+///
+/// Takes the paths rather than deriving them from `$HOME`, for the same reason
+/// [`pin_device_in_rc_file`] takes its rc path: it makes the promise testable
+/// without mutating a process-global. And the promise needs testing — fix-2 is
+/// flagged `auto_applicable`, so `skills/rocm-doctor/` has to say plainly that
+/// this arm still only reports, and something has to hold that true.
+fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
+    let hits: Vec<&PathBuf> = candidates
+        .iter()
         .filter(|f| {
             std::fs::read_to_string(f).is_ok_and(|b| b.contains("HSA_OVERRIDE_GFX_VERSION"))
         })
@@ -1327,6 +1338,42 @@ mod tests {
     #[test]
     fn interactive_shell_without_yes_must_actually_ask() {
         assert_eq!(consent_without_prompt(false, true), None);
+    }
+
+    /// `auto_applicable` means "the CLI has a runner", not "the runner mutates".
+    ///
+    /// fix-2's Linux arm only reports where the override is persisted; it never
+    /// edits dotfiles. `auto_applicable_recipes_have_a_runner` cannot catch a
+    /// regression here, because fix-2 does have a runner — so without this, a
+    /// doc promising a `--dry-run` preview the Linux user never gets stays
+    /// green. That is the drift `skills/rocm-doctor/` exists to prevent.
+    ///
+    /// Asserted on the files themselves rather than on an exit code: a runner
+    /// that started stripping the line would still return 0.
+    #[test]
+    fn reporting_a_persistent_override_never_edits_the_rc_file() {
+        let dir = scratch_dir("fix2-report");
+        let carries = dir.join(".bashrc");
+        let clean = dir.join(".profile");
+        let before = "export HSA_OVERRIDE_GFX_VERSION=10.3.0\nexport PATH=$PATH:/x\n";
+        std::fs::write(&carries, before).expect("seed rc file");
+        std::fs::write(&clean, "# nothing to see\n").expect("seed rc file");
+
+        let code = report_persistent_override(&[carries.clone(), clean.clone()]);
+
+        assert_eq!(code, 0, "reporting is a success, not a refusal");
+        assert_eq!(
+            std::fs::read_to_string(&carries).expect("rc file still readable"),
+            before,
+            "fix-2 on Linux must leave the user's dotfiles byte-identical — \
+             skills/rocm-doctor/ tells an agent it only reports"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&clean).expect("rc file still readable"),
+            "# nothing to see\n",
+            "a file that never carried the override must not be touched either"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
