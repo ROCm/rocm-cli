@@ -136,6 +136,25 @@ fn card(f: &mut Frame, area: Rect, title: &str, role: BoxRole, theme: &Theme) ->
     panel::bento(f, area, Some(title), role, false, theme)
 }
 
+/// Whether an instance's shared `gen_tps_observation` metadata is Held. Both
+/// tok/W and T/S derive from `gen_tps`, so this single check backs every
+/// held-status predicate in this module.
+fn instance_gen_tps_held(i: &rocm_dash_core::metrics::Instance) -> bool {
+    i.gen_tps_observation
+        .as_ref()
+        .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
+}
+
+/// Whether any hero-band value (tok/W or T/S) is derived from a held (stale)
+/// observation. Both figures key off the same `gen_tps_observation` metadata,
+/// so either contributing instance being held gates the shared legend.
+fn any_hero_held(state: &AppState) -> bool {
+    state
+        .instances
+        .values()
+        .any(|i| (i.tokens_per_watt.is_some() || i.gen_tps.is_some()) && instance_gen_tps_held(i))
+}
+
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -209,6 +228,14 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
     }
+    // Glyph key: only when there's spare room beyond the actual feed content,
+    // so it never displaces real activity on a squeezed card.
+    if (feed.height as usize) > lines.len() {
+        lines.push(Line::from(Span::styled(
+            "● live  ✓ done  ✗ failed  ⋯ running",
+            Style::default().fg(theme.muted),
+        )));
+    }
     lines.truncate(feed.height as usize);
     f.render_widget(Paragraph::new(lines), feed);
 }
@@ -263,12 +290,10 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .values()
         .filter_map(|i| i.tokens_per_watt)
         .sum();
-    let any_tpw_held = state.instances.values().any(|i| {
-        i.tokens_per_watt.is_some()
-            && i.gen_tps_observation
-                .as_ref()
-                .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
-    });
+    let any_tpw_held = state
+        .instances
+        .values()
+        .any(|i| i.tokens_per_watt.is_some() && instance_gen_tps_held(i));
     let tpw_label = if tpw > 0.0 {
         let marker = if any_tpw_held {
             crate::ui::format::HELD_MARKER
@@ -288,6 +313,17 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))),
         lh[4],
     );
+    // Shared held-marker legend: shown once for the hero band when either
+    // tok/W or T/S is derived from a held observation; quiet otherwise.
+    if any_hero_held(state) {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            lh[5],
+        );
+    }
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -363,12 +399,10 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme,
     );
     let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
-    let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some()
-            && i.gen_tps_observation
-                .as_ref()
-                .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
-    });
+    let any_tps_held = state
+        .instances
+        .values()
+        .any(|i| i.gen_tps.is_some() && instance_gen_tps_held(i));
     let tps_str = if any_tps_held {
         format!("{:.0}{}", tps, crate::ui::format::HELD_MARKER)
     } else {
@@ -461,23 +495,21 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    // Updates tile — honest placeholder (no update feed wired this run).
+    // Updates tile — honest placeholder. No update/version-check feed is wired
+    // into AppState at all, so "connected" must not be read as "checked and
+    // current" — every reachable state renders "unknown" or the transitional
+    // "Checking…", never a fabricated "Up to date".
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        let body = if state.simulated {
-            // No real update feed can be observed for simulated data.
-            Line::from(Span::styled("unknown", Style::default().fg(theme.muted)))
+        // "Checking…" only applies while not connected (initial/connecting, or
+        // disconnected — any non-simulated state short of `Connected`); every
+        // other reachable state has no update feed to report, so it's "unknown".
+        let text = if !state.simulated && !matches!(state.conn, ConnState::Connected { .. }) {
+            "Checking…"
         } else {
-            match state.conn {
-                ConnState::Connected { .. } => {
-                    Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
-                }
-                _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
-            }
+            "unknown"
         };
-        // No update-feed data source this run: simulated sessions show "unknown"
-        // (nothing observable), otherwise the tile is conn-derived rather than
-        // the mock's hardcoded "ROCm 6.3 ready".
+        let body = Line::from(Span::styled(text, Style::default().fg(theme.muted)));
         f.render_widget(Paragraph::new(body), updates);
     }
 }
@@ -488,7 +520,13 @@ mod tests {
     use crate::app::ActiveTab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
+        ObservationMetadata, Snapshot, SystemMetrics,
+    };
+    use rocm_dash_core::state::{JobState, JobStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn node_load_label_never_marks_simulated_live() {
@@ -583,5 +621,125 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    #[test]
+    fn updates_tile_never_asserts_up_to_date_when_connected() {
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("Up to date"),
+            "must not fabricate a version check: {out:?}"
+        );
+        assert!(
+            out.contains("unknown"),
+            "Updates tile should show unknown: {out:?}"
+        );
+    }
+
+    fn instance_with_obs(name: &str, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: name.into(),
+            container_name: name.into(),
+            status: InstanceStatus::Running,
+            model_name: name.into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(200.0),
+            tokens_per_watt: Some(200.0 / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    #[test]
+    fn held_legend_visible_when_hero_data_is_held() {
+        let mut s = state_with_gpu();
+        let inst = instance_with_obs("m", Some(held_obs()));
+        s.instances.insert(inst.container_id.clone(), inst);
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must be visible when hero data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn held_legend_absent_when_hero_data_is_fresh() {
+        let mut s = state_with_gpu();
+        let inst = instance_with_obs("m", Some(fresh_obs()));
+        s.instances.insert(inst.container_id.clone(), inst);
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    fn job(cmd: &str, status: JobStatus) -> JobState {
+        JobState {
+            cmd: cmd.into(),
+            args: Vec::new(),
+            status,
+            output: std::collections::VecDeque::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn activity_glyph_key_present_with_room_to_spare() {
+        // Exercise the Gherkin precondition literally: a real serving instance
+        // plus a real job, not just the empty-feed placeholder line.
+        let mut s = state_with_gpu();
+        let inst = instance_with_obs("demo-model", None);
+        s.instances.insert(inst.container_id.clone(), inst);
+        s.jobs.jobs.insert(
+            "build".into(),
+            job("cargo build", JobStatus::Done { code: 0 }),
+        );
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("demo-model") && out.contains("cargo build"),
+            "expected real activity entries to render: {out:?}"
+        );
+        assert!(
+            out.contains("live") && out.contains("done") && out.contains("failed"),
+            "activity glyph key missing: {out:?}"
+        );
+    }
+
+    #[test]
+    fn activity_glyph_key_absent_when_feed_full() {
+        // Fill the feed past capacity with jobs so there's no spare room; the
+        // glyph key must not displace real activity on a squeezed card.
+        let mut s = state_with_gpu();
+        for i in 0..10 {
+            s.jobs.jobs.insert(
+                format!("job-{i}"),
+                job(&format!("task {i}"), JobStatus::Running),
+            );
+        }
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("● live  ✓ done  ✗ failed  ⋯ running"),
+            "glyph key must not appear when the feed has no spare room: {out:?}"
+        );
     }
 }
