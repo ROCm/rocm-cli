@@ -37,7 +37,15 @@ mod tests {
     }
 
     /// The self-hosted runner labels that must not appear in a `runs-on`.
-    const SELF_HOSTED_LABELS: [&str; 3] = ["self-hosted", "amd-gpu", "strix-halo"];
+    const SELF_HOSTED_LABELS: [&str; 5] =
+        ["self-hosted", "amd-gpu", "strix-halo", "mi300x", "r9700"];
+
+    /// Labels that do NOT narrow a `runs-on` to one kind of hardware.
+    ///
+    /// `self-hosted`, `linux` and `windows` are self-evidently generic.
+    /// `amd-gpu` reads specific but is not: every AMD GPU runner registers it,
+    /// so a lane selecting on it alone draws from a mixed-silicon pool.
+    const GENERIC_LABELS: [&str; 4] = ["self-hosted", "linux", "windows", "amd-gpu"];
 
     /// Strip a trailing `# …` comment from a YAML line (best-effort: our
     /// workflows never put a literal `#` inside a runs-on/group value).
@@ -816,6 +824,33 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                     "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
                      GPU preflight step: on a wedged or occupied GPU it hangs to the job \
                      timeout instead of failing fast with a reason"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_self_hosted_lane_pins_a_hardware_label() {
+        // `e2e-gpu` and `e2e-gpu-nightly` shipped as `[self-hosted, linux,
+        // amd-gpu]`. The Strix Halo Linux hosts carry `amd-gpu` too, so the
+        // MI300X-named lanes were scheduled onto gfx1151 whenever a Strix
+        // runner won the race: red on the WSL host, and a PASS on the native
+        // Ubuntu one — published as `e2e-gpu-report`, which the consolidated
+        // grid labels MI300X. A green run on hardware the lane does not name is
+        // worse than a red one, because nothing prompts anyone to look.
+        //
+        // Derived like its siblings: a new lane is covered the day it lands,
+        // and only a lane whose labels are ALL generic fails, so pinning a new
+        // hardware label needs no change here.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, runs_on) in self_hosted_e2e_jobs(&text) {
+                let labels = flattened_list_items(&runs_on);
+                assert!(
+                    labels.iter().any(|l| !GENERIC_LABELS.contains(&l.as_str())),
+                    "{workflow} job `{job}` selects its runner with generic labels only \
+                     (`{runs_on}`), so it can land on any AMD GPU host. Pin a label that \
+                     identifies the hardware the lane is named for (e.g. `mi300x`, \
+                     `r9700`, `strix-halo`)"
                 );
             }
         }

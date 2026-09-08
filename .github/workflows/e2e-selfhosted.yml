@@ -135,7 +135,11 @@ jobs:
   e2e-gpu:
     name: E2E tests (GPU)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, amd-gpu]
+    # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
+    # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
+    # on gfx1151 — red on the WSL host, and (worse) a silent pass published as
+    # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
+    runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself and is continue-on-error; ci.yml's required
@@ -326,7 +330,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
-  # by the `strix-halo` label (app-dev-gpu carries `amd-gpu`, not `strix-halo`).
+  # by the `strix-halo` label. These hosts carry `amd-gpu` as well — it marks any
+  # AMD GPU runner, so it never distinguishes one architecture from another.
   # Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
