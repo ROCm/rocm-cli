@@ -2368,6 +2368,73 @@ mod tests {
     /// `Examination::probe` sets in `examine.rs`. It is not derived from that
     /// code, so adding a fifth framework there will not fail this test — see
     /// the note on [`route_when_no_match`] for the three places to edit.
+    /// The gate the rocm-doctor skill tells an agent to read, and the reason it
+    /// is not "is `matched` empty?".
+    ///
+    /// This cannot be asserted from the e2e suite: `diagnose` scores several
+    /// checkers from host state alone, with no symptom keyword involved, so on a
+    /// runner that happens to have (say) `amdgpu` blacklisted the catalog
+    /// explains the host no matter what symptom is passed. Constructing the
+    /// `Examination` is the only way to hold the premise still.
+    #[test]
+    fn sub_threshold_causes_leave_has_match_false_and_route_upstream() {
+        // Missing both groups scores 45 -- worth listing, not enough to
+        // establish. `matched` is NOT empty here, which is the whole point: an
+        // agent gating on emptiness would propose this fix for a host where
+        // nothing was established, and never route the user anywhere.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "the office printer keeps jamming on page three");
+
+        assert!(
+            !report.matched.is_empty(),
+            "this test is pointless unless something sub-threshold was listed"
+        );
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.score < report.min_score_for_match),
+            "expected every cause below {}, got {:?}",
+            report.min_score_for_match,
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !report.has_match,
+            "nothing cleared the threshold, so has_match must be false -- \
+             skills/rocm-doctor/ tells an agent to route upstream on exactly this"
+        );
+        assert!(
+            report.route_when_no_match.url.starts_with("http"),
+            "the skill's rule is to hand over this tracker when nothing was \
+             established, so it must name somewhere to go: {:?}",
+            report.route_when_no_match
+        );
+    }
+
+    /// The other half: the flag has to discriminate, or asserting it is free.
+    #[test]
+    fn an_established_cause_sets_has_match() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "cannot open /dev/kfd: permission denied");
+        assert!(
+            report.has_match,
+            "a symptom that matches the catalog must set has_match: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn routing_targets_cover_every_framework_the_probe_reports() {
         let mut targets = Vec::new();

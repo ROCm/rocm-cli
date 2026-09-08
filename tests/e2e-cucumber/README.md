@@ -284,7 +284,14 @@ Two rules follow:
 - A skill-only edit must still run this job, so `skills/**` is in the `heavy`
   paths filter that gates the `e2e` job.
 
-No scenario asserts that a symptom actually matched: on a host the catalog rules
-out of scope (WSL2) an empty `matched` list is the correct answer. What is
-asserted holds either way, so the feature is clean on WSL2, the no-GPU lane, and
-the GPU lanes alike.
+No scenario asserts whether a symptom matched, in either direction — that is not
+a property this suite can hold still. The catalog scores several checkers from
+**host state alone**, with no symptom keyword involved, so a runner with `amdgpu`
+blacklisted is explained by `fix-5-amdgpu-load` whatever it is asked about; and
+on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
+assertion either way would encode one runner's state.
+
+Claims about *whether* a cause was established therefore live in
+`crates/rocm-core/src/diagnose.rs`, where the `Examination` is constructed rather
+than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+the no-GPU lane, and the GPU lanes alike.
