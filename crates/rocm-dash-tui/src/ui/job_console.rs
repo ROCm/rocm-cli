@@ -121,7 +121,10 @@ pub fn draw_job_console(
         let glyph = match job.status {
             JobStatus::Failed { .. } => "✗ ",
             JobStatus::Cancelled => "○ ",
-            JobStatus::Done { .. } | JobStatus::Running => "✓ ",
+            JobStatus::Done { code: 0 } => "✓ ",
+            JobStatus::Done { .. } => "! ",
+            // Unreachable: `is_terminal` (above) excludes `Running`.
+            JobStatus::Running => unreachable!("terminal banner only renders for finished jobs"),
         };
         header.push(Span::styled(
             format!(" {glyph}{label} "),
@@ -392,6 +395,46 @@ mod tests {
         assert!(
             filled < 20,
             "a running job should keep the compact status chip, not a full-width banner: {filled} cells colored"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_gets_a_distinct_glyph_from_success() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 1,
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !out.contains('✓'),
+            "a nonzero exit banner should not reuse the success glyph: {out:?}"
+        );
+        assert!(
+            out.contains('!'),
+            "a nonzero exit banner should carry a distinct glyph: {out:?}"
         );
     }
 }
