@@ -104,6 +104,13 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
    ```
 
    Read the JSON:
+   - `has_match` — **the gate.** True means a cause cleared the threshold and
+     you may propose a fix; false means nothing was established, so route
+     upstream. Do **not** substitute "is `matched` empty?": several checkers
+     open with a nonzero base score for a merely *potentially* relevant
+     situation (a container, an APU beside a discrete GPU), so a healthy host
+     still returns a non-empty `matched` of sub-threshold entries. Gating on
+     emptiness proposes a fix for a machine with nothing wrong.
    - `matched[]` — ranked causes, each with `id`, `title`, `score` (0–100),
      `evidence[]`, and a `fix` (with `fix_id`, `summary`, `commands`, `verify`,
      `notes`, and the `needs_sudo` / `needs_reboot` / `needs_relogin` /
@@ -115,7 +122,7 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
      [Framework routing](#framework-routing)) — those trackers apply regardless
      of platform. Otherwise relay the `out_of_scope` message and stop (see
      [Out of scope](#out-of-scope)).
-   - `route_when_no_match` — when `matched` is empty, hand the user this
+   - `route_when_no_match` — when `has_match` is false, hand the user this
      upstream tracker; **do not speculate**. Note the CLI picks this target from
      the *host-detected* framework, not from the symptom text — so for an app
      named only in the symptom, route it yourself per
