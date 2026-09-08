@@ -820,6 +820,82 @@ async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
 }
 
+/// Arm the debug/test VRAM hook so the *selected* GPU is reported nearly full.
+/// The GPU lane's real cards are comfortably free, so the serve-plan low-VRAM
+/// OOM warning is otherwise unreachable in E2E; this makes it deterministic
+/// without touching the device the engine actually launches on. Consumed by the
+/// following serve via `run_rocm_with_scenario_env`.
+#[given("the selected GPU is reported nearly out of VRAM")]
+async fn selected_gpu_nearly_out_of_vram(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_LOW_VRAM", "0".into()));
+}
+
+/// Preview a vLLM serve plan pinned to the nearly-full GPU. `--managed`
+/// backgrounds the supervisor (teardown stops it), so this returns once the plan
+/// has printed and the service has launched — the plan text is what the scenario
+/// inspects. The engine still launches against the real, free device.
+#[when("the user previews a vLLM serve plan pinned to that GPU")]
+async fn user_previews_vllm_low_vram_serve_plan(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--engine",
+            "vllm",
+            "--gpu",
+            "0",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The serve must have actually launched, not just printed a plausible plan: a
+/// non-zero rc after a good plan-print would otherwise go undetected since this
+/// scenario only inspects the plan lines (mirrors `assert_vllm_default`).
+#[then("the serve plan warns the GPU is low on VRAM")]
+async fn assert_serve_plan_low_vram_warning(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &[
+                "serve",
+                "<vllm model>",
+                "--engine",
+                "vllm",
+                "--gpu",
+                "0",
+                "--managed",
+            ],
+            rc,
+            output,
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
+    assert!(
+        output.contains("serving may fail on VRAM"),
+        "expected a low-VRAM serve-plan warning, got:\n{output}"
+    );
+}
+
+#[then("the serve plan explains how to lower vLLM's memory reservation")]
+async fn assert_serve_plan_names_memory_knob(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    assert!(
+        output.contains("--gpu-memory-utilization"),
+        "expected the vLLM memory-utilization note in the serve plan, got:\n{output}"
+    );
+}
+
 /// Serve under the GPU-required default (no `--device`), pinning the engine to the
 /// host's effective serve engine so the serve reaches GPU enforcement rather than
 /// tripping on engine selection.

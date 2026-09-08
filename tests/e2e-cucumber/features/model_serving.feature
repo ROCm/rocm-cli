@@ -187,3 +187,19 @@ Feature: Model serving
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
+
+  # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
+  # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
+  # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
+  # `diagnose`/`fix` catalog. The GPU lane's real cards are comfortably free, so the
+  # near-full reading is injected via `ROCM_E2E_FORCE_LOW_VRAM` in debug/test builds:
+  # a single synthetic device on this non-APU host keeps the warning honest, while
+  # the engine still launches against the real, free device. Runs on the vLLM GPU
+  # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
+  # legitimately withhold the warning.
+  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  Scenario: serve-19 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+    Given the selected GPU is reported nearly out of VRAM
+    When the user previews a vLLM serve plan pinned to that GPU
+    Then the serve plan warns the GPU is low on VRAM
+    And the serve plan explains how to lower vLLM's memory reservation
