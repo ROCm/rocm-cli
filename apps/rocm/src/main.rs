@@ -22365,6 +22365,47 @@ model recipes
     }
 
     #[test]
+    fn install_sdk_chat_and_mcp_args_carry_yes_for_non_interactive_spawn() {
+        // The chat/MCP surfaces spawn `rocm` with null stdin, so an overwrite
+        // prompt would refuse with "re-run with `--yes`" — a flag the user has
+        // no way to supply from chat or the dashboard. Both the chat classifier
+        // arm and the MCP tool-args builder must inject `--yes` so a reinstall
+        // over an existing SDK is not silently refused.
+        let action = chat_rocm_command_action_from_args(vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--channel".to_owned(),
+            "release".to_owned(),
+            // The classifier requires a user-chosen (non-system) install folder.
+            "--prefix".to_owned(),
+            "/home/tester/rocm-managed".to_owned(),
+        ])
+        .expect("install sdk classifies");
+        match action {
+            ChatRocmCommandAction::Approval { args, .. } => assert!(
+                args.iter().any(|arg| arg == "--yes"),
+                "chat `install sdk` approval must carry --yes, got {args:?}"
+            ),
+            other @ ChatRocmCommandAction::ReadOnly(_) => {
+                panic!("install sdk must require approval, got {other:?}")
+            }
+        }
+
+        // The MCP `install_sdk` tool builds its own argv (it does not route
+        // through the classifier above), so it must add `--yes` independently.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
+        assert!(
+            args.iter().any(|arg| arg == "--yes"),
+            "MCP install_sdk args must carry --yes, got {args:?}"
+        );
+    }
+
+    #[test]
     fn chat_rocm_command_runs_read_only_and_rejects_risky_shapes() {
         let status = providers::ChatToolCall {
             id: None,
