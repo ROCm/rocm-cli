@@ -1,4 +1,5 @@
-# Ruff configuration for the Python helper scripts (scripts/) and engine workers.
+# Ruff configuration for the repository's Python files: the helper scripts in
+# scripts/ and the Sphinx config in docs/rocm-docs/. (engines/ is Rust-only.)
 # Formatting uses Ruff's defaults (88-column, double quotes), which the
 # `ruff-format` pre-commit hook enforces.
 
@@ -15,7 +16,32 @@ select = [
     "SIM", # flake8-simplify
     "C4",  # flake8-comprehensions
     "RUF", # Ruff-specific rules
+    "ARG", # flake8-unused-arguments
+    "BLE", # flake8-blind-except
+    "SLF", # flake8-self (private-member access)
+    "PL",  # Pylint (PLC/PLE/PLR/PLW)
 ]
 ignore = [
     "E501", # line length is enforced by the formatter; long comments/URLs are fine
+    #
+    # Pylint refactor metrics. These are standalone operational scripts: their
+    # `main()` flows are deliberately linear and their helpers thread
+    # argparse-derived config through. Mirrors the `too_many_lines` allow that
+    # Cargo.toml grants clippy for the same reason.
+    "PLR0911", # too-many-return-statements: early returns beat a nested result variable
+    "PLR0912", # too-many-branches: script `main()` flows are deliberately linear
+    "PLR0913", # too-many-arguments: CLI helpers thread argparse-derived config through
+    "PLR0915", # too-many-statements: splitting these entry points adds no clarity
+    "PLR2004", # magic-value-comparison: HTTP statuses, size/mode bits and retry counts read better inline
+    #
+    # Blind excepts are intentional last-resort handlers in these scripts: each
+    # either reports the error, requeues it to the owning thread, or — in a
+    # teardown path — deliberately ignores it, so a probe or cleanup failure
+    # degrades gracefully instead of crashing the test harness.
+    "BLE001", # blind-except
 ]
+
+[lint.per-file-ignores]
+# The PTY harness imports winpty on Windows and fcntl/pty/struct/termios on
+# POSIX inside the platform branch; neither set can be imported on the other OS.
+"scripts/tui_e2e_smoke.py" = ["PLC0415"] # import-outside-top-level
