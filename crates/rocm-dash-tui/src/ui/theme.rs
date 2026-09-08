@@ -281,22 +281,29 @@ fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
 /// near-white) reads fine against an arbitrary status color — which breaks
 /// down for some bundled light themes.
 ///
+/// Returns true RGB black/white (`Color::Rgb(0, 0, 0)` / `Color::Rgb(255, 255,
+/// 255)`), not the `Color::Black`/`Color::White` ANSI palette entries — those
+/// are indices into the user's terminal palette and can be remapped to
+/// anything (e.g. Catppuccin Latte's ANSI black is `#5c5f77`, far lighter than
+/// true black), which would silently invalidate the WCAG contrast this
+/// function just computed.
+///
 /// Every color in every bundled theme is built through the `rgb()` helper
 /// above, so `Color::Rgb` is the only arm that actually runs in practice; the
 /// function is still exhaustive over `Color` for correctness, falling back to
-/// black (a safe, conservative default) for every other variant.
+/// true black (a safe, conservative default) for every other variant.
 pub fn readable_text_on(bg: Color) -> Color {
     let Color::Rgb(r, g, b) = bg else {
-        return Color::Black;
+        return Color::Rgb(0, 0, 0);
     };
     let l = relative_luminance(r, g, b);
     // Contrast ratio of white/black text against a background of luminance `l`.
     let white_contrast = (1.0 + 0.05) / (l + 0.05);
     let black_contrast = (l + 0.05) / (0.0 + 0.05);
     if white_contrast > black_contrast {
-        Color::White
+        Color::Rgb(255, 255, 255)
     } else {
-        Color::Black
+        Color::Rgb(0, 0, 0)
     }
 }
 
@@ -647,12 +654,18 @@ mod tests {
 
     #[test]
     fn readable_text_on_white_bg_is_black() {
-        assert_eq!(readable_text_on(Color::Rgb(255, 255, 255)), Color::Black);
+        assert_eq!(
+            readable_text_on(Color::Rgb(255, 255, 255)),
+            Color::Rgb(0, 0, 0)
+        );
     }
 
     #[test]
     fn readable_text_on_black_bg_is_white() {
-        assert_eq!(readable_text_on(Color::Rgb(0, 0, 0)), Color::White);
+        assert_eq!(
+            readable_text_on(Color::Rgb(0, 0, 0)),
+            Color::Rgb(255, 255, 255)
+        );
     }
 
     #[test]
@@ -667,7 +680,7 @@ mod tests {
         assert_eq!(t.bg, Color::Rgb(0xef, 0xf1, 0xf5), "bg is a light color");
         let old_trick_color = t.bg;
         let fixed_color = readable_text_on(t.ok);
-        assert_eq!(fixed_color, Color::Black);
+        assert_eq!(fixed_color, Color::Rgb(0, 0, 0));
         assert_ne!(
             fixed_color, old_trick_color,
             "the fix should pick a different (and better-contrasting) color than the old bg-based trick"
