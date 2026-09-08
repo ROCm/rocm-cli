@@ -60,7 +60,10 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 /// Shared chrome: a titled popup whose body is a scrollable block of `lines`.
 ///
 /// Centralizes the `draw_modal_*` pattern so operational screens don't rebuild
-/// it (Phase 3 Wave 0). `scroll` is the first visible line offset.
+/// it (Phase 3 Wave 0). `scroll` is the first visible line offset, clamped
+/// here to the content's last page so a "scroll to end" action (which sends
+/// `u16::MAX`-ish deltas, see `AppState::scroll_help`) can't push every line
+/// past the viewport and render a blank pane.
 pub fn draw_scrollable_lines(
     f: &mut Frame,
     area: Rect,
@@ -73,8 +76,11 @@ pub fn draw_scrollable_lines(
     if inner.height == 0 {
         return;
     }
+    let max_scroll = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner.height);
     let p = Paragraph::new(lines)
-        .scroll((scroll, 0))
+        .scroll((scroll.min(max_scroll), 0))
         .wrap(Wrap { trim: false });
     f.render_widget(p, inner);
 }
@@ -869,5 +875,21 @@ mod ported_chrome_tests {
         assert!(out.contains("Theme"), "label missing: {out:?}");
         assert!(out.contains("tokyo"), "value missing: {out:?}");
         assert!(out.contains('▸'), "focus/control marker missing: {out:?}");
+    }
+
+    #[test]
+    fn help_scroll_past_end_clamps_instead_of_blanking() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 24);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_help(f, area, ActiveTab::Home, &theme, i16::MAX as u16))
+            .unwrap();
+        let out = flat(&term);
+        assert!(
+            out.contains("REPLAY") && out.contains("pause / resume"),
+            "overscrolling help should clamp to the last page, not blank it: {out:?}"
+        );
     }
 }
