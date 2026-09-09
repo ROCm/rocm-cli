@@ -130,10 +130,8 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = instances.iter().enumerate().map(|(i, inst)| {
         let model = trunc(&inst.model_name, 22);
         let tps = format::gen_tps_cell(inst.gen_tps, inst.gen_tps_observation.as_ref());
-        let tpw = inst
-            .tokens_per_watt
-            .filter(|v| v.is_finite())
-            .map_or_else(|| dash.to_string(), |v| format!("{v:.2}"));
+        let tpw =
+            format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref());
         let ttft = inst
             .ttft_ms
             .filter(|v| v.is_finite())
@@ -178,7 +176,9 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let widths = [
         Constraint::Min(12),
         Constraint::Length(7),
-        Constraint::Length(7),
+        // Wide enough for "{v:.2} tok/W*" (tokens_per_watt_cell's longest
+        // rendering) so the held marker never gets clipped mid-unit.
+        Constraint::Length(12),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(7),
@@ -461,7 +461,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
     lines.push(Line::from(vec![
         Span::styled("tok/W ", Style::default().fg(theme.muted)),
         Span::styled(
-            format::tokens_per_watt(inst.tokens_per_watt),
+            format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref()),
             Style::default().fg(theme.accent),
         ),
         Span::styled(" · gen ", Style::default().fg(theme.muted)),
@@ -713,7 +713,10 @@ fn render_summary(
             Span::raw("  "),
             Span::styled("tok/W: ", muted),
             Span::styled(
-                format::tokens_per_watt(inst.tokens_per_watt),
+                format::tokens_per_watt_cell(
+                    inst.tokens_per_watt,
+                    inst.gen_tps_observation.as_ref(),
+                ),
                 Style::default().fg(theme.accent),
             ),
             Span::raw("  "),
@@ -1329,6 +1332,28 @@ mod tests {
     }
 
     #[test]
+    fn table_held_gen_tps_shows_held_marker_on_tok_w_too() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "held-tpw",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W must carry the held marker in the table; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn table_fresh_gen_tps_has_no_held_marker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1590,6 +1615,28 @@ mod tests {
         assert!(
             out.contains("held"),
             "detail for held instance must show 'held' freshness; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_held_shows_held_marker_on_tok_w() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "held-detail-tpw",
+            Some(100.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(1.5);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("1.50 tok/W*"),
+            "held tok/W must carry the held marker in the detail pane; got:\n{out}"
         );
     }
 

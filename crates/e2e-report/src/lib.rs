@@ -1371,11 +1371,10 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
         p.grid-legend {
             @for (i, (outcome, text)) in LEGEND_ENTRIES.iter().copied().enumerate() {
                 @if i > 0 { " · " }
-                @match outcome {
-                    CellOutcome::Xfail | CellOutcome::UnexpectedFail => {
-                        span class=(outcome.grid_class()) { (outcome.glyph()) }
-                    }
-                    _ => { (outcome.glyph()) }
+                @if outcome.grid_class().is_empty() {
+                    (outcome.glyph())
+                } @else {
+                    span class=(outcome.grid_class()) { (outcome.glyph()) }
                 }
                 " " (text)
             }
@@ -2922,6 +2921,44 @@ mod tests {
                 "html grid legend must explain {glyph:?}:\n{html}"
             );
         }
+    }
+
+    #[test]
+    fn expectation_grid_html_legend_colors_every_red_glyph() {
+        // Every outcome that renders red in the grid (`grid_class() ==
+        // "status-fail"`) must also render red in the legend, not just the
+        // original Xfail/UnexpectedFail pair — Xpass, RanWhenNa, and Absent
+        // are equally `status-fail` in the grid and were previously left as
+        // plain, uncoloured glyphs in the legend.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+
+        let html = expectation_grid_html(&inputs).into_string();
+        for glyph in ["⚠️XPASS", "⚠️n/a-ran", "⚠️no-result", "❌FAIL"] {
+            let needle = format!("class=\"status-fail\">{glyph}</span>");
+            assert!(
+                html.contains(&needle),
+                "legend must colour {glyph:?} status-fail:\n{html}"
+            );
+        }
+        // The known-bug xfail glyph is styled grey (status-xfail), not red.
+        assert!(
+            html.contains("class=\"status-xfail\">✗</span>"),
+            "legend must colour the xfail glyph status-xfail:\n{html}"
+        );
+        // Genuinely unstyled outcomes stay bare glyphs, not empty-class spans.
+        assert!(
+            !html.contains("class=\"\">"),
+            "unstyled legend glyphs must not be wrapped in an empty-class span:\n{html}"
+        );
     }
 
     #[test]

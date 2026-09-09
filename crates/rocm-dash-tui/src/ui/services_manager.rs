@@ -24,7 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::metrics::{Instance, ObservationMetadata};
+use rocm_dash_core::metrics::{Instance, ObservationFreshness, ObservationMetadata};
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
@@ -255,9 +255,24 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     }
 
     let rows = service_rows(instances);
+    // Show HELD_LEGEND whenever a listed row would actually render a held
+    // marker via `gen_tps_compact` below — same discipline as
+    // `instances.rs`'s table and `pane.rs`'s running-now list. Unlike those
+    // views, this list has no viewport truncation of its own (no `take(N)`),
+    // so scanning the full `rows` set is exact, not an overcount.
+    let any_held = rows.iter().any(|r| {
+        r.gen_tps.is_some_and(f64::is_finite)
+            && r.gen_tps_observation
+                .as_ref()
+                .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+    });
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(u16::from(any_held)),
+        ])
         .split(inner);
 
     if rows.is_empty() {
@@ -321,6 +336,16 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
         ))),
         body[1],
     );
+
+    if any_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            body[2],
+        );
+    }
 
     // Approval modal sits on top of the list.
     if let Some(pending) = &sm.approval {
@@ -473,6 +498,44 @@ mod tests {
         assert!(out.contains("svc-a"), "service id listed");
         assert!(out.contains("llama3"), "model listed");
         assert!(out.contains("s stop"), "lifecycle hints");
+    }
+
+    #[test]
+    fn snapshot_shows_held_legend_when_a_row_is_held() {
+        use rocm_dash_core::metrics::{InstanceStatus, ObservationFreshness, ObservationMetadata};
+        let mut insts = HashMap::new();
+        insts.insert(
+            "held".into(),
+            Instance {
+                container_id: "held".into(),
+                container_name: "svc-held".into(),
+                model_name: "llama3".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: Some(42.0),
+                gen_tps_observation: Some(ObservationMetadata {
+                    observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                    freshness: ObservationFreshness::Held,
+                }),
+                ..Instance::default()
+            },
+        );
+        let sm = ServicesManagerState::default();
+        let out = render(&sm, &State::default(), &insts);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when a listed service's gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_hides_held_legend_when_no_row_is_held() {
+        let sm = ServicesManagerState::default();
+        let out = render(&sm, &State::default(), &instances());
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when no listed service is held; got:\n{out}"
+        );
     }
 
     #[test]
