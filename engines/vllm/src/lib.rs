@@ -32,7 +32,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+/// Tail budget for the startup-failure summary (and its OOM hint).
+///
+/// Derived from [`DEFAULT_LOG_TAIL_LINES`] rather than spelled as its own
+/// literal so this surface and the CLI's serve summary — which reads the same
+/// protocol constant in `append_oom_serve_note` — cannot drift on what counts as
+/// "the tail" of a failed launch. A change to the protocol budget moves both.
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = DEFAULT_LOG_TAIL_LINES;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).

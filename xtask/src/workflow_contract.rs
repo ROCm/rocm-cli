@@ -242,8 +242,7 @@ mod tests {
     }
 
     /// Every lane that pre-builds `rocm` and hands it to the suite via
-    /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
-    /// enables when it builds for itself.
+    /// `ROCM_CLI_BINARY` must enable `rocm/e2e-test-hooks`.
     ///
     /// The suite's deterministic failure seams (e.g. the scripted Lemonade
     /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
@@ -252,6 +251,14 @@ mod tests {
     /// regressions — but only on whichever lane happens to select them, which is
     /// what made this divergence so hard to read the first time. Pin it here so a
     /// new lane copying an existing block cannot silently reintroduce it.
+    ///
+    /// `cargo xtask e2e` builds a *superset* for itself
+    /// (`rocm/e2e-test-hooks rocm/e2e-oom-fault-injection`), so this asserts the
+    /// shared floor rather than an exact match. The extra
+    /// `e2e-oom-fault-injection` hook is deliberately absent from the prebuilt
+    /// lanes: the scenarios needing it carry `@requires-oom-fault-injection` and
+    /// the harness skips them when `xtask` did not build the binary itself, so a
+    /// missing hook is a reported skip rather than a silent green.
     fn assert_prebuilt_e2e_lanes_enable_test_hooks(workflow: &str, text: &str) {
         let blocks: Vec<_> = multiline_run_blocks(text)
             .into_iter()
@@ -267,9 +274,9 @@ mod tests {
                     "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks"
                 ),
                 "{workflow} prebuilt E2E lane must build with \
-                 `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                 `--features rocm/e2e-test-hooks`, the hook floor `cargo xtask e2e` \
+                 also builds for itself; without it the suite's scripted failure \
+                 seams are compiled out:\n{block}"
             );
         }
     }

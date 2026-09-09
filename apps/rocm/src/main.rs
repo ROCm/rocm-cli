@@ -5134,19 +5134,28 @@ fn serve(args: ServeArgs) -> Result<()> {
     // Reusing an already-running managed service launches nothing and pins no
     // GPU, so it must bypass the GPU-required pre-flight below — the reused
     // service was already vetted at its own launch, and this invocation does no
-    // GPU work. Detect that here, but only when a live managed service for this
-    // engine already exists (so the common launch path keeps failing fast before
-    // any engine work) and the model ref can be canonicalized (a runtime/env is
-    // available, or the engine manages its own). Without a runtime we cannot
-    // resolve, so we fall through and the pre-flight refuses the no-GPU /
-    // no-runtime case with its usual message.
+    // GPU work. Detect that here, but only when a live managed service that
+    // plausibly serves *this* model already exists, and when the model ref can be
+    // canonicalized (a runtime/env is available, or the engine manages its own).
+    // Without a runtime we cannot resolve, so we fall through and the pre-flight
+    // refuses the no-GPU / no-runtime case with its usual message.
+    //
+    // The pre-gate matches on the model, not just the engine: everything inside
+    // this block is real engine work (a `ResolveModel` round-trip, and for a
+    // self-managing engine an `ensure_self_managed_engine_ready` that can print
+    // "Preparing <engine> for GPU serving..." and install), so gating on the
+    // engine alone let a live service for an *unrelated* model — one this
+    // invocation can never reuse — drag that work ahead of the no-usable-GPU
+    // bail on a GPU-less host.
     let mut resolved_model: Option<ResolveModelResponse> = None;
     let mut reuse_existing = false;
     let can_resolve_model = !cpu_only
         && (resolved_selection.runtime_id.is_some()
             || resolved_selection.env_id.is_some()
             || engine_manages_own_runtime(&selected_engine));
-    if can_resolve_model && any_live_managed_service_for_engine(&paths, &selected_engine) {
+    if can_resolve_model
+        && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
+    {
         if engine_manages_own_runtime(&selected_engine) {
             ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
         }
@@ -5168,11 +5177,20 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_model = Some(probe);
     }
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
-    // BEFORE preparing or launching any engine (no wasted engine download, and an
-    // actionable message instead of a late engine crash). The engine enforces the
-    // same rule as a backstop. Skipped for cpu_only and when reusing an
-    // already-running service (nothing is launched); permissive when availability
-    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // before preparing or launching any engine for *this* model (no wasted engine
+    // download, and an actionable message instead of a late engine crash). The
+    // engine enforces the same rule as a backstop.
+    //
+    // The precise contract, since the reuse detection above is the one thing that
+    // can precede this bail: engine work runs first only when a live managed
+    // service already matches this engine and model — i.e. only when this
+    // invocation is about to reuse it and legitimately skip the bail. When no such
+    // service exists (the ordinary launch, and every no-GPU refusal path) the
+    // block above is skipped entirely and this is still the first thing that runs.
+    //
+    // Skipped for cpu_only and when reusing an already-running service (nothing is
+    // launched); permissive when availability cannot be probed on this platform
+    // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
     // test reaches Lemonade's backend boundary without real GPU hardware, and the
     // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
@@ -16609,16 +16627,32 @@ fn existing_live_managed_service(
         })
 }
 
-/// Whether any managed service for `engine` is currently live, without needing a
-/// canonical model id. Used as a cheap pre-gate before resolving a model purely
-/// to detect a reusable already-running service: when no live service for the
-/// engine exists, the reuse check (and its `ResolveModel` round-trip) is skipped
-/// and the normal launch pre-flight runs unchanged.
-fn any_live_managed_service_for_engine(paths: &AppPaths, engine: &str) -> bool {
+/// Whether a live managed service for `engine` plausibly already serves
+/// `model_ref`, decided from the records alone — no canonical model id, and so
+/// no engine round-trip, required.
+///
+/// Cheap pre-gate for the reuse detection in `serve`. Everything that check does
+/// is real engine work: a `ResolveModel` round-trip and, for a self-managing
+/// engine, an [`ensure_self_managed_engine_ready`] that may print
+/// "Preparing <engine> for GPU serving..." and install. That work runs ahead of
+/// the no-usable-GPU pre-flight, so it must be reserved for invocations that can
+/// actually reuse something: keying on the engine alone let a live service for an
+/// unrelated model pull an install in front of the bail on a GPU-less host.
+///
+/// Matching uses [`service_model_names_match`] — the same lenient relation the
+/// service-listing surfaces already use to tie a user-typed name to a record — so
+/// a short-vs-canonical spelling still reaches the probe. The probe then decides
+/// reuse authoritatively on the canonical id via
+/// [`existing_live_managed_service`]; this only decides whether asking is worth
+/// the engine round-trip.
+fn any_live_managed_service_for_model(paths: &AppPaths, engine: &str, model_ref: &str) -> bool {
     load_managed_services(paths).is_ok_and(|records| {
-        records
-            .iter()
-            .any(|record| record.engine == engine && managed_service_is_live(record))
+        records.iter().any(|record| {
+            record.engine == engine
+                && (service_model_names_match(&record.model_ref, model_ref)
+                    || service_model_names_match(&record.canonical_model_id, model_ref))
+                && managed_service_is_live(record)
+        })
     })
 }
 
@@ -24699,6 +24733,136 @@ install therock";
         let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
         assert!(found.is_none());
+    }
+
+    /// Write one live managed record and report what the reuse pre-gate makes of
+    /// a serve for `queried_model_ref`.
+    fn reuse_pregate_for(
+        label: &str,
+        record_model_ref: &str,
+        record_canonical_model_id: &str,
+        queried_engine: &str,
+        queried_model_ref: &str,
+    ) -> Result<bool> {
+        let (root, paths) = test_paths(label);
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            format!("lemonade-{label}"),
+            "lemonade",
+            record_model_ref,
+            record_canonical_model_id,
+            "127.0.0.1",
+            11_520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+
+        let gated = any_live_managed_service_for_model(&paths, queried_engine, queried_model_ref);
+        let _ = fs::remove_dir_all(root);
+        Ok(gated)
+    }
+
+    #[test]
+    fn reuse_pregate_skips_engine_work_for_an_unrelated_live_model() -> Result<()> {
+        // EAI-8059 review: the reuse probe runs a `ResolveModel` round-trip and,
+        // for a self-managing engine, an install that prints "Preparing ... for
+        // GPU serving" — all of it ahead of the no-usable-GPU bail. Keying the
+        // pre-gate on the engine alone let a live service for a model this
+        // invocation can never reuse pull that work in front of the bail. Gating
+        // on the model keeps the fail-fast contract true.
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-model",
+                "other",
+                "other-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "a live service for an unrelated model must not unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_same_model_including_a_short_spelling() -> Result<()> {
+        // The probe must still be reached for anything that could genuinely be
+        // reused, so the gate must not narrow reuse detection: an exact ref, a
+        // canonical-id-only match, and a short-vs-canonical spelling all pass.
+        // The probe then decides reuse authoritatively on the canonical id.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-exact",
+                "qwen",
+                "qwen-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "the same raw model ref must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-canonical",
+                "some-alias",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "Qwen/Qwen3-8B",
+            )?,
+            "a canonical-id match must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-short",
+                "Qwen/Qwen3-8B",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "qwen3-8b",
+            )?,
+            "a short spelling of the same model must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_model_id_the_oom_reuse_scenario_plants() -> Result<()> {
+        // `@id:serve-oom-memory-guidance` plants a live record for this exact id
+        // and then serves it, relying on the reuse short-circuit to reach the
+        // summary on a GPU-less host. That scenario only runs on the
+        // `@requires-no-gpu` mock lane, so pin the pre-gate's verdict for its
+        // literal model id here too: a matcher change that silently turned the
+        // scenario into a launch attempt would otherwise only show up there.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-e2e-oom",
+                "e2e/oom-model",
+                "e2e/oom-model",
+                "lemonade",
+                "e2e/oom-model",
+            )?,
+            "the OOM reuse scenario's planted service must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_still_keys_on_the_engine() -> Result<()> {
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-engine",
+                "qwen",
+                "qwen-canonical",
+                "vllm",
+                "qwen",
+            )?,
+            "a live service for a different engine must not unlock the reuse probe"
+        );
+        Ok(())
     }
 
     #[test]
