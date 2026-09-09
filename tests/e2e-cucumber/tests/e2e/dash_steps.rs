@@ -257,6 +257,34 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the dashboard reports live WSL GPU telemetry")]
+async fn wsl_gpu_telemetry_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_detail_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    let budget = default_timeout();
+    let deadline = Instant::now() + budget;
+    loop {
+        let screen = tui.screen_text();
+        let nonzero_gpu_count = screen
+            .lines()
+            .any(|line| line.contains("GPUs · ") && !line.contains("GPUs · 0"));
+        if nonzero_gpu_count
+            && screen.contains("Node throughput ·")
+            && !screen.contains("Unknown GPU")
+            && !screen.contains("amd-smi unavailable")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ROCM-29846: WSL GPU telemetry did not appear within {budget:?}:\n{screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[then("ROCm setup actions are displayed")]
 async fn rocm_actions_displayed(world: &mut E2eWorld) {
     session(world)

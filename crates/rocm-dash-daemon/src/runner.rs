@@ -74,14 +74,14 @@ pub struct RunnerOptions {
     /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
     /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
     pub amd_smi_binary: Option<OsString>,
-    /// **Test-only.** Skip the mandatory `/dev/kfd` pre-flight in amd-smi
+    /// **Test-only.** Skip the mandatory GPU-device pre-flight in amd-smi
     /// detection so a *fake* `amd_smi_binary` is actually invoked on a GPU-less
     /// CI host instead of short-circuiting to "no GPU". Never set in
-    /// production: the KFD guard prevents a *real* `amd-smi` from hanging in
+    /// production: the device guard prevents a *real* `amd-smi` from hanging in
     /// uninterruptible D-state. Only the daemon integration test that points
     /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
     /// off-critical-path detection behaviour is genuinely exercised.
-    pub amd_smi_skip_kfd_preflight: bool,
+    pub amd_smi_skip_device_preflight: bool,
 }
 
 impl Default for RunnerOptions {
@@ -101,7 +101,7 @@ impl Default for RunnerOptions {
             persist_dir: None,
             services_dir: None,
             amd_smi_binary: None,
-            amd_smi_skip_kfd_preflight: false,
+            amd_smi_skip_device_preflight: false,
         }
     }
 }
@@ -219,13 +219,13 @@ pub async fn run_loop(
     // the loop starts ticking immediately (surfacing serving instances within
     // one discovery tick) and GPU metrics fill in the moment detection lands.
     let amd_smi_binary = opts.amd_smi_binary.clone();
-    let amd_smi_skip_kfd_preflight = opts.amd_smi_skip_kfd_preflight;
+    let amd_smi_skip_device_preflight = opts.amd_smi_skip_device_preflight;
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
     tokio::spawn(async move {
         let gpu = match amd_smi_binary {
-            Some(binary) if amd_smi_skip_kfd_preflight => {
-                AmdSmiCollector::detect_with_binary_skipping_kfd_preflight(binary).await
+            Some(binary) if amd_smi_skip_device_preflight => {
+                AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
             Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
             None => AmdSmiCollector::detect().await,
@@ -273,7 +273,7 @@ pub async fn run_loop(
                         );
                     } else {
                         warn!(
-                            "amd-smi not available (no /dev/kfd or `amd-smi version` failed); GPU disabled"
+                            "amd-smi not available (no accessible GPU device or `amd-smi version` failed); GPU disabled"
                         );
                     }
                     gpu = detected;
@@ -305,7 +305,7 @@ pub async fn run_loop(
                 }
             }
         } else if gpu_init_done {
-            warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+            warnings.push("amd-smi unavailable (GPU device inaccessible or probe failed)".into());
             Vec::new()
         } else {
             // Detection is still in flight (spawned off the critical path), so
