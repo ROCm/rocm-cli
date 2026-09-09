@@ -9601,7 +9601,7 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
 ///
 /// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
 /// and stdin is not a terminal, the piped text becomes the prompt. Returns
-/// `None` when stdin is an interactive TTY or the piped input is empty, so the
+/// `None` when stdin is an interactive TTY or the piped input is blank, so the
 /// caller falls back to the status screen instead of blocking on input nobody
 /// can supply.
 fn read_piped_prompt() -> Result<Option<String>> {
@@ -9614,12 +9614,31 @@ fn read_piped_prompt() -> Result<Option<String>> {
     std::io::stdin()
         .read_to_string(&mut buf)
         .context("failed to read chat prompt from standard input")?;
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_owned()))
+    Ok(piped_prompt_from_input(&buf))
+}
+
+/// Turn raw piped stdin into a chat prompt, or `None` when there is nothing to
+/// send.
+///
+/// `--prompt` reaches the send path verbatim, so a piped prompt must too:
+/// leading indentation and trailing spaces or tabs carry meaning for a model and
+/// are preserved byte for byte. The only thing removed is the line ending the
+/// writer appends — a single trailing `\n`, plus the `\r` in front of it on
+/// Windows — because `echo "…" |` and `printf '…\n' |` add it, not the user.
+/// Further blank lines stay: the second newline of `printf 'a\n\n'` is authored
+/// content, not shell punctuation.
+///
+/// `trim()` is used only to classify the input: whitespace-only stdin (an empty
+/// pipe, or a bare newline) holds no prompt and yields `None`.
+fn piped_prompt_from_input(input: &str) -> Option<String> {
+    if input.trim().is_empty() {
+        return None;
     }
+    let prompt = match input.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+        None => input,
+    };
+    Some(prompt.to_owned())
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
@@ -29914,5 +29933,58 @@ ID_LIKE="suse opensuse"
             body.contains("read_piped_prompt("),
             "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
         );
+    }
+
+    #[test]
+    fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {
+        // A piped prompt must reach the send path byte-identical to the same
+        // text passed with `--prompt`, which is forwarded verbatim. Only the
+        // line ending the writer appends is dropped; indentation and trailing
+        // spaces or tabs are content and have to survive.
+        assert_eq!(
+            piped_prompt_from_input("    indented line\n"),
+            Some("    indented line".to_owned()),
+            "leading indentation must survive; only the trailing newline goes"
+        );
+        assert_eq!(
+            piped_prompt_from_input("trailing spaces matter   \n"),
+            Some("trailing spaces matter   ".to_owned()),
+            "trailing spaces must survive the trailing-newline strip"
+        );
+        assert_eq!(
+            piped_prompt_from_input("\tleading tab"),
+            Some("\tleading tab".to_owned()),
+            "input without a trailing newline must pass through unchanged"
+        );
+        assert_eq!(
+            piped_prompt_from_input("crlf line\r\n"),
+            Some("crlf line".to_owned()),
+            "a Windows line ending must be stripped as one unit"
+        );
+        assert_eq!(
+            piped_prompt_from_input("fn main() {\n    body\n}\n"),
+            Some("fn main() {\n    body\n}".to_owned()),
+            "interior newlines and indentation must survive"
+        );
+        assert_eq!(
+            piped_prompt_from_input("blank line below\n\n"),
+            Some("blank line below\n".to_owned()),
+            "only one trailing line ending is shell punctuation; the rest is content"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_treats_whitespace_only_input_as_no_prompt() {
+        // The fallback that keeps the no-argument behavior intact: an empty
+        // pipe, a bare newline, or blank padding carries no prompt, so the
+        // caller must see `None` and render the status screen instead of
+        // sending whitespace to a model.
+        for input in ["", "\n", "\r\n", "   ", "  \t \n\n", "\n\n\n"] {
+            assert_eq!(
+                piped_prompt_from_input(input),
+                None,
+                "whitespace-only stdin must yield no prompt; input: {input:?}"
+            );
+        }
     }
 }

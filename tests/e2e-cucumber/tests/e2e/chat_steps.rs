@@ -7,6 +7,17 @@ use e2e_cucumber::mock_server::MockServer;
 
 use crate::E2eWorld;
 
+/// The exact bytes `user_pipes_oneshot_chat` writes to the CLI's stdin. The
+/// leading indentation and the trailing space are content — a model reads them,
+/// the same as it would from `--prompt` — while the final newline is what
+/// `echo "…" |` appends, so only that may be stripped.
+const PIPED_PROMPT_STDIN: &str = "    Hello, indented and trailing-spaced \n";
+
+/// `PIPED_PROMPT_STDIN` minus the one line ending the writer appended: what the
+/// CLI must send byte for byte, so a piped prompt equals the same text passed
+/// with `--prompt`. Kept next to the input so the two cannot drift apart.
+const PIPED_PROMPT_SENT: &str = "    Hello, indented and trailing-spaced ";
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a model is being served")]
@@ -86,11 +97,13 @@ async fn user_pipes_oneshot_chat(world: &mut E2eWorld) {
     // documented `echo "…" | rocm chat` path. `run_rocm_with_stdin` pipes stdin,
     // so the child sees a non-terminal stdin and must read the prompt from it.
     // Passing the served model id avoids depending on default-model resolution.
+    // The prompt carries indentation, a trailing space, and the newline `echo`
+    // adds, so the `Then` step can prove which of those the CLI forwards.
     let model = world.model_name.clone().expect("no model name set");
     let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
         world,
         &["chat", "--provider", "local", "--model", &model],
-        "Hello",
+        PIPED_PROMPT_STDIN,
         &[],
     );
     assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
@@ -144,6 +157,38 @@ async fn assert_cli_prints_reply(world: &mut E2eWorld) {
     assert!(
         output.contains("mock response"),
         "chat CLI output does not contain the assistant reply:\n{output}"
+    );
+}
+
+#[then("the model receives the piped prompt with its whitespace intact")]
+async fn piped_chat_request_kept_whitespace(world: &mut E2eWorld) {
+    // The canned reply never varies with the prompt, so printing it proves only
+    // that stdin reached the send path, not that it arrived unaltered — trimming
+    // the piped text would still pass. Assert on the request the mock recorded:
+    // the model must see the piped prompt byte for byte, minus the single line
+    // ending the writer appended. The CLI process has already exited by now and
+    // the mock records the body before it answers, so the snapshot is final and
+    // needs no polling.
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .last_chat_request()
+        .unwrap_or_else(|| panic!("the mock never received a chat request"));
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"));
+    let last_user_content = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no user message found in chat request:\n{body}"));
+    assert_eq!(
+        last_user_content, PIPED_PROMPT_SENT,
+        "the piped prompt reached the model altered; full request:\n{body}"
     );
 }
 
