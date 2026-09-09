@@ -1088,8 +1088,33 @@ fn prepare_embeddable(
     env_root: Option<&Path>,
     reinstall: bool,
 ) -> Result<LemonadeInstallManifest> {
+    prepare_embeddable_with(
+        paths,
+        env_root,
+        reinstall,
+        rocm_deps::LEMONADE_VERSION,
+        embeddable_archive_sha256(),
+        download_file,
+    )
+}
+
+/// Same as [`prepare_embeddable`], but with the archive version, its expected
+/// sha256, and the download step all injectable — the seam a test uses to
+/// exercise the real decision of which source `installed_version` trusts,
+/// rather than reimplementing that decision inline.
+fn prepare_embeddable_with<F>(
+    paths: &AppPaths,
+    env_root: Option<&Path>,
+    reinstall: bool,
+    version: &str,
+    expected_sha256: &str,
+    download: F,
+) -> Result<LemonadeInstallManifest>
+where
+    F: FnMut(&str, &Path) -> Result<()>,
+{
     let root = lemonade_root(paths, env_root);
-    let version = rocm_deps::LEMONADE_VERSION.to_owned();
+    let version = version.to_owned();
     let archive_name = embeddable_archive_name(&version);
     let archive_url = embeddable_url(&version);
     let downloads = root.join("downloads");
@@ -1097,12 +1122,7 @@ fn prepare_embeddable(
     fs::create_dir_all(&downloads)?;
     // Held until the archive bytes have been extracted and copied out: the
     // verified bytes and the extracted bytes must be the same read.
-    let archive_guard = ensure_cached_archive(
-        &archive_url,
-        &archive,
-        embeddable_archive_sha256(),
-        download_file,
-    )?;
+    let archive_guard = ensure_cached_archive(&archive_url, &archive, expected_sha256, download)?;
     let runtime_dir = runtime_dir_in(&root);
     // The runtime directory is not version-scoped, so a bump downloads a new
     // archive into a tree that already holds `lemond` from the previous
@@ -5048,16 +5068,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_version_marker_survives_without_a_manifest() {
-        // The regression this guards: an isolated caller (e.g. a data dir that
-        // has never seen this runtime tree before) must still recognize a
-        // runtime tree extracted by a *different* caller sharing the same
-        // tree, or `prepare_embeddable` wipes and re-extracts it on every
-        // call. Goes through `installed_runtime_version`/`record_runtime_version`
-        // (the exact functions `prepare_embeddable` calls) rather than
-        // reimplementing their read/write, so reverting either production
-        // function to source the version from the manifest instead fails
-        // this test.
+    fn runtime_version_marker_round_trips_through_needs_extraction() {
+        // Unit coverage for the helpers themselves and their wiring into
+        // `needs_extraction` — NOT a regression test for the bug this marker
+        // fixes (see `prepare_embeddable_trusts_the_runtime_tree_over_an_absent_manifest`
+        // below for that): this never calls `prepare_embeddable`, so it can't
+        // constrain which source it reads `installed_version` from.
         let dir = tempfile::tempdir().unwrap();
         let runtime_dir = dir.path();
 
@@ -5078,6 +5094,58 @@ mod tests {
             "7.14.0",
             true
         ));
+    }
+
+    #[test]
+    fn prepare_embeddable_trusts_the_runtime_tree_over_an_absent_manifest() {
+        // The actual regression: `prepare_embeddable` must source
+        // `installed_version` from the marker inside `runtime_dir`, not from
+        // `paths`' manifest. An isolated caller (fresh `AppPaths`, no
+        // manifest on disk) sharing a runtime tree that a *different* caller
+        // already extracted must recognize it as current and skip
+        // re-extraction. Reverting to a manifest read (the original bug)
+        // makes every isolated caller miss, wipe, and re-extract — destroying
+        // any llama.cpp backend already installed there. Calling
+        // `prepare_embeddable_with` (the real function, seamed for an
+        // injectable download step) rather than reimplementing its decision
+        // inline is what makes this test fail under that reversion.
+        let env_root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: env_root.path().join("config"),
+            data_dir: env_root.path().join("data"), // no manifest ever written here
+            cache_dir: env_root.path().join("cache"),
+        };
+        let version = "7.13.0";
+        let root = lemonade_root(&paths, Some(env_root.path()));
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(lemond_path_in(&runtime_dir), b"fake lemond").unwrap();
+        fs::write(lemonade_path_in(&runtime_dir), b"fake lemonade").unwrap();
+        record_runtime_version(&runtime_dir, version).unwrap();
+        let sentinel = runtime_dir.join("llamacpp-rocm-backend.sentinel");
+        fs::write(&sentinel, b"a backend a prior scenario installed").unwrap();
+
+        let archive_bytes = b"never parsed unless extraction wrongly triggers";
+        let expected_sha256 = format!("{:x}", Sha256::digest(archive_bytes));
+
+        let manifest = prepare_embeddable_with(
+            &paths,
+            Some(env_root.path()),
+            false,
+            version,
+            &expected_sha256,
+            |_, destination| {
+                fs::write(destination, archive_bytes)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(manifest.version, version);
+        assert!(
+            sentinel.is_file(),
+            "prepare_embeddable wiped the shared runtime tree instead of recognizing it as current"
+        );
     }
 
     #[test]
