@@ -4311,6 +4311,12 @@ fn wheel_runtime_key(
         hasher.update([0]);
         hasher.update(package_spec.as_bytes());
     }
+    hasher.update([0]);
+    hasher.update(b"rocm-sdk-target");
+    if let Some(target) = &composition.rocm_sdk_target {
+        hasher.update([0]);
+        hasher.update(target.as_bytes());
+    }
     let fingerprint = format!("{:x}", hasher.finalize());
     slugify(&format!(
         "{}-wheel-multi-arch-{version}-{}",
@@ -6021,6 +6027,8 @@ echo Python 3.12.10
             package_specs: base.package_specs.clone(),
             rocm_sdk_target: base.rocm_sdk_target.clone(),
         };
+        let mut legacy_probe_default = base.clone();
+        legacy_probe_default.rocm_sdk_target = None;
 
         let base_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base);
 
@@ -6039,6 +6047,11 @@ echo Python 3.12.10
             base_key,
             wheel_runtime_key(TheRockChannel::Release, "7.14.0", &other_payload),
             "a different device payload is a different runtime, not an overwrite"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &legacy_probe_default,),
+            "a runtime probed without the exact SDK target must be repaired side by side"
         );
         assert_ne!(
             base_key,
