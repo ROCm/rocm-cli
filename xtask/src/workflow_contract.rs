@@ -119,6 +119,34 @@ mod tests {
         items.into_iter().filter(|item| !item.is_empty()).collect()
     }
 
+    /// Recover the canonical (default/fallback) label list from a dynamic
+    /// `runs-on: ${{ fromJSON(...) }}` expression, so a job whose runner
+    /// depends on `github.event_name`/`inputs.*` (e.g. the pooled Linux GPU
+    /// lane, which a scoped `workflow_dispatch` can override to one specific
+    /// box) is still recognized as self-hosted and documented under the label
+    /// set it actually uses on push/pull_request/merge_group — every
+    /// conditional branch before it is guarded by an `inputs.platform` check
+    /// that is false for those triggers, so the LAST single-quoted JSON array
+    /// literal in the expression is always the unconditional fallback.
+    ///
+    /// A job with a plain literal `runs-on` (no `fromJSON(`) is returned
+    /// unchanged.
+    fn canonical_runs_on(value: &str) -> String {
+        if !value.contains("fromJSON(") {
+            return value.to_owned();
+        }
+        let literal = value
+            .rsplit('\'')
+            .find(|s| s.trim_start().starts_with('['))
+            .unwrap_or_else(|| {
+                panic!("no quoted JSON array literal found in dynamic runs-on: {value}")
+            });
+        let labels: Vec<String> = serde_json::from_str(literal).unwrap_or_else(|e| {
+            panic!("dynamic runs-on literal `{literal}` is not a JSON array of strings: {e}")
+        });
+        format!("[{}]", labels.join(", "))
+    }
+
     /// Extract the top-level `concurrency.group` value, joining folded (`>-`)
     /// continuation lines. Returns the whole group expression as one string.
     fn concurrency_group(text: &str) -> String {
@@ -325,7 +353,7 @@ mod tests {
                 );
                 // A job without a runs-on (e.g. one that only `uses:` a
                 // reusable workflow) schedules nothing self-hosted.
-                let runs_on = values.pop()?.trim().to_owned();
+                let runs_on = canonical_runs_on(values.pop()?.trim());
                 let labels = flattened_list_items(&runs_on);
                 SELF_HOSTED_LABELS
                     .iter()
@@ -718,11 +746,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             values.iter().any(|v| v.contains("self-hosted")),
             "e2e-selfhosted.yml must schedule at least one `self-hosted` runner (EAI-7548)"
         );
-        for job in [
-            "e2e-gpu:",
-            "e2e-gpu-strix-ubuntu:",
-            "e2e-gpu-strix-windows:",
-        ] {
+        for job in ["e2e-gpu-linux:", "e2e-gpu-strix-windows:"] {
             assert!(
                 sh.contains(job),
                 "e2e-selfhosted.yml must define the self-hosted job `{job}` (EAI-7548)"
