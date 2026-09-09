@@ -1408,19 +1408,25 @@ async fn main() {
     // where it is not; it is also no slower, because starvation costs more than
     // the extra concurrency buys.
     //
-    // `E2E_MAX_CONCURRENT` overrides it, for bisecting a lane whose failures
-    // look like contention rather than behaviour.
-    let max_concurrent = std::env::var("E2E_MAX_CONCURRENT")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
-                1
-            } else {
+    // `E2E_MAX_CONCURRENT` overrides the MOCK lane's ceiling, for bisecting a
+    // lane whose failures look like contention rather than behaviour. It cannot
+    // raise a serialized lane: the `1` above is a correctness requirement, not
+    // a tuning choice, so it is applied AFTER the override rather than inside
+    // the fallback. Two multi-GiB installs racing one shared runtimes tree, or
+    // two serves racing one port and one GPU's VRAM, is what that `1` prevents.
+    let serialize =
+        cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some();
+    let max_concurrent = if serialize {
+        1
+    } else {
+        std::env::var("E2E_MAX_CONCURRENT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
                 std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 6))
-            }
-        });
+            })
+    };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every

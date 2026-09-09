@@ -1055,17 +1055,30 @@ async fn user_stops_running_server(world: &mut E2eWorld) {
         .path()
         .join("data")
         .join("services");
-    let service_id = std::fs::read_dir(&root)
+    let recorded: Vec<String> = std::fs::read_dir(&root)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
-        .find_map(|entry| {
+        .filter_map(|entry| {
             let bytes = std::fs::read(entry.path()).ok()?;
             let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             Some(record.get("service_id")?.as_str()?.to_owned())
         })
-        .unwrap_or_else(|| panic!("no managed service recorded under {}", root.display()));
+        .collect();
+    // Exactly one, not the first `read_dir` happens to yield. Directory order is
+    // unspecified, so with a second record present — a retried serve's leftover,
+    // or a planted mock alongside a real one — taking the first would stop an
+    // arbitrary service and the assertion that follows would judge that
+    // unrelated stop.
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected exactly one managed service under {} so there is no doubt which one is being \
+         stopped, found {recorded:?}",
+        root.display()
+    );
+    let service_id = recorded.into_iter().next().expect("length checked above");
     let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "stop", &service_id, "--yes"]);
     world.cli_output = Some(format!("{stdout}{stderr}"));
     world.cli_rc = Some(rc);
@@ -1073,12 +1086,23 @@ async fn user_stops_running_server(world: &mut E2eWorld) {
 
 #[when("the user removes the CLI's managed files")]
 async fn user_removes_managed_files(world: &mut E2eWorld) {
-    // `--keep-binaries` is what keeps this safe to run on a shared runner: the
-    // config, data and cache directories are this scenario's own temporary ones,
-    // so the removal is real but reaches nothing outside the scenario. It does
-    // not weaken the scenario — whether the CLI stops what it manages has
-    // nothing to do with whether it also deletes the program.
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["uninstall", "--yes", "--keep-binaries"]);
+    // `--keep-binaries` and `--keep-cache` are what keep this safe to run on a
+    // shared runner. Config and data ARE this scenario's own temporary ones, so
+    // removing them is real and reaches nothing outside the scenario. The cache
+    // is NOT: `isolate_env` points `ROCM_CLI_CACHE_DIR` at the persistent
+    // `E2E_SHARED_CACHE_DIR` whenever CI provides one, which every GPU lane
+    // does — and this scenario is `@requires-os:linux`, so it runs there.
+    // Without `--keep-cache` the uninstall would delete the shared download
+    // cache out from under every later scenario AND every later run.
+    //
+    // Neither flag weakens the scenario: what it asserts is whether the CLI
+    // stops the servers it manages, which has nothing to do with whether it
+    // also deletes the program or the download cache. The records it must not
+    // orphan live under the data dir, which is still removed.
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["uninstall", "--yes", "--keep-binaries", "--keep-cache"],
+    );
     world.cli_output = Some(format!("{stdout}{stderr}"));
     world.cli_rc = Some(rc);
 }
@@ -1200,6 +1224,15 @@ async fn given_default_serve_address_taken(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("could not take the default serve address: {e}"));
     // Held on the World so it stays taken for the whole scenario and is released
     // with it.
+    //
+    // Safe only because this scenario is `@requires-gpu`, and every GPU lane is
+    // serialized to one scenario at a time. `ensure_serve_port_free` clears the
+    // port with `fuser -k`/`kill -9`, and from the moment this listener exists
+    // the process holding that port is the cucumber binary itself — so a
+    // concurrent scenario calling it would kill the whole suite mid-run. The
+    // serialization is enforced in `e2e.rs` and cannot be lifted by
+    // `E2E_MAX_CONCURRENT`; if that ever changes, this needs an ephemeral port
+    // rather than the shared default.
     world.occupied_address = Some(listener);
 }
 

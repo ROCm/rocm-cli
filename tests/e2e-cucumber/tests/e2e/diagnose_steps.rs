@@ -714,13 +714,40 @@ fn proposed_group_command(text: &str) -> Option<String> {
         })
 }
 
-/// The group names in a `-G a,b` argument of a proposed command.
+/// The group names a proposed command would add the user to.
+///
+/// Reads both spellings of the flag, and both of its forms: `-G a,b` /
+/// `--groups a,b` as separate tokens, and `-aG a,b` where the flag is bundled
+/// with another. [`proposed_group_command`] matches any line containing `-G`,
+/// which includes all of them — so recognising only the separate `-G` token
+/// would return NOTHING for a reworded command, and an empty list compares
+/// equal to another empty list. Both callers then pass while measuring nothing.
+/// The callers additionally reject an empty result, so a form not handled here
+/// fails loudly instead.
 fn groups_in_command(command: &str) -> Vec<String> {
-    command
-        .split_whitespace()
-        .skip_while(|token| *token != "-G")
-        .nth(1)
-        .unwrap_or_default()
+    let mut tokens = command.split_whitespace();
+    let names = loop {
+        let Some(token) = tokens.next() else {
+            return Vec::new();
+        };
+        // `-G`/`--groups` take the list as the NEXT token; a bundled `-aG` may
+        // carry it directly (`-aGrender,video`) or in the next token.
+        if token == "-G" || token == "--groups" {
+            break tokens.next().unwrap_or_default();
+        }
+        if let Some(rest) = token.strip_prefix("--groups=") {
+            break rest;
+        }
+        if token.starts_with('-') && !token.starts_with("--") && token.contains('G') {
+            let (_, rest) = token.split_at(token.find('G').expect("checked above") + 1);
+            break if rest.is_empty() {
+                tokens.next().unwrap_or_default()
+            } else {
+                rest
+            };
+        }
+    };
+    names
         .trim_matches('"')
         .split(',')
         .filter(|name| !name.trim().is_empty())
@@ -792,9 +819,23 @@ async fn assert_remedy_command_agrees(world: &mut E2eWorld) {
     // Compare the groups rather than the whole line: the two renderings name the
     // user differently (one leaves `$USER` for the shell, the other resolves it),
     // and that difference is presentation, not disagreement about the remedy.
+    let diagnosis_groups = groups_in_command(&from_diagnosis);
+    let preview_groups = groups_in_command(&from_preview);
+    // Two empty lists compare equal. Without this the scenario would pass — and
+    // its expectation row would go stale — the moment a reworded command stopped
+    // being parsed, while the divergence it exists to measure went unread.
+    for (side, groups, line) in [
+        ("diagnosis", &diagnosis_groups, &from_diagnosis),
+        ("fix preview", &preview_groups, &from_preview),
+    ] {
+        assert!(
+            !groups.is_empty(),
+            "no group names could be read out of the {side}'s command, so the two sides cannot \
+             be compared. This is a harness read failure, not a verdict:\n  {line}"
+        );
+    }
     assert_eq!(
-        groups_in_command(&from_diagnosis),
-        groups_in_command(&from_preview),
+        diagnosis_groups, preview_groups,
         "the diagnosis and the fix preview would add the user to different groups:\n  \
          diagnosis: {from_diagnosis}\n  preview:   {from_preview}"
     );
@@ -927,8 +968,25 @@ async fn assert_named_groups_exist(world: &mut E2eWorld) {
     });
     let command = proposed_group_command(&cause)
         .unwrap_or_else(|| panic!("the diagnosis proposed no group command:\n{cause}"));
+    let proposed = groups_in_command(&command);
+    // Both sides are guarded because an empty either side makes the check below
+    // vacuous: no proposed groups means nothing is tested, and no known groups
+    // means everything is reported unknown. `machine_group_names` swallows a
+    // read error into an empty list, so the second is a real possibility on a
+    // host where `/etc/group` cannot be read — a harness failure that must not
+    // be reported as the product naming groups that do not exist.
+    assert!(
+        !proposed.is_empty(),
+        "no group names could be read out of the proposed command, so nothing was checked. \
+         This is a harness read failure, not a verdict:\n  {command}"
+    );
     let known = crate::machine_group_names();
-    let unknown: Vec<String> = groups_in_command(&command)
+    assert!(
+        !known.is_empty(),
+        "this machine's group database could not be read, so no proposed group can be judged \
+         against it. This is a harness read failure, not a verdict:\n  {command}"
+    );
+    let unknown: Vec<String> = proposed
         .into_iter()
         .filter(|group| !known.iter().any(|name| name == group))
         .collect();
