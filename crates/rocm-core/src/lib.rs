@@ -3429,10 +3429,6 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn detect_host_therock_family() -> Option<String> {
-    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
-}
-
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
 }
@@ -4017,6 +4013,7 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx1152") => Some("gfx1152".to_owned()),
         value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
         "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
+        value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
         value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
         value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
@@ -4063,6 +4060,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx1152",
         "gfx1153",
         "gfx120X-all",
+        "gfx125X-dcgpu",
     ]
 }
 
@@ -9299,6 +9297,32 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
+        );
+    }
+
+    /// ROCm 10's next layout publishes a `gfx125X-dcgpu` family; the raw
+    /// `gfx1250` arch a host reports has to land on it.
+    #[test]
+    fn normalize_therock_family_maps_gfx1250_to_gfx125x_dcgpu() {
+        assert_eq!(
+            normalize_therock_family("gfx1250"),
+            Some("gfx125X-dcgpu".to_owned())
+        );
+    }
+
+    /// The next tarball catalog names this family `gfx103X-all` while the
+    /// canonical catalog names it `gfx103X-dgpu`. Both spellings, and the raw
+    /// arch, have to resolve to the one canonical label the rest of the CLI
+    /// stores, so a `--family gfx103X-all` install is not a different runtime.
+    #[test]
+    fn normalize_therock_family_aliases_gfx103x_all_to_canonical_dgpu_label() {
+        assert_eq!(
+            normalize_therock_family("gfx103X-all"),
+            Some("gfx103X-dgpu".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx1030"),
+            Some("gfx103X-dgpu".to_owned())
         );
     }
 

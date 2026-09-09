@@ -962,6 +962,7 @@ mod tests {
             version: version.to_owned(),
             install_root: PathBuf::from("rocm-storage-test").join(runtime_key),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,

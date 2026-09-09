@@ -1,0 +1,71 @@
+Feature: TheRock "next" ROCm 10 install layout
+
+  # ROCm 10 ships from a different source layout than the canonical multi-arch
+  # release/nightly streams: a separate pip index and a separate tarball catalog
+  # whose listing mixes non-release `-tests-` siblings in with the real dist
+  # archive. The next layout is an explicit extension, never a default: it is
+  # reachable only by pinning a ROCm version whose major is 10 or newer AND
+  # naming an exact raw GFX arch, and the canonical streams keep resolving
+  # exactly as they do today when neither is asked for.
+  #
+  # Every scenario points the ROCM_CLI_THEROCK_*_BASE overrides at a loopback
+  # fixture server (gated by ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE), so dispatch
+  # and selection are exercised with no live network dependency.
+
+  # The regression this pins: a "next-first" dispatch that probes the ROCm 10
+  # sources before the canonical ones. An unpinned release install must never
+  # look at the next layout at all, so the next fixture is served and asserted
+  # untouched rather than left unconfigured.
+  @id:therock-next-01-unpinned-release-stays-canonical
+  Scenario: therock-next-01 - An unpinned release install stays on the canonical multi-arch source
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    Then the preview resolves the canonical release pip index
+    And the preview reports the canonical multi-arch source layout generation
+    And the preview never mentions the ROCm 10 pip index
+
+  # `--version 10.0.0` plus a raw arch is the whole opt-in. The device payload is
+  # requested as an exact `device-gfx1200` extra on rocm, torch and torchvision;
+  # torchaudio carries no device extra because it publishes none.
+  @id:therock-next-02-wheel-pins-raw-device-extras
+  Scenario: therock-next-02 - A pinned ROCm 10 wheel install resolves the next index with raw device extras
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the ROCm 10 pip index
+    And the preview reports the next source layout generation
+    And the preview requests the gfx1200 device extras
+
+  # No silent fallback: a group label carries no exact arch, and the next layout
+  # cannot guess one. The install must refuse and say which flag to pass, rather
+  # than dropping back to the canonical stream or to a bucket payload.
+  @id:therock-next-03-wheel-group-family-refused
+  Scenario: therock-next-03 - A pinned ROCm 10 wheel install refuses a group family label
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for family gfx120X-all pinned to ROCm 10.0.0
+    Then the install fails
+    And the failure asks for an exact GPU arch and names --family gfx1200
+
+  # Linux-only: `--format tarball` is rejected outright on Windows (native
+  # tarball installs are not supported there), so this scenario's premise does
+  # not hold on that platform.
+  #
+  # The `-tests-` sibling carries a LATER mtime than the real dist archive on the
+  # live AMD index, so highest-mtime selection alone picks the wrong file.
+  @id:therock-next-04-tarball-skips-tests-sibling @requires-os:linux
+  Scenario: therock-next-04 - A pinned ROCm 10 tarball install skips the tests sibling
+    Given a canonical release tarball fixture and a ROCm 10 tarball fixture with a tests sibling
+    When the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the ROCm 10 tarball catalog
+    And the preview reports the next source layout generation
+    And the preview selects the real tarball artifact
+    And the preview does not select the tests artifact
+
+  # Same refusal on the tarball path, which is a separate dispatch: pinning a
+  # version was rejected outright for tarball installs before ROCm 10, so the
+  # newly reachable path needs its own proof that it still demands a raw arch.
+  @id:therock-next-05-tarball-group-family-refused @requires-os:linux
+  Scenario: therock-next-05 - A pinned ROCm 10 tarball install refuses a group family label
+    Given a canonical release tarball fixture and a ROCm 10 tarball fixture with a tests sibling
+    When the user previews a tarball SDK install for family gfx120X-all pinned to ROCm 10.0.0
+    Then the install fails
+    And the failure asks for an exact GPU arch and names --family gfx1200
