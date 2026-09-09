@@ -5149,6 +5149,71 @@ mod tests {
     }
 
     #[test]
+    fn prepare_embeddable_records_the_version_after_a_real_extraction() {
+        // The write-side sibling of the test above: an isolated caller
+        // extracting into an empty `runtime_dir` for the first time must
+        // leave a marker behind, or the *next* isolated caller sharing this
+        // tree sees no marker, wipes, and re-extracts on every call — the
+        // same defect the read-side regression guards against, from the
+        // write side instead. Dropping `record_runtime_version`'s call site
+        // in `prepare_embeddable` fails this test.
+        let env_root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: env_root.path().join("config"),
+            data_dir: env_root.path().join("data"),
+            cache_dir: env_root.path().join("cache"),
+        };
+        let version = "7.13.0";
+
+        // A real, well-formed archive (unlike the stub above): this test
+        // exercises the extraction branch, so `extract_archive` must succeed.
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("embeddable.tar.gz");
+        {
+            let file = fs::File::create(&archive).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            for name in [
+                platform_binary_name("lemond"),
+                platform_binary_name("lemonade"),
+            ] {
+                let mut header = tar::Header::new_ustar();
+                header.set_size(5);
+                header.set_mode(0o755);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_path(format!("embeddable/bin/{name}")).unwrap();
+                header.set_cksum();
+                builder.append(&header, &b"hello"[..]).unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let expected_sha256 = format!("{:x}", Sha256::digest(&fs::read(&archive).unwrap()));
+
+        let root = lemonade_root(&paths, Some(env_root.path()));
+        let runtime_dir = runtime_dir_in(&root);
+        assert_eq!(installed_runtime_version(&runtime_dir), None);
+
+        prepare_embeddable_with(
+            &paths,
+            Some(env_root.path()),
+            false,
+            version,
+            &expected_sha256,
+            |_, destination| {
+                fs::copy(&archive, destination)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_runtime_version(&runtime_dir).as_deref(),
+            Some(version),
+            "prepare_embeddable extracted the archive but never recorded the version"
+        );
+    }
+
+    #[test]
     fn lemonade_root_uses_requested_engine_root() {
         let paths = AppPaths {
             config_dir: PathBuf::from("C:/Users/test/.rocm"),
