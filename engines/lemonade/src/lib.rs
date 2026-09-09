@@ -5187,7 +5187,7 @@ mod tests {
             }
             builder.into_inner().unwrap().finish().unwrap();
         }
-        let expected_sha256 = format!("{:x}", Sha256::digest(&fs::read(&archive).unwrap()));
+        let expected_sha256 = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
 
         let root = lemonade_root(&paths, Some(env_root.path()));
         let runtime_dir = runtime_dir_in(&root);
