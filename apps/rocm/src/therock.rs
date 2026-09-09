@@ -24,7 +24,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
@@ -64,6 +64,8 @@ const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
 /// misconfigured proxy or a hostile header rather than a real artifact, and
 /// must not be allowed to refuse an install on its own authority.
 const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+/// Maximum size accepted for index, catalog, and detached-signature responses.
+const THEROCK_MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
@@ -3114,11 +3116,12 @@ fn download_file(
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    rocm_core::download_file_streaming_with_progress(
-        &rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT),
-        on_progress,
-    )
-    .with_context(|| format!("failed to fetch {url}"))?;
+    let request = rocm_core::DownloadRequest {
+        max_bytes: Some(THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES),
+        ..rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT)
+    };
+    rocm_core::download_file_streaming_with_progress(&request, on_progress)
+        .with_context(|| format!("failed to fetch {url}"))?;
     Ok(())
 }
 
@@ -3225,11 +3228,18 @@ fn http_get(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut reader = response.into_reader();
+    let mut reader = response
+        .into_reader()
+        .take(THEROCK_MAX_METADATA_BYTES.saturating_add(1));
     let mut body = Vec::new();
     reader
         .read_to_end(&mut body)
         .with_context(|| format!("failed to read HTTP response body for {url}"))?;
+    if body.len() as u64 > THEROCK_MAX_METADATA_BYTES {
+        bail!(
+            "HTTP response body for {url} exceeded the approved metadata limit of {THEROCK_MAX_METADATA_BYTES} bytes"
+        );
+    }
     Ok(HttpResponseBody {
         status,
         headers,
@@ -4606,7 +4616,24 @@ fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
         .find("];")
         .context("tarball index did not contain the end of the embedded file list")?;
     let json = format!("{}]", &rest[..end]);
-    serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")
+    let files: Vec<TarballIndexFile> =
+        serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")?;
+    for file in &files {
+        validate_tarball_file_name(&file.name)?;
+    }
+    Ok(files)
+}
+
+fn validate_tarball_file_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    if name.contains(['/', '\\'])
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || name.chars().any(char::is_control)
+    {
+        bail!("tarball catalog contains unsafe file name `{name}`");
+    }
+    Ok(())
 }
 
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
@@ -5027,6 +5054,23 @@ mod tests {
         // A variable that is present but blank is not a redirect.
         assert_eq!(select_base_override(true, Some("   "), default), default);
         assert_eq!(select_base_override(true, None, default), default);
+    }
+
+    #[test]
+    fn tarball_catalog_rejects_paths_and_control_characters() {
+        for name in [
+            "../escape.tar.gz",
+            "folder/escape.tar.gz",
+            r"folder\escape.tar.gz",
+            "/absolute.tar.gz",
+            "control\nname.tar.gz",
+        ] {
+            assert!(
+                validate_tarball_file_name(name).is_err(),
+                "unsafe catalog name was accepted: {name:?}"
+            );
+        }
+        assert!(validate_tarball_file_name("therock-dist-linux-gfx120X-all-10.0.0.tar.gz").is_ok());
     }
 
     #[test]
