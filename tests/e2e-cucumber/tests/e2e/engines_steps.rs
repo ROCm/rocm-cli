@@ -9,7 +9,7 @@
 //! from — exists only in what the terminal renders, so a piped run cannot see it.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cucumber::{given, then, when};
 
@@ -98,20 +98,33 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     let marker = format!("(rocm:{ENGINE})");
     // The marker must be on the rendered prompt line, which is what the user
     // actually sees — not merely somewhere in the informational block above it.
-    session
-        .wait_for_screen(&marker, SCREEN_TIMEOUT)
-        .await
-        .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
-
-    let screen = session.screen_text();
-    let on_a_prompt_line = screen
-        .lines()
-        .filter(|line| line.contains(&marker))
-        .any(|line| line.contains('$'));
-    assert!(
-        on_a_prompt_line,
-        "the marker never reached a prompt line:\n{screen}"
-    );
+    //
+    // Waited for as ONE condition rather than two. Waiting for the marker alone
+    // and then reading the screen once is satisfied by the banner above the
+    // prompt ("your prompt is now prefixed (rocm:vllm)"), which the CLI prints
+    // before bash has painted anything — so the single read that follows lands
+    // in the gap between the two whenever the machine is busy, and reports a
+    // shell that simply had not reached its prompt yet as one whose prompt is
+    // unmarked. Polling the real condition removes the gap without weakening
+    // it: the assertion below is unchanged, and a shell that never marks its
+    // prompt still fails, just at the timeout instead of instantly.
+    let deadline = Instant::now() + SCREEN_TIMEOUT;
+    let mut screen = session.screen_text();
+    loop {
+        let on_a_prompt_line = screen
+            .lines()
+            .filter(|line| line.contains(&marker))
+            .any(|line| line.contains('$'));
+        if on_a_prompt_line {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the marker never reached a prompt line within {SCREEN_TIMEOUT:?}:\n{screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        screen = session.screen_text();
+    }
 }
 
 #[then("the engine environment's interpreter is the one that runs")]
