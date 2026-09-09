@@ -7,7 +7,9 @@
 //! Composes the home layout against live `AppState` (read-only): a hero GPU
 //! gauge + spark, a stacked VRAM/TEMP/POWER mini-spark cluster, and Running /
 //! Health / Updates tiles. Empty/absent telemetry renders honest placeholders
-//! rather than synthetic numbers.
+//! rather than synthetic numbers — and pairs every "nothing to show" state
+//! with a hint at the tab/key that would produce something, so no tile is a
+//! dead end.
 //!
 //! ponytail: Home is added behind the existing default this phase (P2). It is
 //! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
@@ -435,28 +437,35 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme,
     );
     if running.height > 0 {
-        let line = state
+        let lines = state
             .instances
             .values()
             .find(|i| i.status.is_serving())
             .map_or_else(
                 || {
-                    Line::from(Span::styled(
+                    let mut lines = vec![Line::from(Span::styled(
                         "Nothing running",
                         Style::default().fg(theme.muted),
-                    ))
+                    ))];
+                    if running.height > 1 {
+                        lines.push(Line::from(Span::styled(
+                            "Press 3 → Serving to launch a model",
+                            Style::default().fg(theme.muted),
+                        )));
+                    }
+                    lines
                 },
                 |i| {
-                    Line::from(vec![
+                    vec![Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
                         Span::styled(
                             i.model_name.clone(),
                             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                         ),
-                    ])
+                    ])]
                 },
             );
-        f.render_widget(Paragraph::new(line), running);
+        f.render_widget(Paragraph::new(lines), running);
     }
 
     // Health tile — derive from snapshot/system-info presence + conn state.
@@ -513,8 +522,16 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         } else {
             "unknown"
         };
-        let body = Line::from(Span::styled(text, Style::default().fg(theme.muted)));
-        f.render_widget(Paragraph::new(body), updates);
+        let mut lines = vec![Line::from(Span::styled(text, Style::default().fg(theme.muted)))];
+        // No fabricated status, but never leave the tile a dead end — point at
+        // the one place that actually runs a real check.
+        if text == "unknown" && updates.height > 1 {
+            lines.push(Line::from(Span::styled(
+                "Press 2 → ROCm → Check for updates",
+                Style::default().fg(theme.muted),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), updates);
     }
 }
 
@@ -662,6 +679,40 @@ mod tests {
         assert!(
             !out.contains("Checking…"),
             "must not claim to still be checking once disconnected: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_hints_where_to_run_a_real_check() {
+        // "unknown" alone is a dead end — the tile must point at the real
+        // "Check for updates" verb (ROCm tab, digit 2) rather than leaving
+        // the user with no next step.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check: {out:?}"
+        );
+    }
+
+    #[test]
+    fn running_tile_hints_when_empty() {
+        // "Nothing running" alone is a dead end — hint at the Serving tab
+        // (digit 3) that would actually launch a model.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Nothing running"),
+            "empty running tile: {out:?}"
+        );
+        assert!(
+            out.contains("Serving"),
+            "Running tile should hint where to launch a model: {out:?}"
         );
     }
 
