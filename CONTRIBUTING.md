@@ -54,6 +54,8 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
+Agents working in this repository additionally follow `AGENTS.md`.
+
 ### Workspace layout
 
 | Path | Description |
