@@ -11,12 +11,12 @@ use rocm_core::{
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
     normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
     runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
-    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    uv_pip_install_base, uv_python_install_dir_source, uv_venv_args,
+    verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
-    generate_rsa_signing_keypair, managed_uv_cache_dir, managed_uv_python_install_dir,
-    sign_rsa_pkcs1_sha256_signature,
+    generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3926,6 +3926,17 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Whether a manifest's recorded executable is inside the currently resolved `uv`
+/// Python install dir. A manifest written before this dir moved (e.g. the legacy
+/// pre-colocation location) must not be trusted as-is, or the relocation this PR
+/// exists to establish never actually happens for anyone who already has Python
+/// installed.
+fn manifest_executable_is_current(paths: &AppPaths, manifest: &ManagedPythonManifest) -> bool {
+    manifest
+        .executable
+        .starts_with(uv_python_install_dir_source(paths).path())
+}
+
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
     let mut config = RocmCliConfig::load(paths).unwrap_or_default();
     config.tools.insert(
@@ -3961,9 +3972,12 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     let uv = ensure_uv_binary(paths)?;
 
     // Check the manifest first — if the recorded executable is still usable, skip the install.
+    // A manifest pointing outside the current install dir (e.g. the legacy location) is
+    // treated as stale so upgrading users actually get relocated.
     if let Ok(Some(manifest)) = load_managed_python_manifest(paths)
         && manifest.version == version
         && manifest.executable.is_file()
+        && manifest_executable_is_current(paths, &manifest)
         && python_launcher_install_ready(&manifest.executable).is_ok()
     {
         progress_line(format!(
@@ -4100,15 +4114,20 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
     if let Some(manifest) = load_managed_python_manifest(paths)?
         && manifest.executable.is_file()
     {
-        if python_launcher_install_ready(&manifest.executable).is_ok() {
+        if !manifest_executable_is_current(paths, &manifest) {
+            progress_line(
+                "Saved managed Python predates the current install location; preparing Python again.",
+            );
+        } else if python_launcher_install_ready(&manifest.executable).is_ok() {
             return Ok(PythonLauncher {
                 executable: manifest.executable,
                 source: "managed",
             });
+        } else {
+            progress_line(
+                "Saved managed Python cannot create a virtual environment; preparing Python again.",
+            );
         }
-        progress_line(
-            "Saved managed Python cannot create a virtual environment; preparing Python again.",
-        );
     }
 
     if managed_python_bootstrap_disabled() {
@@ -5769,13 +5788,21 @@ mod tests {
 
     #[test]
     fn uv_python_install_dir_does_not_follow_a_prefix_install_root() {
-        // Same documented non-goal as `uv_cache_does_not_follow_a_prefix_install_root`:
-        // `--prefix` moves install_root only, while the interpreters stay keyed off the
-        // data dir. Pins the claim `docs/manual-testing.md` makes about `uv-python`.
+        // Same documented non-goal as `uv_cache_does_not_follow_a_prefix_install_root`,
+        // but driven through the real `--prefix` plumbing: `resolved_install_root` is what
+        // `--prefix` actually calls, and `uv_python_install_dir_source` is what `uv` is
+        // actually invoked with, so this fails if either one stops holding.
         let (_root, paths) = test_paths("prefix-uv-python");
         let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
-        let install_dir = managed_uv_python_install_dir(&paths.data_dir);
 
+        let install_root =
+            resolved_install_root(&paths, "wheel", "unused-key", Some(prefix_root.clone()));
+        assert_eq!(
+            install_root, prefix_root,
+            "--prefix did not move the install root"
+        );
+
+        let install_dir = uv_python_install_dir_source(&paths).path().to_path_buf();
         assert!(
             !install_dir.starts_with(&prefix_root),
             "python install dir {} unexpectedly followed the --prefix root",

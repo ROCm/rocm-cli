@@ -1004,6 +1004,23 @@ All installed packages are compatible
         );
     }
 
+    /// `uv_command_env(paths)` is the entrypoint every real caller spawns `uv` with; every
+    /// other test here drives the private `uv_command_env_for` with hand-built sources, so
+    /// the one-line wiring from `paths` through to the actual env pair was unprotected.
+    #[test]
+    fn command_env_wires_paths_through_to_the_python_install_dir() {
+        let paths = test_paths("/managed/root");
+        let env = uv_command_env(&paths);
+        assert_eq!(
+            python_install_dir_in(&env),
+            Some(
+                managed_uv_python_install_dir(&paths.data_dir)
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+    }
+
     #[test]
     fn command_env_keeps_an_inherited_python_install_dir() {
         let paths = test_paths("/managed/root");

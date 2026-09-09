@@ -1241,20 +1241,36 @@ fn maybe_notice_legacy_uv_cache() {
 /// `$HOME/.local/share/uv` on Unix; `%APPDATA%\uv\data` on Windows — uv does not use
 /// `%USERPROFILE%\.local\share`).
 fn legacy_uv_python_install_dir() -> Option<PathBuf> {
-    if rocm_core::runtime_is_windows() {
-        let appdata = std::env::var_os("APPDATA")
+    resolve_legacy_uv_python_install_dir(
+        rocm_core::runtime_is_windows(),
+        std::env::var_os("APPDATA"),
+        std::env::var_os("XDG_DATA_HOME"),
+        rocm_core::runtime_home_dir(),
+    )
+}
+
+/// Pure resolution logic for [`legacy_uv_python_install_dir`]. Split out so the Windows
+/// branch is table-testable: `runtime_is_windows()` is `cfg!(windows)`, so it can never
+/// be exercised by a test running on Linux CI otherwise.
+fn resolve_legacy_uv_python_install_dir(
+    is_windows: bool,
+    appdata: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if is_windows {
+        let appdata = appdata
             .map(PathBuf::from)
             .filter(|value| !value.as_os_str().is_empty())?;
         return Some(appdata.join("uv").join("data").join("python"));
     }
-    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME")
+    if let Some(xdg_data_home) = xdg_data_home
         .map(PathBuf::from)
         .filter(|value| !value.as_os_str().is_empty())
     {
         return Some(xdg_data_home.join("uv").join("python"));
     }
-    let home = rocm_core::runtime_home_dir()?;
-    Some(home.join(".local").join("share").join("uv").join("python"))
+    Some(home?.join(".local").join("share").join("uv").join("python"))
 }
 
 /// One-shot notice that pre-colocation `uv`-managed Python interpreters are still
@@ -1269,14 +1285,14 @@ fn maybe_notice_legacy_uv_python_install_dir() {
     if install_dir.is_override() {
         return;
     }
-    // Only worth mentioning once the managed dir is actually in use; otherwise the legacy
-    // directory is simply still being used by other tools.
-    if !install_dir.path().is_dir() {
-        return;
-    }
     let Some(legacy) = legacy_uv_python_install_dir() else {
         return;
     };
+    // Gated on the legacy directory existing, not the managed one: relocation only
+    // happens when `uv python install` actually runs again (e.g. a manifest pointing
+    // outside the managed dir gets invalidated), which may never occur for a user
+    // whose PATH Python already satisfies every check. Waiting on the managed dir
+    // would leave such users with an un-reclaimed legacy install and no notice.
     if !legacy.is_dir() {
         return;
     }
@@ -17890,9 +17906,20 @@ fn shared_cache_candidates(paths: &AppPaths) -> Vec<(PathBuf, &'static str)> {
         "the uv package cache is shared with other uv projects on this computer and is",
     ));
 
-    // Same reasoning for the standalone interpreters `uv python install` downloads.
+    // Same reasoning for the standalone interpreters `uv python install` downloads. Falls
+    // back to the legacy location when the managed one was never created, so uninstall
+    // still tells the truth about a still-existing legacy interpreter.
+    let python_install_dir = uv_python_install_dir_source(paths);
+    let python_install_path =
+        if !python_install_dir.is_override() && !python_install_dir.path().is_dir() {
+            legacy_uv_python_install_dir()
+                .filter(|legacy| legacy.is_dir())
+                .unwrap_or_else(|| python_install_dir.path().to_path_buf())
+        } else {
+            python_install_dir.path().to_path_buf()
+        };
     candidates.push((
-        uv_python_install_dir_source(paths).path().to_path_buf(),
+        python_install_path,
         "uv-managed Python interpreters are shared with other uv projects on this computer and are",
     ));
 
@@ -19418,6 +19445,63 @@ mod tests {
             &[(missing, "the uv package cache")],
         );
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    // `resolve_legacy_uv_python_install_dir` is pure and table-tested directly so the
+    // Windows branch is covered even though `runtime_is_windows()` (`cfg!(windows)`)
+    // makes it unreachable through `legacy_uv_python_install_dir()` on Linux CI.
+    #[test]
+    fn legacy_uv_python_install_dir_windows_uses_appdata() {
+        let appdata = std::ffi::OsString::from("/fake/AppData/Roaming");
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("uv")
+            .join("data")
+            .join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(true, Some(appdata), None, None),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_windows_without_appdata_is_none() {
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(
+                true,
+                None,
+                None,
+                Some(std::path::PathBuf::from("/home/jane"))
+            ),
+            None,
+            "a missing APPDATA must not fall back to the Unix layout"
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_unix_prefers_xdg_data_home() {
+        let xdg_data_home = std::ffi::OsString::from("/fake/xdg-data");
+        let expected = std::path::PathBuf::from(&xdg_data_home)
+            .join("uv")
+            .join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(
+                false,
+                None,
+                Some(xdg_data_home),
+                Some(std::path::PathBuf::from("/home/jane"))
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_unix_falls_back_to_home() {
+        let home = std::path::PathBuf::from("/home/jane");
+        let expected = home.join(".local").join("share").join("uv").join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(false, None, None, Some(home)),
+            Some(expected)
+        );
     }
 
     use super::*;
