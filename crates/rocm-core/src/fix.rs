@@ -22,6 +22,15 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Print a failure explanation to stderr, ignoring write failures (closed
+/// stderr, full disk) so an I/O error while explaining a failure can't itself
+/// panic the process.
+macro_rules! fail {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Options controlling how a fix is applied.
 #[derive(Debug, Clone, Default)]
 pub struct FixOptions {
@@ -455,20 +464,18 @@ fn print_recipe(r: &FixRecipe) {
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
-        eprintln!("Unknown fix-id: {fix_id}");
+        fail!("Unknown fix-id: {fix_id}");
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
             // does not line up with the catalog's `fix-1 … fix-15` either, so a
             // bare "unknown id" left them with nothing to correct.
-            eprintln!(
-                "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
-            );
-            eprintln!(
+            fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
+            fail!(
                 "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
             );
         } else {
-            eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+            fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
         return 2;
     };
@@ -477,7 +484,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 
     let os = current_os();
     if !recipe.applies_on.contains(&os) {
-        eprintln!(
+        fail!(
             "This fix only applies on: {}. Running OS is: {os}.",
             recipe.applies_on.join(", ")
         );
@@ -496,7 +503,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     } else {
         // Internal error (auto-applicable recipe with no runner) -> 1, not 4
         // (4 is reserved for "attempted but the command failed").
-        eprintln!("Internal error: auto-applicable recipe has no runner.");
+        fail!("Internal error: auto-applicable recipe has no runner.");
         1
     }
 }
@@ -510,15 +517,21 @@ fn confirm(prompt: &str, assume_yes: bool) -> bool {
         return true;
     }
     if !std::io::stdin().is_terminal() {
-        eprintln!("Non-interactive shell and --yes not passed; refusing to apply.");
+        fail!("Non-interactive shell and --yes not passed; refusing to apply.");
         return false;
     }
     print!("{prompt} [y/N]: ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+    let confirmed = std::io::stdin().read_line(&mut line).is_ok() && is_affirmative_answer(&line);
+    if !confirmed {
+        fail!("Not confirmed; refusing to apply.");
     }
+    confirmed
+}
+
+/// Parse a user's typed response to a `[y/N]` prompt.
+fn is_affirmative_answer(line: &str) -> bool {
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
@@ -565,16 +578,16 @@ fn run_render_group(opts: &FixOptions) -> i32 {
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default();
     if user.is_empty() {
-        eprintln!("Could not determine current user from $USER/$LOGNAME.");
+        fail!("Could not determine current user from $USER/$LOGNAME.");
         return 3;
     }
     if !which("usermod") {
-        eprintln!("`usermod` not on PATH; cannot add groups.");
+        fail!("`usermod` not on PATH; cannot add groups.");
         return 3;
     }
     let root = is_root();
     if !which("sudo") && !root {
-        eprintln!("`sudo` is not on PATH and we are not root; cannot add groups.");
+        fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return 3;
     }
     let (program, args): (&str, Vec<String>) = if root {
@@ -612,7 +625,7 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        eprintln!("usermod exited {rc}; group membership NOT changed.");
+        fail!("usermod exited {rc}; group membership NOT changed.");
         return 4;
     }
     println!("Added {user} to render,video.");
@@ -710,7 +723,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
             print!("{out}");
             eprint!("{err}");
             if rc != 0 {
-                eprintln!("setx exited {rc}; User scope NOT changed.");
+                fail!("setx exited {rc}; User scope NOT changed.");
                 return 4;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
@@ -743,12 +756,12 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     // Same resolver `examine` uses, so the line we append names the install the
     // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
     let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
-        eprintln!("No ROCm install found; nothing to add to PATH.");
+        fail!("No ROCm install found; nothing to add to PATH.");
         return 3;
     };
     let bin_path = install.path.join("bin");
     if !bin_path.is_dir() {
-        eprintln!(
+        fail!(
             "{} does not exist; nothing to add to PATH.",
             bin_path.display()
         );
@@ -757,7 +770,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     let bin_dir_owned = bin_path.to_string_lossy().into_owned();
     let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
-        eprintln!("Could not determine your home directory.");
+        fail!("Could not determine your home directory.");
         return 3;
     };
     let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
@@ -786,7 +799,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         "# Added by rocm examine (fix-6-path)",
         &export_line,
     ) {
-        eprintln!("Failed to write {}: {exc}", rc_file.display());
+        fail!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -803,12 +816,12 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         sdk_path = newest_rocm_install_dir();
     }
     if sdk_path.is_empty() {
-        eprintln!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
+        fail!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
         return 3;
     }
     let bin_dir = Path::new(&sdk_path).join("bin");
     if !bin_dir.is_dir() {
-        eprintln!(
+        fail!(
             "{} does not exist on disk; HIP SDK install looks incomplete.",
             bin_dir.display()
         );
@@ -838,7 +851,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        eprintln!("setx exited {rc}; User PATH NOT changed.");
+        fail!("setx exited {rc}; User PATH NOT changed.");
         return 4;
     }
     println!(
@@ -850,7 +863,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
     if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
-        eprintln!("--device-index must be >= 0 (got {idx}).");
+        fail!("--device-index must be >= 0 (got {idx}).");
         return 3;
     }
     if runtime_is_windows() {
@@ -870,7 +883,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         return 0;
     };
     let Some(rc_file) = shell_rc_file() else {
-        eprintln!("Could not determine your home directory.");
+        fail!("Could not determine your home directory.");
         return 3;
     };
     let export_line = format!("export HIP_VISIBLE_DEVICES={idx}");
@@ -897,7 +910,7 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         "# Added by rocm examine (fix-9-igpu-dgpu)",
         &export_line,
     ) {
-        eprintln!("Failed to write {}: {exc}", rc_file.display());
+        fail!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -944,7 +957,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     print!("{out}");
     eprint!("{err}");
     if rc != 0 {
-        eprintln!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
+        fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
         return 4;
     }
     println!(
@@ -996,6 +1009,26 @@ mod tests {
     // they run. Because env is shared across all test threads, two such tests
     // running concurrently can otherwise see each other's value mid-test.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn is_affirmative_answer_accepts_only_y_and_yes() {
+        for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
+            assert!(
+                is_affirmative_answer(accepted),
+                "expected {accepted:?} to be treated as a yes"
+            );
+        }
+    }
+
+    #[test]
+    fn is_affirmative_answer_rejects_everything_else() {
+        for declined in ["n", "no", "", "\n", "yep", "ye"] {
+            assert!(
+                !is_affirmative_answer(declined),
+                "expected {declined:?} to be treated as a decline"
+            );
+        }
+    }
 
     /// Plant a directory the shared resolver will accept as a ROCm install.
     /// `bin/rocminfo` is one of the markers it gates on; a bare directory is

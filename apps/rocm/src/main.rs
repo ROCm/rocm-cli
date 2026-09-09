@@ -1710,6 +1710,9 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        // Do not wrap this call (e.g. with `.context(...)`) -- see
+        // `FixExitCode`'s doc comment for why that would silently break its
+        // exit-code-carrying downcast.
         Some(Command::Fix {
             fix_id,
             yes,
@@ -19306,6 +19309,34 @@ mod tests {
     fn exit_code_for_generic_error_is_failure() {
         let err = anyhow::anyhow!("boom");
         assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`
+    /// chain end to end, not just `exit_code_for` in isolation. Guards against
+    /// a future change at the `Command::Fix` dispatch arm (e.g. wrapping the
+    /// call with `.context(...)`) silently breaking the downcast and falling
+    /// through to the generic exit 1.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn dispatch_carries_fixs_exit_code_through_to_exit_code_for() {
+        // Skip the startup update check: it's a side effect unrelated to what
+        // this test verifies, and could otherwise touch the network.
+        unsafe {
+            std::env::set_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        }
+        let cli = super::Cli {
+            command: Some(super::Command::Fix {
+                fix_id: Some("fix-does-not-exist".to_owned()),
+                yes: true,
+                dry_run: false,
+                device_index: None,
+            }),
+        };
+        let result = super::dispatch(cli);
+        unsafe {
+            std::env::remove_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK");
+        }
+        assert_eq!(super::exit_code_for(result), ExitCode::from(2));
     }
 
     /// A cache that has moved inside a directory uninstall already removes must
