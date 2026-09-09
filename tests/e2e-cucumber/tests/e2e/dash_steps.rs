@@ -143,18 +143,31 @@ async fn open_observe_view(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 
+#[when("the user opens the Chat view")]
+async fn open_chat_view(world: &mut E2eWorld) {
+    // Same resend-until-it-takes rationale as `open_observe_view`: nothing
+    // before this step proves the event loop is reading input yet.
+    session(world)
+        .send_until("5", "● Chat", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to switch to the Chat tab: {e}"));
+}
+
 #[when("the user opens instance detail")]
 async fn open_instance_detail(world: &mut E2eWorld) {
     // `Enter` on the Observe tab opens the selected instance's detail popup
     // (`KeyAction::OpenDetail`); the demo session always seeds at least one
-    // instance, so the default selection (index 0) is always present. Like
-    // `open_observe_view`, resend until it takes effect: nothing before this
-    // step proves the Observe tab's own input handling (as opposed to just the
-    // tab switch) is already wired up on this exact frame.
-    session(world)
-        .send_until("\r", "Instance · ", default_timeout())
+    // instance, so the default selection (index 0) is always present. Enter
+    // toggles `Modal::Detail` open/closed, so it is NOT safe to resend via
+    // `send_until` (its own doc comment restricts that to idempotent keys) —
+    // a resend while the popup is already open would immediately close it.
+    // Plain `send` + `wait_for_screen` instead.
+    let tui = session(world);
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to send Enter: {e}"));
+    tui.wait_for_screen("Instance · ", default_timeout())
         .await
-        .unwrap_or_else(|e| panic!("failed to open instance detail: {e}"));
+        .unwrap_or_else(|e| panic!("instance detail did not open: {e}"));
 }
 
 #[when("the user opens the services manager")]
@@ -200,6 +213,19 @@ async fn open_command_palette(world: &mut E2eWorld) {
     session(world)
         .send(":")
         .unwrap_or_else(|e| panic!("failed to open the command palette: {e}"));
+}
+
+#[when("the user opens the theme picker")]
+async fn open_theme_picker(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("t")
+        .unwrap_or_else(|e| panic!("failed to open the theme picker: {e}"));
+    tui.wait_for_screen(
+        "Theme — j/k select, Enter apply, Esc cancel",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("theme picker did not open: {e}"));
 }
 
 #[when("the user chooses Serving")]
@@ -531,6 +557,16 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
         screen.contains("Home") && screen.contains("Serving") && screen.contains("Observe"),
         "command-palette destinations missing:\n{screen}"
     );
+}
+
+#[then("the dashboard menu is displayed")]
+async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
+    // "Options" only ever renders as one of the main menu's three items
+    // (Options/Help/Quit) — a stable, unique marker for `Modal::Menu`.
+    session(world)
+        .wait_for_screen("Options", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
 
 #[then("Serving actions are displayed")]

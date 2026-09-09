@@ -157,3 +157,21 @@ Feature: Interactive dashboard
     And the backdrop behind the popup is dimmed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-chat-idle-escape-opens-menu @requires-os:linux
+  Scenario: dash-14 - Escape opens the menu when idle on the Chat tab
+    When the user opens the dashboard with demo data
+    And the user opens the Chat view
+    When the user presses Escape
+    Then the dashboard menu is displayed
+    When the user presses Escape
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-theme-picker-dims-backdrop @requires-os:linux
+  Scenario: dash-15 - Opening the theme picker dims the screen behind it
+    When the user opens the dashboard with demo data
+    And the user opens the theme picker
+    Then the backdrop behind the popup is dimmed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
