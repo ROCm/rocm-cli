@@ -5167,16 +5167,33 @@ mod tests {
 
         // A real, well-formed archive (unlike the stub above): this test
         // exercises the extraction branch, so `extract_archive` must succeed.
+        // `extract_archive` dispatches on the destination's extension, which
+        // `prepare_embeddable_with` derives from the current platform (see
+        // `embeddable_os_arch`) — so the bytes built here must be in that
+        // same format, not always a tar.gz.
+        let (_, extension) = embeddable_os_arch();
         let archive_dir = tempfile::tempdir().unwrap();
-        let archive = archive_dir.path().join("embeddable.tar.gz");
-        {
+        let archive = archive_dir.path().join(format!("embeddable.{extension}"));
+        let entry_names = [
+            platform_binary_name("lemond"),
+            platform_binary_name("lemonade"),
+        ];
+        if runtime_is_windows() {
+            let file = fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for name in &entry_names {
+                writer
+                    .start_file(format!("embeddable/bin/{name}"), options)
+                    .unwrap();
+                writer.write_all(b"hello").unwrap();
+            }
+            writer.finish().unwrap();
+        } else {
             let file = fs::File::create(&archive).unwrap();
             let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
             let mut builder = tar::Builder::new(encoder);
-            for name in [
-                platform_binary_name("lemond"),
-                platform_binary_name("lemonade"),
-            ] {
+            for name in &entry_names {
                 let mut header = tar::Header::new_ustar();
                 header.set_size(5);
                 header.set_mode(0o755);
