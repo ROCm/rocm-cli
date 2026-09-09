@@ -136,9 +136,13 @@ Feature: Runtime configuration
   # active runtime. Outside an interactive terminal (as every e2e invocation
   # is here), `install sdk` without `--yes` must refuse rather than overwrite.
   # GPU-gated because the precondition needs a GPU to have a runtime active.
-  # The refusal resolves the Python launcher and reads the channel index first
-  # (both cheap) to learn which runtime would be overwritten, then bails before
-  # the SDK and torch packages are downloaded or anything on disk is changed.
+  # The refusal is not free: the gate keys on the resolved family and version, so
+  # it runs after the Python launcher is resolved and the channel index is read.
+  # Both are already warm here — the `Given` installed a runtime, so the launcher
+  # resolves to the saved managed Python rather than bootstrapping uv, and the
+  # index read is cached — but on a cold host the launcher step can still fetch.
+  # What the refusal does bail before is the SDK and torch download and any
+  # change on disk.
   @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
   Scenario: runtime-08 - Reinstalling the SDK over an existing runtime without --yes is refused
     Given a managed runtime is active

@@ -151,7 +151,14 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk"]);
+        // `--yes` for the same reason the sibling `a managed runtime is active`
+        // passes it: the harness spawns `rocm` with null stdin, so anything the
+        // overwrite gate does not read as a fresh install refuses rather than
+        // prompts. The `installed: none` guard makes this a fresh install today,
+        // so the flag changes nothing — it keeps the step correct if that guard
+        // ever loosens, instead of failing the lane at a prompt nothing can
+        // answer.
+        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     }
     // Same reason as `a managed runtime is active`: pin the runtime explicitly,
     // or the serve that follows refuses to pick one. Not for `assert_engine_ready`
