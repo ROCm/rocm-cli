@@ -21,7 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{AppState, ConnState};
+use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -505,31 +505,62 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    // Updates tile — honest placeholder. No update/version-check feed is wired
-    // into AppState at all, so "connected" must not be read as "checked and
-    // current" — every reachable state renders "unknown" or the transitional
-    // "Checking…", never a fabricated "Up to date".
+    // Updates tile — backed by the periodic `home-update-check` job
+    // (`refresh_update_status`, driven off the tick loop). `state.simulated`
+    // sessions never spawn that job, so they always render `Unknown` — same
+    // as before the check existed, keeping "SIMULATED DATA never looks live".
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        // "Checking…" only applies while still trying to reach the daemon
-        // (Initial/Connecting). Once `Connected` or `Disconnected`, there is
-        // no update feed to report, so it's "unknown" rather than a stuck
-        // "Checking…" during retry backoff.
-        let text = if !state.simulated
-            && matches!(state.conn, ConnState::Initial | ConnState::Connecting)
-        {
-            "Checking…"
-        } else {
-            "unknown"
-        };
-        let mut lines = vec![Line::from(Span::styled(text, Style::default().fg(theme.muted)))];
-        // No fabricated status, but never leave the tile a dead end — point at
-        // the one place that actually runs a real check.
-        if text == "unknown" && updates.height > 1 {
-            lines.push(Line::from(Span::styled(
-                "Press 2 → ROCm → Check for updates",
+        let hint = Line::from(Span::styled(
+            "Press 2 → ROCm → Check for updates",
+            Style::default().fg(theme.muted),
+        ));
+        let mut lines = if state.update_status_pending {
+            vec![Line::from(Span::styled(
+                "Checking…",
                 Style::default().fg(theme.muted),
-            )));
+            ))]
+        } else {
+            match &state.update_status {
+                UpdateStatus::Unknown => {
+                    vec![Line::from(Span::styled(
+                        "unknown",
+                        Style::default().fg(theme.muted),
+                    ))]
+                }
+                UpdateStatus::UpToDate => vec![Line::from(Span::styled(
+                    "Up to date",
+                    Style::default().fg(theme.fg),
+                ))],
+                UpdateStatus::UpdateAvailable { latest_version } => vec![
+                    Line::from(Span::styled(
+                        "Update available",
+                        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        latest_version.clone(),
+                        Style::default().fg(theme.warn),
+                    )),
+                ],
+                UpdateStatus::NoManagedRuntimes => vec![Line::from(Span::styled(
+                    "no managed runtimes",
+                    Style::default().fg(theme.muted),
+                ))],
+                UpdateStatus::Error => vec![Line::from(Span::styled(
+                    "check failed",
+                    Style::default().fg(theme.muted),
+                ))],
+            }
+        };
+        // No fabricated status, but never leave the tile a dead end — point at
+        // the one place that actually runs a real check on demand.
+        let wants_hint = !state.update_status_pending
+            && matches!(
+                state.update_status,
+                UpdateStatus::Unknown | UpdateStatus::Error
+            );
+        if wants_hint && updates.height > 1 {
+            lines.push(hint);
         }
         f.render_widget(Paragraph::new(lines), updates);
     }
@@ -538,7 +569,7 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::ActiveTab;
+    use crate::app::{ActiveTab, ConnState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{
@@ -645,7 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn updates_tile_never_asserts_up_to_date_when_connected() {
+    fn updates_tile_never_asserts_up_to_date_without_a_real_check() {
+        // `state.conn` must never be read as a proxy for "checked and
+        // current" — connectivity to the daemon says nothing about update
+        // status. Only a resolved `UpdateStatus::UpToDate` may render it.
         let mut s = state_with_gpu();
         s.conn = ConnState::Connected {
             host: "localhost".into(),
@@ -654,31 +688,58 @@ mod tests {
         let out = render(&s, 160, 30);
         assert!(
             !out.contains("Up to date"),
-            "must not fabricate a version check: {out:?}"
+            "must not fabricate a version check from conn state: {out:?}"
         );
         assert!(
             out.contains("unknown"),
-            "Updates tile should show unknown: {out:?}"
+            "Updates tile should show unknown before any check resolves: {out:?}"
         );
     }
 
     #[test]
-    fn updates_tile_shows_unknown_not_checking_when_disconnected() {
-        // Disconnected (e.g. retry backoff after the daemon drops) is not the
-        // same as still trying to connect — it must not get stuck on the
-        // transitional "Checking…" label forever.
+    fn updates_tile_shows_checking_while_pending() {
         let mut s = state_with_gpu();
-        s.conn = ConnState::Disconnected {
-            reason: "connection reset".into(),
+        s.update_status_pending = true;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Checking…"),
+            "Updates tile should show Checking… while a check is in flight: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_up_to_date_from_a_real_check() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpToDate;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Up to date"),
+            "a resolved UpToDate status should render: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_update_available_with_version() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpdateAvailable {
+            latest_version: "7.1.0".into(),
         };
         let out = render(&s, 160, 30);
         assert!(
-            out.contains("unknown"),
-            "Updates tile should show unknown once disconnected: {out:?}"
+            out.contains("Update available"),
+            "should surface an available update: {out:?}"
         );
+        assert!(out.contains("7.1.0"), "should show the version: {out:?}");
+    }
+
+    #[test]
+    fn updates_tile_renders_no_managed_runtimes() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::NoManagedRuntimes;
+        let out = render(&s, 160, 30);
         assert!(
-            !out.contains("Checking…"),
-            "must not claim to still be checking once disconnected: {out:?}"
+            out.contains("no managed runtimes"),
+            "should report nothing to check: {out:?}"
         );
     }
 
@@ -686,16 +747,24 @@ mod tests {
     fn updates_tile_hints_where_to_run_a_real_check() {
         // "unknown" alone is a dead end — the tile must point at the real
         // "Check for updates" verb (ROCm tab, digit 2) rather than leaving
-        // the user with no next step.
-        let mut s = state_with_gpu();
-        s.conn = ConnState::Connected {
-            host: "localhost".into(),
-            version: "1.0".into(),
-        };
+        // the user with no next step. Same for a failed check.
+        let s = state_with_gpu();
         let out = render(&s, 160, 30);
         assert!(
             out.contains("Check for updates"),
-            "Updates tile should hint at the real check: {out:?}"
+            "Updates tile should hint at the real check when unknown: {out:?}"
+        );
+
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::Error;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("check failed"),
+            "should report the failure: {out:?}"
+        );
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check when the check failed: {out:?}"
         );
     }
 

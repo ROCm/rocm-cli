@@ -306,6 +306,9 @@ rocm update --apply --dry-run")]
         /// Show what would happen without changing files.
         #[arg(long, requires = "apply")]
         dry_run: bool,
+        /// Print the check result as a single line of JSON instead of text.
+        #[arg(long, conflicts_with = "apply")]
+        json: bool,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {
@@ -1807,6 +1810,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            json,
         }) => {
             let paths = AppPaths::discover()?;
             if apply {
@@ -1854,6 +1858,33 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 activate,
                                 dry_run
                             ),
+                            None,
+                        );
+                        return Err(error);
+                    }
+                }
+                return Ok(());
+            }
+            if json {
+                match therock::render_update_json(&paths) {
+                    Ok(document) => {
+                        println!("{}", serde_json::to_string(&document)?);
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "info",
+                            "rendered update report (json)",
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "error",
+                            format!("update report failed: {error}"),
                             None,
                         );
                         return Err(error);
