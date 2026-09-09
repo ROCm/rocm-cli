@@ -584,6 +584,55 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
+/// Structured counterpart to [`render_update_report`], for `rocm update --json`.
+/// Consumed by the dash TUI's background update-check job (parsed off a
+/// single compact JSON line captured from the job's stdout), so field names
+/// are a stable-ish contract — extend, don't rename, without checking callers.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJson {
+    pub runtimes: Vec<UpdateJsonRuntime>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJsonRuntime {
+    pub runtime_key: String,
+    pub channel: String,
+    pub family: String,
+    pub installed_version: String,
+    pub latest_version: Option<String>,
+    /// `"update_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
+    pub status: String,
+    pub message: Option<String>,
+}
+
+pub(crate) fn render_update_json(paths: &AppPaths) -> Result<UpdateJson> {
+    let manifests = load_runtime_manifests(paths)?;
+    let mut runtimes = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        match runtime_update_plan(paths, &manifest) {
+            Ok(plan) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key,
+                channel: manifest.channel,
+                family: manifest.family,
+                installed_version: manifest.version,
+                latest_version: Some(plan.latest_version),
+                status: plan.status,
+                message: None,
+            }),
+            Err(error) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key,
+                channel: manifest.channel,
+                family: manifest.family,
+                installed_version: manifest.version,
+                latest_version: None,
+                status: "error".to_owned(),
+                message: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(UpdateJson { runtimes })
+}
+
 pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
@@ -5290,6 +5339,40 @@ echo Python 3.12.10
 
         server.join().expect("localhost server thread panicked")?;
         let _ = fs::remove_dir_all(&temp);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
+        let (root, paths) = test_paths("update-json-empty");
+
+        let document = render_update_json(&paths)?;
+
+        assert!(document.runtimes.is_empty());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_per_manifest_error_without_failing_whole_report() -> Result<()> {
+        let (root, paths) = test_paths("update-json-error");
+        // An unsupported channel fails `TheRockChannel::parse` synchronously,
+        // so this error path is deterministic and never depends on real
+        // network reachability (unlike the manifest's placeholder index URL,
+        // which `resolve_pip_runtime_with_timeout` doesn't even consult).
+        let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        manifest.channel = "unsupported-channel".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let document = render_update_json(&paths)?;
+
+        assert_eq!(document.runtimes.len(), 1);
+        let row = &document.runtimes[0];
+        assert_eq!(row.runtime_key, "active");
+        assert_eq!(row.status, "error");
+        assert!(row.latest_version.is_none());
+        assert!(row.message.is_some());
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
