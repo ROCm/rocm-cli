@@ -1602,11 +1602,11 @@ impl AgentClient for MockAgentClient {
             return Err(AgentError::Empty);
         }
         if let Some(trigger) = &self.approval {
-            let fires = history
-                .iter()
-                .rev()
-                .find(|t| t.role == ChatRole::User)
-                .is_some_and(|t| t.content.to_lowercase().contains(&trigger.phrase));
+            let fires = matches!(
+                history.last(),
+                Some(t) if t.role == ChatRole::User
+                    && t.content.to_lowercase().contains(&trigger.phrase)
+            );
             if fires {
                 let _ = trigger.tx.send(ClientMsg::ChatApprovalRequired {
                     intent: trigger.intent.clone(),
@@ -2131,6 +2131,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Empty));
+    }
+
+    #[tokio::test]
+    async fn approval_trigger_does_not_refire_on_follow_up() {
+        // `on_approval_result` appends the approved-action result as an Agent
+        // turn (not a new User turn) before raising the one-shot automatic
+        // follow-up. The trigger must key off the *last* turn only, so that
+        // follow-up call sees `[User(trigger), Agent(result)]` and does not
+        // re-surface approval a second time.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+        let agent = MockAgentClient::with_tool_call_and_approval_trigger(
+            "all good",
+            "gpu_status",
+            "install the sdk",
+            crate::tool_exec::ApprovalIntent {
+                title: "Install TheRock ROCm SDK?".to_string(),
+                body: vec!["install_sdk".to_string()],
+                name: "install_sdk".to_string(),
+                arguments: json!({}),
+            },
+            tx,
+        );
+
+        let first = vec![ChatTurn::user("please install the sdk")];
+        let reply = agent
+            .complete(&first, fixture_snapshot())
+            .await
+            .expect("mock reply");
+        assert!(reply.contains("surfaced to"));
+
+        let follow_up = vec![
+            ChatTurn::user("please install the sdk"),
+            ChatTurn::agent("Installed successfully."),
+        ];
+        let reply = agent
+            .complete(&follow_up, fixture_snapshot())
+            .await
+            .expect("mock reply");
+        assert!(
+            !reply.contains("surfaced to"),
+            "approval trigger re-fired on the automatic follow-up: {reply}"
+        );
     }
 
     #[test]
