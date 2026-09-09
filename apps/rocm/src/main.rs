@@ -1125,11 +1125,12 @@ fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
 /// ordinary return path, instead of calling `std::process::exit` mid-stack
 /// and skipping the `_log_guard` destructor held in `run()`.
 ///
-/// `exit_code_for` recovers the code via `downcast_ref`, which only works if
-/// this error reaches it unwrapped. Do not wrap the `fix()` call (e.g. with
-/// `.context(...)`) between where it's constructed and `exit_code_for` — that
-/// would break the downcast and silently fall through to the generic
-/// "Error: ..." branch instead of the carried exit code.
+/// `exit_code_for` recovers the code via `downcast_ref`, which searches the
+/// whole error chain — wrapping the `fix()` call with `.context(...)` is
+/// fine. What does break it is discarding this error instead of chaining it,
+/// e.g. `.map_err(|e| anyhow!("fix failed: {e}"))`, which loses the
+/// underlying type and silently falls through to the generic "Error: ..."
+/// branch instead of the carried exit code.
 #[derive(Debug)]
 struct FixExitCode(i32);
 
@@ -1710,9 +1711,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
-        // Do not wrap this call (e.g. with `.context(...)`) -- see
+        // Keep this error chained rather than discarding it into a fresh
+        // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
-        // exit-code-carrying downcast.
+        // exit-code-carrying downcast. `.context(...)` is fine.
         Some(Command::Fix {
             fix_id,
             yes,
@@ -19313,17 +19315,17 @@ mod tests {
 
     /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`
     /// chain end to end, not just `exit_code_for` in isolation. Guards against
-    /// a future change at the `Command::Fix` dispatch arm (e.g. wrapping the
-    /// call with `.context(...)`) silently breaking the downcast and falling
-    /// through to the generic exit 1.
+    /// a future change at the `Command::Fix` dispatch arm (e.g. discarding the
+    /// error into a fresh `anyhow!(...)`) silently breaking the downcast and
+    /// falling through to the generic exit 1.
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn dispatch_carries_fixs_exit_code_through_to_exit_code_for() {
         // Skip the startup update check: it's a side effect unrelated to what
-        // this test verifies, and could otherwise touch the network.
-        unsafe {
-            std::env::set_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
-        }
+        // this test verifies, and could otherwise touch the network. Goes
+        // through `ScopedTestEnv` so it's serialized against every other test
+        // that touches process env and restored on drop even on panic.
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
         let cli = super::Cli {
             command: Some(super::Command::Fix {
                 fix_id: Some("fix-does-not-exist".to_owned()),
@@ -19333,9 +19335,7 @@ mod tests {
             }),
         };
         let result = super::dispatch(cli);
-        unsafe {
-            std::env::remove_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK");
-        }
+        drop(env);
         assert_eq!(super::exit_code_for(result), ExitCode::from(2));
     }
 
