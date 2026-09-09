@@ -1080,12 +1080,22 @@ async fn assert_negative_temperature_message(world: &mut E2eWorld) {
 #[then("the user is told that GPU index is unavailable")]
 async fn assert_absent_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // The named index must appear alongside an unavailability reason — whether the
-    // CLI rejects it against the detected count ("out of range") or the engine's
-    // probe rejects it ("not available") on a host where amd-smi can't count.
+    // The named index must appear alongside an unavailability reason. Three shapes
+    // are legitimate, depending on what the host could probe:
+    //   - "not present on this host" — the index is outside the usable visible set
+    //     and NO visibility mask is set, so the absence is the host's, not a mask's.
+    //     This is the normal shape for this scenario. The wording is deliberate:
+    //     blaming HIP/ROCR variables the user never set sends them chasing an
+    //     environment problem that does not exist.
+    //   - "out of range" — no visible set could be enumerated, so the CLI falls
+    //     back to the raw detected count.
+    //   - "not available" — a mask IS active, or the engine's own probe rejects the
+    //     index on a host where amd-smi cannot count.
     assert!(
         output.contains("99")
-            && (output.contains("out of range") || output.contains("not available")),
+            && (output.contains("not present")
+                || output.contains("out of range")
+                || output.contains("not available")),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
