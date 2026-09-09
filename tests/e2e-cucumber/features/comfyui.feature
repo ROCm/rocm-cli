@@ -19,7 +19,7 @@ Feature: ComfyUI runtime selection is actionable
   # remediation and lists both keys. Linux-only because the planted rocm_sdk stub
   # uses `.so` library names; the selection logic it exercises is platform-agnostic.
   @id:comfyui-ambiguous-runtime-actionable @requires-os:linux
-  Scenario: ComfyUI install refuses ambiguously and names every remediation
+  Scenario: comfyui-01 - ComfyUI install refuses ambiguously and names every remediation
     Given two ready ROCm runtimes and no active default
     When the user installs ComfyUI without choosing a runtime
     Then ComfyUI install is refused as ambiguous
