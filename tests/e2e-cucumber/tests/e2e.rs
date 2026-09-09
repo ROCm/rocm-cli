@@ -1156,20 +1156,23 @@ async fn main() {
     // on OS-assigned ports, so they're safe to run concurrently).
     //
     // This `max_concurrent == 1` is ALSO what makes it safe for a GPU lane to
-    // point `shared_cache_dir()`/`shared_uv_cache_dir()` at one persistent dir
-    // (see `isolate_env`): readers extracting an archive and a concurrent
-    // `remove_file` of that same archive after another scenario's extract
-    // (`uv.rs`, `therock.rs`) would otherwise race. `cap.has_amd_gpu` is a
-    // capability *probe* that can disagree with what a lane actually exports
-    // (e.g. a missing GPU driver reads `false` while `E2E_SHARED_CACHE_DIR` is
-    // still set) — so derive the cap from the hazard itself, a configured
-    // shared cache dir, rather than only from the probe. A lane that races
-    // becomes serialized-and-slower instead of racing.
-    let max_concurrent = if cap.has_amd_gpu || shared_cache_dir().is_some() {
-        1
-    } else {
-        64
-    };
+    // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
+    // at one persistent dir (see `isolate_env`): readers extracting an archive
+    // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
+    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
+    // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
+    // lane actually exports (e.g. a missing GPU driver reads `false` while a
+    // shared dir env var is still set) — so derive the cap from the hazards
+    // themselves rather than only from the probe. `shared_uv_cache_dir()` is
+    // deliberately excluded: uv's cache is content-addressed and uv does its
+    // own locking. A lane that races becomes serialized-and-slower instead.
+    let max_concurrent =
+        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
+            1
+        } else {
+            64
+        };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
