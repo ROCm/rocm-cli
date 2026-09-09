@@ -135,7 +135,7 @@ Feature: GPU detection and system inspection
   # accepts either form the README documents — a name the model listing knows,
   # or an explicit `owner/repo` reference — and so does not prescribe which
   # model the examples should use.
-  @id:help-serve-example-names-a-resolvable-model
+  @id:examine-help-serve-example-names-a-resolvable-model
   Scenario: examine-13 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
@@ -144,7 +144,7 @@ Feature: GPU detection and system inspection
   # different things. When the help describes them as the same one, a reader has
   # no way to learn what the plain command does or that there is anything else
   # to reach.
-  @id:help-describes-the-default-command
+  @id:examine-help-describes-the-default-command
   Scenario: examine-14 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command

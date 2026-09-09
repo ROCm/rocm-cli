@@ -213,7 +213,7 @@ reason = "The local chat provider only accepts the built-in assistant model, so 
 # a real GPU host is needed at all, and `flaky = true` because which of these
 # pass varies run to run — a deterministic-XPASS row would fail that lane on
 # unrelated PRs. Delete this row with the other EAI-7423 ones, not with EAI-8007.
-[["services-stop-reports-what-it-stopped"]]
+[["serve-services-stop-reports-what-it-stopped"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*" }
 bug = "EAI-7423"
 reason = "Lemonade managed serve reaches ready then shuts down immediately, so the service this scenario needs to stop never comes up."
@@ -234,7 +234,7 @@ flaky = true
 # it, so the supported way to stop them goes too. It warns that it does not stop
 # them, which is the behaviour being disputed, not a defence of it. No hardware
 # needed. Remove when uninstall stops what it manages first. ---
-[["uninstall-stops-what-it-manages"]]
+[["serve-uninstall-stops-what-it-manages"]]
 when = {}
 bug = "EAI-8014"
 reason = "Uninstall reports completion while leaving the servers it manages running, and removes the records needed to stop them."
