@@ -295,6 +295,78 @@ pub fn violations_requiring<'a>(
         .collect()
 }
 
+/// What a violation line is *about*: the required package and what is there instead.
+///
+/// `DependencyViolation` keeps `uv`'s line verbatim, which is right for display but
+/// leaves every caller wanting to reason about a violation to re-parse it. Both the
+/// CLI and the vLLM engine need the same two fields to tell a deliberate divergence
+/// from a defect, so the parse lives here once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViolationSubject {
+    /// The package whose requirement is unsatisfied — `torch` in
+    /// ``requires `torch==2.11.0+rocm7.13.0` ``.
+    pub package: String,
+    /// The exact version the requirement pins, or `None` for any looser requirement.
+    ///
+    /// Only an exact pin says which release the requirer was built against, which is
+    /// the question callers reasoning about a divergence actually have.
+    pub required: Option<String>,
+    /// The version installed instead, or `None` when `uv` reported the package as
+    /// not installed at all.
+    pub installed: Option<String>,
+}
+
+/// Pull the required package and the installed version out of one violation line.
+///
+/// `uv` frames the line as ``The package `<requirer>` requires `<spec>`, but
+/// `<version>` is installed``. Returns `None` for anything that does not carry both
+/// halves of that frame, so a differently-shaped diagnostic yields no subject rather
+/// than a confidently wrong one.
+pub fn violation_subject(detail: &str) -> Option<ViolationSubject> {
+    let (_, rest) = detail.split_once(UV_CHECK_REQUIREMENT_INFIX)?;
+    let (spec, rest) = rest.split_once('`')?;
+    let package = spec
+        .split(|character: char| {
+            !(character.is_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.')
+        })
+        .next()
+        .filter(|name| !name.is_empty())?
+        .to_owned();
+    // A compound specifier (`>=1.0,<2.0`) pins nothing, and neither does a single
+    // inequality; only a lone `==` names the release the requirer was built against.
+    let required = spec
+        .split_once("==")
+        .map(|(_, version)| version.trim())
+        .filter(|version| !version.is_empty() && !version.contains(','))
+        .map(str::to_owned);
+    // `, but it's not installed` carries no version and correctly yields `None`.
+    let installed = rest
+        .split_once(", but `")
+        .and_then(|(_, tail)| tail.split_once('`'))
+        .map(|(version, _)| version.to_owned());
+    Some(ViolationSubject {
+        package,
+        required,
+        installed,
+    })
+}
+
+/// Split a version into its public part and its local segment.
+///
+/// `2.11.0+rocm7.13.0` -> `("2.11.0", Some("rocm7.13.0"))`. The local segment is the
+/// build identifier: for TheRock wheels it names the ROCm build, and for an engine's
+/// own index it is an opaque commit tag. Telling those two apart is what lets a
+/// caller take the release from one source and the build from another.
+pub fn split_local_version(version: &str) -> (&str, Option<&str>) {
+    match version.split_once('+') {
+        Some((base, local)) => (base, Some(local)),
+        None => (version, None),
+    }
+}
+
 /// Pull the unsatisfied-requirement lines out of a `uv pip check` stderr body.
 ///
 /// `uv` frames one as ``The package `<requirer>` requires `<spec>`, but `<version>` is
@@ -835,5 +907,65 @@ All installed packages are compatible
         assert_eq!(slug("0.8.4"), "0.8.4");
         assert_eq!(slug("latest"), "latest");
         assert_eq!(slug("weird/version space"), "weird-version-space");
+    }
+
+    #[test]
+    fn a_violation_line_yields_the_package_and_both_versions() {
+        let subject = violation_subject(
+            "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed",
+        )
+        .expect("a well-formed violation line has a subject");
+
+        assert_eq!(subject.package, "torch");
+        assert_eq!(subject.required.as_deref(), Some("2.11.0+gitd0c8b1f"));
+        assert_eq!(subject.installed.as_deref(), Some("2.11.0+rocm7.13.0"));
+    }
+
+    #[test]
+    fn a_missing_package_has_no_installed_version() {
+        let subject = violation_subject(
+            "The package `vllm` requires `triton==3.5.0`, but it's not installed",
+        )
+        .expect("the line still names a requirement");
+
+        assert_eq!(subject.package, "triton");
+        assert_eq!(subject.required.as_deref(), Some("3.5.0"));
+        assert_eq!(subject.installed, None, "nothing is installed to name");
+    }
+
+    #[test]
+    fn a_loose_requirement_pins_no_release() {
+        // Only an exact `==` says which release the requirer was built against. A
+        // range or a compound specifier must not be mistaken for one.
+        for detail in [
+            "The package `tilelang` requires `cloudpickle>=3.0`, but `2.2.1` is installed",
+            "The package `foo` requires `bar>=1.0,<2.0`, but `2.5` is installed",
+        ] {
+            let subject = violation_subject(detail).expect("still a violation line");
+            assert_eq!(
+                subject.required, None,
+                "a looser requirement pins nothing: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_without_the_requirement_frame_has_no_subject() {
+        // `uv` reports several other conditions under the same opening frame, and a
+        // confidently wrong parse of one of those is worse than no answer.
+        assert_eq!(violation_subject("Checked 214 packages in 12ms"), None);
+        assert_eq!(
+            violation_subject("The package `vllm` has an invalid METADATA file"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_segment_is_split_from_the_release() {
+        assert_eq!(
+            split_local_version("2.11.0+rocm7.13.0"),
+            ("2.11.0", Some("rocm7.13.0"))
+        );
+        assert_eq!(split_local_version("2.11.0"), ("2.11.0", None));
     }
 }

@@ -6,7 +6,7 @@ Feature: Interactive dashboard
   # not yet promoted to a blocking contract (tracked as a follow-up).
 
   @id:dash-opens-and-navigates @requires-os:linux
-  Scenario: 1 - A user opens the dashboard and navigates to ROCm setup
+  Scenario: dash-01 - A user opens the dashboard and navigates to ROCm setup
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user opens the ROCm view
@@ -15,7 +15,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-chat-offline-reply @requires-os:linux
-  Scenario: 2 - A user receives a response in interactive chat
+  Scenario: dash-02 - A user receives a response in interactive chat
     Given interactive chat uses an offline assistant
     When the user opens interactive chat
     And the user sends a message about GPU health
@@ -24,7 +24,7 @@ Feature: Interactive dashboard
     Then interactive chat exits successfully
 
   @id:dash-loading-service-status @requires-os:linux
-  Scenario: 3 - The dashboard reports a model that is still loading as loading
+  Scenario: dash-03 - The dashboard reports a model that is still loading as loading
     Given a managed model is still loading
     When the user opens the dashboard
     And the user opens the Observe view
@@ -33,7 +33,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-managed-service-metrics @requires-os:linux
-  Scenario: 4 - Observe displays metrics from a managed model
+  Scenario: dash-04 - Observe displays metrics from a managed model
     Given a managed model exposes serving metrics
     When the user opens the dashboard
     And the user opens the Observe view
@@ -42,7 +42,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-help-guidance @requires-os:linux
-  Scenario: 5 - A user can discover dashboard help and next-step guidance
+  Scenario: dash-05 - A user can discover dashboard help and next-step guidance
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
@@ -51,7 +51,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-command-palette-navigation @requires-os:linux
-  Scenario: 6 - A user navigates to Serving through the command palette
+  Scenario: dash-06 - A user navigates to Serving through the command palette
     When the user opens the dashboard with demo data
     And the user opens the command palette
     Then dashboard destinations are displayed
@@ -61,7 +61,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-managed-service-visible @requires-os:linux
-  Scenario: 7 - A managed model is visible in the dashboard
+  Scenario: dash-07 - A managed model is visible in the dashboard
     Given a running managed model is available locally
     When the user opens the dashboard
     And the user opens the Observe view
@@ -70,8 +70,8 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
 
-  @id:eai-7960-gen-tps-held-after-scrape-failure @requires-os:linux
-  Scenario: 8 - Gen throughput stays visible for the validity window after a scrape failure
+  @id:dash-gen-tps-held-after-scrape-failure @requires-os:linux
+  Scenario: dash-08 - Gen throughput stays visible for the validity window after a scrape failure
     # EAI-7960 principal regression: after establishing a positive gen_tps
     # baseline through the scripted mock, a single /metrics transport failure
     # must NOT immediately clear the displayed "tok/s" value.  The contract
@@ -88,8 +88,8 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:eai-7960-gen-tps-expiry-boundary @requires-os:linux
-  Scenario: 9 - Gen throughput expires after the validity window following sustained failure
+  @id:dash-gen-tps-expiry-boundary @requires-os:linux
+  Scenario: dash-09 - Gen throughput expires after the validity window following sustained failure
     # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
     #
     # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,
@@ -111,8 +111,8 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:launcher-shows-live-serving-instance @requires-os:linux
-  Scenario: 10 - The launcher front door shows a live serving model rather than idle
+  @id:dash-launcher-shows-live-serving-instance @requires-os:linux
+  Scenario: dash-10 - The launcher front door shows a live serving model rather than idle
     # EAI-8190 regression: bare `rocm` opens the launcher front door, which
     # reads the managed-service registry (`launcher_serving_instances`) the same
     # way `rocm services` does. A model already serving must surface as

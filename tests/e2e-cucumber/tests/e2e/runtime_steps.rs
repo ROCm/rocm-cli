@@ -161,9 +161,34 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     assert_engine_ready(world);
 }
 
+/// Record the torch-alignment opt-out for this scenario's next `rocm` command.
+///
+/// A behavioural precondition rather than a mechanism the feature file has to
+/// name: the When step stays a plain "the user installs the SDK" and consumes
+/// this on the way through. The CLI reads presence rather than value, so the
+/// value is arbitrary.
+#[given("the user has opted out of realigning torch")]
+async fn setup_torch_alignment_opt_out(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1".into()));
+}
+
 #[when("the user installs the SDK")]
 async fn user_installs_sdk(world: &mut E2eWorld) {
-    let stdout = crate::run_rocm_ok(world, &["install", "sdk"]);
+    // Through `run_rocm_with_scenario_env` rather than `run_rocm_ok` so a Given
+    // can attach a behavioural fixture to this invocation — the torch-alignment
+    // opt-out is one — without the Gherkin naming an environment variable. The
+    // exit code is still asserted here, with the same diagnostic bundle
+    // `run_rocm_ok` prints: an install that failed leaves every Then behind it
+    // reading output that was never produced.
+    let args = ["install", "sdk"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
     world.cli_output = Some(stdout);
 }
 
@@ -172,17 +197,199 @@ async fn user_reinstalls_sdk(world: &mut E2eWorld) {
     user_installs_sdk(world).await;
 }
 
-#[then("the install reports the engine's requirements as satisfied")]
-async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
+#[then("the runtime can still use the GPU")]
+async fn assert_runtime_can_still_use_the_gpu(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
+    // The functional signal rather than a diagnostic string: the device check asks
+    // the runtime's own torch how many devices it can open. A runtime left holding
+    // a torch that one of the two installers cannot use reports none, and that is
+    // the failure this scenario exists to catch.
+    assert!(
+        output.contains("device_check: usable"),
+        "the reinstall left a runtime that cannot open a GPU:\n{output}"
+    );
+    // A genuine unmet requirement must still fail the scenario. Torch itself is
+    // expected to diverge from the engine's exact pin once it is settled on the
+    // SDK's build of the same release, and that is reported as a divergence.
     assert!(
         !output.contains("dependency_check: violated"),
-        "the reinstall left the engine's declared requirements unmet:\n{output}"
+        "the reinstall left a genuine requirement unmet:\n{output}"
+    );
+}
+
+/// The verdict on the `  torch_alignment: <verdict>` line, without the value some
+/// verdicts carry after it.
+///
+/// One line carries the whole outcome, and everything that can settle this
+/// question prints through it — the alignment itself, and the retention that
+/// stands in for it when a torch has already run a GPU kernel with this SDK — so
+/// reading the verdict is what tells the settled states apart from each other and
+/// from a skip.
+fn torch_alignment_verdict(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("torch_alignment: "))
+        .unwrap_or_else(|| {
+            panic!("no torch alignment block, so the runtime was never settled:\n{output}")
+        })
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+}
+
+/// Verdicts that mean the runtime was settled and its torch left in a state this
+/// tool produces on purpose.
+///
+/// Four, not one. Whether a reinstall rewrites torch or finds it already correct
+/// depends on what the shared pre-warm tree held when the scenario started, and a
+/// torch that has already executed a GPU kernel with this SDK is kept exactly as
+/// it is and reported as `retained_*` — settled without anything being installed.
+const SETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
+    "realigned",
+    "already_aligned",
+    "retained_sdk_build",
+    "retained_engine_build",
+];
+
+/// Verdicts that mean the question was left unanswered.
+///
+/// `not_applicable` is the one that would otherwise go unnoticed: it is what a
+/// manifest yielding no SDK build produces, which is exactly the repair path for
+/// every runtime installed before `sdk_torch` was recorded. `disabled` belongs
+/// here for every scenario that did not ask for the opt-out — seeing it means the
+/// opt-out was applied to a user who never set it.
+const UNSETTLED_TORCH_ALIGNMENTS: [&str; 4] = [
+    "torch_alignment: unavailable",
+    "torch_alignment: install_failed",
+    "torch_alignment: not_applicable",
+    "torch_alignment: disabled",
+];
+
+/// The alignment ran, and settled.
+///
+/// Separate from the device check above because the two can disagree: a runtime
+/// whose torch was never touched at all can still open a device, so that check
+/// passes whether or not the alignment fired. The `torch_alignment:` block is the
+/// only evidence that `settle_engine_install` reached this engine, and the gate in
+/// front of it is the part most likely to be widened or narrowed by a later change.
+#[then("the torch alignment settled rather than being skipped")]
+async fn assert_torch_alignment_settled(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let verdict = torch_alignment_verdict(output);
+    assert!(
+        SETTLED_TORCH_ALIGNMENTS.contains(&verdict),
+        "torch alignment reached no settled outcome (`{verdict}`):\n{output}"
+    );
+    // Asserted negatively as well, because the check above reads only the first
+    // block and would pass on a second one that failed.
+    for unsettled in UNSETTLED_TORCH_ALIGNMENTS {
+        assert!(
+            !output.contains(unsettled),
+            "torch alignment reported `{unsettled}`:\n{output}"
+        );
+    }
+    // Asserted on the verdict, not on the divergence lines. Requiring
+    // `expected_divergence` whenever `divergence:` appears cannot fail: one render
+    // arm emits both, the verdict first. The property worth protecting is the other
+    // one — that a torch this tool put here on purpose is never called a defect —
+    // and `violated` is the only rendering that would say so. Unconditional because
+    // it stays true if a future engine pin and SDK build happen to agree: then there
+    // is no divergence to classify, and still no violation to report.
+    assert!(
+        !output.contains("dependency_check: violated"),
+        "the dependency check called a settled runtime a violation:\n{output}"
+    );
+}
+
+/// The opt-out was honoured, and said so in its own words.
+///
+/// `realigned` is the one verdict that proves it was ignored, and it is rejected
+/// unconditionally — that is this step's falsifiable half. `disabled` cannot be
+/// demanded unconditionally alongside it: the CLI only has a rewrite to skip when
+/// the runtime's torch is neither of the two builds it settles on, and whether
+/// this reinstall leaves such a torch depends on whether the SDK's own torch
+/// release is the release the engine pins — a property of the channel index on
+/// the day, not of anything the scenario controls. Every other accepted verdict
+/// is one where torch was kept as it was, which is what the user asked for.
+///
+/// `not_applicable` is rejected for a reason of its own: it is the generic bucket
+/// for "nothing to decide", and folding the opt-out into it leaves the user who
+/// set the variable unable to tell whether it took effect. The reason line is
+/// read too, so the block names the variable that caused the skip rather than
+/// leaving the reader to guess which of several causes applied.
+#[then("the torch alignment reports the opt-out instead of rewriting torch")]
+async fn assert_torch_alignment_opted_out(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let verdict = torch_alignment_verdict(output);
+    assert!(
+        verdict != "realigned",
+        "torch was realigned even though the user opted out:\n{output}"
+    );
+    // Every settled state except the rewrite, plus the skip the opt-out produces.
+    let kept_torch = verdict == "disabled" || SETTLED_TORCH_ALIGNMENTS.contains(&verdict);
+    assert!(
+        kept_torch,
+        "the opt-out left torch in a state this tool does not produce (`{verdict}`):\n{output}"
+    );
+    if verdict == "disabled" {
+        assert!(
+            output.contains("ROCM_CLI_DISABLE_TORCH_ALIGNMENT"),
+            "the skipped alignment does not name the variable that skipped it:\n{output}"
+        );
+    }
+}
+
+/// The kept torch is not sold to the user as a runtime to repair.
+///
+/// Two surfaces print a repair for the same divergence and both have to be quiet
+/// about this one: the CLI's own remedy line under a violated dependency check,
+/// and the engine's built-in repair, which reports through the install's
+/// `warning:` lines. A user who deliberately kept their torch and is then told to
+/// reinstall the engine has been handed an instruction that undoes what they
+/// asked for.
+///
+/// The classification underneath is asserted as well rather than only its two
+/// symptoms, because a remedy could be dropped from the renderer while the
+/// divergence is still recorded as a defect — which is what every other reader of
+/// that verdict, including `engines list`, would act on.
+#[then("the install does not offer to reinstall the engine over the kept torch")]
+async fn assert_no_reinstall_remedy(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        !output.contains("action: rocm engines install vllm --reinstall"),
+        "the CLI told the user to reinstall vLLM over the torch they kept:\n{output}"
     );
     assert!(
-        output.contains("dependency_check: satisfied"),
-        "the install did not report on the engine's requirements at all:\n{output}"
+        !output.contains("vLLM was reinstalled"),
+        "the engine's built-in repair replaced the torch the user kept:\n{output}"
     );
+    assert!(
+        !output.contains("dependency_check: violated"),
+        "the torch the user kept was reported as an unmet requirement:\n{output}"
+    );
+}
+
+/// Opting out of the correction did not opt out of the diagnosis.
+///
+/// The install exited 0 — the When asserts that — and on a host with a GPU that
+/// is only allowed for a runtime that can use it: a runtime that opens no device,
+/// or opens one it cannot run a kernel on, fails the install. So the presence of
+/// the block and the absence of both bad verdicts together say the health check
+/// still ran and still had teeth, without pinning a device count this scenario
+/// does not own.
+#[then("the runtime's device health is still reported")]
+async fn assert_device_health_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output.contains("device_check:"),
+        "the opt-out suppressed the device check as well as the rewrite:\n{output}"
+    );
+    for unusable in ["device_check: no_devices", "device_check: kernel_failed"] {
+        assert!(
+            !output.contains(unusable),
+            "the install reported `{unusable}` and exited 0 anyway:\n{output}"
+        );
+    }
 }
 
 /// The engine inventory reports a usable engine runtime.
@@ -192,8 +399,9 @@ async fn assert_engine_requirements_satisfied(world: &mut E2eWorld) {
 /// violated — that false green is the very thing this feature's scenario exists
 /// to catch — so asserting it afterwards would pass whether or not the fix
 /// works. Teaching that surface to notice a violated pin is tracked separately;
-/// until it does, the `dependency_check: satisfied` assertion is the only
-/// falsifiable signal available.
+/// until it does, the device check is the falsifiable signal, because it asks
+/// the runtime how many GPUs it can actually open rather than whether it looks
+/// installed.
 fn assert_engine_ready(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["engines", "list"]);
     assert!(

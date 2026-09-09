@@ -94,9 +94,9 @@ fn chat_api_key_from_env() -> Option<String> {
 /// unavailable store yields `None` (the dash still launches; switching to the
 /// Anthropic provider then surfaces an actionable error turn).
 fn anthropic_api_key_for_dash() -> Option<String> {
-    crate::provider_keys::resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY")
+    crate::provider_keys::provider_credential("anthropic", "ANTHROPIC_API_KEY")
         .ok()
-        .map(|k| k.value)
+        .map(crate::provider_keys::ProviderCredential::into_value)
 }
 
 /// Adapt the built-in `rocm-core` model recipes into the TUI-local summaries the
@@ -209,6 +209,12 @@ pub fn resolved_args(
         model_recipes: model_recipe_summaries(),
         runtimes: runtime_summaries(paths, config),
         automations: automation_summaries(config),
+        // The dash chat used to send a four-sentence preamble that never said
+        // which machine it was on, so platform questions were answered from
+        // pretraining ("ROCm is not compatible with Windows"). Compose the real
+        // assistant prompt plus this host's facts here — the bin is the only
+        // side with both — and hand the TUI a plain String.
+        chat_system_prompt: Some(crate::rocm_chat_tool_system_prompt_for_host(Some(paths))),
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,

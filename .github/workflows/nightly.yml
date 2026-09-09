@@ -337,9 +337,10 @@ jobs:
   # BUILD skip above — a regression run is worth doing even with no new commits).
   # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
-    name: E2E tests (GPU, incl. nightly-only)
+    name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, amd-gpu]
+    # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
+    runs-on: [self-hosted, linux, mi300x]
     continue-on-error: true
     env:
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
@@ -362,6 +363,46 @@ jobs:
           pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
           echo "reclaimed"
+
+      # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
+      # GPU is missing, the driver is wedged, or VRAM is still saturated by a
+      # leftover serve. A BOUNDED POLL, not a one-shot check: transient contention
+      # (e.g. the reclaim step's kills still draining VRAM) self-heals within
+      # seconds, so we retry up to a ceiling and succeed the moment the GPU is both
+      # responsive AND has enough free VRAM. Only a genuinely absent/wedged/held
+      # GPU reaches the ceiling and fails — with a per-reason message.
+      - name: GPU preflight (bounded wait for an available GPU)
+        run: |
+          # A serve here needs most of the card; require a generous free-VRAM
+          # floor so a leftover serve (which the reclaim step should have killed)
+          # is caught, while normal baseline (~300 MB used) passes immediately.
+          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
+          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
+          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
+          deadline=$(( SECONDS + CEILING_SECS ))
+          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # rocm-smi itself can hang on a wedged driver — bound it with timeout.
+            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
+            # otherwise make a naive first-number match pick up the "0".
+            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            if [ -z "$total" ] || [ -z "$used" ]; then
+              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
+              sleep 5; continue
+            fi
+            free=$(( total - used ))
+            if [ "$free" -ge "$min_free" ]; then
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              exit 0
+            fi
+            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            sleep 5
+          done
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          exit 1
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.

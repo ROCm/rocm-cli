@@ -7,7 +7,7 @@ Feature: Update report
   # managed runtimes so the report needs no network — mock lane, every PR.
 
   @id:update-report-distinguishes-feed-status
-  Scenario: 1 - The update report distinguishes configured from not-configured feeds
+  Scenario: update-01 - The update report distinguishes configured from not-configured feeds
     Given a machine with no managed runtimes
     When the user checks for updates
     Then the report shows there are no managed runtimes to update

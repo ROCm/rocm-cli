@@ -97,6 +97,19 @@ pub struct E2eWorld {
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
 }
 
+/// One scenario's resolved expectation plus the identity needed to report it.
+///
+/// Recorded by `filter_run`, which sees every scenario — including the ones it
+/// filters OUT. A filtered (skipped) scenario never reaches `report.json`, so
+/// this is the only place its feature and name survive to `platform.json`.
+struct Resolution {
+    expectation: e2e_cucumber::expectation::Expectation,
+    /// Effective serve engine for this scenario on this host.
+    engine: String,
+    feature: String,
+    scenario: String,
+}
+
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
 ///
 /// The value is CI-controlled, but validate it before it reaches a filesystem
@@ -118,13 +131,16 @@ fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
-/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
-/// on the runner's persistent disk; unset for local runs, where every scenario
-/// stays fully isolated (nothing shared).
+/// (HF model weights, the pip cache, and the CLI's own therock/tool archive
+/// download cache). Set by CI to a path on the runner's persistent disk; unset
+/// for local runs, where every scenario stays fully isolated (nothing shared).
 ///
-/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
-/// model weights per scenario. Only immutable artifacts are shared — service
-/// records, config, and per-service engine state stay isolated per scenario.
+/// Sharing these read-only artifacts avoids re-downloading the therock
+/// SDK/tool archives and model weights per scenario. Only immutable artifacts
+/// are shared — service records, config, and the runtimes registry stay
+/// isolated per scenario (see [`shared_runtimes_dir`] for the runtimes' own,
+/// opt-in, shared tree, which is what actually covers engine backends like
+/// `llamacpp:rocm`).
 fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
 }
@@ -220,7 +236,29 @@ impl E2eWorld {
             let root = root.path();
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
-            env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+            // The CLI's own therock/tool archive download cache — every archive
+            // in it is content-addressed and re-fetchable (see
+            // storage::download_cache_dir / tool_download_cache_dir). Route it
+            // through the same shared, persistent dir as HF_HOME/PIP_CACHE_DIR
+            // below instead of this scenario's TempDir, so therock SDK/tool
+            // archives are downloaded once per runner rather than once per
+            // scenario. Local runs (no shared dir) keep the old fully-isolated
+            // cache. This does NOT cover the ~3.3GB llamacpp:rocm Lemonade backend
+            // (EAI-8572) — that lives under the shared runtimes tree (see
+            // `use_shared_runtimes`) and was actually fixed by making
+            // `prepare_embeddable` stop wiping that shared tree on every scenario
+            // (rocm-engine-lemonade's `RUNTIME_VERSION_MARKER`).
+            //
+            // Two paths under this cache are mutable rather than content-
+            // addressed: `cache/therock/startup-update-check.json` and
+            // `cache/therock/metadata/*.json` (the etag revalidation cache).
+            // Both are now written atomically (`save_startup_update_check` /
+            // `write_cached_http_entry`), so concurrent scenarios sharing this
+            // dir can't tear either into a state `load_startup_update_check`
+            // would hard-error on.
+            let cache_dir = shared_cache_dir()
+                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -1096,8 +1134,11 @@ async fn main() {
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
     // the post-run evaluation and platform.json can reconcile by id — including
     // skipped scenarios, which never appear in cucumber's report.json.
-    // id → (resolved expectation, effective engine for that scenario).
-    let resolutions: &'static Mutex<BTreeMap<String, (Expectation, String)>> =
+    // id → (resolved expectation, effective engine, feature name, scenario name).
+    // The feature/scenario names travel with the resolution so platform.json can
+    // place even a SKIPPED scenario under its feature in the report's grouped
+    // grid — a skip never reaches report.json, which is the only other source.
+    let resolutions: &'static Mutex<BTreeMap<String, Resolution>> =
         Box::leak(Box::new(Mutex::new(BTreeMap::new())));
 
     // `.run()` records failures into the writers but never sets a non-zero exit
@@ -1114,7 +1155,25 @@ async fn main() {
     // one scenario at a time whenever a GPU is present. The no-GPU mock job keeps
     // the default parallelism (its scenarios use isolated in-process mock servers
     // on OS-assigned ports, so they're safe to run concurrently).
-    let max_concurrent = if cap.has_amd_gpu { 1 } else { 64 };
+    //
+    // This `max_concurrent == 1` is ALSO what makes it safe for a GPU lane to
+    // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
+    // at one persistent dir (see `isolate_env`): readers extracting an archive
+    // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
+    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
+    // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
+    // lane actually exports (e.g. a missing GPU driver reads `false` while a
+    // shared dir env var is still set) — so derive the cap from the hazards
+    // themselves rather than only from the probe. `shared_uv_cache_dir()` is
+    // deliberately excluded: uv's cache is content-addressed and uv does its
+    // own locking. A lane that races becomes serialized-and-slower instead.
+    let max_concurrent =
+        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
+            1
+        } else {
+            64
+        };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
@@ -1153,7 +1212,7 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
-            move |_feature, _rule, scenario| {
+            move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
                     &decl,
@@ -1167,10 +1226,15 @@ async fn main() {
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
-                    let prev = resolutions
-                        .lock()
-                        .expect("resolutions poisoned")
-                        .insert(id.clone(), (expectation, engine));
+                    let prev = resolutions.lock().expect("resolutions poisoned").insert(
+                        id.clone(),
+                        Resolution {
+                            expectation,
+                            engine,
+                            feature: feature.name.clone(),
+                            scenario: scenario.name.clone(),
+                        },
+                    );
                     // Two scenarios sharing an `@id` would silently overwrite each
                     // other's resolution (e.g. a copy-paste with a forgotten id
                     // change) — the report grid keys on @id, so the collision would
@@ -1225,8 +1289,14 @@ async fn main() {
         versions,
         expectations: resolutions
             .iter()
-            .map(|(id, (exp, engine))| {
-                e2e_cucumber::expectation::ResolvedScenario::new(id, engine, exp)
+            .map(|(id, r)| {
+                e2e_cucumber::expectation::ResolvedScenario::new(
+                    id,
+                    &r.feature,
+                    &r.scenario,
+                    &r.engine,
+                    &r.expectation,
+                )
             })
             .collect(),
     };
@@ -1242,7 +1312,7 @@ async fn main() {
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
-        match resolutions.get(id).map(|(exp, _)| exp) {
+        match resolutions.get(id).map(|r| &r.expectation) {
             Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
                     let label = format!("{id} ({bug})");
