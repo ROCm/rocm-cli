@@ -210,7 +210,7 @@ Feature: Model serving
   # at 32 of their 35 allotted minutes on main alone. Three new real serves would
   # put them over, so they follow serve-06/07/08 onto the merge-queue path,
   # where the budget for heavy serves lives.
-  @id:services-stop-reports-what-it-stopped @requires-gpu @merge-queue
+  @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
   Scenario: serve-20 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
@@ -222,7 +222,7 @@ Feature: Model serving
   # supported way to stop it has been removed along with them. Nothing here
   # touches the installed program: the removal is scoped to this scenario's own
   # directories and keeps the binaries.
-  @id:uninstall-stops-what-it-manages @requires-os:linux
+  @id:serve-uninstall-stops-what-it-manages @requires-os:linux
   Scenario: serve-21 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
