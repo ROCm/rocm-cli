@@ -1160,12 +1160,16 @@ async fn main() {
     // (see `isolate_env`): readers extracting an archive and a concurrent
     // `remove_file` of that same archive after another scenario's extract
     // (`uv.rs`, `therock.rs`) would otherwise race. `cap.has_amd_gpu` is a
-    // capability *probe*, not the CI lane's own knowledge of whether it set a
-    // shared cache dir — if a lane exports `E2E_SHARED_CACHE_DIR` while its
-    // probe reads false (e.g. a missing GPU driver), it would silently run up
-    // to 64 scenarios against one shared cache dir. Keep the two coupled if
-    // either changes.
-    let max_concurrent = if cap.has_amd_gpu { 1 } else { 64 };
+    // capability *probe* that can disagree with what a lane actually exports
+    // (e.g. a missing GPU driver reads `false` while `E2E_SHARED_CACHE_DIR` is
+    // still set) — so derive the cap from the hazard itself, a configured
+    // shared cache dir, rather than only from the probe. A lane that races
+    // becomes serialized-and-slower instead of racing.
+    let max_concurrent = if cap.has_amd_gpu || shared_cache_dir().is_some() {
+        1
+    } else {
+        64
+    };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
