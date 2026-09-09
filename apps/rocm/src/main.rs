@@ -4995,13 +4995,19 @@ fn serve(args: ServeArgs) -> Result<()> {
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
-    // Physical AMD GPU ordinals still usable after the active visibility mask
-    // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied. `None` means
-    // availability could not be probed on this platform (e.g. WSL or a non-Linux
-    // target), in which case selection stays permissive and defers device
-    // validation to the engine. Computed once and reused for the fail-fast check
-    // below and for mask-aware GPU selection, so serve never auto-selects — or
-    // accepts an explicit `--gpu` for — a device the mask has hidden.
+    // AMD GPU ordinals still usable after the active visibility mask
+    // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
+    // ordinal space — the space `--gpu` is validated and exported through. A
+    // `ROCR_VISIBLE_DEVICES` mask hides devices below HIP, which re-indexes the
+    // survivors as `0..N`, so those HIP positions are what comes back here, not the
+    // physical ROCR token values. `None` means availability could not be probed
+    // (a non-Linux target, both KFD and DRM unreadable on Linux, or a mask this
+    // ordinal-only probe cannot interpret such as one naming UUIDs) — NOT WSL,
+    // which answers authoritatively via `detect_wsl_summary`. On `None` selection
+    // stays permissive and defers device validation to the engine. An empty set is
+    // the authoritative "no usable GPU", not "unknown". Computed once and reused
+    // for the fail-fast check below and for mask-aware GPU selection, so serve
+    // never auto-selects — or accepts an explicit `--gpu` for — a hidden device.
     let visible_gpu_indices = if cpu_only {
         None
     } else {
@@ -18418,8 +18424,10 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// enumeration are in play. Validate on multi-GPU hardware before relying on a
 /// specific `--gpu <index>` mapping in those configurations.
 ///
-/// Selection is mask-aware: `visible` is the set of physical ordinals still
-/// usable after the active visibility mask (see [`rocm_core::usable_amd_gpu_indices`]).
+/// Selection is mask-aware: `visible` is the set of HIP ordinals still usable
+/// after the active visibility mask (see [`rocm_core::usable_amd_gpu_indices`]) —
+/// already in the space the choice is exported through, since a
+/// `ROCR_VISIBLE_DEVICES` mask has its survivors re-indexed to `0..N`.
 /// Auto-selection is restricted to it and an explicit `--gpu` outside it is
 /// rejected early, so serve never targets a masked-out device. `None` (an
 /// unprobeable host) keeps the previous mask-unaware behavior.
@@ -18545,11 +18553,19 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// assuming device 0 — the engine's device probe then pins the first present GPU
 /// or fails fast under the GPU-required policy.
 ///
-/// Selection is mask-aware: candidates are restricted to `visible`, the physical
+/// Selection is mask-aware: candidates are restricted to `visible`, the HIP
 /// ordinals still usable after the active visibility mask (see
 /// [`rocm_core::usable_amd_gpu_indices`]), so auto-select never lands on a
 /// masked-out GPU the engine would then reject. `None` (an unprobeable host)
 /// leaves the detected range unrestricted, as before.
+///
+/// Under a `ROCR_VISIBLE_DEVICES` mask the *choice* is correct — `visible` is
+/// already re-indexed into the HIP space the selection is exported through — but
+/// the `vram` rows come from amd-smi, which does not honour that mask, so the
+/// idleness ranking can read a different device's occupancy than the one the
+/// ordinal binds. That is a best-effort heuristic, not a binding hazard: it can
+/// pick a less idle visible GPU, never a hidden one. Translating amd-smi rows
+/// through a ROCR mask is deferred (needs multi-GPU hardware to verify).
 ///
 /// This reads service state (`busy_gpu_indices`) but does not lock on its own.
 /// Concurrency safety is the caller's responsibility: `serve()` holds the
@@ -18576,10 +18592,12 @@ fn select_auto_gpu_index(
     busy: &[u32],
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
-    // Candidate physical ordinals: the detected device range, narrowed to those
-    // still visible under the active mask so auto-select never targets a
-    // masked-out GPU. When the host is unprobeable (`visible` is `None`) the
-    // range is used unrestricted (mask-unaware, as before).
+    // Candidate ordinals: the detected device range, narrowed to those still
+    // visible under the active mask so auto-select never targets a masked-out GPU.
+    // `visible` is in HIP space (a ROCR mask's survivors are re-indexed to `0..N`),
+    // which is the space the selection is exported through, so the retained
+    // ordinals are directly selectable. When the host is unprobeable (`visible` is
+    // `None`) the range is used unrestricted (mask-unaware, as before).
     let count = detected.unwrap_or(0);
     let mut all: Vec<u32> = (0..count as u32).collect();
     if let Some(visible) = visible {
