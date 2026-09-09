@@ -172,31 +172,41 @@ impl AnimatedSpinner {
     }
 
     fn start_with_interval(label: impl Into<String>, interval: Duration) -> Self {
-        Self::start_with_interval_impl(label, interval, false)
+        Self::start_with_interval_impl(label, interval, None)
     }
 
-    /// Like [`Self::start_with_interval`], but always spawns the ticker
-    /// thread even when stderr isn't a TTY. Test-only: production callers go
-    /// through `start`/`start_with_interval`, which skip the thread when
-    /// nobody can see its repaints, but a test running with stderr piped
-    /// still needs the thread to verify the ticker mechanism itself.
+    /// Like [`Self::start_with_interval`], but overrides whether the spinner
+    /// is treated as enabled instead of probing stderr. Test-only: whether
+    /// the ticker thread spawns depends on `Spinner::enabled`, which
+    /// `Spinner::new` derives from the real `stderr().is_terminal()` — a
+    /// property of however the test happens to be run, not of the behavior
+    /// under test. Forcing it here keeps these tests deterministic whether
+    /// `cargo test` is launched from an interactive terminal or not.
     #[cfg(test)]
-    fn start_with_interval_forced(label: impl Into<String>, interval: Duration) -> Self {
-        Self::start_with_interval_impl(label, interval, true)
+    fn start_with_interval_enabled(
+        label: impl Into<String>,
+        interval: Duration,
+        enabled: bool,
+    ) -> Self {
+        Self::start_with_interval_impl(label, interval, Some(enabled))
     }
 
     fn start_with_interval_impl(
         label: impl Into<String>,
         interval: Duration,
-        force_ticker: bool,
+        enabled_override: Option<bool>,
     ) -> Self {
-        let inner = Arc::new(Mutex::new(Spinner::new(label)));
+        let mut spinner = Spinner::new(label);
+        if let Some(enabled) = enabled_override {
+            spinner.enabled = enabled;
+        }
+        let inner = Arc::new(Mutex::new(spinner));
         inner.lock().unwrap().tick();
         let stop = Arc::new(AtomicBool::new(false));
         // A ticker thread only exists to keep repainting an already-visible
         // spinner; when stderr isn't a TTY every repaint it would trigger is
         // a no-op, so skip holding an OS thread open for the whole download.
-        let ticker = if force_ticker || inner.lock().unwrap().enabled {
+        let ticker = if inner.lock().unwrap().enabled {
             let inner = Arc::clone(&inner);
             let stop = Arc::clone(&stop);
             Some(thread::spawn(move || {
@@ -370,8 +380,11 @@ mod tests {
 
     #[test]
     fn animated_spinner_keeps_ticking_without_progress_calls() {
-        let spinner =
-            AnimatedSpinner::start_with_interval_forced("Downloading…", Duration::from_millis(5));
+        let spinner = AnimatedSpinner::start_with_interval_enabled(
+            "Downloading…",
+            Duration::from_millis(5),
+            true,
+        );
         thread::sleep(Duration::from_millis(60));
         let idx = spinner.inner.lock().unwrap().idx;
         assert!(
@@ -382,11 +395,14 @@ mod tests {
 
     #[test]
     fn animated_spinner_skips_the_ticker_thread_when_disabled() {
-        // Test processes don't have a TTY on stderr, so `start_with_interval`
-        // (unlike `start_with_interval_forced`) must see `enabled == false`
-        // here and skip spawning the thread entirely.
-        let spinner =
-            AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
+        // Force `enabled = false` explicitly rather than relying on stderr
+        // not being a TTY in the test process, so this stays deterministic
+        // whether `cargo test` runs piped (CI) or from an interactive shell.
+        let spinner = AnimatedSpinner::start_with_interval_enabled(
+            "Downloading…",
+            Duration::from_millis(5),
+            false,
+        );
         assert!(
             spinner.ticker.is_none(),
             "no ticker thread should be spawned when stderr isn't a TTY"
