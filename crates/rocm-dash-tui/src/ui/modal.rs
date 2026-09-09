@@ -63,7 +63,10 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 /// it (Phase 3 Wave 0). `scroll` is the first visible line offset, clamped
 /// here to the content's last page so a "scroll to end" action (which sends
 /// `u16::MAX`-ish deltas, see `AppState::scroll_help`) can't push every line
-/// past the viewport and render a blank pane.
+/// past the viewport and render a blank pane. The clamp is computed from the
+/// *wrapped* row count (`Paragraph::line_count`), not `lines.len()` — `scroll`
+/// is applied post-wrap, so a pre-wrap count under-clamps whenever a line
+/// wraps and leaves trailing content permanently unreachable.
 pub fn draw_scrollable_lines(
     f: &mut Frame,
     area: Rect,
@@ -76,12 +79,11 @@ pub fn draw_scrollable_lines(
     if inner.height == 0 {
         return;
     }
-    let max_scroll = u16::try_from(lines.len())
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = u16::try_from(p.line_count(inner.width))
         .unwrap_or(u16::MAX)
         .saturating_sub(inner.height);
-    let p = Paragraph::new(lines)
-        .scroll((scroll.min(max_scroll), 0))
-        .wrap(Wrap { trim: false });
+    let p = p.scroll((scroll.min(max_scroll), 0));
     f.render_widget(p, inner);
 }
 
@@ -890,6 +892,30 @@ mod ported_chrome_tests {
         assert!(
             out.contains("REPLAY") && out.contains("pause / resume"),
             "overscrolling help should clamp to the last page, not blank it: {out:?}"
+        );
+    }
+
+    /// Home's tab-specific text is a single short line that never wraps at 80
+    /// columns, so the test above can't catch a clamp computed from the
+    /// pre-wrap line count instead of the wrapped row count. Chat's
+    /// descriptions do wrap at this width — this is what actually exercises
+    /// `draw_scrollable_lines`'s `max_scroll` against wrapped content, and
+    /// pins REPLAY's last entry (`{ / }  jump ±60s`) as reachable via "jump
+    /// to end".
+    #[test]
+    fn help_scroll_past_end_reaches_last_line_when_content_wraps() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 24);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_help(f, area, ActiveTab::Chat, &theme, i16::MAX as u16))
+            .unwrap();
+        let out = flat(&term);
+        assert!(
+            out.contains("REPLAY") && out.contains("60s"),
+            "overscrolling wrapped help should still reach the last REPLAY \
+             entry, not clamp short of it: {out:?}"
         );
     }
 }
