@@ -1397,17 +1397,19 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
-    // The mock lane's ceiling is bounded by the machine rather than left at a
-    // flat 64. Its scenarios are safe to run together, but they are not free:
-    // each spawns `rocm` subprocesses, and several drive a TUI under a pseudo-
-    // terminal and assert on WALL-CLOCK windows (the dashboard's held-value
-    // window is 6 s). At 64-way on a 2-4 vCPU runner those steps get
-    // descheduled for seconds and miss the window they are timing — measured at
-    // 4.7 s, which reports a value that expired on schedule as one that was
-    // never held. Scaling to the core count keeps the lane parallel where
-    // parallelism is free and stops it oversubscribing where it is not.
-    // `E2E_MAX_CONCURRENT` overrides the ceiling, for bisecting a lane whose
-    // failures look like contention rather than behaviour.
+    // The mock lane's ceiling is bounded by the machine rather than left at
+    // cucumber's flat 64. Its scenarios are safe to run together, but they are
+    // not free: each spawns `rocm` subprocesses, and several drive a TUI under a
+    // pseudo-terminal and assert on WALL-CLOCK behaviour. At 64-way on a 2-4
+    // vCPU runner those steps are descheduled for seconds — measured at 4.7 s
+    // against a 6 s window — so they miss the moment they are timing and report
+    // a starved reading as a product verdict. Bounding to the core count keeps
+    // the lane parallel where parallelism is free and stops it oversubscribing
+    // where it is not; it is also no slower, because starvation costs more than
+    // the extra concurrency buys.
+    //
+    // `E2E_MAX_CONCURRENT` overrides it, for bisecting a lane whose failures
+    // look like contention rather than behaviour.
     let max_concurrent = std::env::var("E2E_MAX_CONCURRENT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
