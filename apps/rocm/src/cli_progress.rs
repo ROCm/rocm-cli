@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use crossterm::QueueableCommand;
 use crossterm::cursor::MoveToColumn;
 use crossterm::terminal::{Clear, ClearType};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Braille spinner frames (matching the dashboard's visual language).
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -125,18 +126,29 @@ impl Spinner {
     }
 }
 
-/// Truncates `line` (by character count) to fit within `max_width` columns,
-/// appending an ellipsis when it doesn't already fit, so a repaint can never
-/// wrap to a second terminal row.
+/// Truncates `line` (by Unicode display width, not character count — a wide
+/// CJK glyph occupies two terminal columns) to fit within `max_width`
+/// columns, appending an ellipsis when it doesn't already fit, so a repaint
+/// can never wrap to a second terminal row.
 fn truncate_to_width(line: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    if line.chars().count() <= max_width {
+    if line.width() <= max_width {
         return line.to_owned();
     }
-    let keep = max_width.saturating_sub(1);
-    let mut truncated: String = line.chars().take(keep).collect();
+    let ellipsis_width = '…'.width().unwrap_or(1);
+    let keep_width = max_width.saturating_sub(ellipsis_width);
+    let mut truncated = String::new();
+    let mut used_width = 0;
+    for ch in line.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used_width + ch_width > keep_width {
+            break;
+        }
+        truncated.push(ch);
+        used_width += ch_width;
+    }
     truncated.push('…');
     truncated
 }
@@ -205,11 +217,14 @@ pub(crate) fn format_download_progress(prefix: &str, bytes: u64, total: Option<u
         Some(total) if total > 0 => {
             // Floor rather than round: a multi-gigabyte transfer sitting at
             // 99.5% must not be shown as "complete" while bytes are still
-            // outstanding. 100% is reserved for `bytes >= total`.
+            // outstanding. 100% is reserved for `bytes >= total`. Integer
+            // arithmetic in u128 (rather than an f64 ratio) avoids adjacent
+            // huge u64 values collapsing to the same float and reporting
+            // 100% early.
             let pct = if bytes >= total {
                 100
             } else {
-                ((bytes as f64 / total as f64) * 100.0).floor() as u64
+                ((u128::from(bytes) * 100) / u128::from(total)) as u64
             };
             format!(
                 "{prefix} {} / {} ({pct}%)",
@@ -263,6 +278,18 @@ mod tests {
     }
 
     #[test]
+    fn format_download_progress_does_not_round_up_to_100_for_huge_totals() {
+        // An f64 ratio can't distinguish adjacent values this close to
+        // u64::MAX — it collapses to 1.0 and would misreport 100% while a
+        // byte is still outstanding. Integer arithmetic must not.
+        let rendered = format_download_progress("Downloading…", u64::MAX - 1, Some(u64::MAX));
+        assert!(
+            !rendered.contains("(100%)"),
+            "a single outstanding byte out of u64::MAX must not show as complete: {rendered}"
+        );
+    }
+
+    #[test]
     fn set_progress_never_displays_fewer_bytes_than_already_shown() {
         let mut spinner = Spinner::new("Downloading…");
         spinner.set_progress("Downloading…", 900, Some(1000));
@@ -288,7 +315,7 @@ mod tests {
     #[test]
     fn truncate_to_width_ellipsizes_overlong_lines() {
         let truncated = truncate_to_width("⠋ a very long download progress line", 10);
-        assert_eq!(truncated.chars().count(), 10);
+        assert_eq!(truncated.width(), 10);
         assert!(
             truncated.ends_with('…'),
             "overlong line must end with an ellipsis marker: {truncated}"
@@ -298,6 +325,19 @@ mod tests {
     #[test]
     fn truncate_to_width_handles_zero_width() {
         assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_accounts_for_wide_characters() {
+        // Each 下 occupies two terminal columns, so a naive char-count
+        // truncation would keep too many of them and still overflow the row.
+        let truncated = truncate_to_width("下载中下载中下载中", 10);
+        assert!(
+            truncated.width() <= 10,
+            "display width must respect max_width even with wide glyphs: {truncated} ({})",
+            truncated.width()
+        );
+        assert!(truncated.ends_with('…'));
     }
 
     #[test]

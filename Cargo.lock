@@ -3585,6 +3585,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-width",
  "ureq",
  "windows-native-keyring-store",
  "windows-sys 0.61.2",
