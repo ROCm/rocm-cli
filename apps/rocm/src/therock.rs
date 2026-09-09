@@ -295,12 +295,6 @@ impl AggregateDeviceTarget {
         }
     }
 
-    /// The `rocm` extras this target implies. Always three extras, so a plan
-    /// never reads as though the GPU backend were optional.
-    fn rocm_extras(&self) -> String {
-        format!("libraries,devel,device-{}", self.as_str())
-    }
-
     fn reason(&self) -> Option<&str> {
         match self {
             Self::Exact(_) => None,
@@ -1493,17 +1487,23 @@ fn install_wheel_runtime(
 
 fn therock_pip_package_specs(
     package_versions: &TheRockPipPackageVersions,
-    rocm_extras: &str,
+    device_target: &str,
 ) -> Vec<String> {
+    let device_extra = format!("device-{device_target}");
     vec![
-        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
-        format!("torch=={}", package_versions.torch),
-        format!("torchvision=={}", package_versions.torchvision),
+        format!(
+            "rocm[libraries,devel,{device_extra}]=={}",
+            package_versions.rocm
+        ),
+        format!("torch[{device_extra}]=={}", package_versions.torch),
+        format!(
+            "torchvision[{device_extra}]=={}",
+            package_versions.torchvision
+        ),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
 }
-
-/// The exact install intent for `resolution` under `rocm_extras`.
+/// The exact install intent for `resolution` and its source-validated device target.
 ///
 /// Kept beside [`therock_pip_package_specs`] so the specs that identify a
 /// runtime are, by construction, the specs that get installed.
@@ -1515,7 +1515,7 @@ fn wheel_runtime_composition(
         source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
         package_specs: therock_pip_package_specs(
             &resolution.package_versions,
-            &device_target.rocm_extras(),
+            device_target.as_str(),
         ),
         rocm_sdk_target: matches!(device_target, AggregateDeviceTarget::Exact(_))
             .then(|| device_target.as_str().to_owned()),
@@ -5125,7 +5125,7 @@ mod tests {
         );
 
         assert_eq!(target, AggregateDeviceTarget::Exact("gfx1201".to_owned()));
-        assert_eq!(target.rocm_extras(), "libraries,devel,device-gfx1201");
+        assert_eq!(target.as_str(), "gfx1201");
     }
 
     #[test]
@@ -5164,10 +5164,7 @@ mod tests {
         let target =
             AggregateDeviceTarget::resolve(None, "gfx110X-all", &published_device_targets());
 
-        assert_eq!(
-            target.rocm_extras(),
-            "libraries,devel,device-<undetermined>"
-        );
+        assert_eq!(target.as_str(), "<undetermined>");
         assert!(
             target
                 .reason()
@@ -5434,15 +5431,14 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs =
-            therock_pip_package_specs(&package_versions, "libraries,devel,device-gfx942");
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942");
 
         assert_eq!(
             package_specs,
             vec![
                 "rocm[libraries,devel,device-gfx942]==7.13.0a20260513".to_owned(),
-                "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
-                "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
+                "torch[device-gfx942]==2.10.0+rocm7.13.0a20260513".to_owned(),
+                "torchvision[device-gfx942]==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
