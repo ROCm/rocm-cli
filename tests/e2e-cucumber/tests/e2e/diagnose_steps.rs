@@ -832,7 +832,12 @@ async fn given_non_default_device_group(world: &mut E2eWorld) {
     let usable = |name: &String| name != DEFAULT_DEVICE_GROUP && name != "video";
     let group = ["kvm", "input", "disk", "dialout", "plugdev", "users"]
         .into_iter()
-        .find_map(|preferred| names.iter().find(|name| name.as_str() == preferred).cloned())
+        .find_map(|preferred| {
+            names
+                .iter()
+                .find(|name| name.as_str() == preferred)
+                .cloned()
+        })
         .or_else(|| names.iter().find(|name| usable(name)).cloned())
         .expect("this machine names no group other than the default");
     assert!(
