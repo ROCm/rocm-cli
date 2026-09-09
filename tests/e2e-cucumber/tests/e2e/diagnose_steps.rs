@@ -136,6 +136,11 @@ async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
 }
 
+#[given("a user who has chosen the fix for the engine-startup import failure")]
+async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
+}
+
 #[given("a user who has chosen a known fix")]
 async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
@@ -374,6 +379,54 @@ async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
         score >= threshold,
         "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
          of {threshold}, so it is not an established cause:\n{output}"
+    );
+}
+
+#[then("the printed plan says which shell each step runs in")]
+async fn assert_plan_says_which_shell_each_step_runs_in(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The rendered block is a `Commands:` header followed by one `  $ <line>`
+    // per entry; `map_while` stops at the first line that is not one of those,
+    // which is the `Flags:` row underneath.
+    let commands: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .map_while(|line| line.strip_prefix("  $ "))
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "the preview printed no command block at all:\n{output}"
+    );
+    let position = |needle: &str| {
+        commands
+            .iter()
+            .position(|c| c.trim() == needle)
+            .unwrap_or_else(|| panic!("the printed plan no longer runs `{needle}`:\n{output}"))
+    };
+    let open = position("rocm engines shell vllm");
+    let leave = position("exit");
+    let act = position("rocm engines install vllm --reinstall");
+    // Ordered: the subshell is opened, then left, and only then is the engine
+    // reinstalled -- that step replaces the environment the subshell stands in.
+    assert!(
+        open < leave && leave < act,
+        "the plan must open the subshell, leave it, and only then reinstall:\n{output}"
+    );
+    let is_comment = |c: &&str| c.trim_start().starts_with('#');
+    // And labelled, not merely ordered: with every line carrying the same `$`
+    // prefix, a reader has nothing else to tell the two contexts apart.
+    assert!(
+        commands[open..leave]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("INSIDE")),
+        "the plan must say the probes run INSIDE the subshell:\n{output}"
+    );
+    assert!(
+        commands[leave..act]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("YOUR OWN shell")),
+        "the plan must say the reinstall runs back in the user's own shell:\n{output}"
     );
 }
 

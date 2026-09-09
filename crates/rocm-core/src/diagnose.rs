@@ -1307,8 +1307,18 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
 /// host it reports `framework: unknown` with a `torch import failed` note, so
 /// the deciding fact is absent from the examination entirely. Nothing structural
 /// can fire until that probe targets the active runtime's interpreter, which is
-/// why the parameter is unused: the user has to supply the error text, either
-/// through `--symptom` or from a serve failure note.
+/// why the parameter is unused: the user has to supply the error text through
+/// `rocm diagnose --symptom "<pasted error>"`.
+///
+/// That is the only route to this entry from the symptom, and it is a narrow
+/// one: nothing on the serve or `rocm services` path points at `rocm diagnose`
+/// at all — a service that died at startup renders a `logs:` and a `restart:`
+/// hint and no more — so reaching this requires already knowing to paste the
+/// error into `diagnose`. The recipe is also reachable by name (`rocm fix` lists
+/// it, `rocm fix fix-17-torch-dlpack` prints it), but that needs the id rather
+/// than the symptom. Closing that gap means adding a diagnose hint to the
+/// service-failure output, which changes a shared surface for every failed
+/// service regardless of cause and belongs in its own change.
 fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
     let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
     if score <= 0 {
@@ -1319,19 +1329,33 @@ fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagno
     }
     let fix = Fix {
         summary: "Only if the engine's runtime holds a ROCm build of torch in the 2.4-2.9 range with torch-c-dlpack-ext installed: reinstall the engine so its pinned torch is restored, which moves torch off the versions the extension ships prebuilts for.".to_owned(),
+        // Three labelled groups, because the steps run in three different places
+        // and the report renders them as one undifferentiated `$`-prefixed list.
+        // Unlabelled, a user pasting the block wholesale is relying on terminal
+        // stdin buffering to land the probes in the subshell -- and on the
+        // reinstall NOT landing there, since it replaces the very environment
+        // that shell is standing in.
         commands: vec![
-            "# Confirm the trigger before changing anything, and check the torch the".to_owned(),
-            "# ENGINE uses rather than the one on your PATH -- they are different".to_owned(),
-            "# interpreters, and only the engine's decides this failure.".to_owned(),
+            "# --- step 1 of 3, in YOUR shell ---".to_owned(),
+            "# Opens an INTERACTIVE subshell with the engine's environment active,".to_owned(),
+            "# and does not return until you leave it. Run this line on its own.".to_owned(),
             "rocm engines shell vllm".to_owned(),
-            "# ...and run the next two INSIDE the shell it opens:".to_owned(),
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---".to_owned(),
+            "# Confirm the trigger before changing anything. It has to be the".to_owned(),
+            "# ENGINE's interpreter, not the one on your PATH -- they are different".to_owned(),
+            "# interpreters, and only the engine's decides this failure.".to_owned(),
             "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
-            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\"".to_owned(),
+            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\""
+                .to_owned(),
             "# This entry applies ONLY when torch.version.hip is set, torch.__version__".to_owned(),
             "# is in the 2.4-2.9 range, and torch-c-dlpack-ext is installed. Outside".to_owned(),
             "# that range the extension raises a handled ImportError and this is not".to_owned(),
-            "# the failure you are looking at.".to_owned(),
-            "# If all three hold, put the engine's pinned torch back:".to_owned(),
+            "# the failure you are looking at. Then leave the subshell:".to_owned(),
+            "exit".to_owned(),
+            "# --- step 3 of 3, back in YOUR OWN shell ---".to_owned(),
+            "# If all three held, put the engine's pinned torch back. Do NOT run".to_owned(),
+            "# this from inside the subshell: it replaces the environment that".to_owned(),
+            "# shell is standing in.".to_owned(),
             "rocm engines install vllm --reinstall".to_owned(),
         ],
         fix_id: "fix-17-torch-dlpack".to_owned(),
@@ -1762,6 +1786,26 @@ mod tests {
             render_group > 0,
             "the render-group suggestion must no longer be the top answer here"
         );
+    }
+
+    #[test]
+    fn the_engine_import_plan_says_which_shell_each_step_runs_in() {
+        // The plan `diagnose` attaches to the finding is a second copy of the
+        // catalog recipe's command block, and it is the copy the reported user
+        // actually saw. Hold it to the same boundary the recipe is held to, so
+        // the two cannot drift into disagreeing about which shell runs what.
+        let report = diagnose(
+            &linux_base(),
+            "OSError: libtorch_cuda.so: cannot open shared object file",
+        );
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-17-torch-dlpack")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_engine_shell_boundary_is_labelled(&fix.fix_id, &commands);
     }
 
     #[test]

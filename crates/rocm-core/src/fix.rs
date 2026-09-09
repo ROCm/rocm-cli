@@ -372,16 +372,31 @@ const RECIPES: &[FixRecipe] = &[
         title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
         rationale: "vLLM's engine start aborts at import time when torch-c-dlpack-ext loads its CUDA prebuilt on a ROCm torch: it picks the variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant. tvm_ffi imports it as OPTIONAL but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so the optional import kills the process. Both defects are upstream; nothing here is misconfigured. What you can change locally is the torch version: outside the 2.4-2.9 range there is no prebuilt to load, the extension raises the handled ImportError, and tvm_ffi falls back to its JIT path with a warning.",
         auto_applicable: false,
+        // Three labelled groups, because the steps run in three different places
+        // and `print_recipe` renders them as one undifferentiated `$`-prefixed
+        // list. Unlabelled, a user pasting the block wholesale is relying on
+        // terminal stdin buffering to land the probes in the subshell -- and on
+        // the reinstall NOT landing there, since it replaces the very
+        // environment that shell is standing in.
         commands: &[
-            "# Confirm the trigger first, against the ENGINE's interpreter rather than",
-            "# the one on your PATH -- only the engine's torch decides this failure.",
+            "# --- step 1 of 3, in YOUR shell ---",
+            "# Opens an INTERACTIVE subshell with the engine's environment active,",
+            "# and does not return until you leave it. Run this line on its own.",
             "rocm engines shell vllm",
-            "# ...and run the next two INSIDE the shell it opens:",
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---",
+            "# Confirm the trigger against the ENGINE's interpreter rather than the",
+            "# one on your PATH -- only the engine's torch decides this failure.",
             "python -c \"import torch; print(torch.__version__, torch.version.hip)\"",
             "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\"",
             "# Applies ONLY when torch.version.hip is set, torch.__version__ is in the",
             "# 2.4-2.9 range, and torch-c-dlpack-ext is installed. If any of the three",
-            "# does not hold, this is not the failure you are looking at.",
+            "# does not hold, this is not the failure you are looking at. Then leave",
+            "# the subshell:",
+            "exit",
+            "# --- step 3 of 3, back in YOUR OWN shell ---",
+            "# If all three held, put the engine's pinned torch back. Do NOT run this",
+            "# from inside the subshell: it replaces the environment that shell is",
+            "# standing in.",
             "rocm engines install vllm --reinstall",
         ],
         needs_sudo: false,
@@ -396,6 +411,63 @@ const RECIPES: &[FixRecipe] = &[
         runner: None,
     },
 ];
+
+/// Assert that a recipe whose steps span more than one shell says which shell
+/// each group runs in.
+///
+/// Shared by the two copies of the plan — the catalog recipe here and the
+/// `Fix` [`crate::diagnose`] attaches to its finding — because a divergence
+/// between them is exactly the kind of thing a reader would meet and not the
+/// author.
+///
+/// Both renderers print every line of the block with the same `$ ` prefix, so
+/// ordering alone tells a reader nothing: it does not say that
+/// `rocm engines shell vllm` opened an interactive subshell the probes belong
+/// inside, nor that the reinstall must run outside it because it replaces the
+/// very environment that subshell is standing in. Rendered flat, a user pasting
+/// the block wholesale was left depending on terminal stdin buffering to land
+/// each line in the right shell. Hold the block to marking the boundary in both
+/// directions — ordered (open it, leave it, only then act) and labelled.
+#[cfg(test)]
+pub(crate) fn assert_engine_shell_boundary_is_labelled(fix_id: &str, commands: &[&str]) {
+    let position = |needle: &str| {
+        commands
+            .iter()
+            .position(|c| c.trim() == needle)
+            .unwrap_or_else(|| {
+                panic!("{fix_id}: the plan no longer runs `{needle}`:\n{commands:#?}")
+            })
+    };
+    let open = position("rocm engines shell vllm");
+    let leave = position("exit");
+    let act = position("rocm engines install vllm --reinstall");
+    assert!(
+        open < leave && leave < act,
+        "{fix_id}: the subshell has to be opened, then left, and only then may the \
+         reinstall run -- it replaces the environment that subshell stands in:\n{commands:#?}"
+    );
+    let is_comment = |c: &&str| c.trim_start().starts_with('#');
+    assert!(
+        commands[open + 1..leave].iter().any(|c| !is_comment(c)),
+        "{fix_id}: nothing actually runs inside the subshell, so opening one is \
+         unexplained:\n{commands:#?}"
+    );
+    let labelled = |from: usize, to: usize, want: &str| {
+        commands[from..to]
+            .iter()
+            .any(|c| is_comment(c) && c.contains(want))
+    };
+    assert!(
+        labelled(open, leave, "INSIDE"),
+        "{fix_id}: the block has to say the probes run INSIDE the subshell rather \
+         than merely list them after it:\n{commands:#?}"
+    );
+    assert!(
+        labelled(leave, act, "YOUR OWN shell"),
+        "{fix_id}: the block has to say the reinstall runs back in the user's own \
+         shell:\n{commands:#?}"
+    );
+}
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
@@ -1108,6 +1180,13 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
         assert_eq!(count, 16, "expected 16 catalog entries");
+    }
+
+    #[test]
+    fn the_dlpack_recipe_says_which_shell_each_step_runs_in() {
+        let recipe =
+            find_recipe("fix-17-torch-dlpack").expect("fix-17-torch-dlpack must be in the catalog");
+        assert_engine_shell_boundary_is_labelled(recipe.fix_id, recipe.commands);
     }
 
     #[test]

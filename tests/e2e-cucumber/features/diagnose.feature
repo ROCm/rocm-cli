@@ -162,3 +162,23 @@ Feature: Diagnosing failures and listing fixes
     Given a user who hit the vLLM engine-startup import failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI reports the engine-startup import failure as an established cause
+
+  # Every other recipe in the catalog is a flat sequence for one shell. This one
+  # is not: `rocm engines shell vllm` opens an INTERACTIVE subshell, the two
+  # probes are meant to run inside it, and the reinstall replaces the very
+  # environment that subshell is standing in, so it must not run there. The CLI
+  # renders every command line with the same `$` prefix, so ordering alone said
+  # none of that, and a user pasting the block wholesale was left depending on
+  # terminal stdin buffering to land each line in the right shell. What the user
+  # can observe is the printed plan, so that is what is asserted.
+  #
+  # Deliberately not OS-gated even though the fix is linux-only: the plan is
+  # printed before the fix's own platform gate is reached, so the text under test
+  # is identical on both lanes and the Windows lane exercises it too. The step
+  # therefore asserts the printed block and not the exit code, which does differ
+  # (0 where the fix applies, 3 where it does not).
+  @id:diagnose-fix-says-which-shell-each-step-runs-in
+  Scenario: diagnose-14 - A fix whose steps span two shells says which shell each step runs in
+    Given a user who has chosen the fix for the engine-startup import failure
+    When the user previews that fix without applying it
+    Then the printed plan says which shell each step runs in
