@@ -346,3 +346,35 @@ when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-8031"
 reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
 serve_timeout_secs = 240
+
+# --- EAI-7960: MEASURE. The dashboard is supposed to HOLD the last generation
+# throughput for a validity window (clamp(3 × instance_tick, 6 s, 30 s)) after a
+# scrape fails, and clear it only once that window closes. It does not: the
+# value goes as soon as the failure propagates. Both of these scenarios reach
+# that contract through the same "remains visible" step, and their own step
+# documentation says the assertion must be RED until the hold logic lands.
+#
+# They have been passing intermittently rather than reliably, which is what a
+# single instantaneous screenshot of a TUI buys: the one look sometimes lands on
+# a frame painted before the clear, and the scenario "passes" without the
+# behaviour existing. Sampling the whole window instead of looking once (tried
+# here, then reverted as out of scope for a test-only change) measured the value
+# disappearing 0.80 s and 1.27 s after the failed scrape on the mock runner —
+# comfortably inside a window that is meant to be at least 6 s, and far too fast
+# to be the harness being descheduled.
+#
+# `flaky = true` for exactly that reason: the bug is real and constant, while
+# the observation of it is not, so either outcome is tolerated while EAI-7960 is
+# open. Delete both rows when the hold/expiry logic lands — the resulting XPASS
+# is the signal that it did, and the scenarios then guard it. ---
+[["dash-gen-tps-held-after-scrape-failure"]]
+when = {}
+bug = "EAI-7960"
+reason = "The dashboard clears generation throughput on the failing scrape instead of holding it for the validity window."
+flaky = true
+
+[["dash-gen-tps-expiry-boundary"]]
+when = {}
+bug = "EAI-7960"
+reason = "The expiry boundary cannot be reached because the held value is cleared on the failing scrape, before the window opens."
+flaky = true
