@@ -626,6 +626,78 @@ pub fn normalize_runtime_path_text_for_host(value: &str) -> String {
     normalize_runtime_path_text(value)
 }
 
+/// Resolve `path` to the real location on disk, keeping any trailing components
+/// that do not exist yet.
+///
+/// For a path that is about to be *recorded* rather than merely used. The
+/// filesystem happily reaches a folder through a symlink, so an absolute path
+/// built by joining onto a linked ancestor names a route rather than a place:
+/// correct now, and wrong the moment the link goes. Persisting it — in a manifest,
+/// or in the shebang of a console script — outlives whatever made the route valid.
+///
+/// This is the resolve half of the pipeline the runtime manifest goes through:
+/// resolve, then [`normalize_runtime_path_for_storage`], then persist.
+///
+/// The leaf usually does not exist yet — it is where something is about to be
+/// installed — so this walks up to the deepest ancestor that does, canonicalizes
+/// that, and re-attaches the rest. Same shape as `disk_space::nearest_existing_ancestor`,
+/// except that one answers "which filesystem is this on?" and so discards the
+/// walked components, while this needs them back.
+///
+/// Best-effort by design: a path that cannot be resolved comes back absolutized
+/// but otherwise unchanged, which is what the caller would have used anyway.
+/// Cases that give up deliberately rather than guess:
+///
+/// * a `..` in the not-yet-existing tail, where re-attaching after resolving an
+///   ancestor could name a different place than the caller meant;
+/// * a relative path with no readable current directory.
+///
+/// On Windows this also strips the verbatim `\\?\` prefix that `canonicalize`
+/// returns, since a stored path is later compared against ordinary ones. Windows
+/// directory junctions resolve through the same call, so no separate branch.
+pub fn resolve_path_through_symlinks(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut candidate = absolute.as_path();
+    loop {
+        // Checked BEFORE `exists`, because the two platforms disagree about what a
+        // `..` past a missing directory even means. Windows collapses it lexically,
+        // so `<root>/missing/..` "exists" and canonicalizes to `<root>`; Unix walks
+        // the path through the filesystem, so it does not exist at all. Resolving
+        // here would therefore record a different folder depending on the host —
+        // and the whole point of this function is that the folder it returns is the
+        // one the files land in. Give up instead.
+        if candidate.components().next_back() == Some(std::path::Component::ParentDir) {
+            return absolute;
+        }
+        if candidate.exists() {
+            let Ok(resolved) = candidate.canonicalize() else {
+                return absolute;
+            };
+            let mut resolved = crate::disk_space::strip_verbatim_prefix(&resolved);
+            for component in tail.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        // `file_name` is None at the root. Nothing left to walk up to, so keep the
+        // caller's path.
+        let (Some(name), Some(parent)) = (candidate.file_name(), candidate.parent()) else {
+            return absolute;
+        };
+        tail.push(name.to_os_string());
+        candidate = parent;
+    }
+}
+
 pub fn normalize_runtime_path_for_storage(path: &Path) -> PathBuf {
     PathBuf::from(normalize_runtime_path_text_for_storage(
         &path.display().to_string(),
@@ -754,6 +826,124 @@ pub fn platform_binary_name(binary_name: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-resolve-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        // Resolved up front, so an assertion cannot turn on whether the platform's
+        // temp dir is itself reached through a link.
+        //
+        // Deliberately the function under test rather than a bare `canonicalize`:
+        // on Windows `canonicalize` hands back a verbatim `\\?\C:\…` path, which
+        // would make every expectation here verbatim while the function correctly
+        // returns a plain one — the tests would then fail on the prefix rather than
+        // on the behaviour they are about. That the prefix really is stripped is
+        // asserted separately, in `resolving_never_yields_a_windows_verbatim_prefix`.
+        resolve_path_through_symlinks(&root)
+    }
+
+    #[test]
+    fn resolving_keeps_components_that_do_not_exist_yet() {
+        // The common case: the leaf is where something is about to be installed.
+        let root = scratch_dir("missing-leaf");
+        assert_eq!(
+            resolve_path_through_symlinks(&root.join("a").join("b").join("c")),
+            root.join("a").join("b").join("c")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolving_follows_a_linked_ancestor_and_reattaches_the_rest() {
+        let root = scratch_dir("linked-ancestor");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+
+        assert_eq!(
+            resolve_path_through_symlinks(&root.join("link").join("wheel").join("key")),
+            real.join("wheel").join("key")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolving_leaves_a_dangling_link_alone() {
+        // Nothing to resolve to, so the caller's path is the best answer available.
+        let root = scratch_dir("dangling");
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("link")).unwrap();
+        let requested = root.join("link").join("child");
+
+        assert_eq!(resolve_path_through_symlinks(&requested), requested);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolving_is_idempotent() {
+        let root = scratch_dir("idempotent");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+        let once = resolve_path_through_symlinks(&root.join("link").join("leaf"));
+
+        assert_eq!(resolve_path_through_symlinks(&once), once);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolving_gives_up_rather_than_guess_at_a_parent_component() {
+        // A `..` reached past a missing directory means different things on
+        // different hosts: Windows collapses it lexically, so `<root>/missing/..`
+        // resolves to `<root>`, while Unix walks the filesystem and finds nothing.
+        // Resolving it would record a different folder depending on the host, so
+        // the path comes back untouched on both.
+        let root = scratch_dir("parent-component");
+        let requested = root.join("missing").join("..").join("sibling");
+
+        assert_eq!(resolve_path_through_symlinks(&requested), requested);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolving_still_handles_a_parent_component_the_filesystem_can_walk() {
+        // The give-up above must not spread to a `..` whose parent is really
+        // there — that one is unambiguous on every host, and refusing it would
+        // leave an ordinary path unresolved.
+        let root = scratch_dir("parent-that-exists");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let requested = nested.join("..").join("b").join("leaf");
+
+        assert_eq!(
+            resolve_path_through_symlinks(&requested),
+            nested.join("leaf")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolving_never_yields_a_windows_verbatim_prefix() {
+        // A stored path is later compared against ordinary ones, and `\\?\C:\…`
+        // never `starts_with`-matches `C:\…`. Trivially true off Windows; the
+        // prefix stripping itself is covered in `disk_space`.
+        let root = scratch_dir("verbatim");
+        let resolved = resolve_path_through_symlinks(&root.join("leaf"));
+
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            resolved.display()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn platform_binary_name_follows_runtime_host() {

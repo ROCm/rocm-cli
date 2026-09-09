@@ -20,8 +20,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use rocm_dash_core::metrics::InstanceStatus;
-
 use crate::app::{AppState, KeyAction, PaneFocus};
 use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
@@ -406,7 +404,7 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
             let running: Vec<_> = state
                 .instances
                 .values()
-                .filter(|i| i.status == InstanceStatus::Running)
+                .filter(|i| i.status.is_serving())
                 .collect();
             let mut lines = vec![head(format!("Running now — {}", running.len()))];
             if running.is_empty() {

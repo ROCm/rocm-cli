@@ -1,7 +1,7 @@
 Feature: Artifact prefetch cleanup
 
   @id:artifact-prefetch-failed-marker-leaves-no-temp
-  Scenario: A failed artifact cache write leaves no temporary marker
+  Scenario: artifact-prefetch-01 - A failed artifact cache write leaves no temporary marker
     Given a signed direct-download artifact fixture
     And its cache marker destination is occupied by a directory
     When the user approves the artifact prefetch

@@ -258,11 +258,20 @@ def evaluate(
     sdk_headers = state.get("windows_sdk_headers") or []
 
     version_id = str(os_release.get("VERSION_ID") or "")
-    supported_ubuntu = os_release.get("ID") == "ubuntu" and version_id in {
-        "22.04",
-        "24.04",
-        "26.04",
-    }
+    # 22.04 is deliberately unsupported: its glibc 2.35 is below the glibc 2.38 /
+    # GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked
+    # against, so the Lemonade engine cannot start on it. See docs/wsl.md.
+    version_parts = version_id.split(".")
+    ubuntu_version = None
+    if len(version_parts) == 2 and all(
+        part.isascii() and part.isdecimal() for part in version_parts
+    ):
+        ubuntu_version = (int(version_parts[0]), int(version_parts[1]))
+    supported_ubuntu = (
+        os_release.get("ID") == "ubuntu"
+        and ubuntu_version is not None
+        and ubuntu_version >= (24, 4)
+    )
     build_tools = all(
         tools.get(name) for name in ["git", "cmake", "gcc", "g++", "make"]
     )
@@ -270,7 +279,9 @@ def evaluate(
     checks = [
         Check("wsl", bool(state.get("is_wsl")), "WSL marker or /dev/dxg detected"),
         Check(
-            "ubuntu", supported_ubuntu, f"Ubuntu VERSION_ID={version_id or '<unknown>'}"
+            "ubuntu",
+            supported_ubuntu,
+            f"Ubuntu 24.04 or newer (VERSION_ID={version_id or '<unknown>'})",
         ),
         Check("dxg_device", bool(paths.get("/dev/dxg")), "/dev/dxg"),
         Check(
@@ -390,6 +401,28 @@ def self_test() -> None:
     ready_state["ldconfig"]["librocdxg"] = True
     checks = evaluate(ready_state, require_rocm_tools=False)
     assert all(check.ok for check in checks if check.required), checks
+
+    for version_id in ["24.04", "24.10", "25.04", "26.04", "28.04"]:
+        supported_state = json.loads(json.dumps(ready_state))
+        supported_state["os_release"]["VERSION_ID"] = version_id
+        checks = evaluate(supported_state, require_rocm_tools=False)
+        assert any(check.name == "ubuntu" and check.ok for check in checks), checks
+        assert all(check.ok for check in checks if check.required), checks
+
+    # 22.04 is below the Lemonade glibc floor, and malformed or unknown
+    # versions must fail closed rather than report an otherwise perfect host ready.
+    for version_id in ["22.04", "24.04.1", "unknown", ""]:
+        unsupported_state = json.loads(json.dumps(ready_state))
+        unsupported_state["os_release"]["VERSION_ID"] = version_id
+        checks = evaluate(unsupported_state, require_rocm_tools=False)
+        assert any(check.name == "ubuntu" and not check.ok for check in checks), checks
+        assert not all(check.ok for check in checks if check.required), checks
+
+    missing_version_state = json.loads(json.dumps(ready_state))
+    del missing_version_state["os_release"]["VERSION_ID"]
+    checks = evaluate(missing_version_state, require_rocm_tools=False)
+    assert any(check.name == "ubuntu" and not check.ok for check in checks), checks
+    assert not all(check.ok for check in checks if check.required), checks
 
 
 def main() -> int:

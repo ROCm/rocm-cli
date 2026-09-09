@@ -19,7 +19,7 @@ Feature: Release install lifecycle
   # ── Packaging + signature-verified install (Linux) ────────────────────
 
   @id:lifecycle-linux-install-signed-keypath @lifecycle @requires-os:linux
-  Scenario: Linux - a bundle signed with a key file installs, verifies, and sets up the shell profile
+  Scenario: lifecycle-01 - Linux - a bundle signed with a key file installs, verifies, and sets up the shell profile
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -32,7 +32,7 @@ Feature: Release install lifecycle
     And the shell profile lists the install directory
 
   @id:lifecycle-linux-install-signed-pem @lifecycle @requires-os:linux
-  Scenario: Linux - a bundle signed with an inline PEM installs and verifies
+  Scenario: lifecycle-02 - Linux - a bundle signed with an inline PEM installs and verifies
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key PEM
@@ -44,7 +44,7 @@ Feature: Release install lifecycle
   # ── Trust rejection: untrusted key, bad checksum, bad/missing signature ─
 
   @id:lifecycle-linux-reject-untrusted-key @lifecycle @requires-os:linux
-  Scenario: Linux - an install with no public key falls back to the pinned trust root and rejects an untrusted signer
+  Scenario: lifecycle-03 - Linux - an install with no public key falls back to the pinned trust root and rejects an untrusted signer
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -53,7 +53,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-linux-reject-bad-checksum @lifecycle @requires-os:linux
-  Scenario: Linux - a tampered checksum is rejected before activation
+  Scenario: lifecycle-04 - Linux - a tampered checksum is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -63,7 +63,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-linux-reject-bad-signature @lifecycle @requires-os:linux
-  Scenario: Linux - a tampered signature is rejected before activation
+  Scenario: lifecycle-05 - Linux - a tampered signature is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -73,7 +73,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-linux-reject-missing-signature @lifecycle @requires-os:linux
-  Scenario: Linux - a missing signature is rejected when a signature is required
+  Scenario: lifecycle-06 - Linux - a missing signature is rejected when a signature is required
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -85,7 +85,7 @@ Feature: Release install lifecycle
   # ── Reinstall: stale-manifest purge, config preservation, PATH idempotency ─
 
   @id:lifecycle-linux-reinstall-purges-stale @lifecycle @requires-os:linux
-  Scenario: Linux - reinstalling purges a stale prior entry and preserves config
+  Scenario: lifecycle-07 - Linux - reinstalling purges a stale prior entry and preserves config
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the shell profile updated
@@ -101,7 +101,7 @@ Feature: Release install lifecycle
   # ── Installed-binary PTY, shell-profile / XDG, and uninstall ────────────
 
   @id:lifecycle-linux-installed-binary-pty @lifecycle @requires-os:linux
-  Scenario: Linux - the installed binary opens and exits interactive chat through a pseudo-terminal
+  Scenario: lifecycle-08 - Linux - the installed binary opens and exits interactive chat through a pseudo-terminal
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
@@ -113,7 +113,7 @@ Feature: Release install lifecycle
     And the installed config still selects the vllm default engine
 
   @id:lifecycle-linux-uninstall-full-purge @lifecycle @requires-os:linux
-  Scenario: Linux - uninstall removes binaries, manifest, and XDG state
+  Scenario: lifecycle-09 - Linux - uninstall removes binaries, manifest, and XDG state
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the shell profile updated
@@ -126,7 +126,7 @@ Feature: Release install lifecycle
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
 
   @id:lifecycle-windows-install-signed @lifecycle @requires-os:windows
-  Scenario: Windows - a signed zip installs and verifies with native crypto
+  Scenario: lifecycle-10 - Windows - a signed zip installs and verifies with native crypto
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -136,7 +136,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-key-rotation-fallback @lifecycle @requires-os:windows
-  Scenario: Windows - a malformed current trust root falls through to the valid next key
+  Scenario: lifecycle-11 - Windows - a malformed current trust root falls through to the valid next key
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -146,7 +146,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-windows-all-pinned-keys-malformed @lifecycle @requires-os:windows
-  Scenario: Windows - all malformed pinned trust roots fail deterministically
+  Scenario: lifecycle-12 - Windows - all malformed pinned trust roots fail deterministically
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -156,7 +156,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-updates-user-path @lifecycle @requires-os:windows
-  Scenario: Windows - a default install updates the user PATH and restores it afterwards
+  Scenario: lifecycle-13 - Windows - a default install updates the user PATH and restores it afterwards
     Given a freshly built release tree
     And a generated signing keypair
     And the user PATH is captured for restoration
@@ -167,7 +167,7 @@ Feature: Release install lifecycle
     And the install directory is on the user PATH
 
   @id:lifecycle-windows-verifies-without-openssl @lifecycle @requires-os:windows
-  Scenario: Windows - the installer verifies with native crypto when openssl is absent from PATH
+  Scenario: lifecycle-14 - Windows - the installer verifies with native crypto when openssl is absent from PATH
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -177,7 +177,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-rejects-bad-signature-without-openssl @lifecycle @requires-os:windows
-  Scenario: Windows - a bad signature is rejected with native crypto when openssl is absent from PATH
+  Scenario: lifecycle-15 - Windows - a bad signature is rejected with native crypto when openssl is absent from PATH
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -187,7 +187,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reinstall-purges-stale @lifecycle @requires-os:windows
-  Scenario: Windows - reinstalling purges a stale prior entry
+  Scenario: lifecycle-16 - Windows - reinstalling purges a stale prior entry
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
@@ -198,7 +198,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-reject-untrusted-key @lifecycle @requires-os:windows
-  Scenario: Windows - an install with no public key rejects an untrusted signer
+  Scenario: lifecycle-17 - Windows - an install with no public key rejects an untrusted signer
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -207,7 +207,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-bad-checksum @lifecycle @requires-os:windows
-  Scenario: Windows - a tampered checksum is rejected before activation
+  Scenario: lifecycle-18 - Windows - a tampered checksum is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -217,7 +217,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-bad-signature @lifecycle @requires-os:windows
-  Scenario: Windows - a tampered signature is rejected before activation
+  Scenario: lifecycle-19 - Windows - a tampered signature is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -227,7 +227,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-missing-signature @lifecycle @requires-os:windows
-  Scenario: Windows - a missing signature is rejected when a signature is required
+  Scenario: lifecycle-20 - Windows - a missing signature is rejected when a signature is required
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -237,7 +237,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-http-install @lifecycle @requires-os:windows
-  Scenario: Windows - a signed bundle installs over a loopback HTTP download
+  Scenario: lifecycle-21 - Windows - a signed bundle installs over a loopback HTTP download
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -247,7 +247,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-installed-binary-smoke @lifecycle @requires-os:windows
-  Scenario: Windows - the installed binary honors isolated directories and keeps the running executable on uninstall
+  Scenario: lifecycle-22 - Windows - the installed binary honors isolated directories and keeps the running executable on uninstall
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file

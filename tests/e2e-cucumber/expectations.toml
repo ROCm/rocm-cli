@@ -171,24 +171,6 @@ flaky = true
 # product does not do that yet — so the day one is fixed its row goes stale and
 # deletes itself.
 
-# --- EAI-8011: the help's own worked examples name a model the CLI cannot
-# resolve (`qwen2.5-7b-instruct` — not a catalog alias, and not an `owner/repo`
-# reference either). Pure help text, so it holds on every platform. Remove this
-# row when the examples name a resolvable model. ---
-[["help-serve-example-names-a-resolvable-model"]]
-when = {}
-bug = "EAI-8011"
-reason = "The help offers `rocm serve qwen2.5-7b-instruct`, which is neither a name the model listing knows nor an owner/repo reference."
-
-# --- EAI-8011: the help says running `rocm` with no subcommand opens the
-# dashboard, which is what it also says `rocm dash` does; the README documents
-# the plain command as opening the launcher instead, and that is what it really
-# does. Pure help text. Remove when the two are described distinctly. ---
-[["help-describes-the-default-command"]]
-when = {}
-bug = "EAI-8011"
-reason = "The help describes running the CLI with no subcommand as opening the dashboard, the same thing it says `rocm dash` does."
-
 # --- EAI-8010: `--dry-run` is declared as requiring `--apply`, so previewing an
 # update without asking for one is rejected as a usage error, though the README
 # documents the two as independent. Argument handling only, so platform-
@@ -197,17 +179,6 @@ reason = "The help describes running the CLI with no subcommand as opening the d
 when = {}
 bug = "EAI-8010"
 reason = "`rocm update --dry-run` is refused as a usage error unless --apply is also given."
-
-# --- EAI-8019: `serve --help` advertises `cpu_only` among its device policies
-# and the command then rejects it outright. Scoped to the no-GPU lane, which is
-# where the scenario runs (`@requires-no-gpu`) — there every policy meets the
-# same "no GPU on this machine" refusal, which makes a refusal aimed at the
-# policy itself cleanly visible. Remove when the advertised list and the accepted
-# list are the same list. ---
-[["serve-rejects-no-advertised-device-policy"]]
-when = {}
-bug = "EAI-8019"
-reason = "`serve` advertises cpu_only as a device policy and then refuses it for being cpu_only."
 
 # --- EAI-8020: `diagnose` and `fix` each carry their own copy of the
 # render-group remedy, and the verification step has drifted between them
@@ -267,17 +238,6 @@ flaky = true
 when = {}
 bug = "EAI-8014"
 reason = "Uninstall reports completion while leaving the servers it manages running, and removes the records needed to stop them."
-
-# --- EAI-8015: MEASURE. When the device's owning group has no entry in the local
-# group database, `stat` answers `UNKNOWN` and the diagnosis passes that straight
-# into a `usermod -a -G UNKNOWN,video` the user cannot run; only an EMPTY group
-# name is filtered. The scenario substitutes that `stat` answer, so it needs a
-# real device node but not a real broken host. GPU lane only — with no
-# `/dev/kfd` the inspection stops before it ever asks `stat`. ---
-[["diagnose-commands-name-a-real-group"]]
-when = {}
-bug = "EAI-8015"
-reason = "A diagnosis names the group-lookup failure `UNKNOWN` as a group for the user to join."
 
 # --- EAI-8020: MEASURE. The other half of the same divergence: `diagnose` names
 # the device's actual owning group while the `fix` recipe is hard-coded to
@@ -356,3 +316,33 @@ serve_timeout_secs = 120
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
+
+# --- EAI-8031 (public mirror: ROCm/rocm-cli#260): on a Strix Halo WINDOWS host,
+# serving a canonical Hugging Face checkpoint through the `owner/repo:variant`
+# direct-serve path (`unsloth/Qwen3-0.6B-GGUF:Q4_0`) exits 0 but `/v1/models`
+# never lists the model, so the endpoint never becomes ready. Fails on every run
+# since the scenario was introduced by 37a3b63c (#242, 2026-08-12); it is the
+# lane's only host-independent unexpected failure.
+#
+# os=windows: this is specific to Windows AND to this serve path — the Strix Halo
+# Ubuntu lane passes the scenario, and on Windows the short-recipe-name path
+# (`serve-lemonade-inference`, same checkpoint) passes too. So it is not lemonade
+# managed serve at large, and must not widen to a bare `when = {}`.
+# therock_family/has_amd_gpu mirror the sibling rows and document intent: the
+# scenario is @requires-gpu, so on a no-GPU Windows lane it is SKIPPED, never
+# xfail'd.
+#
+# serve_timeout_secs: the lane leaves `E2E_SERVE_TIMEOUT_SECS` unset, so this
+# waits out the full 600s default on a serve that never arrives — ~10 minutes of
+# every run spent on a known bug. A HEALTHY lemonade serve of this same
+# (cache-warm) checkpoint on this host reaches ready in ~120s: measured on run
+# 32185662513, where the three passing GPU-serve scenarios took 117s, 117s and
+# 120s. 240s therefore keeps ~2x headroom — deliberately NOT the 90s used by the
+# EAI-7423 rows above, which is below a healthy serve here and would mask the
+# fix by keeping the scenario red once the bug is closed. Remove this row when
+# EAI-8031 lands; the resulting XPASS is the signal that it did. ---
+[["serve-hf-checkpoint-inference"]]
+when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
+bug = "EAI-8031"
+reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
+serve_timeout_secs = 240

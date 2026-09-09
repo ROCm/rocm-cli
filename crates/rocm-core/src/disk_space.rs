@@ -130,7 +130,7 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
 /// map back to `\\server\share`.
 ///
 /// Pure string handling so it is exercised on every platform, not only Windows.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+pub(crate) fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
         return PathBuf::from(format!(r"\\{rest}"));

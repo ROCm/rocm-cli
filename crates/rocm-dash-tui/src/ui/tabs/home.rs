@@ -195,8 +195,10 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     for job in state.jobs.jobs.values().take(feed.height as usize) {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
-            _ => ("⋯ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
+            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
+            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
         };
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::default().fg(color)),
@@ -583,5 +585,48 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    #[test]
+    fn activity_feed_glyphs_match_job_console_vocabulary() {
+        use rocm_dash_core::state::StateEvent;
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.jobs.apply(StateEvent::StartJob {
+            id: "a".into(),
+            cmd: "ok".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "a".into(),
+            code: 0,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "b".into(),
+            cmd: "bad".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "b".into(),
+            code: 1,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "c".into(),
+            cmd: "cancelled".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::CancelJob("c".into()));
+        s.jobs.apply(StateEvent::StartJob {
+            id: "d".into(),
+            cmd: "running".into(),
+            args: vec![],
+        });
+
+        let out = render(&s, 160, 30);
+        assert!(out.contains('✓'), "zero-exit glyph missing: {out:?}");
+        assert!(out.contains('!'), "nonzero-exit glyph missing: {out:?}");
+        assert!(out.contains('○'), "cancelled glyph missing: {out:?}");
+        assert!(out.contains('⋯'), "running glyph missing: {out:?}");
     }
 }

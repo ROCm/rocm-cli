@@ -207,6 +207,36 @@ mod tests {
     }
 
     #[test]
+    fn serving_detail_counts_ready_instances_as_running() {
+        // Regression: a served model reports `Ready` (readiness-probed), not
+        // `Running`. The detail pane must count it as serving so the count
+        // matches `rocm services`, which also treats ready as live.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2; // "Running instances/services" → OpenServices
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_name: "vllm-1".into(),
+                model_name: "Llama-3.1-8B".into(),
+                status: InstanceStatus::Ready,
+                port: Some(8000),
+                ..Default::default()
+            },
+        );
+        let out = render(&s, 120, 28);
+        assert!(
+            out.contains("Running now — 1"),
+            "ready instance not counted as running: {out:?}"
+        );
+        assert!(
+            out.contains("Llama-3.1-8B"),
+            "ready model not shown inline: {out:?}"
+        );
+    }
+
+    #[test]
     fn serving_verb_action_maps_selection_to_seam() {
         assert_eq!(verb_action(0), KeyAction::OpenServeWizard);
         assert_eq!(verb_action(1), KeyAction::OpenEngineManager);

@@ -9,8 +9,8 @@
 //! cross-platform command:
 //!
 //! * a top-level `<dist>/` directory holding `bin/rocm[.exe]`, `bin/rocmd[.exe]`,
-//!   `README.md`, `LICENSE.TXT`, and the platform installer (`install.sh` on
-//!   Unix, `install.ps1` on Windows);
+//!   `README.md`, `LICENSE.TXT`, `THIRD_PARTY_NOTICES.txt`, and the platform
+//!   installer (`install.sh` on Unix, `install.ps1` on Windows);
 //! * an archive of that directory — `<dist>.tar.gz` on Unix, `<dist>.zip` on
 //!   Windows — with the bundle directory as the single top-level entry;
 //! * a `<archive>.sha256` sidecar in `sha256sum`/`Get-FileHash` syntax
@@ -34,7 +34,13 @@ use crate::paths::{binary_name, release_binary_dir, workspace_root};
 
 /// Files copied to the top level of the bundle directory, resolved relative to
 /// the workspace root. The installer differs per platform; the rest are shared.
-const SHARED_TOP_LEVEL_FILES: &[&str] = &["README.md", "LICENSE.TXT"];
+///
+/// `THIRD_PARTY_NOTICES.txt` ships alongside `LICENSE.TXT` because the bundled
+/// binaries statically link the third-party crates it attributes. Most of those
+/// licenses (MIT, BSD, Apache-2.0) require their notice text to accompany the
+/// distributed binary, so omitting it from the archive leaves the obligation
+/// unmet no matter how current the copy in the repository is.
+const SHARED_TOP_LEVEL_FILES: &[&str] = &["README.md", "LICENSE.TXT", "THIRD_PARTY_NOTICES.txt"];
 
 /// Platform installer copied into the bundle. The bundle ships the installer for
 /// the platform it targets, matching the archive format.
@@ -564,7 +570,12 @@ mod tests {
         for name in ["rocm", "rocmd"] {
             fs::write(bin_dir.join(name), format!("{name}-bytes")).expect("write binary");
         }
-        for name in ["README.md", "LICENSE.TXT", "install.sh"] {
+        for name in [
+            "README.md",
+            "LICENSE.TXT",
+            "THIRD_PARTY_NOTICES.txt",
+            "install.sh",
+        ] {
             fs::write(root.join(name), format!("{name}-content")).expect("write top-level");
         }
 
@@ -576,6 +587,14 @@ mod tests {
         assert!(output_root.join(dist).join("bin/rocm").is_file());
         assert!(output_root.join(dist).join("bin/rocmd").is_file());
         assert!(output_root.join(dist).join("install.sh").is_file());
+        // Attribution for the statically linked third-party crates has to travel
+        // with the binaries, not just live in the repository.
+        assert!(
+            output_root
+                .join(dist)
+                .join("THIRD_PARTY_NOTICES.txt")
+                .is_file()
+        );
 
         let archive = plan.archive().expect("archive");
         let checksum = write_checksum(&archive).expect("checksum");

@@ -13,6 +13,7 @@
 mod affected;
 mod demos;
 mod e2e;
+mod e2e_prewarm;
 mod e2e_report;
 mod manifest;
 mod package;
@@ -106,6 +107,10 @@ enum Command {
         /// Verify the notices file is up to date without writing; exit non-zero if it would change.
         #[arg(long)]
         check: bool,
+        /// Skip silently when cargo-about is missing or not the pinned version, instead of
+        /// failing. For the local git hook; conflicts with --check so CI's gate always runs.
+        #[arg(long, conflicts_with = "check")]
+        if_available: bool,
     },
     /// Verify that commits in a range are cryptographically signed and carry a
     /// DCO `Signed-off-by` trailer.
@@ -167,6 +172,27 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Prepare the shared managed runtime the GPU E2E lanes serve against,
+    /// refreshing it when the channel index has published a newer version.
+    ///
+    /// Replaces the lanes' existence-only pre-warm guard, which never reinstalled
+    /// and so froze every GPU lane on whatever runtime was installed first. The
+    /// tree stays a cache: an install happens only when nothing is present for the
+    /// channel, an in-place side-by-side update only when the index is genuinely
+    /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    E2ePrewarm {
+        /// TheRock package channel the shared runtime should track.
+        #[arg(long, default_value = "release")]
+        channel: String,
+        /// Recent installs to keep per channel, format, and GPU family when
+        /// pruning after an install or update.
+        #[arg(long, default_value_t = 2)]
+        keep: usize,
+        /// Pre-warm root holding `config/`, `data/`, and `cache/`. Its
+        /// `data/runtimes` is what the lanes export as `E2E_SHARED_RUNTIMES_DIR`.
+        #[arg(long)]
+        prewarm_dir: PathBuf,
+    },
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
     /// stdout for `$GITHUB_STEP_SUMMARY`.
@@ -216,7 +242,10 @@ fn run() -> Result<()> {
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::Manifest { check } => manifest::run(check)?,
-        Command::Tpn { check } => tpn::run(check)?,
+        Command::Tpn {
+            check,
+            if_available,
+        } => tpn::run(check, if_available)?,
         Command::VerifyCommits {
             base,
             require_verified,
@@ -238,6 +267,11 @@ fn run() -> Result<()> {
             target,
         } => package::run(&dist_name, &output_dir, target.as_deref())?,
         Command::E2e { args } => e2e::run(&args)?,
+        Command::E2ePrewarm {
+            channel,
+            keep,
+            prewarm_dir,
+        } => e2e_prewarm::run(&channel, keep, &prewarm_dir)?,
         Command::E2eReport {
             artifacts_dir,
             html_out,
