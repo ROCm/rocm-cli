@@ -1428,8 +1428,9 @@ fn install_wheel_runtime(
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
-    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
-        .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
+    let rocm_sdk_probe =
+        probe_rocm_sdk_runtime_for_target(&env_python, Some(device_target.as_str()))
+            .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
     let installed_version = rocm_sdk_probe
         .rocm_sdk_version
@@ -3171,17 +3172,28 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
     ]
 }
 
-/// What `rocm_sdk` reports about the runtime that was just installed.
+/// What `rocm_sdk` reports about an installed runtime.
 ///
-/// Deliberately does not set `ROCM_SDK_TARGET_FAMILY`: forcing the target the
-/// installer chose would make `resolved_target_family` echo that choice back
-/// instead of reporting what the environment actually composed, which is the
-/// one signal that catches a runtime whose device payload does not match its
-/// host.
+/// A newly composed aggregate runtime is probed with the exact device payload
+/// selected from the canonical source. Without that input `rocm_sdk` may choose
+/// an unrelated default target even though only one device package was installed,
+/// producing library paths and a kernel check for the wrong GPU. Adopted legacy
+/// runtimes remain unforced so the probe reports their existing composition.
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    let text = capture_python_stdout(
+    probe_rocm_sdk_runtime_for_target(python_executable, None)
+}
+
+fn probe_rocm_sdk_runtime_for_target(
+    python_executable: &Path,
+    device_target: Option<&str>,
+) -> Result<RocmSdkPythonProbe> {
+    let env = device_target
+        .map(|target| vec![("ROCM_SDK_TARGET_FAMILY".to_owned(), target.to_owned())])
+        .unwrap_or_default();
+    let text = capture_python_stdout_with_env(
         python_executable,
         ROCM_SDK_PROBE_SCRIPT,
+        &env,
         "launch rocm_sdk probe",
     )
     .with_context(|| {
