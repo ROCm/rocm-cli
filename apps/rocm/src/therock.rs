@@ -1589,7 +1589,7 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned target-complete rocm, torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
@@ -2023,41 +2023,70 @@ fn resolve_pip_runtime_from_index(
             "release channel only installs stable TheRock wheel versions, but no stable `rocm` package versions were found in {index_url}; try `rocm install sdk --channel release --format tarball` for stable release artifacts, or use `--channel nightly --format wheel` for preview builds"
         );
     }
-    let torch_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torch",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchvision_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchvision",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchaudio_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchaudio",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let package_versions = select_matching_pip_package_versions(
-        channel,
-        &rocm_versions,
-        &torch_versions,
-        &torchvision_versions,
-        &torchaudio_versions,
-        version_selector,
-    )
-    .with_context(|| {
-        let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
-        format!(
-            "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+    let package_versions = if matches!(source.layout, SourceLayout::Next) {
+        let device_target = match &source.device_target {
+            AggregateDeviceTarget::Exact(target) => target.as_str(),
+            AggregateDeviceTarget::Undetermined(reason) => {
+                bail!(
+                    "cannot resolve ROCm X package metadata without an exact device target: {reason}"
+                )
+            }
+        };
+        let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
+            .with_context(|| {
+                let requested = version_selector.map_or_else(
+                    || "latest compatible version".to_owned(),
+                    RuntimeVersionSelector::describe,
+                );
+                format!("no TheRock rocm package was found for {requested} in {index_url}")
+            })?;
+        resolve_published_pip_package_versions(
+            paths,
+            index_url,
+            &rocm_version,
+            device_target,
+            wheel_compatibility,
+        )?
+    } else {
+        let torch_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torch",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchvision_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchvision",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        select_matching_pip_package_versions(
+            channel,
+            &rocm_versions,
+            &torch_versions,
+            &torchvision_versions,
+            &torchaudio_versions,
+            version_selector,
         )
-    })?;
+        .with_context(|| {
+            let requested = version_selector.map_or_else(
+                || "latest compatible version".to_owned(),
+                RuntimeVersionSelector::describe,
+            );
+            format!(
+                "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            )
+        })?
+    };
     let latest_version = package_versions.rocm.clone();
     Ok(PipRuntimeResolution {
         family: family_resolution.family.clone(),
@@ -2299,6 +2328,158 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
     )
+}
+
+fn select_rocm_version(
+    channel: TheRockChannel,
+    rocm_versions: &[String],
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Option<String> {
+    let mut candidates = if version_selector.is_some() {
+        rocm_versions.to_vec()
+    } else {
+        channel_rocm_candidates(rocm_versions, channel)
+    };
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates.sort_by(|left, right| compare_version_strings(left, right));
+    candidates.pop()
+}
+
+fn uv_python_version(compatibility: &WheelCompatibility) -> Result<String> {
+    let digits = compatibility
+        .python_tag
+        .strip_prefix("cp")
+        .context("managed Python reported an unsupported wheel tag")?;
+    if digits.len() < 2 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!(
+            "managed Python reported unsupported wheel tag `{}`",
+            compatibility.python_tag
+        );
+    }
+    Ok(format!("{}.{}", &digits[..1], &digits[1..]))
+}
+
+fn uv_python_platform(compatibility: &WheelCompatibility) -> Result<&'static str> {
+    if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "win_amd64")
+    {
+        Ok("x86_64-pc-windows-msvc")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_x86_64")
+    {
+        Ok("x86_64-unknown-linux-gnu")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_aarch64")
+    {
+        Ok("aarch64-unknown-linux-gnu")
+    } else {
+        bail!(
+            "managed Python reported unsupported platform wheel tags: {}",
+            compatibility.platform_tags.join(",")
+        )
+    }
+}
+
+fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageVersions> {
+    let mut versions = std::collections::HashMap::new();
+    for line in output.lines().map(str::trim) {
+        let Some((name, version)) = line.split_once("==") else {
+            continue;
+        };
+        versions.insert(name.to_ascii_lowercase(), version.to_owned());
+    }
+    let required = |name: &str| {
+        versions
+            .get(name)
+            .cloned()
+            .with_context(|| format!("uv metadata resolution did not pin `{name}`"))
+    };
+    let rocm = required("rocm")?;
+    let torch = required("torch")?;
+    let torchvision = required("torchvision")?;
+    let torchaudio = required("torchaudio")?;
+    for (name, version) in [
+        ("torch", torch.as_str()),
+        ("torchvision", torchvision.as_str()),
+        ("torchaudio", torchaudio.as_str()),
+    ] {
+        if package_rocm_suffix(version).as_deref() != Some(rocm.as_str()) {
+            bail!(
+                "published package metadata selected {name} {version}, which does not share ROCm build {rocm}"
+            );
+        }
+    }
+    Ok(TheRockPipPackageVersions {
+        compatibility_key: rocm.clone(),
+        rocm,
+        torch,
+        torchvision,
+        torchaudio,
+    })
+}
+
+fn resolve_published_pip_package_versions(
+    paths: &AppPaths,
+    index_url: &str,
+    rocm_version: &str,
+    device_target: &str,
+    compatibility: &WheelCompatibility,
+) -> Result<TheRockPipPackageVersions> {
+    let uv =
+        ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
+    let python_version = uv_python_version(compatibility)?;
+    let python_platform = uv_python_platform(compatibility)?;
+    let device_extra = format!("device-{device_target}");
+    let requirements = format!(
+        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
+    );
+    let mut child = Command::new(&uv)
+        .args([
+            "pip",
+            "compile",
+            "-",
+            "--index-url",
+            index_url,
+            "--python-version",
+            &python_version,
+            "--python-platform",
+            python_platform,
+            "--no-header",
+            "--no-annotate",
+        ])
+        .envs(uv_command_env(paths))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch {} for ROCm X metadata resolution",
+                uv.display()
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .context("uv metadata resolver stdin was unavailable")?
+        .write_all(requirements.as_bytes())
+        .context("failed to send ROCm X requirements to uv")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for ROCm X metadata resolution")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!("published ROCm X package metadata is not jointly installable: {detail}");
+    }
+    parse_uv_compiled_package_versions(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn select_matching_pip_package_versions(
@@ -4626,7 +4807,38 @@ fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
 
 fn validate_tarball_file_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();
-    if name.contains(['/', '\\'])
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .trim_end_matches([' ', '.']);
+    let windows_reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if name.contains(['/', '\\', ':'])
+        || name.ends_with([' ', '.'])
+        || windows_reserved
         || !matches!(components.next(), Some(Component::Normal(_)))
         || components.next().is_some()
         || name.chars().any(char::is_control)
@@ -5057,20 +5269,32 @@ mod tests {
     }
 
     #[test]
-    fn tarball_catalog_rejects_paths_and_control_characters() {
+    fn tarball_catalog_rejects_unsafe_file_names_at_the_parser_boundary() {
         for name in [
             "../escape.tar.gz",
             "folder/escape.tar.gz",
             r"folder\escape.tar.gz",
             "/absolute.tar.gz",
             "control\nname.tar.gz",
+            "archive.tar.gz:payload",
+            "CON.tar.gz",
+            "archive.tar.gz.",
+            "archive.tar.gz ",
         ] {
+            let html =
+                format!(r#"<script>const files = [{{"name":"{name}","mtime":1.0}}];</script>"#);
             assert!(
-                validate_tarball_file_name(name).is_err(),
+                parse_tarball_index_html(&html).is_err(),
                 "unsafe catalog name was accepted: {name:?}"
             );
         }
-        assert!(validate_tarball_file_name("therock-dist-linux-gfx120X-all-10.0.0.tar.gz").is_ok());
+        let html = r#"<script>const files = [{"name":"therock-dist-linux-gfx120X-all-10.0.0.tar.gz","mtime":1.0}];</script>"#;
+        assert_eq!(
+            parse_tarball_index_html(html)
+                .expect("safe catalog name must parse")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5112,34 +5336,45 @@ mod tests {
         assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
     }
 
-    /// The next catalog lists a `-tests-` archive beside the real one with a
-    /// *later* mtime, so plain "newest wins" picks the wrong file. Its leftover
-    /// suffix is not a version, which is what excludes it.
+    /// The next catalog's gfx103X token differs from the canonical token, and
+    /// its later `-tests-` sibling must not win selection.
     #[test]
-    fn next_tarball_selection_skips_the_tests_sibling() {
+    fn next_gfx103x_tarball_selection_uses_alias_and_skips_tests_sibling() {
         let platform = platform_tarball_token();
-        let prefix = format!("therock-dist-{platform}-gfx90a-");
+        let next_prefix = format!("therock-dist-{platform}-gfx103X-all-");
         let files = vec![
             TarballIndexFile {
-                name: format!("{prefix}10.0.0.tar.gz"),
+                name: format!("{next_prefix}10.0.0.tar.gz"),
                 mtime: 1_787_612_008.0,
             },
             TarballIndexFile {
-                name: format!("{prefix}tests-10.0.0.tar.gz"),
+                name: format!("{next_prefix}tests-10.0.0.tar.gz"),
                 mtime: 1_787_612_032.0,
             },
         ];
+
+        assert!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Canonical,
+                "gfx103X-dgpu",
+                None,
+            )
+            .is_none(),
+            "the canonical layout must not recognize the next-only family alias"
+        );
 
         let (file, version) = select_tarball_candidate(
             &files,
             TheRockChannel::Release,
             SourceLayout::Next,
-            "gfx90a",
+            "gfx103X-dgpu",
             None,
         )
-        .expect("the real dist archive must be selected");
+        .expect("the next alias must select the real dist archive");
 
-        assert_eq!(file.name, format!("{prefix}10.0.0.tar.gz"));
+        assert_eq!(file.name, format!("{next_prefix}10.0.0.tar.gz"));
         assert_eq!(version, "10.0.0");
     }
 
@@ -6143,6 +6378,51 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn uv_metadata_plan_accepts_non_arithmetic_audio_version() -> Result<()> {
+        let plan = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.0.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )?;
+
+        assert_eq!(plan.rocm, "10.0.0");
+        assert_eq!(plan.torch, "2.13.0+rocm10.0.0");
+        assert_eq!(plan.torchvision, "0.28.0+rocm10.0.0");
+        assert_eq!(plan.torchaudio, "2.11.0.2+rocm10.0.0");
+        Ok(())
+    }
+
+    #[test]
+    fn uv_metadata_plan_rejects_mixed_rocm_builds() {
+        let error = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.1.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )
+        .expect_err("a mixed ROCm build must fail closed")
+        .to_string();
+
+        assert!(error.contains("torchvision"), "{error}");
+        assert!(
+            error.contains("does not share ROCm build 10.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn uv_metadata_resolver_maps_supported_python_platforms() -> Result<()> {
+        let windows = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["win_amd64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_version(&windows)?, "3.12");
+        assert_eq!(uv_python_platform(&windows)?, "x86_64-pc-windows-msvc");
+
+        let linux = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_platform(&linux)?, "x86_64-unknown-linux-gnu");
+        Ok(())
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it

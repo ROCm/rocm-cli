@@ -4,23 +4,22 @@
 
 //! Steps for `therock_next_generation.feature`.
 //!
-//! Every scenario serves both the canonical release layout and the ROCm 10
+//! Scenarios 01-05 serve both the canonical release layout and the ROCm 10
 //! ("next") layout from one loopback server, under `current/` and `next/`
-//! prefixes, and points the gated `ROCM_CLI_THEROCK_*_BASE` overrides at them.
+//! prefixes, and point the gated `ROCM_CLI_THEROCK_*_BASE` overrides at them.
 //! Serving both — rather than only the one a scenario expects to be used — is
 //! what makes "the canonical stream is still canonical" and "the next stream is
 //! only reached when explicitly pinned" assertable: a dispatch regression
 //! resolves the *other* fixture instead of failing to resolve anything.
 //!
-//! One scenario (`therock-next-06`) is not part of that hermetic pattern: it
-//! installs for real, against the live `stable.repo.amd.com`, on a
-//! self-hosted GPU runner, with no `--family` override at all. The fixture
-//! scenarios above prove dispatch and refusal logic on wiring the CLI already
-//! has for a *supplied* exact arch; this one proves the exact arch itself can
-//! come from `resolve_family`'s existing host-probe auto-detection
-//! (`detect_host_gfx_target`) rather than requiring the user to already know
-//! and type their raw GFX code, and that a real install with that
-//! auto-detected arch actually completes.
+//! Scenario 06 sets an override without the trust opt-in and resolves the live
+//! default index, proving the child CLI ignores the untrusted value end to end.
+//!
+//! Scenario 07 installs for real against `stable.repo.amd.com` on a self-hosted
+//! GPU runner, with no `--family` override. The fixture scenarios prove dispatch
+//! and refusal logic for a supplied exact arch; this one proves the exact arch
+//! can come from `resolve_family`'s host probe (`detect_host_gfx_target`) and that
+//! the resulting managed SDK/Torch stack executes a real GPU kernel.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -42,7 +41,7 @@ const GROUP_FAMILY: &str = "gfx120X-all";
 const NEXT_ROCM_VERSION: &str = "10.0.0";
 const NEXT_TORCH_VERSION: &str = "2.10.0+rocm10.0.0";
 const NEXT_TORCHVISION_VERSION: &str = "0.25.0+rocm10.0.0";
-const NEXT_TORCHAUDIO_VERSION: &str = "2.10.0+rocm10.0.0";
+const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 
 const CURRENT_ROCM_VERSION: &str = "7.10.0";
 const CURRENT_TORCH_VERSION: &str = "2.9.0+rocm7.10.0";
@@ -112,22 +111,39 @@ fn aggregate_root_html() -> String {
     })
 }
 
-/// One package page. `py3-none-any` keeps the wheel compatible with whatever
-/// interpreter the runner resolves, so the scenario asserts selection logic
-/// rather than the host's Python tag.
-fn wheel_index_html(package: &str, version: &str) -> String {
-    format!(
-        "<a href=\"{package}-{version}-py3-none-any.whl\">{package}-{version}-py3-none-any.whl</a>\n"
-    )
+/// One PEP 503 package page with PEP 658 metadata. The metadata lets uv resolve
+/// the published dependency contract without downloading a wheel.
+fn write_wheel_index(served: &Path, package: &str, version: &str, requires: &[String]) {
+    let file_name = format!("{package}-{version}-py3-none-any.whl");
+    let html =
+        format!("<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>\n");
+    write_fixture(&served.join("index.html"), &html);
+    let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
+    if matches!(package, "rocm" | "torch" | "torchvision") {
+        metadata.push_str("Provides-Extra: device-gfx1200\n");
+    }
+    if package == "rocm" {
+        metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
+    }
+    for requirement in requires {
+        writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
+    }
+    write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
 }
 
 fn write_pip_index(served: &Path, versions: [(&str, &str); 4]) {
     write_fixture(&served.join("index.html"), &aggregate_root_html());
+    let torch_version = versions
+        .iter()
+        .find_map(|(package, version)| (*package == "torch").then_some(*version))
+        .expect("fixture must include torch");
     for (package, version) in versions {
-        write_fixture(
-            &served.join(package).join("index.html"),
-            &wheel_index_html(package, version),
-        );
+        let requires = if matches!(package, "torchvision" | "torchaudio") {
+            vec![format!("torch=={torch_version}")]
+        } else {
+            Vec::new()
+        };
+        write_wheel_index(&served.join(package), package, version, &requires);
     }
 }
 
@@ -179,6 +195,25 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
+}
+
+#[given("an untrusted ROCm 10 pip base override")]
+async fn untrusted_pip_index_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("untrusted-therock-pip-fixture");
+    write_pip_index(
+        &served,
+        [
+            ("rocm", NEXT_ROCM_VERSION),
+            ("torch", NEXT_TORCH_VERSION),
+            ("torchvision", NEXT_TORCHVISION_VERSION),
+            ("torchaudio", NEXT_TORCHAUDIO_VERSION),
+        ],
+    );
+    world.artifact_server = Some(LoopbackServer::start(&served));
+    let untrusted = server_base(world);
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", untrusted.into()));
 }
 
 #[given("a canonical release tarball fixture and a ROCm 10 tarball fixture with a tests sibling")]
@@ -391,6 +426,30 @@ async fn preview_resolves_next_pip_index(world: &mut E2eWorld) {
         world,
         &format!("latest_compatible_version: {NEXT_ROCM_VERSION}"),
         "resolved next version",
+    );
+}
+
+#[then("the preview resolves the default ROCm 10 pip index")]
+async fn preview_resolves_default_next_pip_index(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        &format!("canonical_source: {DEFAULT_NEXT_RELEASE_PIP_BASE}"),
+        "default next source",
+    );
+    assert_contains(
+        world,
+        &format!("index_url: {DEFAULT_NEXT_RELEASE_PIP_BASE}"),
+        "default resolved index",
+    );
+}
+
+#[then("the preview never mentions the untrusted ROCm 10 pip index")]
+async fn preview_never_mentions_untrusted_next_index(world: &mut E2eWorld) {
+    let untrusted = server_base(world);
+    assert!(
+        !stdout(world).contains(&untrusted),
+        "an override without explicit trust redirected the install to {untrusted}:\n{}",
+        stdout(world)
     );
 }
 
@@ -614,5 +673,45 @@ async fn assert_install_used_detected_device_target(world: &mut E2eWorld) {
         world,
         &format!("device_target: {detected}"),
         "install did not target this host's auto-detected GPU",
+    );
+}
+
+#[then("the ROCm 10 runtime passes SDK and Torch GPU probes")]
+async fn assert_next_runtime_passes_sdk_and_gpu_probes(world: &mut E2eWorld) {
+    let install_output = stdout(world);
+    for field in ["rocm_sdk_version:", "rocm_sdk_root:", "rocm_sdk_bin:"] {
+        assert!(
+            install_output
+                .lines()
+                .any(|line| line.trim().starts_with(field)),
+            "live install did not report {field}\n{install_output}"
+        );
+    }
+    let python = install_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("python_executable: "))
+        .expect("live install did not report its managed Python executable");
+    let script = r#"
+import json
+import rocm_sdk
+rocm_sdk.initialize_process()
+import torch
+assert torch.cuda.is_available(), "torch reports no usable AMD GPU"
+assert torch.cuda.device_count() > 0, "torch reports zero AMD GPUs"
+probe = torch.ones(1, device="cuda")
+probe.add_(1)
+torch.cuda.synchronize()
+print(json.dumps({"rocm_sdk": rocm_sdk.__version__, "torch": torch.__version__, "hip": torch.version.hip, "devices": torch.cuda.device_count()}))
+"#;
+    let result = std::process::Command::new(python)
+        .args(["-c", script])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to launch managed ROCm X Python {python}: {error}"));
+    assert!(
+        result.status.success(),
+        "managed ROCm X SDK/Torch GPU probe failed (status {}):\nstdout:\n{}\nstderr:\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
 }

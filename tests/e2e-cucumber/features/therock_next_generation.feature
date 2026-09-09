@@ -8,9 +8,9 @@ Feature: TheRock "next" ROCm 10 install layout
   # naming an exact raw GFX arch, and the canonical streams keep resolving
   # exactly as they do today when neither is asked for.
   #
-  # Every scenario points the ROCM_CLI_THEROCK_*_BASE overrides at a loopback
-  # fixture server (gated by ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE), so dispatch
-  # and selection are exercised with no live network dependency.
+  # Scenarios 01-05 point source overrides at loopback fixtures through the
+  # explicit trust gate. Scenario 06 proves the same overrides are inert when
+  # the trust gate is absent; scenario 07 supplies the live GPU evidence.
 
   # The regression this pins: a "next-first" dispatch that probes the ROCm 10
   # sources before the canonical ones. An unpinned release install must never
@@ -70,6 +70,16 @@ Feature: TheRock "next" ROCm 10 install layout
     Then the install fails
     And the failure asks for an exact GPU arch and names --family gfx1200
 
+  # Artifact base overrides are a trust boundary. Merely naming an override
+  # must not redirect the CLI; the separate opt-in is required. This scenario
+  # reaches the live default index, so it runs on the scheduled network lane.
+  @id:therock-next-06-base-override-requires-opt-in @nightly
+  Scenario: therock-next-06 - A ROCm 10 source override is ignored without explicit trust
+    Given an untrusted ROCm 10 pip base override
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the default ROCm 10 pip index
+    And the preview never mentions the untrusted ROCm 10 pip index
+
   # Not hermetic like the scenarios above: this one installs for real, against
   # the live stable.repo.amd.com, on a self-hosted GPU runner, with no
   # --family override at all. `resolve_family` already falls back to
@@ -78,8 +88,8 @@ Feature: TheRock "next" ROCm 10 install layout
   # layout needs without the user ever typing a raw GFX code. The fixture
   # scenarios above can't prove this: their fixtures serve a fixed gfx1200
   # regardless of what GPU the runner actually has.
-  @id:therock-next-06-live-install-auto-detects-arch @requires-gpu @nightly
-  Scenario: therock-next-06 - Installing the SDK from the live ROCm 10 preview source auto-detects the exact arch
+  @id:therock-next-07-live-install-auto-detects-arch @requires-gpu @nightly
+  Scenario: therock-next-07 - Installing the SDK from the live ROCm 10 preview source auto-detects the exact arch
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override
     Then the install used the ROCm 10 preview source
@@ -87,3 +97,4 @@ Feature: TheRock "next" ROCm 10 install layout
     And a runtime is registered
     And the runtime is set as active
     And the runtime includes an inference engine
+    And the ROCm 10 runtime passes SDK and Torch GPU probes
