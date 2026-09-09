@@ -268,6 +268,49 @@ mod tests {
     }
 
     #[test]
+    fn serving_detail_shows_held_legend_in_short_viewport_with_many_running() {
+        // Regression: `live_lines` used to append HELD_LEGEND as just another
+        // line, well after the (up to 5) running rows + "…and N more" line.
+        // In a short viewport the clipped `Paragraph` could show a held row
+        // while cutting the legend that explains it. `draw_detail` now
+        // reserves a dedicated, always-visible legend row instead — assert
+        // the legend still appears even when the detail pane is squeezed to
+        // just tall enough to show the header and first running row.
+        use rocm_dash_core::metrics::{
+            Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+        };
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Serving;
+        s.serving_sel = 2; // "Running instances/services" → OpenServices
+        for n in 0..10u16 {
+            s.instances.insert(
+                format!("vllm-{n}"),
+                Instance {
+                    container_name: format!("vllm-{n}"),
+                    model_name: format!("Model-{n}"),
+                    status: InstanceStatus::Running,
+                    port: Some(8000 + n),
+                    gen_tps: Some(42.0),
+                    gen_tps_observation: Some(ObservationMetadata {
+                        observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                        freshness: ObservationFreshness::Held,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        // area.height=8 → bento inner.height=5 for the detail column, tall
+        // enough for summary + blank + "Running now" header + the first
+        // running row, but far short of the old inline legend's position
+        // after 5 rows + the "…and N more" line.
+        let out = render(&s, 160, 8);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must survive a short viewport when a held row is visible; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn serving_detail_hides_held_legend_when_all_fresh() {
         use rocm_dash_core::metrics::{
             Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
