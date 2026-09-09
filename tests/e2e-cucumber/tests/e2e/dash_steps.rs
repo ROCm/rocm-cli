@@ -645,26 +645,36 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 /// counter until the daemon delivers at least one 503 — confirming the failure
 /// scrape actually landed before the assertion checks the TUI. This avoids a
 /// fixed wall-time sleep while remaining deterministic.
-#[when("the metrics endpoint fails transiently")]
-async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+/// Put the scripted mock into Failure mode and return the moment the daemon's
+/// first 503 was observed — the moment the held-value validity window starts.
+async fn start_failure_window(world: &mut E2eWorld) -> Instant {
     let mock = world.mock.as_ref().expect("no mock server running");
+    let before = mock.metrics_failure_count();
     mock.set_metrics_mode(MetricsMode::Failure);
 
-    // Poll until the daemon delivers at least one 503 to the mock endpoint.
-    // The production instance_tick is 2 s, so this converges in 2–3 s.
+    // Poll until the daemon delivers at least one NEW 503 to the mock endpoint.
+    // Counted relative to `before` so this is also correct on a retry, where
+    // earlier failures are already on the counter. The production
+    // instance_tick is 2 s, so it converges in 2-3 s.
     let budget = default_timeout();
     let deadline = Instant::now() + budget;
     loop {
-        if mock.metrics_failure_count() >= 1 {
-            break;
+        if mock.metrics_failure_count() > before {
+            return Instant::now();
         }
         assert!(
             Instant::now() < deadline,
             "scripted failure was never served within {budget:?}; \
              check instance_tick and scrape cadence"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[when("the metrics endpoint fails transiently")]
+async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    let started = start_failure_window(world).await;
+    world.metrics_failure_at = Some(started);
 
     // Allow one TUI render cycle (50 ms >> 20 ms poll) so the failure
     // snapshot is painted before the assertion reads the screen.
@@ -683,17 +693,57 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 /// assertion **FAILS**, confirming EAI-7960 is reproduced at the PTY seam.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
-    assert!(
-        screen.contains("tok/s"),
-        "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
-         after the first failed scrape instead of being held for the validity \
-         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\
-         Root cause: runner.rs clears gen_tps on the same tick as the failure; \
-         no held-value / validity-window logic exists yet.\n\
-         This assertion must FAIL (RED) until the fix is applied.\n\n\
-         Last screen:\n{screen}"
-    );
+    let mut started = world
+        .metrics_failure_at
+        .expect("the failure step records when the first 503 landed");
+
+    // Look repeatedly while the window is open instead of once. The value must
+    // be held for the WHOLE window, so every in-window sample must show it and
+    // one that does not is the regression — strictly stronger than a single
+    // look, and it does not depend on that one look being prompt.
+    //
+    // Promptness is the problem this solves. The suite runs several scenarios
+    // at once, and a step descheduled past the window sees a value that expired
+    // exactly on schedule and calls it "cleared immediately". If a whole window
+    // goes by with no sample, the observation is retried on a fresh window
+    // rather than reported: nothing was measured, so there is nothing to report.
+    for attempt in 1..=WINDOW_ATTEMPTS {
+        let close = started + VALIDITY_WINDOW.saturating_sub(HELD_SAMPLE_MARGIN);
+        let mut samples = 0_usize;
+        while Instant::now() < close {
+            let screen = session(world).screen_text();
+            samples += 1;
+            assert!(
+                screen.contains("tok/s"),
+                "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared {:?} after the \
+                 first failed scrape instead of being held for the validity window \
+                 (clamp(3 × instance_tick, 6 s, 30 s)).\n\
+                 Root cause: runner.rs clears gen_tps on the same tick as the failure; \
+                 no held-value / validity-window logic exists yet.\n\n\
+                 Last screen:\n{screen}",
+                started.elapsed()
+            );
+            tokio::time::sleep(HELD_SAMPLE_INTERVAL).await;
+        }
+        if samples > 0 {
+            return;
+        }
+        assert!(
+            attempt < WINDOW_ATTEMPTS,
+            "the validity window ({VALIDITY_WINDOW:?}) closed before this step could read the \
+             screen even once, on {WINDOW_ATTEMPTS} successive windows — so gen_tps was never \
+             measured. This is the harness losing its window under load, not a statement about \
+             the product."
+        );
+        // Restore a positive baseline, then open a fresh window to observe.
+        let mock = world.mock.as_ref().expect("no mock server running");
+        mock.set_metrics_mode(MetricsMode::Growing);
+        session(world)
+            .wait_for_screen("tok/s", default_timeout())
+            .await
+            .unwrap_or_else(|e| panic!("gen_tps never recovered for a retried window: {e}"));
+        started = start_failure_window(world).await;
+    }
 }
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
@@ -704,6 +754,16 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
 /// is always reached. An additional buffer of two instance-ticks (4 s) ensures
 /// the runner has had enough cycles to propagate the expiry to the TUI.
 const VALIDITY_WINDOW: Duration = Duration::from_secs(6);
+/// How much of the window to leave unsampled at its end: the clear is allowed
+/// to land anywhere at the boundary, so the "still held" assertion stops short
+/// of the tick it is not judging.
+const HELD_SAMPLE_MARGIN: Duration = Duration::from_millis(1500);
+/// Gap between screen samples while the window is open.
+const HELD_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+/// How many windows to open before giving up on getting a single look inside
+/// one. Two is enough for a transient scheduling stall; a step that loses every
+/// window is reporting a loaded machine, not a defect.
+const WINDOW_ATTEMPTS: usize = 3;
 const VALIDITY_WINDOW_BUFFER: Duration = Duration::from_secs(5); // 2 × instance_tick + render
 
 /// Sleep for the full observation validity window so the caller can then assert

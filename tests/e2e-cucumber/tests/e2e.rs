@@ -102,6 +102,11 @@ pub struct E2eWorld {
     /// belongs to the Given, while the invocations that must see it are in later
     /// steps.
     pub path_override: Option<String>,
+    /// When the dashboard's scripted metrics endpoint first answered a scrape
+    /// with a failure, which is when the held-value validity window starts. The
+    /// assertion that the value is still shown needs it to know how much of
+    /// that window is left, rather than assuming it is looking promptly.
+    pub metrics_failure_at: Option<std::time::Instant>,
     /// Plain child processes a scenario spawned itself and registered with the
     /// CLI as managed services, so a step can assert the PRODUCT stopped them.
     ///
@@ -283,6 +288,7 @@ impl Default for E2eWorld {
             lifecycle: None,
             occupied_address: None,
             path_override: None,
+            metrics_failure_at: None,
             owned_processes: Vec::new(),
         }
     }
