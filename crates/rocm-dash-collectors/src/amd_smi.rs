@@ -4,11 +4,12 @@
 
 //! amd-smi subprocess + JSON parse.
 //!
-//! Field paths and the KFD pre-flight check are vendored from the TypeScript
+//! Field paths and the GPU-device pre-flight are vendored from the TypeScript
 //! `AmdSmiProvider` in instinct-dash. See `../wiki/entities/amd-smi.md`.
 
 use std::ffi::OsString;
 use std::io;
+use std::path::Path;
 use std::time::Duration;
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo};
@@ -20,6 +21,7 @@ use tokio::time::timeout;
 use tracing::warn;
 
 const KFD_DEVICE: &str = "/dev/kfd";
+const DXG_DEVICE: &str = "/dev/dxg";
 const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -29,9 +31,11 @@ pub struct AmdSmiCollector {
 }
 
 impl AmdSmiCollector {
-    /// Returns `Some` only if `/dev/kfd` is readable AND `amd-smi version` succeeds.
+    /// Returns `Some` only if a supported GPU device is readable and
+    /// `amd-smi version` succeeds.
     ///
-    /// The KFD pre-flight is mandatory: without it, `amd-smi` blocks in
+    /// The device pre-flight is mandatory: without an accessible `/dev/kfd` on
+    /// bare-metal Linux or `/dev/dxg` on WSL, `amd-smi` can block in
     /// uninterruptible kernel sleep (D-state) that no signal can escape.
     pub async fn detect() -> Option<Self> {
         Self::detect_with_binary("amd-smi").await
@@ -47,18 +51,18 @@ impl AmdSmiCollector {
     }
 
     /// Like [`detect_with_binary`](Self::detect_with_binary) but skips the
-    /// mandatory `/dev/kfd` pre-flight.
+    /// mandatory GPU-device pre-flight.
     ///
-    /// **Test-only.** The KFD pre-flight is a safety guard: against a *real*
-    /// `amd-smi` on a host without a usable `/dev/kfd`, the process can block in
-    /// uninterruptible kernel sleep (D-state) that no signal can escape. This
-    /// entry point exists solely so daemon integration tests can point
-    /// [`detect_with_binary`](Self::detect_with_binary) at a *fake* script (for
-    /// which the hang cannot happen) and have it actually run on a GPU-less CI
-    /// host, instead of short-circuiting to `None` and turning the test into a
-    /// no-op. Never call it against a real binary in production.
+    /// **Test-only.** The device pre-flight is a safety guard: against a *real*
+    /// `amd-smi` on a host without an accessible `/dev/kfd` or `/dev/dxg`, the
+    /// process can block in uninterruptible kernel sleep (D-state) that no
+    /// signal can escape. This entry point exists solely so daemon integration
+    /// tests can point [`detect_with_binary`](Self::detect_with_binary) at a
+    /// *fake* script (for which the hang cannot happen) and have it actually run
+    /// on a GPU-less CI host, instead of short-circuiting to `None` and turning
+    /// the test into a no-op. Never call it against a real binary in production.
     #[doc(hidden)]
-    pub async fn detect_with_binary_skipping_kfd_preflight(
+    pub async fn detect_with_binary_skipping_device_preflight(
         binary: impl Into<OsString>,
     ) -> Option<Self> {
         Self::detect_with_binary_inner(binary, true).await
@@ -66,9 +70,11 @@ impl AmdSmiCollector {
 
     async fn detect_with_binary_inner(
         binary: impl Into<OsString>,
-        skip_kfd_preflight: bool,
+        skip_device_preflight: bool,
     ) -> Option<Self> {
-        if !skip_kfd_preflight && !kfd_accessible() {
+        if !skip_device_preflight
+            && !gpu_device_accessible(Path::new(KFD_DEVICE), Path::new(DXG_DEVICE))
+        {
             return None;
         }
         let me = Self {
@@ -134,11 +140,12 @@ impl AmdSmiCollector {
     }
 }
 
-fn kfd_accessible() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .open(KFD_DEVICE)
-        .is_ok()
+fn gpu_device_accessible(kfd_device: &Path, dxg_device: &Path) -> bool {
+    device_accessible(kfd_device) || device_accessible(dxg_device)
+}
+
+fn device_accessible(path: &Path) -> bool {
+    std::fs::OpenOptions::new().read(true).open(path).is_ok()
 }
 
 fn val_u64(v: Option<&Value>) -> Option<u64> {
@@ -364,6 +371,14 @@ fn parse_memory(v: Option<&Value>) -> MemoryPartitionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dxg_access_satisfies_device_preflight_without_kfd() {
+        let dir = tempfile::tempdir().unwrap();
+        let dxg = dir.path().join("dxg");
+        std::fs::write(&dxg, []).unwrap();
+
+        assert!(gpu_device_accessible(&dir.path().join("missing-kfd"), &dxg));
+    }
 
     const SAMPLE_METRIC: &str = r#"{
       "gpu_data": [
