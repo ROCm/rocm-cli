@@ -68,9 +68,11 @@ impl Spinner {
 
     /// Repaint with a byte-progress label. Throttled to at most one repaint
     /// per [`MIN_PROGRESS_REPAINT_INTERVAL`], except the very first call
-    /// (`last_progress_paint` starts unset) and the final chunk (`bytes >=
-    /// total`) always repaint, so the first and last frames shown are never
-    /// stale.
+    /// (`last_progress_paint` starts unset) always repaints, as does the
+    /// final chunk when the total size is known (`bytes >= total`). With an
+    /// unknown total there is no final-chunk signal to detect, so the true
+    /// last frame is subject to the same throttle as any other and may be
+    /// swallowed.
     ///
     /// `bytes` is clamped to a high-water mark: a retried transfer that
     /// restarts from zero (or resumes from an earlier offset than what was
@@ -170,13 +172,34 @@ impl AnimatedSpinner {
     }
 
     fn start_with_interval(label: impl Into<String>, interval: Duration) -> Self {
+        Self::start_with_interval_impl(label, interval, false)
+    }
+
+    /// Like [`Self::start_with_interval`], but always spawns the ticker
+    /// thread even when stderr isn't a TTY. Test-only: production callers go
+    /// through `start`/`start_with_interval`, which skip the thread when
+    /// nobody can see its repaints, but a test running with stderr piped
+    /// still needs the thread to verify the ticker mechanism itself.
+    #[cfg(test)]
+    fn start_with_interval_forced(label: impl Into<String>, interval: Duration) -> Self {
+        Self::start_with_interval_impl(label, interval, true)
+    }
+
+    fn start_with_interval_impl(
+        label: impl Into<String>,
+        interval: Duration,
+        force_ticker: bool,
+    ) -> Self {
         let inner = Arc::new(Mutex::new(Spinner::new(label)));
         inner.lock().unwrap().tick();
         let stop = Arc::new(AtomicBool::new(false));
-        let ticker = {
+        // A ticker thread only exists to keep repainting an already-visible
+        // spinner; when stderr isn't a TTY every repaint it would trigger is
+        // a no-op, so skip holding an OS thread open for the whole download.
+        let ticker = if force_ticker || inner.lock().unwrap().enabled {
             let inner = Arc::clone(&inner);
             let stop = Arc::clone(&stop);
-            thread::spawn(move || {
+            Some(thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     thread::sleep(interval);
                     if stop.load(Ordering::Relaxed) {
@@ -184,12 +207,14 @@ impl AnimatedSpinner {
                     }
                     inner.lock().unwrap().tick();
                 }
-            })
+            }))
+        } else {
+            None
         };
         Self {
             inner,
             stop,
-            ticker: Some(ticker),
+            ticker,
         }
     }
 
@@ -346,12 +371,25 @@ mod tests {
     #[test]
     fn animated_spinner_keeps_ticking_without_progress_calls() {
         let spinner =
-            AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
+            AnimatedSpinner::start_with_interval_forced("Downloading…", Duration::from_millis(5));
         thread::sleep(Duration::from_millis(60));
         let idx = spinner.inner.lock().unwrap().idx;
         assert!(
             idx >= 3,
             "the background ticker must keep advancing frames on its own: idx={idx}"
+        );
+    }
+
+    #[test]
+    fn animated_spinner_skips_the_ticker_thread_when_disabled() {
+        // Test processes don't have a TTY on stderr, so `start_with_interval`
+        // (unlike `start_with_interval_forced`) must see `enabled == false`
+        // here and skip spawning the thread entirely.
+        let spinner =
+            AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
+        assert!(
+            spinner.ticker.is_none(),
+            "no ticker thread should be spawned when stderr isn't a TTY"
         );
     }
 }

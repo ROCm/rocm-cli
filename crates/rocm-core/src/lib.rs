@@ -249,14 +249,21 @@ pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<Download
 ///
 /// `on_progress` is called with the cumulative bytes written and, when
 /// known, the total size — once before the transfer starts and once after
-/// every chunk is written to disk. Reports are monotonically
+/// every chunk is written to disk. The byte count is monotonically
 /// non-decreasing across the whole call, including across retries: an
 /// attempt that restarts from scratch (the server ignored `Range`, or
 /// resumed at the wrong offset and had its partial file discarded) counts
 /// its own bytes from 0 internally, but the byte count `on_progress` sees
 /// never drops below the highest value already reported by an earlier
-/// attempt. Callers that don't need progress should use
-/// [`download_file_streaming`] instead.
+/// attempt. The total is not clamped the same way and is passed through as
+/// reported by the current attempt, so it can go from `None` to `Some` (or
+/// back) mid-transfer if a retry's response differs on `Content-Length`.
+/// Note also that for the whole duration of a from-scratch restart, the
+/// byte count holds flat at the prior high-water mark until the new attempt
+/// catches back up — a caller driving a static progress line should pair
+/// this with an animated indicator (as the `rocm` CLI's spinner does) so a
+/// long restart doesn't look hung. Callers that don't need progress should
+/// use [`download_file_streaming`] instead.
 pub fn download_file_streaming_with_progress(
     request: &DownloadRequest<'_>,
     on_progress: &mut dyn FnMut(u64, Option<u64>),
@@ -8189,7 +8196,12 @@ mod tests {
     }
 
     #[test]
-    fn download_with_progress_stays_continuous_across_a_resumed_attempt() -> Result<()> {
+    // This guards the resume path re-seeding `written` from the partial file
+    // already on disk (see `written = std::io::copy(...)` above), not the
+    // high-water-mark clamp itself — it would pass unchanged with the clamp
+    // removed entirely. `download_with_progress_stays_monotonic_after_a_discarded_restart`
+    // below is the one that actually exercises the clamp.
+    fn download_with_progress_reports_the_resumed_offset_before_reading_more() -> Result<()> {
         let body = download_body();
         let (port, server) = spawn_download_server(
             body.clone(),
