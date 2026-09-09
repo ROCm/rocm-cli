@@ -5484,10 +5484,28 @@ mod tests {
     }
 
     #[test]
+    fn slash_help_resets_stale_scroll_offset() {
+        let mut s = st();
+        s.help_scroll = 42;
+        assert_eq!(s.handle_slash_command("/help"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+        assert_eq!(s.help_scroll, 0);
+    }
+
+    #[test]
     fn slash_question_mark_opens_help_modal() {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
         assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_question_mark_resets_stale_scroll_offset() {
+        let mut s = st();
+        s.help_scroll = 17;
+        assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+        assert_eq!(s.help_scroll, 0);
     }
 
     #[test]
