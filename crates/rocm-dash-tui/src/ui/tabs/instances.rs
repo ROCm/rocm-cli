@@ -97,15 +97,23 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // visible marker with no legend at all, which is the failure mode this
     // mechanism exists to prevent. Overcounting by one boundary row is the
     // accepted cost of never doing that.
-    // The finite check mirrors `gen_tps_cell`, which never prints a marker
-    // for `None`/non-finite `gen_tps` regardless of freshness metadata.
+    // The finite checks mirror `gen_tps_cell`/`tokens_per_watt_cell`, which
+    // never print a marker for `None`/non-finite values regardless of
+    // freshness metadata. Both cells key off the same `gen_tps_observation`
+    // (tok/W derives from the same per-tick `gen_tps` sample), but each
+    // gates independently on its *own* value's finiteness — an instance can
+    // have non-finite/missing `gen_tps` (no marker on TOK/S) while
+    // `tokens_per_watt` is still finite and held (marker on TOK/W), so the
+    // row needs the legend even though the `gen_tps` half of this check
+    // alone would say no.
     let visible_rows = inner.height.saturating_sub(1) as usize;
     let any_held = instances.iter().take(visible_rows).any(|inst| {
-        inst.gen_tps.is_some_and(f64::is_finite)
-            && inst
-                .gen_tps_observation
-                .as_ref()
-                .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+        let held = inst
+            .gen_tps_observation
+            .as_ref()
+            .is_some_and(|m| m.freshness == ObservationFreshness::Held);
+        held && (inst.gen_tps.is_some_and(f64::is_finite)
+            || inst.tokens_per_watt.is_some_and(f64::is_finite))
     });
     let (table_area, legend_area) = if any_held {
         let split = Layout::default()
@@ -1350,6 +1358,35 @@ mod tests {
         assert!(
             out.contains("0.42 tok/W*"),
             "held tok/W must carry the held marker in the table; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_shows_held_legend_for_tok_w_even_when_gen_tps_is_missing() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // gen_tps itself is None (so TOK/S renders no marker at all), but
+        // tokens_per_watt is finite and held — the legend must still appear
+        // because the TOK/W cell independently prints a marker for it.
+        let mut inst = mk_inst_obs(
+            "held-tpw-only",
+            None,
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W must carry the held marker even without gen_tps; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when only the tok/W cell shows a held marker; got:\n{out}"
         );
     }
 
