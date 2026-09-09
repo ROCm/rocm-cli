@@ -452,6 +452,9 @@ pub(crate) struct RuntimeUpdatePlan {
 pub(crate) struct WheelRuntimeComposition {
     pub source_layout_generation: String,
     pub package_specs: Vec<String>,
+    /// Exact target supplied to `rocm_sdk` when resolving runtime libraries.
+    #[serde(default)]
+    pub rocm_sdk_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1032,10 +1035,9 @@ fn resolve_latest_for_manifest(
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
             let wheel_composition = match &device_target {
-                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
-                    &resolution,
-                    &device_target.rocm_extras(),
-                )),
+                AggregateDeviceTarget::Exact(_) => {
+                    Some(wheel_runtime_composition(&resolution, &device_target))
+                }
                 AggregateDeviceTarget::Undetermined(_) => None,
             };
             let target_runtime_key = wheel_composition.as_ref().map_or_else(
@@ -1271,7 +1273,7 @@ fn install_wheel_runtime(
     // usable target still composes a key here — from the `<undetermined>` extras
     // — which no real install can ever produce, and the refusal below stops it
     // from reaching a manifest.
-    let wheel_composition = wheel_runtime_composition(&resolution, &device_target.rocm_extras());
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -1507,11 +1509,16 @@ fn therock_pip_package_specs(
 /// runtime are, by construction, the specs that get installed.
 fn wheel_runtime_composition(
     resolution: &PipRuntimeResolution,
-    rocm_extras: &str,
+    device_target: &AggregateDeviceTarget,
 ) -> WheelRuntimeComposition {
     WheelRuntimeComposition {
         source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
-        package_specs: therock_pip_package_specs(&resolution.package_versions, rocm_extras),
+        package_specs: therock_pip_package_specs(
+            &resolution.package_versions,
+            &device_target.rocm_extras(),
+        ),
+        rocm_sdk_target: matches!(device_target, AggregateDeviceTarget::Exact(_))
+            .then(|| device_target.as_str().to_owned()),
     }
 }
 
@@ -1522,12 +1529,15 @@ fn wheel_runtime_composition(
 /// host happens to report now; storing the specs verbatim means that answer
 /// survives without a second manifest field to keep in sync.
 fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>) -> Option<&str> {
-    composition?.package_specs.iter().find_map(|spec| {
-        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
-        extras
-            .split(',')
-            .map(str::trim)
-            .find_map(|extra| extra.strip_prefix("device-"))
+    let composition = composition?;
+    composition.rocm_sdk_target.as_deref().or_else(|| {
+        composition.package_specs.iter().find_map(|spec| {
+            let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+            extras
+                .split(',')
+                .map(str::trim)
+                .find_map(|extra| extra.strip_prefix("device-"))
+        })
     })
 }
 
@@ -5183,6 +5193,7 @@ mod tests {
                 "torchvision==0.26.0+rocm7.14.0".to_owned(),
                 "torchaudio==2.11.0+rocm7.14.0".to_owned(),
             ],
+            rocm_sdk_target: Some(device_target.to_owned()),
         }
     }
 
@@ -5998,14 +6009,17 @@ echo Python 3.12.10
         let base = WheelRuntimeComposition {
             source_layout_generation: "multi-arch-v2".to_owned(),
             package_specs: vec!["rocm[libraries,devel,device-gfx942]==7.14.0".to_owned()],
+            rocm_sdk_target: Some("gfx942".to_owned()),
         };
         let other_payload = WheelRuntimeComposition {
             source_layout_generation: "multi-arch-v2".to_owned(),
             package_specs: vec!["rocm[libraries,devel,device-gfx950]==7.14.0".to_owned()],
+            rocm_sdk_target: Some("gfx950".to_owned()),
         };
         let other_generation = WheelRuntimeComposition {
             source_layout_generation: "multi-arch-v3".to_owned(),
             package_specs: base.package_specs.clone(),
+            rocm_sdk_target: base.rocm_sdk_target.clone(),
         };
 
         let base_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base);
@@ -6041,6 +6055,7 @@ echo Python 3.12.10
                 "rocm[libraries,devel,device-gfx1103]==7.14.1".to_owned(),
                 "torch==2.11.0+rocm7.14.1".to_owned(),
             ],
+            rocm_sdk_target: Some("gfx1103".to_owned()),
         };
 
         assert_eq!(
