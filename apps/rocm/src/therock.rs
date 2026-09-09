@@ -774,17 +774,11 @@ fn load_startup_update_check(paths: &AppPaths) -> Result<Option<StartupUpdateChe
 
 fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord) -> Result<()> {
     let path = startup_update_check_path(paths);
-    let parent = path
-        .parent()
-        .context("startup update check path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    fs::write(
+    write_file_atomically(
         &path,
-        serde_json::to_vec_pretty(record)
+        &serde_json::to_vec_pretty(record)
             .context("failed to serialize startup update check record")?,
     )
-    .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
 }
 
 fn install_wheel_runtime(

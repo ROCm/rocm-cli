@@ -249,14 +249,12 @@ impl E2eWorld {
             // (rocm-engine-lemonade's `RUNTIME_VERSION_MARKER`).
             //
             // Two paths under this cache are mutable rather than content-
-            // addressed: `cache/therock/startup-update-check.json` (a plain,
-            // non-atomic `fs::write`) and `cache/therock/metadata/*.json` (the
-            // etag revalidation cache, atomically written). Concurrent scenarios
-            // now sharing this dir could race the former into a torn file, which
-            // `load_startup_update_check` treats as a hard error — so disable the
-            // check suite-wide rather than let a shared, non-atomic write become
-            // a flaky `rocm` exit code.
-            env.push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
+            // addressed: `cache/therock/startup-update-check.json` and
+            // `cache/therock/metadata/*.json` (the etag revalidation cache).
+            // Both are now written atomically (`save_startup_update_check` /
+            // `write_cached_http_entry`), so concurrent scenarios sharing this
+            // dir can't tear either into a state `load_startup_update_check`
+            // would hard-error on.
             let cache_dir = shared_cache_dir()
                 .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
             env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
