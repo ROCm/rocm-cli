@@ -339,7 +339,7 @@ async fn scrape_warning_persists_between_scrape_ticks() {
 /// first snapshot carrying the instance already has `gpu_system_info == Some`.
 ///
 /// The fake `amd-smi` is forced through the real detection path via
-/// `amd_smi_skip_kfd_preflight` (see `RunnerOptions`): otherwise the `/dev/kfd`
+/// `amd_smi_skip_device_preflight` (see `RunnerOptions`): otherwise the GPU-device
 /// pre-flight short-circuits to "no GPU" on GPU-less CI, the fake never runs,
 /// and the assertion passes vacuously even with the fix reverted. The surfaced
 /// snapshot must also carry NO "amd-smi unavailable" warning — detection is
@@ -378,9 +378,9 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
             services_dir: Some(services_dir),
             amd_smi_binary: Some(fake_bin),
             // Drive the fake through the real detection path on GPU-less CI:
-            // without this the `/dev/kfd` pre-flight would short-circuit before
+            // without this the GPU-device pre-flight would short-circuit before
             // the fake runs, making the ordering assertion vacuous.
-            amd_smi_skip_kfd_preflight: true,
+            amd_smi_skip_device_preflight: true,
             disable_vllm_metrics: true,
             ..Default::default()
         };
