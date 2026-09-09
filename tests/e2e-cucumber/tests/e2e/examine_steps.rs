@@ -159,12 +159,21 @@ async fn assert_default_command_described_distinctly(world: &mut E2eWorld) {
         "expected the help to list a `dash` command that opens the dashboard:\n{help}"
     );
     // The sentence describing what running the CLI with no subcommand does.
-    let default_sentence = help
+    //
+    // Read from the whole PARAGRAPH the phrase sits in, not from its one line:
+    // clap wraps `long_about` at the terminal width, and this sentence sits near
+    // a wrap boundary. Matching a single line would let a future wording that
+    // does call the plain command the dashboard slip through whenever the wrap
+    // happened to fall between "subcommand" and "dashboard" — passing while the
+    // defect this exists to catch is present.
+    let paragraph: Vec<&str> = help
+        .split("\n\n")
+        .find(|block| block.contains("with no subcommand"))
+        .unwrap_or_default()
         .lines()
         .map(str::trim)
-        .find(|line| line.contains("with no subcommand"))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+        .collect();
+    let default_sentence = paragraph.join(" ").to_ascii_lowercase();
     assert!(
         !default_sentence.is_empty(),
         "the help does not say what running the CLI with no subcommand does:\n{help}"

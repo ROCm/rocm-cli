@@ -365,8 +365,17 @@ serve_timeout_secs = 240
 #
 # `flaky = true` for exactly that reason: the bug is real and constant, while
 # the observation of it is not, so either outcome is tolerated while EAI-7960 is
-# open. Delete both rows when the hold/expiry logic lands — the resulting XPASS
-# is the signal that it did, and the scenarios then guard it. ---
+# open.
+#
+# Note what that costs, because these rows cannot advertise their own removal.
+# A flaky row deliberately tolerates a pass, so a passing run is reported as
+# `flaky XPASS` and never as stale — the deletion signal the non-flaky rows in
+# this file rely on does not exist here. Delete both rows when EAI-7960 is
+# CLOSED, tracked from the ticket rather than from this lane. Until then
+# dash-08/dash-09 are tolerate-either and are not guarding the behaviour; the
+# durable fix is to make the observation deterministic (sample the window rather
+# than take one screenshot of a TUI) so the rows can drop `flaky` and go back to
+# self-deleting. ---
 [["dash-gen-tps-held-after-scrape-failure"]]
 when = {}
 bug = "EAI-7960"
