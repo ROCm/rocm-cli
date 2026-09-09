@@ -12,6 +12,7 @@
 //! only reached when explicitly pinned" assertable: a dispatch regression
 //! resolves the *other* fixture instead of failing to resolve anything.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use cucumber::{given, then, when};
@@ -95,8 +96,10 @@ fn aggregate_root_html() -> String {
         "rocm-sdk-device-gfx1200",
     ]
     .iter()
-    .map(|name| format!("<a href=\"{name}/\">{name}</a>\n"))
-    .collect()
+    .fold(String::new(), |mut html, name| {
+        writeln!(html, "<a href=\"{name}/\">{name}</a>").expect("write fixture HTML");
+        html
+    })
 }
 
 /// One package page. `py3-none-any` keeps the wheel compatible with whatever
