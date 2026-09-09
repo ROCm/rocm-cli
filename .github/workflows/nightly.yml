@@ -337,9 +337,10 @@ jobs:
   # BUILD skip above — a regression run is worth doing even with no new commits).
   # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
-    name: E2E tests (GPU, incl. nightly-only)
+    name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, amd-gpu]
+    # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
+    runs-on: [self-hosted, linux, mi300x]
     continue-on-error: true
     env:
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.

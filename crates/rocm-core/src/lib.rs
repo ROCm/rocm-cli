@@ -1070,14 +1070,6 @@ pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> 
         .context("failed to write to TCP stream")
 }
 
-pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read TCP stream")?;
-    Ok(response)
-}
-
 /// Read one HTTP response, bounded by a wall-clock deadline.
 ///
 /// Two problems with reading to end-of-stream instead. A response is only
@@ -1089,7 +1081,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 /// slow-drip responder could stretch the total wait to an arbitrary multiple of
 /// what the caller asked for. This returns as soon as the response is complete by
 /// its own framing, and never runs past `deadline` in total.
-fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !http_response_is_complete(&response) {
@@ -1130,10 +1122,17 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
 /// those are delimited by the connection closing, so the caller must keep reading
 /// until EOF.
 fn http_response_is_complete(response: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(response);
-    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+    // Headers are ASCII by the HTTP spec, so it is safe to lossy-decode just
+    // that slice to parse them. The body length check below stays on raw
+    // bytes: lossy-decoding a body that ends mid multi-byte UTF-8 sequence
+    // replaces the truncated tail with a 3-byte U+FFFD, which can inflate a
+    // partial body's *decoded* length past the declared Content-Length and
+    // report completeness one read early.
+    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end + 4..];
     let header_value = |name: &str| {
         headers.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -1150,7 +1149,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
     if header_value("Transfer-Encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
-        return body.ends_with("0\r\n\r\n");
+        return body.ends_with(b"0\r\n\r\n");
     }
     false
 }
@@ -2416,7 +2415,7 @@ fn normalize_cpu_model(value: &str) -> String {
 /// route-out note, a false negative runs bare-metal driver checks against a
 /// platform that has no amdgpu module and reports nonsense.
 #[must_use]
-pub(crate) fn is_wsl_host() -> bool {
+pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
@@ -4746,15 +4745,16 @@ pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
         .ok()?
         .flatten()
         .filter_map(|entry| {
-            let value = fs::read_to_string(entry.path().join("gfx_target_version")).ok()?;
+            let value = kfd_node_gfx_target_version(&entry.path())?;
             let token = parse_linux_kfd_gfx_target(value.trim())?;
             Some((entry.file_name().to_string_lossy().into_owned(), token))
         })
         .collect();
     // `read_dir` order is filesystem-defined, so a multi-node box could report a
-    // different GPU run to run. Node names are `node0`, `node1`, ...; sorting by
-    // name makes the answer stable and picks the lowest-numbered node, which is
-    // the one HIP ordinal 0 refers to.
+    // different GPU run to run. Node directories are numbered (`0`, `1`, ... on
+    // a real KFD; `node0`, `node1`, ... in planted fixtures), so sorting on the
+    // trailing number makes the answer stable and picks the lowest-numbered
+    // node, which is the one HIP ordinal 0 refers to.
     targets.sort_by_key(|(name, _)| natural_node_order(name));
     targets.into_iter().next().map(|(_, token)| token)
 }
@@ -4830,9 +4830,12 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 /// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
 /// figure. KFD counts *compute* nodes and is authoritative for HIP ordinals, so
 /// it wins whenever it reports at least one GPU. DRM is used only as the
-/// zero-KFD fallback: some hosts (e.g. Strix Halo APUs) enumerate the GPU only
-/// via DRM ip-discovery and report zero KFD GPU nodes, so relying on KFD alone
-/// would wrongly conclude there is no GPU and block serving.
+/// zero-KFD fallback, so that a host KFD does not account for is not wrongly
+/// told it has no GPU and blocked from serving. The fallback was added when the
+/// KFD count read a node file that no kernel exposes and so came back zero
+/// everywhere; how often a correctly-read KFD still reports zero has not been
+/// surveyed, so treat this as a hedge rather than a description of known
+/// hardware.
 ///
 /// DRM must not *raise* a nonzero KFD count: a display/render-only AMD DRM card
 /// with no KFD compute node (e.g. KFD=1, DRM=2) would otherwise invent a usable
@@ -4844,7 +4847,7 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
     match kfd {
         // KFD is compute-authoritative: prefer it whenever it sees a GPU.
         Some(k) if k > 0 => Some(k),
-        // Zero KFD compute nodes: fall back to DRM for the APU shape.
+        // Zero KFD compute nodes: let DRM answer rather than block serving.
         Some(_) => Some(drm.unwrap_or(0)),
         // KFD unreadable: use DRM if it could be read, else availability unknown.
         None => drm,
@@ -4878,7 +4881,17 @@ fn linux_drm_amdgpu_card_count() -> Option<usize> {
 /// availability is unknown and must not be treated as zero.
 #[cfg(target_os = "linux")]
 fn linux_kfd_gpu_node_count() -> Option<usize> {
-    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    linux_kfd_gpu_node_count_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+/// The KFD GPU-node count, against a caller-supplied nodes directory.
+///
+/// Split out for the same reason as [`detect_kfd_gfx_target_in`]: the hosts
+/// where this matters are the ones a test cannot run on. Only the readable
+/// branch is driven by tests -- the unreadable branches key off the real
+/// `/dev/kfd`, which a planted directory cannot stand in for.
+#[cfg(any(target_os = "linux", test))]
+fn linux_kfd_gpu_node_count_in(nodes_dir: &Path) -> Option<usize> {
     match fs::read_dir(nodes_dir) {
         Ok(entries) => Some(
             entries
@@ -4893,11 +4906,48 @@ fn linux_kfd_gpu_node_count() -> Option<usize> {
 
 /// A KFD topology node is a GPU (not the CPU node) when its
 /// `gfx_target_version` is a nonzero value; CPU nodes report `0`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn kfd_node_is_gpu(node_dir: &Path) -> bool {
+    kfd_node_gfx_target_version(node_dir)
+        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+}
+
+/// A KFD topology node's `gfx_target_version`, or `None` when the node does not
+/// state one.
+///
+/// The kernel exposes it as a **line inside the node's `properties` file**
+/// (`gfx_target_version 90402`), not as a standalone file. Reading only the
+/// standalone path found nothing on every real KFD host, so target detection
+/// silently fell through to the DRM ip-discovery route, which decodes a GC IP
+/// version and is wrong-but-plausible on the GC 9.4.x line: an MI300X reported
+/// `gfx943` where KFD plainly said `90402` (gfx942). Hosts whose ip-discovery
+/// route also came up empty got `<unknown>` instead.
+///
+/// The standalone file is still read as a fallback, so any layout that does
+/// expose it keeps working.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_node_gfx_target_version(node_dir: &Path) -> Option<String> {
+    let from_properties = fs::read_to_string(node_dir.join("properties"))
+        .ok()
+        .and_then(|text| kfd_property_value(&text, "gfx_target_version"));
+    if from_properties.is_some() {
+        return from_properties;
+    }
     fs::read_to_string(node_dir.join("gfx_target_version"))
         .ok()
-        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+        .map(|value| value.trim().to_owned())
+}
+
+/// The value of one `key value` line in a KFD `properties` body.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_property_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        if parts.next()? != key {
+            return None;
+        }
+        parts.next().map(str::to_owned)
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -8666,6 +8716,25 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn http_response_is_complete_does_not_miscount_a_split_multibyte_char() {
+        // A body ending in a multi-byte UTF-8 character can arrive one byte
+        // short of the declared Content-Length. Lossy-decoding the whole
+        // buffer to check completeness turns that dangling partial sequence
+        // into a 3-byte U+FFFD replacement, inflating the decoded length past
+        // the declared one and reporting completeness a read early.
+        let body = "hi \u{2603}"; // snowman is a 3-byte UTF-8 character
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let truncated = &full[..full.len() - 1];
+
+        assert!(!http_response_is_complete(truncated));
+        assert!(http_response_is_complete(&full));
+    }
+
     /// A signal arriving mid-response must not fail the request.
     ///
     /// A signal delivered while the client is parked in `read` aborts it with
@@ -10191,7 +10260,9 @@ Class Name:                Display
 
     #[test]
     fn kfd_topology_names_the_gpu_when_no_tooling_is_installed() -> Result<()> {
-        // The MI300X case. `Examination` enumerates GPUs by shelling out to
+        // Covers the standalone-file fallback; see
+        // `kfd_topology_reads_the_target_from_the_properties_file` for the
+        // layout a real KFD host has. `Examination` enumerates GPUs by shelling out to
         // lspci and rocminfo; where neither is reachable it reported no AMD GPU
         // on a machine that has one, while the human report -- which reads this
         // topology instead -- named the target correctly. Planted here because
@@ -10243,6 +10314,122 @@ Class Name:                Display
 
         assert_eq!(found.as_deref(), Some("gfx1100"));
         Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_reads_the_target_from_the_properties_file() -> Result<()> {
+        // The layout every real KFD host actually has: the value is a line in
+        // the node's `properties`, and there is no standalone file. Reading only
+        // the standalone path found nothing here, so an MI300X fell through to
+        // ip-discovery and was reported as `gfx943` while KFD said `90402`.
+        // Node directories are bare integers on real hardware, not `nodeN`.
+        let (root, _) = temp_app_paths("kfd-topology-properties");
+        let nodes = root.join("nodes");
+        // Trimmed from a live MI300X; ordering and neighbours are as found.
+        for (node, properties) in [
+            (
+                "0",
+                "cpu_cores_count 56\nsimd_count 0\ngfx_target_version 0\n",
+            ),
+            (
+                "5",
+                "cpu_cores_count 0\nsimd_count 1216\nmax_waves_per_simd 8\ngfx_target_version 90402\n",
+            ),
+        ] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("properties"), properties)?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_gpu_node_count_reads_properties_and_skips_cpu_nodes() -> Result<()> {
+        // The count used the same phantom standalone file, so it saw zero GPUs
+        // on every real host and let the DRM card count stand in for it. Two
+        // CPU nodes and two GPU nodes, shaped like a live Instinct topology.
+        let (root, _) = temp_app_paths("kfd-node-count-properties");
+        let nodes = root.join("nodes");
+        for (node, properties) in [
+            ("0", "cpu_cores_count 56\ngfx_target_version 0\n"),
+            ("1", "cpu_cores_count 56\ngfx_target_version 0\n"),
+            ("5", "simd_count 1216\ngfx_target_version 90402\n"),
+            ("6", "simd_count 1216\ngfx_target_version 90402\n"),
+        ] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("properties"), properties)?;
+        }
+
+        let count = linux_kfd_gpu_node_count_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(count, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_properties_win_over_a_standalone_file() -> Result<()> {
+        // Both present: `properties` is what the kernel maintains, so it decides.
+        let (root, _) = temp_app_paths("kfd-topology-properties-precedence");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("0"))?;
+        fs::write(
+            nodes.join("0").join("properties"),
+            "gfx_target_version 90402\n",
+        )?;
+        fs::write(nodes.join("0").join("gfx_target_version"), "110000\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_bare_integer_node_order_is_numeric_not_lexical() -> Result<()> {
+        // Real KFD node directories are bare integers, and the only ordering that
+        // separates numeric from lexical sorting is a multi-digit one: `10` must
+        // not come before `2`. The other topology tests use single digits, which
+        // sort the same either way, so this is the case that pins the behaviour.
+        let (root, _) = temp_app_paths("kfd-topology-bare-integer-order");
+        let nodes = root.join("nodes");
+        for (node, version) in [("10", "110100\n"), ("2", "90402\n")] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                format!("gfx_target_version {version}"),
+            )?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        // Node 2 is the lowest-numbered GPU node, so it is the one HIP ordinal 0
+        // refers to.
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_property_value_reads_only_its_own_key() {
+        let body = "simd_count 1216\ngfx_target_version 90402\nnum_gws 64\n";
+        assert_eq!(
+            kfd_property_value(body, "gfx_target_version").as_deref(),
+            Some("90402")
+        );
+        assert_eq!(
+            kfd_property_value(body, "simd_count").as_deref(),
+            Some("1216")
+        );
+        // A key that only appears as a prefix of another must not match, and an
+        // absent key yields nothing rather than an empty string.
+        assert_eq!(kfd_property_value(body, "gfx_target"), None);
+        assert_eq!(kfd_property_value(body, "vram_size"), None);
     }
 
     #[test]
