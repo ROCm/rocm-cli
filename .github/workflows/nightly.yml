@@ -332,7 +332,8 @@ jobs:
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
-  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
+  # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
   # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
@@ -552,7 +553,8 @@ jobs:
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
-  # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
+  # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
@@ -645,8 +647,9 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
-  # setup aligned with ci.yml's proven Strix Windows job while opting into the
-  # same platform-adaptive @nightly large-model scenario as the Linux runner.
+  # setup aligned with e2e-selfhosted.yml's proven Strix Windows job while
+  # opting into the same platform-adaptive @nightly large-model scenario as the
+  # Linux runner.
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90

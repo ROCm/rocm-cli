@@ -1125,8 +1125,8 @@ async fn main() {
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
-    // per-engine canary covers them on the PR fast path); set by ci.yml on the
-    // `merge_group` event.
+    // per-engine canary covers them on the PR fast path); set by
+    // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",

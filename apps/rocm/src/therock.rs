@@ -5744,15 +5744,17 @@ mod tests {
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
         assert!(install_root.starts_with(&paths.data_dir));
         // Without --prefix the generated runtime folder is itself under the data dir, so
-        // the uv cache shares a filesystem with the environment it populates.
+        // the uv cache is reachable from the environment it populates without crossing a
+        // mount point.
         assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
     }
 
     #[test]
     fn uv_cache_does_not_follow_a_prefix_install_root() {
         // Documents a known gap rather than an intended behavior: `--prefix` relocates
-        // install_root only, while the uv cache stays keyed off the data dir. When the two
-        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // install_root only, while the uv cache stays keyed off the data dir. When reaching
+        // one from the other crosses a mount point uv falls back to copying — it is the
+        // mount, not the filesystem, so a bind mount is enough. Tracked separately; see
         // the `--prefix` non-goal on the PR that introduced the colocation.
         let (_root, paths) = test_paths("prefix-uv-cache");
         let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
