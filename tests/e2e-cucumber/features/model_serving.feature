@@ -196,10 +196,14 @@ Feature: Model serving
   # a single synthetic device on this non-APU host keeps the warning honest, while
   # the engine still launches against the real, free device. Runs on the vLLM GPU
   # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
-  # legitimately withhold the warning.
+  # legitimately withhold the warning. `--managed` serves under the GPU-required
+  # device policy, which refuses before it ever builds a plan unless a ROCm
+  # runtime is active — hence the same `a managed runtime is active` precondition
+  # every other real-serve scenario on this lane opens with.
   @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
   Scenario: serve-19 - A vLLM serve plan on a nearly-full GPU points at the memory knob
-    Given the selected GPU is reported nearly out of VRAM
+    Given a managed runtime is active
+    And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU
     Then the serve plan warns the GPU is low on VRAM
     And the serve plan explains how to lower vLLM's memory reservation

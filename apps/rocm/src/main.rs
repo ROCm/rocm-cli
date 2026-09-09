@@ -25877,10 +25877,14 @@ install therock";
 
     #[test]
     fn auto_selection_uses_vram_row_count_when_amd_smi_count_is_unknown() {
-        // A shared node without amd-smi: `detect_gpu_count()` is `None`, but the
-        // DRM sysfs fallback still populated per-GPU VRAM. Auto-selection must
-        // derive the device count from those rows and skip the busy GPU 0 rather
-        // than returning no selection (which would land the engine on GPU 0).
+        // `detect_gpu_count()` is `None` while VRAM telemetry is present. With
+        // *several* rows that is the amd-smi shape of the state -- `metric`
+        // answered while `list` did not -- not the DRM sysfs fallback, which
+        // withholds telemetry entirely once a second AMD card is found and so
+        // can never produce more than one row (`read_drm_vram_usage`). Either
+        // way auto-selection must derive the count from the rows and skip the
+        // busy GPU 0 rather than returning no selection (which would land the
+        // engine on GPU 0).
         let usage = [
             vram(0, 182_000, 192_000),
             vram(1, 1_000, 192_000),
@@ -25889,7 +25893,15 @@ install therock";
         assert_eq!(
             select_auto_gpu_index(None, &[], Some(&usage)),
             vec![1],
-            "with no amd-smi count, rank the sysfs VRAM rows and pick the first idle GPU"
+            "with no amd-smi count, rank the reported VRAM rows and pick the first idle GPU"
+        );
+        // The state the DRM sysfs fallback can actually reach: exactly one row.
+        // It is still ranked (and still selected) rather than discarded for
+        // being a single device.
+        assert_eq!(
+            select_auto_gpu_index(None, &[], Some(&[vram(0, 1_000, 192_000)])),
+            vec![0],
+            "the single row the sysfs fallback can emit must still be selectable"
         );
         // Still nothing to go on when neither the count nor telemetry is present.
         assert_eq!(
