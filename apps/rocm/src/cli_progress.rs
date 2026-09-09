@@ -195,7 +195,10 @@ impl AnimatedSpinner {
 
     /// Repaint with a byte-progress label. See [`Spinner::set_progress`].
     pub(crate) fn set_progress(&self, prefix: &str, bytes: u64, total: Option<u64>) {
-        self.inner.lock().unwrap().set_progress(prefix, bytes, total);
+        self.inner
+            .lock()
+            .unwrap()
+            .set_progress(prefix, bytes, total);
     }
 }
 
@@ -342,7 +345,8 @@ mod tests {
 
     #[test]
     fn animated_spinner_keeps_ticking_without_progress_calls() {
-        let spinner = AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
+        let spinner =
+            AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
         thread::sleep(Duration::from_millis(60));
         let idx = spinner.inner.lock().unwrap().idx;
         assert!(
