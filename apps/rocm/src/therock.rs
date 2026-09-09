@@ -1096,12 +1096,11 @@ fn install_tarball_runtime(
     }
 
     let download_label = format!("Downloading {}…", artifact.file_name);
-    let mut spinner = crate::cli_progress::Spinner::new(download_label.clone());
-    spinner.tick();
+    let spinner = crate::cli_progress::AnimatedSpinner::start(download_label.clone());
     let download_result = download_file(&artifact.url, &cache_path, &mut |bytes, total| {
         spinner.set_progress(&download_label, bytes, total);
     });
-    spinner.clear();
+    drop(spinner);
     download_result?;
     extract_tarball_and_discard_archive(&cache_path, &install_root)?;
 

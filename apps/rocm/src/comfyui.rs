@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::cli_progress::Spinner;
+use crate::cli_progress::AnimatedSpinner;
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -1298,8 +1298,7 @@ fn download_and_extract_source(
     } else {
         writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
         let download_label = "Fetching ComfyUI source archive…";
-        let mut spinner = Spinner::new(download_label);
-        spinner.tick();
+        let spinner = AnimatedSpinner::start(download_label);
         let download_result = download_file(
             COMFYUI_SOURCE_ARCHIVE_URL,
             &archive_path,
@@ -1307,7 +1306,7 @@ fn download_and_extract_source(
                 spinner.set_progress(download_label, bytes, total);
             },
         );
-        spinner.clear();
+        drop(spinner);
         download_result?;
     }
     let extract_root = app_root

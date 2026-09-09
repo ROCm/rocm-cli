@@ -8,6 +8,9 @@
 //! printing a final summary to — never sees control characters.
 
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossterm::QueueableCommand;
@@ -21,6 +24,10 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 /// a fast local link would otherwise flood the terminal with far more
 /// repaints per second than a human can perceive.
 const MIN_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often [`AnimatedSpinner`]'s background thread repaints while idle, so
+/// a stalled transfer still visibly animates instead of looking hung.
+const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A carriage-return status indicator written to stderr. Disabled (a no-op) when
 /// stderr is not a TTY, so piped/redirected output never receives control
@@ -89,10 +96,19 @@ impl Spinner {
             return;
         }
         let frame = SPINNER_FRAMES[self.idx % SPINNER_FRAMES.len()];
+        let mut line = format!("{frame} {}", self.label);
+        if let Ok((cols, _)) = crossterm::terminal::size() {
+            // A line that fits exactly at `cols` still wraps on some terminals
+            // once the cursor lands in the last column, and `Clear::CurrentLine`
+            // on the next repaint can only erase the row the cursor ends up on
+            // — not a wrapped-over first row. Leaving one column of slack keeps
+            // every repaint confined to a single row.
+            line = truncate_to_width(&line, cols.saturating_sub(1) as usize);
+        }
         let mut err = std::io::stderr();
         let _ = err.queue(MoveToColumn(0));
         let _ = err.queue(Clear(ClearType::CurrentLine));
-        let _ = write!(err, "{frame} {}", self.label);
+        let _ = write!(err, "{line}");
         let _ = err.flush();
         self.active = true;
     }
@@ -106,6 +122,78 @@ impl Spinner {
             let _ = err.flush();
             self.active = false;
         }
+    }
+}
+
+/// Truncates `line` (by character count) to fit within `max_width` columns,
+/// appending an ellipsis when it doesn't already fit, so a repaint can never
+/// wrap to a second terminal row.
+fn truncate_to_width(line: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if line.chars().count() <= max_width {
+        return line.to_owned();
+    }
+    let keep = max_width.saturating_sub(1);
+    let mut truncated: String = line.chars().take(keep).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// A [`Spinner`] kept animating by a background thread, for callers whose
+/// progress signal can go quiet for long stretches — a stalled download's
+/// `on_progress` callback only fires when bytes actually arrive, unlike
+/// `serve`'s HTTP-polling wait loop, which already ticks on every iteration
+/// regardless of readiness. Clears the line and stops the thread on drop.
+pub(crate) struct AnimatedSpinner {
+    inner: Arc<Mutex<Spinner>>,
+    stop: Arc<AtomicBool>,
+    ticker: Option<JoinHandle<()>>,
+}
+
+impl AnimatedSpinner {
+    pub(crate) fn start(label: impl Into<String>) -> Self {
+        Self::start_with_interval(label, IDLE_TICK_INTERVAL)
+    }
+
+    fn start_with_interval(label: impl Into<String>, interval: Duration) -> Self {
+        let inner = Arc::new(Mutex::new(Spinner::new(label)));
+        inner.lock().unwrap().tick();
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let inner = Arc::clone(&inner);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(interval);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    inner.lock().unwrap().tick();
+                }
+            })
+        };
+        Self {
+            inner,
+            stop,
+            ticker: Some(ticker),
+        }
+    }
+
+    /// Repaint with a byte-progress label. See [`Spinner::set_progress`].
+    pub(crate) fn set_progress(&self, prefix: &str, bytes: u64, total: Option<u64>) {
+        self.inner.lock().unwrap().set_progress(prefix, bytes, total);
+    }
+}
+
+impl Drop for AnimatedSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(ticker) = self.ticker.take() {
+            let _ = ticker.join();
+        }
+        self.inner.lock().unwrap().clear();
     }
 }
 
@@ -188,6 +276,38 @@ mod tests {
             spinner.label.contains("900"),
             "progress must not regress after a retry: {}",
             spinner.label
+        );
+    }
+
+    #[test]
+    fn truncate_to_width_leaves_short_lines_untouched() {
+        assert_eq!(truncate_to_width("⠋ short", 40), "⠋ short");
+        assert_eq!(truncate_to_width("⠋ exact", 7), "⠋ exact");
+    }
+
+    #[test]
+    fn truncate_to_width_ellipsizes_overlong_lines() {
+        let truncated = truncate_to_width("⠋ a very long download progress line", 10);
+        assert_eq!(truncated.chars().count(), 10);
+        assert!(
+            truncated.ends_with('…'),
+            "overlong line must end with an ellipsis marker: {truncated}"
+        );
+    }
+
+    #[test]
+    fn truncate_to_width_handles_zero_width() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn animated_spinner_keeps_ticking_without_progress_calls() {
+        let spinner = AnimatedSpinner::start_with_interval("Downloading…", Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(60));
+        let idx = spinner.inner.lock().unwrap().idx;
+        assert!(
+            idx >= 3,
+            "the background ticker must keep advancing frames on its own: idx={idx}"
         );
     }
 }
