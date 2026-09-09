@@ -575,11 +575,15 @@ fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
     if score <= 0 {
         return zero("fix-4-render-group", "User missing render/video group");
     }
+    // `stat -c %G` prints the literal "UNKNOWN" when the device GID has no
+    // matching group name (common in containers). Treat that the same as an
+    // empty value and fall back to the render group, so the suggested command
+    // never names a group that does not exist.
     let kfd_group = e
         .kfd
         .as_ref()
         .map(|k| k.owner_group.clone())
-        .filter(|g| !g.is_empty())
+        .filter(|g| !g.is_empty() && !g.eq_ignore_ascii_case("UNKNOWN"))
         .unwrap_or_else(|| "render".to_owned());
     let fix = Fix {
         summary: format!("Add the current user to '{kfd_group}' (and 'video' for safety) and log out/in."),
@@ -1602,6 +1606,42 @@ mod tests {
         let top = &report.matched[0];
         assert_eq!(top.id, "fix-4-render-group");
         assert_eq!(top.score, 60); // 35 render + 25 kfd
+    }
+
+    #[test]
+    fn unknown_kfd_group_falls_back_to_render() {
+        // `stat -c %G /dev/kfd` prints "UNKNOWN" when the GID has no group
+        // name. That value must not leak into the remediation command, which
+        // would otherwise suggest `usermod -a -G UNKNOWN,video` -- a group that
+        // does not exist. Fall back to the render group instead. Exercise both
+        // casings so the case-insensitive guard cannot silently regress to an
+        // exact-match check while this test stays green.
+        for sentinel in ["UNKNOWN", "unknown"] {
+            let mut e = linux_base();
+            e.in_render_group = Some(false);
+            e.kfd = Some(Device {
+                path: "/dev/kfd".to_owned(),
+                exists: true,
+                mode: "crw-rw----".to_owned(),
+                owner_group: sentinel.to_owned(),
+                user_can_write: Some(false),
+                ..Device::default()
+            });
+            let report = diagnose(&e, "");
+            let top = &report.matched[0];
+            assert_eq!(top.id, "fix-4-render-group");
+            let fix = top.fix.as_ref().expect("fix-4 carries a fix");
+            assert_eq!(
+                fix.commands,
+                vec!["sudo usermod -a -G render,video \"$USER\"".to_owned()],
+                "{sentinel} group must fall back to render, not leak into the command"
+            );
+            assert!(
+                !fix.summary.to_uppercase().contains("UNKNOWN"),
+                "summary must not name the bogus {sentinel} group:\n{}",
+                fix.summary
+            );
+        }
     }
 
     #[test]

@@ -818,13 +818,27 @@ async fn given_unnameable_device_group(world: &mut E2eWorld) {
 
 #[given("the GPU device belongs to a recognised non-default group")]
 async fn given_non_default_device_group(world: &mut E2eWorld) {
-    // Any real group on this machine other than the one the fix recipe assumes.
+    // A real group on this machine other than the one the fix recipe assumes.
     // `video` is excluded too: the remedy adds it alongside, so using it would
     // make the two sides agree by coincidence.
-    let group = crate::machine_group_names()
+    //
+    // Prefer a group a device node plausibly belongs to, so the situation reads
+    // as one a machine really presents rather than as an arbitrary substitution;
+    // `/etc/group`'s own order would otherwise hand this `root` or `daemon`.
+    // Any other group still satisfies the premise — what the scenario needs is a
+    // group the machine names and the recipe does not assume — so an unusual
+    // host falls back to the first such entry rather than failing.
+    let names = crate::machine_group_names();
+    let usable = |name: &String| name != DEFAULT_DEVICE_GROUP && name != "video";
+    let group = ["kvm", "input", "disk", "dialout", "plugdev", "users"]
         .into_iter()
-        .find(|name| name != DEFAULT_DEVICE_GROUP && name != "video")
+        .find_map(|preferred| names.iter().find(|name| name.as_str() == preferred).cloned())
+        .or_else(|| names.iter().find(|name| usable(name)).cloned())
         .expect("this machine names no group other than the default");
+    assert!(
+        usable(&group),
+        "picked {group:?} as the non-default device group, which the remedy adds anyway"
+    );
     world.path_override = Some(crate::stat_shim_path(
         world,
         GPU_DEVICE,
@@ -922,7 +936,7 @@ async fn assert_named_groups_exist(world: &mut E2eWorld) {
     );
 }
 
-#[then("adding the user to a device group is not the leading remedy")]
+#[then("adding the user to a device group is not offered as a cause")]
 async fn assert_no_device_group_remedy(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     let report: serde_json::Value =
@@ -942,6 +956,12 @@ async fn assert_no_device_group_remedy(world: &mut E2eWorld) {
     // point of doing so. With access already demonstrated, repairing permissions
     // is not a cause of anything, and offering it sends the user to change their
     // group membership for no reason.
+    //
+    // Deliberately "not offered" rather than "not ranked first": the check adds
+    // score for missing membership and never subtracts for demonstrated access,
+    // so a fix that only demoted this cause below the others would leave the
+    // user still told to change their groups. Scoring it zero is the outcome
+    // this asks for, and the step says so in those words.
     assert_eq!(
         score, 0,
         "the device is readable and writable, yet the diagnosis still offers \

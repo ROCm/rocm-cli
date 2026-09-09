@@ -862,10 +862,12 @@ fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
 
 fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
     let Some(idx) = opts.device_index else {
+        // Print-only path: without an index the fix only prints the query that
+        // helps the user identify N, so it succeeds like any other preview.
         println!(
             "Run `rocminfo | grep -E 'Agent |Marketing|gfx'` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
         );
-        return 3;
+        return 0;
     };
     let Some(rc_file) = shell_rc_file() else {
         println!("Could not determine your home directory.");
@@ -907,6 +909,8 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
 
 fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     let Some(idx) = opts.device_index else {
+        // Print-only path: without an index the fix only prints the query that
+        // helps the user identify N, so it succeeds like any other preview.
         println!("Run the following to identify the discrete GPU's index:");
         println!(
             "  & \"$env:HIP_PATH\\bin\\hipInfo.exe\" | Select-String \"device#|Name|gcnArchName\""
@@ -914,7 +918,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "Then re-run with --device-index N (the iGPU is typically device# 0; the dGPU is usually device# 1)."
         );
-        return 3;
+        return 0;
     };
     let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User");
     if !existing.is_empty() {
@@ -988,6 +992,11 @@ fn newest_rocm_install_dir() -> String {
 mod tests {
     use super::*;
 
+    // Serializes tests that replace the process-global `ROCM_PATH` env var while
+    // they run. Because env is shared across all test threads, two such tests
+    // running concurrently can otherwise see each other's value mid-test.
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Plant a directory the shared resolver will accept as a ROCm install.
     /// `bin/rocminfo` is one of the markers it gates on; a bare directory is
     /// deliberately not enough.
@@ -1004,6 +1013,9 @@ mod tests {
         // outright, so it returned nothing here no matter what was planted.
         // Going through the shared resolver is what makes this pass -- and is
         // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-resolver-{}-{:?}",
             std::process::id(),
@@ -1038,6 +1050,9 @@ mod tests {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
         // marker.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
@@ -1124,6 +1139,25 @@ mod tests {
         };
         let code = apply("fix-2-unset-override", &opts);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn fix_9_without_device_index_is_print_only_and_returns_zero() {
+        // Regression: the missing `--device-index` branch only prints the
+        // query that identifies the dGPU, so it is a print-only preview and
+        // must return 0 -- not the environment/OS code 3. A dry-run without the
+        // argument must likewise succeed, since the runner never mutates.
+        for dry_run in [false, true] {
+            let opts = FixOptions {
+                dry_run,
+                ..FixOptions::default()
+            };
+            let code = apply("fix-9-igpu-dgpu", &opts);
+            assert_eq!(
+                code, 0,
+                "fix-9 without --device-index (dry_run={dry_run}) must be a print-only success"
+            );
+        }
     }
 
     #[test]
