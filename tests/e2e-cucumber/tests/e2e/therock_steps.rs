@@ -11,6 +11,16 @@
 //! what makes "the canonical stream is still canonical" and "the next stream is
 //! only reached when explicitly pinned" assertable: a dispatch regression
 //! resolves the *other* fixture instead of failing to resolve anything.
+//!
+//! One scenario (`therock-next-06`) is not part of that hermetic pattern: it
+//! installs for real, against the live `stable.repo.amd.com`, on a
+//! self-hosted GPU runner, with no `--family` override at all. The fixture
+//! scenarios above prove dispatch and refusal logic on wiring the CLI already
+//! has for a *supplied* exact arch; this one proves the exact arch itself can
+//! come from `resolve_family`'s existing host-probe auto-detection
+//! (`detect_host_gfx_target`) rather than requiring the user to already know
+//! and type their raw GFX code, and that a real install with that
+//! auto-detected arch actually completes.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -477,5 +487,132 @@ async fn failure_names_the_exact_arch_flag(world: &mut E2eWorld) {
     assert!(
         reported.contains(&format!("--family {RAW_ARCH}")),
         "the refusal did not name the flag that fixes it:\n{reported}"
+    );
+}
+
+/// The default (un-overridden) ROCm 10 preview pip index base. Matches
+/// `THEROCK_NEXT_RELEASE_PIP_INDEX_BASE` in `apps/rocm/src/therock.rs`.
+const DEFAULT_NEXT_RELEASE_PIP_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
+
+/// The newest `rocm` version the live ROCm 10 preview source actually
+/// publishes right now, discovered at run time rather than hardcoded: the
+/// preview source is a moving target, and a version this scenario doesn't
+/// control would go stale the moment a newer one is published.
+async fn discover_latest_next_rocm_version() -> String {
+    let url = format!("{DEFAULT_NEXT_RELEASE_PIP_BASE}/rocm/");
+    let html = reqwest::get(&url)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to fetch the ROCm 10 preview pip index at {url}: {error}")
+        })
+        .text()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to read the ROCm 10 preview pip index body from {url}: {error}")
+        });
+    let mut versions = Vec::new();
+    let marker = "rocm-";
+    let mut rest = html.as_str();
+    while let Some(start) = rest.find(marker) {
+        let after = &rest[start + marker.len()..];
+        // The `rocm` aggregate meta-package publishes as an sdist (`.tar.gz`),
+        // not a wheel (confirmed live) — check both suffixes, whichever comes
+        // first, same as the CLI's own `parse_simple_index_version_candidate`.
+        let end = match (after.find(".tar.gz"), after.find(".whl")) {
+            (Some(tar), Some(whl)) => Some(tar.min(whl)),
+            (Some(tar), None) => Some(tar),
+            (None, Some(whl)) => Some(whl),
+            (None, None) => None,
+        };
+        let Some(end) = end else {
+            // No recognized suffix after this "rocm-": advance past just the
+            // marker itself (not the whole rest of the page) so the next
+            // search still finds a later real "rocm-" occurrence instead of
+            // skipping the page outright.
+            rest = &after[1.min(after.len())..];
+            continue;
+        };
+        // A wheel's stem is `rocm-<version>-<python tag>-...`; only the sdist
+        // form's `end` names the version directly, so drop anything past the
+        // first remaining `-` for the wheel case.
+        let candidate = &after[..end];
+        let version = candidate.split('-').next().unwrap_or(candidate);
+        versions.push(version.to_owned());
+        rest = &after[end..];
+    }
+    versions.sort_by(|left, right| compare_dotted_versions(left, right));
+    versions
+        .into_iter()
+        .next_back()
+        .unwrap_or_else(|| panic!("no `rocm-*` package versions were found at {url}:\n{html}"))
+}
+
+/// Loose dotted-version comparison good enough to pick "the newest" out of a
+/// live index: numeric components first, falling back to plain string order
+/// for anything a simple `x.y.z` split doesn't cover (e.g. a `+local` suffix).
+fn compare_dotted_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    fn numeric_prefix(value: &str) -> Vec<u64> {
+        value
+            .split(['.', '+'])
+            .map_while(|part| part.parse().ok())
+            .collect()
+    }
+    numeric_prefix(left)
+        .cmp(&numeric_prefix(right))
+        .then_with(|| left.cmp(right))
+}
+
+#[when("the user installs the SDK from the ROCm 10 preview source with no family override")]
+async fn user_installs_sdk_from_next_source_auto_detected(world: &mut E2eWorld) {
+    let version = discover_latest_next_rocm_version().await;
+    // No `--family`: this is the whole point of the scenario. `resolve_family`
+    // falls back to `detect_host_gfx_target()` when nothing overrides it, so
+    // the runner's real GPU is what picks the exact arch the next layout needs.
+    let args = [
+        "install",
+        "sdk",
+        "--channel",
+        "release",
+        "--format",
+        "wheel",
+        "--version",
+        &version,
+    ];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the install used the ROCm 10 preview source")]
+async fn assert_install_used_next_source(world: &mut E2eWorld) {
+    assert_contains(
+        world,
+        "source_layout_generation: next-v1",
+        "next layout generation",
+    );
+    assert_contains(
+        world,
+        &format!("canonical_source: {DEFAULT_NEXT_RELEASE_PIP_BASE}"),
+        "live next source",
+    );
+}
+
+#[then("the install requested the device extras for this host's detected GPU")]
+async fn assert_install_used_detected_device_target(world: &mut E2eWorld) {
+    let (examine_stdout, _, _) = crate::run_rocm(world, &["examine"]);
+    let detected = examine_stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("detected_gfx_target: "))
+        .unwrap_or_else(|| {
+            panic!("host reported no detected_gfx_target, so auto-detection had nothing to sniff:\n{examine_stdout}")
+        });
+    assert_contains(
+        world,
+        &format!("device_target: {detected}"),
+        "install did not target this host's auto-detected GPU",
     );
 }

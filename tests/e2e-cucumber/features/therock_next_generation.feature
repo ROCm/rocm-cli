@@ -69,3 +69,21 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user previews a tarball SDK install for family gfx120X-all pinned to ROCm 10.0.0
     Then the install fails
     And the failure asks for an exact GPU arch and names --family gfx1200
+
+  # Not hermetic like the scenarios above: this one installs for real, against
+  # the live stable.repo.amd.com, on a self-hosted GPU runner, with no
+  # --family override at all. `resolve_family` already falls back to
+  # `detect_host_gfx_target()` when nothing overrides it, so a pinned ROCm 10
+  # install should resolve the runner's real GPU into the exact arch the next
+  # layout needs without the user ever typing a raw GFX code. The fixture
+  # scenarios above can't prove this: their fixtures serve a fixed gfx1200
+  # regardless of what GPU the runner actually has.
+  @id:therock-next-06-live-install-auto-detects-arch @requires-gpu @nightly
+  Scenario: therock-next-06 - Installing the SDK from the live ROCm 10 preview source auto-detects the exact arch
+    Given a machine with no CLI-managed runtimes
+    When the user installs the SDK from the ROCm 10 preview source with no family override
+    Then the install used the ROCm 10 preview source
+    And the install requested the device extras for this host's detected GPU
+    And a runtime is registered
+    And the runtime is set as active
+    And the runtime includes an inference engine
