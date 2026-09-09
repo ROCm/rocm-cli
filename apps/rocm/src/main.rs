@@ -29461,8 +29461,7 @@ ID_LIKE="suse opensuse"
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &with_previous);
         assert!(
-            rendered
-                .contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
         );
         assert!(
