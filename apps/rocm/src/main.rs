@@ -1236,9 +1236,26 @@ fn maybe_notice_legacy_uv_cache() {
     let _ = fs::write(&marker, b"");
 }
 
-/// Legacy `uv`-managed Python install location, used before it was colocated with the
-/// managed data directory. Kept relative so the check works on every platform's home dir.
-const LEGACY_UV_PYTHON_INSTALL_DIR_RELATIVE: [&str; 4] = [".local", "share", "uv", "python"];
+/// Where `uv` puts Python installs absent `UV_PYTHON_INSTALL_DIR`: a `python`
+/// subdirectory of its persistent data dir (`$XDG_DATA_HOME/uv`, else
+/// `$HOME/.local/share/uv` on Unix; `%APPDATA%\uv\data` on Windows — uv does not use
+/// `%USERPROFILE%\.local\share`).
+fn legacy_uv_python_install_dir() -> Option<PathBuf> {
+    if rocm_core::runtime_is_windows() {
+        let appdata = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty())?;
+        return Some(appdata.join("uv").join("data").join("python"));
+    }
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|value| !value.as_os_str().is_empty())
+    {
+        return Some(xdg_data_home.join("uv").join("python"));
+    }
+    let home = rocm_core::runtime_home_dir()?;
+    Some(home.join(".local").join("share").join("uv").join("python"))
+}
 
 /// One-shot notice that pre-colocation `uv`-managed Python interpreters are still
 /// occupying space at the default `uv` location. Nothing is migrated or deleted: removing
@@ -1257,12 +1274,9 @@ fn maybe_notice_legacy_uv_python_install_dir() {
     if !install_dir.path().is_dir() {
         return;
     }
-    let Some(home) = rocm_core::runtime_home_dir() else {
+    let Some(legacy) = legacy_uv_python_install_dir() else {
         return;
     };
-    let legacy = LEGACY_UV_PYTHON_INSTALL_DIR_RELATIVE
-        .iter()
-        .fold(home, |dir, part| dir.join(part));
     if !legacy.is_dir() {
         return;
     }

@@ -56,7 +56,7 @@ separately.
 Likewise, the standalone Python interpreters that `uv python install`
 downloads do **not** follow `--prefix` either. They live at
 `<data-dir>\uv-python` rather than `uv`'s own default of
-`%USERPROFILE%\.local\share\uv\python\` (or `$HOME/.local/share/uv/python/` on
+`%APPDATA%\uv\data\python\` on Windows (or `$HOME/.local/share/uv/python/` on
 Linux/macOS); override with `ROCM_CLI_UV_PYTHON_INSTALL_DIR` if you need it on
 the prefix filesystem instead.
 
