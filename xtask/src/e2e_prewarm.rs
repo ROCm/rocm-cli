@@ -822,6 +822,8 @@ registered ROCm runtimes
   registry: /w/e2e-prewarm/data/runtimes/registry
   marker: /w/e2e-prewarm/data/runtimes/active.json
   installed:
+    legend: * = active, - = rollback target
+
     adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=unusable (pip runtime manifest is missing rocm_sdk probe data)
       install_root: /opt/external-rocm
     release-wheel-gfx94x-dcgpu-7-15-0 runtime_id=therock-release-gfx94x-dcgpu version=7.15.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (pip runtime manifest is missing rocm_sdk probe data)
@@ -859,6 +861,8 @@ registered ROCm runtimes
   marker: /w/e2e-prewarm/data/runtimes/active.json
   active_status: missing manifest for active_runtime_key=release-wheel-gfx94x-dcgpu-7-14-0
   installed:
+    legend: * = active, - = rollback target
+
     adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
       install_root: /opt/external-rocm
     release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable

@@ -8,11 +8,12 @@ name: E2E self-hosted
 # with their OWN concurrency group — means an offline runner can only ever stall
 # THIS workflow's supersession, never the required checks in ci.yml.
 #
-# These lanes are non-blocking (continue-on-error). NOTE: their check names
-# (`E2E tests (GPU)` etc.) are still in main's required-status-check list, so
-# while a runner is offline they report as missing and can still block a merge;
-# fully closing that requires removing them from the required list (a separate
-# branch-protection change, out of scope for this workflow).
+# These lanes are non-blocking (continue-on-error), and as of 2026-09 their
+# check names do not gate a merge either: PRs #334, #335 and #343 all landed
+# while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the merge_group
+# ref, which a required check under ALLGREEN would have blocked. Renaming a lane
+# is therefore safe. (Branch protection is not readable without admin, so this is
+# inferred from those merges rather than read from the required list.)
 
 on:
   push:
@@ -133,9 +134,13 @@ jobs:
         run: echo "forced=true" >> "$GITHUB_OUTPUT"
 
   e2e-gpu:
-    name: E2E tests (GPU)
+    name: E2E tests (MI300X)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, amd-gpu]
+    # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
+    # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
+    # on gfx1151 — red on the WSL host, and (worse) a silent pass published as
+    # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
+    runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself and is continue-on-error; ci.yml's required
@@ -326,7 +331,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
-  # by the `strix-halo` label (app-dev-gpu carries `amd-gpu`, not `strix-halo`).
+  # by the `strix-halo` label. These hosts carry `amd-gpu` as well — it marks any
+  # AMD GPU runner, so it never distinguishes one architecture from another.
   # Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)

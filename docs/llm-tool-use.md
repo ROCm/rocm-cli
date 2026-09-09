@@ -27,8 +27,14 @@ rocm-cli local assistants use structured tools, not shell commands.
   general serving engines; the assistant may inspect or manage them for model
   serving, but it should not switch its own built-in chat engine away from
   Lemonade.
-- On native Windows, vLLM live serving/install checks are skipped. The assistant
-  should direct those requests to WSL/Linux and should not suggest CPU fallback.
+- The assistant prompt is grounded in the host. rocm-cli detects the operating
+  system (including WSL), the AMD GPU and its `gfx` target, and which serving
+  engines run there, and appends those facts to the system prompt on every chat
+  surface. Platform statements belong in that block, not in the static prompt: a
+  claim such as "on native Windows, vLLM live checks are skipped" is true only
+  on native Windows, and asserting it unconditionally misinformed WSL users,
+  where vLLM is the supported path. The assistant should answer platform
+  questions from the injected facts and must never suggest CPU fallback.
 
 This follows the same shape described by current tool-use docs: the application
 defines tool schemas, the model requests a tool, the application executes the
