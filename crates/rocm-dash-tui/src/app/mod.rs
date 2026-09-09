@@ -469,7 +469,9 @@ pub enum UpdateStatus {
     Unknown,
     NoManagedRuntimes,
     UpToDate,
-    UpdateAvailable { latest_version: String },
+    UpdateAvailable {
+        latest_version: String,
+    },
     Error,
 }
 
@@ -1644,12 +1646,17 @@ fn open_overlay_for_focus(
 /// Reduce a parsed `rocm update --json` document's `runtimes` array into an
 /// [`UpdateStatus`]. Empty ⇒ nothing managed to check; any update-available
 /// row wins over up-to-date/error rows (the tile surfaces the most actionable
-/// state); an all-error result (no runtime resolved) ⇒ `Error`.
+/// state); otherwise `UpToDate` only if every row resolved cleanly — a mixed
+/// result (some rows errored, some unrecognized) can't honestly assert
+/// freshness for the runtimes that didn't resolve, so it's `Error` too.
 fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
     fn status_of(row: &serde_json::Value) -> Option<&str> {
         row.get("status").and_then(serde_json::Value::as_str)
     }
-    let Some(runtimes) = document.get("runtimes").and_then(serde_json::Value::as_array) else {
+    let Some(runtimes) = document
+        .get("runtimes")
+        .and_then(serde_json::Value::as_array)
+    else {
         return UpdateStatus::Error;
     };
     if runtimes.is_empty() {
@@ -1657,16 +1664,22 @@ fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
     }
     if let Some(latest_version) = runtimes.iter().find_map(|row| {
         (status_of(row) == Some("update_available"))
-            .then(|| row.get("latest_version").and_then(serde_json::Value::as_str))
+            .then(|| {
+                row.get("latest_version")
+                    .and_then(serde_json::Value::as_str)
+            })
             .flatten()
             .map(str::to_owned)
     }) {
         return UpdateStatus::UpdateAvailable { latest_version };
     }
-    if runtimes.iter().all(|row| status_of(row) == Some("error")) {
-        return UpdateStatus::Error;
+    if runtimes
+        .iter()
+        .all(|row| matches!(status_of(row), Some("up_to_date" | "ahead_of_index")))
+    {
+        return UpdateStatus::UpToDate;
     }
-    UpdateStatus::UpToDate
+    UpdateStatus::Error
 }
 
 /// Spawn/consume the periodic `home-update-check` job that backs the Home
@@ -1702,11 +1715,13 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
         return Vec::new();
     }
 
-    let fx = state.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
-        id: HOME_UPDATE_CHECK_JOB_ID.to_owned(),
-        cmd: crate::ui::exec::resolve_exe(),
-        args: vec!["update".to_owned(), "--json".to_owned()],
-    });
+    let fx = state
+        .jobs
+        .apply(rocm_dash_core::state::StateEvent::StartJob {
+            id: HOME_UPDATE_CHECK_JOB_ID.to_owned(),
+            cmd: crate::ui::exec::resolve_exe(),
+            args: vec!["update".to_owned(), "--json".to_owned()],
+        });
     if !fx.is_empty() {
         state.update_status_pending = true;
     }
@@ -6928,7 +6943,10 @@ mod tests {
 
         // Still pending, job still running (non-terminal) → no-op, no second spawn.
         let fx2 = refresh_update_status(&mut s);
-        assert!(fx2.is_empty(), "no duplicate spawn while pending and running");
+        assert!(
+            fx2.is_empty(),
+            "no duplicate spawn while pending and running"
+        );
         assert!(s.update_status_pending);
         assert_eq!(s.update_status, UpdateStatus::Unknown);
     }
@@ -7005,5 +7023,37 @@ mod tests {
         assert!(fx.is_empty());
         assert!(!s.update_status_pending);
         assert_eq!(s.update_status, UpdateStatus::Error);
+    }
+
+    #[test]
+    fn reduce_update_json_all_up_to_date_or_ahead_is_up_to_date() {
+        let doc = serde_json::json!({
+            "runtimes": [
+                {"status": "up_to_date"},
+                {"status": "ahead_of_index"},
+            ]
+        });
+        assert_eq!(reduce_update_json(&doc), UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn reduce_update_json_mixed_up_to_date_and_error_is_error_not_up_to_date() {
+        // One runtime resolved cleanly, one didn't — asserting "Up to date"
+        // here would be a false claim about the runtime that errored.
+        let doc = serde_json::json!({
+            "runtimes": [
+                {"status": "up_to_date"},
+                {"status": "error", "message": "boom"},
+            ]
+        });
+        assert_eq!(reduce_update_json(&doc), UpdateStatus::Error);
+    }
+
+    #[test]
+    fn reduce_update_json_unrecognized_status_is_error() {
+        let doc = serde_json::json!({
+            "runtimes": [{"status": "something_new"}]
+        });
+        assert_eq!(reduce_update_json(&doc), UpdateStatus::Error);
     }
 }
