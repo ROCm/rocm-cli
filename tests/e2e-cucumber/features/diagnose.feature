@@ -140,3 +140,25 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI which fixes it offers
     Then every fix the catalog documents is listed
     And only the fixes the CLI can carry out itself are marked as such
+
+  # This failure mode is reachable ONLY from the error text. The fact that
+  # decides it is the torch version inside the managed runtime, which the host
+  # examination does not read — so unlike every other entry there is no
+  # structural signal to fall back on, and a symptom that does not score is a
+  # symptom that gets the render-group false lead instead. That makes "the text
+  # scores" the whole behaviour, which is why it is asserted directly here.
+  #
+  # The assertion is that the entry CLEARS the report's own threshold, not that
+  # it ranks first: a runner with a real fault of its own (a blacklisted amdgpu)
+  # legitimately scores higher for any symptom, so a ranking assertion would be
+  # a test of the runner's health. Clearing the threshold comes from the keyword
+  # alone and holds on every host.
+  #
+  # @requires-os:linux because the checker is registered linux-only, and
+  # @requires-bare-metal because WSL2 does not run the catalog at all — the two
+  # are not interchangeable, WSL2 reports an os_family of linux.
+  @id:diagnose-recognises-the-engine-import-failure @requires-bare-metal @requires-os:linux
+  Scenario: diagnose-13 - A vLLM engine-startup import failure is recognised from its error text
+    Given a user who hit the vLLM engine-startup import failure
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the CLI reports the engine-startup import failure as an established cause

@@ -364,6 +364,37 @@ const RECIPES: &[FixRecipe] = &[
         applies_on: WINDOWS_ONLY,
         runner: None,
     },
+    // The number is a stable handle, not a position: `fix-16` is reserved by the
+    // vLLM out-of-memory entry on its own branch, so this one takes 17 rather
+    // than colliding and forcing whichever lands second to rename a published id.
+    FixRecipe {
+        fix_id: "fix-17-torch-dlpack",
+        title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
+        rationale: "vLLM's engine start aborts at import time when torch-c-dlpack-ext loads its CUDA prebuilt on a ROCm torch: it picks the variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant. tvm_ffi imports it as OPTIONAL but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so the optional import kills the process. Both defects are upstream; nothing here is misconfigured. What you can change locally is the torch version: outside the 2.4-2.9 range there is no prebuilt to load, the extension raises the handled ImportError, and tvm_ffi falls back to its JIT path with a warning.",
+        auto_applicable: false,
+        commands: &[
+            "# Confirm the trigger first, against the ENGINE's interpreter rather than",
+            "# the one on your PATH -- only the engine's torch decides this failure.",
+            "rocm engines shell vllm",
+            "# ...and run the next two INSIDE the shell it opens:",
+            "python -c \"import torch; print(torch.__version__, torch.version.hip)\"",
+            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\"",
+            "# Applies ONLY when torch.version.hip is set, torch.__version__ is in the",
+            "# 2.4-2.9 range, and torch-c-dlpack-ext is installed. If any of the three",
+            "# does not hold, this is not the failure you are looking at.",
+            "rocm engines install vllm --reinstall",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts",
+        notes: &[
+            "Running vLLM on ROCm is not by itself a reason to apply this. torch-c-dlpack-ext arrives as a transitive dependency of tilelang, which vLLM pins, and it only misbehaves on the torch versions it ships prebuilts for.",
+            "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
+        ],
+        applies_on: LINUX_ONLY,
+        runner: None,
+    },
 ];
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
@@ -459,7 +490,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
-            // does not line up with the catalog's `fix-1 … fix-15` either, so a
+            // does not line up with the catalog's `fix-N` names either, so a
             // bare "unknown id" left them with nothing to correct.
             eprintln!(
                 "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
@@ -1076,7 +1107,7 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        assert_eq!(count, 15, "expected 15 catalog entries");
+        assert_eq!(count, 16, "expected 16 catalog entries");
     }
 
     #[test]

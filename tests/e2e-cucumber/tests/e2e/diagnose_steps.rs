@@ -16,6 +16,16 @@ use crate::E2eWorld;
 /// so scenarios assert the shape of a match, not the id.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
+/// The error text a vLLM engine-startup import failure leaves behind, as a user
+/// would paste it. `libtorch_cuda.so` is the token that carries it: a ROCm build
+/// of torch ships `libtorch_hip.so` and never that file, so it scores on its own
+/// without needing the rest of the traceback.
+const ENGINE_IMPORT_SYMPTOM: &str =
+    "vllm engine fails to start: OSError: libtorch_cuda.so: cannot open shared object file";
+
+/// The catalog entry [`ENGINE_IMPORT_SYMPTOM`] must reach.
+const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
+
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
 /// recipes gate on host state (e.g. `$USER`) and return non-zero even for a
@@ -57,6 +67,10 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
+    // Not a typo, and not a hole to fill: `fix-16` is reserved by the vLLM
+    // out-of-memory entry on its own branch. The number is a stable handle, so
+    // the two are kept distinct rather than renamed after the fact.
+    "fix-17-torch-dlpack",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -115,6 +129,11 @@ async fn user_hit_known_failure(world: &mut E2eWorld) {
 #[given("a user who hit a failure the CLI does not recognise")]
 async fn user_hit_unknown_failure(world: &mut E2eWorld) {
     world.model_name = Some("xyzzy totally unrelated gibberish".to_string());
+}
+
+#[given("a user who hit the vLLM engine-startup import failure")]
+async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
 }
 
 #[given("a user who has chosen a known fix")]
@@ -320,6 +339,41 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some(),
         "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+#[then("the CLI reports the engine-startup import failure as an established cause")]
+async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    // Read the bar out of the document rather than restating 50: the report
+    // publishes it so callers need not hardcode it, and a test that hardcodes it
+    // is not exercising that.
+    let threshold = report
+        .get("min_score_for_match")
+        .and_then(serde_json::Value::as_i64)
+        .expect("diagnose JSON must publish its match threshold");
+    let score = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array")
+        .iter()
+        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(ENGINE_IMPORT_FIX_ID))
+        .and_then(|d| d.get("score"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| {
+            panic!("the catalog did not recognise the engine-startup import failure:\n{output}")
+        });
+    // Below the bar the entry is presented among the sub-threshold noise it was
+    // added to outrank, which is the state the report was in before it existed.
+    assert!(
+        score >= threshold,
+        "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
+         of {threshold}, so it is not an established cause:\n{output}"
     );
 }
 
