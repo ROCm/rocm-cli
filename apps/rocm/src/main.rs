@@ -9194,6 +9194,7 @@ fn adopt_runtime_from_probe(
         // Adoption does not install torch, so the build is derived from the SDK
         // version instead.
         sdk_torch: None,
+        wheel_composition: None,
         read_only: true,
         imported_from: Some(install_root),
         installed_at_unix_ms: rocm_core::unix_time_millis(),
@@ -15821,7 +15822,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15840,6 +15841,7 @@ fn apply_runtime_update(
         therock::runtime_version_display(&plan.latest_version)
     );
     let _ = writeln!(output, "  status: {}", plan.status);
+    let _ = writeln!(output, "  target_runtime_key: {}", plan.target_runtime_key);
     let _ = writeln!(output, "  activate_after_install: {activate}");
     if !plan.update_available {
         let _ = writeln!(output, "  result: no newer runtime found");
@@ -15848,13 +15850,12 @@ fn apply_runtime_update(
 
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
-        let install_plan = therock::install_sdk(
+        let install_plan = therock::install_sdk_for_update(
             paths,
             &source.channel,
             &source.format,
-            None,
-            None,
-            None,
+            &source.family,
+            plan.device_target.as_deref(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15864,18 +15865,26 @@ fn apply_runtime_update(
         return Ok(output);
     }
 
-    let install_output = therock::install_sdk(
+    let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
         &source.format,
-        None,
-        None,
-        None,
+        &source.family,
+        plan.device_target.as_deref(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
-    let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
-        .context("updated runtime install completed but the new runtime manifest was not found")?;
+    // By exact key, never by version: a same-version repair installs a sibling
+    // that shares the source's channel, format, family AND version, so a
+    // version match would just as happily return the stale runtime this update
+    // was meant to replace, and then activate it.
+    let installed = select_installed_update_runtime(&manifests_after, &plan.target_runtime_key)
+        .with_context(|| {
+            format!(
+                "runtime install completed but no manifest was written for the planned runtime key `{}`",
+                plan.target_runtime_key
+            )
+        })?;
     let _ = writeln!(output, "  installed_runtime_key: {}", installed.runtime_key);
     let _ = writeln!(
         output,
@@ -15940,15 +15949,11 @@ fn select_runtime_update_source<'a>(
 
 fn select_installed_update_runtime<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
-    source: &therock::InstalledRuntimeManifest,
-    latest_version: &str,
+    target_runtime_key: &str,
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests.iter().find(|manifest| {
-        manifest.channel == source.channel
-            && manifest.format == source.format
-            && manifest.family == source.family
-            && manifest.version == latest_version
-    })
+    manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key == target_runtime_key)
 }
 
 pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
@@ -30018,32 +30023,40 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn installed_update_runtime_matches_latest_version_and_family() {
-        let mut source = test_runtime_manifest_for_update(
-            "old-gfx120",
+    fn installed_update_runtime_is_selected_by_exact_target_key() {
+        // Everything a version match would have keyed on is identical here:
+        // same channel, format, family and version. Only the composition-keyed
+        // runtime key tells the freshly installed repair apart from the stale
+        // runtime it was installed to replace.
+        let stale = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.13.0a20260416",
+            "7.14.0",
         );
-        source.channel = "release".to_owned();
         let wrong_family = test_runtime_manifest_for_update(
-            "new-gfx110",
+            "release-wheel-multi-arch-7-14-0-ffffffffffffffff",
             "therock-release:gfx110X-all",
             "gfx110X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let target = test_runtime_manifest_for_update(
-            "new-gfx120",
+        let repaired = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0-0123456789abcdef",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let manifests = vec![wrong_family, target.clone()];
+        let manifests = vec![stale, wrong_family, repaired.clone()];
 
-        let selected = select_installed_update_runtime(&manifests, &source, "7.14.0a20260531")
-            .expect("matching updated runtime should be selected");
+        let selected = select_installed_update_runtime(&manifests, &repaired.runtime_key)
+            .expect("the side-by-side repair must be selected by its exact key");
+        assert_eq!(selected.runtime_key, repaired.runtime_key);
 
-        assert_eq!(selected.runtime_key, target.runtime_key);
+        assert!(
+            select_installed_update_runtime(&manifests, "release-wheel-multi-arch-7-15-0")
+                .is_none(),
+            "an install that wrote no manifest for the planned key must not resolve to a sibling"
+        );
     }
 
     fn write_test_pip_runtime(
@@ -30117,6 +30130,7 @@ ID_LIKE="suse opensuse"
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -30156,6 +30170,7 @@ ID_LIKE="suse opensuse"
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 1,

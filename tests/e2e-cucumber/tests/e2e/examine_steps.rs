@@ -6,7 +6,11 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+/// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
+///
+/// Shared with `runtime_steps`, which reads the same shape out of the `install
+/// sdk` preview.
+pub(crate) fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
     output.lines().find_map(|line| {
         let (name, value) = line.trim().split_once(':')?;
         (name == field).then(|| value.trim())
@@ -17,8 +21,8 @@ fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
 async fn setup_gpu_machine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
-        stdout.contains("AMD GPU detected") || stdout.contains("detected_gfx_target"),
-        "no AMD GPU detected on this machine:\n{stdout}"
+        field_value(&stdout, "detected_gfx_target").is_some_and(|target| target.starts_with("gfx")),
+        "no AMD GPU target detected on this machine:\n{stdout}"
     );
 }
 
