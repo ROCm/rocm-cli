@@ -101,7 +101,7 @@ Feature: Chat and endpoint detection
   # reaches the model unaltered apart from the newline the shell appends —
   # indentation is meaningful to a model and must not be trimmed away.
   @id:chat-cli-stdin-prompt
-  Scenario: chat-08 - The chat CLI reads a one-shot prompt from stdin
+  Scenario: chat-09 - The chat CLI reads a one-shot prompt from stdin
     Given a model is being served
     And the model is registered with the CLI
     When the user pipes a one-shot chat prompt through the CLI
