@@ -6445,6 +6445,9 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             println!(
                 "  note: running services keep their recorded runtime until they are restarted"
             );
+            if result.previous_runtime_key.is_some() {
+                println!("{ROLLBACK_RECOVERY_HINT}");
+            }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
             record_cli_audit_event(
@@ -15762,6 +15765,13 @@ fn apply_runtime_update(
     Ok(output)
 }
 
+/// Shown after any activation (direct `runtimes activate` or `update --apply
+/// --activate`) that recorded a previous runtime, so both paths that reach
+/// this state give the same advice — see `RuntimesCommand::Activate` in
+/// `runtimes()` for the other call site.
+const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
+(no history — undoes only this one activation)";
+
 /// Appends the `--activate` branch of the `update --apply` summary. The
 /// rollback hint is only shown when a previous runtime was actually recorded —
 /// `rocm runtimes rollback` hard-errors otherwise (no prior runtime to return
@@ -15786,11 +15796,7 @@ fn append_update_activate_summary(output: &mut String, activation: &RuntimeActiv
         "  note: running services keep their recorded runtime until they are restarted"
     );
     if activation.previous_runtime_key.is_some() {
-        let _ = writeln!(
-            output,
-            "  next step: if this update causes problems, run `rocm runtimes rollback` \
-(undoes only this one activation)"
-        );
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
     }
 }
 
@@ -29455,9 +29461,8 @@ ID_LIKE="suse opensuse"
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &with_previous);
         assert!(
-            rendered.contains(
-                "next step: if this update causes problems, run `rocm runtimes rollback`"
-            ),
+            rendered
+                .contains("next step: if this causes problems, run `rocm runtimes rollback`"),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
         );
         assert!(

@@ -192,6 +192,11 @@ async fn active_changed_from_nothing(world: &mut E2eWorld) {
         out.contains("changed_from_runtime_key: <unset>"),
         "expected no previous runtime, got:\n{out}"
     );
+    assert!(
+        !out.contains("rocm runtimes rollback"),
+        "no previous runtime is recorded, so rollback would hard-error; \
+         must not hint at a command that immediately fails:\n{out}"
+    );
 }
 
 #[then("that runtime becomes active having changed from the first")]
@@ -204,6 +209,11 @@ async fn active_changed_from_first(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("changed_from_runtime_key: {FIRST_KEY}")),
         "expected previous runtime {FIRST_KEY}, got:\n{out}"
+    );
+    assert!(
+        out.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+        "a previous runtime is recorded, so the built binary should hint at rollback as a \
+         recovery path, got:\n{out}"
     );
 }
 
