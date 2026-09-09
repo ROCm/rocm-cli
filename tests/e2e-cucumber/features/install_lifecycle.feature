@@ -112,6 +112,20 @@ Feature: Release install lifecycle
     Then the installed interactive chat exits successfully
     And the installed config still selects the vllm default engine
 
+  # EAI-8014: uninstall used to report success while a server it manages kept
+  # serving and holding the GPU, then delete the very tooling (`rocm services
+  # stop`, the service records) needed to stop it.
+  @id:lifecycle-linux-uninstall-stops-managed-server @lifecycle @requires-os:linux
+  Scenario: Linux - uninstall stops the local server it manages
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And a local server this machine manages is running
+    When the user uninstalls from the installed binary
+    Then the removal is reported as complete
+    And the local server this machine manages is no longer running
+
   @id:lifecycle-linux-uninstall-full-purge @lifecycle @requires-os:linux
   Scenario: Linux - uninstall removes binaries, manifest, and XDG state
     Given a freshly built release tree

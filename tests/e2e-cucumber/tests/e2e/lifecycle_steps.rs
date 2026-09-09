@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cucumber::{given, then, when};
+use e2e_cucumber::mock_server::{ServiceRecordOptions, write_service_record_with};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
@@ -54,10 +55,20 @@ pub struct LifecycleState {
     smoke_config: Option<PathBuf>,
     smoke_data: Option<PathBuf>,
     smoke_cache: Option<PathBuf>,
+    /// A stand-in for a local server this machine manages, planted with a
+    /// service record so uninstall must stop it. Killed on `Drop` if a scenario
+    /// fails before uninstall reaches it, so no scenario leaks a process.
+    managed_server: Option<std::process::Child>,
 }
 
 impl Drop for LifecycleState {
     fn drop(&mut self) {
+        // Never leak the managed-server stand-in, even when a scenario fails
+        // before uninstall would have stopped it.
+        if let Some(mut server) = self.managed_server.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
         // Restore the machine user PATH if a scenario mutated it, even on panic.
         #[cfg(windows)]
         if let Some(previous) = self.captured_user_path.take() {
@@ -385,6 +396,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_config: None,
         smoke_data: None,
         smoke_cache: None,
+        managed_server: None,
     });
 }
 
@@ -456,6 +468,41 @@ fn seed_isolated_dirs(world: &mut E2eWorld) {
     st.smoke_config = Some(config);
     st.smoke_data = Some(data);
     st.smoke_cache = Some(cache);
+}
+
+/// Start a local server this machine manages: a real long-lived child process
+/// plus the on-disk service record `rocm serve --managed` would leave behind,
+/// planted in the isolated data dir the installed binary reads.
+///
+/// Black-box on purpose — a process the CLI can find only through its record,
+/// exactly as a real managed vLLM server appears to `rocm uninstall`. The record
+/// carries no start-time token (the legacy shape), so the CLI's verified
+/// termination treats it as a best-effort match and stops it.
+#[given("a local server this machine manages is running")]
+async fn given_managed_server_running(world: &mut E2eWorld) {
+    let services_dir = state(world)
+        .smoke_data
+        .as_ref()
+        .expect("isolated data dir must be seeded before planting a service record")
+        .join("services");
+    let server = Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("failed to start the managed server stand-in");
+    write_service_record_with(
+        &services_dir,
+        "amd/test-model",
+        // Nothing listens here: the CLI's readiness probe fails, so liveness
+        // falls through to the recorded process — which is alive.
+        59_999,
+        ServiceRecordOptions {
+            status: "ready",
+            startup_phase: None,
+            supervisor_pid: server.id(),
+            engine_pid: Some(server.id()),
+        },
+    );
+    state_mut(world).managed_server = Some(server);
 }
 
 // ── When: package ──────────────────────────────────────────────────────
@@ -1185,6 +1232,46 @@ async fn then_examine_isolated(world: &mut E2eWorld) {
             "examine referenced the real user rocm dir {real}:\n{out}"
         );
     }
+}
+
+#[then("the removal is reported as complete")]
+async fn then_removal_complete(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("uninstall complete"),
+        "uninstall did not report completion:\n{out}"
+    );
+}
+
+#[then("the local server this machine manages is no longer running")]
+async fn then_managed_server_stopped(world: &mut E2eWorld) {
+    let mut server = state_mut(world)
+        .managed_server
+        .take()
+        .expect("no managed server was started");
+    // The stand-in is our own child, so its exit is observable directly rather
+    // than through a PID probe that a zombie would answer wrongly. Uninstall
+    // waits out its own bounded stop grace, so allow for that before failing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let exited = loop {
+        match server
+            .try_wait()
+            .expect("failed to poll the managed server")
+        {
+            Some(_) => break true,
+            None if std::time::Instant::now() >= deadline => break false,
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    if !exited {
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+    let out = &state(world).last_output;
+    assert!(
+        exited,
+        "uninstall reported success while the server it manages kept running:\n{out}"
+    );
 }
 
 #[then("uninstall reports skipping the running executable on Windows")]
