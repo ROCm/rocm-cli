@@ -32,7 +32,7 @@ separate tier flag or tag filter to maintain.
 | Job | Workflow | Platform | Runner labels |
 |---|---|---|---|
 | `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
-| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, amd-gpu]` |
+| `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo, native]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
@@ -42,6 +42,14 @@ The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
 hardcoded `/home/ubuntu/actions-runner` paths exist only on the native one. The
 WSL lane pins `wsl` for the same reason, from the other side.
+
+Every label in a `runs-on` must narrow the pool to one kind of hardware. In
+particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
+carried by every AMD GPU runner, Strix Halo included, so it selects a
+mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
+`xtask/src/workflow_contract.rs` enforces this, because the failure is quiet —
+the lane simply passes on the wrong GPU and reports under the label it was
+named for.
 
 `e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
@@ -142,28 +150,55 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 ## The shared pre-warmed runtime
 
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
-pre-warmed managed runtime (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
+pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace and survives `git clean`.
+lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
+package layout cannot poison the cache consumed by code that only understands the
+previous layout.
 
-It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
+The tree may hold **more than one** runtime — the pre-warm installs a newer one
+side by side when the channel index publishes it (below) — so scenarios must not
+rely on the CLI auto-selecting a runtime, which it deliberately declines to do
+once two are installed. Each scenario keeps its own config dir, so the pre-warm's
+`--activate` is invisible to it; the precondition steps re-activate from the
+tree's own `active.json`, which lives inside the shared tree and is therefore
+visible through the symlink. Without that, a serve fails with `no active ROCm
+runtime is configured` while the precondition still passes.
+
+It is a **cache with invalidation and repair**, not a one-shot install. Each
+self-hosted lane calls:
 
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
 
-before the suite, which asks `rocm update` whether the channel index has published
-a newer version and then:
+before the suite. `rocm update` compares both the channel version and the wheel
+composition recorded in the runtime manifest (source-layout generation and exact
+pinned package specs, including the `device-<target>` payload). A deterministic
+composition fingerprint is part of each wheel runtime key, so a corrected
+composition is installed beside — never over — the old environment. Each report
+line also carries `target=<key>`: the runtime key an apply from that line would
+produce, which on a superseded manifest is its already-installed replacement.
+Pre-warm then:
 
 - installs the SDK when nothing is present for that channel;
-- installs the newer runtime **side-by-side** and activates it
+- installs a newer runtime **side-by-side** and activates it
   (`rocm update --apply --runtime <key> --activate`) when the index is ahead;
+- replaces a same-version runtime side-by-side when its manifest has an older or
+  missing wheel composition, then activates the composition-keyed replacement;
+- treats that repair as complete while the matching replacement remains installed,
+  so retained legacy manifests do not trigger repeated repairs or notifications;
+- activates the runtime a reuse actually means — after a repair that is the
+  replacement named by `target=`, not the superseded manifest the line belongs to;
+- ensures the default engine is installed even when the runtime itself is reused;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
-  (a pinned build newer than the index must not be rolled back), or when freshness
+  (a pinned build newer than the index must not be rolled back and cannot be
+  reproduced from the index, so it is never offered a repair), or when freshness
   cannot be established at all — an unreachable index reuses and warns rather than
   re-downloading gigabytes or failing the lane;
-- prunes with `rocm storage remove-old-installs` after any install or update, so
-  the multi-version cache stays bounded.
+- prunes with `rocm storage remove-old-installs` after any install, update, or
+  repair, so the multi-version cache stays bounded.
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every

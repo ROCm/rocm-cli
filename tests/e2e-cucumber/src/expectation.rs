@@ -25,10 +25,10 @@ const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
-const REQUIRES_ROOT_TAG: &str = "requires-root";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -56,6 +56,10 @@ pub enum Expectation {
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
+    /// `@requires-gfx-target`: the scenario needs a detected chip name but does
+    /// not access the GPU. This permits resolver dry-runs on WSL before GPU
+    /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
+    pub requires_gfx_target: bool,
     /// `@requires-no-gpu`: the scenario's premise is a host with NO usable AMD GPU
     /// (e.g. a GPU-required serve must fail fast). Skipped on any host that has a
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
@@ -83,15 +87,6 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
-    /// `@requires-root`: the scenario's premise is a process running as root
-    /// (effective UID 0), so it is skipped where the test process is not root.
-    /// Needed by the driver-install-as-root contract (EAI-8053): the fix is
-    /// uid-aware (prepend `sudo` only when NOT root), so the "no `sudo` prefix"
-    /// contract only holds where the runner is actually root. None of the four
-    /// `expectations.toml` condition keys can express "running as root", so — like
-    /// `@requires-wsl` — this is a tag, not a row, keeping the xfail row honest on
-    /// non-root lanes (they SKIP rather than falsely PASS).
-    pub requires_root: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -127,10 +122,10 @@ impl ScenarioDecl {
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_gpu = false;
+        let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
-        let mut requires_root = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -152,14 +147,14 @@ impl ScenarioDecl {
                 serve_timeout_secs = rest.parse::<u64>().ok();
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == REQUIRES_GFX_TARGET_TAG {
+                requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
                 requires_no_gpu = true;
             } else if tag == REQUIRES_BARE_METAL_TAG {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
-            } else if tag == REQUIRES_ROOT_TAG {
-                requires_root = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -171,10 +166,10 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
+            requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
-            requires_root,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -331,6 +326,19 @@ impl Expectation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedScenario {
     pub id: String,
+    /// The `Feature:` this scenario belongs to. Recorded here because a SKIPPED
+    /// scenario never reaches `report.json`, so the report has no other way to
+    /// place it under its feature in the grouped grid.
+    ///
+    /// No `#[serde(default)]` here: this struct only derives `Serialize`, so a
+    /// deserialization attribute would be dead. Backward compatibility for
+    /// artifacts written before these fields existed lives entirely on the
+    /// consuming side — `ManifestExpectation` in the `e2e-report` crate.
+    pub feature: String,
+    /// The scenario's own name (`<key>-<NN> - <description>`). Carries the
+    /// per-feature index the report sorts rows by, and gives skipped scenarios a
+    /// human label they'd otherwise lack.
+    pub scenario: String,
     pub effective_engine: String,
     /// "pass" | "xfail" | "skip".
     pub expected: String,
@@ -343,7 +351,13 @@ pub struct ResolvedScenario {
 }
 
 impl ResolvedScenario {
-    pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
+    pub fn new(
+        id: &str,
+        feature: &str,
+        scenario: &str,
+        effective_engine: &str,
+        expectation: &Expectation,
+    ) -> Self {
         let (bug, reason, flaky) = match expectation {
             Expectation::ExpectXfail { bug, reason, flaky } => {
                 (Some(bug.clone()), Some(reason.clone()), *flaky)
@@ -353,6 +367,8 @@ impl ResolvedScenario {
         };
         Self {
             id: id.to_owned(),
+            feature: feature.to_owned(),
+            scenario: scenario.to_owned(),
             effective_engine: effective_engine.to_owned(),
             expected: expectation.label().to_owned(),
             bug,
@@ -377,8 +393,8 @@ pub struct PlatformManifest<'a> {
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-gpu`
 ///    scenario on a host with no AMD GPU, a `@requires-bare-metal` scenario on
-///    WSL2, a `@requires-root` scenario off root, a `@requires-os:<os>` scenario
-///    on a different OS, or a scenario whose effective engine can't start.
+///    WSL2, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
+///    effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
@@ -419,6 +435,11 @@ pub fn resolve(
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
         };
     }
+    if decl.requires_gfx_target && cap.gfx_target.is_none() {
+        return Expectation::Skip {
+            reason: "requires a detected AMD GFX target; none detected on this host".to_owned(),
+        };
+    }
     if decl.requires_no_gpu && cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires a host with no AMD GPU; this host has one".to_owned(),
@@ -432,11 +453,6 @@ pub fn resolve(
     if decl.requires_wsl && !cap.is_wsl {
         return Expectation::Skip {
             reason: "requires WSL; this host is not running under WSL".to_owned(),
-        };
-    }
-    if decl.requires_root && !cap.is_root {
-        return Expectation::Skip {
-            reason: "requires the runner to be root; this process is not root".to_owned(),
         };
     }
     if let Some(os) = &decl.requires_os
@@ -519,7 +535,6 @@ mod tests {
             "mi300x" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: false,
-                is_root: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -529,7 +544,6 @@ mod tests {
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: false,
-                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -539,7 +553,6 @@ mod tests {
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
                 is_wsl: false,
-                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -553,7 +566,6 @@ mod tests {
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
-                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -566,7 +578,6 @@ mod tests {
             "wsl" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
-                is_root: false,
                 gfx_target: None,
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -578,29 +589,15 @@ mod tests {
             "wsl-no-passthrough" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
-                is_root: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
             },
-            // A no-GPU host running as root — the mock CI lane's shape, where the
-            // driver-install sudo-prefix contract (EAI-8053) has a premise.
-            "mock-root" => HostCapability {
-                os_family: "linux".into(),
-                is_wsl: false,
-                is_root: true,
-                gfx_target: None,
-                has_amd_gpu: false,
-                available_engines: vec!["lemonade".into(), "vllm".into()],
-                effective_serve_engine: "lemonade".into(),
-                platform_slug: "mock".into(),
-            },
             _ => HostCapability {
                 os_family: "other".into(),
                 is_wsl: false,
-                is_root: false,
                 gfx_target: None,
                 has_amd_gpu: false,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
@@ -661,23 +658,23 @@ serve_timeout_secs = 90
     }
 
     #[test]
-    fn root_tag_parses_and_gates_on_root() {
-        // Parses in both shapes; absent by default so no existing scenario changes.
-        assert!(decl(&["id:x", "requires-root"]).requires_root);
-        assert!(decl(&["@id:x", "@requires-root"]).requires_root);
-        assert!(!decl(&["id:x", "requires-gpu"]).requires_root);
+    fn detected_target_requirement_does_not_require_gpu_passthrough() {
+        let matrix = Expectations::default();
+        let scenario = decl(&["id:resolver-preview", "requires-gfx-target"]);
 
-        let m = Expectations::default();
-        let d = decl(&["id:driver-root", "requires-os:linux", "requires-root"]);
-        // Root host: the premise holds, so it resolves (here, expected-pass with
-        // an empty matrix — an xfail row is layered on separately).
         assert_eq!(
-            resolve(&d, &cap("mock-root"), &m, false, false, false),
+            resolve(
+                &scenario,
+                &cap("wsl-no-passthrough"),
+                &matrix,
+                false,
+                false,
+                false,
+            ),
             Expectation::ExpectPass
         );
-        // Non-root host: skipped, so a `when = {}` xfail row can't XPASS there.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(&scenario, &cap("mock"), &matrix, false, false, false,),
             Expectation::Skip { .. }
         ));
     }
@@ -916,7 +913,7 @@ reason = "unrelated open bug"
     #[test]
     fn vllm_pinned_scenario_skips_where_vllm_cannot_start() {
         let m = Expectations::default();
-        // Scenario 5-style: pins vLLM.
+        // The feature-qualified `serve-vllm-inference` scenario pins vLLM.
         let d = decl(&[
             "id:serve-vllm-inference",
             "requires-gpu",

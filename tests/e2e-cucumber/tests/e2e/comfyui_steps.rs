@@ -54,9 +54,14 @@ fn active_runtime_python(world: &E2eWorld) -> PathBuf {
     })
 }
 
-/// Depth-limited search for a `bin/python` (Unix) or `Scripts/python.exe`
-/// (Windows) under `root`. The managed runtime keeps its interpreter a few levels
-/// down; cap the walk so a pathological tree can't hang the scenario.
+/// Locate a `bin/python` (Unix) or `Scripts/python.exe` (Windows) under `root`.
+///
+/// The documented layout is probed FIRST: `root` itself is the initial frontier
+/// entry, so a managed runtime — whose interpreter is exactly `<install_root>/bin/
+/// python` — is found on the first iteration with no directory traversal at all.
+/// The breadth walk below is only a fallback for a tree that does not match, and
+/// is depth-capped so a pathological one cannot hang the scenario rather than
+/// being a cost the normal path pays.
 fn find_venv_python(root: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     let (bin, exe) = ("Scripts", "python.exe");
@@ -206,13 +211,35 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
 
 #[when("the user installs ComfyUI")]
 async fn user_installs_comfyui(world: &mut E2eWorld) {
-    // Do NOT use run_rocm_ok: the real install exits non-zero while still leaving
-    // the runtime damaged, so the exit code is not the contract (see the feature
-    // comment). Capture the outcome for diagnostics only.
+    // Capture the outcome rather than asserting here: the exit code is checked by
+    // its own Then step, so a failure is reported as that step failing rather than
+    // as a mid-scenario panic in the action.
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install"]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[then("the install succeeds")]
+async fn assert_install_succeeded(world: &mut E2eWorld) {
+    // The premise for every invariant below. `comfyui::install` bails early on
+    // several paths (no managed runtime, a runtime that isn't `ready`, a non-wheel
+    // format, a failed source download or `uv` acquisition); on any of those the
+    // runtime is TRIVIALLY unchanged and the torch/nvidia assertions would pass
+    // having exercised nothing. Since #298 the install exits 0 on the measured
+    // MI300X lane, so requiring that is what makes the rest evidence of anything.
+    let rc = world.cli_rc.expect("no ComfyUI install was run");
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["comfyui", "install"],
+            rc,
+            world.cli_output.as_deref().unwrap_or(""),
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
 }
 
 #[then("the runtime's torch is still a ROCm build")]

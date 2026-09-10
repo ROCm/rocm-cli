@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::metrics::Instance;
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 
@@ -81,6 +82,20 @@ pub const fn row_count() -> usize {
 pub fn choice_for(sel: usize) -> LauncherChoice {
     ROWS.get(sel)
         .map_or(LauncherChoice::OpenDashboard, |(_, _, _, c)| *c)
+}
+
+/// Move the selection cursor one step, wrapping around `row_count`.
+///
+/// `forward` selects the next row (Down/j/Right); otherwise the previous row
+/// (Up/k/Left). Pulled out of `run_launcher`'s event loop so the wrapping
+/// arithmetic is unit-testable without a real terminal.
+#[must_use]
+pub const fn move_selection(sel: usize, row_count: usize, forward: bool) -> usize {
+    if forward {
+        (sel + 1) % row_count
+    } else {
+        (sel + row_count - 1) % row_count
+    }
 }
 
 /// True when a model is actively serving (drives the running vs idle variant).
@@ -233,10 +248,25 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ move   Enter select   d dashboard   q quit",
+        "↑↓←→ move   Enter select   d dashboard   q quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the launcher's render state, seeding `instances` from the serving
+/// models the caller discovered in the managed-service registry.
+///
+/// Kept separate from the terminal loop so the seeding is unit-testable without
+/// a real terminal: an empty `serving` yields the idle front door, a non-empty
+/// one makes `is_running` report the running model.
+fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
+    let mut state = AppState::new(String::new(), theme_name.to_string());
+    state.instances = serving
+        .into_iter()
+        .map(|inst| (inst.container_id.clone(), inst))
+        .collect();
+    state
 }
 
 /// Run the launcher as a synchronous pre-dash screen.
@@ -245,12 +275,17 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// caller escalates into the existing dash entry points (ponytail: no parallel
 /// async loop here).
 ///
-/// Renders the idle variant from a fresh `AppState` (no live daemon is started
-/// just for the front door); live telemetry appears once the dash is opened.
+/// `serving` seeds the status strip / menu so the front door reflects the models
+/// the managed-service registry reports as running (the same authority
+/// `rocm services` reads) — without starting a live telemetry daemon just for the
+/// front door. Live GPU telemetry still appears once the dash is opened.
 ///
 /// # Errors
 /// Propagates terminal setup / event-read I/O errors.
-pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>> {
+pub fn run_launcher(
+    theme_name: &str,
+    serving: Vec<Instance>,
+) -> std::io::Result<Option<LauncherChoice>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -258,7 +293,7 @@ pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>>
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
-    let state = AppState::new(String::new(), theme_name.to_string());
+    let state = launcher_state(theme_name, serving);
     let theme = state.theme;
 
     enable_raw_mode()?;
@@ -280,9 +315,11 @@ pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>>
             KeyCode::Char('q') | KeyCode::Esc => break None,
             KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
             KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % row_count(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                sel = (sel + row_count() - 1) % row_count();
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                sel = move_selection(sel, row_count(), true);
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                sel = move_selection(sel, row_count(), false);
             }
             _ => {}
         }
@@ -398,6 +435,37 @@ mod tests {
     }
 
     #[test]
+    fn launcher_state_seeds_serving_from_registry_instances() {
+        // Regression: the front door built an empty AppState and always showed
+        // "Idle — nothing serving" even when a model was running. Seeding from
+        // the caller's registry-derived instances must make the launcher report
+        // the running model.
+        let serving = vec![Instance {
+            container_id: "vllm-ready".into(),
+            model_name: "Qwen2.5-0.5B".into(),
+            status: InstanceStatus::Ready,
+            port: Some(11435),
+            ..Default::default()
+        }];
+        let running = launcher_state("default-dark", serving);
+        assert!(
+            is_running(&running),
+            "seeded serving instance must make the launcher report running"
+        );
+        let out = render(&running, 0, 100, 24);
+        assert!(out.contains("Serving"), "serve line missing: {out:?}");
+        assert!(
+            out.contains("Qwen2.5-0.5B"),
+            "served model missing: {out:?}"
+        );
+        assert!(out.contains("11435"), "served port missing: {out:?}");
+
+        // With no serving instances the front door stays honestly idle.
+        let idle = launcher_state("default-dark", Vec::new());
+        assert!(!is_running(&idle), "empty seed must render idle");
+    }
+
+    #[test]
     fn choice_mapping_and_counts() {
         assert_eq!(row_count(), 5);
         // Row order: 0=Set up, 1=Serve, 2=Diagnose, 3=Chat, 4=Open dashboard.
@@ -410,6 +478,28 @@ mod tests {
         assert_eq!(ROWS[0].3, LauncherChoice::SetUp);
         assert_eq!(ROWS[1].1, "Serve a model");
         assert_eq!(ROWS[1].3, LauncherChoice::Serve);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        // Right must move the selection identically to Down, and Left
+        // identically to Up — `move_selection`'s `forward` flag is the only
+        // thing standing in for the aliased key, so compare it against the
+        // exact wrapping formulas the run_launcher match arms used to inline.
+        let rc = row_count();
+        let mut sel = 0usize;
+        for _ in 0..10 {
+            let via_right = move_selection(sel, rc, true);
+            let via_down = (sel + 1) % rc;
+            assert_eq!(via_right, via_down, "Right must match Down");
+            sel = via_right;
+        }
+        for _ in 0..10 {
+            let via_left = move_selection(sel, rc, false);
+            let via_up = (sel + rc - 1) % rc;
+            assert_eq!(via_left, via_up, "Left must match Up");
+            sel = via_left;
+        }
     }
 
     #[test]

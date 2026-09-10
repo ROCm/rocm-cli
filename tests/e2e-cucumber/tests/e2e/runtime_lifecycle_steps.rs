@@ -140,6 +140,12 @@ async fn rollback(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user lists the registered runtimes")]
+async fn list_runtimes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user uninstalls that runtime")]
 async fn uninstall(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
@@ -269,6 +275,33 @@ async fn import_succeeds(world: &mut E2eWorld) {
     assert!(
         out.contains("runtime imported"),
         "expected the replace import to succeed, got:\n{out}"
+    );
+}
+
+#[then("the listing explains the active and rollback markers")]
+async fn listing_explains_markers(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("legend: * = active, - = rollback target"),
+        "expected the marker legend, got:\n{out}"
+    );
+}
+
+#[then("the first runtime is marked active")]
+async fn first_marked_active(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(&format!("* {FIRST_KEY}")),
+        "expected {FIRST_KEY} marked active, got:\n{out}"
+    );
+}
+
+#[then("the second runtime is marked as the rollback target")]
+async fn second_marked_rollback(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(&format!("- {SECOND_KEY}")),
+        "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
     );
 }
 

@@ -74,6 +74,7 @@ pub(super) fn build_chat_agent(
                 Some(approval_tx),
             )
             .ok()
+            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         }
         ChatProvider::Anthropic => {
@@ -92,6 +93,7 @@ pub(super) fn build_chat_agent(
                 Some(approval_tx),
             )
             .ok()
+            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         }
     }
@@ -105,13 +107,20 @@ pub(super) fn build_chat_agent(
 /// no network I/O. Returns the [`AgentError`](crate::agent::AgentError) so the
 /// caller can either discard it (`.ok()` at startup) or surface it as an error
 /// turn (the rebuild drain).
+///
+/// `system_prompt` is the bin-composed, host-grounded prompt from
+/// `ResolvedArgs`; `None` (demo/replay/mock) keeps the agent's default preamble.
+/// Both call sites must pass it — the rebuild drain included, or accepting the
+/// detected local endpoint would silently drop the grounding mid-session.
 pub(super) fn build_local_agent(
     cfg: crate::llm::LlmConfig,
     params: crate::agent::InferenceParams,
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
     approval_tx: mpsc::UnboundedSender<ClientMsg>,
+    system_prompt: Option<String>,
 ) -> Result<std::sync::Arc<dyn crate::agent::AgentClient>, crate::agent::AgentError> {
     crate::agent::RigAgentClient::new(cfg, params, executor, Some(approval_tx))
+        .map(|c| c.with_preamble(system_prompt))
         .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
 }
 
