@@ -1006,14 +1006,68 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             );
         }
 
+        // The README's own lane lists were the one hand-copied hole in this
+        // otherwise derived net: the nightly sentence was asserted by literal
+        // string match against a copy in this test source, so both could go
+        // stale together while the guard stayed green — which is exactly what
+        // happened when the R9700 lane landed. Derive both from the YAML.
+        //
+        // Whitespace is normalized first because these are prose sentences and
+        // a table, wrapped for readability; the lane lists must survive a
+        // reflow that does not change what the doc says.
         let readme = std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/README.md"))
             .expect("read E2E README");
+        let readme_flat = normalized_whitespace(&readme);
+
+        let nightly = read_workflow("nightly.yml");
+        let nightly_lanes = self_hosted_e2e_jobs(&nightly);
         assert!(
-            normalized_whitespace(&readme).contains(
-                "The nightly workflow runs non-blocking jobs — MI300X, Radeon R9700, and Strix Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`"
-            ),
-            "E2E README must identify every nightly job platform"
+            !nightly_lanes.is_empty(),
+            "expected at least one self-hosted job in nightly.yml (extractor sanity check)"
         );
+        let nightly_ids: Vec<String> = nightly_lanes.iter().map(|(job, _)| job.clone()).collect();
+        assert_eq!(
+            backticked_list_between(&readme_flat, "as non-blocking lanes (", ") with"),
+            nightly_ids,
+            "the E2E README must name every nightly self-hosted lane, in workflow order"
+        );
+
+        // The README's CI job table is the per-PR view: the blocking mock job
+        // from ci.yml, then one row per self-hosted lane. Only the self-hosted
+        // rows are derivable, so the mock row is matched by workflow and the
+        // rest are compared against e2e-selfhosted.yml.
+        let readme_rows = markdown_table_rows(&readme, "| Job | Workflow | Platform | Blocking |");
+        let (mock_rows, self_hosted_rows): (Vec<_>, Vec<_>) = readme_rows
+            .into_iter()
+            .partition(|row| row.get(1).is_some_and(|workflow| workflow == "`ci.yml`"));
+        assert_eq!(
+            mock_rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            vec!["`e2e`".to_owned()],
+            "the README CI job table must carry exactly one blocking mock row"
+        );
+        assert_eq!(
+            self_hosted_rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            lanes
+                .iter()
+                .map(|(job, _)| format!("`{job}`"))
+                .collect::<Vec<_>>(),
+            "the README CI job table must have one row per self-hosted job in \
+             e2e-selfhosted.yml, in workflow order"
+        );
+        for row in &self_hosted_rows {
+            assert_eq!(
+                row[3], "no",
+                "self-hosted lane `{}` is continue-on-error, so the README must not \
+                 document it as blocking",
+                row[0]
+            );
+        }
     }
 
     #[test]
@@ -1074,6 +1128,28 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     fn nightly_prebuilt_e2e_lanes_enable_test_hooks() {
         let workflow = read_workflow("nightly.yml");
         assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
+    }
+
+    #[test]
+    fn gpu_prewarm_caches_are_namespaced_by_source_layout() {
+        // The shared tree survives `git clean` and every branch on the runner.
+        // A branch that composes runtimes under a new source layout would
+        // otherwise leave keys and manifests in that tree which code on the
+        // previous layout cannot read, poisoning the lanes it never touched.
+        for workflow_name in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let workflow = read_workflow(workflow_name);
+            assert!(
+                workflow.contains("e2e-prewarm-multi-arch-v2"),
+                "{workflow_name} must isolate the canonical multi-arch runtime tree"
+            );
+            assert!(
+                !workflow.lines().any(|line| {
+                    line.trim_end().ends_with("e2e-prewarm\"")
+                        || line.trim_end().ends_with("e2e-prewarm'")
+                }),
+                "{workflow_name} still uses the generation-agnostic pre-warm tree"
+            );
+        }
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the
