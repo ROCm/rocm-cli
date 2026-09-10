@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -1692,13 +1693,62 @@ fn write_restore_sequences<W: io::Write>(out: &mut W) -> io::Result<()> {
 /// pre-existing default disposition and avoiding truncating a mid-write child on
 /// the way out; and (2) `run_async`'s embedded-daemon socket is not unlinked
 /// here, but the daemon unlinks a stale socket on its next bind, so it self-heals.
+///
+/// More than one watcher can be live at once — bare `rocm` escalates from the
+/// hub into a dashboard session, so the hub's process-lifetime watcher and
+/// `run`'s session watcher coexist — and Tokio's signal registry is
+/// process-global: one `kill` notifies *every* subscriber regardless of which
+/// runtime registered it. Both watchers therefore wake on the same signal. The
+/// [`SHUTTING_DOWN`] latch arbitrates: only the first one through restores the
+/// terminal and exits, so two threads never race unsynchronised writes to
+/// stdout nor call `std::process::exit` concurrently. See [`await_termination`].
 pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle<()>> {
     let termination = TerminationSignals::register()?;
     Ok(tokio::spawn(async move {
-        let code = termination.recv().await;
+        let Some(code) = await_termination(termination, &SHUTTING_DOWN).await else {
+            // A sibling watcher already claimed the shutdown and is about to
+            // `exit`; this one must do nothing at all.
+            return;
+        };
         restore_terminal();
         std::process::exit(code);
     }))
+}
+
+/// Process-global "some watcher has claimed the termination path" latch.
+///
+/// Deliberately process-global rather than threaded through `ResolvedArgs`: the
+/// hazard is two watchers on two *runtimes*, and a path-independent latch covers
+/// every call site (present and future) without each one having to know whether
+/// an outer watcher already exists.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Claim the single-shot shutdown path on `latch`. Returns `true` exactly once —
+/// for whichever caller wins the swap — and `false` for every caller after it.
+///
+/// `SeqCst` because correctness here is "exactly one winner across threads", not
+/// ordering of surrounding data; the stronger ordering costs nothing on a path
+/// that runs at most once per process.
+///
+/// Parameterised over the latch (rather than reading [`SHUTTING_DOWN`] directly)
+/// so tests can drive a fresh latch and stay order-independent — the process
+/// global cannot be reset once a test has set it.
+fn claim_shutdown(latch: &AtomicBool) -> bool {
+    !latch.swap(true, Ordering::SeqCst)
+}
+
+/// Park until a termination signal arrives, then arbitrate on `latch`.
+///
+/// Returns `Some(128 + signo)` for the single watcher that wins the latch — that
+/// caller must restore the terminal and exit with the code — and `None` for any
+/// other watcher woken by the same process-global signal delivery.
+///
+/// Split out of [`spawn_termination_watcher`]'s task body so a test can drive the
+/// whole register → receive → arbitrate path in-process; the body itself ends in
+/// `std::process::exit` and can never be unit-tested.
+async fn await_termination(termination: TerminationSignals, latch: &AtomicBool) -> Option<i32> {
+    let code = termination.recv().await;
+    claim_shutdown(latch).then_some(code)
 }
 
 /// Termination-signal listeners, registered up front so a signal that arrives
@@ -3663,13 +3713,143 @@ mod tests {
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
     }
 
+    /// Serialises every test that touches the process-global signal machinery.
+    ///
+    /// The two lanes differ: Linux CI runs `cargo nextest` (one process per
+    /// test, so this lock is a no-op), while the required Windows lane runs
+    /// `cargo test`, which runs the whole binary's tests as THREADS IN ONE
+    /// PROCESS. There, `termination_watcher_parks_until_aborted` has a live
+    /// watcher whose body ends in `std::process::exit`; if the self-`kill` test
+    /// below ran concurrently, that watcher would wake on the other test's
+    /// signal and take the entire test binary down with exit 143. It would also
+    /// steal the signal the other test is asserting on. Holding this lock for
+    /// the whole of each test — including the runtime's `block_on` — makes the
+    /// two strictly sequential.
+    ///
+    /// The tests are written as plain `#[test]` + an explicit runtime (rather
+    /// than `#[tokio::test]`) precisely so the guard is held across `block_on`
+    /// without holding a `std` lock across an `.await`.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A current-thread runtime with the signal driver enabled, which
+    /// `TerminationSignals::register` needs.
+    fn signal_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building a current-thread runtime for the signal tests")
+    }
+
     #[test]
-    fn signal_exit_codes_follow_shell_convention() {
-        // The signal-handler task exits with the conventional 128 + signo code so
-        // a supervisor sees the right termination reason. SIGINT is signal 2,
-        // SIGTERM is signal 15.
-        assert_eq!(EXIT_CODE_SIGINT, 128 + 2);
-        assert_eq!(EXIT_CODE_SIGTERM, 128 + 15);
+    fn only_the_first_caller_claims_the_shutdown_latch() {
+        // The guard that stops the hub's process-lifetime watcher and a
+        // session's watcher from both restoring the terminal and both calling
+        // `process::exit` on one signal. Driven on a local latch so the test
+        // never touches (or depends on the state of) the process global.
+        let latch = AtomicBool::new(false);
+        assert!(claim_shutdown(&latch), "the first claim must win");
+        assert!(!claim_shutdown(&latch), "a second claim must lose");
+        assert!(!claim_shutdown(&latch), "and so must every later one");
+
+        // Under contention there must still be exactly one winner: a
+        // non-atomic read-then-write would let several threads through.
+        let contended = AtomicBool::new(false);
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    if claim_shutdown(&contended) {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one of 16 racing watchers may claim the shutdown"
+        );
+    }
+
+    #[test]
+    fn termination_watcher_parks_until_aborted() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signal_test_runtime().block_on(async {
+            // The real wiring `run` depends on: registration must succeed, and
+            // the spawned task must stay parked on `recv()` (never resolving on
+            // its own and exiting the process), until the clean-return path
+            // aborts it.
+            let handle = spawn_termination_watcher()
+                .expect("registering the termination-signal listeners must succeed");
+            // Let the task actually start and park; on a current-thread runtime
+            // a freshly spawned task has not been polled yet, so without this
+            // `is_finished` would be trivially false.
+            tokio::task::yield_now().await;
+            assert!(
+                !handle.is_finished(),
+                "the watcher must stay parked while no signal has arrived"
+            );
+
+            handle.abort();
+            let err = handle
+                .await
+                .expect_err("an aborted watcher must not report completion");
+            assert!(
+                err.is_cancelled(),
+                "the watcher must end by cancellation, not by panicking: {err:?}"
+            );
+        });
+    }
+
+    // Unix-only. This test sends real signals to its own process, which is safe
+    // ONLY because it drives `await_termination` directly: the watcher body that
+    // calls `std::process::exit` is never run here. `TerminationSignals::register`
+    // installs the handlers *before* the `kill`, so the signal is caught rather
+    // than taking its default (fatal) disposition. Both listeners are registered
+    // before the single `kill` on purpose — that is exactly the hub-watcher +
+    // session-watcher shape, and Tokio's process-global registry wakes both.
+    #[cfg(unix)]
+    #[test]
+    fn termination_signals_yield_shell_exit_codes_and_only_one_watcher_shuts_down() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signal_test_runtime().block_on(async {
+            for (signo, expected) in [
+                (libc::SIGTERM, EXIT_CODE_SIGTERM),
+                (libc::SIGINT, EXIT_CODE_SIGINT),
+            ] {
+                // A fresh latch per kind keeps the test order-independent.
+                let latch = AtomicBool::new(false);
+                let hub_watcher = TerminationSignals::register()
+                    .expect("registering the hub listeners must succeed");
+                let session_watcher = TerminationSignals::register()
+                    .expect("registering the session listeners must succeed");
+
+                // SAFETY: `raise` is an async-signal-safe libc call with no
+                // arguments to get wrong, and both listeners above are already
+                // installed, so the signal is delivered to Tokio's handler
+                // instead of terminating the test binary.
+                #[allow(unsafe_code)] // libc FFI
+                let rc = unsafe { libc::raise(signo) };
+                assert_eq!(rc, 0, "raise({signo}) failed");
+
+                assert_eq!(
+                    await_termination(hub_watcher, &latch).await,
+                    Some(expected),
+                    "the first watcher must receive signal {signo} and map it to \
+                     the conventional 128 + signo exit code"
+                );
+                assert_eq!(
+                    await_termination(session_watcher, &latch).await,
+                    None,
+                    "the second watcher woken by the same signal must stand down \
+                     rather than race a concurrent restore + exit"
+                );
+            }
+        });
     }
 
     // Unix-only: crossterm emits ANSI escape sequences to a generic writer on

@@ -478,15 +478,42 @@ async fn dashboard_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 
-#[then(expr = "the dashboard exits from the signal with code {int}")]
-async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+/// Assert the exit code stashed by the signal `When` step. Shared by the
+/// dashboard and launcher wordings — the assertion is identical, only the
+/// process under test differs, and `subject` keeps the failure message honest
+/// about which one it was.
+fn assert_exited_from_signal(world: &mut E2eWorld, subject: &str, expected: i32) {
     let observed = session(world)
         .observed_exit_code()
         .expect("no signal exit code was recorded; deliver the signal first");
     assert_eq!(
         observed, expected,
-        "dashboard exited with {observed} after the signal, expected {expected}"
+        "{subject} exited with {observed} after the signal, expected {expected}"
     );
+}
+
+#[then(expr = "the dashboard exits from the signal with code {int}")]
+async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+    assert_exited_from_signal(world, "the dashboard", expected);
+}
+
+// The launcher hub is a different process shape from a dashboard session (it
+// outlives each session's runtime), so scenarios that signal the hub say so
+// rather than borrowing the dashboard's wording.
+#[then(expr = "the launcher exits from the signal with code {int}")]
+async fn launcher_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+    assert_exited_from_signal(world, "the launcher", expected);
+}
+
+#[then("the launcher front door is displayed")]
+async fn launcher_front_door_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    // "Set up this system" is the front door's first menu entry, drawn at any
+    // size. Waiting (rather than reading the screen once) synchronises on the
+    // first paint after a launch or after a session hands control back.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door was not displayed: {e}"));
 }
 
 #[then("the terminal is restored to the normal screen")]

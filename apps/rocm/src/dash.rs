@@ -382,6 +382,14 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
     // dropped on purpose (dropping a `JoinHandle` detaches the task, it does not
     // abort it), so the hub keeps `signal_rt`'s worker draining the signal pipe
     // for the whole loop below and the watcher lives for the process.
+    //
+    // This watcher deliberately COEXISTS with the one `app::run` installs when a
+    // flow escalates into a full dashboard session. Tokio's signal registry is
+    // process-global, so a single `kill` wakes both. That is safe because the
+    // watcher body arbitrates on a process-global latch: only the first one
+    // through restores the terminal and exits, so the two never race
+    // unsynchronised stdout writes or concurrent `process::exit` calls. See
+    // `spawn_termination_watcher`.
     let _watcher = signal_rt
         .block_on(async { rocm_dash_tui::app::spawn_termination_watcher() })
         .map_err(|e| anyhow::anyhow!("installing launcher termination-signal handlers: {e}"))?;

@@ -148,23 +148,28 @@ Feature: Interactive dashboard
 
   @id:dash-launcher-sigterm-restores-terminal-across-a-session @requires-os:linux
   Scenario: dash-13 - A SIGTERM to the launcher hub restores the terminal after a session
-    # rominf regression: bare `rocm` is a persistent hub whose process outlives
-    # each session's Tokio runtime. Tokio never unregisters the libc signal
-    # handler it installs, so a per-session watcher goes deaf the moment its
-    # runtime is dropped — leaving the synchronous launcher menu (itself in raw
-    # mode) unable to restore the terminal on a SIGTERM delivered after the
-    # user's first flow: an unkillable, worse form of the bug this PR fixes. A
-    # single process-lifetime watcher, installed once for the whole hub, must
-    # keep every window killable. This drives a full session round-trip — open
-    # the dashboard, quit back to the menu — before signalling, so it exercises
-    # the across-session path a single-session scenario cannot. (The startup
-    # ordering — listeners registered before raw mode — is covered by
-    # construction: `spawn_termination_watcher` is called before
-    # `enable_raw_mode`; a 20 ms-polled PTY scenario cannot observe that
-    # microsecond window, so none is claimed for it.)
+    # EAI-7194 launcher-hub regression: bare `rocm` is a persistent hub whose
+    # process outlives each session's Tokio runtime. Tokio never unregisters the
+    # libc signal handler it installs, so a per-session watcher goes deaf the
+    # moment its runtime is dropped — leaving the synchronous launcher menu
+    # (itself in raw mode) unable to restore the terminal on a SIGTERM delivered
+    # after the user's first flow: an unkillable, worse form of the bug this PR
+    # fixes. A single process-lifetime watcher, installed once for the whole hub,
+    # must keep every window killable. The process under test here is the
+    # launcher hub, not a dashboard, so the outcome steps are the launcher's.
+    # This drives a full session round-trip — open the dashboard, quit back to
+    # the menu — before signalling, so it exercises the across-session path a
+    # single-session scenario cannot. (The startup ordering — listeners
+    # registered before raw mode — is covered by construction:
+    # `spawn_termination_watcher` is called before `enable_raw_mode`; a 20
+    # ms-polled PTY scenario cannot observe that microsecond window, so none is
+    # claimed for it.)
     When the user opens the launcher
-    And the user opens the dashboard from the launcher
-    And the user quits back to the launcher
-    And the launcher receives a SIGTERM
-    Then the dashboard exits from the signal with code 143
+    Then the launcher front door is displayed
+    When the user opens the dashboard from the launcher
+    Then the dashboard home view is displayed
+    When the user quits back to the launcher
+    Then the launcher front door is displayed
+    When the launcher receives a SIGTERM
+    Then the launcher exits from the signal with code 143
     And the terminal is restored to the normal screen

@@ -419,41 +419,8 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-                while Instant::now() < drain_deadline {
-                    if self.screen_text().contains(marker) {
-                        return Ok(());
-                    }
-                    if let Some(panic_message) = self.take_reader_panic() {
-                        return Err(format!(
-                            "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                            self.framed_screen()
-                        ));
-                    }
-                    if self
-                        .reader
-                        .as_ref()
-                        .is_some_and(std::thread::JoinHandle::is_finished)
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                // Final check after the drain window closes: the reader may have
-                // committed the last frame between the loop's screen check and the
-                // `is_finished`/deadline exit, so re-read before declaring failure.
-                if self.screen_text().contains(marker) {
+                if self.drain_final_frame(Some(marker)).await? {
                     return Ok(());
-                }
-                // A reader panic landing exactly on the drain deadline would
-                // otherwise be masked by the generic "process exited" error below
-                // (and then swallowed entirely if `Drop` runs during another
-                // unwind). Surface it here so the real cause wins.
-                if let Some(panic_message) = self.take_reader_panic() {
-                    return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                        self.framed_screen()
-                    ));
                 }
                 return Err(format!(
                     "process exited ({status:?}) before {marker:?} appeared.\n{}",
@@ -622,7 +589,7 @@ impl TuiSession {
                     self.finished = true;
                     let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.record_once(code);
-                    self.drain_final_frame().await;
+                    self.drain_final_frame(None).await?;
                     return Ok(code);
                 }
                 Ok(None) => {}
@@ -646,19 +613,58 @@ impl TuiSession {
 
     /// Let the reader thread consume any bytes still buffered after the child
     /// exits (its final restore sequences) for a short bounded window, so the
-    /// emulated screen reflects the terminal's final state before it is read.
-    async fn drain_final_frame(&mut self) {
+    /// emulated screen reflects the terminal's final state before it is read. A
+    /// single poll is not enough when a large frame is still buffered behind the
+    /// process exit notification.
+    ///
+    /// The one drain loop for both exit paths, so they cannot drift: pass
+    /// `stop_on: Some(marker)` to also return as soon as `marker` appears (that
+    /// caller is racing the drain against a screen assertion), or `None` to just
+    /// wait out the window. Returns whether `stop_on` was found; `Err` if the
+    /// reader thread panicked, which must win over the caller's generic timeout
+    /// or "process exited" message (and would otherwise be swallowed entirely
+    /// when `Drop` runs during another unwind).
+    async fn drain_final_frame(&mut self, stop_on: Option<&str>) -> Result<bool, String> {
+        let found =
+            |session: &Self| stop_on.is_some_and(|marker| session.screen_text().contains(marker));
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-        while Instant::now() < drain_deadline {
+        loop {
+            if found(self) {
+                return Ok(true);
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(self.drain_panic_message(stop_on, &panic_message));
+            }
             if self
                 .reader
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
+                || Instant::now() >= drain_deadline
             {
                 break;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+        // Final checks after the drain window closes: the reader may have
+        // committed the last frame — or panicked — between the loop's checks and
+        // the `is_finished`/deadline exit, so re-read before declaring failure.
+        if found(self) {
+            return Ok(true);
+        }
+        if let Some(panic_message) = self.take_reader_panic() {
+            return Err(self.drain_panic_message(stop_on, &panic_message));
+        }
+        Ok(false)
+    }
+
+    /// Reader-panic diagnostic for [`drain_final_frame`], naming the marker the
+    /// drain was racing when there was one.
+    fn drain_panic_message(&self, stop_on: Option<&str>, panic_message: &str) -> String {
+        let context = stop_on.map_or_else(String::new, |marker| format!(" for {marker:?}"));
+        format!(
+            "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
+            self.framed_screen()
+        )
     }
 }
 
