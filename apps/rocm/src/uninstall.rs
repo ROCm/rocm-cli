@@ -21,8 +21,17 @@ use crate::{
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let plan = build_uninstall_plan(&paths, &options)?;
-    print!("{}", render_uninstall_plan(&plan, &options));
+    uninstall_with_paths(&paths, &options)
+}
+
+/// The whole `uninstall` command against a given [`AppPaths`].
+///
+/// Split from [`uninstall`] only so a test can drive the real command — plan,
+/// confirm gate, stop pass, removal — against an isolated root, instead of
+/// exercising the pieces separately and taking the wiring between them on faith.
+fn uninstall_with_paths(paths: &AppPaths, options: &UninstallOptions) -> Result<()> {
+    let plan = build_uninstall_plan(paths, options)?;
+    print!("{}", render_uninstall_plan(&plan, options));
 
     if plan.actions.is_empty() || options.dry_run {
         return Ok(());
@@ -41,10 +50,10 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     // Only an uninstall that takes away the means of stopping a server has to
     // stop it first; a cache-only run leaves `rocm services stop` and every
     // service record in place.
-    let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, &paths);
+    let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, paths);
     stop_managed_services_then_remove(&plan, || {
         if removes_recovery_tooling {
-            stop_managed_services_before_uninstall(&paths)
+            stop_managed_services_before_uninstall(paths)
         } else {
             Ok(ManagedServiceStopReport::default())
         }
@@ -217,6 +226,13 @@ mod tests {
             .spawn()
             .expect("failed to spawn the managed server");
         let pid = child.id();
+        // Bind and drop, so the record carries a port nothing is listening on.
+        // A hardcoded port would flip this test to a failure the moment anything
+        // on the runner happened to hold it, via the gate's own port probe.
+        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve an unused port")
+            .port();
         let mut record = rocm_core::ManagedServiceRecord::new(
             &paths,
             "svc-live",
@@ -224,7 +240,7 @@ mod tests {
             "m",
             "m",
             "127.0.0.1",
-            9,
+            free_port,
             "managed",
             pid,
             None,
@@ -251,6 +267,86 @@ mod tests {
         assert!(
             !doomed.exists(),
             "the planned path must be removed once the server is stopped"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Linux-only for the same reason as the test above: `process_start_ticks`
+    /// and zombie-state detection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_uninstall_command_itself_stops_a_managed_server_before_removing_anything() {
+        // Drives the real command end to end — plan, confirm gate, stop pass,
+        // removal — rather than the pieces separately. Inlining the old
+        // remove-first loop back into `uninstall_with_paths` fails here even
+        // though every narrower test still passes.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-cmd-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        for dir in [&paths.config_dir, &paths.data_dir, &paths.cache_dir] {
+            fs::create_dir_all(dir).expect("seed an isolated dir the plan will remove");
+        }
+        let marker = paths.data_dir.join("state.json");
+        fs::write(&marker, b"{}").expect("seed state the removal must delete");
+
+        let server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the managed server");
+        let pid = server.id();
+        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("reserve an unused port")
+            .port();
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-cmd-live",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            free_port,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("write the service record");
+
+        // `--keep-binaries` keeps the test off the real executable-discovery
+        // path; removing the data dir still takes the service records away, so
+        // the stop pass is required to run.
+        super::uninstall_with_paths(
+            &paths,
+            &crate::UninstallOptions {
+                yes: true,
+                keep_binaries: true,
+                ..crate::UninstallOptions::default()
+            },
+        )
+        .expect("uninstall should succeed once the server is stopped");
+
+        let mut server = server;
+        let _ = server.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "`rocm uninstall` must stop the server it manages"
+        );
+        assert!(
+            !marker.exists(),
+            "`rocm uninstall` must remove the planned state once the server is stopped"
         );
         let _ = fs::remove_dir_all(root);
     }

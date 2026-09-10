@@ -489,12 +489,18 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
         .arg("600")
         .spawn()
         .expect("failed to start the managed server stand-in");
+    // Bind and drop, so the record carries a port nothing is listening on. The
+    // CLI's readiness probe then fails and liveness falls through to the
+    // recorded process, which is alive. A hardcoded port would make this
+    // scenario fail whenever the runner happened to hold it.
+    let free_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("reserve an unused port")
+        .port();
     write_service_record_with(
         &services_dir,
         "amd/test-model",
-        // Nothing listens here: the CLI's readiness probe fails, so liveness
-        // falls through to the recorded process — which is alive.
-        59_999,
+        free_port,
         ServiceRecordOptions {
             status: "ready",
             startup_phase: None,

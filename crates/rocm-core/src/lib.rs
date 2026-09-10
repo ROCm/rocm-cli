@@ -7314,6 +7314,15 @@ impl ManagedServiceRecord {
         record
     }
 
+    /// Persist the record, atomically.
+    ///
+    /// Written to a temp file in the same directory and renamed into place, so a
+    /// concurrent reader sees either the old record or the new one, never a
+    /// half-written file. A plain overwrite left a window in which a reader
+    /// (`load_managed_services`, or the uninstall gate that treats an unparseable
+    /// manifest as a live server it cannot account for) could observe a truncated
+    /// record and act on it. The temp name carries the pid, so concurrent writers
+    /// do not collide.
     pub fn write(&self) -> Result<()> {
         let mut host_record = self.clone();
         host_record.normalize_paths_for_host();
@@ -7324,12 +7333,27 @@ impl ManagedServiceRecord {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let storage_record = host_record.with_storage_paths();
-        fs::write(
-            &host_record.manifest_path,
-            serde_json::to_vec_pretty(&storage_record)
-                .context("failed to serialize service record")?,
-        )
-        .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))?;
+        let bytes = serde_json::to_vec_pretty(&storage_record)
+            .context("failed to serialize service record")?;
+        let file_name = host_record
+            .manifest_path
+            .file_name()
+            .context("service manifest path must have a file name")?
+            .to_string_lossy()
+            .into_owned();
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::write(&temp_path, &bytes)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        if let Err(error) = fs::rename(&temp_path, &host_record.manifest_path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error).with_context(|| {
+                format!("failed to write {}", host_record.manifest_path.display())
+            });
+        }
         Ok(())
     }
 }
