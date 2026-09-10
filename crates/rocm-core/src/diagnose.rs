@@ -313,9 +313,11 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
 //     `.cuda.` module path) and a bare `out of memory` stay sub-threshold: any
 //     PyTorch job emits the class name, so it must corroborate rather than
 //     carry the verdict alone (`torch_oom_class_alone_is_not_a_vllm_match`).
-// `keyword_score` de-duplicates overlapping spans, so `HIP out of memory` counts
-// once (as the 50-point message), not also as the nested 25-point `out of
-// memory` — one phrase yields one evidence bullet.
+// This table alone is scored through `keyword_score_collapsing_overlaps`, which
+// de-duplicates overlapping spans, so `HIP out of memory` counts once (as the
+// 50-point message), not also as the nested 25-point `out of memory` — one
+// phrase yields one evidence bullet. Every other table keeps the catalog's
+// default "each entry is an independent signal" scoring.
 const KEYWORDS_VLLM_OOM: KeywordTable = &[
     (
         "hip out of memory",
@@ -363,10 +365,38 @@ const KEYWORDS_VLLM_OOM: KeywordTable = &[
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 ///
-/// Matches whose spans overlap are collapsed to the strongest one, so a single
-/// phrase cannot masquerade as two independent signals (e.g. `HIP out of memory`
-/// must not also count the `out of memory` nested inside it).
+/// Every entry that matches counts as an independent signal. This is the
+/// behaviour every table in the catalog except [`KEYWORDS_VLLM_OOM`] is tuned
+/// for -- see [`keyword_score_collapsing_overlaps`] for why that one differs and
+/// why the difference must not be generalized.
 fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, false)
+}
+
+/// Like [`keyword_score`], but collapses matches whose spans overlap to the
+/// strongest one, so a single phrase cannot masquerade as two independent
+/// signals (e.g. `HIP out of memory` must not also count the `out of memory`
+/// nested inside it).
+///
+/// This is **deliberately not** applied to the rest of the catalog. Several
+/// older tables pair a greedy `.*` pattern with a second, genuinely independent
+/// keyword, and the greedy span swallows it: `api-ms-win-crt-.*\.dll` runs to
+/// the last `.dll` on the line and covers an independent `msvcp140.dll`,
+/// `dkms .*failed` covers an independent `dpkg: error`, and so on. Since
+/// collapsing can only lower a score, applying it there would push real
+/// diagnoses below [`MIN_SCORE_FOR_MATCH`] and make them vanish
+/// (`overlap_dedup_does_not_demote_other_catalog_keyword_tables` pins this).
+/// [`KEYWORDS_VLLM_OOM`] is safe because its overlaps are true nestings of
+/// literal phrases, not artifacts of a greedy wildcard.
+fn keyword_score_collapsing_overlaps(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, true)
+}
+
+fn keyword_score_impl(
+    symptom: &str,
+    table: KeywordTable,
+    collapse_overlaps: bool,
+) -> (i32, Vec<String>) {
     if symptom.is_empty() {
         return (0, Vec::new());
     }
@@ -388,7 +418,7 @@ fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
     // not contribute two evidence bullets (nor two weights toward the score).
     let mut kept: Vec<(i32, &'static str, usize, usize)> = Vec::new();
     for hit in hits {
-        let overlaps = kept.iter().any(|k| hit.2 < k.3 && k.2 < hit.3);
+        let overlaps = collapse_overlaps && kept.iter().any(|k| hit.2 < k.3 && k.2 < hit.3);
         if !overlaps {
             kept.push(hit);
         }
@@ -1424,7 +1454,7 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
         // re-enabling the misattribution the anchor exists to prevent.
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
-    let (score, evidence) = keyword_score(symptom, KEYWORDS_VLLM_OOM);
+    let (score, evidence) = keyword_score_collapsing_overlaps(symptom, KEYWORDS_VLLM_OOM);
     if score <= 0 {
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
@@ -2366,6 +2396,88 @@ mod tests {
         );
         assert_eq!(oom.score, 50, "the HIP message carries the match alone");
         assert!(fix.summary.contains("--gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {
+        // The vLLM-OOM table needs overlapping spans collapsed ("out of memory"
+        // nested inside "HIP out of memory"). Other tables must NOT get that
+        // treatment: several of them pair a greedy `.*` pattern with a second,
+        // genuinely independent keyword, and the greedy span swallows the
+        // independent one. Collapsing there silently loses real diagnoses,
+        // because a keyword score can only fall.
+        //
+        // Each case below pins the score these tables produced before the
+        // de-duplication was introduced.
+
+        // `api-ms-win-crt-.*\.dll` (35) runs to the *last* `.dll` on the line,
+        // covering the independent `msvcp140.dll` (30). Two distinct missing
+        // DLLs, two signals -- 65 clears MIN_SCORE_FOR_MATCH, 35 does not.
+        let (score, ev) = keyword_score(
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+            KEYWORDS_MSVC_REDIST,
+        );
+        assert_eq!(
+            score, 65,
+            "two distinct missing DLLs are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `dkms .*failed` (45) spans the whole line, covering `dpkg: error` (25).
+        let (score, ev) = keyword_score(
+            "dkms status: dpkg: error processing amdgpu-dkms, build failed",
+            KEYWORDS_DPKG_BROKEN,
+        );
+        assert_eq!(
+            score, 70,
+            "a DKMS failure and a dpkg error are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `amdhip64.*not found` (50) spans past `could not find hip` (40):
+        // 90 is HIGH confidence, 50 is only a bare match.
+        let (score, ev) = keyword_score(
+            "amdhip64.dll: could not find hip runtime, not found",
+            KEYWORDS_HIP_SDK_MISSING,
+        );
+        assert_eq!(score, 90, "both HIP-SDK signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+
+        // `404.*repo\.radeon\.com` (50) runs to the *last* repo.radeon.com on
+        // the line, covering `unable to locate package rocm` (35).
+        let (score, ev) = keyword_score(
+            "e: failed to fetch https://repo.radeon.com/rocm/apt/jammy/release 404 not found, \
+             unable to locate package rocm, retrying https://repo.radeon.com/rocm/apt",
+            KEYWORDS_REPO_BROKEN,
+        );
+        assert_eq!(score, 85, "both apt-repo signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn windows_missing_dll_pair_still_reaches_the_msvc_redist_fix() {
+        // The user-visible half of the guard above: with no PATH probe result
+        // (`msvc_redist_present == None`) the keyword score alone decides, so a
+        // demoted table makes fix-15 vanish from the report entirely.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(
+            &e,
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+        );
+        let msvc = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("the MSVC redistributable fix must still be reported");
+        assert!(
+            msvc.score >= MIN_SCORE_FOR_MATCH,
+            "score was {}",
+            msvc.score
+        );
+        assert!(report.has_match());
     }
 
     #[test]
