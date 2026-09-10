@@ -1144,16 +1144,56 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
-    /// EAI-8366 regression: a readable *non-regular* input (here `/dev/null`, a
-    /// character device — a stand-in for the FIFO / `/dev/stdin` / process-
-    /// substitution paths the replay reader handles) must NOT be rejected on
-    /// shape. Only a directory is a shape error; requiring a regular file would
-    /// break streaming replays.
+    /// EAI-8366 regression covering *both* halves of the non-regular-file
+    /// contract, on a real one-shot stream rather than a stand-in:
+    ///
+    /// 1. a FIFO must not be rejected on shape — only a directory is a shape
+    ///    error, and requiring a regular file would break `--replay <(...)`;
+    /// 2. validation must not *pre-open* it. `open(2)` on a writer-less FIFO
+    ///    blocks until a writer arrives, so dropping the `is_file()` narrowing
+    ///    around the readability probe hangs `rocm dash` before the TUI starts
+    ///    (and, with a writer, would consume the stream the replay reader is
+    ///    about to read). The validation therefore runs on a worker thread and
+    ///    must report back well inside the timeout below.
+    ///
+    /// A readable character device such as `/dev/null` cannot stand in here: it
+    /// opens instantly, so it passes with or without the narrowing.
     #[cfg(unix)]
+    #[allow(unsafe_code)] // libc FFI: mkfifo has no std equivalent
     #[test]
-    fn validate_replay_path_accepts_non_regular_readable_input() {
-        validate_replay_path(Path::new("/dev/null"))
-            .expect("a readable non-regular input must pass validation");
+    fn validate_replay_path_accepts_a_fifo_without_opening_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fifo = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-fifo-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+        // call, and `mkfifo` only reads it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        // No writer is ever opened for this FIFO, so any `open` of it blocks
+        // indefinitely. The worker thread is deliberately not joined: if the
+        // validation regresses it stays parked in `open` until the test process
+        // exits, and the timeout below is what fails the test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(validate_replay_path(&probe).map_err(|err| format!("{err:#}")));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+
+        let _ = std::fs::remove_file(&fifo);
+        let validation = outcome.unwrap_or_else(|err| {
+            panic!(
+                "validate_replay_path never returned for a writer-less FIFO ({err}): \
+                 non-regular replay paths must not be pre-opened"
+            )
+        });
+        validation.expect("a FIFO must pass validation, not be rejected on shape");
     }
 
     /// A present, readable recording passes validation so the normal replay
