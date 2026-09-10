@@ -59,24 +59,47 @@ pub use runtime::{
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
     normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
-    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
-    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
-    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
-    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
+    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
+    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
+    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
+    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use uv::{
-    DEFAULT_UV_TIMEOUT_SECS, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV, UvCacheSource,
-    ensure_uv_binary, uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs,
-    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args,
+    DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
+    UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
+    uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
+    uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
 };
 
 pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
 pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
+
+/// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
+pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
+
+/// Whether the user has opted out of rocm-cli choosing this runtime's torch.
+///
+/// Presence is the signal, so any value — including the empty string — disables the
+/// alignment; that keeps `ROCM_CLI_DISABLE_TORCH_ALIGNMENT=` from reading as "off"
+/// to one side and "on" to the other.
+///
+/// The CLI and the vLLM engine both consult this: the engine cannot call into the
+/// binary that owns the alignment, and a duplicated read is a contract that drifts.
+/// If the two ever disagreed, a runtime the CLI deliberately left alone would be
+/// rewritten by the engine on the very next `rocm engines install vllm` — the fight
+/// the opt-out exists to end.
+///
+/// This suppresses the correction, not the diagnosis. The runtime is still asked
+/// what it can do, the dependency check still runs, and a runtime that opens no
+/// device or cannot run a kernel on one is still reported as such.
+pub fn torch_alignment_disabled() -> bool {
+    std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
+}
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
@@ -219,6 +242,32 @@ pub struct DownloadOutcome {
 /// matching length proves nothing about the bytes — do not read a successful
 /// return as "the artifact is genuine" unless a digest was supplied.
 pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<DownloadOutcome> {
+    download_file_streaming_with_progress(request, &mut |_written, _total| {})
+}
+
+/// As [`download_file_streaming`], but reports progress via `on_progress`.
+///
+/// `on_progress` is called with the cumulative bytes written and, when
+/// known, the total size — once before the transfer starts and once after
+/// every chunk is written to disk. The byte count is monotonically
+/// non-decreasing across the whole call, including across retries: an
+/// attempt that restarts from scratch (the server ignored `Range`, or
+/// resumed at the wrong offset and had its partial file discarded) counts
+/// its own bytes from 0 internally, but the byte count `on_progress` sees
+/// never drops below the highest value already reported by an earlier
+/// attempt. The total is not clamped the same way and is passed through as
+/// reported by the current attempt, so it can go from `None` to `Some` (or
+/// back) mid-transfer if a retry's response differs on `Content-Length`.
+/// Note also that for the whole duration of a from-scratch restart, the
+/// byte count holds flat at the prior high-water mark until the new attempt
+/// catches back up — a caller driving a static progress line should pair
+/// this with an animated indicator (as the `rocm` CLI's spinner does) so a
+/// long restart doesn't look hung. Callers that don't need progress should
+/// use [`download_file_streaming`] instead.
+pub fn download_file_streaming_with_progress(
+    request: &DownloadRequest<'_>,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<DownloadOutcome> {
     if let Some(parent) = request.destination.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -233,8 +282,18 @@ pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<Download
     let _ = fs::remove_file(&partial_path);
     let mut backoff = Backoff::default();
     let mut attempt = 1;
+    // `download_attempt` reports whatever it has on disk for *this* attempt,
+    // which resets to 0 on a from-scratch restart even though earlier
+    // attempts already progressed further. Clamp to a high-water mark here
+    // so every caller — not just ones that happen to add their own UI-side
+    // clamp — sees a byte count that never goes backwards.
+    let mut high_water = 0_u64;
+    let mut monotonic_progress = move |written: u64, total: Option<u64>| {
+        high_water = high_water.max(written);
+        on_progress(high_water, total);
+    };
     let outcome = loop {
-        match download_attempt(request, &partial_path) {
+        match download_attempt(request, &partial_path, &mut monotonic_progress) {
             Ok(outcome) => break outcome,
             Err(error) => {
                 let retryable = error.retryable && attempt < DOWNLOAD_MAX_ATTEMPTS;
@@ -292,9 +351,19 @@ const fn status_is_retryable(status: u16) -> bool {
     status == 408 || status == 429 || status >= 500
 }
 
+/// A single attempt at the transfer. `written` — and so what this reports
+/// through `on_progress` — reflects only what this attempt itself has put on
+/// disk: a confirmed `206` continuation starts counting from the resumed
+/// offset, but a restart (the server ignored `Range`, or resumed at the
+/// wrong offset and had its partial file discarded) truncates the file and
+/// starts counting from 0 again, even if a previous attempt already reported
+/// further along. That's fine — [`download_file_streaming_with_progress`]
+/// wraps `on_progress` with a high-water mark so callers never observe the
+/// drop; this function does not need to care.
 fn download_attempt(
     request: &DownloadRequest<'_>,
     partial_path: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<DownloadOutcome, DownloadAttemptError> {
     // Resume from whatever a previous attempt already wrote. A missing file is
     // simply a fresh start.
@@ -350,7 +419,11 @@ fn download_attempt(
     let remaining_len = header_u64(&response, "Content-Length");
     let total_len =
         remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
-    if let Some(total) = total_len.or(request.expected_len) {
+    // Fall back to the caller-supplied expected length when the server omits
+    // `Content-Length`, so progress reporting doesn't lose a total that's
+    // already known and already used for the preflight checks below.
+    let reported_total = total_len.or(request.expected_len);
+    if let Some(total) = reported_total {
         if let Some(max_bytes) = request.max_bytes
             && total > max_bytes
         {
@@ -394,6 +467,8 @@ fn download_attempt(
         })?
     };
 
+    on_progress(written, reported_total);
+
     let mut reader = response.into_reader();
     let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
     loop {
@@ -406,7 +481,7 @@ fn download_attempt(
             // the user, so report the shortfall either way rather than a bare
             // transport error.
             Err(error) => {
-                let reason = total_len.or(request.expected_len).map_or_else(
+                let reason = reported_total.map_or_else(
                     || format!("failed while downloading {}", request.url),
                     |expected| {
                         format!(
@@ -431,6 +506,7 @@ fn download_attempt(
         if let Err(error) = file.write_all(&buffer[..read]) {
             return Err(permanent(disk_space::map_write_error(error, partial_path)));
         }
+        on_progress(written, reported_total);
     }
     if let Err(error) = file.sync_all() {
         return Err(permanent(disk_space::map_write_error(error, partial_path)));
@@ -496,6 +572,21 @@ fn content_range_start(response: &ureq::Response) -> Option<u64> {
 
 pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
     download_file_streaming(&DownloadRequest::new(url, destination, timeout))?;
+    Ok(())
+}
+
+/// As [`download_file_to_path`], but reports progress via `on_progress`. See
+/// [`download_file_streaming_with_progress`] for callback semantics.
+pub fn download_file_to_path_with_progress(
+    url: &str,
+    destination: &Path,
+    timeout: Duration,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_streaming_with_progress(
+        &DownloadRequest::new(url, destination, timeout),
+        on_progress,
+    )?;
     Ok(())
 }
 
@@ -986,14 +1077,6 @@ pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> 
         .context("failed to write to TCP stream")
 }
 
-pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read TCP stream")?;
-    Ok(response)
-}
-
 /// Read one HTTP response, bounded by a wall-clock deadline.
 ///
 /// Two problems with reading to end-of-stream instead. A response is only
@@ -1005,7 +1088,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 /// slow-drip responder could stretch the total wait to an arbitrary multiple of
 /// what the caller asked for. This returns as soon as the response is complete by
 /// its own framing, and never runs past `deadline` in total.
-fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !http_response_is_complete(&response) {
@@ -1026,6 +1109,14 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
             {
                 bail!("timed out reading HTTP response");
             }
+            // A signal delivered to this thread aborts the read with `EINTR`.
+            // `SA_RESTART` does not save us: Linux never restarts a socket read
+            // that has a receive timeout set, and this loop sets one on every
+            // pass (see signal(7), "Interruption of system calls"). Any handler
+            // in the process is enough — `crossterm`'s `SIGWINCH` hook is linked
+            // into the CLI. Nothing is wrong with the connection, so read again;
+            // `deadline` still bounds the total wait.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error).context("failed to read TCP stream"),
         }
     }
@@ -1038,10 +1129,17 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
 /// those are delimited by the connection closing, so the caller must keep reading
 /// until EOF.
 fn http_response_is_complete(response: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(response);
-    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+    // Headers are ASCII by the HTTP spec, so it is safe to lossy-decode just
+    // that slice to parse them. The body length check below stays on raw
+    // bytes: lossy-decoding a body that ends mid multi-byte UTF-8 sequence
+    // replaces the truncated tail with a 3-byte U+FFFD, which can inflate a
+    // partial body's *decoded* length past the declared Content-Length and
+    // report completeness one read early.
+    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end + 4..];
     let header_value = |name: &str| {
         headers.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -1058,7 +1156,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
     if header_value("Transfer-Encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
-        return body.ends_with("0\r\n\r\n");
+        return body.ends_with(b"0\r\n\r\n");
     }
     false
 }
@@ -2324,7 +2422,7 @@ fn normalize_cpu_model(value: &str) -> String {
 /// route-out note, a false negative runs bare-metal driver checks against a
 /// platform that has no amdgpu module and reports nonsense.
 #[must_use]
-pub(crate) fn is_wsl_host() -> bool {
+pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
@@ -4654,15 +4752,16 @@ pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
         .ok()?
         .flatten()
         .filter_map(|entry| {
-            let value = fs::read_to_string(entry.path().join("gfx_target_version")).ok()?;
+            let value = kfd_node_gfx_target_version(&entry.path())?;
             let token = parse_linux_kfd_gfx_target(value.trim())?;
             Some((entry.file_name().to_string_lossy().into_owned(), token))
         })
         .collect();
     // `read_dir` order is filesystem-defined, so a multi-node box could report a
-    // different GPU run to run. Node names are `node0`, `node1`, ...; sorting by
-    // name makes the answer stable and picks the lowest-numbered node, which is
-    // the one HIP ordinal 0 refers to.
+    // different GPU run to run. Node directories are numbered (`0`, `1`, ... on
+    // a real KFD; `node0`, `node1`, ... in planted fixtures), so sorting on the
+    // trailing number makes the answer stable and picks the lowest-numbered
+    // node, which is the one HIP ordinal 0 refers to.
     targets.sort_by_key(|(name, _)| natural_node_order(name));
     targets.into_iter().next().map(|(_, token)| token)
 }
@@ -4738,9 +4837,12 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 /// Combine the KFD-topology and DRM-card AMD GPU counts into one "GPUs present"
 /// figure. KFD counts *compute* nodes and is authoritative for HIP ordinals, so
 /// it wins whenever it reports at least one GPU. DRM is used only as the
-/// zero-KFD fallback: some hosts (e.g. Strix Halo APUs) enumerate the GPU only
-/// via DRM ip-discovery and report zero KFD GPU nodes, so relying on KFD alone
-/// would wrongly conclude there is no GPU and block serving.
+/// zero-KFD fallback, so that a host KFD does not account for is not wrongly
+/// told it has no GPU and blocked from serving. The fallback was added when the
+/// KFD count read a node file that no kernel exposes and so came back zero
+/// everywhere; how often a correctly-read KFD still reports zero has not been
+/// surveyed, so treat this as a hedge rather than a description of known
+/// hardware.
 ///
 /// DRM must not *raise* a nonzero KFD count: a display/render-only AMD DRM card
 /// with no KFD compute node (e.g. KFD=1, DRM=2) would otherwise invent a usable
@@ -4752,7 +4854,7 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
     match kfd {
         // KFD is compute-authoritative: prefer it whenever it sees a GPU.
         Some(k) if k > 0 => Some(k),
-        // Zero KFD compute nodes: fall back to DRM for the APU shape.
+        // Zero KFD compute nodes: let DRM answer rather than block serving.
         Some(_) => Some(drm.unwrap_or(0)),
         // KFD unreadable: use DRM if it could be read, else availability unknown.
         None => drm,
@@ -4786,7 +4888,17 @@ fn linux_drm_amdgpu_card_count() -> Option<usize> {
 /// availability is unknown and must not be treated as zero.
 #[cfg(target_os = "linux")]
 fn linux_kfd_gpu_node_count() -> Option<usize> {
-    let nodes_dir = Path::new("/sys/class/kfd/kfd/topology/nodes");
+    linux_kfd_gpu_node_count_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+/// The KFD GPU-node count, against a caller-supplied nodes directory.
+///
+/// Split out for the same reason as [`detect_kfd_gfx_target_in`]: the hosts
+/// where this matters are the ones a test cannot run on. Only the readable
+/// branch is driven by tests -- the unreadable branches key off the real
+/// `/dev/kfd`, which a planted directory cannot stand in for.
+#[cfg(any(target_os = "linux", test))]
+fn linux_kfd_gpu_node_count_in(nodes_dir: &Path) -> Option<usize> {
     match fs::read_dir(nodes_dir) {
         Ok(entries) => Some(
             entries
@@ -4801,11 +4913,48 @@ fn linux_kfd_gpu_node_count() -> Option<usize> {
 
 /// A KFD topology node is a GPU (not the CPU node) when its
 /// `gfx_target_version` is a nonzero value; CPU nodes report `0`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn kfd_node_is_gpu(node_dir: &Path) -> bool {
+    kfd_node_gfx_target_version(node_dir)
+        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+}
+
+/// A KFD topology node's `gfx_target_version`, or `None` when the node does not
+/// state one.
+///
+/// The kernel exposes it as a **line inside the node's `properties` file**
+/// (`gfx_target_version 90402`), not as a standalone file. Reading only the
+/// standalone path found nothing on every real KFD host, so target detection
+/// silently fell through to the DRM ip-discovery route, which decodes a GC IP
+/// version and is wrong-but-plausible on the GC 9.4.x line: an MI300X reported
+/// `gfx943` where KFD plainly said `90402` (gfx942). Hosts whose ip-discovery
+/// route also came up empty got `<unknown>` instead.
+///
+/// The standalone file is still read as a fallback, so any layout that does
+/// expose it keeps working.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_node_gfx_target_version(node_dir: &Path) -> Option<String> {
+    let from_properties = fs::read_to_string(node_dir.join("properties"))
+        .ok()
+        .and_then(|text| kfd_property_value(&text, "gfx_target_version"));
+    if from_properties.is_some() {
+        return from_properties;
+    }
     fs::read_to_string(node_dir.join("gfx_target_version"))
         .ok()
-        .is_some_and(|value| kfd_gfx_target_version_is_gpu(value.trim()))
+        .map(|value| value.trim().to_owned())
+}
+
+/// The value of one `key value` line in a KFD `properties` body.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_property_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        if parts.next()? != key {
+            return None;
+        }
+        parts.next().map(str::to_owned)
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -8002,6 +8151,162 @@ mod tests {
     }
 
     #[test]
+    fn download_with_progress_reports_cumulative_bytes_across_chunks() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("progress");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert_eq!(
+            calls.first(),
+            Some(&(0, total)),
+            "the first call must fire before any bytes are read, already knowing the total: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "cumulative bytes must never go backwards: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total must stay constant across an attempt: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    // This guards the resume path re-seeding `written` from the partial file
+    // already on disk (see `written = std::io::copy(...)` above), not the
+    // high-water-mark clamp itself — it would pass unchanged with the clamp
+    // removed entirely. `download_with_progress_stays_monotonic_after_a_discarded_restart`
+    // below is the one that actually exercises the clamp.
+    fn download_with_progress_reports_the_resumed_offset_before_reading_more() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::Resume,
+            ],
+        )?;
+        let dir = download_scratch("progress-resume");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress across a retried attempt, e.g. reset to 0: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(written, _)| written == 5000),
+            "the resumed attempt must report the byte count already on disk before reading more: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total size must stay stable across the retry: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn download_with_progress_stays_monotonic_after_a_discarded_restart() -> Result<()> {
+        // The second reply resumes at the wrong offset, so its partial file is
+        // discarded and the third attempt restarts from scratch — internally
+        // reporting 0 bytes written again even though the first attempt had
+        // already reached 5000. The caller must never see that drop.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::ResumeAtWrongOffset { start: 8000 },
+                DownloadReply::Complete,
+            ],
+        )?;
+        let dir = download_scratch("progress-wrong-offset");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        let requests = server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert_eq!(
+            requests.len(),
+            3,
+            "the wrong-offset reply must be discarded and retried, not accepted"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "cumulative bytes must never go backwards, even across a discarded \
+             partial file and a from-scratch restart: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(written, _)| written == 5000),
+            "the truncated first attempt's progress must not be lost once the \
+             restart reports 0 internally: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
     fn download_interrupted_beyond_recovery_leaves_no_destination_file() -> Result<()> {
         // Every attempt ends early, so the download never completes and the
         // user is left with the truncation as the reported reason.
@@ -8420,6 +8725,123 @@ mod tests {
         );
 
         let _ = server.join();
+        Ok(())
+    }
+
+    #[test]
+    fn http_response_is_complete_does_not_miscount_a_split_multibyte_char() {
+        // A body ending in a multi-byte UTF-8 character can arrive one byte
+        // short of the declared Content-Length. Lossy-decoding the whole
+        // buffer to check completeness turns that dangling partial sequence
+        // into a 3-byte U+FFFD replacement, inflating the decoded length past
+        // the declared one and reporting completeness a read early.
+        let body = "hi \u{2603}"; // snowman is a 3-byte UTF-8 character
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let truncated = &full[..full.len() - 1];
+
+        assert!(!http_response_is_complete(truncated));
+        assert!(http_response_is_complete(&full));
+    }
+
+    /// A signal arriving mid-response must not fail the request.
+    ///
+    /// A signal delivered while the client is parked in `read` aborts it with
+    /// `EINTR`. `SA_RESTART` does not save us: Linux never restarts a socket read
+    /// that has a receive timeout set, and this client sets one on every pass.
+    /// Any handler in the process is enough to trigger it — `crossterm`'s
+    /// `SIGWINCH` hook is linked into the CLI — so treating `EINTR` as a
+    /// transport error turned an unrelated signal into a spurious "endpoint
+    /// unreachable".
+    ///
+    /// Linux-only on purpose. The guarantee being exercised — a receive timeout
+    /// defeats `SA_RESTART` — is documented for Linux; BSD-derived kernels may
+    /// restart the read instead, which would leave this passing without ever
+    /// reaching the retry. CI has no macOS runner to tell the difference.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn http_read_survives_a_signal_arriving_mid_response() -> Result<()> {
+        extern "C" fn noop_handler(_signal: libc::c_int) {}
+
+        let body = r#"{"data":[{"id":"qwen"}]}"#;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            // Answer late, so the client is blocked in `read` while the signals
+            // land rather than racing them.
+            std::thread::sleep(Duration::from_millis(400));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        // Install the handler with SA_RESTART set, to show that the flag is not
+        // what protects this read.
+        //
+        // The handler is left installed rather than restored: the default
+        // disposition for SIGUSR1 is to kill the process, so putting it back
+        // would let a signal still in flight take the whole test binary down.
+        // Leaving a no-op handler is inert — nothing else here raises SIGUSR1,
+        // and the signals below are aimed at this thread alone, so no other
+        // test sharing this process can observe either one.
+        #[allow(unsafe_code)] // libc FFI
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_handler as *const () as libc::sighandler_t;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()),
+                0,
+                "failed to install the SIGUSR1 handler"
+            );
+        }
+
+        // Target this thread specifically: a process-directed signal could land
+        // on any thread and disturb an unrelated test sharing this process.
+        #[allow(unsafe_code)] // libc FFI
+        let reader = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signaller = {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // Let the connect and the request write finish first; only the
+                // response read is under test.
+                std::thread::sleep(Duration::from_millis(50));
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    #[allow(unsafe_code)] // libc FFI
+                    unsafe {
+                        libc::pthread_kill(reader, libc::SIGUSR1);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+        let response =
+            http_get_text_with_auth(&endpoint, "/v1/models", None, Duration::from_secs(5));
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        signaller.join().expect("signaller thread should not panic");
+        server.join().expect("server thread should not panic")?;
+
+        assert_eq!(
+            response?, body,
+            "an interrupted read is retryable, not a failed request"
+        );
         Ok(())
     }
 
@@ -9850,7 +10272,9 @@ Class Name:                Display
 
     #[test]
     fn kfd_topology_names_the_gpu_when_no_tooling_is_installed() -> Result<()> {
-        // The MI300X case. `Examination` enumerates GPUs by shelling out to
+        // Covers the standalone-file fallback; see
+        // `kfd_topology_reads_the_target_from_the_properties_file` for the
+        // layout a real KFD host has. `Examination` enumerates GPUs by shelling out to
         // lspci and rocminfo; where neither is reachable it reported no AMD GPU
         // on a machine that has one, while the human report -- which reads this
         // topology instead -- named the target correctly. Planted here because
@@ -9902,6 +10326,122 @@ Class Name:                Display
 
         assert_eq!(found.as_deref(), Some("gfx1100"));
         Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_reads_the_target_from_the_properties_file() -> Result<()> {
+        // The layout every real KFD host actually has: the value is a line in
+        // the node's `properties`, and there is no standalone file. Reading only
+        // the standalone path found nothing here, so an MI300X fell through to
+        // ip-discovery and was reported as `gfx943` while KFD said `90402`.
+        // Node directories are bare integers on real hardware, not `nodeN`.
+        let (root, _) = temp_app_paths("kfd-topology-properties");
+        let nodes = root.join("nodes");
+        // Trimmed from a live MI300X; ordering and neighbours are as found.
+        for (node, properties) in [
+            (
+                "0",
+                "cpu_cores_count 56\nsimd_count 0\ngfx_target_version 0\n",
+            ),
+            (
+                "5",
+                "cpu_cores_count 0\nsimd_count 1216\nmax_waves_per_simd 8\ngfx_target_version 90402\n",
+            ),
+        ] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("properties"), properties)?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_gpu_node_count_reads_properties_and_skips_cpu_nodes() -> Result<()> {
+        // The count used the same phantom standalone file, so it saw zero GPUs
+        // on every real host and let the DRM card count stand in for it. Two
+        // CPU nodes and two GPU nodes, shaped like a live Instinct topology.
+        let (root, _) = temp_app_paths("kfd-node-count-properties");
+        let nodes = root.join("nodes");
+        for (node, properties) in [
+            ("0", "cpu_cores_count 56\ngfx_target_version 0\n"),
+            ("1", "cpu_cores_count 56\ngfx_target_version 0\n"),
+            ("5", "simd_count 1216\ngfx_target_version 90402\n"),
+            ("6", "simd_count 1216\ngfx_target_version 90402\n"),
+        ] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(nodes.join(node).join("properties"), properties)?;
+        }
+
+        let count = linux_kfd_gpu_node_count_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(count, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_properties_win_over_a_standalone_file() -> Result<()> {
+        // Both present: `properties` is what the kernel maintains, so it decides.
+        let (root, _) = temp_app_paths("kfd-topology-properties-precedence");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("0"))?;
+        fs::write(
+            nodes.join("0").join("properties"),
+            "gfx_target_version 90402\n",
+        )?;
+        fs::write(nodes.join("0").join("gfx_target_version"), "110000\n")?;
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_topology_bare_integer_node_order_is_numeric_not_lexical() -> Result<()> {
+        // Real KFD node directories are bare integers, and the only ordering that
+        // separates numeric from lexical sorting is a multi-digit one: `10` must
+        // not come before `2`. The other topology tests use single digits, which
+        // sort the same either way, so this is the case that pins the behaviour.
+        let (root, _) = temp_app_paths("kfd-topology-bare-integer-order");
+        let nodes = root.join("nodes");
+        for (node, version) in [("10", "110100\n"), ("2", "90402\n")] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                format!("gfx_target_version {version}"),
+            )?;
+        }
+
+        let found = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        // Node 2 is the lowest-numbered GPU node, so it is the one HIP ordinal 0
+        // refers to.
+        assert_eq!(found.as_deref(), Some("gfx942"));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_property_value_reads_only_its_own_key() {
+        let body = "simd_count 1216\ngfx_target_version 90402\nnum_gws 64\n";
+        assert_eq!(
+            kfd_property_value(body, "gfx_target_version").as_deref(),
+            Some("90402")
+        );
+        assert_eq!(
+            kfd_property_value(body, "simd_count").as_deref(),
+            Some("1216")
+        );
+        // A key that only appears as a prefix of another must not match, and an
+        // absent key yields nothing rather than an empty string.
+        assert_eq!(kfd_property_value(body, "gfx_target"), None);
+        assert_eq!(kfd_property_value(body, "vram_size"), None);
     }
 
     #[test]

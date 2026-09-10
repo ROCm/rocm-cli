@@ -43,7 +43,32 @@ impl AmdSmiCollector {
     /// directory rather than on `PATH`, so callers resolve the path or command
     /// name (via `rocm_core::resolve_amd_smi_binary`) and pass it here.
     pub async fn detect_with_binary(binary: impl Into<OsString>) -> Option<Self> {
-        if !kfd_accessible() {
+        Self::detect_with_binary_inner(binary, false).await
+    }
+
+    /// Like [`detect_with_binary`](Self::detect_with_binary) but skips the
+    /// mandatory `/dev/kfd` pre-flight.
+    ///
+    /// **Test-only.** The KFD pre-flight is a safety guard: against a *real*
+    /// `amd-smi` on a host without a usable `/dev/kfd`, the process can block in
+    /// uninterruptible kernel sleep (D-state) that no signal can escape. This
+    /// entry point exists solely so daemon integration tests can point
+    /// [`detect_with_binary`](Self::detect_with_binary) at a *fake* script (for
+    /// which the hang cannot happen) and have it actually run on a GPU-less CI
+    /// host, instead of short-circuiting to `None` and turning the test into a
+    /// no-op. Never call it against a real binary in production.
+    #[doc(hidden)]
+    pub async fn detect_with_binary_skipping_kfd_preflight(
+        binary: impl Into<OsString>,
+    ) -> Option<Self> {
+        Self::detect_with_binary_inner(binary, true).await
+    }
+
+    async fn detect_with_binary_inner(
+        binary: impl Into<OsString>,
+        skip_kfd_preflight: bool,
+    ) -> Option<Self> {
+        if !skip_kfd_preflight && !kfd_accessible() {
             return None;
         }
         let me = Self {

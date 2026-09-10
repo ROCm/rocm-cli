@@ -2,14 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::cli_progress::AnimatedSpinner;
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
-    runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child, runtime_path_list_join,
-    runtime_path_list_split, runtime_paths_equivalent, unix_time_millis, uv_command_env,
-    uv_pip_install_base,
+    AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
+    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
+    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
+    uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -347,10 +348,18 @@ pub(crate) fn install(
         let _ = io::stdout().flush();
         let uv = ensure_uv_binary(paths)
             .context("failed to acquire uv binary for ComfyUI dependency install")?;
+        // Pin the managed runtime's ROCm torch stack to its exact installed
+        // versions so a transitive ComfyUI dependency cannot resolve `torch` (and
+        // its `nvidia-*` CUDA deps) from PyPI and clobber it (EAI-8051). Filtering
+        // torch out of the direct specs is not enough — the resolver reaches it
+        // transitively. A constraint fails loudly on a genuine version conflict,
+        // which leaves the runtime intact rather than silently corrupting it.
+        let constraints = torch_stack_constraints(&runtime.python, Some(&runtime_env), &mut log)?;
+        let constraints_path = write_torch_constraints(&app_root, &constraints, &mut log)?;
         run_uv_logged_command(
             paths,
             &uv,
-            uv_install_args(&runtime.python, &packages),
+            uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
             Some(&runtime_env),
             &mut log,
             "install ComfyUI dependencies",
@@ -1288,7 +1297,17 @@ fn download_and_extract_source(
         )?;
     } else {
         writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
-        download_file(COMFYUI_SOURCE_ARCHIVE_URL, &archive_path)?;
+        let download_label = "Fetching ComfyUI source archive…";
+        let spinner = AnimatedSpinner::start(download_label);
+        let download_result = download_file(
+            COMFYUI_SOURCE_ARCHIVE_URL,
+            &archive_path,
+            &mut |bytes, total| {
+                spinner.set_progress(download_label, bytes, total);
+            },
+        );
+        drop(spinner);
+        download_result?;
     }
     let extract_root = app_root
         .join("extract")
@@ -1349,8 +1368,12 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    download_file_to_path(url, destination, Duration::from_mins(2))
+fn download_file(
+    url: &str,
+    destination: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_to_path_with_progress(url, destination, Duration::from_mins(2), on_progress)
 }
 
 fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
@@ -1393,11 +1416,133 @@ fn requirement_package_name(spec: &str) -> Option<String> {
     (end > 0).then(|| trimmed[..end].replace('_', "-").to_ascii_lowercase())
 }
 
-fn uv_install_args(venv_python: &Path, packages: &[String]) -> Vec<String> {
+fn uv_install_args(
+    venv_python: &Path,
+    packages: &[String],
+    constraints_path: Option<&Path>,
+) -> Vec<String> {
     let mut args = uv_pip_install_base(venv_python);
     args.push("--upgrade".to_owned());
+    if let Some(path) = constraints_path {
+        args.push("--constraint".to_owned());
+        args.push(path.to_string_lossy().into_owned());
+    }
     args.extend(packages.iter().cloned());
     args
+}
+
+/// The torch-stack packages whose managed ROCm versions must be preserved across
+/// a ComfyUI dependency install.
+const TORCH_STACK_PACKAGES: [&str; 3] = ["torch", "torchvision", "torchaudio"];
+
+/// Probe of an installed distribution's version, read from metadata WITHOUT
+/// importing the package (importing torch needs the runtime's native env). Emits
+/// JSON: a map from package name to version string for the ones present.
+const TORCH_STACK_VERSION_PROBE: &str = "import json,sys\n\
+     from importlib import metadata\n\
+     out={}\n\
+     for name in ('torch','torchvision','torchaudio'):\n\
+     \x20 try:\n\
+     \x20   out[name]=metadata.version(name)\n\
+     \x20 except Exception:\n\
+     \x20   pass\n\
+     sys.stdout.write(json.dumps(out))\n";
+
+/// Read the exact installed versions of the managed runtime's torch stack via
+/// dist metadata (no native import). Returns constraint lines (`torch==X`) for
+/// each package currently present, so the ComfyUI dependency resolution is pinned
+/// to them and cannot pull a CUDA build. An absent package yields no line — we
+/// only constrain what the runtime actually ships.
+///
+/// Constraining only the installed packages is safe here because the full
+/// torch/torchvision/torchaudio trio is an invariant of a managed runtime:
+/// `therock` installs all three atomically and refuses to install unless it finds
+/// a mutually-compatible set (see `select_matching_pip_package_versions` — it
+/// bails with "no mutually compatible ... torch, torchvision, and torchaudio
+/// versions"), and
+/// ComfyUI install only ever targets such a runtime (`select_runtime` requires a
+/// managed wheel install). So there is no "torch present, torchvision/torchaudio
+/// absent" runtime in which an unpinned CUDA `torchvision` could resolve against
+/// the release part of the pinned ROCm torch and install a mixed CUDA/ROCm stack.
+fn torch_stack_constraints(
+    python: &Path,
+    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
+    log: &mut fs::File,
+) -> Result<Vec<String>> {
+    let versions = probe_torch_stack_versions(python, runtime_env)?;
+    let constraints = torch_constraint_lines(&versions);
+    writeln!(
+        log,
+        "Pinning managed torch stack: {}",
+        if constraints.is_empty() {
+            "none found".to_owned()
+        } else {
+            constraints.join(", ")
+        }
+    )?;
+    Ok(constraints)
+}
+
+fn probe_torch_stack_versions(
+    python: &Path,
+    runtime_env: Option<&ComfyUiRuntimeEnvironment>,
+) -> Result<Vec<(String, String)>> {
+    let mut command = Command::new(python);
+    command.arg("-c").arg(TORCH_STACK_VERSION_PROBE);
+    if let Some(runtime_env) = runtime_env {
+        apply_runtime_environment(&mut command, runtime_env)?;
+    }
+    let output = capture_configured_command(
+        command,
+        &format!("probe managed torch stack with {}", python.display()),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "failed to read the managed runtime's torch versions (status {}).\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: std::collections::BTreeMap<String, String> = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("failed to parse torch stack version probe output: {stdout}"))?;
+    Ok(parsed.into_iter().collect())
+}
+
+/// Build `name==version` constraint lines for the torch-stack packages that were
+/// found, in a stable order. Pure and side-effect free for unit testing.
+fn torch_constraint_lines(versions: &[(String, String)]) -> Vec<String> {
+    TORCH_STACK_PACKAGES
+        .iter()
+        .filter_map(|package| {
+            versions
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(package))
+                .map(|(_, version)| format!("{package}=={version}"))
+        })
+        .collect()
+}
+
+/// Write the torch-stack constraints to a file uv can read via `--constraint`.
+/// Returns `None` when there is nothing to pin (no constraint file is needed).
+fn write_torch_constraints(
+    app_root: &Path,
+    constraints: &[String],
+    log: &mut fs::File,
+) -> Result<Option<PathBuf>> {
+    if constraints.is_empty() {
+        return Ok(None);
+    }
+    let path = app_root.join("torch-constraints.txt");
+    fs::create_dir_all(
+        path.parent()
+            .context("ComfyUI constraints path has no parent directory")?,
+    )?;
+    let mut contents = constraints.join("\n");
+    contents.push('\n');
+    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    writeln!(log, "Wrote torch constraints to {}.", path.display())?;
+    Ok(Some(path))
 }
 
 fn run_uv_logged_command(
@@ -1710,6 +1855,50 @@ mod tests {
     }
 
     #[test]
+    fn torch_constraint_lines_pin_present_stack_in_stable_order() {
+        // Probe output arrives unordered and case-mixed; constraints come out in
+        // the canonical torch/torchvision/torchaudio order, one per present pkg.
+        let versions = vec![
+            ("torchvision".to_owned(), "0.22.0+gitabc".to_owned()),
+            ("Torch".to_owned(), "2.11.0+gitd0c8b1f".to_owned()),
+        ];
+        assert_eq!(
+            torch_constraint_lines(&versions),
+            vec![
+                "torch==2.11.0+gitd0c8b1f".to_owned(),
+                "torchvision==0.22.0+gitabc".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn torch_constraint_lines_empty_when_stack_absent() {
+        assert!(torch_constraint_lines(&[]).is_empty());
+        assert!(torch_constraint_lines(&[("numpy".to_owned(), "1.25.0".to_owned())]).is_empty());
+    }
+
+    #[test]
+    fn uv_install_args_include_constraint_flag_when_pinned() {
+        let python = Path::new("/runtime/bin/python");
+        let packages = vec!["numpy".to_owned()];
+        let constraints = PathBuf::from("/tmp/torch-constraints.txt");
+
+        let with_pin = uv_install_args(python, &packages, Some(&constraints));
+        assert!(
+            with_pin
+                .windows(2)
+                .any(|pair| pair == ["--constraint".to_owned(), constraints.display().to_string()]),
+            "expected --constraint <path> in {with_pin:?}"
+        );
+
+        let without_pin = uv_install_args(python, &packages, None);
+        assert!(
+            !without_pin.iter().any(|arg| arg == "--constraint"),
+            "no --constraint expected when nothing to pin: {without_pin:?}"
+        );
+    }
+
+    #[test]
     fn status_without_install_is_plain() -> Result<()> {
         let paths = test_paths("comfyui-status");
         let config = RocmCliConfig::default();
@@ -1937,6 +2126,8 @@ mod tests {
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2002,6 +2193,8 @@ mod tests {
                 library_paths: vec![sdk_lib.clone()],
                 ..Default::default()
             }),
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2098,6 +2291,8 @@ mod tests {
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2128,5 +2323,74 @@ mod tests {
             data_dir: root.join("data"),
             cache_dir: root.join("cache"),
         }
+    }
+
+    #[test]
+    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
+        // A multi-chunk body (the streaming downloader reads in 64 KiB
+        // chunks) so a single callback firing wouldn't already satisfy the
+        // "monotonically increasing" assertion below.
+        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let served = body.clone();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )?;
+            stream.write_all(&served)?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/archive.tar.gz");
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-comfyui-download-progress-{}",
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root)?;
+        let destination = root.join("archive.tar.gz");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        download_file(&url, &destination, &mut |bytes, total| {
+            calls.push((bytes, total));
+        })?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&root);
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.len() >= 2,
+            "expected at least a pre-transfer and a final callback: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last callback must report the complete transfer: {calls:?}"
+        );
+        Ok(())
     }
 }
