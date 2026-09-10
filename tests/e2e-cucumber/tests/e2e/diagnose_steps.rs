@@ -16,6 +16,16 @@ use crate::E2eWorld;
 /// so scenarios assert the shape of a match, not the id.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
+/// The error text a vLLM engine-startup import failure leaves behind, as a user
+/// would paste it. `libtorch_cuda.so` is the token that carries it: a ROCm build
+/// of torch ships `libtorch_hip.so` and never that file, so it scores on its own
+/// without needing the rest of the traceback.
+const ENGINE_IMPORT_SYMPTOM: &str =
+    "vllm engine fails to start: OSError: libtorch_cuda.so: cannot open shared object file";
+
+/// The catalog entry [`ENGINE_IMPORT_SYMPTOM`] must reach.
+const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
+
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
 /// recipes gate on host state (e.g. `$USER`) and return non-zero even for a
@@ -58,6 +68,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
     "fix-16-vllm-oom",
+    "fix-17-torch-dlpack",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -123,6 +134,16 @@ async fn user_hit_vllm_oom(world: &mut E2eWorld) {
     world.model_name = Some(
         "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string(),
     );
+}
+
+#[given("a user who hit the vLLM engine-startup import failure")]
+async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
+}
+
+#[given("a user who has chosen the fix for the engine-startup import failure")]
+async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
 }
 
 #[given("a user who has chosen a known fix")]
@@ -392,6 +413,89 @@ async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|verify| verify.contains("--gpu-memory-utilization")),
         "verification must not unconditionally prescribe the tenancy workaround:\n{output}"
+    );
+}
+
+#[then("the CLI reports the engine-startup import failure as an established cause")]
+async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    // Read the bar out of the document rather than restating 50: the report
+    // publishes it so callers need not hardcode it, and a test that hardcodes it
+    // is not exercising that.
+    let threshold = report
+        .get("min_score_for_match")
+        .and_then(serde_json::Value::as_i64)
+        .expect("diagnose JSON must publish its match threshold");
+    let score = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array")
+        .iter()
+        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(ENGINE_IMPORT_FIX_ID))
+        .and_then(|d| d.get("score"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| {
+            panic!("the catalog did not recognise the engine-startup import failure:\n{output}")
+        });
+    // Below the bar the entry is presented among the sub-threshold noise it was
+    // added to outrank, which is the state the report was in before it existed.
+    assert!(
+        score >= threshold,
+        "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
+         of {threshold}, so it is not an established cause:\n{output}"
+    );
+}
+
+#[then("the printed plan says which shell each step runs in")]
+async fn assert_plan_says_which_shell_each_step_runs_in(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The rendered block is a `Commands:` header followed by one `  $ <line>`
+    // per entry; `map_while` stops at the first line that is not one of those,
+    // which is the `Flags:` row underneath.
+    let commands: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .map_while(|line| line.strip_prefix("  $ "))
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "the preview printed no command block at all:\n{output}"
+    );
+    let position = |needle: &str| {
+        commands
+            .iter()
+            .position(|c| c.trim() == needle)
+            .unwrap_or_else(|| panic!("the printed plan no longer runs `{needle}`:\n{output}"))
+    };
+    let open = position("rocm engines shell vllm");
+    let leave = position("exit");
+    let act = position("rocm engines install vllm --reinstall");
+    // Ordered: the subshell is opened, then left, and only then is the engine
+    // reinstalled -- that step replaces the environment the subshell stands in.
+    assert!(
+        open < leave && leave < act,
+        "the plan must open the subshell, leave it, and only then reinstall:\n{output}"
+    );
+    let is_comment = |c: &&str| c.trim_start().starts_with('#');
+    // And labelled, not merely ordered: with every line carrying the same `$`
+    // prefix, a reader has nothing else to tell the two contexts apart.
+    assert!(
+        commands[open..leave]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("INSIDE")),
+        "the plan must say the probes run INSIDE the subshell:\n{output}"
+    );
+    assert!(
+        commands[leave..act]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("YOUR OWN shell")),
+        "the plan must say the reinstall runs back in the user's own shell:\n{output}"
     );
 }
 

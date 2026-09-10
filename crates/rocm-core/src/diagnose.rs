@@ -364,6 +364,34 @@ const KEYWORDS_VLLM_OOM: KeywordTable = &[
     ),
 ];
 
+/// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
+/// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
+///
+/// `libtorch_cuda.so` alone is worth exactly [`MIN_SCORE_FOR_MATCH`], on
+/// purpose. It is the one token in that traceback that cannot mean anything
+/// else — a ROCm build of torch ships `libtorch_hip.so` and never that file —
+/// and a user who pastes only the `OSError` line still has to clear the bar, or
+/// the entry loses to the sub-threshold noise it exists to outrank. Everything
+/// less specific stays below it: `torch_c_dlpack_ext` on its own says the
+/// extension is in the picture, not that it chose the wrong variant.
+const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
+    (
+        r"libtorch_cuda\.so",
+        50,
+        "error names libtorch_cuda.so, which a ROCm build of torch does not ship",
+    ),
+    (
+        "torch_c_dlpack_ext",
+        45,
+        "error names the torch_c_dlpack_ext extension",
+    ),
+    (
+        "_optional_torch_c_dlpack",
+        35,
+        "error names tvm_ffi's _optional_torch_c_dlpack shim",
+    ),
+];
+
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 ///
 /// Every entry that matches counts as an independent signal. This is the
@@ -1527,6 +1555,85 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
+/// The vLLM engine-startup import failure (EAI-8012).
+///
+/// Keyword-only, and not by preference. The fact that decides this failure is
+/// the torch version inside the *managed runtime*, and `Examination`'s framework
+/// probe imports torch from the ambient interpreter instead — on an affected
+/// host it reports `framework: unknown` with a `torch import failed` note, so
+/// the deciding fact is absent from the examination entirely. Nothing structural
+/// can fire until that probe targets the active runtime's interpreter, which is
+/// why the parameter is unused: the user has to supply the error text through
+/// `rocm diagnose --symptom "<pasted error>"`.
+///
+/// That is the only route to this entry from the symptom, and it is a narrow
+/// one: nothing on the serve or `rocm services` path points at `rocm diagnose`
+/// at all — a service that died at startup renders a `logs:` and a `restart:`
+/// hint and no more — so reaching this requires already knowing to paste the
+/// error into `diagnose`. The recipe is also reachable by name (`rocm fix` lists
+/// it, `rocm fix fix-17-torch-dlpack` prints it), but that needs the id rather
+/// than the symptom. Closing that gap means adding a diagnose hint to the
+/// service-failure output, which changes a shared surface for every failed
+/// service regardless of cause and belongs in its own change.
+fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
+    let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
+    if score <= 0 {
+        return zero(
+            "fix-17-torch-dlpack",
+            "torch-c-dlpack-ext loads its CUDA variant on ROCm",
+        );
+    }
+    let fix = Fix {
+        summary: "Only if the engine's runtime holds a ROCm build of torch in the 2.4-2.9 range with torch-c-dlpack-ext installed: reinstall the engine so its pinned torch is restored, which moves torch off the versions the extension ships prebuilts for.".to_owned(),
+        // Three labelled groups, because the steps run in three different places
+        // and the report renders them as one undifferentiated `$`-prefixed list.
+        // Unlabelled, a user pasting the block wholesale is relying on terminal
+        // stdin buffering to land the probes in the subshell -- and on the
+        // reinstall NOT landing there, since it replaces the very environment
+        // that shell is standing in.
+        commands: vec![
+            "# --- step 1 of 3, in YOUR shell ---".to_owned(),
+            "# Opens an INTERACTIVE subshell with the engine's environment active,".to_owned(),
+            "# and does not return until you leave it. Run this line on its own.".to_owned(),
+            "rocm engines shell vllm".to_owned(),
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---".to_owned(),
+            "# Confirm the trigger before changing anything. It has to be the".to_owned(),
+            "# ENGINE's interpreter, not the one on your PATH -- they are different".to_owned(),
+            "# interpreters, and only the engine's decides this failure.".to_owned(),
+            "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
+            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\""
+                .to_owned(),
+            "# This entry applies ONLY when torch.version.hip is set, torch.__version__".to_owned(),
+            "# is in the 2.4-2.9 range, and torch-c-dlpack-ext is installed. Outside".to_owned(),
+            "# that range the extension raises a handled ImportError and this is not".to_owned(),
+            "# the failure you are looking at. Then leave the subshell:".to_owned(),
+            "exit".to_owned(),
+            "# --- step 3 of 3, back in YOUR OWN shell ---".to_owned(),
+            "# If all three held, put the engine's pinned torch back. Do NOT run".to_owned(),
+            "# this from inside the subshell: it replaces the environment that".to_owned(),
+            "# shell is standing in.".to_owned(),
+            "rocm engines install vllm --reinstall".to_owned(),
+        ],
+        fix_id: "fix-17-torch-dlpack".to_owned(),
+        auto_applicable: false,
+        verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts".to_owned(),
+        notes: vec![
+            "Running vLLM on ROCm is not by itself a reason to apply this. The trigger is narrow: a ROCm build of torch in the 2.4-2.9 range (the versions torch-c-dlpack-ext ships prebuilts for), torch without a native __dlpack_c_exchange_api__, and torch-c-dlpack-ext present -- it arrives as a transitive dependency of tilelang, which vLLM pins.".to_owned(),
+            "The usual way a runtime lands in that range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.".to_owned(),
+            "The defect is upstream and there is nothing to correct locally: torch-c-dlpack-ext picks its variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant to pick. tvm_ffi imports it as optional but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so an explicitly optional import kills the process.".to_owned(),
+            "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-17-torch-dlpack",
+        "vLLM engine start aborts on torch-c-dlpack-ext loading its CUDA variant",
+        score,
+        evidence,
+        fix,
+    )
+}
+
 /// A checker plus the OS families it applies to.
 type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
 
@@ -1547,6 +1654,11 @@ const CHECKERS: &[Checker] = &[
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
     (check_16_vllm_oom, &["linux", "wsl"]),
+    // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
+    // gated off native Windows. 17 rather than 16 because the vLLM
+    // out-of-memory entry above already holds 16; the number is a stable
+    // handle, so the two do not get to share one.
+    (check_17_torch_dlpack_cuda_variant, &["linux"]),
 ];
 
 /// Run every applicable checker, drop zero-score results, sort by score
@@ -1918,6 +2030,84 @@ mod tests {
                 fix.summary
             );
         }
+    }
+
+    #[test]
+    fn the_engine_import_failure_outranks_the_render_group_false_lead() {
+        // The reported case, reduced to what makes the false lead fire: the user
+        // is outside the render and video groups, so the catalog's best answer
+        // to this symptom was fix-4 at 45 (35 render + 10 video), and following
+        // it meant a usermod, a re-login, and no progress. The fixture leaves
+        // `kfd` unset rather than modelling the reported host's permissions,
+        // because fix-4's score here comes from the group membership alone.
+        // The fixture reproduces that false lead, so the assertion is about the
+        // ranking and not only about the new entry's score.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+
+        let report = diagnose(
+            &e,
+            "vllm engine fails to start: OSError: libtorch_cuda.so: cannot open shared object file",
+        );
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-17-torch-dlpack");
+        assert!(top.score >= MIN_SCORE_FOR_MATCH, "score was {}", top.score);
+        assert!(report.has_match());
+
+        let render_group = report
+            .matched
+            .iter()
+            .position(|d| d.id == "fix-4-render-group")
+            .expect("the fixture must still produce the false lead this outranks");
+        assert!(
+            render_group > 0,
+            "the render-group suggestion must no longer be the top answer here"
+        );
+    }
+
+    #[test]
+    fn the_engine_import_plan_says_which_shell_each_step_runs_in() {
+        // The plan `diagnose` attaches to the finding is a second copy of the
+        // catalog recipe's command block, and it is the copy the reported user
+        // actually saw. Hold it to the same boundary the recipe is held to, so
+        // the two cannot drift into disagreeing about which shell runs what.
+        let report = diagnose(
+            &linux_base(),
+            "OSError: libtorch_cuda.so: cannot open shared object file",
+        );
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-17-torch-dlpack")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_engine_shell_boundary_is_labelled(&fix.fix_id, &commands);
+        // The boundary check alone leaves the wording free to drift, so pin the
+        // two copies to each other line for line as well.
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_extension_name_alone_does_not_establish_the_variant_failure() {
+        // The extension appearing in a traceback says it is involved, not that
+        // it loaded the CUDA variant. Holding this under the threshold is what
+        // stops the entry from answering every vLLM import error.
+        let report = diagnose(
+            &linux_base(),
+            "ImportError raised from torch_c_dlpack_ext during startup",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-17-torch-dlpack")
+            .expect("the keyword should still register as a weak signal");
+        assert!(
+            hit.score < MIN_SCORE_FOR_MATCH,
+            "score was {}, which would promote a weak signal to an established cause",
+            hit.score
+        );
     }
 
     #[test]

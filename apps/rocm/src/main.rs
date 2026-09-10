@@ -5,6 +5,7 @@
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
+mod cli_progress;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -41,7 +42,7 @@ use rocm_core::{
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
-    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    read_http_response_bounded, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
     shell_command_for_host, uv_cache_source, write_all_tcp_stream,
@@ -5278,7 +5279,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
     if background {
         let mut spinner =
-            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
         let report = start_managed_service(
             &selected_engine,
@@ -9205,6 +9206,7 @@ fn adopt_runtime_from_probe(
         // Adoption does not install torch, so the build is derived from the SDK
         // version instead.
         sdk_torch: None,
+        wheel_composition: None,
         read_only: true,
         imported_from: Some(install_root),
         installed_at_unix_ms: rocm_core::unix_time_millis(),
@@ -13669,11 +13671,43 @@ pub(crate) fn render_engine_inventory_text() -> String {
     render_engine_inventory_text_with_paths(paths.as_ref())
 }
 
+/// Marker shown beside the engine `serve`/CLI commands default to. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const DEFAULT_ENGINE_MARKER: &str = "*";
+
+/// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
+/// engine-inventory renderers so the two copies cannot drift apart.
+fn write_default_engine_legend(output: &mut String) {
+    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+}
+
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    // A configured `default_engine` still wins over the host preference, mirroring
+    // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
+    // the legend could mark an engine `serve` will not actually default to.
+    let configured_default_engine = paths.and_then(|paths| {
+        RocmCliConfig::load(paths)
+            .ok()
+            .and_then(|config| config.default_engine)
+    });
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or the marker would land on an engine name
+    // that is empty rather than falling back.
+    let default_engine = configured_default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == default_engine);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -13690,8 +13724,15 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     } else {
         let _ = writeln!(output, "  Plugin folders: not checked");
     }
+    if any_marked {
+        write_default_engine_legend(&mut output);
+    }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine { "*" } else { " " };
+        let marker = if *name == default_engine {
+            DEFAULT_ENGINE_MARKER
+        } else {
+            " "
+        };
         let _ = writeln!(output, "{marker} {name:10} {note}");
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -13807,11 +13848,23 @@ fn append_examine_engine_inventory(
     config: &RocmCliConfig,
     host_default_engine: &str,
 ) {
-    let configured_default = config.default_engine.as_deref();
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or `effective_default` below would become
+    // an engine name that is empty rather than falling back.
+    let configured_default = config
+        .default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     // A configured value still wins, mirroring `select_serve_engine`. Only the
     // fallback becomes GPU-aware: it used to be the platform constant, which
     // reported Lemonade on Instinct where serve picks vLLM.
     let effective_default = configured_default.unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == effective_default);
     let _ = writeln!(output, "engine_inventory:");
     // Unchanged on purpose: this line means "what the user configured", so an
     // unset value must keep reading as unset rather than borrowing the host default.
@@ -13852,9 +13905,12 @@ fn append_examine_engine_inventory(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if any_marked {
+        write_default_engine_legend(output);
+    }
     for (engine, note) in engine_inventory() {
         let marker = if *engine == effective_default {
-            "*"
+            DEFAULT_ENGINE_MARKER
         } else {
             " "
         };
@@ -15832,7 +15888,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15851,6 +15907,7 @@ fn apply_runtime_update(
         therock::runtime_version_display(&plan.latest_version)
     );
     let _ = writeln!(output, "  status: {}", plan.status);
+    let _ = writeln!(output, "  target_runtime_key: {}", plan.target_runtime_key);
     let _ = writeln!(output, "  activate_after_install: {activate}");
     if !plan.update_available {
         let _ = writeln!(output, "  result: no newer runtime found");
@@ -15859,13 +15916,12 @@ fn apply_runtime_update(
 
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
-        let install_plan = therock::install_sdk(
+        let install_plan = therock::install_sdk_for_update(
             paths,
             &source.channel,
             &source.format,
-            None,
-            None,
-            None,
+            &source.family,
+            plan.device_target.as_deref(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15875,18 +15931,26 @@ fn apply_runtime_update(
         return Ok(output);
     }
 
-    let install_output = therock::install_sdk(
+    let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
         &source.format,
-        None,
-        None,
-        None,
+        &source.family,
+        plan.device_target.as_deref(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
-    let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
-        .context("updated runtime install completed but the new runtime manifest was not found")?;
+    // By exact key, never by version: a same-version repair installs a sibling
+    // that shares the source's channel, format, family AND version, so a
+    // version match would just as happily return the stale runtime this update
+    // was meant to replace, and then activate it.
+    let installed = select_installed_update_runtime(&manifests_after, &plan.target_runtime_key)
+        .with_context(|| {
+            format!(
+                "runtime install completed but no manifest was written for the planned runtime key `{}`",
+                plan.target_runtime_key
+            )
+        })?;
     let _ = writeln!(output, "  installed_runtime_key: {}", installed.runtime_key);
     let _ = writeln!(
         output,
@@ -15951,15 +16015,11 @@ fn select_runtime_update_source<'a>(
 
 fn select_installed_update_runtime<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
-    source: &therock::InstalledRuntimeManifest,
-    latest_version: &str,
+    target_runtime_key: &str,
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests.iter().find(|manifest| {
-        manifest.channel == source.channel
-            && manifest.format == source.format
-            && manifest.family == source.family
-            && manifest.version == latest_version
-    })
+    manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key == target_runtime_key)
 }
 
 pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
@@ -19266,6 +19326,7 @@ fn http_get_local_service(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     // Authenticate the probe when the endpoint is protected; loopback endpoints
@@ -19279,7 +19340,7 @@ fn http_get_local_service(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service readiness request")?;
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .context("failed to read service readiness response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -19300,6 +19361,7 @@ fn http_post_local_service_json(
     body: &serde_json::Value,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     let body = serde_json::to_string(body).context("failed to serialize service request")?;
@@ -19310,8 +19372,8 @@ fn http_post_local_service_json(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service request")?;
-    let response =
-        read_tcp_stream_to_string(&mut stream).context("failed to read service response")?;
+    let response = read_http_response_bounded(&mut stream, deadline)
+        .context("failed to read service response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .unwrap_or((response.as_str(), ""));
@@ -20620,6 +20682,70 @@ mod tests {
     }
 
     #[test]
+    fn lemonade_stop_unload_is_bounded_by_the_request_timeout() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the stall this PR fixes: a peer that trickles the
+        // response one byte at a time, never framing or closing, used to stall
+        // `read_tcp_stream_to_string`'s read-to-EOF loop indefinitely. That hung
+        // `unload_lemonade_service_model` past its 5s timeout during scenario
+        // teardown, showing up as an unexplained multi-minute gap. The unload
+        // call must now return an error at (not far past) its 5s budget.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer);
+            let body = b"{\"status\":\"success\",\"message\":\"ok\"}";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            // One byte every 300ms never finishes framing the 35-byte body
+            // inside the 5s unload timeout below, so the bound under test is
+            // the deadline firing, not the response completing early.
+            for byte in body {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+
+        let (_root, paths) = test_paths("lemonade-stop-unload-dribble");
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-qwen",
+            "lemonade",
+            "qwen",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            Some("therock-release".to_owned()),
+            Some("lemonade-embeddable-10.6.0".to_owned()),
+            Some("gpu_required".to_owned()),
+        );
+        let started = Instant::now();
+        assert!(unload_lemonade_service_model(&record).is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "bounded BY the 5s deadline, not failing early: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        Ok(())
+    }
+
+    #[test]
     fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -20719,6 +20845,71 @@ mod tests {
 
         assert_eq!(readiness, EndpointReadiness::Serving);
         assert_eq!(status_for_readiness(readiness), "ready");
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_readiness_ready_verdict_does_not_wait_for_the_peer_to_close() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the other half of this PR's fix: a response is
+        // read to completion by its own framing, not by waiting for the peer
+        // to close. Before this fix, `read_tcp_stream_to_string` blocked
+        // until EOF, so a keep-alive engine that answers correctly but never
+        // closes the socket looked identical to a hung one — the readiness
+        // probe ran out its timeout and reported not-ready even though the
+        // answer had already arrived.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buffer = [0_u8; 1024];
+                    let Ok(read) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let body = if request.starts_with("POST /v1/chat/completions ") {
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                    } else {
+                        r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    // Hold the connection open well past the readiness wait's
+                    // timeout below, and deliberately omit `Connection:
+                    // close`. The client must not need EOF to recognize the
+                    // response as complete.
+                    thread::sleep(Duration::from_secs(10));
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a complete response must be recognized without waiting on the peer to close"
+        );
+        // `server`'s accept loop runs forever; dropping the JoinHandle detaches
+        // it rather than joining, and the thread dies with the test process.
         drop(server);
         Ok(())
     }
@@ -29550,6 +29741,84 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn render_engine_inventory_text_includes_marker_legend() {
+        let (root, paths) = test_paths("engine-inventory-marker-legend");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        // Anchor on the marked row itself (not just `"{DEFAULT_ENGINE_MARKER} "`,
+        // which also matches inside the legend line and would pass even if no
+        // row were actually marked).
+        let marker_pos = rendered
+            .find(&format!("{DEFAULT_ENGINE_MARKER} {host_default}"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
+        // A configured default naming an external plugin (or a stale/typo'd
+        // name) matches zero rows in `engine_inventory()`'s built-ins list —
+        // the legend would then explain a marker that appears nowhere.
+        let (root, paths) = test_paths("engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !rendered.contains("legend:"),
+            "legend must be absent when the configured default matches no built-in engine; got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
@@ -30207,6 +30476,47 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn examine_engine_inventory_includes_marker_legend() {
+        let (root, paths) = test_paths("examine-engine-inventory-marker-legend");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = output.find(&legend).expect("legend line present");
+        let marker_pos = output
+            .find(&format!("{DEFAULT_ENGINE_MARKER} vllm"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{output}"
+        );
+    }
+
+    #[test]
+    fn examine_engine_inventory_omits_legend_when_effective_default_matches_nothing() {
+        // Same gap as `render_engine_inventory_text_with_paths`: an effective
+        // default naming an external plugin (or a stale/typo'd name) matches
+        // zero rows in `engine_inventory()`'s built-ins list.
+        let (root, paths) = test_paths("examine-engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !output.contains("legend:"),
+            "legend must be absent when the effective default matches no built-in engine; got:\n{output}"
+        );
+    }
+
     // ---------- engine shell prompt shim ----------
 
     #[test]
@@ -30403,6 +30713,14 @@ ID_LIKE="suse opensuse"
             output.contains("rocm config clear-default-engine"),
             "the note must name the remedy, not just the problem:\n{output}"
         );
+        assert!(
+            output.contains("  * lemonade "),
+            "the '*' marker must land on the configured engine, not the host's:\n{output}"
+        );
+        assert!(
+            !output.contains("  * vllm "),
+            "the host's preferred engine must not also be marked once overridden:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -30420,6 +30738,36 @@ ID_LIKE="suse opensuse"
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_treats_a_blank_configured_engine_as_unset() {
+        // Mirrors `select_serve_engine`'s guard: a config file with
+        // `default_engine = ""` must fall back to the host preference rather
+        // than reporting an empty engine name as "effective" and marking none
+        // of the real ones.
+        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
+        let config = RocmCliConfig {
+            default_engine: Some(String::new()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("configured_default_engine: <platform default>"),
+            "a blank configured value must read as unset:\n{output}"
+        );
+        assert!(
+            output.contains("effective_default_engine: vllm"),
+            "a blank configured value must fall back to the host default:\n{output}"
+        );
+        assert!(
+            output.contains("  * vllm "),
+            "the '*' marker must land on the host's default, not an empty name:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -30469,32 +30817,40 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn installed_update_runtime_matches_latest_version_and_family() {
-        let mut source = test_runtime_manifest_for_update(
-            "old-gfx120",
+    fn installed_update_runtime_is_selected_by_exact_target_key() {
+        // Everything a version match would have keyed on is identical here:
+        // same channel, format, family and version. Only the composition-keyed
+        // runtime key tells the freshly installed repair apart from the stale
+        // runtime it was installed to replace.
+        let stale = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.13.0a20260416",
+            "7.14.0",
         );
-        source.channel = "release".to_owned();
         let wrong_family = test_runtime_manifest_for_update(
-            "new-gfx110",
+            "release-wheel-multi-arch-7-14-0-ffffffffffffffff",
             "therock-release:gfx110X-all",
             "gfx110X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let target = test_runtime_manifest_for_update(
-            "new-gfx120",
+        let repaired = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0-0123456789abcdef",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let manifests = vec![wrong_family, target.clone()];
+        let manifests = vec![stale, wrong_family, repaired.clone()];
 
-        let selected = select_installed_update_runtime(&manifests, &source, "7.14.0a20260531")
-            .expect("matching updated runtime should be selected");
+        let selected = select_installed_update_runtime(&manifests, &repaired.runtime_key)
+            .expect("the side-by-side repair must be selected by its exact key");
+        assert_eq!(selected.runtime_key, repaired.runtime_key);
 
-        assert_eq!(selected.runtime_key, target.runtime_key);
+        assert!(
+            select_installed_update_runtime(&manifests, "release-wheel-multi-arch-7-15-0")
+                .is_none(),
+            "an install that wrote no manifest for the planned key must not resolve to a sibling"
+        );
     }
 
     fn write_test_pip_runtime(
@@ -30568,6 +30924,7 @@ ID_LIKE="suse opensuse"
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -30607,6 +30964,7 @@ ID_LIKE="suse opensuse"
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 1,

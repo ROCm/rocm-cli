@@ -6,7 +6,11 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+/// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
+///
+/// Shared with `runtime_steps`, which reads the same shape out of the `install
+/// sdk` preview.
+pub(crate) fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
     output.lines().find_map(|line| {
         let (name, value) = line.trim().split_once(':')?;
         (name == field).then(|| value.trim())
@@ -17,8 +21,8 @@ fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
 async fn setup_gpu_machine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
-        stdout.contains("AMD GPU detected") || stdout.contains("detected_gfx_target"),
-        "no AMD GPU detected on this machine:\n{stdout}"
+        field_value(&stdout, "detected_gfx_target").is_some_and(|target| target.starts_with("gfx")),
+        "no AMD GPU target detected on this machine:\n{stdout}"
     );
 }
 
@@ -176,6 +180,44 @@ async fn assert_all_engines_listed(world: &mut E2eWorld) {
             "engine '{engine}' not found in:\n{output}"
         );
     }
+}
+
+#[then("the engine listing explains the default-engine marker")]
+async fn engine_listing_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the listing")]
+async fn host_default_engine_marked_in_listing(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("* {expected}")),
+        "expected '{expected}' marked as the default engine, got:\n{output}"
+    );
+}
+
+#[then("the inspection explains the default-engine marker")]
+async fn inspection_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend in examine output, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the inspection's engine inventory")]
+async fn host_default_engine_marked_in_inspection(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("  * {expected} ")),
+        "expected '{expected}' marked as the default engine in engine_inventory, got:\n{output}"
+    );
 }
 
 #[then("the inspection reports Linux as the operating system")]

@@ -733,6 +733,24 @@ impl CellOutcome {
     }
 }
 
+/// One (outcome, human explanation) entry per glyph, in the grid legend's
+/// display order. Shared by the HTML and Markdown legends so a new
+/// `CellOutcome` variant can't update one copy and leave the other stale.
+const LEGEND_ENTRIES: &[(CellOutcome, &str)] = &[
+    (CellOutcome::Pass, "pass"),
+    (CellOutcome::Xfail, "known bug, failed as expected (xfail)"),
+    (CellOutcome::Skip, "not applicable here"),
+    (CellOutcome::UnexpectedFail, "regression"),
+    (CellOutcome::Xpass, "bug fixed here (stale entry)"),
+    (CellOutcome::FlakyXpass, "known flaky bug passed this run"),
+    (CellOutcome::RanWhenNa, "ran despite being marked n/a"),
+    (
+        CellOutcome::Absent,
+        "expected to run but no result recorded",
+    ),
+    (CellOutcome::Missing, "no data."),
+];
+
 /// One platform column of the reconciled (scenario-id × platform) grid.
 struct GridColumn {
     /// Platform identity from the manifest (e.g. "mi300x", "strix-halo", "mock").
@@ -1351,11 +1369,15 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
     html! {
         h2 { "Expectation grid (scenario × platform)" }
         p.grid-legend {
-            "✅ pass · "
-            span.status-xfail { "✗" } " known bug, failed as expected (xfail) · "
-            "n/a not applicable here · "
-            span.status-fail { "❌FAIL" } " regression · "
-            "⚠️XPASS bug fixed here (stale entry) · · no data."
+            @for (i, (outcome, text)) in LEGEND_ENTRIES.iter().copied().enumerate() {
+                @if i > 0 { " · " }
+                @if outcome.grid_class().is_empty() {
+                    (outcome.glyph())
+                } @else {
+                    span class=(outcome.grid_class()) { (outcome.glyph()) }
+                }
+                " " (text)
+            }
         }
         // One table per feature, so a reader can scan a single area of the CLI
         // instead of one undivided 60-row block.
@@ -1437,10 +1459,12 @@ fn expectation_grid_markdown(
     }
 
     let mut out = String::from("\n### Expectation grid (scenario × platform)\n\n");
-    out.push_str(
-        "_✅ pass · ✗ known bug (failed as expected, i.e. xfail) · n/a not applicable here · \
-         ❌FAIL regression · ⚠️XPASS bug fixed here (stale entry) · · no data._\n\n",
-    );
+    let legend = LEGEND_ENTRIES
+        .iter()
+        .map(|(outcome, text)| format!("{} {text}", outcome.glyph()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let _ = writeln!(out, "_{legend}_\n");
 
     // One table per feature, under its own heading — a single undivided table of
     // every scenario in the suite is unreadable, and gives no clue where one area
@@ -2862,6 +2886,127 @@ mod tests {
         assert!(
             !md.contains("**XPASS** on"),
             "flaky XPASS must not need attention:\n{md}"
+        );
+    }
+
+    #[test]
+    fn expectation_grid_legend_explains_every_glyph() {
+        // The legend must explain every glyph `CellOutcome::glyph()` can emit,
+        // not just the original pass/xfail/n-a/FAIL/XPASS/no-data set — flaky
+        // XPASS, ran-when-n/a, and absent results are real states a reader can
+        // land on and must not be left silently unexplained.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+
+        let md = consolidated_summary_markdown(&inputs);
+        for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
+            assert!(
+                md.contains(glyph),
+                "markdown grid legend must explain {glyph:?}:\n{md}"
+            );
+        }
+
+        let html = expectation_grid_html(&inputs).into_string();
+        for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
+            assert!(
+                html.contains(glyph),
+                "html grid legend must explain {glyph:?}:\n{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn legend_entries_stay_exhaustive_with_cell_outcome() {
+        // `expected_text`'s match is exhaustive, so adding a `CellOutcome`
+        // variant without adding an arm here is a compile error — unlike the
+        // hardcoded 3-glyph check above, this can't silently miss a 10th
+        // variant the way `LEGEND_ENTRIES` alone could.
+        fn expected_text(outcome: CellOutcome) -> &'static str {
+            match outcome {
+                CellOutcome::Pass => "pass",
+                CellOutcome::Xfail => "known bug, failed as expected (xfail)",
+                CellOutcome::Skip => "not applicable here",
+                CellOutcome::UnexpectedFail => "regression",
+                CellOutcome::Xpass => "bug fixed here (stale entry)",
+                CellOutcome::FlakyXpass => "known flaky bug passed this run",
+                CellOutcome::RanWhenNa => "ran despite being marked n/a",
+                CellOutcome::Absent => "expected to run but no result recorded",
+                CellOutcome::Missing => "no data.",
+            }
+        }
+        const ALL: [CellOutcome; 9] = [
+            CellOutcome::Pass,
+            CellOutcome::Xfail,
+            CellOutcome::Skip,
+            CellOutcome::UnexpectedFail,
+            CellOutcome::Xpass,
+            CellOutcome::FlakyXpass,
+            CellOutcome::RanWhenNa,
+            CellOutcome::Absent,
+            CellOutcome::Missing,
+        ];
+
+        assert_eq!(
+            LEGEND_ENTRIES.len(),
+            ALL.len(),
+            "LEGEND_ENTRIES must have exactly one entry per CellOutcome variant"
+        );
+        for outcome in ALL {
+            let entry = LEGEND_ENTRIES
+                .iter()
+                .find(|(o, _)| *o == outcome)
+                .unwrap_or_else(|| panic!("{outcome:?} has no LEGEND_ENTRIES explanation"));
+            assert_eq!(
+                entry.1,
+                expected_text(outcome),
+                "{outcome:?}'s LEGEND_ENTRIES text drifted from the source of truth"
+            );
+        }
+    }
+
+    #[test]
+    fn expectation_grid_html_legend_colors_every_red_glyph() {
+        // Every outcome that renders red in the grid (`grid_class() ==
+        // "status-fail"`) must also render red in the legend, not just the
+        // original Xfail/UnexpectedFail pair — Xpass, RanWhenNa, and Absent
+        // are equally `status-fail` in the grid and were previously left as
+        // plain, uncoloured glyphs in the legend.
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "expectations": [
+                {"id":"serve-x","effective_engine":"vllm","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mi300x".to_string(), path)];
+
+        let html = expectation_grid_html(&inputs).into_string();
+        for glyph in ["⚠️XPASS", "⚠️n/a-ran", "⚠️no-result", "❌FAIL"] {
+            let needle = format!("class=\"status-fail\">{glyph}</span>");
+            assert!(
+                html.contains(&needle),
+                "legend must colour {glyph:?} status-fail:\n{html}"
+            );
+        }
+        // The known-bug xfail glyph is styled grey (status-xfail), not red.
+        assert!(
+            html.contains("class=\"status-xfail\">✗</span>"),
+            "legend must colour the xfail glyph status-xfail:\n{html}"
+        );
+        // Genuinely unstyled outcomes stay bare glyphs, not empty-class spans.
+        assert!(
+            !html.contains("class=\"\">"),
+            "unstyled legend glyphs must not be wrapped in an empty-class span:\n{html}"
         );
     }
 
