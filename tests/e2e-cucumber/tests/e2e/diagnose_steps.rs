@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -39,6 +40,15 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// already in the groups, and `fix-6-path` exits early with "no ROCm install
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// The recipe used to prove a failed helper command is explained on stderr with
+/// exit code 4. `fix-4-render-group` is the only AUTO recipe whose command-failure
+/// branch this suite can force deterministically: its helper (`usermod`, run
+/// directly as root or via `sudo` otherwise) is resolved off `$PATH`, so a
+/// scenario-controlled `$PATH` (see `command_fails_bin_dir`) can stand a fake
+/// `usermod`/`sudo` in for it, unconditionally failing, without needing real
+/// root or touching real group membership.
+const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
@@ -119,6 +129,18 @@ fn fix_rc_file(world: &E2eWorld) -> std::path::PathBuf {
     fix_home(world).join(".bashrc")
 }
 
+/// The directory this scenario stands in for `$PATH`, holding the fake
+/// `usermod`/`sudo` scripts. Scoped under the scenario's isolated root so it is
+/// cleaned up with everything else.
+fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin")
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a user who hit a known ROCm failure")]
@@ -162,6 +184,34 @@ async fn user_chose_mutating_fix(world: &mut E2eWorld) {
 #[given("a user who has chosen a fix meant for a different operating system")]
 async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
     world.model_name = Some(fix_id_for_the_other_os().to_string());
+}
+
+#[given("a user who has approved a fix whose helper command will fail")]
+async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
+    let bin_dir = command_fails_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
+    // `usermod` only has to exist for the `which` probe; the command actually run
+    // -- `usermod` directly if already root, `sudo usermod ...` otherwise -- goes
+    // through one of these two scripts either way, and both fail unconditionally.
+    for name in ["usermod", "sudo"] {
+        let script = bin_dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+            .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
+        }
+    }
+    // Restricting `$PATH` to only the fakes above also makes the recipe's
+    // root-detection deterministic: it shells out to `id -u`, which is not on
+    // this PATH, so the spawn itself fails and reads as "not root" regardless of
+    // who runs the suite -- the same `sudo usermod` branch fails on every host,
+    // CI or developer machine, root or not.
+    world.command_env.push(("PATH", bin_dir.into_os_string()));
+    world.command_env.push(("USER", "e2e-test-user".into()));
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
 #[given("a user who refers to a cause by its position in the diagnosis")]
@@ -229,6 +279,52 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply the approved fix")]
+async fn user_applies_approved_fix(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user is asked interactively to apply it and types no")]
+async fn user_declines_fix_interactively(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let home = fix_home(world).display().to_string();
+    // `run_rocm`'s piped stdin can never reach `confirm()`'s interactive
+    // branch: `is_terminal()` is always false there. A real pseudo-terminal is
+    // the only way to reach it, so this step (unlike every other one in this
+    // file) drives the CLI through `TuiSession` instead of `run_rocm`.
+    //
+    // `TuiSession`'s own isolation (`pty_env`) sets HOME to a PTY-only sandbox
+    // it owns and never sets SHELL, so without overriding both here the fix
+    // would resolve to a different — and possibly nonexistent — rc file than
+    // the one the `Given` step planted, the same way the piped sibling
+    // (`user_applies_fix_without_agreeing`) overrides them via
+    // `run_rocm_with_env`.
+    let mut session = TuiSession::spawn_with_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1"],
+        &[("HOME", home.as_str()), ("SHELL", "/bin/bash")],
+    )
+    .unwrap_or_else(|e| panic!("failed to open the fix prompt: {e}"));
+    session
+        .wait_for_screen("[y/N]:", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the confirmation prompt never appeared: {e}"));
+    session
+        .send("n\r")
+        .unwrap_or_else(|e| panic!("failed to type the decline: {e}"));
+    let rc = session
+        .wait_for_exit_code(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the CLI never exited after declining: {e}"));
+    world.cli_output = Some(session.screen_text());
+    world.cli_rc = Some(rc);
+    world.tui = Some(session);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -587,10 +683,15 @@ async fn assert_inapplicable_fix_declined(world: &mut E2eWorld) {
         Some(3),
         "a fix that does not apply here should exit 3, distinct from 2/4/5"
     );
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        output.contains("This fix only applies on:"),
-        "the refusal must say which platforms the fix is for:\n{output}"
+        stderr.contains("This fix only applies on:"),
+        "the refusal must say which platforms the fix is for, on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("This fix only applies on:"),
+        "the platform refusal must not also be on stdout:\n{stdout}"
     );
 }
 
@@ -696,14 +797,10 @@ async fn assert_unknown_fix_refused(world: &mut E2eWorld) {
         Some(2),
         "unknown fix-id should exit 2 (unknown id)"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("Unknown fix-id"),
-        "expected an 'Unknown fix-id' message:\n{combined}"
+        stderr.contains("Unknown fix-id"),
+        "expected an 'Unknown fix-id' message on stderr:\n{stderr}"
     );
 }
 
@@ -716,41 +813,59 @@ async fn assert_position_argument_corrected(world: &mut E2eWorld) {
         Some(2),
         "a position argument should exit 2 like any unknown id"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("position"),
-        "the refusal must say the argument was read as a position:\n{combined}"
+        stderr.contains("position"),
+        "the refusal must say the argument was read as a position, on stderr:\n{stderr}"
     );
     // And it must point at what to use instead, or the correction is useless.
     assert!(
-        combined.contains("id:"),
-        "the refusal must name the identifier to use instead:\n{combined}"
+        stderr.contains("id:"),
+        "the refusal must name the identifier to use instead, on stderr:\n{stderr}"
     );
 }
 
 #[then("the CLI refuses and explains that it needs agreement")]
 async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     // The refusal has to say *why* and how to proceed. A bare non-zero exit
     // reads as a broken fix rather than a deliberate stop.
     assert!(
-        output.contains("--yes"),
-        "the refusal must name what to pass to proceed:\n{output}"
+        stderr.contains("--yes"),
+        "the refusal must name what to pass to proceed, on stderr:\n{stderr}"
     );
     assert!(
-        output.contains("refusing to apply"),
-        "the refusal must say it did not apply the fix:\n{output}"
+        stderr.contains("refusing to apply"),
+        "the refusal must say it did not apply the fix, on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("refusing to apply"),
+        "the agreement refusal must not also be on stdout:\n{stdout}"
     );
     // Distinct from the unknown-id refusal (2), so a script can tell "you did
     // not agree" apart from "no such fix".
     assert_eq!(
         world.cli_rc,
         Some(5),
-        "declining to apply is its own outcome, not an error:\n{output}"
+        "declining to apply is its own outcome, not an error:\n{stderr}"
+    );
+}
+
+#[then("the CLI declines on the terminal and explains that it needs agreement")]
+async fn assert_interactive_decline_reported(world: &mut E2eWorld) {
+    // Same outcome as the non-interactive refusal (diagnose-08): declining is
+    // its own outcome, not an error.
+    assert_eq!(
+        world.cli_rc,
+        Some(5),
+        "declining an interactive prompt is its own outcome, not an error"
+    );
+    let screen = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        screen.contains("Not confirmed; refusing to apply."),
+        "the terminal must show the same decline message the non-interactive \
+         path reports, on screen:\n{screen}"
     );
 }
 
@@ -772,5 +887,26 @@ async fn assert_rc_file_untouched(world: &mut E2eWorld) {
         PLANTED_RC,
         "declining the fix must leave {} byte-for-byte unchanged",
         rc_file.display()
+    );
+}
+
+#[then("the CLI reports the command failure on stderr with exit code 4")]
+async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
+    // 4 is its own outcome: a command that ran and failed, distinct from 3
+    // (does not apply here) and 5 (user declined).
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a fix whose helper command fails should exit 4"
+    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert!(
+        stderr.contains("usermod exited") && stderr.contains("group membership NOT changed"),
+        "the command-failure explanation must be on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("group membership NOT changed"),
+        "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }

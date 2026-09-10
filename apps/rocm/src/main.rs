@@ -63,6 +63,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1125,7 +1126,84 @@ fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn main() -> Result<()> {
+/// Marker error carrying `rocm fix`'s exit code back through `main()`'s
+/// ordinary return path, instead of calling `std::process::exit` mid-stack
+/// and skipping the `_log_guard` destructor held in `run()`.
+///
+/// `exit_code_for` recovers the code via `downcast_ref`, which searches the
+/// whole error chain — wrapping the `fix()` call with `.context(...)` is
+/// fine. What does break it is discarding this error instead of chaining it,
+/// e.g. `.map_err(|e| anyhow!("fix failed: {e}"))`, which loses the
+/// underlying type and silently falls through to the generic "Error: ..."
+/// branch instead of the carried exit code.
+#[derive(Debug)]
+struct FixExitCode(i32);
+
+impl std::fmt::Display for FixExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fix exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for FixExitCode {}
+
+/// Marker error carrying a clap usage/parse error's exit code back through
+/// `main()`'s ordinary return path, for the same reason [`FixExitCode`]
+/// exists: `clap::Error::exit()` calls `std::process::exit` mid-stack, which
+/// would skip the `_log_guard` destructor held in `run()`. The error is
+/// printed at the point it's constructed (clap knows which stream and
+/// formatting a given error kind wants); this type only carries the exit
+/// code onward.
+#[derive(Debug)]
+struct ClapExitCode(i32);
+
+impl std::fmt::Display for ClapExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clap exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ClapExitCode {}
+
+/// Print a clap usage/parse error on the stream and in the format clap itself
+/// chooses, then carry its exit code onward as a [`ClapExitCode`] instead of
+/// calling `err.exit()`, which would `std::process::exit` mid-stack and skip
+/// the `_log_guard` destructor.
+fn clap_exit_code(err: clap::Error) -> anyhow::Error {
+    let code = err.exit_code();
+    let _ = err.print();
+    ClapExitCode(code).into()
+}
+
+fn main() -> ExitCode {
+    exit_code_for(run())
+}
+
+/// Maps `run()`'s result to a process exit code, unwrapping a `FixExitCode`
+/// or `ClapExitCode` to its carried code and otherwise reproducing the
+/// standard `Result<(), anyhow::Error>` `Termination` behavior (print the
+/// error to stderr, exit 1).
+fn exit_code_for(result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if let Some(FixExitCode(code)) = e.downcast_ref::<FixExitCode>() {
+                ExitCode::from(*code as u8)
+            } else if let Some(ClapExitCode(code)) = e.downcast_ref::<ClapExitCode>() {
+                ExitCode::from(*code as u8)
+            } else {
+                // Match the standard `Result<(), E>` `Termination` behavior exactly:
+                // ignore a failed write here rather than `eprintln!`, which panics.
+                // A caller with a closed stderr pipe must still see exit code 1, not
+                // a panic that replaces it.
+                let _ = writeln!(io::stderr(), "Error: {e:?}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     reset_sigpipe();
 
     // Held for the whole process lifetime: dropping it flushes and stops the
@@ -1152,7 +1230,7 @@ fn main() -> Result<()> {
         // exit, instead of dumping a request plan from the natural-language
         // planner.
         if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
-            err.exit();
+            return Err(clap_exit_code(err));
         }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
@@ -1165,7 +1243,7 @@ fn main() -> Result<()> {
         );
     }
 
-    dispatch(parse_cli())
+    dispatch(parse_cli()?)
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
@@ -1189,9 +1267,16 @@ fn cli_command() -> clap::Command {
 /// `rocm help` list subcommands alphabetically. Mirrors the derived
 /// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
 /// cannot pick up the reordering.
-fn parse_cli() -> Cli {
-    let matches = cli_command().get_matches();
-    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+///
+/// Returns a [`ClapExitCode`]-carrying error instead of calling
+/// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
+/// after `_log_guard` has dropped rather than mid-stack. This covers both
+/// places clap can fail here: `try_get_matches()` for an ordinary argv parse
+/// error (a bad flag, `--help`, a missing required argument — the common
+/// case), and `from_arg_matches()` for the derive step below it.
+fn parse_cli() -> Result<Cli> {
+    let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
+    Cli::from_arg_matches(&matches).map_err(clap_exit_code)
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1668,6 +1753,10 @@ fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
         Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        // Keep this error chained rather than discarding it into a fresh
+        // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
+        // `FixExitCode`'s doc comment for why that would silently break its
+        // exit-code-carrying downcast. `.context(...)` is fine.
         Some(Command::Fix {
             fix_id,
             yes,
@@ -2278,7 +2367,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     };
     let code = rocm_core::apply_fix(&fix_id, &opts);
     if code != 0 {
-        std::process::exit(code);
+        return Err(FixExitCode(code).into());
     }
     Ok(())
 }
@@ -19329,6 +19418,107 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
+
+    /// `Ok(())` must map to a clean exit so `rocm`'s successful commands don't
+    /// regress to a nonzero code.
+    #[test]
+    fn exit_code_for_ok_is_success() {
+        assert_eq!(super::exit_code_for(Ok(())), ExitCode::SUCCESS);
+    }
+
+    /// `fix()`'s marker error must carry its exact code through, since that
+    /// code (2/3/4/5) is part of `rocm fix`'s documented contract.
+    #[test]
+    fn exit_code_for_fix_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::FixExitCode(3));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(3));
+    }
+
+    /// `ClapExitCode` exists so a usage/parse error can reach `main()` through
+    /// the ordinary return path (letting `_log_guard` drop) instead of
+    /// `clap::Error::exit()` calling `std::process::exit` mid-stack. Guard the
+    /// downcast the same way `exit_code_for_fix_exit_code_carries_the_code`
+    /// guards `FixExitCode`'s.
+    #[test]
+    fn exit_code_for_clap_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::ClapExitCode(2));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(2));
+    }
+
+    /// `run()`'s mistyped-subcommand branch and `parse_cli()` both route a
+    /// real `clap::Error` through the production `clap_exit_code` helper
+    /// (not a hand-built `ClapExitCode`), so this calls that same helper on a
+    /// real parse failure to exercise the actual
+    /// `clap parse failure -> clap_exit_code -> ClapExitCode -> exit_code_for`
+    /// chain end to end. Reverting `clap_exit_code` to call `err.exit()`
+    /// directly, or dropping its use from either call site, breaks this.
+    #[test]
+    fn clap_error_exit_code_survives_the_clap_exit_code_round_trip() {
+        let err = command_invocation_error(&["instal".to_owned()])
+            .expect("`instal` should read as a mistyped subcommand");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// `parse_cli()` itself reads `std::env::args_os()` (via
+    /// `Command::try_get_matches()`), which a unit test cannot redirect, so
+    /// this exercises the same `cli_command()` builder with an explicit argv
+    /// instead: an unrecognised flag is the common case `parse_cli()` was
+    /// still routing through `err.exit()` before it switched from
+    /// `get_matches()` to `try_get_matches()`.
+    #[test]
+    fn cli_command_rejects_unknown_flag_through_clap_exit_code() {
+        let err = super::cli_command()
+            .try_get_matches_from(["rocm", "--this-flag-does-not-exist"])
+            .expect_err("an unknown flag must be a parse error");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// Any other error must still fail with exit 1, matching what
+    /// `Result<(), anyhow::Error>`'s `Termination` impl already does today for
+    /// every subcommand other than `fix`.
+    #[test]
+    fn exit_code_for_generic_error_is_failure() {
+        let err = anyhow::anyhow!("boom");
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`
+    /// chain end to end, not just `exit_code_for` in isolation. Guards against
+    /// a future change at the `Command::Fix` dispatch arm (e.g. discarding the
+    /// error into a fresh `anyhow!(...)`) silently breaking the downcast and
+    /// falling through to the generic exit 1.
+    #[test]
+    fn dispatch_carries_fixs_exit_code_through_to_exit_code_for() {
+        // Skip the startup update check: it's a side effect unrelated to what
+        // this test verifies, and could otherwise touch the network. Goes
+        // through `ScopedTestEnv` so it's serialized against every other test
+        // that touches process env and restored on drop even on panic.
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let cli = super::Cli {
+            command: Some(super::Command::Fix {
+                fix_id: Some("fix-does-not-exist".to_owned()),
+                yes: true,
+                dry_run: false,
+                device_index: None,
+            }),
+        };
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(super::exit_code_for(result), ExitCode::from(2));
+    }
+
     /// A cache that has moved inside a directory uninstall already removes must
     /// not be reported as "not removed" — the note would be false.
     #[test]
