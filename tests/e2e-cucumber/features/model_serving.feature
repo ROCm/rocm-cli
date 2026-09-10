@@ -195,9 +195,12 @@ Feature: Model serving
   # is distinct from scenario 13 (an index beyond the device count): here the index
   # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
   # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
-  # rejection directly; on a single-GPU host the same request is simply out of
-  # range. Both are an honest refusal rather than a remap, which is what this
-  # asserts. Runs on GPU hardware.
+  # rejection directly. It holds on a single-GPU host too, so this stays ungated:
+  # the mask names device 0, which exists there, so the visible set still resolves
+  # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
+  # names a device a single-GPU host does not have — see the note there.) Either
+  # way an honest refusal rather than a remap, which is what this asserts. Runs on
+  # GPU hardware.
   @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
     When the user serves a model pinned to a GPU hidden by the visibility mask
@@ -211,12 +214,24 @@ Feature: Model serving
   # tokens. On a multi-GPU host `ROCR_VISIBLE_DEVICES=1` leaves one device that HIP
   # sees as ordinal 0; `--gpu 1` is therefore out of the visible set and must be
   # refused — before the fix it was read as the physical token 1, wrongly accepted,
-  # then exported as HIP ordinal 1 that no longer binds. On a single-GPU host the
-  # same request is simply out of range. Either way an honest refusal, never a
-  # broken bind. The complementary accept-path (`--gpu 0` binding the surviving
-  # physical device) needs live multi-GPU hardware and is covered by the
-  # `usable_amd_gpu_indices_from` unit tests. Runs on GPU hardware.
-  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-os:linux
+  # then exported as HIP ordinal 1 that no longer binds. The complementary
+  # accept-path (`--gpu 0` binding the surviving physical device) needs live
+  # multi-GPU hardware and is covered by the `usable_amd_gpu_indices_from` unit
+  # tests.
+  #
+  # KNOWN GAP — why this needs `@requires-multi-gpu` rather than just a GPU:
+  # a mask token `>= present` is not a device the host has, so
+  # `usable_amd_gpu_indices_from` cannot resolve the visible set and reports
+  # "unknown" (`None`) rather than an authoritative answer. On a SINGLE-GPU host
+  # `ROCR_VISIBLE_DEVICES=1` is exactly that shape, and `--gpu` validation then
+  # falls back to the detected count — itself unknown there, because amd-smi
+  # honours the same mask — so the serve is ALLOWED, not refused. That permissive
+  # fallback is deliberate (an unprobeable host must not be blocked from serving)
+  # and EAI-7194 does not change it, so the refusal is only asserted where a
+  # second device makes the mask resolvable. Sibling scenario serve-19 uses a
+  # `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible set
+  # resolves on one GPU too and it stays ungated.
+  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set
     Then serving is refused before any engine starts

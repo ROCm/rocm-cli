@@ -911,9 +911,11 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
 /// Serve pinned to GPU ordinal 1 while an active visibility mask
 /// (`HIP_VISIBLE_DEVICES=0`) hides every device except ordinal 0. On a multi-GPU
 /// host ordinal 1 exists but is masked out, so the CLI must reject it against the
-/// visible set (EAI-7194); on a single-GPU host the same ordinal is simply out of
-/// range. Either way the serve must be refused rather than remapped onto the one
-/// visible device.
+/// visible set (EAI-7194). The mask names device 0, which every GPU host has, so
+/// the visible set resolves on a single-GPU host as well and ordinal 1 is refused
+/// against it there too — which is why this scenario needs no multi-GPU gate.
+/// Either way the serve must be refused rather than remapped onto the one visible
+/// device.
 #[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
 async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
@@ -930,8 +932,13 @@ async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
 /// Serve pinned to GPU ordinal 1 while `ROCR_VISIBLE_DEVICES=1` hides every
 /// device except the physical ordinal 1. ROCr re-indexes that survivor to HIP
 /// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
-/// (EAI-7194) — not read as the physical token and wrongly accepted. On a
-/// single-GPU host the same ordinal is out of range. Either way an honest refusal.
+/// (EAI-7194) — not read as the physical token and wrongly accepted.
+///
+/// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
+/// device that is not there: the visible set cannot be resolved, `--gpu`
+/// validation takes its permissive unprobeable-host fallback, and the serve is
+/// allowed rather than refused. See the scenario comment in
+/// `features/model_serving.feature` for the full note on that gap.
 #[when("the user serves a model pinned past the ROCR-reindexed visible set")]
 async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
