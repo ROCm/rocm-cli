@@ -82,6 +82,11 @@ pub struct RunnerOptions {
     /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
     /// off-critical-path detection behaviour is genuinely exercised.
     pub amd_smi_skip_kfd_preflight: bool,
+    /// **Test-only.** When set, cycle timestamps advance from a fixed epoch by
+    /// the logical tick count plus the signed seconds stored in this file.
+    /// Production callers leave this unset; E2E scenarios use it to cross
+    /// observation-validity boundaries without racing wall-clock scheduling.
+    pub test_clock_offset_path: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -102,6 +107,7 @@ impl Default for RunnerOptions {
             services_dir: None,
             amd_smi_binary: None,
             amd_smi_skip_kfd_preflight: false,
+            test_clock_offset_path: None,
         }
     }
 }
@@ -122,6 +128,27 @@ const fn vllm_metrics_enabled(opts: &RunnerOptions) -> bool {
     !opts.disable_vllm_metrics
 }
 
+fn cycle_timestamp(
+    epoch: DateTime<Utc>,
+    tick: Duration,
+    tick_count: u64,
+    offset_path: Option<&std::path::Path>,
+) -> DateTime<Utc> {
+    let Some(path) = offset_path else {
+        return Utc::now();
+    };
+    let tick_millis = tick.as_millis().saturating_mul(u128::from(tick_count));
+    let logical_millis = i64::try_from(tick_millis).unwrap_or(i64::MAX);
+    let offset_secs = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_default();
+    epoch
+        .checked_add_signed(chrono::TimeDelta::milliseconds(logical_millis))
+        .and_then(|at| at.checked_add_signed(chrono::TimeDelta::seconds(offset_secs)))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 /// Loop forever: tick host + gpu metrics + bench rows, apply through reducer, broadcast.
 ///
 /// `tick_override` lets tests run faster than `opts.gpu_tick`; production passes
@@ -138,6 +165,7 @@ pub async fn run_loop(
     let mut host = HostCollector::new();
     let tick = tick_override.unwrap_or(opts.gpu_tick);
     let mut ticker = interval(tick);
+    let test_clock_epoch = Utc::now();
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Compute multipliers vs the gpu tick.
@@ -254,7 +282,12 @@ pub async fn run_loop(
         // Single wall-clock anchor for this loop iteration. All counter/direct
         // observations and the assembled Snapshot timestamp share this instant so
         // every instance refreshed in this cycle serialises Fresh deterministically.
-        let cycle_at = Utc::now();
+        let cycle_at = cycle_timestamp(
+            test_clock_epoch,
+            tick,
+            tick_count,
+            opts.test_clock_offset_path.as_deref(),
+        );
 
         // Adopt the background amd-smi detection result the moment it lands,
         // without ever blocking the loop while it is still in flight. Until then
@@ -991,6 +1024,25 @@ fn avg_ms_from_histogram(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn test_clock_advances_by_ticks_and_external_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = dir.path().join("offset-secs");
+        std::fs::write(&offset, "0").unwrap();
+        let epoch = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+        assert_eq!(
+            cycle_timestamp(epoch, Duration::from_secs(1), 3, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(3)
+        );
+
+        std::fs::write(&offset, "7").unwrap();
+        assert_eq!(
+            cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(11)
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
