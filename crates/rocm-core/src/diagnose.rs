@@ -300,8 +300,9 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
 // CUDA out of memory` is the identical shape any ROCm PyTorch job emits (ROCm's
 // PyTorch build reports the CUDA-compat name), so this table alone cannot tell
 // vLLM's OOM apart from an arbitrary training script hitting the same
-// allocator error. `check_16_vllm_oom` therefore requires an anchored OOM line
-// (`VLLM_ANCHOR_PATTERN` on the same line as an OOM token) before scoring at all.
+// allocator error. `check_16_vllm_oom` therefore scores *only* the lines
+// carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
+// pasted log: an OOM on an unanchored line contributes nothing at all.
 //
 // Weighting splits the *allocator message* from the *exception class name*:
 //   - The HIP allocator's own messages (`HIP out of memory`, the
@@ -1396,6 +1397,16 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
 /// is deliberately NOT an anchor: it is a Megatron/DeepSpeed term (rocm-cli does
 /// not serve one model across GPUs), so anchoring on it would misattribute those
 /// frameworks' OOMs to vLLM.
+///
+/// `gpu[-_]memory[-_]utilization` is also a (20-point) entry in
+/// [`KEYWORDS_VLLM_OOM`], so a line that only echoes the flag -- a config dump,
+/// or a paste of rocm-cli's own low-VRAM hint, which prints
+/// `--gpu-memory-utilization` -- is both anchored and self-scoring. That is
+/// harmless *because* only anchored lines are scored: such a line is worth 20,
+/// far below [`MIN_SCORE_FOR_MATCH`], so it can surface as a weak signal in
+/// `matched` but can never carry a verdict, and it can no longer lend its anchor
+/// to an OOM elsewhere in the paste. It stays an anchor because the flag is
+/// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
 const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 
 /// A canonical vLLM-OOM `--symptom` string guaranteed to clear
@@ -1408,22 +1419,37 @@ const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 /// it prints always reports a cause.
 pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
 
-/// Whether `symptom` carries the vLLM OOM anchor (`vllm` or
-/// `gpu_memory_utilization`) on the *same line* as an OOM token from
-/// [`KEYWORDS_VLLM_OOM`]. Co-occurrence anywhere in a pasted log is too loose --
-/// a stray `vllm` mention re-enables the very misattribution the anchor exists
-/// to prevent (a `llama.cpp` OOM in a paste that also names vLLM). The engine's
-/// emitted `vllm: <failing line>` satisfies this by construction.
-fn vllm_oom_line_is_anchored(symptom: &str) -> bool {
-    let anchor = Regex::new(VLLM_ANCHOR_PATTERN);
-    let Ok(anchor) = anchor else { return false };
-    symptom.lines().any(|line| {
-        let low = line.to_lowercase();
-        anchor.is_match(&low)
-            && KEYWORDS_VLLM_OOM
-                .iter()
-                .any(|(pattern, _, _)| Regex::new(pattern).is_ok_and(|re| re.is_match(&low)))
-    })
+/// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
+/// `gpu_memory_utilization`), joined by newlines — the only text
+/// [`check_16_vllm_oom`] is allowed to score.
+///
+/// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
+/// re-enables the very misattribution the anchor exists to prevent (a
+/// `llama.cpp` OOM in a paste that also names vLLM). Returning the anchored
+/// lines rather than a yes/no gate is what makes that true: regex matching
+/// ignores line boundaries, so scoring the whole symptom behind a boolean gate
+/// still counted keyword hits from *unanchored* lines at full weight, and one
+/// benign `gpu_memory_utilization` config echo was enough to hand another
+/// framework's OOM a HIGH_CONFIDENCE vLLM verdict
+/// (`only_the_anchored_lines_are_scored_not_the_whole_paste`).
+///
+/// The join is by `\n` so that no pattern can straddle two lines: the regexes
+/// here are literals or use `.*`, which does not match a newline. Dropping the
+/// unanchored lines therefore cannot fabricate a match across the seam.
+///
+/// The same-line "anchor + OOM token" requirement falls out of this: an anchored
+/// line with no OOM token contributes nothing, so the score is 0 and the checker
+/// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
+/// anchor and the error on one line by construction.
+fn vllm_anchored_lines(symptom: &str) -> String {
+    let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
+        return String::new();
+    };
+    symptom
+        .lines()
+        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
@@ -1447,14 +1473,17 @@ pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
 /// the user must pass the error via `--symptom`, or arrive from the serve
 /// failure note that points here. `e` is therefore unused.
 fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
-    if !vllm_oom_line_is_anchored(symptom) {
-        // No vLLM anchor on an OOM line: don't attribute a bare framework OOM to
-        // vLLM at all. Requiring the anchor on the same line as the OOM token
-        // (not merely somewhere in the paste) keeps a stray `vllm` mention from
-        // re-enabling the misattribution the anchor exists to prevent.
+    // Score the anchored lines only, never the whole paste. The anchor is the
+    // *only* thing separating this failure mode from any other framework's
+    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
+    // keyword hits from unanchored lines would still count at full weight. Any
+    // future change here must keep the scored text restricted to anchored lines.
+    let anchored = vllm_anchored_lines(symptom);
+    if anchored.is_empty() {
+        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
-    let (score, evidence) = keyword_score_collapsing_overlaps(symptom, KEYWORDS_VLLM_OOM);
+    let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
     if score <= 0 {
         return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
     }
@@ -2498,6 +2527,90 @@ mod tests {
         // still matches.
         let anchored = diagnose(&linux_base(), "vllm: CUDA out of memory");
         assert!(anchored.matched.iter().any(|d| d.id == "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn only_the_anchored_lines_are_scored_not_the_whole_paste() {
+        // Regression: the anchor was a boolean *gate*, after which the entire
+        // symptom was scored. Regex matching ignores line boundaries, so a
+        // benign vLLM config echo on one line unlocked full-weight scoring of
+        // another framework's OOM on a different line: `cuda out of memory`
+        // (50) + `torch.outofmemoryerror` (45) do not overlap, so both survived
+        // collapsing for 95 -- above HIGH_CONFIDENCE -- and the user got a
+        // confident "vLLM ran the GPU out of memory" verdict for a llama.cpp
+        // failure. Only the anchored lines may be scored.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the anchored config line is still a (weak) vLLM signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "an unanchored framework's OOM must not score for vLLM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+        assert!(
+            oom.evidence
+                .iter()
+                .all(|e| !e.to_lowercase().contains("out of memory")),
+            "evidence must come from the anchored line only: {:?}",
+            oom.evidence
+        );
+
+        // Same shape with the anchored line carrying no OOM token at all: the
+        // unanchored OOM must not be borrowed to reach a verdict either.
+        let report = diagnose(
+            &linux_base(),
+            "starting vllm serve on gpu 0\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on an unanchored line must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The control: once the OOM is on the anchored line, it still matches at
+        // full strength, so the scoping did not simply disable the checker.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             vllm: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM line must still match");
+        assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn rocm_cli_s_own_low_vram_hint_is_never_a_verdict_on_its_own() {
+        // `gpu[-_]memory[-_]utilization` is both an anchor and a scoring entry,
+        // so a line that merely echoes the flag anchors itself. rocm-cli's own
+        // low-VRAM hint prints `--gpu-memory-utilization`, and users paste it
+        // back in. That must stay a weak signal, never a diagnosis: worth 20,
+        // far below MIN_SCORE_FOR_MATCH, with nothing else on the line to
+        // corroborate it.
+        let report = diagnose(&linux_base(), crate::VLLM_GPU_MEMORY_UTILIZATION_HINT);
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the flag mention stays visible as a weak signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare flag echo must not diagnose an OOM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
     }
 
     #[test]
