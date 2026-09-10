@@ -361,23 +361,19 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
         }
         KeyAction::OpenEngineManager => {
             let mut lines = vec![head("Engines".into())];
-            let lemon = info().and_then(|i| i.lemond_version.clone());
-            lines.push(Line::from(vec![
-                mark(lemon.is_some()),
-                Span::styled(
-                    lemon.map_or_else(
-                        || "Lemonade — not installed".into(),
-                        |v| format!("Lemonade {v}"),
-                    ),
-                    Style::default().fg(theme.fg),
-                ),
-            ]));
-            // The daemon doesn't surface vLLM detection yet — open the manager to
+            // The daemon doesn't surface engine detection yet — `GpuSystemInfo`
+            // has no producer for `lemond_version`, so every value read here
+            // would be `None` no matter what is installed. Open the manager to
             // check rather than claiming a status we don't have.
-            lines.push(Line::from(vec![
-                Span::styled("· ", Style::default().fg(theme.muted)),
-                Span::styled("vLLM — open to check", Style::default().fg(theme.muted)),
-            ]));
+            for engine in ["Lemonade", "vLLM"] {
+                lines.push(Line::from(vec![
+                    Span::styled("· ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        format!("{engine} — open to check"),
+                        Style::default().fg(theme.muted),
+                    ),
+                ]));
+            }
             lines
         }
         KeyAction::OpenServeWizard => {
