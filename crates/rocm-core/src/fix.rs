@@ -384,19 +384,20 @@ const RECIPES: &[FixRecipe] = &[
             "# and does not return until you leave it. Run this line on its own.",
             "rocm engines shell vllm",
             "# --- step 2 of 3, INSIDE the subshell step 1 opened ---",
-            "# Confirm the trigger against the ENGINE's interpreter rather than the",
-            "# one on your PATH -- only the engine's torch decides this failure.",
+            "# Confirm the trigger before changing anything. It has to be the",
+            "# ENGINE's interpreter, not the one on your PATH -- they are different",
+            "# interpreters, and only the engine's decides this failure.",
             "python -c \"import torch; print(torch.__version__, torch.version.hip)\"",
             "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\"",
-            "# Applies ONLY when torch.version.hip is set, torch.__version__ is in the",
-            "# 2.4-2.9 range, and torch-c-dlpack-ext is installed. If any of the three",
-            "# does not hold, this is not the failure you are looking at. Then leave",
-            "# the subshell:",
+            "# This entry applies ONLY when torch.version.hip is set, torch.__version__",
+            "# is in the 2.4-2.9 range, and torch-c-dlpack-ext is installed. Outside",
+            "# that range the extension raises a handled ImportError and this is not",
+            "# the failure you are looking at. Then leave the subshell:",
             "exit",
             "# --- step 3 of 3, back in YOUR OWN shell ---",
-            "# If all three held, put the engine's pinned torch back. Do NOT run this",
-            "# from inside the subshell: it replaces the environment that shell is",
-            "# standing in.",
+            "# If all three held, put the engine's pinned torch back. Do NOT run",
+            "# this from inside the subshell: it replaces the environment that",
+            "# shell is standing in.",
             "rocm engines install vllm --reinstall",
         ],
         needs_sudo: false,
@@ -406,6 +407,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Running vLLM on ROCm is not by itself a reason to apply this. torch-c-dlpack-ext arrives as a transitive dependency of tilelang, which vLLM pins, and it only misbehaves on the torch versions it ships prebuilts for.",
             "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
+            "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
         applies_on: LINUX_ONLY,
         runner: None,
@@ -419,6 +421,16 @@ const RECIPES: &[FixRecipe] = &[
 /// `Fix` [`crate::diagnose`] attaches to its finding — because a divergence
 /// between them is exactly the kind of thing a reader would meet and not the
 /// author.
+///
+/// Scope, so the guarantee is not read wider than it is: this holds the
+/// *command block* only, and only its shell boundary. It says nothing about
+/// `summary`, `notes` or `verify`. Byte-equality of the two blocks is a
+/// separate check — [`assert_plan_matches_the_catalog_copy`] — and the prose
+/// around them is deliberately not identical, because [`FixRecipe`] has a
+/// `rationale` field that `Fix` has no counterpart for: the upstream-defect
+/// explanation that `diagnose` carries as a note is printed by `rocm fix` out
+/// of `rationale` instead, and duplicating it into `notes` would print it
+/// twice.
 ///
 /// Both renderers print every line of the block with the same `$ ` prefix, so
 /// ordering alone tells a reader nothing: it does not say that
@@ -466,6 +478,26 @@ pub(crate) fn assert_engine_shell_boundary_is_labelled(fix_id: &str, commands: &
         labelled(leave, act, "YOUR OWN shell"),
         "{fix_id}: the block has to say the reinstall runs back in the user's own \
          shell:\n{commands:#?}"
+    );
+}
+
+/// Assert that the command block a [`crate::diagnose::Fix`] carries is
+/// byte-identical to the catalog recipe's, line for line.
+///
+/// The two are hand-maintained copies of one plan in two modules, and the
+/// block is the part a user pastes into a shell, so a silent divergence is a
+/// user pasting steps that no longer match the ones `rocm fix` prints. Holding
+/// the shell boundary in both (see
+/// [`assert_engine_shell_boundary_is_labelled`]) leaves the wording free to
+/// drift; this closes that.
+#[cfg(test)]
+pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&str]) {
+    let recipe = find_recipe(fix_id)
+        .unwrap_or_else(|| panic!("{fix_id}: no catalog recipe to compare the plan against"));
+    assert_eq!(
+        recipe.commands, commands,
+        "{fix_id}: the plan `diagnose` attaches has drifted from the catalog recipe \
+         `rocm fix` prints; they are one plan and a user may meet either copy"
     );
 }
 

@@ -1758,10 +1758,12 @@ mod tests {
 
     #[test]
     fn the_engine_import_failure_outranks_the_render_group_false_lead() {
-        // The reported case. On the affected host the GPU is functional and
-        // /dev/kfd is world-writable, but the user happens to be outside the
-        // render group -- so the catalog's best answer to this symptom was fix-4
-        // at 45, and following it meant a usermod, a re-login, and no progress.
+        // The reported case, reduced to what makes the false lead fire: the user
+        // is outside the render and video groups, so the catalog's best answer
+        // to this symptom was fix-4 at 45 (35 render + 10 video), and following
+        // it meant a usermod, a re-login, and no progress. The fixture leaves
+        // `kfd` unset rather than modelling the reported host's permissions,
+        // because fix-4's score here comes from the group membership alone.
         // The fixture reproduces that false lead, so the assertion is about the
         // ranking and not only about the new entry's score.
         let mut e = linux_base();
@@ -1806,6 +1808,9 @@ mod tests {
             .expect("the finding must carry a plan");
         let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
         crate::fix::assert_engine_shell_boundary_is_labelled(&fix.fix_id, &commands);
+        // The boundary check alone leaves the wording free to drift, so pin the
+        // two copies to each other line for line as well.
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
 
     #[test]
