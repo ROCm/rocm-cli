@@ -276,6 +276,11 @@ impl Expectations {
         self.by_id.get(id).map_or(&[], Vec::as_slice)
     }
 
+    /// Every scenario id this file declares a condition for.
+    pub fn declared_ids(&self) -> impl Iterator<Item = &str> {
+        self.by_id.keys().map(String::as_str)
+    }
+
     /// The shortest `serve_timeout_secs` among the conditions matching this host
     /// for a scenario, if any. A known bug that manifests as a serve which never
     /// becomes ready should fail fast rather than burn the full cold-start window
@@ -1147,6 +1152,46 @@ flaky = true
             .expect("the EAI-8031 row shortens the serve wait");
         assert!(secs < 600, "must be shorter than the global default");
         assert!(secs >= 240, "must stay well above a ~120s healthy serve");
+    }
+
+    /// A row whose scenario has been renamed or deleted never matches anything,
+    /// so it can neither xfail nor go stale: it just sits there stating a bug
+    /// that nothing measures. Nothing at runtime notices — resolution is keyed
+    /// FROM the scenario TO this file, never the other way — so the orphan is
+    /// caught here instead.
+    #[test]
+    fn every_expectation_row_names_a_scenario_that_exists() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut scenario_ids = std::collections::BTreeSet::new();
+        let features = std::fs::read_dir(root.join("features")).expect("no features directory");
+        for entry in features {
+            let path = entry.expect("unreadable features directory entry").path();
+            if path.extension().is_none_or(|ext| ext != "feature") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+            for tag in text.split_whitespace() {
+                if let Some(id) = tag.strip_prefix("@id:") {
+                    scenario_ids.insert(id.to_owned());
+                }
+            }
+        }
+        assert!(
+            !scenario_ids.is_empty(),
+            "read no `@id:` tags at all, so this check would pass vacuously"
+        );
+
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let orphans: Vec<&str> = m
+            .declared_ids()
+            .filter(|id| !scenario_ids.contains(*id))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "expectations.toml declares rows for scenarios that no longer exist: {orphans:?}\n\
+             Delete the row, or fix the id if the scenario was renamed."
+        );
     }
 
     #[test]

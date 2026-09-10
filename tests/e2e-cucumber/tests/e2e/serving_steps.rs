@@ -874,6 +874,406 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── Device policies the command offers ─────────────────────────────
+
+/// The device policies `serve --help` advertises, read out of the help rather
+/// than listed here so the check follows whatever the command currently offers.
+///
+/// Scoped to `--device`'s own block. `serve --help` advertises possible values
+/// for more than one option — `--engine` renders its list first, from clap's
+/// `value_parser` — so taking the first possible-values list in the help returns
+/// the engines, and this scenario would then serve `--device lemonade`, meeting
+/// an unrelated rejection that happens to read like the one under test.
+///
+/// Both of clap's renderings are read, because the choice between them is a
+/// property of how the option happens to be declared rather than a contract:
+///
+/// * inline — `--device <DEVICE>  Device policy [possible values: a, b]`
+/// * block  — a `Possible values:` line followed by one `- name: description`
+///   entry per value, which is what clap emits for a documented `ValueEnum`
+///
+/// Reading only one of them makes this return nothing the moment the other is
+/// used, and returning nothing here does not read as "the command advertises
+/// nothing" — it silently removes the very list the scenario exists to check.
+/// The caller's guard turns that into a loud failure, but recognising both
+/// shapes is what keeps the scenario measuring the contract at all.
+fn advertised_device_policies(help: &str) -> Vec<String> {
+    let lines: Vec<&str> = help.lines().collect();
+    let device = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("--device"));
+    let Some(device) = device else {
+        return Vec::new();
+    };
+    // `--device`'s own block: everything up to the next option. A `--device`
+    // that advertises nothing must not borrow the following option's list.
+    let block: Vec<&str> = lines
+        .iter()
+        .skip(device)
+        .enumerate()
+        .take_while(|(offset, line)| *offset == 0 || !line.trim_start().starts_with("--"))
+        .map(|(_, line)| *line)
+        .collect();
+
+    if let Some(values) = block.iter().find_map(|line| {
+        let (_, rest) = line.split_once("[possible values:")?;
+        let (values, _) = rest.split_once(']')?;
+        Some(
+            values
+                .split(',')
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        )
+    }) && !values.is_empty()
+    {
+        return values;
+    }
+
+    let Some(heading) = block
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case("possible values:"))
+    else {
+        return Vec::new();
+    };
+    block
+        .iter()
+        .skip(heading + 1)
+        // `filter_map` rather than `map_while`: a long description wraps onto a
+        // continuation line, and stopping at the first line that is not an entry
+        // would drop every policy after it. The block is already bounded to
+        // `--device`, so there is nothing after it to run into.
+        .filter_map(|line| {
+            let entry = line.trim_start().strip_prefix("- ")?;
+            // `- <name>: <description>`; the description may itself contain a
+            // colon, so only the first one separates the two.
+            let name = entry.split_once(':').map_or(entry, |(name, _)| name);
+            Some(name.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+#[when("the user serves a model under each device policy the command offers")]
+async fn user_serves_under_each_device_policy(world: &mut E2eWorld) {
+    let (help, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let policies = advertised_device_policies(&help);
+    // A harness guard, not the contract: `serve --help` has always advertised
+    // some device policy, so an empty list means this step could not read the
+    // one it renders today, not that the command stopped offering any. Reported
+    // as its own failure so a help-format change cannot be mistaken for the
+    // command refusing a policy it advertises.
+    assert!(
+        !policies.is_empty(),
+        "could not read any device policy out of `--device`'s block in `serve --help` — neither \
+         an inline `[possible values: ...]` nor a `Possible values:` list of `- name:` entries. \
+         This is a harness read failure, not a verdict on the command:\n{help}"
+    );
+    let (model, engine, _) = host_serve_target();
+    // One line per policy, so a failure names which one was refused. This runs
+    // only where there is no GPU, so no serve can actually start and each of
+    // these returns promptly.
+    let mut transcript = Vec::new();
+    for policy in &policies {
+        let (stdout, stderr, rc) = crate::run_rocm(
+            world,
+            &["serve", model, "--engine", engine, "--device", policy],
+        );
+        transcript.push(format!("{policy}\t{rc}\t{stdout}{stderr}"));
+    }
+    world.cli_outputs = Some(transcript);
+}
+
+#[then("no policy is refused for being that policy")]
+async fn assert_no_policy_refused(world: &mut E2eWorld) {
+    let transcript = world
+        .cli_outputs
+        .as_ref()
+        .expect("no serve attempts recorded");
+    // On this lane every policy is refused for the same host-level reason — the
+    // machine has no GPU — and that refusal is not what this scenario is about.
+    // What it must not find is a refusal aimed at the POLICY: a command that
+    // offers a choice and then rejects the user for making it.
+    //
+    // Matched on the refusal wording rather than on "named the policy and
+    // failed", because the ordinary host-level refusal names the policy too
+    // (`device_policy: gpu_required; no active ROCm runtime is configured`), so
+    // a name-plus-nonzero-rc rule would call every run on this lane a rejection.
+    // Three wordings are recognised: the two the product uses to turn a policy
+    // down for being that policy, and clap's own, which is what a value that is
+    // advertised but not accepted as a value looks like.
+    let rejected: Vec<&String> = transcript
+        .iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("cpu mode is not a fallback path")
+                || lower.contains("unsupported device policy")
+                || (lower.contains("invalid value") && lower.contains("--device"))
+        })
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "`serve --help` offers these device policies, but the command refuses one for being \
+         what it is:\n{}",
+        rejected
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ── A local server this scenario owns ──────────────────────────────
+
+/// The recorded id of the server a scenario starts for itself. Distinct from the
+/// planted mock's id so the suite's teardown treats it as a real service and
+/// tries to stop it too, as a backstop behind the scenario's own assertion.
+const OWNED_SERVICE_ID: &str = "e2e-owned-server";
+
+#[given("a local server this machine manages is running")]
+async fn given_owned_managed_server(world: &mut E2eWorld) {
+    let pid = world.start_managed_service_process(OWNED_SERVICE_ID, "TestModel/E2E-1B");
+    // The CLI must agree the server is there before anything is asked of it,
+    // otherwise a later "it is gone" would prove nothing.
+    let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
+    assert!(
+        listing.contains(OWNED_SERVICE_ID),
+        "the CLI does not list the running server (pid {pid}), so there is nothing to \
+         stop:\n{listing}"
+    );
+}
+
+#[when("the user stops the server that is running")]
+async fn user_stops_running_server(world: &mut E2eWorld) {
+    // Whichever service this scenario's serve registered. Read from the record
+    // the CLI wrote in its own (isolated) services directory — the same on-disk
+    // schema the suite's teardown reads — rather than assuming an id.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let recorded: Vec<String> = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .filter_map(|entry| {
+            let bytes = std::fs::read(entry.path()).ok()?;
+            let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some(record.get("service_id")?.as_str()?.to_owned())
+        })
+        .collect();
+    // Exactly one, not the first `read_dir` happens to yield. Directory order is
+    // unspecified, so with a second record present — a retried serve's leftover,
+    // or a planted mock alongside a real one — taking the first would stop an
+    // arbitrary service and the assertion that follows would judge that
+    // unrelated stop.
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected exactly one managed service under {} so there is no doubt which one is being \
+         stopped, found {recorded:?}",
+        root.display()
+    );
+    let service_id = recorded.into_iter().next().expect("length checked above");
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "stop", &service_id, "--yes"]);
+    world.cli_output = Some(format!("{stdout}{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user removes the CLI's managed files")]
+async fn user_removes_managed_files(world: &mut E2eWorld) {
+    // `--keep-binaries` and `--keep-cache` are what keep this safe to run on a
+    // shared runner. Config and data ARE this scenario's own temporary ones, so
+    // removing them is real and reaches nothing outside the scenario. The cache
+    // is NOT: `isolate_env` points `ROCM_CLI_CACHE_DIR` at the persistent
+    // `E2E_SHARED_CACHE_DIR` whenever CI provides one, which every GPU lane
+    // does — and this scenario is `@requires-os:linux`, so it runs there.
+    // Without `--keep-cache` the uninstall would delete the shared download
+    // cache out from under every later scenario AND every later run.
+    //
+    // Neither flag weakens the scenario: what it asserts is whether the CLI
+    // stops the servers it manages, which has nothing to do with whether it
+    // also deletes the program or the download cache. The records it must not
+    // orphan live under the data dir, which is still removed.
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["uninstall", "--yes", "--keep-binaries", "--keep-cache"],
+    );
+    world.cli_output = Some(format!("{stdout}{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the removal is reported as complete")]
+async fn assert_removal_complete(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no uninstall output");
+    assert_eq!(world.cli_rc, Some(0), "removal did not succeed:\n{output}");
+    assert!(
+        output.contains("uninstall complete"),
+        "removal did not report completion:\n{output}"
+    );
+}
+
+#[then("the server is no longer running")]
+async fn assert_owned_server_stopped(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    // Guards the assertion below against passing vacuously: with no process
+    // registered there is nothing that could still be running, and the scenario
+    // would go green having proved nothing.
+    assert!(
+        !world.owned_processes.is_empty(),
+        "this scenario registered no server, so there is nothing to have stopped"
+    );
+    // Asked of the OS, and asked HERE — before this scenario's teardown, which
+    // also kills what it owns. Deferring the question until after teardown would
+    // report the harness's own cleanup as the product's work, turning the very
+    // defect under test into a pass.
+    let mut still_running = Vec::new();
+    for process in &mut world.owned_processes {
+        if process.is_running() {
+            still_running.push(process.pid());
+        }
+    }
+    assert!(
+        still_running.is_empty(),
+        "the CLI reported success but the server it manages is still running (pid \
+         {still_running:?}):\n{output}"
+    );
+}
+
+#[then("the CLI reports that it stopped a process")]
+async fn assert_stop_count_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no stop output");
+    assert_eq!(world.cli_rc, Some(0), "stopping did not succeed:\n{output}");
+    let reported = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("stopped processes:"))
+        .map_or_else(
+            || panic!("the stop gave no account of what it stopped:\n{output}"),
+            str::trim,
+        );
+    let count: u32 = reported
+        .parse()
+        .unwrap_or_else(|_| panic!("could not read the reported count {reported:?}:\n{output}"));
+    // An operator reading "0" has been told the stop found nothing to do, which
+    // is the opposite of what happened.
+    assert!(
+        count >= 1,
+        "the server was running and is now stopped, but the CLI reports it stopped \
+         {count}:\n{output}"
+    );
+}
+
+// ── Choosing a device and an address ───────────────────────────────
+
+#[when("the user serves a model letting the CLI choose the GPU")]
+async fn user_serves_with_auto_gpu(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // `--gpu auto` is the default, named here so the scenario is about the
+    // choice rather than about what happens to be configured. The plan the CLI
+    // prints on its way to launching is where it says which device it picked,
+    // and that line is all this scenario reads — whether the serve then goes on
+    // to succeed is a different scenario's business.
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--gpu",
+            "auto",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the plan names the device it chose")]
+async fn assert_auto_gpu_named(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    let chosen = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gpu: auto (selected "))
+        .and_then(|rest| rest.split(')').next())
+        .map_or_else(
+            || panic!("the plan does not say which GPU was chosen:\n{output}"),
+            str::trim,
+        );
+    // "none" on a machine that has a GPU leaves the user unable to tell whether
+    // their model is about to run on the device at all.
+    assert_ne!(
+        chosen, "none",
+        "this machine has an AMD GPU, but letting the CLI choose one selected \
+         nothing:\n{output}"
+    );
+}
+
+#[given("the address a new server would use is already taken")]
+async fn given_default_serve_address_taken(world: &mut E2eWorld) {
+    // Hold the address a server started without `--port` would take, so the next
+    // serve meets exactly the situation a user's second server meets.
+    ensure_serve_port_free().await;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT))
+        .unwrap_or_else(|e| panic!("could not take the default serve address: {e}"));
+    // Held on the World so it stays taken for the whole scenario and is released
+    // with it.
+    //
+    // Safe only because this scenario is `@requires-gpu`, and every GPU lane is
+    // serialized to one scenario at a time. `ensure_serve_port_free` clears the
+    // port with `fuser -k`/`kill -9`, and from the moment this listener exists
+    // the process holding that port is the cucumber binary itself — so a
+    // concurrent scenario calling it would kill the whole suite mid-run. The
+    // serialization is enforced in `e2e.rs` and cannot be lifted by
+    // `E2E_MAX_CONCURRENT`; if that ever changes, this needs an ephemeral port
+    // rather than the shared default.
+    world.occupied_address = Some(listener);
+}
+
+#[when("the user serves a model without choosing an address")]
+async fn user_serves_without_choosing_address(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    // No `--port`, so the CLI picks the address itself — which is the whole
+    // question. The serve is expected not to come up (something else holds the
+    // address), so nothing here waits for readiness; the planned address is
+    // printed before the engine is launched.
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the new server does not try to use the taken address")]
+async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    let planned = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("port:"))
+        .map(str::trim);
+    // Two honest outcomes: pick somewhere else, or say the usual address is
+    // busy. Planning to use it anyway is the one that collides with the server
+    // already there.
+    match planned {
+        None => assert!(
+            world.cli_rc != Some(0),
+            "the CLI neither planned an address nor refused:\n{output}"
+        ),
+        Some(port) => assert_ne!(
+            port,
+            SERVE_PORT.to_string(),
+            "the address is already taken, but the new server plans to use it \
+             anyway:\n{output}"
+        ),
+    }
+}
+
 /// Serve bound to a public (non-loopback) interface without the public-bind
 /// opt-in. The bind-host validation is the first thing `serve` does — before any
 /// engine, model, or GPU work — so this refusal is observable with no GPU (mock

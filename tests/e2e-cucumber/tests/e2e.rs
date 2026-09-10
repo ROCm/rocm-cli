@@ -94,6 +94,81 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// An address a scenario is deliberately holding, so a serve started without
+    /// one meets an address that is already in use. Released with the World.
+    pub occupied_address: Option<std::net::TcpListener>,
+    /// A `PATH` a scenario prepared for the `rocm` invocations that follow (see
+    /// [`stat_shim_path`]). Carried on the World because the situation it sets up
+    /// belongs to the Given, while the invocations that must see it are in later
+    /// steps.
+    pub path_override: Option<String>,
+    /// Plain child processes a scenario spawned itself and registered with the
+    /// CLI as managed services, so a step can assert the PRODUCT stopped them.
+    ///
+    /// Killed in `Drop` as a panic-path backstop only — never as the thing under
+    /// test. The scenarios that use these assert the child is gone *before*
+    /// teardown runs, because a `Drop` that cleans up after the product failed
+    /// would turn the very defect being pinned into a pass.
+    pub owned_processes: Vec<OwnedProcess>,
+}
+
+/// A child process this scenario owns, kept alive until the product is asked to
+/// stop it (or teardown reaps it).
+#[derive(Debug)]
+pub struct OwnedProcess {
+    pub child: std::process::Child,
+}
+
+impl OwnedProcess {
+    /// The child's PID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the process is still running.
+    ///
+    /// This handle is the child's parent, so reaping it is what turns "signalled
+    /// and gone" into an observable exit — a terminated child stays a zombie
+    /// until then, and asking the OS whether the PID exists would still say yes.
+    /// Polls briefly: the product signals the process and this only has to
+    /// outlast the moment between the signal landing and the kernel finishing
+    /// with it, not any grace period the product itself waits out.
+    pub fn is_running(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return false,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => return true,
+                // Not treated as "stopped". The only caller asserts that the
+                // product stopped this process, so answering `false` here is
+                // answering "the product did its job" — which would turn a wait
+                // this harness could not perform into a pass for the very defect
+                // the scenario exists to catch. `Child` caches the status once
+                // it has reaped, so a repeated call returns `Ok(Some(_))` rather
+                // than an error and there is no benign case left to absorb.
+                //
+                // Panicking is safe here specifically: nothing calls this from
+                // `Drop` (the only caller is the serve-21 step), so there is no
+                // unwind-during-drop abort to worry about, and cucumber catches
+                // a step panic per scenario — the failure is reported and this
+                // handle's `Drop` still runs its kill/wait cleanup.
+                Err(error) => panic!(
+                    "could not determine whether pid {} is still running: {error}",
+                    self.pid()
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -221,6 +296,9 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            occupied_address: None,
+            path_override: None,
+            owned_processes: Vec::new(),
         }
     }
 }
@@ -482,6 +560,52 @@ impl E2eWorld {
     /// own lifecycle defaults (a record kept alive by this test process).
     pub fn register_mock_service(&self) {
         self.register_mock_service_with(ServiceRecordOptions::default());
+    }
+
+    /// Spawn a plain, long-lived child process and register it with the CLI as a
+    /// ready managed service, exactly as a real `rocm serve --managed` would
+    /// record its own processes. Returns the child's PID.
+    ///
+    /// The child is a sleeper rather than a server: every scenario that uses
+    /// this asks whether the CLI *stopped the process it recorded*, and a
+    /// listening socket would add a second thing to get wrong without making
+    /// that question any easier to answer. Both PID fields point at the child so
+    /// the record looks like one the CLI itself wrote.
+    ///
+    /// Unix only — Windows has no equivalent one-liner sleeper on PATH, and the
+    /// scenarios that call this are `@requires-os:linux`.
+    pub fn start_managed_service_process(&mut self, service_id: &'static str, model: &str) -> u32 {
+        use std::process::Stdio;
+
+        let root = self.isolated_root.as_ref().expect("no isolated root");
+        let services = root.path().join("data").join("services");
+        // Long enough to outlive any scenario, short enough that a leaked child
+        // on a persistent runner reaps itself rather than lingering forever.
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn the scenario's managed-service process");
+        let pid = child.id();
+        self.owned_processes.push(OwnedProcess { child });
+
+        // The port is never connected to; it only has to be a plausible value in
+        // a well-formed record.
+        write_service_record_with(
+            &services,
+            model,
+            18_765,
+            ServiceRecordOptions {
+                service_id,
+                status: "ready",
+                startup_phase: None,
+                supervisor_pid: pid,
+                engine_pid: Some(pid),
+            },
+        );
+        pid
     }
 
     pub fn register_mock_service_with(&self, options: ServiceRecordOptions) {
@@ -752,6 +876,127 @@ pub fn run_rocm_with_env(
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Install a `stat` shim on the front of `PATH` that answers for ONE device path
+/// and delegates every other invocation to the real binary, and return the `PATH`
+/// value to hand the child.
+///
+/// The CLI learns a device's mode and owning group by shelling out to `stat`, and
+/// several contracts are about what it then does with unusual answers — an owning
+/// group the machine cannot name, or one that is not the conventional default.
+/// Those states are properties of a machine's device nodes, not something a test
+/// can arrange on a shared runner, so the answer is substituted instead.
+///
+/// What this proves and what it does not: it exercises how the CLI HANDLES such
+/// an answer, not that any particular host produces one. `stat` really does print
+/// `UNKNOWN` for an id with no entry in the group database, which is where the
+/// substituted answer comes from.
+///
+/// Scoped as tightly as possible: only the named path is answered for, so every
+/// other `stat` the CLI makes still reads the real filesystem.
+///
+/// Unix only — panics elsewhere. Every scenario that reaches it is
+/// `@requires-os:linux`, so the panic is unreachable rather than a limitation.
+#[cfg(unix)]
+pub fn stat_shim_path(
+    world: &E2eWorld,
+    device: &str,
+    mode: &str,
+    owner: &str,
+    group: &str,
+) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the stat shim directory");
+
+    let real = ["/usr/bin/stat", "/bin/stat", "/usr/local/bin/stat"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `stat` binary to delegate to");
+    // `-c %A|%U|%G` is the only form the CLI asks for, and the shim answers only
+    // when the target path is the one under test; anything else is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"{device}\" ]; then\n    \
+         printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n    exit 0\n  fi\ndone\nexec {real} \"$@\"\n"
+    );
+    let shim = bin.join("stat");
+    std::fs::write(&shim, script).expect("failed to write the stat shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the stat shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn stat_shim_path(
+    _world: &E2eWorld,
+    _device: &str,
+    _mode: &str,
+    _owner: &str,
+    _group: &str,
+) -> String {
+    unreachable!("the stat shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Add an `id` shim to the same directory [`stat_shim_path`] uses, reporting the
+/// current user as belonging to `groups` instead of their real ones, and return
+/// the `PATH` carrying both shims.
+///
+/// The CLI reads group membership by shelling out to `id -Gn`. Whether the user
+/// running the suite belongs to a device group is a property of the runner, and
+/// on the GPU runner they already do — so a contract about what the CLI concludes
+/// for a user who does NOT can only be measured by substituting the answer. Call
+/// after [`stat_shim_path`], whose directory this reuses.
+#[cfg(unix)]
+pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the shim directory");
+
+    let real = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `id` binary to delegate to");
+    // `-Gn` is the only form the CLI asks for; every other invocation is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-Gn\" ]; then\n  echo '{}'\n  exit 0\nfi\nexec {real} \"$@\"\n",
+        groups.join(" ")
+    );
+    let shim = bin.join("id");
+    std::fs::write(&shim, script).expect("failed to write the id shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the id shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn id_shim_path(_world: &E2eWorld, _groups: &[&str]) -> String {
+    unreachable!("the id shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Every group name the machine's own group database knows.
+///
+/// Read from `/etc/group` rather than asked of a tool, so the check does not
+/// depend on `getent` being installed. Unix only, for the same reason as
+/// [`stat_shim_path`].
+pub fn machine_group_names() -> Vec<String> {
+    std::fs::read_to_string("/etc/group")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split(':').next())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Run `rocm` with the behavioral fixture established by a Given step, then
@@ -1167,12 +1412,36 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
-    let max_concurrent =
-        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
-            1
-        } else {
-            64
-        };
+    // The mock lane's ceiling is bounded by the machine rather than left at
+    // cucumber's flat 64. Its scenarios are safe to run together, but they are
+    // not free: each spawns `rocm` subprocesses, and several drive a TUI under a
+    // pseudo-terminal and assert on WALL-CLOCK behaviour. At 64-way on a 2-4
+    // vCPU runner those steps are descheduled for seconds — measured at 4.7 s
+    // against a 6 s window — so they miss the moment they are timing and report
+    // a starved reading as a product verdict. Bounding to the core count keeps
+    // the lane parallel where parallelism is free and stops it oversubscribing
+    // where it is not; it is also no slower, because starvation costs more than
+    // the extra concurrency buys.
+    //
+    // `E2E_MAX_CONCURRENT` overrides the MOCK lane's ceiling, for bisecting a
+    // lane whose failures look like contention rather than behaviour. It cannot
+    // raise a serialized lane: the `1` above is a correctness requirement, not
+    // a tuning choice, so it is applied AFTER the override rather than inside
+    // the fallback. Two multi-GiB installs racing one shared runtimes tree, or
+    // two serves racing one port and one GPU's VRAM, is what that `1` prevents.
+    let serialize =
+        cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some();
+    let max_concurrent = if serialize {
+        1
+    } else {
+        std::env::var("E2E_MAX_CONCURRENT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 6))
+            })
+    };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
