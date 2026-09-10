@@ -676,8 +676,8 @@ enum RuntimesCommand {
     },
     /// Switch back to the previously selected ROCm install.
     #[command(
-        after_help = "NOTE: rollback has no history — rolling back twice just toggles \
-between the same two runtimes."
+        after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
+left, so it cannot undo more than one activation."
     )]
     Rollback,
     /// Remove a ROCm install from ROCm CLI.
@@ -7070,6 +7070,7 @@ struct SdkInstallFinalization {
     runtime_key: String,
     install_root: PathBuf,
     family: String,
+    previous_runtime_key: Option<String>,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -8788,11 +8789,15 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
 }
 
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
-    format!(
+    let mut output = format!(
         "ROCm SDK installed successfully.\n  install folder: {}\n  active runtime: {}\n  next step: run `rocm help` to see how to use rocm-cli.\n",
         finalized.install_root.display(),
         finalized.runtime_key
-    )
+    );
+    if finalized.previous_runtime_key.is_some() {
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
+    output
 }
 
 fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstallFinalization>> {
@@ -8828,6 +8833,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
         runtime_key: activation.runtime_key,
         install_root: manifest.install_root,
         family: manifest.family,
+        previous_runtime_key: activation.previous_runtime_key,
     }))
 }
 
@@ -15765,10 +15771,12 @@ fn apply_runtime_update(
     Ok(output)
 }
 
-/// Shown after any activation (direct `runtimes activate` or `update --apply
-/// --activate`) that recorded a previous runtime, so both paths that reach
-/// this state give the same advice — see `RuntimesCommand::Activate` in
-/// `runtimes()` for the other call site.
+/// Shown after any activation (direct `runtimes activate`, `update --apply
+/// --activate`, or an `install sdk` that switches the active runtime) that
+/// recorded a previous runtime, so every path that reaches this state gives
+/// the same advice — see `RuntimesCommand::Activate` in `runtimes()`,
+/// `append_update_activate_summary`, and `render_sdk_install_success` for the
+/// call sites.
 const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
 (no history — undoes only this one activation)";
 
@@ -19389,26 +19397,6 @@ mod tests {
                 "`{command}` is marked preview, so it must not headline the examples:\n{examples}"
             );
         }
-    }
-
-    /// `rollback_runtime` hard-errors when no previous runtime is recorded (see
-    /// `update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists`
-    /// below) because it can only ever undo one step, not walk a history. A user
-    /// who expects a multi-step undo would be surprised by that, so the limit must
-    /// be stated up front in `--help`, not discovered via an error message.
-    #[test]
-    fn rollback_help_states_the_single_level_limit() {
-        let help = Cli::command()
-            .find_subcommand_mut("runtimes")
-            .expect("runtimes subcommand")
-            .find_subcommand_mut("rollback")
-            .expect("rollback subcommand")
-            .render_long_help()
-            .to_string();
-        assert!(
-            help.contains("rollback has no history"),
-            "`rocm runtimes rollback --help` must state the single-level limit:\n{help}"
-        );
     }
 
     /// An `ExamineSummary` with the install-reporting fields under test and
@@ -26406,11 +26394,62 @@ ID_LIKE="suse opensuse"
         assert!(success.contains(&manifest.install_root.display().to_string()));
         assert!(!success.contains("config:"));
         assert!(!success.contains("marker:"));
+        assert!(
+            !success.contains("rocm runtimes rollback"),
+            "the first install has no previous runtime, so rollback would hard-error; \
+             must not hint at a command that immediately fails:\n{success}"
+        );
 
         let mut examine = String::new();
         append_examine_runtime_state(&mut examine, &rebased_paths, &config)?;
         assert!(examine.contains("active_runtime_status: ready"));
         assert!(examine.contains("setup_runtime_root:"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A second `install sdk` switches the active runtime the same way
+    /// `runtimes activate` does, and `activate_runtime` records the previous
+    /// runtime either way — so this path must surface the same rollback hint
+    /// `runtimes activate` and `update --apply --activate` already do, not
+    /// silently drop the recovery advice because it went through the install
+    /// finalization path instead.
+    #[test]
+    fn sdk_install_finalization_hints_rollback_after_a_second_install() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization-second-install");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-first",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let first = finalize_successful_sdk_install(&paths)?
+            .context("first sdk install finalization should select the installed runtime")?;
+        assert_eq!(first.previous_runtime_key, None);
+
+        let second_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-second",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let second = finalize_successful_sdk_install(&paths)?
+            .context("second sdk install finalization should select the newest runtime")?;
+        assert_eq!(second.runtime_key, second_manifest.runtime_key);
+        assert_eq!(
+            second.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-first")
+        );
+
+        let success = render_sdk_install_success(&second);
+        assert!(
+            success.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            "a previous runtime was recorded, so the install summary should hint at rollback \
+             as a recovery path, got:\n{success}"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -26647,6 +26686,20 @@ ID_LIKE="suse opensuse"
         assert_eq!(
             config.previous_runtime_key.as_deref(),
             Some("release-pip-gfx120x-all-7-13-0")
+        );
+
+        // Rolling back a second time toggles back to where the first rollback
+        // came from — this is the guarantee the `rollback --help` text makes
+        // ("it remembers only the runtime you just left"). This test fails the
+        // moment that toggle stops holding.
+        let rolled_back_again = rollback_runtime(&paths, &mut config)?;
+        assert_eq!(
+            rolled_back_again.runtime_key,
+            "release-pip-gfx120x-all-7-13-0"
+        );
+        assert_eq!(
+            config.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -27734,6 +27787,7 @@ ID_LIKE="suse opensuse"
             runtime_key: "wheel-gfx942-7.13.0".to_owned(),
             install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
             family: "gfx94X-dcgpu".to_owned(),
+            previous_runtime_key: None,
         }
     }
 
