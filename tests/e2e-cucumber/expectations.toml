@@ -153,9 +153,10 @@ reason = "Managed runtime path nests recursively (runtimes/wheel/...) on re-prov
 # matches those rows too: which of them pass varies run to run on that lane, and
 # a deterministic-XPASS row would fail the lane on unrelated PRs.
 #
-# This does NOT weaken the coverage the bench fix relies on: the three
-# MockServer-backed bench scenarios run unxfail'd on every lane, including this
-# one, and they are what pin the request path and the failure reporting.
+# This does NOT weaken the coverage the bench fix relies on: the five
+# MockServer-backed bench scenarios (bench-01 to bench-05) run unxfail'd on
+# every lane, including this one, and they are what pin the request path, the
+# failure reporting, the CSV columns, and the rollup-split warning.
 [["bench-load-real-serve"]]
 when = { effective_engine = "lemonade", os = "linux", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-7423"

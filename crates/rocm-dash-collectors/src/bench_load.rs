@@ -80,6 +80,33 @@ pub struct CellReport {
     pub failed: u32,
     /// Reason from the first failure observed, for the operator-facing warning.
     pub first_error: Option<String>,
+    /// Set on the first cell of a sweep whose append landed in a file that
+    /// already held blank-`engine` rows for that cell; `None` on every other
+    /// report, so the CLI warns once per run rather than once per cell. Always
+    /// `None` from [`run_cell`], which appends nothing.
+    pub engine_split: Option<EngineSplitNotice>,
+}
+
+/// Evidence that the results file being appended to straddles the point at
+/// which the `engine` column started being populated.
+///
+/// `engine` is a rollup key (`RollupKey` in `rocm_dash_core::bench_rollup`), so
+/// a cell's rows written before the column was populated (blank `engine`) do
+/// not group with the rows written after it (`vllm`): one Pass^N over N trials
+/// becomes two smaller groups, and nothing on the dashboard says why — the
+/// Bench rollup table renders `cell/model/tp·dtype/concurrency` and never
+/// `engine`. The same split follows any run whose `/metrics` was unreachable
+/// (a remote endpoint, metrics disabled, a restart mid-series), so this is not
+/// a one-off upgrade notice; it fires whenever the two groups actually exist.
+///
+/// Carried out to the CLI rather than printed here so the collector stays free
+/// of process-wide output.
+#[derive(Debug, Clone)]
+pub struct EngineSplitNotice {
+    /// The cell whose earlier rows in the file carry a blank `engine`.
+    pub cell: String,
+    /// The results file holding both groups.
+    pub path: String,
 }
 
 /// Why a single benchmark request produced no usable measurement.
@@ -401,10 +428,10 @@ async fn run_cell_with_clients(
 
     // The `/metrics` scraper only understands vLLM's `vllm:` series, so a
     // recognisable sample is proof the endpoint is vLLM; a non-vLLM endpoint
-    // leaves the column blank rather than guessing. `engine` is a new column:
-    // rows appended before this change have it blank, and since `engine` is a
-    // rollup key, a shared `results.csv` spanning the upgrade splits a cell's
-    // trials into blank and `vllm` groups — rotate the file to regroup them.
+    // leaves the column blank rather than guessing. `engine` is a new column and
+    // a rollup key, so a shared `results.csv` spanning the upgrade splits a
+    // cell's trials into blank and `vllm` groups; the append path detects that
+    // and the CLI warns about it (see [`EngineSplitNotice`]).
     let engine = detect_engine(prom_before.as_ref(), prom_after.as_ref());
 
     let row = BenchmarkRow {
@@ -435,6 +462,8 @@ async fn run_cell_with_clients(
         succeeded: n_success,
         failed: n_failed,
         first_error,
+        // Filled in by the sweep, which is what knows the target file.
+        engine_split: None,
     })
 }
 
@@ -506,7 +535,7 @@ fn prom_latency(
 /// window cannot be measured: either scrape missing, the observation count did
 /// not advance (`Δcount ≤ 0`, no request recorded this metric in the window),
 /// the counter reset (`Δsum < 0`, a server restart), or either delta is `NaN`
-/// (Prometheus reports an unobserved histogram sum that way).
+/// (defensive: see the guard below).
 ///
 /// The value is deliberately *not* backfilled from the after-scrape's lifetime
 /// `sum/count` average. That average covers every request the server process
@@ -527,7 +556,18 @@ fn latency_ms(
     let delta_count = count_after? - count_before?;
     // Phrased as acceptance, not rejection: every comparison against NaN is
     // false, so this rejects a NaN delta where `if delta_count <= 0.0 || ...`
-    // would fall through and emit Some(NaN).
+    // would fall through and emit Some(NaN) — which `opt_f64` then writes into
+    // the CSV as a literal `NaN` cell.
+    //
+    // A conforming vLLM cannot produce that NaN: `_sum`/`_count` are counters
+    // that `prometheus_client` initialises to `0.0`/`0` and never renders as
+    // NaN (NaN appears in text exposition for summary quantiles with no
+    // observations and for gauges explicitly set to NaN, neither of which is
+    // among the four series `vllm_prom` reads). The guard is therefore
+    // defensive, not a response to an observed exposition: `extract` finishes
+    // with `parse::<f64>()`, which accepts a `NaN` token from a malformed or
+    // non-conforming exporter, and this is the last place to stop it before it
+    // reaches an immutable CSV row.
     (delta_count > 0.0 && delta_sum >= 0.0).then_some(delta_sum / delta_count * 1000.0)
 }
 
@@ -537,13 +577,30 @@ pub const RAMP_SEQUENCE: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128];
 /// Minimum fractional `gen_tps` improvement to keep ramping.
 pub const PLATEAU_GAIN: f64 = 0.05;
 
+/// Zero-based position of the `cell` column in [`CSV_HEADER`].
+const CELL_COLUMN: usize = 0;
+
+/// Zero-based position of the `engine` column in [`CSV_HEADER`].
+///
+/// Both indexes are only read after the file's header has been validated as
+/// byte-identical to [`CSV_HEADER`], so they cannot address a foreign layout.
+const ENGINE_COLUMN: usize = 4;
+
 /// Open (or create) `csv_path` once, take an exclusive advisory lock, validate
 /// or write the header, then append one newline-terminated row.
 ///
 /// The lock serializes cooperating `rocm bench load` processes so concurrent
 /// first writers cannot both emit the header. `O_APPEND` keeps each row write
 /// at the end of the file.
-fn append_one_row(row: &BenchmarkRow, csv_path: &Path) -> Result<(), BenchLoadError> {
+///
+/// Returns an [`EngineSplitNotice`] when the row carries an `engine` and the
+/// file already holds rows for the same cell without one — the two sets are
+/// separate rollup groups, which the caller reports. Detected under the same
+/// lock as the append so a concurrent writer cannot slip a row in between.
+fn append_one_row(
+    row: &BenchmarkRow,
+    csv_path: &Path,
+) -> Result<Option<EngineSplitNotice>, BenchLoadError> {
     use std::io::{BufRead, Seek};
 
     let mut file = OpenOptions::new()
@@ -553,6 +610,7 @@ fn append_one_row(row: &BenchmarkRow, csv_path: &Path) -> Result<(), BenchLoadEr
         .open(csv_path)?;
     file.lock()?;
 
+    let mut notice = None;
     if file.metadata()?.len() == 0 {
         file.write_all(CSV_HEADER.as_bytes())?;
     } else {
@@ -564,11 +622,59 @@ fn append_one_row(row: &BenchmarkRow, csv_path: &Path) -> Result<(), BenchLoadEr
                 path: csv_path.display().to_string(),
             });
         }
+        if row.engine.is_some() {
+            file.seek(std::io::SeekFrom::Start(0))?;
+            if has_blank_engine_row(&file, &row.cell) {
+                notice = Some(EngineSplitNotice {
+                    cell: row.cell.clone(),
+                    path: csv_path.display().to_string(),
+                });
+            }
+        }
     }
 
+    // `O_APPEND` puts this at the end of the file regardless of where the
+    // scan above left the read cursor.
     let line = serialize_row_to_line(row)?;
     file.write_all(&line)?;
-    Ok(())
+    Ok(notice)
+}
+
+/// Whether `file` already holds a row for `cell` whose `engine` column is blank.
+///
+/// Best-effort by design: an unreadable record is skipped rather than failing
+/// the append, because this only decides whether to print a warning and a
+/// half-written or hand-edited line is not worth refusing a benchmark over.
+/// The reader is `flexible` for the same reason. Stops at the first hit, so the
+/// common case (a file the current build wrote) costs one pass at most.
+fn has_blank_engine_row(file: &std::fs::File, cell: &str) -> bool {
+    csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(std::io::BufReader::new(file))
+        .records()
+        .flatten()
+        .any(|record| {
+            record.get(CELL_COLUMN) == Some(cell)
+                && record
+                    .get(ENGINE_COLUMN)
+                    .is_none_or(|engine| engine.trim().is_empty())
+        })
+}
+
+/// Attach `notice` to `report` unless this sweep already raised one.
+///
+/// The notice describes the *file*, so repeating it for every concurrency level
+/// of a ramp would be noise; `already` carries the once-per-sweep state.
+fn attach_engine_split(
+    report: &mut CellReport,
+    notice: Option<EngineSplitNotice>,
+    already: &mut bool,
+) {
+    if !*already && notice.is_some() {
+        report.engine_split = notice;
+        *already = true;
+    }
 }
 
 /// Run a concurrency sweep and append one aggregate row per cell to `csv_path`.
@@ -586,11 +692,13 @@ pub async fn run_and_append_csv(
     let clients = BenchClients::new()?;
 
     let mut reports = Vec::with_capacity(concurrency_levels.len());
+    let mut split_reported = false;
     for &conc in concurrency_levels {
-        let report = run_cell_with_clients(spec, conc, &clients).await?;
+        let mut report = run_cell_with_clients(spec, conc, &clients).await?;
         // A fully-failed cell is still appended: the dashboard tailer expects one
         // row per cell, and the caller reports the failure separately.
-        append_one_row(&report.row, csv_path)?;
+        let notice = append_one_row(&report.row, csv_path)?;
+        attach_engine_split(&mut report, notice, &mut split_reported);
         reports.push(report);
     }
 
@@ -654,10 +762,12 @@ pub async fn run_auto_ramp(
     let mut reports = Vec::new();
     let mut prev_gen_tps: Option<f64> = None;
     let clients = BenchClients::new()?;
+    let mut split_reported = false;
 
     for &conc in RAMP_SEQUENCE {
-        let report = run_cell_with_clients(spec, conc, &clients).await?;
-        append_one_row(&report.row, csv_path)?;
+        let mut report = run_cell_with_clients(spec, conc, &clients).await?;
+        let notice = append_one_row(&report.row, csv_path)?;
+        attach_engine_split(&mut report, notice, &mut split_reported);
 
         let is_last = conc == *RAMP_SEQUENCE.last().unwrap_or(&conc);
         let stop = should_stop_ramp(prev_gen_tps, &report.row, is_last);
@@ -993,7 +1103,9 @@ mod tests {
             .collect();
 
         for handle in handles {
-            handle.join().unwrap().unwrap();
+            // These rows carry no `engine`, so none of them can straddle the
+            // split — a notice here would mean the scan fires on the wrong rows.
+            assert!(handle.join().unwrap().unwrap().is_none());
         }
 
         let content = std::fs::read_to_string(&csv_path).unwrap();
@@ -1646,9 +1758,11 @@ mod tests {
 
     #[test]
     fn latency_ms_is_none_when_a_counter_is_nan() {
-        // Prometheus emits NaN for a histogram sum with no observations, and
-        // `vllm_prom::parse` accepts it verbatim (`parse::<f64>()` parses
-        // "NaN"), so a NaN can reach this arithmetic from a real scrape.
+        // Defensive, not observed: a conforming vLLM never exposes NaN here —
+        // its histogram `_sum`/`_count` are counters `prometheus_client`
+        // initialises to `0.0`/`0`. What makes the guard worth keeping is that
+        // `vllm_prom::extract` ends in `parse::<f64>()`, which accepts a `NaN`
+        // token, so a malformed or non-conforming exporter can still put one in.
         //
         // Every comparison against NaN is false, so a guard phrased as a
         // rejection — `if delta_count <= 0.0 || delta_sum < 0.0 { None }` —
@@ -1826,5 +1940,157 @@ mod tests {
             .tpot_ms
             .expect("tpot_ms must be populated when the counter advanced");
         assert!((tpot - 20.0).abs() < 0.01, "expected tpot≈20 got {tpot}");
+    }
+
+    // ---------- engine-column rollup split ----------
+
+    /// The column positions the blank-`engine` scan reads must be the ones
+    /// [`CSV_HEADER`] actually declares; a reordered header would otherwise send
+    /// the scan looking at `model` or `run` and silently stop warning.
+    #[test]
+    fn scan_column_indexes_match_the_header() {
+        let columns: Vec<&str> = CSV_HEADER.trim().split(',').collect();
+        assert_eq!(columns[CELL_COLUMN], "cell");
+        assert_eq!(columns[ENGINE_COLUMN], "engine");
+    }
+
+    /// A file exactly as a build that never populated `engine` left it: the
+    /// current header (the append is refused otherwise) and a row for the cell
+    /// about to be appended, with the `engine` field empty.
+    fn write_pre_engine_file(csv_path: &Path, cells: &[&str]) {
+        use std::fmt::Write as _;
+
+        let mut content = CSV_HEADER.to_string();
+        for cell in cells {
+            let _ = writeln!(
+                content,
+                "{cell},1,1,test-model,,16,8,4,200,100,10.0,5.0,0.5,rocm bench load (local smoke),1,0,50.0,20.0"
+            );
+        }
+        std::fs::write(csv_path, content).unwrap();
+    }
+
+    fn engine_row(cell: &str, engine: Option<&str>) -> BenchmarkRow {
+        BenchmarkRow {
+            cell: cell.to_string(),
+            run: 1,
+            engine: engine.map(ToString::to_string),
+            concurrency: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn append_flags_a_cell_whose_earlier_rows_predate_the_engine_column() {
+        let dir = tempdir();
+        let csv_path = dir.join("results.csv");
+        write_pre_engine_file(&csv_path, &["bench-c1"]);
+
+        let notice = append_one_row(&engine_row("bench-c1", Some("vllm")), &csv_path)
+            .unwrap()
+            .expect("appending a vllm row over blank-engine rows must be flagged");
+        assert_eq!(notice.cell, "bench-c1");
+        assert_eq!(notice.path, csv_path.display().to_string());
+
+        // The row is still appended — this is a warning, not a refusal.
+        let content = std::fs::read_to_string(&csv_path).unwrap();
+        assert_eq!(content.lines().count(), 3);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_is_quiet_when_no_group_is_actually_split() {
+        let dir = tempdir();
+
+        // Earlier rows already carry the same engine → one group, no notice.
+        let labelled = dir.join("labelled.csv");
+        std::fs::write(
+            &labelled,
+            format!(
+                "{CSV_HEADER}bench-c1,1,1,test-model,vllm,16,8,4,200,100,10.0,5.0,0.5,l,1,0,50.0,20.0\n"
+            ),
+        )
+        .unwrap();
+        assert!(
+            append_one_row(&engine_row("bench-c1", Some("vllm")), &labelled)
+                .unwrap()
+                .is_none()
+        );
+
+        // Blank-engine rows exist, but for a different cell: different rollup
+        // group either way, so there is nothing to explain.
+        let other_cell = dir.join("other-cell.csv");
+        write_pre_engine_file(&other_cell, &["bench-c8"]);
+        assert!(
+            append_one_row(&engine_row("bench-c1", Some("vllm")), &other_cell)
+                .unwrap()
+                .is_none()
+        );
+
+        // The appended row has no engine either (non-vLLM endpoint), so it lands
+        // in the same group as the earlier rows.
+        let unlabelled = dir.join("unlabelled.csv");
+        write_pre_engine_file(&unlabelled, &["bench-c1"]);
+        assert!(
+            append_one_row(&engine_row("bench-c1", None), &unlabelled)
+                .unwrap()
+                .is_none()
+        );
+
+        // A brand-new file has no earlier rows at all.
+        let fresh = dir.join("fresh.csv");
+        assert!(
+            append_one_row(&engine_row("bench-c1", Some("vllm")), &fresh)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The notice names the file, not the cell, so a multi-cell sweep over a
+    /// file whose every cell predates the column must still warn exactly once.
+    #[tokio::test]
+    async fn engine_split_is_reported_once_per_sweep() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(stub_response(100, 50))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/metrics"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(prom_body_full(5, 2, 1.0, 10.0, 2.0, 100.0)),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempdir();
+        let csv_path = dir.join("results.csv");
+        write_pre_engine_file(&csv_path, &["bench-c1", "bench-c2"]);
+
+        let mut spec = make_spec(&server.uri());
+        spec.requests = 2;
+        let reports = run_and_append_csv(&spec, &[1, 2], &csv_path).await.unwrap();
+
+        assert!(
+            reports.iter().all(|r| r.row.engine.as_deref() == Some("vllm")),
+            "the mock exposes vLLM metrics, so every row must be labelled"
+        );
+        let flagged: Vec<&str> = reports
+            .iter()
+            .filter_map(|r| r.engine_split.as_ref())
+            .map(|notice| notice.cell.as_str())
+            .collect();
+        assert_eq!(
+            flagged,
+            ["bench-c1"],
+            "both cells straddle the split, but the warning is about the file and must be raised once"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

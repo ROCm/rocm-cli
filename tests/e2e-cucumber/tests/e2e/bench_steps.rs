@@ -117,6 +117,10 @@ fn run_bench(world: &mut E2eWorld, endpoint: &str) {
 /// file so the row's `engine`/`tpot_ms` columns can be asserted directly.
 #[when("the user benchmarks the served endpoint recording results to a file")]
 async fn benchmark_recording_results(world: &mut E2eWorld) {
+    run_bench_recording(world);
+}
+
+fn run_bench_recording(world: &mut E2eWorld) {
     let endpoint = world
         .endpoint
         .clone()
@@ -151,6 +155,95 @@ async fn benchmark_recording_results(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// Leave behind the results file a build that never populated `engine` would
+/// have written for this same cell.
+///
+/// Produced by running the benchmark once and then blanking the `engine` column
+/// of the row it wrote, rather than by pasting a fixture: an append whose header
+/// does not match byte-for-byte is refused outright, so a hand-written file
+/// would decay into a header-mismatch failure that proves nothing about the
+/// warning. Blanking is also exactly how a run against an endpoint with no
+/// reachable `/metrics` leaves the column, which is the other way the split
+/// happens.
+#[given("earlier results for the same cell were recorded without an engine")]
+async fn seed_results_recorded_without_an_engine(world: &mut E2eWorld) {
+    run_bench_recording(world);
+    let rc = world.cli_rc.expect("no command was run");
+    assert!(
+        rc == 0,
+        "the seeding benchmark run failed (rc={rc}):\n{}{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+
+    let path = bench_out_path(world);
+    let csv = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read bench CSV {}: {e}", path.display()));
+    let blanked = blank_engine_column(&csv);
+    assert_ne!(
+        blanked, csv,
+        "the seeding run wrote no engine value to blank:\n{csv}"
+    );
+    std::fs::write(&path, blanked).expect("could not rewrite the seeded bench CSV");
+}
+
+/// Empty the `engine` field of every data row, locating it by header name so a
+/// column reorder cannot silently blank the wrong one.
+fn blank_engine_column(csv: &str) -> String {
+    let mut lines = csv.lines();
+    let header = lines.next().unwrap_or_else(|| panic!("bench CSV is empty"));
+    let idx = header
+        .split(',')
+        .position(|c| c == "engine")
+        .unwrap_or_else(|| panic!("no `engine` column in header: {header}"));
+
+    let mut out = format!("{header}\n");
+    for line in lines {
+        let mut fields: Vec<&str> = line.split(',').collect();
+        if let Some(field) = fields.get_mut(idx) {
+            *field = "";
+        }
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+#[then("the benchmark warns that the earlier rows group separately")]
+async fn assert_engine_split_warning(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let rc = world.cli_rc.expect("no command was run");
+    // A split is worth saying out loud, but the run still measured what it was
+    // asked to: warn, do not fail.
+    assert!(
+        rc == 0,
+        "rocm bench load failed (rc={rc}):\n{stdout}{stderr}"
+    );
+
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("blank engine column"))
+        .unwrap_or_else(|| {
+            panic!("the run did not warn about the pre-existing blank-engine rows:\n{stderr}")
+        });
+    // Naming the cell and the file is what makes the warning actionable: the
+    // Bench panel renders no `engine` column, so without them there is nothing
+    // to connect a halved group to.
+    assert!(
+        warning.contains("bench-c1"),
+        "the warning must name the affected cell:\n{warning}"
+    );
+    assert!(
+        warning.contains("bench-results.csv"),
+        "the warning must name the file holding both groups:\n{warning}"
+    );
+    assert!(
+        stderr.contains("rotate"),
+        "the warning must say what to do about it:\n{stderr}"
+    );
 }
 
 #[then("the recorded benchmark row is labelled the vLLM engine with a per-output-token latency")]

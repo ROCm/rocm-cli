@@ -6,9 +6,10 @@ Feature: Benchmarking a served endpoint
   # one of the two 404'd — and every request failure was swallowed, so the run
   # still exited 0 with a row of blanks.
   #
-  # bench-01 to bench-04 run on every lane (MockServer-backed, no GPU needed)
-  # and are what pin the request path, the failure reporting, and the CSV
-  # columns. bench-05 is the hardware proof against a really served model.
+  # bench-01 to bench-05 run on every lane (MockServer-backed, no GPU needed)
+  # and are what pin the request path, the failure reporting, the CSV columns,
+  # and the rollup-split warning. bench-06 is the hardware proof against a
+  # really served model.
 
   # The mock answers chat on BOTH the versioned and unversioned routes, so
   # "the benchmark succeeded" alone would pass even with the bug present. This
@@ -45,6 +46,18 @@ Feature: Benchmarking a served endpoint
     When the user benchmarks the served endpoint recording results to a file
     Then the recorded benchmark row is labelled the vLLM engine with a per-output-token latency
 
+  # `engine` is a rollup key, so a results file holding a cell's rows from
+  # before the column was populated groups them apart from the rows written
+  # now: N trials become two smaller groups, and the Bench panel renders no
+  # `engine` column to explain it. Nothing in the file or on screen says why,
+  # so the run itself has to — which is behaviour, not a source comment.
+  @id:bench-load-warns-on-engine-split
+  Scenario: bench-05 - Appending over results that predate the engine column warns about the split
+    Given a model is being served with a metrics endpoint
+    And earlier results for the same cell were recorded without an engine
+    When the user benchmarks the served endpoint recording results to a file
+    Then the benchmark warns that the earlier rows group separately
+
   # Hardware proof: a real `rocm serve` on this host (vLLM on Instinct, lemonade
   # on Strix Halo) benchmarked through the endpoint the CLI itself reports.
   #
@@ -53,7 +66,7 @@ Feature: Benchmarking a served endpoint
   # without an active ROCm runtime. Lemonade hosts do not need it, so omitting it
   # fails on Instinct alone — mirror the sibling GPU serve scenarios and keep it.
   @id:bench-load-real-serve @requires-gpu
-  Scenario: bench-05 - Benchmarking a really served model reports throughput
+  Scenario: bench-06 - Benchmarking a really served model reports throughput
     Given a managed runtime is active
     And a model is being served on GPU
     When the user benchmarks the served endpoint
