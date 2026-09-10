@@ -78,11 +78,11 @@ impl ModelPicker {
         let len = self.filtered(recipes).len();
         match key {
             KeyCode::Esc => PickerOutcome::Cancelled,
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Left => {
                 self.selected = self.selected.saturating_sub(1);
                 PickerOutcome::None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Right => {
                 if len > 0 {
                     self.selected = (self.selected + 1).min(len - 1);
                 }
@@ -185,7 +185,7 @@ pub fn draw_model_picker(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "type filter · ↑↓ select · Enter choose · Esc cancel",
+            "type filter · ↑↓←→ select · Enter choose · Esc cancel",
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -284,6 +284,19 @@ mod tests {
             p.on_key(KeyCode::Down, &recipes());
         }
         assert_eq!(p.selected, 2);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut p = ModelPicker::default();
+        for _ in 0..10 {
+            p.on_key(KeyCode::Right, &recipes());
+        }
+        assert_eq!(p.selected, 2);
+        for _ in 0..10 {
+            p.on_key(KeyCode::Left, &recipes());
+        }
+        assert_eq!(p.selected, 0);
     }
 
     #[test]

@@ -37,7 +37,15 @@ mod tests {
     }
 
     /// The self-hosted runner labels that must not appear in a `runs-on`.
-    const SELF_HOSTED_LABELS: [&str; 3] = ["self-hosted", "amd-gpu", "strix-halo"];
+    const SELF_HOSTED_LABELS: [&str; 5] =
+        ["self-hosted", "amd-gpu", "strix-halo", "mi300x", "r9700"];
+
+    /// Labels that do NOT narrow a `runs-on` to one kind of hardware.
+    ///
+    /// `self-hosted`, `linux` and `windows` are self-evidently generic.
+    /// `amd-gpu` reads specific but is not: every AMD GPU runner registers it,
+    /// so a lane selecting on it alone draws from a mixed-silicon pool.
+    const GENERIC_LABELS: [&str; 4] = ["self-hosted", "linux", "windows", "amd-gpu"];
 
     /// Strip a trailing `# …` comment from a YAML line (best-effort: our
     /// workflows never put a literal `#` inside a runs-on/group value).
@@ -822,6 +830,33 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_self_hosted_lane_pins_a_hardware_label() {
+        // `e2e-gpu` and `e2e-gpu-nightly` shipped as `[self-hosted, linux,
+        // amd-gpu]`. The Strix Halo Linux hosts carry `amd-gpu` too, so the
+        // MI300X-named lanes were scheduled onto gfx1151 whenever a Strix
+        // runner won the race: red on the WSL host, and a PASS on the native
+        // Ubuntu one — published as `e2e-gpu-report`, which the consolidated
+        // grid labels MI300X. A green run on hardware the lane does not name is
+        // worse than a red one, because nothing prompts anyone to look.
+        //
+        // Derived like its siblings: a new lane is covered the day it lands,
+        // and only a lane whose labels are ALL generic fails, so pinning a new
+        // hardware label needs no change here.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, runs_on) in self_hosted_e2e_jobs(&text) {
+                let labels = flattened_list_items(&runs_on);
+                assert!(
+                    labels.iter().any(|l| !GENERIC_LABELS.contains(&l.as_str())),
+                    "{workflow} job `{job}` selects its runner with generic labels only \
+                     (`{runs_on}`), so it can land on any AMD GPU host. Pin a label that \
+                     identifies the hardware the lane is named for (e.g. `mi300x`, \
+                     `r9700`, `strix-halo`)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_self_hosted_lane_allows_for_a_cold_serve() {
         // The per-PR Strix Windows lane was the only lane without this, while its
         // own nightly twin set it. A first serve on shared hardware loads the
@@ -1039,6 +1074,28 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     fn nightly_prebuilt_e2e_lanes_enable_test_hooks() {
         let workflow = read_workflow("nightly.yml");
         assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
+    }
+
+    #[test]
+    fn gpu_prewarm_caches_are_namespaced_by_source_layout() {
+        // The shared tree survives `git clean` and every branch on the runner.
+        // A branch that composes runtimes under a new source layout would
+        // otherwise leave keys and manifests in that tree which code on the
+        // previous layout cannot read, poisoning the lanes it never touched.
+        for workflow_name in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let workflow = read_workflow(workflow_name);
+            assert!(
+                workflow.contains("e2e-prewarm-multi-arch-v2"),
+                "{workflow_name} must isolate the canonical multi-arch runtime tree"
+            );
+            assert!(
+                !workflow.lines().any(|line| {
+                    line.trim_end().ends_with("e2e-prewarm\"")
+                        || line.trim_end().ends_with("e2e-prewarm'")
+                }),
+                "{workflow_name} still uses the generation-agnostic pre-warm tree"
+            );
+        }
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the

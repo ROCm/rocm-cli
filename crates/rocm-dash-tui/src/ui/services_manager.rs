@@ -160,10 +160,10 @@ pub fn on_key<S: ::std::hash::BuildHasher>(
     // 3) List navigation + lifecycle requests.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *services = None,
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
             sm.selected = sm.selected.saturating_sub(1);
         }
-        KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right if !rows.is_empty() => {
             sm.selected = (sm.selected + 1).min(rows.len() - 1);
         }
         KeyCode::Char('s') => request_lifecycle(sm, &rows, LifecycleAction::Stop),
@@ -359,7 +359,7 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · s stop · r restart · Esc close",
+            "↑↓←→ select · s stop · r restart · Esc close",
             Style::default().fg(theme.muted),
         ))),
         body[1],
@@ -497,6 +497,19 @@ mod tests {
         assert_eq!(services.as_ref().unwrap().selected, 1);
         on_key(&mut services, &mut jobs, &insts, key(KeyCode::Down)); // clamp at last
         assert_eq!(services.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut services = Some(ServicesManagerState::default());
+        let mut jobs = State::default();
+        let insts = instances();
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Right));
+        assert_eq!(services.as_ref().unwrap().selected, 1);
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Right)); // clamp at last
+        assert_eq!(services.as_ref().unwrap().selected, 1);
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Left));
+        assert_eq!(services.as_ref().unwrap().selected, 0);
     }
 
     fn render(

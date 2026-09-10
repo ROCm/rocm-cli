@@ -38,10 +38,12 @@ rocm-engine-vllm = { path = "../../engines/vllm" }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tar = "0.4"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(unix)'.dependencies]
