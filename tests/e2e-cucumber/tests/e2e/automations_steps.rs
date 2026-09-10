@@ -67,20 +67,51 @@ fn slug_of(display_name: &str) -> String {
         .join("-")
 }
 
+/// Whether `token` looks like a watcher identifier rather than display text.
+///
+/// Every real id is lowercase with a `-`/`_` separator (`server-recover`,
+/// `therock-update`, `gpu-metrics`). Requiring that shape is what lets the
+/// ambiguous forms below — a parenthesised token, a trailing column, a
+/// dash-separated tail — be read as an id without mistaking a display-name
+/// qualifier ("Server recovery (beta)") for one.
+fn is_identifier_shaped(token: &str) -> bool {
+    !token.is_empty()
+        && token.contains(['-', '_'])
+        && token
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 /// The identifier a check block explicitly EXPOSES, if any.
 ///
 /// The contract is "enable-able from what the listing shows", so the moment the
-/// product publishes a real identifier — inline on the header (`Server recovery
-/// [server-recover]` or `... (server-recover)`) or on an indented detail line
-/// (`id: server-recover`) — this must pick THAT up, or a correct fix would stay
-/// xfailed forever (the row would never go stale). Returns `None` only when the
-/// block names no identifier at all, which is today's defect.
+/// product publishes a real identifier this must pick THAT up, or a correct fix
+/// would stay xfailed forever (the row would never go stale). Recognises the
+/// shapes a fix might plausibly use:
+///   - a detail line — `id: server-recover`, `slug = server-recover`
+///   - bracketed on the header — `Server recovery [server-recover]`
+///   - parenthesised on the header — `Server recovery (server-recover)`
+///   - dash-separated on the header — `Server recovery — server-recover`
+///   - a trailing column — `Server recovery      server-recover`
+///
+/// Returns `None` only when the block names no identifier at all, which is
+/// today's defect.
 fn exposed_identifier(block: &[&str]) -> Option<String> {
-    // A detail line that names the id outright, in the obvious shapes a fix
-    // might use: "id: server-recover", "identifier = server-recover".
+    // A detail line that names the id outright.
     for line in block {
         let line = line.trim();
-        for key in ["id:", "id =", "identifier:", "identifier ="] {
+        for key in [
+            "id:",
+            "id =",
+            "identifier:",
+            "identifier =",
+            "slug:",
+            "slug =",
+            "key:",
+            "key =",
+            "name:",
+            "name =",
+        ] {
             if let Some(rest) = line.strip_prefix(key) {
                 let id = rest.trim().trim_matches(|c| c == '"' || c == '`');
                 if !id.is_empty() {
@@ -89,22 +120,47 @@ fn exposed_identifier(block: &[&str]) -> Option<String> {
             }
         }
     }
-    // An id printed inline on the header, in brackets or parens after the name:
-    // "Server recovery [server-recover]". The state suffix "(on)"/"(off)" has
+    // An id printed on the header itself. The state suffix "(on)"/"(off)" has
     // already been stripped from `header` before this is called.
     let header = block.first()?.trim();
+
+    // Bracketed or parenthesised: "Server recovery [server-recover]".
     for (open, close) in [('[', ']'), ('(', ')')] {
         if let (Some(o), Some(c)) = (header.rfind(open), header.rfind(close))
             && o < c
         {
             let inner = header[o + 1..c].trim();
-            // A single token with no spaces is an identifier; a phrase is
-            // still part of the display name, not an id.
-            if !inner.is_empty() && !inner.contains(char::is_whitespace) {
+            // Brackets are unambiguous — nothing but an id is written that way.
+            // Parentheses are not, so those must look like an identifier.
+            if open == '[' && !inner.is_empty() && !inner.contains(char::is_whitespace) {
+                return Some(inner.to_owned());
+            }
+            if is_identifier_shaped(inner) {
                 return Some(inner.to_owned());
             }
         }
     }
+
+    // Dash-separated tail: "Server recovery — server-recover" (em/en dash, or a
+    // spaced ASCII hyphen). Only the last segment can be the id.
+    for sep in [" — ", " – ", " - "] {
+        if let Some((_, tail)) = header.rsplit_once(sep) {
+            let tail = tail.trim();
+            if is_identifier_shaped(tail) {
+                return Some(tail.to_owned());
+            }
+        }
+    }
+
+    // A trailing column: "Server recovery      server-recover", i.e. the id set
+    // off by column padding rather than punctuation.
+    if let Some((_, tail)) = header.rsplit_once("  ") {
+        let tail = tail.trim();
+        if is_identifier_shaped(tail) {
+            return Some(tail.to_owned());
+        }
+    }
+
     None
 }
 

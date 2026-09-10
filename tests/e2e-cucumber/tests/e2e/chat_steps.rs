@@ -166,8 +166,13 @@ async fn assert_piped_prompt_sent(world: &mut E2eWorld) {
         .and_then(|m| m.get("content"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("no user message in chat request:\n{request}"));
+    // Compare trimmed: the step pipes a trailing newline (as a shell pipeline
+    // does), and forwarding stdin verbatim is a perfectly correct fix. Demanding
+    // the exact untrimmed string would keep this row xfailed against exactly
+    // that behaviour — the stale-row failure mode this file sets out to avoid.
     assert_eq!(
-        user_content, "Hello from standard input",
+        user_content.trim(),
+        "Hello from standard input",
         "the model received the wrong prompt: {request}"
     );
 }

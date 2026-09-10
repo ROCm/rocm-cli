@@ -19,6 +19,15 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 
+/// How long a rejected `dash --replay` gets to exit before the step calls it a
+/// hang. Deliberately its own budget rather than `default_timeout()`: today the
+/// dashboard hangs on an unreadable recording, so this bound is paid on every
+/// mock-lane run until that is fixed, and 30s per run is real CI time for a
+/// known-red scenario. It is still far more headroom than a cold binary start
+/// needs on a loaded shared runner, so once the bug is fixed and the xfail row
+/// is deleted the scenario does not become a flake.
+const REPLAY_REJECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
     world
@@ -261,7 +270,7 @@ async fn quit_launcher(world: &mut E2eWorld) {
 async fn assert_replay_refused_promptly(world: &mut E2eWorld) {
     let tui = session(world);
     let rc = tui
-        .wait_for_any_exit(Duration::from_secs(2))
+        .wait_for_any_exit(REPLAY_REJECTION_TIMEOUT)
         .await
         .unwrap_or_else(|e| {
             panic!(

@@ -180,9 +180,16 @@ async fn assert_activation_hint_resolves(world: &mut E2eWorld) {
             || panic!("no activation hint on screen:\n{screen}"),
             |(_, rest)| rest.trim(),
         );
-    // The hint is the command a user would run, which on Unix is `source <path>`.
-    // Take the path it points at, whichever form it came in.
-    let path = hint.strip_prefix("source ").unwrap_or(hint).trim();
+    // The hint is the command a user would run, which on Unix is `source <path>`
+    // — but `. <path>` is the same instruction, and a path with spaces would be
+    // quoted. Strip whichever wrapper it came in so the existence check below
+    // fails only when the CLI named a path that is genuinely not there.
+    let path = hint
+        .strip_prefix("source ")
+        .or_else(|| hint.strip_prefix(". "))
+        .unwrap_or(hint)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
     assert!(
         !path.is_empty(),
         "the activation hint named no path:\n{screen}"
