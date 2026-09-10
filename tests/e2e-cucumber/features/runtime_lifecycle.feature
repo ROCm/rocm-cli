@@ -53,13 +53,3 @@ Feature: Runtime lifecycle state machine
     Then the listing explains the active and rollback markers
     And the first runtime is marked active
     And the second runtime is marked as the rollback target
-
-  # `rollback` can only ever undo one step, not walk a history — rolling back
-  # twice just re-toggles between the same two runtimes. A unit test on
-  # `render_long_help()` proves clap renders the NOTE, but not that the built
-  # binary prints it to a real user (examine.feature:15-18 sets this precedent
-  # for `--help` text). No runtime state needed, so this runs on the mock lane.
-  @id:runtime-lifecycle-rollback-help-states-single-level-limit
-  Scenario: runtime-lifecycle-06 - Stating rollback's single-level limit in --help
-    When the user asks for rollback help
-    Then the help states that rollback has no history

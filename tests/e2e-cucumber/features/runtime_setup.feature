@@ -131,3 +131,12 @@ Feature: Runtime configuration
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  # `rollback` can only ever undo one step, not walk a history. A unit test on
+  # `render_long_help()` proves clap renders the NOTE, but not that the built
+  # binary prints it to a real user (examine.feature:15-18 sets this precedent
+  # for `--help` text). No runtime state needed, so this runs on the mock lane.
+  @id:runtime-rollback-help-states-single-level-limit
+  Scenario: runtime-08 - Stating rollback's single-level limit in --help
+    When the user asks for rollback help
+    Then the help states that rollback has no history

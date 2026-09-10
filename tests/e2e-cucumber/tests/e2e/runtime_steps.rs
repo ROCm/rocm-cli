@@ -591,3 +591,20 @@ async fn assert_adopt_error_explains(world: &mut E2eWorld) {
         "error does not explain TheRock requirement:\n{stdout}\n{stderr}"
     );
 }
+
+#[when("the user asks for rollback help")]
+async fn ask_rollback_help(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback", "--help"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the help states that rollback has no history")]
+async fn rollback_help_states_limit(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        out.contains("rollback has no history"),
+        "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
+    );
+}

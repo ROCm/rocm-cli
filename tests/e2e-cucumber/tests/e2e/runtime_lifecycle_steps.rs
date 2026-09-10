@@ -173,12 +173,6 @@ async fn import_replace(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
-#[when("the user asks for rollback help")]
-async fn ask_rollback_help(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback", "--help"]);
-    record(world, stdout, stderr, rc);
-}
-
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("that runtime becomes active having changed from nothing")]
@@ -318,15 +312,6 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("- {SECOND_KEY}")),
         "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
-    );
-}
-
-#[then("the help states that rollback has no history")]
-async fn rollback_help_states_limit(world: &mut E2eWorld) {
-    let out = ok_output(world);
-    assert!(
-        out.contains("rollback has no history"),
-        "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
     );
 }
 
