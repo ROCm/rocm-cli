@@ -7,6 +7,9 @@ Feature: Runtime lifecycle state machine
   # runtimes in the isolated registry, so no SDK download or GPU is needed — they
   # run on the mock lane every PR. Related EAI-7404.
 
+  # Also covers the `rocm runtimes rollback` recovery hint: absent on the first
+  # activation (no previous runtime, rollback would hard-error), present once a
+  # previous runtime exists to roll back to.
   @id:runtime-lifecycle-activate-records-previous
   Scenario: runtime-lifecycle-01 - Activating a runtime records where it changed from
     Given two registered runtimes and none active
