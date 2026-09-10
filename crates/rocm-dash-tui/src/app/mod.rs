@@ -6934,8 +6934,18 @@ mod tests {
 
     // --- Home tab update check (background job-bridge trigger) ---
 
+    // Serializes every test in this group against
+    // `refresh_update_status_skips_spawn_when_disabled_via_env`, which toggles
+    // `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK` — process env is shared across
+    // test threads, so an unguarded test can observe the var mid-toggle and
+    // spuriously see `refresh_update_status` skip the spawn it expects.
+    static UPDATE_CHECK_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn refresh_update_status_spawns_on_first_due_tick() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         assert!(!s.update_status_pending);
         let fx = refresh_update_status(&mut s);
@@ -6946,6 +6956,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_does_not_duplicate_spawn_while_running() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let fx = refresh_update_status(&mut s);
         assert!(!fx.is_empty());
@@ -6963,6 +6976,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_from_terminal_success_json() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
         assert!(s.update_status_pending);
@@ -7000,6 +7016,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_to_error_on_terminal_failure() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
         assert!(s.update_status_pending);
@@ -7017,6 +7036,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_to_error_on_unparsable_success_output() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
 
@@ -7033,6 +7055,52 @@ mod tests {
         assert!(fx.is_empty());
         assert!(!s.update_status_pending);
         assert_eq!(s.update_status, UpdateStatus::Error);
+    }
+
+    #[test]
+    fn refresh_update_status_spawn_args_include_bounded_timeout() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = st();
+        let _ = refresh_update_status(&mut s);
+        let job = s
+            .jobs
+            .job(HOME_UPDATE_CHECK_JOB_ID)
+            .expect("job spawned on first due tick");
+        assert_eq!(
+            job.args.last().map(String::as_str),
+            Some(HOME_UPDATE_CHECK_TIMEOUT_SECS.to_string().as_str()),
+            "the background check must be bounded, matching the CLI's own \
+             STARTUP_UPDATE_CHECK_TIMEOUT_SECS convention: {:?}",
+            job.args
+        );
+        assert!(job.args.iter().any(|a| a == "--timeout-secs"));
+    }
+
+    #[test]
+    fn refresh_update_status_skips_spawn_when_disabled_via_env() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by `UPDATE_CHECK_ENV_TEST_LOCK`; no other thread
+        // reads/writes this var concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        }
+        let result = std::panic::catch_unwind(|| {
+            let mut s = st();
+            let fx = refresh_update_status(&mut s);
+            assert!(fx.is_empty(), "a disabled check must not spawn a job");
+            assert!(!s.update_status_pending);
+            assert!(s.jobs.job(HOME_UPDATE_CHECK_JOB_ID).is_none());
+        });
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK");
+        }
+        result.unwrap();
     }
 
     #[test]
