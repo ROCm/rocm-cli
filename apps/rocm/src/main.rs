@@ -5,6 +5,7 @@
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
+mod cli_progress;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -5275,7 +5276,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
     if background {
         let mut spinner =
-            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
         let report = start_managed_service(
             &selected_engine,
