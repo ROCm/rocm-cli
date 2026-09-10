@@ -5100,36 +5100,20 @@ fn serve(args: ServeArgs) -> Result<()> {
         },
     )?;
     // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
-    // read inside `resolve_gpu_indices` and the claiming record write inside
-    // `spawn_managed_engine_child` must be atomic, or two concurrent
-    // `rocm serve --gpu auto` can both read the same GPU as free and launch on
-    // it. Acquired here — after engine resolution, self-managed runtime prep, and
-    // the `ResolveModel` RPC have all completed unlocked — so a slow first-use
-    // install (e.g. the Lemonade embeddable download/extract) never blocks an
-    // unrelated serve. The guard spans only `--gpu auto`'s busy-GPU read, the
-    // serve-plan rendering below, and the claiming record write, then is dropped
-    // once the record is persisted (before the readiness wait). Explicit-index and
-    // CPU-only launches hold it too — their selection is already fixed (the index
-    // was validated above) — so the claim-record write stays uniformly serialized;
-    // with the install moved out of the critical section they hold it only briefly.
-    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
-    let gpu_indices = if cpu_only {
-        Vec::new()
-    } else if let Some(indices) = pinned_gpu_indices {
-        // Explicit `--gpu <index>`: validated before runtime resolution above.
-        indices
-    } else {
-        // `--gpu auto`: read live busy-GPU state under the lock so a concurrent
-        // claim cannot make two serves land on the same idle GPU.
-        resolve_gpu_indices(
-            &paths,
-            &gpu_selection,
-            detect_gpu_count(),
-            visible_gpu_indices.as_deref(),
-            gpu_vram.as_deref(),
-            visibility_mask_active,
-        )?
-    };
+    // read and the claiming record write inside `spawn_managed_engine_child` must
+    // be atomic, or two concurrent `rocm serve --gpu auto` can both read the same
+    // GPU as free and launch on it. Taken here — after engine resolution,
+    // self-managed runtime prep, and the `ResolveModel` RPC have all completed
+    // unlocked — so a slow first-use install (e.g. the Lemonade embeddable
+    // download/extract) never blocks an unrelated serve.
+    let (gpu_indices, launch_lock) = select_gpu_indices_under_launch_lock(
+        &paths,
+        cpu_only,
+        pinned_gpu_indices,
+        detect_gpu_count,
+        visible_gpu_indices.as_deref(),
+        gpu_vram.as_deref(),
+    )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
@@ -18409,12 +18393,25 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
     }
 }
 
-/// Resolve a `GpuSelection` to the concrete device ordinal to pin for this
-/// server. `Auto` picks the lowest-numbered GPU that is idle (high free VRAM)
-/// and not already serving a rocm-cli managed/foreground model; an explicit
-/// index is validated against the detected GPU count when it is known. The
-/// result holds at most one ordinal; serving across multiple GPUs is not
-/// supported.
+/// Take the managed-launch lock and decide, under it, which device ordinal this
+/// server pins. This is the whole select-then-claim critical section's entry
+/// half: the returned [`rocm_core::FileLock`] must be held by the caller until
+/// the claiming service record is persisted, at which point the choice is
+/// visible to any concurrent auto-selection and the lock is dropped (in
+/// `start_managed_service`/`run_attached_service`, before the readiness wait).
+/// Acquiring the lock and reading busy-GPU state are one operation here on
+/// purpose: split apart, two concurrent `rocm serve --gpu auto` both read the
+/// same GPU as free and land on it.
+///
+/// `pinned` is the already-validated explicit `--gpu <index>` (see
+/// [`validate_pinned_gpu_index`], which `serve()` applies before runtime
+/// resolution so a bad ordinal is refused without a runtime). Explicit-index and
+/// CPU-only launches take the lock too — their selection is fixed, but their
+/// claim-record write must stay serialized against a concurrent auto-select.
+/// Only `--gpu auto` (`cpu_only` false, `pinned` `None`) reads live state under
+/// it, picking the lowest-numbered GPU that is idle (high free VRAM) and not
+/// already serving a rocm-cli managed/foreground model. The result holds at most
+/// one ordinal; serving across multiple GPUs is not supported.
 ///
 /// Ordinal semantics: the index produced here is fed to engines via
 /// `HIP_VISIBLE_DEVICES`, but it is sourced from `amd-smi`'s `gpu` index
@@ -18428,23 +18425,36 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// after the active visibility mask (see [`rocm_core::usable_amd_gpu_indices`]) —
 /// already in the space the choice is exported through, since a
 /// `ROCR_VISIBLE_DEVICES` mask has its survivors re-indexed to `0..N`.
-/// Auto-selection is restricted to it and an explicit `--gpu` outside it is
-/// rejected early, so serve never targets a masked-out device. `None` (an
-/// unprobeable host) keeps the previous mask-unaware behavior.
-fn resolve_gpu_indices(
+/// Auto-selection is restricted to it, so serve never targets a masked-out
+/// device. `None` (an unprobeable host) keeps the previous mask-unaware
+/// behavior.
+///
+/// The lock is held for as long as the caller keeps the guard, which includes
+/// the already-running check inside `spawn_managed_engine_child` — that refreshes
+/// managed-service liveness and can issue per-service endpoint probes, so an
+/// unrelated concurrent serve can wait on the order of seconds. `FileLock`
+/// blocks without a timeout; the slow first-use install is deliberately kept
+/// outside this section so it is not also serialized.
+fn select_gpu_indices_under_launch_lock(
     paths: &AppPaths,
-    selection: &GpuSelection,
-    detected: Option<usize>,
+    cpu_only: bool,
+    pinned: Option<Vec<u32>>,
+    detect_count: impl FnOnce() -> Option<usize>,
     visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
-    mask_active: bool,
-) -> Result<Vec<u32>> {
-    match selection {
-        GpuSelection::Index(index) => {
-            validate_pinned_gpu_index(*index, detected, visible, mask_active)
-        }
-        GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, visible, vram)),
-    }
+) -> Result<(Vec<u32>, rocm_core::FileLock)> {
+    let lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+    let indices = if cpu_only {
+        Vec::new()
+    } else if let Some(indices) = pinned {
+        indices
+    } else {
+        // `detect_count` is invoked only here: it shells out to amd-smi, and the
+        // CPU-only and explicit-index paths have no use for the count, so they do
+        // not pay for that subprocess inside the critical section.
+        auto_select_gpu_indices(paths, detect_count(), visible, vram)
+    };
+    Ok((indices, lock))
 }
 
 /// Validate an explicit `--gpu <index>` against the active visibility set,
@@ -30160,14 +30170,24 @@ ID_LIKE="suse opensuse"
 
     #[test]
     fn launch_lock_makes_gpu_select_and_claim_atomic() {
-        // Regression for the serve read-select-launch race: the busy-GPU read in
-        // `resolve_gpu_indices` and the claiming record write must happen under
-        // one lock, or two concurrent `--gpu auto` serves both read the same GPU
-        // as free and land on it. Each thread drives the exact entry point
-        // `serve()` uses (`resolve_gpu_indices` with `GpuSelection::Auto`) under
-        // the same launch-lock path, so the test tracks the production
-        // select-then-claim sequence rather than a hand-rolled copy; the lock must
-        // force the two onto DISTINCT GPUs.
+        // Regression for the serve read-select-launch race: the busy-GPU read and
+        // the claiming record write must happen under one lock, or two concurrent
+        // `--gpu auto` serves both read the same GPU as free and land on it.
+        //
+        // The test does NOT take the lock itself — that would only prove
+        // `FileLock` excludes (already covered by
+        // `file_lock_serializes_concurrent_holders` in rocm-core). It calls
+        // `select_gpu_indices_under_launch_lock`, the production helper `serve()`
+        // uses, whose contract is that it returns the guard *it* acquired together
+        // with the selection; the test holds that guard across the claim exactly
+        // as `serve()` holds it until `spawn_managed_engine_child` persists the
+        // record. Delete the `FileLock::acquire` from that helper and this test
+        // goes red: both threads then select GPU 0.
+        //
+        // Determinism: the barrier releases both threads together and each sleeps
+        // between select and claim, so an unlocked helper double-books GPU 0
+        // regardless of scheduling skew, while the locked helper forces the second
+        // thread to observe the first thread's claim.
         let (root, paths) = test_paths("launch-lock-atomic-claim");
         paths.ensure().expect("prepare paths");
         let detected = Some(2_usize);
@@ -30181,24 +30201,26 @@ ID_LIKE="suse opensuse"
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        let _lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())
-                            .expect("acquire launch lock");
-                        // Same call `serve()` makes under the launch lock. `None`
-                        // visibility keeps selection mask-unaware for the test host.
-                        let gpu = resolve_gpu_indices(
+                        // The exact call `serve()` makes: the helper acquires the
+                        // launch lock and selects under it, handing the guard back.
+                        // `None` visibility keeps selection mask-unaware for the
+                        // test host; `pinned` `None` + `cpu_only` false is the
+                        // `--gpu auto` path that reads live busy-GPU state.
+                        let (gpu, lock) = select_gpu_indices_under_launch_lock(
                             paths,
-                            &GpuSelection::Auto,
-                            detected,
-                            None,
-                            None,
                             false,
+                            None,
+                            || detected,
+                            None,
+                            None,
                         )
-                        .expect("auto GPU selection");
-                        // Widen the select→claim window so an unlocked variant
-                        // would deterministically double-book GPU 0; under the
-                        // lock the second thread cannot enter until we claim.
+                        .expect("auto GPU selection under launch lock");
+                        // Widen the select→claim window so an unlocked helper
+                        // deterministically double-books GPU 0; under the lock the
+                        // second thread cannot enter until we claim.
                         std::thread::sleep(Duration::from_millis(50));
                         write_claiming_record(paths, service_id, port, &gpu);
+                        drop(lock);
                         gpu
                     })
                 })
