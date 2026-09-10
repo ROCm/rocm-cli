@@ -2077,7 +2077,9 @@ mod tests {
         let reports = run_and_append_csv(&spec, &[1, 2], &csv_path).await.unwrap();
 
         assert!(
-            reports.iter().all(|r| r.row.engine.as_deref() == Some("vllm")),
+            reports
+                .iter()
+                .all(|r| r.row.engine.as_deref() == Some("vllm")),
             "the mock exposes vLLM metrics, so every row must be labelled"
         );
         let flagged: Vec<&str> = reports
