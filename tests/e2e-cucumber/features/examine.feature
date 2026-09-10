@@ -17,11 +17,18 @@ Feature: GPU detection and system inspection
     When the user asks for help
     Then the subcommands are listed in alphabetical order
 
+  # The target assertion is a cross-check, not a tautology: the expectation comes
+  # from the KFD topology in sysfs, while `examine` reaches its answer through the
+  # CLI's own probe. Detection used to look for `gfx_target_version` as a standalone
+  # file, which no kernel exposes, and silently fell back to decoding a GC IP
+  # version -- naming an MI300X `gfx943` instead of `gfx942`. Only the GPU lane can
+  # exercise this; there is no KFD topology to read on the mock lane.
   @id:examine-detects-gpu-and-driver @requires-gpu
   Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
+    And the inspection names the GPU target that the kernel reports
     And the inspection reports that the driver is available
 
   # `examine` used to report a hardcoded platform constant as the default engine,
@@ -122,3 +129,26 @@ Feature: GPU detection and system inspection
   Scenario: examine-12 - The driver install dry-run shows the effective repo version
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder
+
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing
+
+  # `rocm examine`'s own engine_inventory block prefixes the effective default
+  # engine with the same `*` marker, via a renderer separate from `engines
+  # list`'s (see `append_examine_engine_inventory` vs
+  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # two used to be able to drift apart. examine-13 only ever drove `engines
+  # list`, leaving this second renderer's legend unexercised end-to-end.
+  @id:examine-shows-default-engine-legend
+  Scenario: examine-14 - Inspecting the system explains the default-engine marker
+    When the user inspects the system
+    Then the inspection explains the default-engine marker
+    And the host's default engine is marked in the inspection's engine inventory

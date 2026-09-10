@@ -21,16 +21,24 @@
 //! shared tree and what a fresh install produces was therefore untested, and
 //! widened silently.
 //!
-//! This keeps the cache and invalidates it only when the channel index actually
-//! publishes something newer, reusing the primitives the CLI already ships
-//! rather than reimplementing version resolution in workflow shell:
+//! This keeps the cache and invalidates it when either the channel index
+//! publishes something newer or the package composition the CLI now requires
+//! differs from the one the installed runtime records, reusing the primitives
+//! the CLI already ships rather than reimplementing resolution in workflow
+//! shell:
 //!
 //! * `rocm update` reports, per installed runtime, `status=up_to_date |
-//!   update_available | ahead_of_index` by comparing against the channel index.
-//! * `rocm update --apply --runtime <key> --activate` installs the newer runtime
-//!   SIDE BY SIDE and makes it the default. Side-by-side matters: `install sdk`
-//!   bakes ABSOLUTE paths into the runtime manifest, so a runtime must be created
-//!   in its final location and never moved afterwards.
+//!   update_available | repair_available | ahead_of_index` by comparing both the
+//!   channel version and the recorded wheel composition, plus `target=<key>`:
+//!   the runtime key an apply from that line would produce.
+//! * `rocm update --apply --runtime <key> --activate` installs the newer or
+//!   composition-corrected runtime SIDE BY SIDE and makes it the default.
+//!   Side-by-side matters: `install sdk` bakes ABSOLUTE paths into the runtime
+//!   manifest, so a runtime must be created in its final location and never
+//!   moved afterwards.
+//! * `rocm runtimes activate <key>` points the tree at the runtime a reuse
+//!   actually meant, which after a repair is not the manifest the report line
+//!   belongs to.
 //! * `rocm storage remove-old-installs --keep N` bounds the resulting multi-version
 //!   cache with a per-channel/format/family retention policy.
 //!
@@ -56,9 +64,21 @@ pub enum Decision {
     /// The channel index has a newer version than the installed one; install it
     /// alongside and activate it.
     Update { runtime_key: String },
+    /// The version is current, but its recorded package composition is stale or
+    /// absent. Install a composition-keyed replacement alongside it.
+    Repair { runtime_key: String },
     /// The tree is current, or its freshness could not be established. Serve
     /// against what is already there.
-    Reuse { reason: String },
+    ///
+    /// `activate` names the runtime that reuse means, when the report identified
+    /// one. A tree that has already been repaired holds BOTH the superseded
+    /// legacy runtime and its replacement, and only the replacement can run this
+    /// host's kernels — so reuse has to say which, or the lane serves whichever
+    /// one the active pointer happens to hold.
+    Reuse {
+        reason: String,
+        activate: Option<String>,
+    },
 }
 
 /// Decide from a `rocm update` report what the pre-warm should do for `channel`.
@@ -101,6 +121,7 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
             return Decision::Reuse {
                 reason: "could not establish runtime freshness; leaving the shared tree untouched"
                     .to_owned(),
+                activate: None,
             };
         }
 
@@ -109,9 +130,43 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
         return Decision::Install;
     }
 
-    if let Some(stale) = runtimes
+    let channel_runtimes = runtimes
         .iter()
         .filter(|line| line.channel.as_deref() == Some(channel))
+        .collect::<Vec<_>>();
+
+    // A current composition already in the tree satisfies the lane even while an
+    // obsolete same-channel entry survives until the retention pass removes it.
+    // Checked FIRST for exactly that reason: the legacy entry is the one that
+    // would otherwise be repaired, again, on every single run.
+    if let Some(current) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("up_to_date"))
+    {
+        return Decision::Reuse {
+            reason: "runtime is up to date with the channel index".to_owned(),
+            // Its own key when it is the current runtime; its replacement's key
+            // when it is the superseded manifest that the repair left behind.
+            activate: Some(current.serving_runtime_key().to_owned()),
+        };
+    }
+
+    // `ahead_of_index` means the installed runtime is NEWER than anything the
+    // index offers (a hand-placed or pinned build). The index cannot reproduce
+    // it, so neither an update nor a repair could do anything but roll it back.
+    // Serve it as it stands.
+    if let Some(pinned) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("ahead_of_index"))
+    {
+        return Decision::Reuse {
+            reason: "installed runtime is ahead of the channel index".to_owned(),
+            activate: Some(pinned.runtime_key.clone()),
+        };
+    }
+
+    if let Some(stale) = channel_runtimes
+        .iter()
         .find(|line| line.status.as_deref() == Some("update_available"))
     {
         return Decision::Update {
@@ -119,27 +174,22 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
         };
     }
 
-    // `ahead_of_index` means the installed runtime is NEWER than anything the
-    // index offers (a hand-placed or pinned build). Reuse it rather than
-    // "updating" backwards.
-    let reason = if runtimes
+    if let Some(stale) = channel_runtimes
         .iter()
-        .filter(|line| line.channel.as_deref() == Some(channel))
-        .any(|line| line.status.as_deref() == Some("up_to_date"))
+        .find(|line| line.status.as_deref() == Some("repair_available"))
     {
-        "runtime is up to date with the channel index"
-    } else if runtimes
-        .iter()
-        .filter(|line| line.channel.as_deref() == Some(channel))
-        .any(|line| line.status.as_deref() == Some("ahead_of_index"))
-    {
-        "installed runtime is ahead of the channel index"
-    } else {
-        // Only `status=error` (or a shape this does not recognise) remains.
-        "could not establish runtime freshness; leaving the shared tree untouched"
-    };
+        return Decision::Repair {
+            runtime_key: stale.runtime_key.clone(),
+        };
+    }
+
+    // Only `status=error` (or a shape this does not recognise) remains. Naming a
+    // runtime to activate here would be a guess about a tree whose state could
+    // not be read at all.
     Decision::Reuse {
-        reason: reason.to_owned(),
+        reason: "could not establish runtime freshness; leaving the shared tree untouched"
+            .to_owned(),
+        activate: None,
     }
 }
 
@@ -332,17 +382,22 @@ pub fn activation_candidates(runtimes_list_report: &str) -> Vec<String> {
         .collect()
 }
 
-/// One `  runtime <key> format=… channel=… … status=…` line from `rocm update`.
+/// One `  runtime <key> format=… channel=… … status=… target=…` line from
+/// `rocm update`.
 ///
 /// Both shapes that renderer emits are handled: the full report line, and the
 /// degraded `runtime <key> format=… status=error message=…` line. `message=` is
-/// free text that may contain spaces, but it is last and only `channel`/`status`
-/// are read, so a whitespace split is sufficient — trailing words of the message
-/// simply carry no `=` and are ignored.
+/// free text that may contain spaces, but it is last and only
+/// `channel`/`status`/`target` are read, so a whitespace split is sufficient —
+/// trailing words of the message simply carry no `=` and are ignored.
 struct RuntimeLine {
     runtime_key: String,
     channel: Option<String>,
     status: Option<String>,
+    /// The runtime key an apply from this line would produce. On a superseded
+    /// legacy manifest this names its already-installed replacement, which is
+    /// the sibling the lane must actually serve against.
+    target_runtime_key: Option<String>,
 }
 
 impl RuntimeLine {
@@ -352,10 +407,12 @@ impl RuntimeLine {
         let runtime_key = fields.next()?.to_owned();
         let mut channel = None;
         let mut status = None;
+        let mut target_runtime_key = None;
         for field in fields {
             match field.split_once('=') {
                 Some(("channel", value)) => channel = Some(value.to_owned()),
                 Some(("status", value)) => status = Some(value.to_owned()),
+                Some(("target", value)) => target_runtime_key = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -363,12 +420,20 @@ impl RuntimeLine {
             runtime_key,
             channel,
             status,
+            target_runtime_key,
         })
+    }
+
+    /// The runtime this line says the lane should be serving against.
+    fn serving_runtime_key(&self) -> &str {
+        self.target_runtime_key
+            .as_deref()
+            .unwrap_or(&self.runtime_key)
     }
 }
 
-/// Bring the shared pre-warm tree at `prewarm_dir` to the newest runtime the
-/// `channel` index offers, keeping `keep` recent installs per channel/format/family.
+/// Bring the shared pre-warm tree at `prewarm_dir` to the runtime state the
+/// `channel` requires, keeping `keep` recent installs per channel/format/family.
 pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     let rocm = resolve_rocm_binary()?;
     for sub in ["config", "data", "cache"] {
@@ -400,6 +465,7 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
                 println!("pre-warm: `rocm update` failed ({error:#}); reusing the existing tree");
                 Decision::Reuse {
                     reason: "update probe failed".to_owned(),
+                    activate: None,
                 }
             } else {
                 println!("pre-warm: `rocm update` failed ({error:#}); no registry yet, installing");
@@ -426,8 +492,29 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
                 .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
                 .status_ok("rocm update --apply")?;
         }
-        Decision::Reuse { reason } => {
+        Decision::Repair { runtime_key } => {
+            println!(
+                "pre-warm: {runtime_key} has a stale package composition; installing its replacement alongside it"
+            );
+            rocm_command(&rocm, prewarm_dir)
+                .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
+                .status_ok("rocm update --apply")?;
+        }
+        Decision::Reuse { reason, activate } => {
             println!("pre-warm: reusing the shared {channel} runtime ({reason})");
+            // Reuse is not "leave the pointer alone". Once a repair has run, the
+            // tree holds the superseded runtime AND its replacement, and only
+            // the replacement can run this host's kernels — so name the one this
+            // reuse actually meant. `runtimes activate` is idempotent, so the
+            // ordinary warm case just reasserts what is already active. Before
+            // the engine check below, because that installs into whichever
+            // runtime is active.
+            if let Some(runtime_key) = activate {
+                println!("pre-warm: activating {runtime_key}");
+                rocm_command(&rocm, prewarm_dir)
+                    .args(["runtimes", "activate", runtime_key])
+                    .status_ok("rocm runtimes activate")?;
+            }
         }
     }
 
@@ -447,7 +534,7 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // An install/update that exits 0 without leaving a registry behind is the
+    // An install/update/repair that exits 0 without leaving a registry behind is the
     // confusing case the lanes used to call out by hand: every scenario then falls
     // back to installing its own runtime and the job quietly blows its time cap.
     // Say so loudly, but do not fail — the suite can still run.
@@ -459,7 +546,7 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
         );
     }
 
-    // Only reached after an install or update actually added a tree. Housekeeping:
+    // Only reached after an install, update, or repair added a tree. Housekeeping:
     // a failure here wastes disk but leaves a correct runtime in place, so it must
     // not fail the lane.
     let pruned = rocm_command(&rocm, prewarm_dir)
@@ -795,10 +882,20 @@ update
 ";
 
     fn report(status: &str, channel: &str) -> String {
+        report_with_target(
+            status,
+            channel,
+            &format!("{channel}-wheel-gfx94x-dcgpu-7-13-0"),
+        )
+    }
+
+    /// A report line whose `target=` names a runtime other than its own key —
+    /// what a superseded legacy manifest renders once its replacement exists.
+    fn report_with_target(status: &str, channel: &str, target: &str) -> String {
         format!(
             "update\n  policy: bounded startup check, cached metadata, prompt before mutating state.\n  \
 runtime {channel}-wheel-gfx94x-dcgpu-7-13-0 format=wheel channel={channel} \
-family=gfx94X-dcgpu installed=7.13.0 latest=7.15.0 status={status}\n    \
+family=gfx94X-dcgpu installed=7.13.0 latest=7.15.0 status={status} target={target}\n    \
 install_root: /w/e2e-prewarm/data/runtimes/wheel/{channel}-wheel-gfx94x-dcgpu-7-13-0\n    \
 source: index\n"
         )
@@ -822,6 +919,8 @@ registered ROCm runtimes
   registry: /w/e2e-prewarm/data/runtimes/registry
   marker: /w/e2e-prewarm/data/runtimes/active.json
   installed:
+    legend: * = active, - = rollback target
+
     adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=unusable (pip runtime manifest is missing rocm_sdk probe data)
       install_root: /opt/external-rocm
     release-wheel-gfx94x-dcgpu-7-15-0 runtime_id=therock-release-gfx94x-dcgpu version=7.15.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (pip runtime manifest is missing rocm_sdk probe data)
@@ -859,6 +958,8 @@ registered ROCm runtimes
   marker: /w/e2e-prewarm/data/runtimes/active.json
   active_status: missing manifest for active_runtime_key=release-wheel-gfx94x-dcgpu-7-14-0
   installed:
+    legend: * = active, - = rollback target
+
     adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
       install_root: /opt/external-rocm
     release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
@@ -1084,10 +1185,14 @@ Local model engines
         // skip the engine. Reuse must still install and update NOTHING, which is
         // what keeps it cheap enough to re-check the engine on every run.
         assert!(!runtime_changed(&Decision::Reuse {
-            reason: "up to date".to_owned()
+            reason: "up to date".to_owned(),
+            activate: None,
         }));
         assert!(runtime_changed(&Decision::Install));
         assert!(runtime_changed(&Decision::Update {
+            runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+        }));
+        assert!(runtime_changed(&Decision::Repair {
             runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
         }));
     }
@@ -1108,22 +1213,91 @@ Local model engines
     }
 
     #[test]
-    fn current_runtime_is_reused() {
-        let Decision::Reuse { reason } = decide(&report("up_to_date", "release"), "release") else {
-            panic!("an up-to-date runtime must be reused, not reinstalled");
+    fn same_version_runtime_with_a_stale_composition_is_repaired() {
+        assert_eq!(
+            decide(&report("repair_available", "release"), "release"),
+            Decision::Repair {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_installed_replacement_stops_the_repair_repeating() {
+        // The retention pass has not yet dropped the legacy manifest, so the
+        // report still carries its `repair_available` line beside the current
+        // one. Repairing again would reinstall a runtime already in the tree,
+        // every run, forever.
+        let text = format!(
+            "{}{}",
+            report("repair_available", "release"),
+            report("up_to_date", "release")
+        );
+
+        let Decision::Reuse { reason, .. } = decide(&text, "release") else {
+            panic!("an installed current composition must prevent repeated repair");
         };
         assert!(reason.contains("up to date"), "{reason}");
     }
 
     #[test]
+    fn current_runtime_is_reused_and_activated() {
+        let Decision::Reuse { reason, activate } =
+            decide(&report("up_to_date", "release"), "release")
+        else {
+            panic!("an up-to-date runtime must be reused, not reinstalled");
+        };
+        assert!(reason.contains("up to date"), "{reason}");
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
+            "reuse must name the runtime it means, or the lane serves whatever the pointer holds"
+        );
+    }
+
+    #[test]
+    fn reuse_after_a_repair_activates_the_replacement_not_the_superseded_runtime() {
+        // The line belongs to the superseded legacy manifest: its own key is the
+        // old one, and `target=` names the composition-keyed replacement the
+        // repair already installed. Activating the line's own key here would
+        // serve the runtime whose device payload cannot run this host's kernels.
+        let Decision::Reuse { activate, .. } = decide(
+            &report_with_target(
+                "up_to_date",
+                "release",
+                "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            ),
+            "release",
+        ) else {
+            panic!("a migrated tree must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0-0123456789abcdef")
+        );
+    }
+
+    #[test]
     fn runtime_ahead_of_the_index_is_not_downgraded() {
         // A pinned or hand-placed build newer than the index must be left alone —
-        // "updating" it would move the lane backwards.
-        let Decision::Reuse { reason } = decide(&report("ahead_of_index", "release"), "release")
-        else {
+        // "updating" it would move the lane backwards. It is also the one case
+        // where `target=` must be ignored: the index cannot reproduce this build,
+        // so the key an apply would produce names a runtime that is not there.
+        let Decision::Reuse { reason, activate } = decide(
+            &report_with_target(
+                "ahead_of_index",
+                "release",
+                "release-wheel-multi-arch-7-15-0-deadbeefdeadbeef",
+            ),
+            "release",
+        ) else {
             panic!("a runtime ahead of the index must be reused");
         };
         assert!(reason.contains("ahead of"), "{reason}");
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
     }
 
     #[test]
@@ -1133,7 +1307,7 @@ Local model engines
         // conservative pre-warm decision must reuse rather than download again.
         let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
 status=error message=failed to reach https://repo.amd.com/rocm/whl after 3 tries\n";
-        let Decision::Reuse { reason } = decide(text, "release") else {
+        let Decision::Reuse { reason, .. } = decide(text, "release") else {
             panic!("an unattributable index error must reuse the existing tree");
         };
         assert!(reason.contains("could not establish"), "{reason}");
@@ -1153,7 +1327,7 @@ status=error message=failed to reach the index\n",
     fn index_error_on_an_attributable_line_is_reused() {
         let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
 channel=release status=error message=failed to reach the index\n";
-        let Decision::Reuse { reason } = decide(text, "release") else {
+        let Decision::Reuse { reason, .. } = decide(text, "release") else {
             panic!("an unreadable freshness status must reuse the existing tree");
         };
         assert!(reason.contains("could not establish"), "{reason}");
@@ -1189,7 +1363,7 @@ channel=release status=error message=failed to reach the index\n";
 
     #[test]
     fn unparseable_report_reuses() {
-        let Decision::Reuse { reason } = decide(
+        let Decision::Reuse { reason, .. } = decide(
             "update\n  runtime weird-key format=wheel channel=release\n",
             "release",
         ) else {
@@ -1206,6 +1380,10 @@ message=connect timed out after 30 s";
         assert_eq!(parsed.runtime_key, "k");
         assert_eq!(parsed.channel.as_deref(), Some("release"));
         assert_eq!(parsed.status.as_deref(), Some("error"));
+        // A degraded line has no plan, so it names no target. Falling back to
+        // the line's own key keeps the reuse path from activating nothing.
+        assert_eq!(parsed.target_runtime_key, None);
+        assert_eq!(parsed.serving_runtime_key(), "k");
     }
 
     #[test]

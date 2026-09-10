@@ -173,6 +173,8 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
+| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon R9700 (self-hosted) | no |
+| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -183,12 +185,14 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow runs non-blocking jobs — MI300X, Radeon R9700, and Strix
-Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then
-consolidates them into the same cross-platform grid. The
-shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
-the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
-through Lemonade on Strix Halo.
+The nightly workflow covers the same hardware as the table above, as
+non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
+`e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
+`E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
+grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
+MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
+checkpoint through Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on

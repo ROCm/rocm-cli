@@ -83,10 +83,10 @@ fn active_runtime_key(runtimes_dir: &Path) -> Option<String> {
 /// fails — which a poisoned entry makes it do. So the suite must expect to meet
 /// one and step over it rather than name it and fail.
 ///
-/// Judged by the same rule the pre-warm's own repair uses: an install root
-/// inside this tree is sound, one outside it is a corpse. Checking existence
-/// alone would be wrong — on a runner where a foreign path happens to exist the
-/// scenario would serve against a runtime outside the shared tree.
+/// Judged by the same rule the pre-warm's own repair uses: an install root must
+/// both exist and live inside this tree. Existence alone would be insufficient —
+/// a foreign path may exist — while containment alone accepts a stale manifest
+/// whose in-tree runtime directory has already disappeared.
 fn activatable_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
     let roots = comparable_roots(runtimes_dir);
     registry_runtime_keys(runtimes_dir)
@@ -106,7 +106,7 @@ fn activatable_runtime_keys(runtimes_dir: &Path) -> Vec<String> {
                 return true;
             };
             let root = Path::new(root);
-            roots.iter().any(|base| root.starts_with(base))
+            root.is_dir() && roots.iter().any(|base| root.starts_with(base))
         })
         .collect()
 }
@@ -220,6 +220,17 @@ mod tests {
             &serde_json::json!({
                 "runtime_key": key,
                 "install_root": format!("/tmp/rocm-e2e-gone/data/runtimes/wheel/{key}"),
+            })
+            .to_string(),
+        );
+    }
+
+    fn missing_in_tree(dir: &Path, key: &str) {
+        write(
+            &dir.join("registry").join(format!("{key}.json")),
+            &serde_json::json!({
+                "runtime_key": key,
+                "install_root": dir.join("wheel").join(key),
             })
             .to_string(),
         );
@@ -408,6 +419,15 @@ mod tests {
         let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
         let dir = tmp.path();
         poisoned(dir, "release-wheel-gfx94x-dcgpu-7-13-0");
+
+        assert_eq!(runtime_key_to_activate(dir), None);
+    }
+
+    #[test]
+    fn ignores_a_manifest_whose_in_tree_install_root_is_missing() {
+        let tmp = tempfile::TempDir::with_prefix("shared-runtime-").expect("temp dir");
+        let dir = tmp.path();
+        missing_in_tree(dir, "release-wheel-multi-arch-7-14-0");
 
         assert_eq!(runtime_key_to_activate(dir), None);
     }

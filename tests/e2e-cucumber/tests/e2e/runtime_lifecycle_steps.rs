@@ -140,6 +140,12 @@ async fn rollback(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user lists the registered runtimes")]
+async fn list_runtimes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user uninstalls that runtime")]
 async fn uninstall(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
@@ -180,6 +186,11 @@ async fn active_changed_from_nothing(world: &mut E2eWorld) {
         out.contains("changed_from_runtime_key: <unset>"),
         "expected no previous runtime, got:\n{out}"
     );
+    assert!(
+        !out.contains("rocm runtimes rollback"),
+        "no previous runtime is recorded, so rollback would hard-error; \
+         must not hint at a command that immediately fails:\n{out}"
+    );
 }
 
 #[then("that runtime becomes active having changed from the first")]
@@ -192,6 +203,11 @@ async fn active_changed_from_first(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("changed_from_runtime_key: {FIRST_KEY}")),
         "expected previous runtime {FIRST_KEY}, got:\n{out}"
+    );
+    assert!(
+        out.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+        "a previous runtime is recorded, so the built binary should hint at rollback as a \
+         recovery path, got:\n{out}"
     );
 }
 
@@ -269,6 +285,33 @@ async fn import_succeeds(world: &mut E2eWorld) {
     assert!(
         out.contains("runtime imported"),
         "expected the replace import to succeed, got:\n{out}"
+    );
+}
+
+#[then("the listing explains the active and rollback markers")]
+async fn listing_explains_markers(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("legend: * = active, - = rollback target"),
+        "expected the marker legend, got:\n{out}"
+    );
+}
+
+#[then("the first runtime is marked active")]
+async fn first_marked_active(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(&format!("* {FIRST_KEY}")),
+        "expected {FIRST_KEY} marked active, got:\n{out}"
+    );
+}
+
+#[then("the second runtime is marked as the rollback target")]
+async fn second_marked_rollback(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains(&format!("- {SECOND_KEY}")),
+        "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
     );
 }
 

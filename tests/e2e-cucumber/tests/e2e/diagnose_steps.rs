@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -15,6 +16,16 @@ use crate::E2eWorld;
 /// produced no match on Windows.) The specific fix-id is environment-dependent,
 /// so scenarios assert the shape of a match, not the id.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
+
+/// The error text a vLLM engine-startup import failure leaves behind, as a user
+/// would paste it. `libtorch_cuda.so` is the token that carries it: a ROCm build
+/// of torch ships `libtorch_hip.so` and never that file, so it scores on its own
+/// without needing the rest of the traceback.
+const ENGINE_IMPORT_SYMPTOM: &str =
+    "vllm engine fails to start: OSError: libtorch_cuda.so: cannot open shared object file";
+
+/// The catalog entry [`ENGINE_IMPORT_SYMPTOM`] must reach.
+const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
 
 /// A print-only recipe (no runner, applies on linux+windows) whose `--dry-run`
 /// is deterministic across environments — used for the preview scenario. Other
@@ -29,6 +40,15 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// already in the groups, and `fix-6-path` exits early with "no ROCm install
 /// found". This one needs only `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// The recipe used to prove a failed helper command is explained on stderr with
+/// exit code 4. `fix-4-render-group` is the only AUTO recipe whose command-failure
+/// branch this suite can force deterministically: its helper (`usermod`, run
+/// directly as root or via `sudo` otherwise) is resolved off `$PATH`, so a
+/// scenario-controlled `$PATH` (see `command_fails_bin_dir`) can stand a fake
+/// `usermod`/`sudo` in for it, unconditionally failing, without needing real
+/// root or touching real group membership.
+const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
@@ -57,6 +77,10 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
+    // Not a typo, and not a hole to fill: `fix-16` is reserved by the vLLM
+    // out-of-memory entry on its own branch. The number is a stable handle, so
+    // the two are kept distinct rather than renamed after the fact.
+    "fix-17-torch-dlpack",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -105,6 +129,18 @@ fn fix_rc_file(world: &E2eWorld) -> std::path::PathBuf {
     fix_home(world).join(".bashrc")
 }
 
+/// The directory this scenario stands in for `$PATH`, holding the fake
+/// `usermod`/`sudo` scripts. Scoped under the scenario's isolated root so it is
+/// cleaned up with everything else.
+fn command_fails_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin")
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a user who hit a known ROCm failure")]
@@ -115,6 +151,16 @@ async fn user_hit_known_failure(world: &mut E2eWorld) {
 #[given("a user who hit a failure the CLI does not recognise")]
 async fn user_hit_unknown_failure(world: &mut E2eWorld) {
     world.model_name = Some("xyzzy totally unrelated gibberish".to_string());
+}
+
+#[given("a user who hit the vLLM engine-startup import failure")]
+async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
+}
+
+#[given("a user who has chosen the fix for the engine-startup import failure")]
+async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
+    world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
 }
 
 #[given("a user who has chosen a known fix")]
@@ -138,6 +184,34 @@ async fn user_chose_mutating_fix(world: &mut E2eWorld) {
 #[given("a user who has chosen a fix meant for a different operating system")]
 async fn user_chose_fix_for_another_os(world: &mut E2eWorld) {
     world.model_name = Some(fix_id_for_the_other_os().to_string());
+}
+
+#[given("a user who has approved a fix whose helper command will fail")]
+async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
+    let bin_dir = command_fails_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir).expect("failed to create the scenario's fake PATH dir");
+    // `usermod` only has to exist for the `which` probe; the command actually run
+    // -- `usermod` directly if already root, `sudo usermod ...` otherwise -- goes
+    // through one of these two scripts either way, and both fail unconditionally.
+    for name in ["usermod", "sudo"] {
+        let script = bin_dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+            .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
+        }
+    }
+    // Restricting `$PATH` to only the fakes above also makes the recipe's
+    // root-detection deterministic: it shells out to `id -u`, which is not on
+    // this PATH, so the spawn itself fails and reads as "not root" regardless of
+    // who runs the suite -- the same `sudo usermod` branch fails on every host,
+    // CI or developer machine, root or not.
+    world.command_env.push(("PATH", bin_dir.into_os_string()));
+    world.command_env.push(("USER", "e2e-test-user".into()));
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
 #[given("a user who refers to a cause by its position in the diagnosis")]
@@ -205,6 +279,52 @@ async fn user_applies_fix_without_agreeing(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply the approved fix")]
+async fn user_applies_approved_fix(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["fix", &fix_id, "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user is asked interactively to apply it and types no")]
+async fn user_declines_fix_interactively(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let home = fix_home(world).display().to_string();
+    // `run_rocm`'s piped stdin can never reach `confirm()`'s interactive
+    // branch: `is_terminal()` is always false there. A real pseudo-terminal is
+    // the only way to reach it, so this step (unlike every other one in this
+    // file) drives the CLI through `TuiSession` instead of `run_rocm`.
+    //
+    // `TuiSession`'s own isolation (`pty_env`) sets HOME to a PTY-only sandbox
+    // it owns and never sets SHELL, so without overriding both here the fix
+    // would resolve to a different — and possibly nonexistent — rc file than
+    // the one the `Given` step planted, the same way the piped sibling
+    // (`user_applies_fix_without_agreeing`) overrides them via
+    // `run_rocm_with_env`.
+    let mut session = TuiSession::spawn_with_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1"],
+        &[("HOME", home.as_str()), ("SHELL", "/bin/bash")],
+    )
+    .unwrap_or_else(|e| panic!("failed to open the fix prompt: {e}"));
+    session
+        .wait_for_screen("[y/N]:", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the confirmation prompt never appeared: {e}"));
+    session
+        .send("n\r")
+        .unwrap_or_else(|e| panic!("failed to type the decline: {e}"));
+    let rc = session
+        .wait_for_exit_code(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the CLI never exited after declining: {e}"));
+    world.cli_output = Some(session.screen_text());
+    world.cli_rc = Some(rc);
+    world.tui = Some(session);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -320,6 +440,89 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some(),
         "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+#[then("the CLI reports the engine-startup import failure as an established cause")]
+async fn assert_engine_import_failure_established(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    // Read the bar out of the document rather than restating 50: the report
+    // publishes it so callers need not hardcode it, and a test that hardcodes it
+    // is not exercising that.
+    let threshold = report
+        .get("min_score_for_match")
+        .and_then(serde_json::Value::as_i64)
+        .expect("diagnose JSON must publish its match threshold");
+    let score = report
+        .get("matched")
+        .and_then(|m| m.as_array())
+        .expect("diagnose JSON has no 'matched' array")
+        .iter()
+        .find(|d| d.get("id").and_then(serde_json::Value::as_str) == Some(ENGINE_IMPORT_FIX_ID))
+        .and_then(|d| d.get("score"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| {
+            panic!("the catalog did not recognise the engine-startup import failure:\n{output}")
+        });
+    // Below the bar the entry is presented among the sub-threshold noise it was
+    // added to outrank, which is the state the report was in before it existed.
+    assert!(
+        score >= threshold,
+        "{ENGINE_IMPORT_FIX_ID} scored {score}, under the report's own threshold \
+         of {threshold}, so it is not an established cause:\n{output}"
+    );
+}
+
+#[then("the printed plan says which shell each step runs in")]
+async fn assert_plan_says_which_shell_each_step_runs_in(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The rendered block is a `Commands:` header followed by one `  $ <line>`
+    // per entry; `map_while` stops at the first line that is not one of those,
+    // which is the `Flags:` row underneath.
+    let commands: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .map_while(|line| line.strip_prefix("  $ "))
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "the preview printed no command block at all:\n{output}"
+    );
+    let position = |needle: &str| {
+        commands
+            .iter()
+            .position(|c| c.trim() == needle)
+            .unwrap_or_else(|| panic!("the printed plan no longer runs `{needle}`:\n{output}"))
+    };
+    let open = position("rocm engines shell vllm");
+    let leave = position("exit");
+    let act = position("rocm engines install vllm --reinstall");
+    // Ordered: the subshell is opened, then left, and only then is the engine
+    // reinstalled -- that step replaces the environment the subshell stands in.
+    assert!(
+        open < leave && leave < act,
+        "the plan must open the subshell, leave it, and only then reinstall:\n{output}"
+    );
+    let is_comment = |c: &&str| c.trim_start().starts_with('#');
+    // And labelled, not merely ordered: with every line carrying the same `$`
+    // prefix, a reader has nothing else to tell the two contexts apart.
+    assert!(
+        commands[open..leave]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("INSIDE")),
+        "the plan must say the probes run INSIDE the subshell:\n{output}"
+    );
+    assert!(
+        commands[leave..act]
+            .iter()
+            .any(|c| is_comment(c) && c.contains("YOUR OWN shell")),
+        "the plan must say the reinstall runs back in the user's own shell:\n{output}"
     );
 }
 
@@ -480,10 +683,15 @@ async fn assert_inapplicable_fix_declined(world: &mut E2eWorld) {
         Some(3),
         "a fix that does not apply here should exit 3, distinct from 2/4/5"
     );
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        output.contains("This fix only applies on:"),
-        "the refusal must say which platforms the fix is for:\n{output}"
+        stderr.contains("This fix only applies on:"),
+        "the refusal must say which platforms the fix is for, on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("This fix only applies on:"),
+        "the platform refusal must not also be on stdout:\n{stdout}"
     );
 }
 
@@ -589,14 +797,10 @@ async fn assert_unknown_fix_refused(world: &mut E2eWorld) {
         Some(2),
         "unknown fix-id should exit 2 (unknown id)"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("Unknown fix-id"),
-        "expected an 'Unknown fix-id' message:\n{combined}"
+        stderr.contains("Unknown fix-id"),
+        "expected an 'Unknown fix-id' message on stderr:\n{stderr}"
     );
 }
 
@@ -609,41 +813,59 @@ async fn assert_position_argument_corrected(world: &mut E2eWorld) {
         Some(2),
         "a position argument should exit 2 like any unknown id"
     );
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     assert!(
-        combined.contains("position"),
-        "the refusal must say the argument was read as a position:\n{combined}"
+        stderr.contains("position"),
+        "the refusal must say the argument was read as a position, on stderr:\n{stderr}"
     );
     // And it must point at what to use instead, or the correction is useless.
     assert!(
-        combined.contains("id:"),
-        "the refusal must name the identifier to use instead:\n{combined}"
+        stderr.contains("id:"),
+        "the refusal must name the identifier to use instead, on stderr:\n{stderr}"
     );
 }
 
 #[then("the CLI refuses and explains that it needs agreement")]
 async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no fix output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
     // The refusal has to say *why* and how to proceed. A bare non-zero exit
     // reads as a broken fix rather than a deliberate stop.
     assert!(
-        output.contains("--yes"),
-        "the refusal must name what to pass to proceed:\n{output}"
+        stderr.contains("--yes"),
+        "the refusal must name what to pass to proceed, on stderr:\n{stderr}"
     );
     assert!(
-        output.contains("refusing to apply"),
-        "the refusal must say it did not apply the fix:\n{output}"
+        stderr.contains("refusing to apply"),
+        "the refusal must say it did not apply the fix, on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("refusing to apply"),
+        "the agreement refusal must not also be on stdout:\n{stdout}"
     );
     // Distinct from the unknown-id refusal (2), so a script can tell "you did
     // not agree" apart from "no such fix".
     assert_eq!(
         world.cli_rc,
         Some(5),
-        "declining to apply is its own outcome, not an error:\n{output}"
+        "declining to apply is its own outcome, not an error:\n{stderr}"
+    );
+}
+
+#[then("the CLI declines on the terminal and explains that it needs agreement")]
+async fn assert_interactive_decline_reported(world: &mut E2eWorld) {
+    // Same outcome as the non-interactive refusal (diagnose-08): declining is
+    // its own outcome, not an error.
+    assert_eq!(
+        world.cli_rc,
+        Some(5),
+        "declining an interactive prompt is its own outcome, not an error"
+    );
+    let screen = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        screen.contains("Not confirmed; refusing to apply."),
+        "the terminal must show the same decline message the non-interactive \
+         path reports, on screen:\n{screen}"
     );
 }
 
@@ -665,5 +887,26 @@ async fn assert_rc_file_untouched(world: &mut E2eWorld) {
         PLANTED_RC,
         "declining the fix must leave {} byte-for-byte unchanged",
         rc_file.display()
+    );
+}
+
+#[then("the CLI reports the command failure on stderr with exit code 4")]
+async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
+    // 4 is its own outcome: a command that ran and failed, distinct from 3
+    // (does not apply here) and 5 (user declined).
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a fix whose helper command fails should exit 4"
+    );
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert!(
+        stderr.contains("usermod exited") && stderr.contains("group membership NOT changed"),
+        "the command-failure explanation must be on stderr:\n{stderr}"
+    );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("group membership NOT changed"),
+        "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }

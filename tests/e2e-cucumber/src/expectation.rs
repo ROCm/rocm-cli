@@ -26,6 +26,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
 const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
+const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
@@ -68,6 +69,10 @@ pub struct ScenarioDecl {
     /// probe report "unknown" rather than a visible set, and `--gpu` validation
     /// then takes its permissive fallback instead of refusing.
     pub requires_multi_gpu: bool,
+    /// `@requires-gfx-target`: the scenario needs a detected chip name but does
+    /// not access the GPU. This permits resolver dry-runs on WSL before GPU
+    /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
+    pub requires_gfx_target: bool,
     /// `@requires-no-gpu`: the scenario's premise is a host with NO usable AMD GPU
     /// (e.g. a GPU-required serve must fail fast). Skipped on any host that has a
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
@@ -131,6 +136,7 @@ impl ScenarioDecl {
         let mut id = None;
         let mut requires_gpu = false;
         let mut requires_multi_gpu = false;
+        let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
@@ -157,6 +163,8 @@ impl ScenarioDecl {
                 requires_gpu = true;
             } else if tag == REQUIRES_MULTI_GPU_TAG {
                 requires_multi_gpu = true;
+            } else if tag == REQUIRES_GFX_TARGET_TAG {
+                requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
                 requires_no_gpu = true;
             } else if tag == REQUIRES_BARE_METAL_TAG {
@@ -175,6 +183,7 @@ impl ScenarioDecl {
             id,
             requires_gpu,
             requires_multi_gpu,
+            requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
@@ -457,6 +466,11 @@ pub fn resolve(
             reason: format!("requires more than one AMD GPU; {detected}"),
         };
     }
+    if decl.requires_gfx_target && cap.gfx_target.is_none() {
+        return Expectation::Skip {
+            reason: "requires a detected AMD GFX target; none detected on this host".to_owned(),
+        };
+    }
     if decl.requires_no_gpu && cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires a host with no AMD GPU; this host has one".to_owned(),
@@ -684,6 +698,28 @@ serve_timeout_secs = 90
         assert!(decl(&["@id:x", "@requires-bare-metal"]).requires_bare_metal);
         // Absent by default, so no existing scenario changes meaning.
         assert!(!decl(&["id:x", "requires-gpu"]).requires_bare_metal);
+    }
+
+    #[test]
+    fn detected_target_requirement_does_not_require_gpu_passthrough() {
+        let matrix = Expectations::default();
+        let scenario = decl(&["id:resolver-preview", "requires-gfx-target"]);
+
+        assert_eq!(
+            resolve(
+                &scenario,
+                &cap("wsl-no-passthrough"),
+                &matrix,
+                false,
+                false,
+                false,
+            ),
+            Expectation::ExpectPass
+        );
+        assert!(matches!(
+            resolve(&scenario, &cap("mock"), &matrix, false, false, false,),
+            Expectation::Skip { .. }
+        ));
     }
 
     #[test]
