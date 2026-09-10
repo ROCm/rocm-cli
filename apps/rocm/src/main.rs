@@ -5,6 +5,7 @@
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
+mod cli_progress;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -5311,7 +5312,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
     if background {
         let mut spinner =
-            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
         let report = start_managed_service(
             &selected_engine,
@@ -13695,11 +13696,43 @@ pub(crate) fn render_engine_inventory_text() -> String {
     render_engine_inventory_text_with_paths(paths.as_ref())
 }
 
+/// Marker shown beside the engine `serve`/CLI commands default to. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const DEFAULT_ENGINE_MARKER: &str = "*";
+
+/// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
+/// engine-inventory renderers so the two copies cannot drift apart.
+fn write_default_engine_legend(output: &mut String) {
+    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+}
+
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    // A configured `default_engine` still wins over the host preference, mirroring
+    // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
+    // the legend could mark an engine `serve` will not actually default to.
+    let configured_default_engine = paths.and_then(|paths| {
+        RocmCliConfig::load(paths)
+            .ok()
+            .and_then(|config| config.default_engine)
+    });
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or the marker would land on an engine name
+    // that is empty rather than falling back.
+    let default_engine = configured_default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == default_engine);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -13716,8 +13749,15 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     } else {
         let _ = writeln!(output, "  Plugin folders: not checked");
     }
+    if any_marked {
+        write_default_engine_legend(&mut output);
+    }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine { "*" } else { " " };
+        let marker = if *name == default_engine {
+            DEFAULT_ENGINE_MARKER
+        } else {
+            " "
+        };
         let _ = writeln!(output, "{marker} {name:10} {note}");
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -13833,11 +13873,23 @@ fn append_examine_engine_inventory(
     config: &RocmCliConfig,
     host_default_engine: &str,
 ) {
-    let configured_default = config.default_engine.as_deref();
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or `effective_default` below would become
+    // an engine name that is empty rather than falling back.
+    let configured_default = config
+        .default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     // A configured value still wins, mirroring `select_serve_engine`. Only the
     // fallback becomes GPU-aware: it used to be the platform constant, which
     // reported Lemonade on Instinct where serve picks vLLM.
     let effective_default = configured_default.unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == effective_default);
     let _ = writeln!(output, "engine_inventory:");
     // Unchanged on purpose: this line means "what the user configured", so an
     // unset value must keep reading as unset rather than borrowing the host default.
@@ -13878,9 +13930,12 @@ fn append_examine_engine_inventory(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if any_marked {
+        write_default_engine_legend(output);
+    }
     for (engine, note) in engine_inventory() {
         let marker = if *engine == effective_default {
-            "*"
+            DEFAULT_ENGINE_MARKER
         } else {
             " "
         };
@@ -29140,6 +29195,84 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn render_engine_inventory_text_includes_marker_legend() {
+        let (root, paths) = test_paths("engine-inventory-marker-legend");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        // Anchor on the marked row itself (not just `"{DEFAULT_ENGINE_MARKER} "`,
+        // which also matches inside the legend line and would pass even if no
+        // row were actually marked).
+        let marker_pos = rendered
+            .find(&format!("{DEFAULT_ENGINE_MARKER} {host_default}"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
+        // A configured default naming an external plugin (or a stale/typo'd
+        // name) matches zero rows in `engine_inventory()`'s built-ins list —
+        // the legend would then explain a marker that appears nowhere.
+        let (root, paths) = test_paths("engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !rendered.contains("legend:"),
+            "legend must be absent when the configured default matches no built-in engine; got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
@@ -29797,6 +29930,47 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn examine_engine_inventory_includes_marker_legend() {
+        let (root, paths) = test_paths("examine-engine-inventory-marker-legend");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = output.find(&legend).expect("legend line present");
+        let marker_pos = output
+            .find(&format!("{DEFAULT_ENGINE_MARKER} vllm"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{output}"
+        );
+    }
+
+    #[test]
+    fn examine_engine_inventory_omits_legend_when_effective_default_matches_nothing() {
+        // Same gap as `render_engine_inventory_text_with_paths`: an effective
+        // default naming an external plugin (or a stale/typo'd name) matches
+        // zero rows in `engine_inventory()`'s built-ins list.
+        let (root, paths) = test_paths("examine-engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !output.contains("legend:"),
+            "legend must be absent when the effective default matches no built-in engine; got:\n{output}"
+        );
+    }
+
     // ---------- engine shell prompt shim ----------
 
     #[test]
@@ -29993,6 +30167,14 @@ ID_LIKE="suse opensuse"
             output.contains("rocm config clear-default-engine"),
             "the note must name the remedy, not just the problem:\n{output}"
         );
+        assert!(
+            output.contains("  * lemonade "),
+            "the '*' marker must land on the configured engine, not the host's:\n{output}"
+        );
+        assert!(
+            !output.contains("  * vllm "),
+            "the host's preferred engine must not also be marked once overridden:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -30010,6 +30192,36 @@ ID_LIKE="suse opensuse"
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_treats_a_blank_configured_engine_as_unset() {
+        // Mirrors `select_serve_engine`'s guard: a config file with
+        // `default_engine = ""` must fall back to the host preference rather
+        // than reporting an empty engine name as "effective" and marking none
+        // of the real ones.
+        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
+        let config = RocmCliConfig {
+            default_engine: Some(String::new()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("configured_default_engine: <platform default>"),
+            "a blank configured value must read as unset:\n{output}"
+        );
+        assert!(
+            output.contains("effective_default_engine: vllm"),
+            "a blank configured value must fall back to the host default:\n{output}"
+        );
+        assert!(
+            output.contains("  * vllm "),
+            "the '*' marker must land on the host's default, not an empty name:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }

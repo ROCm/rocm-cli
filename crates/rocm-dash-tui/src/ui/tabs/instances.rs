@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use rocm_dash_core::metrics::{Instance, InstanceStatus};
+use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
@@ -80,6 +80,51 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
+    // Show HELD_LEGEND only when at least one *displayed* row would actually
+    // render a held marker. `Table` (no scroll state) draws rows from the
+    // start of `instances` until the area runs out of height, one row per
+    // instance after the header — so anything at or past `visible_rows`
+    // never reaches the screen and must not be allowed to conjure a legend.
+    // `inner.height - 1` (header only, legend not yet subtracted) is used as
+    // an upper bound. This can overcount by exactly the one row the legend
+    // itself claims: if the *only* held row sits at that last scanned index,
+    // showing the legend consumes a row and pushes that exact row off-screen,
+    // so the legend ends up explaining a marker that is no longer visible
+    // (see `table_held_legend_shown_even_when_boundary_row_scrolls_off`).
+    // That is intentional and the safe direction: the alternative (scanning
+    // a tighter bound that already accounts for the legend's own row) can
+    // never overcount, but can then *undercount* instead — a genuinely
+    // visible marker with no legend at all, which is the failure mode this
+    // mechanism exists to prevent. Overcounting by one boundary row is the
+    // accepted cost of never doing that.
+    // The finite checks mirror `gen_tps_cell`/`tokens_per_watt_cell`, which
+    // never print a marker for `None`/non-finite values regardless of
+    // freshness metadata. Both cells key off the same `gen_tps_observation`
+    // (tok/W derives from the same per-tick `gen_tps` sample), but each
+    // gates independently on its *own* value's finiteness — an instance can
+    // have non-finite/missing `gen_tps` (no marker on TOK/S) while
+    // `tokens_per_watt` is still finite and held (marker on TOK/W), so the
+    // row needs the legend even though the `gen_tps` half of this check
+    // alone would say no.
+    let visible_rows = inner.height.saturating_sub(1) as usize;
+    let any_held = instances.iter().take(visible_rows).any(|inst| {
+        let held = inst
+            .gen_tps_observation
+            .as_ref()
+            .is_some_and(|m| m.freshness == ObservationFreshness::Held);
+        held && (inst.gen_tps.is_some_and(f64::is_finite)
+            || inst.tokens_per_watt.is_some_and(f64::is_finite))
+    });
+    let (table_area, legend_area) = if any_held {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        (split[0], Some(split[1]))
+    } else {
+        (inner, None)
+    };
+
     let header = Row::new([
         "MODEL", "TOK/S", "TOK/W", "TTFT", "TPOT", "POWER", "QUEUE", "KV%",
     ])
@@ -93,10 +138,8 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = instances.iter().enumerate().map(|(i, inst)| {
         let model = trunc(&inst.model_name, 22);
         let tps = format::gen_tps_cell(inst.gen_tps, inst.gen_tps_observation.as_ref());
-        let tpw = inst
-            .tokens_per_watt
-            .filter(|v| v.is_finite())
-            .map_or_else(|| dash.to_string(), |v| format!("{v:.2}"));
+        let tpw =
+            format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref());
         let ttft = inst
             .ttft_ms
             .filter(|v| v.is_finite())
@@ -141,7 +184,9 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let widths = [
         Constraint::Min(12),
         Constraint::Length(7),
-        Constraint::Length(7),
+        // Wide enough for "{v:.2} tok/W*" (tokens_per_watt_cell's longest
+        // rendering) so the held marker never gets clipped mid-unit.
+        Constraint::Length(12),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(7),
@@ -149,7 +194,16 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Constraint::Length(5),
     ];
     let table = Table::new(rows, widths).header(header).column_spacing(1);
-    f.render_widget(table, inner);
+    f.render_widget(table, table_area);
+    if let Some(legend_area) = legend_area {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            legend_area,
+        );
+    }
 }
 
 /// How tall to make the heatmap block.
@@ -415,7 +469,7 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
     lines.push(Line::from(vec![
         Span::styled("tok/W ", Style::default().fg(theme.muted)),
         Span::styled(
-            format::tokens_per_watt(inst.tokens_per_watt),
+            format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref()),
             Style::default().fg(theme.accent),
         ),
         Span::styled(" · gen ", Style::default().fg(theme.muted)),
@@ -667,7 +721,10 @@ fn render_summary(
             Span::raw("  "),
             Span::styled("tok/W: ", muted),
             Span::styled(
-                format::tokens_per_watt(inst.tokens_per_watt),
+                format::tokens_per_watt_cell(
+                    inst.tokens_per_watt,
+                    inst.gen_tps_observation.as_ref(),
+                ),
                 Style::default().fg(theme.accent),
             ),
             Span::raw("  "),
@@ -1286,6 +1343,89 @@ mod tests {
     }
 
     #[test]
+    fn table_held_gen_tps_shows_held_marker_on_tok_w_too() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "held-tpw",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W must carry the held marker in the table; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_shows_held_legend_for_tok_w_even_when_gen_tps_is_missing() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // gen_tps itself is None (so TOK/S renders no marker at all), but
+        // tokens_per_watt is finite and held — the legend must still appear
+        // because the TOK/W cell independently prints a marker for it.
+        let mut inst = mk_inst_obs(
+            "held-tpw-only",
+            None,
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W must carry the held marker even without gen_tps; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when only the tok/W cell shows a held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_at_80_columns_keeps_tok_w_marker_and_model_readable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // TOK/W was widened to Length(12) to fit its longest rendering
+        // ("{v:.2} tok/W*") without clipping the held marker — at the cost
+        // of MODEL's headroom above its Min(12) floor. Every other render
+        // test in this file uses a 160-column backend; cover the narrow
+        // 80-column case where that headroom is tightest.
+        let mut inst = mk_inst_obs(
+            "narrow",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.model_name = "llama-3.1-8b-instruct".into();
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W marker must not be clipped at 80 columns; got:\n{out}"
+        );
+        assert!(
+            out.contains("llama-3.1-8b"),
+            "MODEL must stay readable above its Min(12) floor at 80 columns; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn table_fresh_gen_tps_has_no_held_marker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1324,6 +1464,171 @@ mod tests {
         assert!(
             out.contains("789") && !out.contains("789*"),
             "legacy (no metadata) must NOT show held marker; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_visible_when_gen_tps_held() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "held",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when a shown gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_when_all_fresh() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs(
+            "fresh",
+            Some(456.0),
+            Some(obs(ObservationFreshness::Fresh, 5)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all shown gen_tps are fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_for_legacy_none_metadata() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("legacy", Some(789.0), None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_for_non_finite_gen_tps() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // gen_tps_cell never prints HELD_MARKER for a non-finite value (it
+        // renders "—" instead), so held metadata here must not conjure a
+        // legend either.
+        let inst = mk_inst_obs(
+            "nonfinite",
+            Some(f64::NAN),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for a non-finite gen_tps; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_absent_when_held_row_is_off_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Twenty instances, sorted by (zero-padded) name; only the very last
+        // one is held. A short viewport only fits a few rows, so that held
+        // row never reaches the screen and must not add a legend.
+        let mut m = HashMap::new();
+        for n in 0..20 {
+            let name = format!("n{n:02}");
+            let held = n == 19;
+            let inst = mk_inst_obs(
+                &name,
+                Some(1.0),
+                if held {
+                    Some(obs(ObservationFreshness::Held, 30))
+                } else {
+                    Some(obs(ObservationFreshness::Fresh, 5))
+                },
+            );
+            m.insert(inst.container_id.clone(), inst);
+        }
+        let state = mk_state(m, 0);
+        let mut term = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains("n19"),
+            "test setup assumption broken: the held row must be off-screen; got:\n{out}"
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the only held row is off-screen; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_legend_shown_even_when_boundary_row_scrolls_off() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Nine instances in a viewport sized so the any_held scan bound
+        // (`inner.height - 1`) is exactly 9, i.e. its last scanned index is
+        // 8 — the *only* held row. The scan finds it and shows the legend,
+        // but showing the legend claims a row, shrinking the actual visible
+        // data rows to 8 (indices 0..=7) and pushing this row off-screen.
+        // This is the documented, accepted trade-off (see the comment above
+        // `visible_rows` in `draw_table`): never hide a legend a visible
+        // marker needs, even if that means occasionally showing one whose
+        // triggering row is no longer on screen.
+        let mut m = HashMap::new();
+        for n in 0..9 {
+            let name = format!("n{n:02}");
+            let held = n == 8;
+            let inst = mk_inst_obs(
+                &name,
+                Some(1.0),
+                if held {
+                    Some(obs(ObservationFreshness::Held, 30))
+                } else {
+                    Some(obs(ObservationFreshness::Fresh, 5))
+                },
+            );
+            m.insert(inst.container_id.clone(), inst);
+        }
+        let state = mk_state(m, 0);
+        let mut term = Terminal::new(TestBackend::new(160, 13)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            !out.contains("n08"),
+            "test setup assumption broken: the boundary row must scroll off once the legend claims its row; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must still show for a boundary-row match, even though that row is no longer visible; got:\n{out}"
         );
     }
 
@@ -1382,6 +1687,28 @@ mod tests {
         assert!(
             out.contains("held"),
             "detail for held instance must show 'held' freshness; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_held_shows_held_marker_on_tok_w() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "held-detail-tpw",
+            Some(100.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.tokens_per_watt = Some(1.5);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("1.50 tok/W*"),
+            "held tok/W must carry the held marker in the detail pane; got:\n{out}"
         );
     }
 

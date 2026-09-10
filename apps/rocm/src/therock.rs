@@ -1664,7 +1664,13 @@ fn install_tarball_runtime(
         let _ = writeln!(output, "  {warning}");
     }
 
-    download_file(&artifact.url, &cache_path)?;
+    let download_label = format!("Downloading {}…", artifact.file_name);
+    let spinner = crate::cli_progress::AnimatedSpinner::start(download_label.clone());
+    let download_result = download_file(&artifact.url, &cache_path, &mut |bytes, total| {
+        spinner.set_progress(&download_label, bytes, total);
+    });
+    drop(spinner);
+    download_result?;
     extract_tarball_and_discard_archive(&cache_path, &install_root)?;
 
     let manifest = InstalledRuntimeManifest {
@@ -2761,23 +2767,27 @@ fn http_header_value(headers: &str, name: &str) -> Option<String> {
     value
 }
 
-/// Fetch an artifact to `destination`.
+/// Fetch an artifact to `destination`, reporting cumulative bytes written and
+/// (when known) the total size to `on_progress` as the transfer proceeds.
 ///
 /// Streams rather than buffers: SDK tarballs are single-digit gigabytes, and
 /// holding one in memory to write it out again costs that much RAM on top of
 /// the same amount of disk. The primitive also handles the free-space
 /// preflight, retry with resume, and the length cross-check that catches a
 /// transfer the server ended early.
-fn download_file(url: &str, destination: &Path) -> Result<()> {
+fn download_file(
+    url: &str,
+    destination: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
     let parent = destination
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    rocm_core::download_file_streaming(&rocm_core::DownloadRequest::new(
-        url,
-        destination,
-        THEROCK_DOWNLOAD_TIMEOUT,
-    ))
+    rocm_core::download_file_streaming_with_progress(
+        &rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT),
+        on_progress,
+    )
     .with_context(|| format!("failed to fetch {url}"))?;
     Ok(())
 }
@@ -6453,7 +6463,7 @@ echo Python 3.12.10
         fs::create_dir_all(&temp)?;
         let destination = temp.join("artifact.bin");
 
-        download_file(&url, &destination)?;
+        download_file(&url, &destination, &mut |_, _| {})?;
         assert_eq!(fs::read(&destination)?, body);
 
         let response = http_get(&url, &[], Some(5))?;
@@ -6503,6 +6513,86 @@ echo Python 3.12.10
         assert!(row.latest_version.is_none());
         assert!(row.message.is_some());
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
+        use std::net::TcpListener;
+        use std::thread;
+
+        // A multi-chunk body (`download_file_streaming` reads in 64 KiB
+        // chunks) so a single callback firing wouldn't already satisfy the
+        // "monotonically increasing" assertion below.
+        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let served = body.clone();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )?;
+            stream.write_all(&served)?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+
+        let temp = workspace_test_artifact_dir().join(format!(
+            "download-progress-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&temp)?;
+        let destination = temp.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        download_file(&url, &destination, &mut |bytes, total| {
+            calls.push((bytes, total));
+        })?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&temp);
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.len() >= 2,
+            "expected at least a pre-transfer and a final callback: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last callback must report the complete transfer: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the reported total must stay consistent across callbacks: {calls:?}"
+        );
         Ok(())
     }
 
