@@ -474,18 +474,19 @@ async fn assert_runtime_active(world: &mut E2eWorld) {
     );
 }
 
-#[then("the install reports overwriting the existing runtime")]
-async fn assert_install_overwrote_existing(world: &mut E2eWorld) {
+#[then("the install reports that --yes approved replacing the existing runtime")]
+async fn assert_install_reported_yes_approval(world: &mut E2eWorld) {
     // The registered-and-active Thens are true from the `Given` alone, so they
-    // cannot tell an overwrite from a no-op. This asserts the overwrite branch
-    // was actually taken: with `--yes` the approval gate resolves to
-    // `ProceedApproved`, whose only externally visible signal is this line. If
-    // `--yes` regressed to a refusal, or the install silently took the fresh
-    // path, this line is absent and the scenario fails.
+    // cannot tell an approved reinstall from a no-op. This asserts the approved
+    // branch was actually taken: with `--yes` the gate resolves to
+    // `ProceedApproved`, whose only externally visible signal is this line. The
+    // `Approved by --yes:` prefix is what discriminates — the fresh-install line
+    // ("No existing ROCm SDK found") does not carry it, so if `--yes` regressed
+    // to a refusal, or the install silently took the fresh path, this fails.
     let output = world.cli_output.as_deref().expect("no install output");
     assert!(
-        output.contains("Overwriting existing ROCm SDK"),
-        "reinstall with --yes did not report overwriting the existing runtime:\n{output}"
+        output.contains("Approved by --yes: an existing ROCm SDK was found"),
+        "reinstall with --yes did not report the approved replacement:\n{output}"
     );
 }
 

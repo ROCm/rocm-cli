@@ -156,9 +156,9 @@ The live SDK acceptance test creates an isolated test root under `target/`, crea
 rocm install sdk --channel release --format wheel --yes
 ```
 
-`--yes` approves overwriting an existing managed SDK without prompting, which
-keeps the command non-interactive when the test root is reused across runs (a
-fresh root never prompts). It matches the invocation in
+`--yes` approves replacing an existing managed SDK as the active default without
+prompting, which keeps the command non-interactive when the test root is reused
+across runs (a fresh root never prompts). It matches the invocation in
 `scripts/therock_sdk_install_test.py`.
 
 Then it verifies:

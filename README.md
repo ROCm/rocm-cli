@@ -199,9 +199,10 @@ rocm install sdk
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it. Re-running the command over a
-managed runtime it already created asks before overwriting; add `--yes` to
-approve that overwrite non-interactively, such as from a script.
+creates a separate managed runtime alongside it. Re-running the command when it
+already created a managed runtime for the same GPU family and channel asks
+first, because the new install takes over as the active default; add `--yes` to
+approve that non-interactively, such as from a script.
 
 Then serve a model:
 
@@ -260,10 +261,13 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. A fresh install never prompts, but re-running it over an existing
-managed SDK asks before overwriting; pass `--yes` to approve the overwrite
+by rocm-cli. A fresh install never prompts, but when a managed SDK already
+exists for the same GPU family and channel it asks first, because the new
+install becomes the active default in its place; pass `--yes` to approve that
 non-interactively (for example in scripts or CI, where the prompt would
-otherwise refuse). `install driver` installs the AMD kernel driver on Linux
+otherwise refuse). Because the install root and manifest are keyed by version,
+an upgrade or downgrade keeps the previous install on disk — only a same-version
+reinstall replaces it in place. `install driver` installs the AMD kernel driver on Linux
 (DKMS or native package). `update` checks for a newer ROCm package; pass
 `--apply` to install it.
 

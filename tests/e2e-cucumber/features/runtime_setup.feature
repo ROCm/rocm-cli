@@ -132,9 +132,9 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Reinstalling over an existing managed SDK must not silently clobber the
+  # Reinstalling over an existing managed SDK must not silently displace the
   # active runtime. Outside an interactive terminal (as every e2e invocation
-  # is here), `install sdk` without `--yes` must refuse rather than overwrite.
+  # is here), `install sdk` without `--yes` must refuse rather than proceed.
   # GPU-gated because the precondition needs a GPU to have a runtime active.
   # The refusal is not free: the gate keys on the resolved family and version, so
   # it runs after the Python launcher is resolved and the channel index is read.
@@ -153,13 +153,13 @@ Feature: Runtime configuration
   # Companion to Scenario runtime-08: with --yes the same reinstall proceeds and the
   # runtime stays registered and active afterward. Nightly-gated in addition to
   # GPU because, unlike Scenario runtime-08, this exercises a real second SDK install.
-  # The registered/active Thens hold from the Given alone, so the overwrite Then
+  # The registered/active Thens hold from the Given alone, so the approval Then
   # is what actually distinguishes this from a no-op: it fails if --yes ever
   # regresses to a refusal or silently takes the fresh-install path.
   @id:runtime-install-sdk-overwrite-with-yes @requires-gpu @nightly
-  Scenario: runtime-09 - Reinstalling the SDK over an existing runtime with --yes overwrites it
+  Scenario: runtime-09 - Reinstalling the SDK over an existing runtime with --yes proceeds
     Given a managed runtime is active
     When the user reinstalls the SDK with --yes
-    Then the install reports overwriting the existing runtime
+    Then the install reports that --yes approved replacing the existing runtime
     And a runtime is registered
     And the runtime is set as active

@@ -1003,9 +1003,10 @@ fn install_wheel_runtime(
         ));
     }
 
-    // Fresh installs proceed with just an informational line; only overwriting an
-    // existing managed SDK asks for confirmation (and needs `--yes` when there is
-    // no terminal to answer the prompt).
+    // Fresh installs proceed with just an informational line. Only an install
+    // that displaces an existing managed SDK for this family/channel as the
+    // active default asks for confirmation (and needs `--yes` when there is no
+    // terminal to answer the prompt).
     let existing = existing_runtime_relation(
         paths,
         channel,
@@ -1022,7 +1023,7 @@ fn install_wheel_runtime(
         }
         SdkInstallApproval::ProceedApproved => {
             progress_line(format!(
-                "Overwriting existing ROCm SDK ({}) with ROCm {}.",
+                "Approved by --yes: an existing ROCm SDK was found ({}); installing ROCm {}, which becomes the active default runtime.",
                 existing.as_deref().unwrap_or_default(),
                 runtime_version_display(&resolution.latest_version)
             ));
@@ -1043,7 +1044,7 @@ fn install_wheel_runtime(
         }
         SdkInstallApproval::RefuseNonInteractive => {
             bail!(
-                "an existing ROCm SDK ({}) would be overwritten; re-run with --yes to overwrite it non-interactively, for example `rocm install sdk --yes`",
+                "an existing ROCm SDK was found ({}); continuing would make the newly installed ROCm the active default runtime. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`",
                 existing.as_deref().unwrap_or_default()
             );
         }
@@ -1271,18 +1272,20 @@ fn repo_version_without_wheels(
 enum SdkInstallApproval {
     /// No existing managed SDK for this family+channel — install without asking.
     ProceedFresh,
-    /// An existing SDK is present and `--yes` was given — overwrite it silently.
+    /// An existing SDK is present and `--yes` was given — displace it as the
+    /// active default without asking.
     ProceedApproved,
-    /// An existing SDK is present and there is a terminal — prompt to overwrite.
+    /// An existing SDK is present and there is a terminal — prompt before
+    /// displacing it as the active default.
     PromptOverwrite,
     /// An existing SDK is present but there is no terminal and no `--yes` — refuse.
     RefuseNonInteractive,
 }
 
 /// Decide whether an SDK install proceeds, prompts, or is refused. Fresh installs
-/// (no `existing` runtime) always proceed; only overwriting an existing SDK needs
-/// confirmation, and outside an interactive terminal that confirmation must come
-/// from `--yes`.
+/// (no `existing` runtime) always proceed; displacing an existing SDK as the
+/// active default needs confirmation, and outside an interactive terminal that
+/// confirmation must come from `--yes`.
 const fn sdk_install_approval(
     existing: bool,
     assume_yes: bool,
@@ -1299,10 +1302,17 @@ const fn sdk_install_approval(
     }
 }
 
-/// Interactive confirmation gate for overwriting an existing managed SDK. Prints
+/// Interactive confirmation gate for displacing an existing managed SDK. Prints
 /// what would be replaced, then reads a yes/no answer from stdin. Only reached
 /// when an existing SDK is present, `--yes` was not passed, and a terminal is
 /// attached (see `sdk_install_approval`).
+///
+/// "Displacing" rather than "overwriting" is deliberate: `runtime_key` embeds the
+/// resolved version, so an upgrade or downgrade lands in its own install root
+/// with its own manifest and the previous install stays on disk — what changes is
+/// which runtime is the active default. Only a same-version reinstall reuses the
+/// same root. The prompt says so instead of claiming a deletion that does not
+/// happen.
 fn confirm_overwrite_existing_sdk(
     channel: TheRockChannel,
     family: &str,
@@ -1322,7 +1332,7 @@ fn confirm_overwrite_existing_sdk(
     // The host-newer ROCm explanation is already emitted as a visible progress
     // line before this prompt on the real install path, so it is not repeated
     // here.
-    prompt_yes_no("Overwrite the existing ROCm SDK? [y/N]: ")
+    prompt_yes_no("Replace the existing ROCm SDK as the active default? [y/N]: ")
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
@@ -1396,9 +1406,10 @@ fn install_tarball_runtime(
         ));
     }
 
-    // Fresh installs proceed with just an informational line; only overwriting an
-    // existing managed SDK asks for confirmation (and needs `--yes` when there is
-    // no terminal to answer the prompt).
+    // Fresh installs proceed with just an informational line. Only an install
+    // that displaces an existing managed SDK for this family/channel as the
+    // active default asks for confirmation (and needs `--yes` when there is no
+    // terminal to answer the prompt).
     let existing = existing_runtime_relation(paths, channel, &artifact.family, &artifact.version)?;
     match sdk_install_approval(existing.is_some(), assume_yes, interactive_terminal()) {
         SdkInstallApproval::ProceedFresh => {
@@ -1410,7 +1421,7 @@ fn install_tarball_runtime(
         }
         SdkInstallApproval::ProceedApproved => {
             progress_line(format!(
-                "Overwriting existing ROCm SDK ({}) with ROCm {}.",
+                "Approved by --yes: an existing ROCm SDK was found ({}); installing ROCm {}, which becomes the active default runtime.",
                 existing.as_deref().unwrap_or_default(),
                 runtime_version_display(&artifact.version)
             ));
@@ -1431,7 +1442,7 @@ fn install_tarball_runtime(
         }
         SdkInstallApproval::RefuseNonInteractive => {
             bail!(
-                "an existing ROCm SDK ({}) would be overwritten; re-run with --yes to overwrite it non-interactively, for example `rocm install sdk --yes`",
+                "an existing ROCm SDK was found ({}); continuing would make the newly installed ROCm the active default runtime. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`",
                 existing.as_deref().unwrap_or_default()
             );
         }
