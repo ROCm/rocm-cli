@@ -2569,6 +2569,502 @@ printf '%s' \"$pr\" | jq -r \"$q\"\n";
         rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
     }
 
+    /// The job-level `if:` condition, flattened across folded (`>-`)
+    /// continuation lines so a clause split over several lines cannot hide.
+    ///
+    /// Scoped to the indent-4 key, so a step-level `if:` (indent 8) can never
+    /// be mistaken for the job's own gate.
+    fn job_if(block: &str) -> String {
+        let start = block
+            .lines()
+            .position(|line| indent_of(line) == 4 && line.trim_start().starts_with("if:"))
+            .expect("job declares a job-level `if:`");
+        let scoped = block.lines().skip(start).collect::<Vec<_>>().join("\n");
+        let value = flattened_values(&scoped, "if")
+            .into_iter()
+            .next()
+            .expect("job-level `if:` has an extractable value");
+        // Drop the block-scalar indicator (`>-`, `|`, …) the folded form opens
+        // with, so the condition reads the same however it was spelled.
+        value
+            .trim_start_matches(['>', '|', '-', '+'])
+            .trim()
+            .to_owned()
+    }
+
+    const E2E_VERDICT_STEP: &str = "- name: Require the required E2E tests job to have passed";
+
+    /// The consolidated report job's verdict step, found by its exact name.
+    fn e2e_verdict_step() -> String {
+        let ci = read_workflow("ci.yml");
+        named_step(job_block(&ci, "e2e-report"), E2E_VERDICT_STEP)
+    }
+
+    /// The job name the verdict step reads, from the step's own `env:`.
+    fn e2e_verdict_required_job(step: &str) -> String {
+        step.lines()
+            .find_map(|line| line.trim().strip_prefix("REQUIRED_JOB:"))
+            .expect("the verdict step names the job it reads in `REQUIRED_JOB`")
+            .trim()
+            .to_owned()
+    }
+
+    /// `E2E consolidated report` is a required merge check named after the
+    /// `E2E tests` lane, so it has to be produced whenever that lane is and it
+    /// has to carry the verdict of the lane's REQUIRED leg. Both halves failed
+    /// silently before: a job-level `heavy` clause skipped the job on a light
+    /// pull request (branch protection counts a skipped required check as
+    /// satisfied), and rendering the HTML succeeded when every scenario failed.
+    ///
+    /// The verdict is deliberately not `needs.e2e.result`: `e2e` is a matrix
+    /// over two Ubuntu images, the result aggregates both, and only the
+    /// 24.04 leg (`E2E tests`) is a required check. Reading the aggregate would
+    /// make the 26.04 leg block merges through this check.
+    #[test]
+    fn consolidated_e2e_report_cannot_be_skipped_and_carries_the_required_legs_verdict() {
+        let ci = read_workflow("ci.yml");
+        let lane = job_block(&ci, "e2e");
+        let report = job_block(&ci, "e2e-report");
+        let condition = job_if(report);
+
+        assert!(
+            !condition.contains("heavy"),
+            "e2e-report's job-level `if:` is `{condition}`, which gates on the `heavy` path \
+             filter: on a PR that matches no heavy path the job is SKIPPED, and branch \
+             protection treats a skipped required check as satisfied, so the check silently \
+             stops gating anything. Mirror the `e2e` job's condition instead and decide what \
+             work happens at the step level."
+        );
+        assert_eq!(
+            condition,
+            job_if(lane),
+            "e2e-report's job-level `if:` must mirror the `e2e` job's exactly, so the two are \
+             produced and skipped as a pair; a clause on one side only skips a required check"
+        );
+        assert!(
+            condition.contains("always()"),
+            "e2e-report's job-level `if:` is `{condition}`, which lacks `always()`: without it \
+             a failed `E2E tests` lane skips the report entirely, and those are the runs \
+             worth rendering"
+        );
+        assert!(
+            report.lines().any(|line| line.trim() == "- e2e"),
+            "e2e-report must list `e2e` under needs: the verdict reads that job's conclusion \
+             from the API, which is only final once the job has finished"
+        );
+        // Every job the condition reads must be listed under `needs:`. A
+        // `needs.<job>` of a job that is not a need is not available, the
+        // condition can never be true, and the job is skipped on every run,
+        // which branch protection counts as satisfied.
+        for referenced in condition
+            .split("needs.")
+            .skip(1)
+            .filter_map(|rest| rest.split('.').next())
+        {
+            assert!(
+                report
+                    .lines()
+                    .any(|line| line.trim() == format!("- {referenced}")),
+                "e2e-report's job-level `if:` reads `needs.{referenced}`, so `{referenced}` must \
+                 be listed under needs: otherwise the condition can never be true and the \
+                 REQUIRED check is skipped on every run"
+            );
+        }
+        // The exact set, not mere presence: job-level permissions replace the
+        // workflow-wide set, so `contents: read` is repeated for checkout, the
+        // verdict step's job listing needs `actions: read`, and nothing may be
+        // added (a write scope would sit next to a job that runs repository code).
+        assert_eq!(
+            job_mapping(report, "permissions"),
+            BTreeMap::from([
+                ("actions".to_owned(), "read".to_owned()),
+                ("contents".to_owned(), "read".to_owned()),
+            ]),
+            "e2e-report's permissions must be exactly `actions: read` (the verdict step lists \
+             the run's jobs) and `contents: read` (checkout)"
+        );
+        assert_eq!(
+            job_mapping(lane, "outputs").get("ran").map(String::as_str),
+            Some("${{ steps.gate.outputs.run }}"),
+            "the `e2e` job must publish its gate decision as `ran`; the report's download \
+             and render steps read it"
+        );
+
+        // The verdict is the LAST step, so the report is still rendered for a
+        // failing run, and it reads the required job rather than the aggregate.
+        let steps: Vec<&str> = report
+            .lines()
+            .filter(|line| indent_of(line) == 6 && line.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(
+            steps.last().map(|line| line.trim()),
+            Some(E2E_VERDICT_STEP),
+            "the verdict step must be the report job's last step"
+        );
+        // Every step that builds the report is gated on `ran`: when the lane's
+        // gate decides not to run (a pull request touching no heavy path, a
+        // `clippy` that did not succeed) it executes nothing, so an ungated
+        // `cargo xtask e2e-report` (no checkout) or download would fail this
+        // REQUIRED check where `E2E tests` itself passes. The condition is
+        // compared EXACTLY: `always() || ran` or `ran || true` would contain the
+        // gate and still run the step. The verdict step is the one that must NOT
+        // be gated on it, or a lane that ran nothing could never be judged.
+        let ran_gate = "needs.e2e.outputs.ran == 'true'";
+        let mut blocks: Vec<Vec<&str>> = Vec::new();
+        for line in report.lines().skip_while(|l| l.trim() != "steps:") {
+            if indent_of(line) == 6 && line.trim_start().starts_with("- ") {
+                blocks.push(Vec::new());
+            }
+            if let Some(block) = blocks.last_mut() {
+                block.push(line);
+            }
+        }
+        let verdict_block = blocks.pop().expect("the report job has steps");
+        let step_if = |block: &[&str]| -> Option<String> {
+            block.iter().find_map(|line| {
+                (indent_of(line) == 8)
+                    .then(|| line.trim().strip_prefix("if:").map(|v| v.trim().to_owned()))
+                    .flatten()
+            })
+        };
+        assert!(
+            blocks.len() >= 5,
+            "expected the checkout, toolchain, download, render and upload steps before the \
+             verdict, found {}",
+            blocks.len()
+        );
+        let gated = [ran_gate.to_owned(), format!("always() && {ran_gate}")];
+        for block in &blocks {
+            let condition = step_if(block);
+            assert!(
+                condition.as_ref().is_some_and(|c| gated.contains(c)),
+                "every report-building step of e2e-report must be gated on exactly \
+                 `{ran_gate}` (optionally behind `always() &&`), the `e2e` job's `ran` \
+                 output: when the lane's gate decides not to run it executes nothing, so an \
+                 ungated step runs without artifacts or a checkout and fails this required \
+                 check. This step's `if:` is {condition:?}:\n{}",
+                block.join("\n")
+            );
+        }
+        assert!(
+            step_if(&verdict_block).is_some_and(|c| !c.contains("ran")),
+            "the verdict step must not be gated on `ran`: it is what judges a lane that ran \
+             nothing"
+        );
+        let step = e2e_verdict_step();
+        let step_lines: Vec<&str> = step.lines().map(str::trim).collect();
+        for required in [
+            "if: ${{ !cancelled() }}",
+            "GH_TOKEN: ${{ github.token }}",
+            "RAN: ${{ needs.e2e.outputs.ran }}",
+        ] {
+            assert!(
+                step_lines.contains(&required),
+                "the verdict step must carry `{required}`:\n{step}"
+            );
+        }
+        assert!(
+            !step.contains("needs.e2e.result"),
+            "the verdict must not read `needs.e2e.result`: it aggregates the non-required \
+             ubuntu-26.04 leg too, which would make that leg block merges:\n{step}"
+        );
+
+        // A failing verdict must fail the check: neither the job nor the step
+        // may swallow it.
+        for line in report.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            assert!(
+                !line.contains("continue-on-error"),
+                "e2e-report must not carry `continue-on-error`: it would turn a failing \
+                 verdict into a pass: `{}`",
+                line.trim()
+            );
+        }
+
+        // The producer/consumer pair: the name the verdict looks for must be the
+        // name the required 24.04 leg reports under, or the step fails closed on
+        // every run (or, if loosened, reads the wrong leg). The whole expression
+        // is compared, so the 26.04 arm cannot also produce the bare name: two
+        // jobs would then match and the verdict would fail every run.
+        let required = e2e_verdict_required_job(&step);
+        let name_line = lane
+            .lines()
+            .find(|line| indent_of(line) == 4 && line.trim_start().starts_with("name:"))
+            .expect("the `e2e` job has a name");
+        assert_eq!(
+            name_line.trim(),
+            format!(
+                "name: ${{{{ matrix.os == 'ubuntu-24.04' && '{required}' || \
+                 format('{required} ({{0}})', matrix.os) }}}}"
+            ),
+            "REQUIRED_JOB (`{required}`) must be the bare name the `e2e` job gives its \
+             ubuntu-24.04 leg and only that leg; the other leg is `{required} (<os>)`"
+        );
+    }
+
+    /// Run the verdict step's real script under `bash -e`, as a `run:` step
+    /// does, with a stub `gh` that records its arguments and answers each call
+    /// as `outcomes` says (the last outcome repeats), and `ran` as the `e2e`
+    /// job's `ran` output. An outcome is `ok` (print `listing`, exit 0), `fail`
+    /// (exit 1 like an API outage) or `partial` (print `listing`, then exit 1,
+    /// as `--paginate` does when a later page fails). Returns the exit code,
+    /// everything the script logged, and the arguments of each `gh` call, one
+    /// string per call.
+    #[cfg(unix)]
+    fn run_e2e_verdict_sequence(
+        listing: &str,
+        outcomes: &[&str],
+        ran: &str,
+    ) -> (i32, String, Vec<String>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("verdict.sh");
+        let calls = dir.path().join("calls");
+        let listing_path = dir.path().join("jobs.json");
+        let step = e2e_verdict_step();
+        std::fs::write(
+            &script,
+            dedent(&run_block(&step).expect("the verdict step has a `run: |` block"))
+                .expect("the verdict step's script is not empty"),
+        )
+        .expect("write script");
+        std::fs::write(&listing_path, listing).expect("write listing");
+        // The nth call reads the nth word of OUTCOMES, or the last one.
+        let body = "#!/bin/sh\n\
+            echo \"$*\" >> \"$CALLS\"\n\
+            n=$(wc -l < \"$CALLS\" | tr -d ' ')\n\
+            outcome=$(printf '%s\\n' $OUTCOMES | sed -n \"${n}p\")\n\
+            [ -n \"$outcome\" ] || outcome=$(printf '%s\\n' $OUTCOMES | tail -n 1)\n\
+            case \"$outcome\" in\n\
+              ok) cat \"$LISTING\" ;;\n\
+              partial) cat \"$LISTING\"; echo 'HTTP 502' >&2; exit 1 ;;\n\
+              *) echo 'HTTP 502' >&2; exit 1 ;;\n\
+            esac\n";
+        rocm_core::fake_executable::write_fake_executable(&dir.path().join("gh"), body)
+            .expect("plant gh stub");
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script)
+            .env("PATH", path)
+            .env("CALLS", &calls)
+            .env("LISTING", &listing_path)
+            .env("OUTCOMES", outcomes.join(" "))
+            .env("REQUIRED_JOB", e2e_verdict_required_job(&step))
+            .env("RAN", ran)
+            .env("RETRY_DELAY_SECS", "0")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .output()
+            .expect("running the verdict script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        let made = std::fs::read_to_string(&calls)
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        (
+            out.status
+                .code()
+                .expect("verdict exited with a status code"),
+            log,
+            made,
+        )
+    }
+
+    /// As [`run_e2e_verdict_sequence`] for the two steady cases: every call
+    /// prints `listing`, or (when it is `None`) every call fails.
+    #[cfg(unix)]
+    fn run_e2e_verdict(listing: Option<&str>, ran: &str) -> (i32, String, Vec<String>) {
+        match listing {
+            Some(text) => run_e2e_verdict_sequence(text, &["ok"], ran),
+            None => run_e2e_verdict_sequence("", &["fail"], ran),
+        }
+    }
+
+    /// One page of the run's job list, as `gh api` prints it.
+    #[cfg(unix)]
+    fn jobs_page(jobs: &[(&str, Option<&str>)]) -> String {
+        let jobs: Vec<serde_json::Value> = jobs
+            .iter()
+            .map(|(name, conclusion)| serde_json::json!({ "name": name, "conclusion": conclusion }))
+            .collect();
+        serde_json::json!({ "total_count": jobs.len(), "jobs": jobs }).to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn e2e_verdict_follows_the_required_leg_and_fails_closed() {
+        // The contract test above pins the step's inputs; this runs its logic,
+        // so a verdict that never fails (or always does) cannot pass for one.
+        if !jq_available_or_skip("e2e_verdict_follows_the_required_leg_and_fails_closed") {
+            return;
+        }
+        let step = e2e_verdict_step();
+        let required = e2e_verdict_required_job(&step);
+        let other_leg = format!("{required} (ubuntu-26.04)");
+        let other = other_leg.as_str();
+
+        // Every verdict states its reason, so a pass and a failure cannot be
+        // told apart by the exit code alone.
+        let verdict = |listing: Option<&str>, code: i32, said: &str| {
+            let (got, log, _) = run_e2e_verdict(listing, "true");
+            assert_eq!(got, code, "wanted exit {code} saying `{said}`; got:\n{log}");
+            assert!(log.contains(said), "wanted `{said}` in:\n{log}");
+        };
+
+        // The required leg decides, whatever the other leg did.
+        verdict(
+            Some(&jobs_page(&[
+                (&required, Some("success")),
+                (other, Some("success")),
+            ])),
+            0,
+            "concluded success",
+        );
+        verdict(
+            Some(&jobs_page(&[
+                (&required, Some("success")),
+                (other, Some("failure")),
+            ])),
+            0,
+            "concluded success",
+        );
+        verdict(
+            Some(&jobs_page(&[
+                (&required, Some("failure")),
+                (other, Some("success")),
+            ])),
+            1,
+            "concluded 'failure'",
+        );
+        // Anything but a success is a failure, including a job that has not
+        // concluded or never ran.
+        for conclusion in [Some("cancelled"), Some("skipped"), Some("timed_out"), None] {
+            let shown = conclusion.unwrap_or("none");
+            verdict(
+                Some(&jobs_page(&[(&required, conclusion)])),
+                1,
+                &format!("concluded '{shown}'"),
+            );
+        }
+        // The job list is paginated: `gh api --paginate` prints one document per
+        // page, and the required job can be on any of them.
+        let paged = format!(
+            "{}\n{}",
+            jobs_page(&[("build-and-test", Some("success"))]),
+            jobs_page(&[(&required, Some("success"))])
+        );
+        verdict(Some(&paged), 0, "concluded success");
+        let paged_failure = format!(
+            "{}\n{}",
+            jobs_page(&[("build-and-test", Some("success"))]),
+            jobs_page(&[(&required, Some("failure"))])
+        );
+        verdict(Some(&paged_failure), 1, "concluded 'failure'");
+
+        // Fail CLOSED where no verdict can be established.
+        verdict(
+            Some(&jobs_page(&[
+                (other, Some("success")),
+                ("clippy", Some("success")),
+            ])),
+            1,
+            "expected exactly one job named",
+        );
+        verdict(
+            Some(&jobs_page(&[
+                (&required, Some("success")),
+                (&required, Some("success")),
+            ])),
+            1,
+            "expected exactly one job named",
+        );
+        verdict(Some(&jobs_page(&[])), 1, "expected exactly one job named");
+        verdict(
+            Some("<html>not json</html>"),
+            1,
+            "could not read this run's job list",
+        );
+        verdict(None, 1, "could not list this run's jobs");
+        // An outage is retried before it is believed, and the retries are
+        // bounded.
+        let listing_call = "api --paginate \
+            repos/owner/repo/actions/runs/1/jobs?filter=latest&per_page=100";
+        let (_, _, calls) = run_e2e_verdict(None, "true");
+        assert_eq!(
+            calls, [listing_call; 3],
+            "a failing job listing is tried three times, no more"
+        );
+        // The request itself is pinned: `--paginate` (the required job can be on
+        // any page), `filter=latest` (a re-run's latest attempt, not an earlier
+        // one) and this run's id.
+        let (_, _, calls) =
+            run_e2e_verdict(Some(&jobs_page(&[(&required, Some("success"))])), "true");
+        assert_eq!(
+            calls,
+            [listing_call],
+            "a job listing that works is read once, with the paginated latest-attempt request"
+        );
+
+        // Recovery: an outage that clears is believed once it has cleared, and a
+        // listing that failed part-way is never read as a complete one.
+        let good = jobs_page(&[(&required, Some("success"))]);
+        for outcomes in [
+            &["fail", "fail", "ok"][..],
+            &["fail", "ok"][..],
+            &["partial", "ok"][..],
+        ] {
+            let (code, log, calls) = run_e2e_verdict_sequence(&good, outcomes, "true");
+            assert_eq!(code, 0, "outcomes {outcomes:?} must recover:\n{log}");
+            assert_eq!(
+                calls.len(),
+                outcomes.len(),
+                "outcomes {outcomes:?}: the first success ends the retries, it is neither \
+                 discarded nor followed by another call"
+            );
+        }
+        // A success is final: a failing call after it is never made, so it
+        // cannot undo the verdict (this is what the `break` is for).
+        let (code, log, calls) = run_e2e_verdict_sequence(&good, &["fail", "ok", "fail"], "true");
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(calls.len(), 2, "the retries stop at the first success");
+        // `--paginate` prints the pages it has read and then exits non-zero when
+        // a later page fails. That output must not survive as the job list: here
+        // it would even read as a passing verdict.
+        let (code, log, calls) = run_e2e_verdict_sequence(&good, &["partial"], "true");
+        assert_eq!(
+            code, 1,
+            "a listing that failed part-way is not a listing:\n{log}"
+        );
+        assert_eq!(calls.len(), 3);
+        assert!(
+            log.contains("could not list this run's jobs") && !log.contains("concluded"),
+            "{log}"
+        );
+
+        // A lane that ran nothing: `E2E tests` concluded success without
+        // executing a scenario (its gate decided not to run), so the verdict
+        // reports success and says no scenario ran. The `e2e` job's `ran` output
+        // is `true` or `false` in production, so `false` is the no-op value.
+        let (code, log, _) =
+            run_e2e_verdict(Some(&jobs_page(&[(&required, Some("success"))])), "false");
+        assert_eq!(code, 0, "{log}");
+        assert!(
+            log.contains("without running any scenario"),
+            "a verdict over a no-op lane must say no scenario ran:\n{log}"
+        );
+        let (code, log, _) =
+            run_e2e_verdict(Some(&jobs_page(&[(&required, Some("success"))])), "true");
+        assert_eq!(code, 0, "{log}");
+        assert!(
+            !log.contains("without running any scenario"),
+            "a lane that ran its scenarios must not be reported as a no-op:\n{log}"
+        );
+    }
+
     /// Run a report job's missing-report check script under `bash -e`, as a
     /// `run:` step does, with a stub `gh` that lists `uploaded` (or fails when
     /// `uploaded` is `None`) and a `needs` context of `results`.
