@@ -85,7 +85,16 @@ pub fn run(args: &[String]) -> Result<()> {
 
     if binaries.build_release {
         let status = Command::new(&cargo)
-            .args(["build", "--release", "-p", "rocm", "-p", "rocmd"])
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "rocm",
+                "-p",
+                "rocmd",
+                "--features",
+                "rocm/e2e-test-hooks",
+            ])
             .current_dir(&root)
             .status()
             .context("failed to run `cargo build --release -p rocm -p rocmd`")?;

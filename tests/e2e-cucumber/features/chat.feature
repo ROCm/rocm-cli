@@ -1,7 +1,7 @@
 Feature: Chat and endpoint detection
 
   @id:chat-served-model-discoverable
-  Scenario: 1 - A served model is discoverable through the services list
+  Scenario: chat-01 - A served model is discoverable through the services list
     Given a model is being served
     And the model is registered with the CLI
     When the user checks for running services
@@ -13,7 +13,7 @@ Feature: Chat and endpoint detection
   # offers it — the notice must precede any request. (Previously an
   # untestable-black-box gap.)
   @id:chat-privacy-notice-accurate @requires-os:linux
-  Scenario: 2 - The privacy notice is shown before using a local endpoint
+  Scenario: chat-02 - The privacy notice is shown before using a local endpoint
     Given a model is being served locally
     And the model is registered with the CLI
     When the user opens interactive chat
@@ -23,7 +23,7 @@ Feature: Chat and endpoint detection
     Then interactive chat exits successfully
 
   @id:chat-managed-model-interactive @requires-os:linux
-  Scenario: 3 - Interactive chat uses a running managed model
+  Scenario: chat-03 - Interactive chat uses a running managed model
     Given a running managed model is available locally
     When the user opens interactive chat
     Then the local endpoint is shown for confirmation
@@ -34,8 +34,25 @@ Feature: Chat and endpoint detection
     When the user quits interactive chat
     Then interactive chat exits successfully
 
+  # The reported defect was not a bad model, it was a blind one: the dashboard
+  # assistant was never told which machine it was answering for, so it answered
+  # platform questions from pretraining ("ROCm is not compatible with Windows").
+  # Asserts what the CLI sends, not what the model replies — a 4B model's wording
+  # is not deterministic, but what it is told is entirely ours.
+  @id:chat-assistant-is-told-which-machine-it-is-on @requires-os:linux
+  Scenario: chat-04 - The assistant is told what machine it is running on
+    Given a running managed model is available locally
+    When the user opens interactive chat
+    Then the local endpoint is shown for confirmation
+    When the user accepts the local endpoint
+    And the user sends a message to the managed model
+    Then the assistant is told which operating system this machine runs
+    And the assistant is told which GPU this machine has
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+
   @id:chat-endpoint-shown-in-services
-  Scenario: 4 - A served model's endpoint is shown in the services list
+  Scenario: chat-05 - A served model's endpoint is shown in the services list
     Given a model is being served
     And the model is registered with the CLI
     When the user lists running services
@@ -46,18 +63,18 @@ Feature: Chat and endpoint detection
   # assertion (a tools-bearing request is accepted) is engine-agnostic, so no GPU
   # is required — dropping @requires-gpu gives this per-PR mock-lane coverage.
   @id:chat-tool-definitions-accepted
-  Scenario: 5 - Chat requests that include tool definitions are accepted
+  Scenario: chat-06 - Chat requests that include tool definitions are accepted
     Given a managed runtime is active
     And a model is served in the background
     When a chat request with tool definitions is sent
     Then the chat response is successful
 
-  # Runs on every lane (see scenario 5): real serve on a GPU host, MockServer on
+  # Runs on every lane (see chat-06): real serve on a GPU host, MockServer on
   # the no-GPU mock lane. Asserts only that a served model returns a non-empty
   # reply, which is engine-agnostic — real generation is covered by the
   # @requires-gpu serve-*-inference scenarios.
   @id:chat-end-to-end-local-model
-  Scenario: 6 - End-to-end chat through a locally served model
+  Scenario: chat-07 - End-to-end chat through a locally served model
     Given a managed runtime is active
     And a model is served in the background
     And the served model has been detected
@@ -70,14 +87,14 @@ Feature: Chat and endpoint detection
   # reports `rocm chat` as covered. Runs on mock (no GPU): the local provider
   # resolves the planted managed-service record and talks to the mock server.
   @id:chat-cli-oneshot-prompt
-  Scenario: 7 - The chat CLI answers a one-shot prompt against a local server
+  Scenario: chat-08 - The chat CLI answers a one-shot prompt against a local server
     Given a model is being served
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
 
   @id:chat-cli-stdin-prompt
-  Scenario: 8 - The chat CLI answers a prompt received through standard input
+  Scenario: chat-09 - The chat CLI answers a prompt received through standard input
     Given a model is being served
     And the model is registered with the CLI
     When the user pipes a chat prompt to the CLI

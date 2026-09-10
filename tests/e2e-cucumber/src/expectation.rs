@@ -25,6 +25,7 @@ const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
@@ -55,6 +56,10 @@ pub enum Expectation {
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
+    /// `@requires-gfx-target`: the scenario needs a detected chip name but does
+    /// not access the GPU. This permits resolver dry-runs on WSL before GPU
+    /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
+    pub requires_gfx_target: bool,
     /// `@requires-no-gpu`: the scenario's premise is a host with NO usable AMD GPU
     /// (e.g. a GPU-required serve must fail fast). Skipped on any host that has a
     /// GPU — the inverse of `requires_gpu`. This is how the no-GPU fail-fast path
@@ -117,6 +122,7 @@ impl ScenarioDecl {
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
         let mut requires_gpu = false;
+        let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
@@ -141,6 +147,8 @@ impl ScenarioDecl {
                 serve_timeout_secs = rest.parse::<u64>().ok();
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == REQUIRES_GFX_TARGET_TAG {
+                requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
                 requires_no_gpu = true;
             } else if tag == REQUIRES_BARE_METAL_TAG {
@@ -158,6 +166,7 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
+            requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
@@ -317,6 +326,19 @@ impl Expectation {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResolvedScenario {
     pub id: String,
+    /// The `Feature:` this scenario belongs to. Recorded here because a SKIPPED
+    /// scenario never reaches `report.json`, so the report has no other way to
+    /// place it under its feature in the grouped grid.
+    ///
+    /// No `#[serde(default)]` here: this struct only derives `Serialize`, so a
+    /// deserialization attribute would be dead. Backward compatibility for
+    /// artifacts written before these fields existed lives entirely on the
+    /// consuming side — `ManifestExpectation` in the `e2e-report` crate.
+    pub feature: String,
+    /// The scenario's own name (`<key>-<NN> - <description>`). Carries the
+    /// per-feature index the report sorts rows by, and gives skipped scenarios a
+    /// human label they'd otherwise lack.
+    pub scenario: String,
     pub effective_engine: String,
     /// "pass" | "xfail" | "skip".
     pub expected: String,
@@ -329,7 +351,13 @@ pub struct ResolvedScenario {
 }
 
 impl ResolvedScenario {
-    pub fn new(id: &str, effective_engine: &str, expectation: &Expectation) -> Self {
+    pub fn new(
+        id: &str,
+        feature: &str,
+        scenario: &str,
+        effective_engine: &str,
+        expectation: &Expectation,
+    ) -> Self {
         let (bug, reason, flaky) = match expectation {
             Expectation::ExpectXfail { bug, reason, flaky } => {
                 (Some(bug.clone()), Some(reason.clone()), *flaky)
@@ -339,6 +367,8 @@ impl ResolvedScenario {
         };
         Self {
             id: id.to_owned(),
+            feature: feature.to_owned(),
+            scenario: scenario.to_owned(),
             effective_engine: effective_engine.to_owned(),
             expected: expectation.label().to_owned(),
             bug,
@@ -403,6 +433,11 @@ pub fn resolve(
     if decl.requires_gpu && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
+        };
+    }
+    if decl.requires_gfx_target && cap.gfx_target.is_none() {
+        return Expectation::Skip {
+            reason: "requires a detected AMD GFX target; none detected on this host".to_owned(),
         };
     }
     if decl.requires_no_gpu && cap.has_amd_gpu {
@@ -620,6 +655,28 @@ serve_timeout_secs = 90
         assert!(decl(&["@id:x", "@requires-bare-metal"]).requires_bare_metal);
         // Absent by default, so no existing scenario changes meaning.
         assert!(!decl(&["id:x", "requires-gpu"]).requires_bare_metal);
+    }
+
+    #[test]
+    fn detected_target_requirement_does_not_require_gpu_passthrough() {
+        let matrix = Expectations::default();
+        let scenario = decl(&["id:resolver-preview", "requires-gfx-target"]);
+
+        assert_eq!(
+            resolve(
+                &scenario,
+                &cap("wsl-no-passthrough"),
+                &matrix,
+                false,
+                false,
+                false,
+            ),
+            Expectation::ExpectPass
+        );
+        assert!(matches!(
+            resolve(&scenario, &cap("mock"), &matrix, false, false, false,),
+            Expectation::Skip { .. }
+        ));
     }
 
     #[test]
@@ -856,7 +913,7 @@ reason = "unrelated open bug"
     #[test]
     fn vllm_pinned_scenario_skips_where_vllm_cannot_start() {
         let m = Expectations::default();
-        // Scenario 5-style: pins vLLM.
+        // The feature-qualified `serve-vllm-inference` scenario pins vLLM.
         let d = decl(&[
             "id:serve-vllm-inference",
             "requires-gpu",

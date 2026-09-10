@@ -123,6 +123,15 @@ async fn open_dashboard(world: &mut E2eWorld) {
     world.tui = Some(tui);
 }
 
+#[when("the user opens the launcher")]
+async fn open_launcher(world: &mut E2eWorld) {
+    // Bare `rocm` (no subcommand) opens the launcher front door under an
+    // interactive terminal — the PTY slave satisfies `interactive_terminal()`.
+    let tui = TuiSession::spawn(world, &[])
+        .unwrap_or_else(|e| panic!("failed to open the launcher: {e}"));
+    world.tui = Some(tui);
+}
+
 #[when("the user opens the ROCm view")]
 async fn open_rocm_view(world: &mut E2eWorld) {
     // Dashboard tabs are currently ordered Home, ROCm, Serving, Observe; these
@@ -241,6 +250,11 @@ async fn quit_interactive_chat(world: &mut E2eWorld) {
     quit_tui(world, "interactive chat").await;
 }
 
+#[when("the user quits the launcher")]
+async fn quit_launcher(world: &mut E2eWorld) {
+    quit_tui(world, "the launcher").await;
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the dashboard refuses to start without opening the interactive view")]
@@ -340,6 +354,131 @@ async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
         last_user_content, MANAGED_MODEL_PROMPT,
         "mock did not receive the exact typed prompt; full request:\n{body}"
     );
+}
+
+/// The recorded chat request's message contents, in order.
+///
+/// The grounding steps look across every role rather than only `system`: what
+/// matters is that the model was told, not which envelope carried it (the
+/// built-in local provider folds system text into the user turn).
+///
+/// Waits for the request carrying `MANAGED_MODEL_PROMPT` specifically. Accepting
+/// any chat request instead picks up the local-endpoint detection probe, which
+/// is sent before the user types and carries no system prompt at all — the
+/// grounding then looks absent when it was simply asserted against the wrong
+/// request. Unlike `chat-03`, these steps have no screen wait ahead of them to
+/// order the two.
+async fn recorded_chat_messages(world: &mut E2eWorld) -> Vec<String> {
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request_where(default_timeout(), |body| {
+            body.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                            && message_text(m.get("content").unwrap_or(&serde_json::Value::Null))
+                                .contains(MANAGED_MODEL_PROMPT)
+                    })
+                })
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the mock never received the user's chat turn: {e}"));
+    body.get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"))
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(message_text)
+        .collect()
+}
+
+/// The text of one OpenAI-format message. `content` is a bare string on the
+/// turns the TUI builds, but an array of typed parts on the system message the
+/// chat client emits — read both, or the grounding looks absent when it is
+/// simply wrapped.
+fn message_text(content: &serde_json::Value) -> String {
+    content.as_str().map_or_else(
+        || {
+            content
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        },
+        str::to_owned,
+    )
+}
+
+/// The single line of the sent prompt that opens with `label`, or a failure
+/// naming what was actually sent. Asserting on the request — never on the
+/// canned reply — is the point: the mock answers identically whatever it is
+/// told, so only the request can show the assistant was grounded.
+fn sent_fact_line(messages: &[String], label: &str) -> String {
+    messages
+        .iter()
+        .flat_map(|m| m.lines())
+        .map(str::trim)
+        .find(|line| line.starts_with(label))
+        .unwrap_or_else(|| {
+            panic!(
+                "the assistant was never told `{label}`; the request carried:\n{}",
+                messages.join("\n---\n")
+            )
+        })
+        .to_owned()
+}
+
+#[then("the assistant is told which operating system this machine runs")]
+async fn assistant_told_the_operating_system(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- Operating system:");
+    let host = e2e_cucumber::capability::host_capability();
+    let expected = if host.os_family.eq_ignore_ascii_case("windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+    assert!(
+        line.contains(expected),
+        "this machine runs {}, but the assistant was told: {line}",
+        host.os_family
+    );
+    // WSL is the case the old prompt got wrong — it told WSL users vLLM was
+    // unavailable — so a WSL host must be named as one, not flattened to Linux.
+    assert_eq!(
+        line.contains("WSL"),
+        host.is_wsl,
+        "WSL must be stated exactly when this machine is WSL (is_wsl={}): {line}",
+        host.is_wsl
+    );
+}
+
+#[then("the assistant is told which GPU this machine has")]
+async fn assistant_told_the_gpu(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- AMD GPU:");
+    let host = e2e_cucumber::capability::host_capability();
+    match host.gfx_target.as_deref() {
+        // A host with a real GPU must see that GPU named, not a placeholder.
+        Some(target) => assert!(
+            line.contains(target),
+            "this machine's GPU is {target}, but the assistant was told: {line}"
+        ),
+        // A host without one must be told so explicitly, rather than left to
+        // fill the silence from pretraining.
+        None => assert!(
+            line.contains("no AMD GPU detected"),
+            "no GPU is detectable here, so the assistant must be told that: {line}"
+        ),
+    }
 }
 
 #[then("the managed model is shown as loading rather than ready")]
@@ -447,6 +586,36 @@ fn assert_tui_opened(world: &E2eWorld) {
 
 #[then("the dashboard exits successfully")]
 async fn dashboard_exited(world: &mut E2eWorld) {
+    assert_tui_opened(world);
+}
+
+#[then("the launcher shows the model serving")]
+async fn launcher_shows_serving(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let tui = session(world);
+    // The front door's status strip renders "Serving <model>" for a live
+    // registry instance; wait on the model name to synchronise with the first
+    // paint before inspecting the whole screen.
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher never showed the serving model: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serving"),
+        "launcher did not show the model as serving:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Idle — nothing serving"),
+        "launcher still reported idle despite a live registry instance:\n{screen}"
+    );
+}
+
+#[then("the launcher exits successfully")]
+async fn launcher_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 

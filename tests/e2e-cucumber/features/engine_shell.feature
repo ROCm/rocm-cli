@@ -15,7 +15,7 @@ Feature: Engine shell
   # Windows, and the runner's own $SHELL varies, which would otherwise decide
   # whether a marker appears at all.
   @id:engine-shell-marks-the-prompt @requires-os:linux
-  Scenario: 1 - Entering an engine shell is visibly different from the shell you left
+  Scenario: engine-shell-01 - Entering an engine shell is visibly different from the shell you left
     Given a machine with an installed engine environment
     When the user opens a shell for that engine
     Then the shell is visibly marked as that engine's shell
@@ -34,7 +34,7 @@ Feature: Engine shell
   # first survives whichever way the mismatch is repaired, the second would go
   # stale the moment it is.
   @id:engine-shell-activation-hint-is-usable @requires-os:linux
-  Scenario: 2 - The activation hint an engine shell prints refers to a real file
+  Scenario: engine-shell-02 - The activation hint an engine shell prints refers to a real file
     Given a machine with an engine environment installed the way the engine records it
     When the user opens a shell for that engine
     Then the printed activation hint names a file that exists
