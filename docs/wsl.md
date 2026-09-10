@@ -37,40 +37,50 @@ python scripts\wsl_preflight.py --distro Ubuntu
 
 ## Install ROCDXG In WSL
 
-Install build/runtime prerequisites:
+Use the CLI:
+
+```bash
+rocm install driver            # print the plan
+rocm install driver --yes      # run it
+```
+
+On WSL2 this installs ROCDXG rather than Linux DKMS — there is no in-tree
+amdgpu driver to build, because the GPU comes from the Windows host driver
+through `/dev/dxg`. The plan is printed for review first and only runs with
+`--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
+touching anything, installs the release package, runs `ldconfig`, and then
+verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
+No reboot is needed: ROCDXG is userspace.
+
+Confirm afterwards with `rocm examine`, which should report
+`driver_status: wsl_rocdxg_ready`.
+
+To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
+To require checksum verification before the package is installed, set
+`ROCM_CLI_ROCDXG_SHA256` to the trusted 64-character SHA-256 digest for that
+exact package:
+
+```bash
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
+```
+
+No production checksum is embedded, so verification is opt-in; when the
+variable is set and the download does not match, the install stops before
+`apt install`.
+
+### Doing it by hand
+
+The equivalent manual steps, for reference or for a host where the CLI is not
+installed yet:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git cmake build-essential python3 python3-venv
-```
-
-Preferred package install for the current public release:
-
-```bash
+sudo apt-get install -y ca-certificates curl
 curl -L -o /tmp/rocdxg-roct_1.2.0_amd64.deb \
   https://github.com/ROCm/librocdxg/releases/download/v1.2.0/rocdxg-roct_1.2.0_amd64.deb
 sudo apt install -y /tmp/rocdxg-roct_1.2.0_amd64.deb
 sudo ldconfig
 ```
-
-From this repo inside WSL, the same supported path is wrapped as:
-
-```bash
-bash scripts/wsl_setup_rocdxg.sh
-python scripts/wsl_preflight.py --require-ready
-```
-
-To require checksum verification before installing the downloaded `.deb`, set
-`ROCDXG_SHA256` to the trusted 64-character SHA-256 digest for that exact
-ROCDXG package:
-
-```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
-```
-
-The wrapper intentionally does not guess or embed a production checksum. If
-`ROCDXG_SHA256` is set and the downloaded package does not match, installation
-stops before `apt install`.
 
 Source-build alternative:
 
