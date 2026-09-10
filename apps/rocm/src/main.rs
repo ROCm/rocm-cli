@@ -1142,19 +1142,39 @@ impl std::fmt::Display for FixExitCode {
 
 impl std::error::Error for FixExitCode {}
 
+/// Marker error carrying a clap usage/parse error's exit code back through
+/// `main()`'s ordinary return path, for the same reason [`FixExitCode`]
+/// exists: `clap::Error::exit()` calls `std::process::exit` mid-stack, which
+/// would skip the `_log_guard` destructor held in `run()`. The error is
+/// printed at the point it's constructed (clap knows which stream and
+/// formatting a given error kind wants); this type only carries the exit
+/// code onward.
+#[derive(Debug)]
+struct ClapExitCode(i32);
+
+impl std::fmt::Display for ClapExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clap exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ClapExitCode {}
+
 fn main() -> ExitCode {
     exit_code_for(run())
 }
 
 /// Maps `run()`'s result to a process exit code, unwrapping a `FixExitCode`
-/// to its carried code and otherwise reproducing the standard
-/// `Result<(), anyhow::Error>` `Termination` behavior (print the error to
-/// stderr, exit 1).
+/// or `ClapExitCode` to its carried code and otherwise reproducing the
+/// standard `Result<(), anyhow::Error>` `Termination` behavior (print the
+/// error to stderr, exit 1).
 fn exit_code_for(result: Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(FixExitCode(code)) = e.downcast_ref::<FixExitCode>() {
+                ExitCode::from(*code as u8)
+            } else if let Some(ClapExitCode(code)) = e.downcast_ref::<ClapExitCode>() {
                 ExitCode::from(*code as u8)
             } else {
                 // Match the standard `Result<(), E>` `Termination` behavior exactly:
@@ -1195,7 +1215,9 @@ fn run() -> Result<()> {
         // exit, instead of dumping a request plan from the natural-language
         // planner.
         if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
-            err.exit();
+            let code = err.exit_code();
+            let _ = err.print();
+            return Err(ClapExitCode(code).into());
         }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
@@ -1208,7 +1230,7 @@ fn run() -> Result<()> {
         );
     }
 
-    dispatch(parse_cli())
+    dispatch(parse_cli()?)
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
@@ -1232,9 +1254,17 @@ fn cli_command() -> clap::Command {
 /// `rocm help` list subcommands alphabetically. Mirrors the derived
 /// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
 /// cannot pick up the reordering.
-fn parse_cli() -> Cli {
+///
+/// Returns a [`ClapExitCode`]-carrying error instead of calling
+/// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
+/// after `_log_guard` has dropped rather than mid-stack.
+fn parse_cli() -> Result<Cli> {
     let matches = cli_command().get_matches();
-    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+    Cli::from_arg_matches(&matches).map_err(|err| {
+        let code = err.exit_code();
+        let _ = err.print();
+        ClapExitCode(code).into()
+    })
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -19302,6 +19332,31 @@ mod tests {
     fn exit_code_for_fix_exit_code_carries_the_code() {
         let err = anyhow::Error::new(super::FixExitCode(3));
         assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(3));
+    }
+
+    /// `ClapExitCode` exists so a usage/parse error can reach `main()` through
+    /// the ordinary return path (letting `_log_guard` drop) instead of
+    /// `clap::Error::exit()` calling `std::process::exit` mid-stack. Guard the
+    /// downcast the same way `exit_code_for_fix_exit_code_carries_the_code`
+    /// guards `FixExitCode`'s.
+    #[test]
+    fn exit_code_for_clap_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::ClapExitCode(2));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(2));
+    }
+
+    /// `parse_cli`'s internal clap error now returns a `ClapExitCode` instead
+    /// of calling `err.exit()` directly. Exercise the real
+    /// `clap parse failure -> ClapExitCode -> exit_code_for` chain end to end
+    /// via `command_invocation_error`, which shares the same
+    /// `clap::Error::exit_code()`/`print()` handoff.
+    #[test]
+    fn clap_error_exit_code_survives_the_clap_exit_code_round_trip() {
+        let err = command_invocation_error(&["instal".to_owned()])
+            .expect("`instal` should read as a mistyped subcommand");
+        let code = err.exit_code();
+        let result: Result<()> = Err(super::ClapExitCode(code).into());
+        assert_eq!(super::exit_code_for(result), ExitCode::from(code as u8));
     }
 
     /// Any other error must still fail with exit 1, matching what

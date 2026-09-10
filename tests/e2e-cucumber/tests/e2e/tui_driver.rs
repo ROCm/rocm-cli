@@ -458,20 +458,29 @@ impl TuiSession {
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
+        match self.wait_for_exit_code(timeout).await? {
+            0 => Ok(()),
+            code => Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero. Used by journeys (e.g. a declined confirmation
+    /// prompt) whose success case is a specific *nonzero* code, where
+    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
+    /// would reject the very outcome under test.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.finished = true;
-                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully ({status:?}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
+                    self.record_once(code);
+                    return Ok(code);
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),

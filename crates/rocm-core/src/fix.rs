@@ -31,6 +31,14 @@ macro_rules! fail {
     }};
 }
 
+/// Relay a captured command's stdout/stderr, ignoring write failures for the
+/// same reason `fail!` does — relaying subprocess output can't itself panic
+/// the process if the pipe on the other end is closed.
+fn relay_output(out: &str, err: &str) {
+    let _ = write!(std::io::stdout(), "{out}");
+    let _ = write!(std::io::stderr(), "{err}");
+}
+
 /// Options controlling how a fix is applied.
 #[derive(Debug, Clone, Default)]
 pub struct FixOptions {
@@ -622,8 +630,7 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (rc, out, err) = run(program, &arg_refs, RUN_TIMEOUT);
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
         fail!("usermod exited {rc}; group membership NOT changed.");
         return 4;
@@ -720,8 +727,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
             println!("  (dry-run; not executed)");
         } else if confirm("Clear HSA_OVERRIDE_GFX_VERSION from User scope?", opts.yes) {
             let (rc, out, err) = run("setx", &["HSA_OVERRIDE_GFX_VERSION", ""], RUN_TIMEOUT);
-            print!("{out}");
-            eprint!("{err}");
+            relay_output(&out, &err);
             if rc != 0 {
                 fail!("setx exited {rc}; User scope NOT changed.");
                 return 4;
@@ -848,8 +854,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         return 5;
     }
     let (rc, out, err) = run("setx", &["PATH", &new_path], RUN_TIMEOUT);
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
         fail!("setx exited {rc}; User PATH NOT changed.");
         return 4;
@@ -954,8 +959,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         &["HIP_VISIBLE_DEVICES", &idx.to_string()],
         RUN_TIMEOUT,
     );
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
         fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
         return 4;

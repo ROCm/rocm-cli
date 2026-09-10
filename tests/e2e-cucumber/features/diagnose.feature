@@ -153,3 +153,17 @@ Feature: Diagnosing failures and listing fixes
     Given a user who has approved a fix whose helper command will fail
     When the user asks the CLI to apply the approved fix
     Then the CLI reports the command failure on stderr with exit code 4
+
+  # diagnose-08 proves the non-interactive refusal (piped stdin, `is_terminal()`
+  # false); this proves the sibling branch on a real terminal — the CLI must
+  # print the confirmation prompt, read the typed answer, and, on anything but
+  # y/yes, decline the same way. That branch has no piped-stdin equivalent: a
+  # real TTY is required to reach it at all, so this is the one scenario in the
+  # suite driven through the pseudo-terminal harness instead of piped stdin.
+  # Linux-only for the same reason diagnose-08 is: the recipe under test
+  # (`fix-9-igpu-dgpu`) only appends a shell rc file on Linux.
+  @id:diagnose-fix-interactive-decline-reported @requires-os:linux
+  Scenario: diagnose-14 - Declining the confirmation prompt on a real terminal is reported the same way
+    Given a user who has chosen a fix that would change the machine
+    When the user is asked interactively to apply it and types no
+    Then the CLI declines on the terminal and explains that it needs agreement

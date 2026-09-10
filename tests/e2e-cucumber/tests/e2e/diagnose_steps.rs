@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
 /// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
@@ -263,6 +264,31 @@ async fn user_applies_approved_fix(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[when("the user is asked interactively to apply it and types no")]
+async fn user_declines_fix_interactively(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    // `run_rocm`'s piped stdin can never reach `confirm()`'s interactive
+    // branch: `is_terminal()` is always false there. A real pseudo-terminal is
+    // the only way to reach it, so this step (unlike every other one in this
+    // file) drives the CLI through `TuiSession` instead of `run_rocm`.
+    let mut session = TuiSession::spawn(world, &["fix", &fix_id, "--device-index", "1"])
+        .unwrap_or_else(|e| panic!("failed to open the fix prompt: {e}"));
+    session
+        .wait_for_screen("[y/N]:", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the confirmation prompt never appeared: {e}"));
+    session
+        .send("n\r")
+        .unwrap_or_else(|e| panic!("failed to type the decline: {e}"));
+    let rc = session
+        .wait_for_exit_code(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the CLI never exited after declining: {e}"));
+    world.cli_output = Some(session.screen_text());
+    world.cli_rc = Some(rc);
+    world.tui = Some(session);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -543,6 +569,11 @@ async fn assert_inapplicable_fix_declined(world: &mut E2eWorld) {
         stderr.contains("This fix only applies on:"),
         "the refusal must say which platforms the fix is for, on stderr:\n{stderr}"
     );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("This fix only applies on:"),
+        "the platform refusal must not also be on stdout:\n{stdout}"
+    );
 }
 
 #[then("every fix the catalog documents is listed")]
@@ -688,12 +719,34 @@ async fn assert_refuses_without_agreement(world: &mut E2eWorld) {
         stderr.contains("refusing to apply"),
         "the refusal must say it did not apply the fix, on stderr:\n{stderr}"
     );
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        !stdout.contains("refusing to apply"),
+        "the agreement refusal must not also be on stdout:\n{stdout}"
+    );
     // Distinct from the unknown-id refusal (2), so a script can tell "you did
     // not agree" apart from "no such fix".
     assert_eq!(
         world.cli_rc,
         Some(5),
         "declining to apply is its own outcome, not an error:\n{stderr}"
+    );
+}
+
+#[then("the CLI declines on the terminal and explains that it needs agreement")]
+async fn assert_interactive_decline_reported(world: &mut E2eWorld) {
+    // Same outcome as the non-interactive refusal (diagnose-08): declining is
+    // its own outcome, not an error.
+    assert_eq!(
+        world.cli_rc,
+        Some(5),
+        "declining an interactive prompt is its own outcome, not an error"
+    );
+    let screen = world.cli_output.as_deref().unwrap_or("");
+    assert!(
+        screen.contains("Not confirmed; refusing to apply."),
+        "the terminal must show the same decline message the non-interactive \
+         path reports, on screen:\n{screen}"
     );
 }
 
