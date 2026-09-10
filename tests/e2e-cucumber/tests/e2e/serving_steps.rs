@@ -1104,14 +1104,21 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
 #[then("the user is told the pinned GPU is unavailable")]
 async fn assert_masked_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // Ordinal 1 must be reported unavailable: rejected against the active
-    // visibility mask ("not available under the active visibility mask") on a
-    // multi-GPU host, or as out of range on a single-GPU host. Never a silent
-    // remap onto the one visible device (ordinal 0).
+    // Ordinal 1 must be named and refused by the CLI's own pre-flight: against the
+    // active visibility mask ("not available under the active visibility mask") on
+    // a multi-GPU host, or as out of range where no visible set could be
+    // enumerated. Never a silent remap onto the one visible device (ordinal 0).
+    //
+    // The accepted wording is deliberately narrow. A bare "not available" would
+    // also match the ENGINE's own late rejection ("requested GPU 1 is not
+    // available on this host"), which predates this pre-flight — so the scenario
+    // would still pass with the CLI-side fix reverted and prove nothing.
+    // Requiring the `--gpu index 1` prefix pins the refusal to the CLI and to the
+    // requested ordinal.
     assert!(
-        output.contains("not available under the active visibility mask")
-            || output.contains("out of range")
-            || output.contains("not available"),
+        output.contains("--gpu index 1")
+            && (output.contains("not available under the active visibility mask")
+                || output.contains("out of range")),
         "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
