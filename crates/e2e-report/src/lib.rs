@@ -2924,6 +2924,55 @@ mod tests {
     }
 
     #[test]
+    fn legend_entries_stay_exhaustive_with_cell_outcome() {
+        // `expected_text`'s match is exhaustive, so adding a `CellOutcome`
+        // variant without adding an arm here is a compile error — unlike the
+        // hardcoded 3-glyph check above, this can't silently miss a 10th
+        // variant the way `LEGEND_ENTRIES` alone could.
+        fn expected_text(outcome: CellOutcome) -> &'static str {
+            match outcome {
+                CellOutcome::Pass => "pass",
+                CellOutcome::Xfail => "known bug, failed as expected (xfail)",
+                CellOutcome::Skip => "not applicable here",
+                CellOutcome::UnexpectedFail => "regression",
+                CellOutcome::Xpass => "bug fixed here (stale entry)",
+                CellOutcome::FlakyXpass => "known flaky bug passed this run",
+                CellOutcome::RanWhenNa => "ran despite being marked n/a",
+                CellOutcome::Absent => "expected to run but no result recorded",
+                CellOutcome::Missing => "no data.",
+            }
+        }
+        const ALL: [CellOutcome; 9] = [
+            CellOutcome::Pass,
+            CellOutcome::Xfail,
+            CellOutcome::Skip,
+            CellOutcome::UnexpectedFail,
+            CellOutcome::Xpass,
+            CellOutcome::FlakyXpass,
+            CellOutcome::RanWhenNa,
+            CellOutcome::Absent,
+            CellOutcome::Missing,
+        ];
+
+        assert_eq!(
+            LEGEND_ENTRIES.len(),
+            ALL.len(),
+            "LEGEND_ENTRIES must have exactly one entry per CellOutcome variant"
+        );
+        for outcome in ALL {
+            let entry = LEGEND_ENTRIES
+                .iter()
+                .find(|(o, _)| *o == outcome)
+                .unwrap_or_else(|| panic!("{outcome:?} has no LEGEND_ENTRIES explanation"));
+            assert_eq!(
+                entry.1,
+                expected_text(outcome),
+                "{outcome:?}'s LEGEND_ENTRIES text drifted from the source of truth"
+            );
+        }
+    }
+
+    #[test]
     fn expectation_grid_html_legend_colors_every_red_glyph() {
         // Every outcome that renders red in the grid (`grid_class() ==
         // "status-fail"`) must also render red in the legend, not just the

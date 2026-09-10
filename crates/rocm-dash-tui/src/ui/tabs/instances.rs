@@ -1391,6 +1391,38 @@ mod tests {
     }
 
     #[test]
+    fn table_at_80_columns_keeps_tok_w_marker_and_model_readable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // TOK/W was widened to Length(12) to fit its longest rendering
+        // ("{v:.2} tok/W*") without clipping the held marker — at the cost
+        // of MODEL's headroom above its Min(12) floor. Every other render
+        // test in this file uses a 160-column backend; cover the narrow
+        // 80-column case where that headroom is tightest.
+        let mut inst = mk_inst_obs(
+            "narrow",
+            Some(123.0),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.model_name = "llama-3.1-8b-instruct".into();
+        inst.tokens_per_watt = Some(0.42);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("0.42 tok/W*"),
+            "held tok/W marker must not be clipped at 80 columns; got:\n{out}"
+        );
+        assert!(
+            out.contains("llama-3.1-8b"),
+            "MODEL must stay readable above its Min(12) floor at 80 columns; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn table_fresh_gen_tps_has_no_held_marker() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;

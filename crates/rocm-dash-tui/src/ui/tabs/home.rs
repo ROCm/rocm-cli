@@ -667,9 +667,16 @@ mod tests {
             160,
             30,
         );
+        // Assert the specific rendered cells, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregates stopped being marked.
         assert!(
-            out.contains(format::HELD_MARKER),
-            "HELD_MARKER must appear when instance data is held; got:\n{out}"
+            out.contains(&format!("{:.0}{}", 300.0, format::HELD_MARKER)),
+            "held tok/s aggregate must show the held marker; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{:.1} tokens / watt{}", 1.0, format::HELD_MARKER)),
+            "held tok/W aggregate must show the held marker; got:\n{out}"
         );
         assert!(
             out.contains(format::HELD_LEGEND),
@@ -761,9 +768,16 @@ mod tests {
             !out.contains("NaN"),
             "a non-finite instance must not poison the tok/s aggregate; got:\n{out}"
         );
+        // Assert the specific rendered cell, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregate stopped being marked.
         assert!(
-            out.contains(format::HELD_MARKER) && out.contains(format::HELD_LEGEND),
-            "the finite held instance must still mark and explain the aggregate; got:\n{out}"
+            out.contains(&format!("{:.0}{}", 150.0, format::HELD_MARKER)),
+            "the finite held instance must still mark the tok/s aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the held tok/s aggregate must still be explained by the legend; got:\n{out}"
         );
     }
 

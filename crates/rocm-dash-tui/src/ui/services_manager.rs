@@ -567,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_list_window_matches_ratatui_minimal_scroll_behavior() {
+    fn visible_list_window_matches_hand_derived_model() {
         // Selected fits inside the first page: window starts at 0.
         assert_eq!(visible_list_window(0, 30, 16), 0..16);
         assert_eq!(visible_list_window(15, 30, 16), 0..16);

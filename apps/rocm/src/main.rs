@@ -28514,15 +28514,20 @@ ID_LIKE="suse opensuse"
     #[test]
     fn render_engine_inventory_text_includes_marker_legend() {
         let (root, paths) = test_paths("engine-inventory-marker-legend");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
 
         let rendered = render_engine_inventory_text_with_paths(Some(&paths));
         let _ = fs::remove_dir_all(root);
 
         let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
         let legend_pos = rendered.find(&legend).expect("legend line present");
+        // Anchor on the marked row itself (not just `"{DEFAULT_ENGINE_MARKER} "`,
+        // which also matches inside the legend line and would pass even if no
+        // row were actually marked).
         let marker_pos = rendered
-            .find(&format!("{DEFAULT_ENGINE_MARKER} "))
-            .expect("a marked engine entry present");
+            .find(&format!("{DEFAULT_ENGINE_MARKER} {host_default}"))
+            .expect("the default engine entry present");
         assert!(
             legend_pos < marker_pos,
             "legend must appear before the entries it explains:\n{rendered}"
