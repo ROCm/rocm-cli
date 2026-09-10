@@ -134,8 +134,10 @@ pub fn on_key(
     // 3) List navigation + actions.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *am = None,
-        KeyCode::Up | KeyCode::Char('k') => a.selected = a.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') if !automations.is_empty() => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            a.selected = a.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right if !automations.is_empty() => {
             a.selected = (a.selected + 1).min(automations.len() - 1);
         }
         KeyCode::Char('l') => return spawn_refresh(a, jobs),
@@ -315,7 +317,7 @@ pub fn draw_automations_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · Enter/Space toggle (needs approval) · l refresh · Esc close",
+            "↑↓←→ select · Enter/Space toggle (needs approval) · l refresh · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -450,6 +452,21 @@ mod tests {
         assert_eq!(am.as_ref().unwrap().selected, ws.len() - 1);
         for _ in 0..10 {
             on_key(&mut am, &ws, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(am.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut am = Some(AutomationsManagerState::default());
+        let mut jobs = State::default();
+        let ws = automations();
+        for _ in 0..10 {
+            on_key(&mut am, &ws, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(am.as_ref().unwrap().selected, ws.len() - 1);
+        for _ in 0..10 {
+            on_key(&mut am, &ws, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(am.as_ref().unwrap().selected, 0);
     }

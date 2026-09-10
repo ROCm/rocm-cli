@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, EndpointReadiness, EndpointReadinessOutcome, ManagedServiceRecord,
     RocmCliConfig, append_audit_event, connect_tcp_stream, format_host_port,
-    managed_service_endpoint_readiness, read_tcp_stream_to_string, unix_time_millis,
+    managed_service_endpoint_readiness, read_http_response_bounded, unix_time_millis,
     write_all_tcp_stream,
 };
 use std::fs;
@@ -596,6 +596,7 @@ fn post_json_to_local_endpoint_body(
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported local endpoint URL `{endpoint_url}`"))?;
     let body = serde_json::to_string(body).context("failed to serialize chat request")?;
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(&host, port, timeout)?;
     let host_header = format_host_port(&host, port);
     let auth_header = local_bearer_header(endpoint_api_key);
@@ -607,7 +608,7 @@ fn post_json_to_local_endpoint_body(
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write local provider chat request")?;
 
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .context("failed to read local provider chat response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")

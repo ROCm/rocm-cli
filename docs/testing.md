@@ -169,8 +169,12 @@ Then it verifies:
   explicit `--prefix` folders
 - the installer does not pre-create that pip cache during dry-run or setup;
   pip creates it inside the ROCm folder when packages are downloaded
-- a single TheRock-index pip install plan for pinned `rocm[libraries,devel]`,
-  `torch`, `torchvision`, and `torchaudio` versions
+- a single TheRock-index pip install plan for pinned `rocm`, `torch`, and
+  `torchvision` requirements with exactly one `device-<detected-gfx-target>`
+  extra (`rocm` also requests `libraries,devel`), plus pinned `torchaudio`
+- on a host with no detectable AMD GPU the preview reports `device_target:
+  undetermined` and renders the device extra as a placeholder; a real install
+  refuses rather than falling back to every published device payload
 - package selection uses the newest exact ROCm build suffix common to the SDK
   package and the PyTorch stack for the current Python/platform wheel tags
 - `python -m rocm_sdk version`
