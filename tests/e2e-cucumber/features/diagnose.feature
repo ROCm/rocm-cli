@@ -140,3 +140,45 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI which fixes it offers
     Then every fix the catalog documents is listed
     And only the fixes the CLI can carry out itself are marked as such
+
+  # This failure mode is reachable ONLY from the error text. The fact that
+  # decides it is the torch version inside the managed runtime, which the host
+  # examination does not read — so unlike every other entry there is no
+  # structural signal to fall back on, and a symptom that does not score is a
+  # symptom that gets the render-group false lead instead. That makes "the text
+  # scores" the whole behaviour, which is why it is asserted directly here.
+  #
+  # The assertion is that the entry CLEARS the report's own threshold, not that
+  # it ranks first: a runner with a real fault of its own (a blacklisted amdgpu)
+  # legitimately scores higher for any symptom, so a ranking assertion would be
+  # a test of the runner's health. Clearing the threshold comes from the keyword
+  # alone and holds on every host.
+  #
+  # @requires-os:linux because the checker is registered linux-only, and
+  # @requires-bare-metal because WSL2 does not run the catalog at all — the two
+  # are not interchangeable, WSL2 reports an os_family of linux.
+  @id:diagnose-recognises-the-engine-import-failure @requires-bare-metal @requires-os:linux
+  Scenario: diagnose-13 - A vLLM engine-startup import failure is recognised from its error text
+    Given a user who hit the vLLM engine-startup import failure
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the CLI reports the engine-startup import failure as an established cause
+
+  # Every other recipe in the catalog is a flat sequence for one shell. This one
+  # is not: `rocm engines shell vllm` opens an INTERACTIVE subshell, the two
+  # probes are meant to run inside it, and the reinstall replaces the very
+  # environment that subshell is standing in, so it must not run there. The CLI
+  # renders every command line with the same `$` prefix, so ordering alone said
+  # none of that, and a user pasting the block wholesale was left depending on
+  # terminal stdin buffering to land each line in the right shell. What the user
+  # can observe is the printed plan, so that is what is asserted.
+  #
+  # Deliberately not OS-gated even though the fix is linux-only: the plan is
+  # printed before the fix's own platform gate is reached, so the text under test
+  # is identical on both lanes and the Windows lane exercises it too. The step
+  # therefore asserts the printed block and not the exit code, which does differ
+  # (0 where the fix applies, 3 where it does not).
+  @id:diagnose-fix-says-which-shell-each-step-runs-in
+  Scenario: diagnose-14 - A fix whose steps span two shells says which shell each step runs in
+    Given a user who has chosen the fix for the engine-startup import failure
+    When the user previews that fix without applying it
+    Then the printed plan says which shell each step runs in
