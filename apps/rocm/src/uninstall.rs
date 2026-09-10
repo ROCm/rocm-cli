@@ -112,6 +112,10 @@ mod tests {
     /// on every platform. Binding an ephemeral port and dropping it would leave
     /// a window in which something else on a busy runner grabs the port and
     /// fails these tests through the gate's own probe.
+    ///
+    /// Both users are Linux-only, so the constant is too — `-D warnings` makes
+    /// dead code a build failure on the other platforms.
+    #[cfg(target_os = "linux")]
     const UNSERVABLE_PORT: u16 = 0;
 
     /// An isolated root and a plan whose one action removes a real file in it.
