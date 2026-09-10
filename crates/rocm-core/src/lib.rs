@@ -7400,7 +7400,53 @@ pub fn resolve_amd_smi_binary() -> OsString {
 /// collides with memory already in use and the engine OOMs even a tiny model.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.1 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.1 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
+
+/// Whether a vLLM startup-log tail carries a genuine out-of-memory failure.
+///
+/// Classifies the tail with the *same* rule as the `rocm diagnose` vLLM-OOM
+/// checker (`check_16_vllm_oom`, reached through
+/// [`vllm_oom_symptom_is_diagnosable`]) so the pre-launch low-VRAM note, the
+/// post-failure serve summary, and `rocm diagnose` never disagree on what counts
+/// as a vLLM OOM. The tail is vLLM's own process output, so the checker's
+/// required vLLM anchor is supplied by context: each line is scored as
+/// `vllm: <line>`, and the tail is an OOM iff some line clears the checker's
+/// `MIN_SCORE_FOR_MATCH` threshold.
+///
+/// This deliberately rejects a bare `out of memory` with no allocator-shaped
+/// signature — a kernel OOM-killer line, a dependency's log, or an unrelated
+/// subprocess — the same false positive the checker's threshold guards against,
+/// rather than driving the user-facing memory note off any stray OOM substring
+/// in the tail. A real vLLM/HIP allocation failure (`HIP out of memory`,
+/// `CUDA out of memory`, `hipErrorOutOfMemory`, or `torch.OutOfMemoryError`
+/// corroborated by an allocator message) still clears it.
+pub fn vllm_log_shows_oom(log: &str) -> bool {
+    log.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {line}"))
+    })
+}
+
+/// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to.
+///
+/// Prefers the user's actual failing line (so `diagnose` echoes their real
+/// error) and falls back to [`VLLM_OOM_CANONICAL_SYMPTOM`] when no single line
+/// clears the checker's threshold, so the printed command always reports a
+/// cause. Shared by the vLLM engine's post-failure hint and the `rocm` CLI serve
+/// summary so both surfaces route to `diagnose` identically instead of
+/// hand-rolling the line selection twice.
+pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> String {
+    log_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && vllm_log_shows_oom(line))
+        .map_or_else(
+            || VLLM_OOM_CANONICAL_SYMPTOM.to_owned(),
+            |line| format!("vllm: {line}"),
+        )
+}
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
@@ -11798,6 +11844,44 @@ last_installed_runtime_id = "therock-release"
             usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures() {
+        // A real allocator message (the `MIN_SCORE_FOR_MATCH`-clearing shape the
+        // `rocm diagnose` vLLM-OOM checker recognises) is a genuine OOM, whichever
+        // module path the exception carries.
+        assert!(vllm_log_shows_oom(
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+        assert!(vllm_log_shows_oom(
+            "torch.cuda.OutOfMemoryError: CUDA out of memory"
+        ));
+        assert!(vllm_log_shows_oom("RuntimeError: hipErrorOutOfMemory"));
+        // Case-insensitive.
+        assert!(vllm_log_shows_oom("HIP OUT OF MEMORY"));
+
+        // Sub-threshold on their own — the same lines the diagnose checker keeps
+        // below `MIN_SCORE_FOR_MATCH` so a stray OOM phrase does not carry the
+        // verdict. Detecting these here would contradict that checker (they are
+        // the false positives the shared threshold exists to reject).
+        //
+        // The bare exception class every PyTorch OOM raises, with no allocator
+        // message to corroborate it.
+        assert!(!vllm_log_shows_oom("TORCH.OUTOFMEMORYERROR"));
+        // A spaced "out of memory" with no allocator anchor phrase.
+        assert!(!vllm_log_shows_oom("HIP error: out of memory"));
+        // A kernel OOM-killer line from an unrelated subprocess must NOT drive
+        // the vLLM memory note.
+        assert!(!vllm_log_shows_oom(
+            "Out of memory: Killed process 4242 (python)"
+        ));
+        // The generic EngineCore wrapper is NOT an OOM signature.
+        assert!(!vllm_log_shows_oom(
+            "EngineCore failed: engine core initialization failed"
+        ));
+        assert!(!vllm_log_shows_oom("OSError: model weights not found"));
+        assert!(!vllm_log_shows_oom(""));
     }
 
     #[test]

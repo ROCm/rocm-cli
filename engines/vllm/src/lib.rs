@@ -32,7 +32,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ENGINE_NAME: &str = "vllm";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
-const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+/// Tail budget for the startup-failure summary (and its OOM hint).
+///
+/// Derived from [`DEFAULT_LOG_TAIL_LINES`] rather than spelled as its own
+/// literal so this surface and the CLI's serve summary — which reads the same
+/// protocol constant in `append_oom_serve_note` — cannot drift on what counts as
+/// "the tail" of a failed launch. A change to the protocol budget moves both.
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = DEFAULT_LOG_TAIL_LINES;
 const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
@@ -2227,40 +2233,21 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 /// with the `rocm` CLI's pre-launch low-VRAM note so both surfaces point the
 /// user at the same fix rather than drifting into different phrasing.
 fn oom_utilization_hint(log_tail: &str) -> String {
-    if !log_tail_shows_oom(log_tail) {
+    if !rocm_core::vllm_log_shows_oom(log_tail) {
         return String::new();
     }
-    // Route the user's *actual* failing line into the `--symptom` example when
-    // the diagnose checker would actually score it; otherwise fall back to the
-    // canonical symptom so the printed command always reports a cause. The
-    // detector here is a coarse substring scan that accepts lines the scorer
-    // rates sub-threshold (e.g. a bare "... out of memory"), so without this
-    // fallback the diagnose command could report nothing -- which reads as "the
-    // tool checked and there's no known cause", worse than not printing it.
-    let symptom_line = log_tail
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && log_tail_shows_oom(line))
-        .unwrap_or("out of memory");
-    let candidate = format!("vllm: {symptom_line}");
-    let symptom = if rocm_core::vllm_oom_symptom_is_diagnosable(&candidate) {
-        candidate
-    } else {
-        rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
-    };
+    // Pick the `--symptom` line with the shared helper so this surface and the
+    // `rocm` CLI serve summary route to `rocm diagnose` identically instead of
+    // hand-rolling the selection twice. `vllm_log_shows_oom` now classifies each
+    // line with the *same* rule the diagnose checker uses, so the chosen line is
+    // guaranteed to score for that checker.
+    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
+    let symptom_line = symptom.strip_prefix("vllm: ").unwrap_or(symptom.as_str());
     format!(
         "\n\nDetected an out-of-memory failure ({symptom_line}). {}\n\
          For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
         rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
     )
-}
-
-/// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
-/// HIP allocation failure (e.g. `torch.OutOfMemoryError: HIP out of memory`).
-fn log_tail_shows_oom(log_tail: &str) -> bool {
-    let lower = log_tail.to_ascii_lowercase();
-    lower.contains("out of memory") || lower.contains("outofmemory")
 }
 
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
@@ -2728,7 +2715,7 @@ mod tests {
     fn oom_utilization_hint_fires_on_out_of_memory_log_tails() {
         // The exact PyTorch/HIP signature from the field report.
         let torch = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-        assert!(log_tail_shows_oom(torch));
+        assert!(rocm_core::vllm_log_shows_oom(torch));
         let hint = oom_utilization_hint(torch);
         assert!(
             hint.contains("--gpu-memory-utilization"),
@@ -2747,27 +2734,30 @@ mod tests {
         );
 
         // Detection is case-insensitive and also matches the spaced phrasing.
-        assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
-        assert!(log_tail_shows_oom("RuntimeError: CUDA out of memory"));
+        assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
+        assert!(rocm_core::vllm_log_shows_oom(
+            "RuntimeError: CUDA out of memory"
+        ));
     }
 
     #[test]
     fn every_emitted_oom_symptom_is_diagnosable() {
         // Closes the loop between the two layers: the engine prints
         // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
-        // actually score for the diagnose checker -- including for lines the
-        // coarse substring detector accepts but the scorer rates sub-threshold
-        // on their own (those fall back to the canonical symptom).
+        // actually score for the diagnose checker. Since the detector now
+        // classifies each line with the *same* rule the checker uses, an accepted
+        // line is diagnosable by construction -- this guards that invariant.
         let accepted_lines = [
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
             "RuntimeError: hipErrorOutOfMemory",
-            "torch.cuda.OutOfMemoryError",
-            "HIP error: out of memory",
-            "the process was killed: out of memory",
+            "torch.cuda.OutOfMemoryError: CUDA out of memory",
             "CUDA out of memory",
         ];
         for line in accepted_lines {
-            assert!(log_tail_shows_oom(line), "detector must accept: {line}");
+            assert!(
+                rocm_core::vllm_log_shows_oom(line),
+                "detector must accept: {line}"
+            );
             let hint = oom_utilization_hint(line);
             let symptom = hint
                 .split("--symptom '")
@@ -2779,15 +2769,50 @@ mod tests {
                 "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
             );
         }
+
+        // The reconciled detector rejects sub-threshold lines the loose scan used
+        // to accept -- exactly the false positives the diagnose checker's
+        // threshold guards against. Rejecting them here keeps the two layers from
+        // disagreeing (the engine must not print a `--symptom` the checker would
+        // then score as "no known cause").
+        let rejected_lines = [
+            // The bare exception class every PyTorch OOM raises, uncorroborated.
+            "torch.cuda.OutOfMemoryError",
+            // A spaced "out of memory" with no allocator anchor phrase.
+            "HIP error: out of memory",
+            // A kernel OOM-killer line from an unrelated subprocess.
+            "the process was killed: out of memory",
+        ];
+        for line in rejected_lines {
+            assert!(
+                !rocm_core::vllm_log_shows_oom(line),
+                "detector must reject sub-threshold line: {line}"
+            );
+            assert!(
+                oom_utilization_hint(line).is_empty(),
+                "a sub-threshold line must not carry a memory hint: {line}"
+            );
+        }
     }
 
     #[test]
     fn oom_utilization_hint_stays_quiet_for_unrelated_failures() {
         let unrelated = "ValueError: model architecture 'FooForCausalLM' is not supported";
-        assert!(!log_tail_shows_oom(unrelated));
+        assert!(!rocm_core::vllm_log_shows_oom(unrelated));
         assert!(
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
+        );
+
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash (unsupported arch, shm size, TP misconfig, missing
+        // weights, OOM, ...); treating it as an OOM signature would misreport
+        // those unrelated failures as memory exhaustion.
+        let wrapper_only = "ERROR Engine core initialization failed";
+        assert!(!rocm_core::vllm_log_shows_oom(wrapper_only));
+        assert!(
+            oom_utilization_hint(wrapper_only).is_empty(),
+            "the generic EngineCore wrapper alone must not be treated as OOM"
         );
     }
 

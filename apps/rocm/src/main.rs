@@ -5120,17 +5120,87 @@ fn serve(args: ServeArgs) -> Result<()> {
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
+    // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
+    // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
+    let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
+    let resolved_selection = resolve_engine_selection(
+        &config,
+        &selected_engine,
+        runtime_id.as_deref(),
+        env_id.as_deref(),
+    );
+    let resolved_selection = validate_engine_selection_runtime(&paths, resolved_selection)?;
+    // Reusing an already-running managed service launches nothing and pins no
+    // GPU, so it must bypass the GPU-required pre-flight below — the reused
+    // service was already vetted at its own launch, and this invocation does no
+    // GPU work. Detect that here, but only when a live managed service that
+    // plausibly serves *this* model already exists, and when the model ref can be
+    // canonicalized (a runtime/env is available, or the engine manages its own).
+    // Without a runtime we cannot resolve, so we fall through and the pre-flight
+    // refuses the no-GPU / no-runtime case with its usual message.
+    //
+    // The pre-gate matches on the model, not just the engine: everything inside
+    // this block is real engine work (a `ResolveModel` round-trip, and for a
+    // self-managing engine an `ensure_self_managed_engine_ready` that can print
+    // "Preparing <engine> for GPU serving..." and install), so gating on the
+    // engine alone let a live service for an *unrelated* model — one this
+    // invocation can never reuse — drag that work ahead of the no-usable-GPU
+    // bail on a GPU-less host.
+    let mut resolved_model: Option<ResolveModelResponse> = None;
+    let mut reuse_existing = false;
+    let can_resolve_model = !cpu_only
+        && (resolved_selection.runtime_id.is_some()
+            || resolved_selection.env_id.is_some()
+            || engine_manages_own_runtime(&selected_engine));
+    if can_resolve_model
+        && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
+    {
+        if engine_manages_own_runtime(&selected_engine) {
+            ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
+        }
+        let probe = engine_request::<_, ResolveModelResponse>(
+            Some(&paths),
+            &selected_engine,
+            EngineMethod::ResolveModel,
+            &ResolveModelRequest {
+                model_ref: engine_model_ref.clone(),
+                runtime_id: resolved_selection.runtime_id.clone(),
+                device_policy: Some(device_policy.clone()),
+                recipe_override: None,
+                engine_recipe: engine_recipe.clone(),
+            },
+        )?;
+        reuse_existing =
+            existing_live_managed_service(&paths, &selected_engine, &probe.canonical_model_id)
+                .is_some();
+        resolved_model = Some(probe);
+    }
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
-    // BEFORE preparing or launching any engine (no wasted engine download, and an
-    // actionable message instead of a late engine crash). The engine enforces the
-    // same rule as a backstop. Skipped for cpu_only; permissive when availability
-    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // before preparing or launching any engine for *this* model (no wasted engine
+    // download, and an actionable message instead of a late engine crash). The
+    // engine enforces the same rule as a backstop.
+    //
+    // The precise contract, since the reuse detection above is the one thing that
+    // can precede this bail: engine work runs first only when a live managed
+    // service already matches this engine and model — i.e. only when this
+    // invocation is about to reuse it and legitimately skip the bail. When no such
+    // service exists (the ordinary launch, and every no-GPU refusal path) the
+    // block above is skipped entirely and this is still the first thing that runs.
+    //
+    // Skipped for cpu_only and when reusing an already-running service (nothing is
+    // launched); permissive when availability cannot be probed on this platform
+    // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
         && !scripted_backend_failure
+        && !reuse_existing
+        && !e2e_simulate_oom_launch()
         && let Some(usable) = rocm_core::usable_amd_gpu_indices()
         && usable.is_empty()
     {
@@ -5142,23 +5212,20 @@ fn serve(args: ServeArgs) -> Result<()> {
             policy = device_policy_name(&device_policy)
         );
     }
-    // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
-    // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
-    // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
-    let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
+    // Validate the pinned `--gpu` index and resolve the GPU set BEFORE any
+    // runtime or engine work, so an index that does not exist on the host is
+    // rejected up front (`serve-absent-gpu-index-rejected`: "refused before any
+    // engine starts") rather than after `ensure_self_managed_engine_ready` has
+    // begun preparing the engine. It sits after the no-usable-GPU pre-flight so a
+    // GPU-less host still refuses with "no usable AMD GPU" before the index is
+    // ever inspected. A reuse pins no GPU, but validating the index here is
+    // side-effect-free and keeps a bad `--gpu` from being silently ignored.
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
     let gpu_indices = if cpu_only {
         Vec::new()
     } else {
         resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
     };
-    let resolved_selection = resolve_engine_selection(
-        &config,
-        &selected_engine,
-        runtime_id.as_deref(),
-        env_id.as_deref(),
-    );
-    let resolved_selection = validate_engine_selection_runtime(&paths, resolved_selection)?;
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
         && resolved_selection.env_id.is_none()
@@ -5171,21 +5238,25 @@ fn serve(args: ServeArgs) -> Result<()> {
     }
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && resolved_model.is_none()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
-    let resolve = engine_request::<_, ResolveModelResponse>(
-        Some(&paths),
-        &selected_engine,
-        EngineMethod::ResolveModel,
-        &ResolveModelRequest {
-            model_ref: engine_model_ref,
-            runtime_id: resolved_selection.runtime_id.clone(),
-            device_policy: Some(device_policy),
-            recipe_override: None,
-            engine_recipe,
-        },
-    )?;
+    let resolve = match resolved_model {
+        Some(resolve) => resolve,
+        None => engine_request::<_, ResolveModelResponse>(
+            Some(&paths),
+            &selected_engine,
+            EngineMethod::ResolveModel,
+            &ResolveModelRequest {
+                model_ref: engine_model_ref,
+                runtime_id: resolved_selection.runtime_id.clone(),
+                device_policy: Some(device_policy),
+                recipe_override: None,
+                engine_recipe,
+            },
+        )?,
+    };
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
@@ -5341,6 +5412,17 @@ fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
             );
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            let notes = append_oom_serve_note(
+                notes,
+                engine_serves_vllm,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
+            );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -5419,6 +5501,141 @@ fn collect_serve_notes(
                 notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
             }
         }
+    }
+    notes
+}
+
+/// Test-only fault-injection switch, off (`const false`) in shipped binaries:
+/// the `e2e-oom-fault-injection` feature is enabled only by the `xtask e2e`
+/// mock-lane build, never by the release build. When enabled and
+/// `ROCM_E2E_SIMULATE_OOM_LAUNCH=1` is set on the process, `rocm serve` fabricates
+/// the on-disk state of a managed vLLM launch that spawned, wrote an
+/// out-of-memory traceback to the log it owns, and never became ready — so the
+/// positive OOM-guidance summary path can be verified on a GPU-less CI host,
+/// where a real launch cannot run. See [`simulate_oom_managed_launch`].
+#[cfg(feature = "e2e-oom-fault-injection")]
+fn e2e_simulate_oom_launch() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "1")
+}
+
+/// Release builds carry no fault-injection switch: the seam compiles out
+/// entirely, so `rocm serve` behaves identically to a build without the feature.
+#[cfg(not(feature = "e2e-oom-fault-injection"))]
+const fn e2e_simulate_oom_launch() -> bool {
+    false
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
+/// managed vLLM launch that spawned, OOM'd, and never became ready, then return
+/// the launch report the summary path would see for it — `already_running: false`
+/// (this invocation launched it), `status: "starting"` (it failed to become
+/// ready), and a `log_path` whose contents carry a real allocator OOM signature.
+/// [`append_oom_serve_note`] then renders the memory-knob guidance. No process is
+/// spawned. Compiled out of shipped binaries.
+#[cfg(feature = "e2e-oom-fault-injection")]
+#[allow(clippy::too_many_arguments)]
+fn simulate_oom_managed_launch(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    port: u16,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+) -> Result<ManagedLaunchReport> {
+    paths.ensure()?;
+    fs::create_dir_all(paths.services_dir())?;
+    let mut record = ManagedServiceRecord::new(
+        paths,
+        service_id,
+        engine,
+        requested_model,
+        resolve.canonical_model_id.clone(),
+        host,
+        port,
+        "managed",
+        std::process::id(),
+        runtime_id.map(str::to_owned),
+        env_id.map(str::to_owned),
+        Some(device_policy_name(device_policy).to_owned()),
+    );
+    record.gpu_indices = gpu_indices.to_vec();
+    record.status = "starting".to_owned();
+    record.write()?;
+    // A real allocator OOM signature (the same torch/HIP line
+    // `rocm_core::vllm_log_shows_oom` matches) in the log this invocation owns, so
+    // the summary renders memory guidance for a launch that actually OOM'd.
+    fs::write(
+        &record.log_path,
+        "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+    )
+    .with_context(|| format!("failed to write {}", record.log_path.display()))?;
+    Ok(ManagedLaunchReport {
+        service_id: service_id.to_owned(),
+        endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
+        status: "starting".to_owned(),
+        already_running: false,
+        child_pid: None,
+        log_path: Some(record.log_path),
+        manifest_path: Some(record.manifest_path),
+    })
+}
+
+/// Appends the actionable memory-knob note when a managed serve failed to become
+/// ready and its engine log carries an out-of-memory signature.
+///
+/// This is the post-failure companion to the pre-launch low-VRAM warning in
+/// [`collect_serve_notes`]. The reported low-VRAM environment ships no
+/// rocm-smi/amd-smi, so that telemetry-driven warning never fires there; reading
+/// the failed serve's own log tail is the reliable signal that the launch died on
+/// VRAM. Gated on vLLM (the only engine exposing `--gpu-memory-utilization`), on
+/// the launch having actually *failed to become ready*
+/// ([`serve_summary::serve_failed_to_become_ready`] — a healthy still-loading
+/// `running` service is not a failure), and on this invocation actually having
+/// launched the process (`already_running` is excluded) so healthy deployments,
+/// unrelated failures, and an unrelated invocation that merely reused an
+/// already-live service are never misattributed. The OOM-signature check in
+/// [`serve_summary::oom_memory_note`] narrows it further. Also skips a note
+/// whose hint text is already present in `notes` (the pre-launch low-VRAM
+/// warning may have added it) so the same fix is never printed twice.
+fn append_oom_serve_note(
+    mut notes: Vec<String>,
+    engine_is_vllm: bool,
+    already_running: bool,
+    status: &str,
+    log_path: Option<&Path>,
+) -> Vec<String> {
+    if !engine_is_vllm || already_running || !serve_summary::serve_failed_to_become_ready(status) {
+        return notes;
+    }
+    // Cheap guard first: if the shared hint is already in `notes` (added by the
+    // pre-launch low-VRAM warning) there is nothing to add, so skip the log read
+    // entirely.
+    let already_hinted = notes
+        .iter()
+        .any(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT));
+    if already_hinted {
+        return notes;
+    }
+    let Some(log_path) = log_path else {
+        return notes;
+    };
+    // Read the same tail budget the engine's own OOM surfaces use
+    // (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`) so the CLI serve summary
+    // and the engine agree on what counts as "the tail" of a failed launch,
+    // rather than drifting apart on independent magic literals.
+    let log_tail = read_optional_tail_lines(
+        log_path,
+        rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
+        "service log",
+    )
+    .join("\n");
+    if let Some(note) = serve_summary::oom_memory_note(status, &log_tail) {
+        notes.push(note);
     }
     notes
 }
@@ -5851,6 +6068,22 @@ fn start_managed_service(
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
+    #[cfg(feature = "e2e-oom-fault-injection")]
+    if e2e_simulate_oom_launch() {
+        return simulate_oom_managed_launch(
+            &paths,
+            engine,
+            service_id,
+            requested_model,
+            resolve,
+            host,
+            port,
+            device_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+        );
+    }
     let (mut record, child_pid) = match spawn_managed_engine_child(
         &paths,
         engine,
@@ -16394,6 +16627,35 @@ fn existing_live_managed_service(
         })
 }
 
+/// Whether a live managed service for `engine` plausibly already serves
+/// `model_ref`, decided from the records alone — no canonical model id, and so
+/// no engine round-trip, required.
+///
+/// Cheap pre-gate for the reuse detection in `serve`. Everything that check does
+/// is real engine work: a `ResolveModel` round-trip and, for a self-managing
+/// engine, an [`ensure_self_managed_engine_ready`] that may print
+/// "Preparing <engine> for GPU serving..." and install. That work runs ahead of
+/// the no-usable-GPU pre-flight, so it must be reserved for invocations that can
+/// actually reuse something: keying on the engine alone let a live service for an
+/// unrelated model pull an install in front of the bail on a GPU-less host.
+///
+/// Matching uses [`service_model_names_match`] — the same lenient relation the
+/// service-listing surfaces already use to tie a user-typed name to a record — so
+/// a short-vs-canonical spelling still reaches the probe. The probe then decides
+/// reuse authoritatively on the canonical id via
+/// [`existing_live_managed_service`]; this only decides whether asking is worth
+/// the engine round-trip.
+fn any_live_managed_service_for_model(paths: &AppPaths, engine: &str, model_ref: &str) -> bool {
+    load_managed_services(paths).is_ok_and(|records| {
+        records.iter().any(|record| {
+            record.engine == engine
+                && (service_model_names_match(&record.model_ref, model_ref)
+                    || service_model_names_match(&record.canonical_model_id, model_ref))
+                && managed_service_is_live(record)
+        })
+    })
+}
+
 fn managed_service_running_state(status: &str) -> &'static str {
     match status {
         "ready" | "running" => "running",
@@ -24473,6 +24735,136 @@ install therock";
         assert!(found.is_none());
     }
 
+    /// Write one live managed record and report what the reuse pre-gate makes of
+    /// a serve for `queried_model_ref`.
+    fn reuse_pregate_for(
+        label: &str,
+        record_model_ref: &str,
+        record_canonical_model_id: &str,
+        queried_engine: &str,
+        queried_model_ref: &str,
+    ) -> Result<bool> {
+        let (root, paths) = test_paths(label);
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            format!("lemonade-{label}"),
+            "lemonade",
+            record_model_ref,
+            record_canonical_model_id,
+            "127.0.0.1",
+            11_520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+
+        let gated = any_live_managed_service_for_model(&paths, queried_engine, queried_model_ref);
+        let _ = fs::remove_dir_all(root);
+        Ok(gated)
+    }
+
+    #[test]
+    fn reuse_pregate_skips_engine_work_for_an_unrelated_live_model() -> Result<()> {
+        // EAI-8059 review: the reuse probe runs a `ResolveModel` round-trip and,
+        // for a self-managing engine, an install that prints "Preparing ... for
+        // GPU serving" — all of it ahead of the no-usable-GPU bail. Keying the
+        // pre-gate on the engine alone let a live service for a model this
+        // invocation can never reuse pull that work in front of the bail. Gating
+        // on the model keeps the fail-fast contract true.
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-model",
+                "other",
+                "other-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "a live service for an unrelated model must not unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_same_model_including_a_short_spelling() -> Result<()> {
+        // The probe must still be reached for anything that could genuinely be
+        // reused, so the gate must not narrow reuse detection: an exact ref, a
+        // canonical-id-only match, and a short-vs-canonical spelling all pass.
+        // The probe then decides reuse authoritatively on the canonical id.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-exact",
+                "qwen",
+                "qwen-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "the same raw model ref must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-canonical",
+                "some-alias",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "Qwen/Qwen3-8B",
+            )?,
+            "a canonical-id match must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-short",
+                "Qwen/Qwen3-8B",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "qwen3-8b",
+            )?,
+            "a short spelling of the same model must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_model_id_the_oom_reuse_scenario_plants() -> Result<()> {
+        // `@id:serve-oom-memory-guidance` plants a live record for this exact id
+        // and then serves it, relying on the reuse short-circuit to reach the
+        // summary on a GPU-less host. That scenario only runs on the
+        // `@requires-no-gpu` mock lane, so pin the pre-gate's verdict for its
+        // literal model id here too: a matcher change that silently turned the
+        // scenario into a launch attempt would otherwise only show up there.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-e2e-oom",
+                "e2e/oom-model",
+                "e2e/oom-model",
+                "lemonade",
+                "e2e/oom-model",
+            )?,
+            "the OOM reuse scenario's planted service must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_still_keys_on_the_engine() -> Result<()> {
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-engine",
+                "qwen",
+                "qwen-canonical",
+                "vllm",
+                "qwen",
+            )?,
+            "a live service for a different engine must not unlock the reuse probe"
+        );
+        Ok(())
+    }
+
     #[test]
     fn spawn_managed_engine_child_blocks_reuse_with_mismatched_recipe() -> Result<()> {
         // A live service recorded with one recipe (e.g. a tool-call parser flag)
@@ -25567,6 +25959,177 @@ install therock";
                 .iter()
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_reads_the_failed_serve_log_and_names_the_knobs() {
+        // A managed vLLM serve that died on VRAM lands not-ready with the OOM
+        // traceback only in its log; the note must be recovered from that log.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-hit.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "loading weights\ntorch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")
+                    && entry.contains("--gpu <index>")),
+            "the OOM note must name both memory knobs: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_is_withheld_when_it_does_not_apply() {
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-miss.log", std::process::id()));
+        fs::write(&log_path, "torch.OutOfMemoryError: HIP out of memory\n").expect("write log");
+
+        // A ready serve is healthy even if the log mentions memory.
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "ready", Some(&log_path)).is_empty()
+        );
+        // A non-vLLM engine has no `--gpu-memory-utilization` to reach for.
+        assert!(
+            append_oom_serve_note(Vec::new(), false, false, "starting", Some(&log_path)).is_empty()
+        );
+        // A missing log gives no signal to branch on.
+        assert!(append_oom_serve_note(Vec::new(), true, false, "starting", None).is_empty());
+
+        // A failure whose log carries no OOM signature is left alone.
+        fs::write(&log_path, "OSError: model weights not found\n").expect("rewrite log");
+        assert!(
+            append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path)).is_empty()
+        );
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn append_oom_serve_note_is_withheld_for_a_healthy_still_loading_service() {
+        // `running` means the endpoint is up and the model is still loading
+        // normally — a healthy state deliberately kept distinct from `starting`
+        // so `rocmd` does not restart a slow-loading model. An OOM string left in
+        // its log tail (e.g. from an earlier probe) must NOT be reported as this
+        // serve having "run out of GPU memory".
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-running.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, false, "running", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "a healthy still-loading `running` service must not get the OOM note: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_ignores_an_already_running_services_log() {
+        // Re-issuing `serve` against a service another invocation already
+        // launched must never blame *this* invocation for that other process's
+        // failure — even when its log carries a real OOM signature and the
+        // reused record's status is not yet "ready".
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-already-running.log",
+            std::process::id()
+        ));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, true, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an already-running service's log must not be attributed to this invocation: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_does_not_repeat_a_hint_already_in_the_notes() {
+        // When the pre-launch low-VRAM warning already carried the shared
+        // utilization hint, a post-failure OOM confirmation must not print the
+        // exact same hint text a second time.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-dedup.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let pre_launch_notes = vec![
+            "selected GPU 0 has low free VRAM".to_owned(),
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned(),
+        ];
+        let notes = append_oom_serve_note(
+            pre_launch_notes.clone(),
+            true,
+            false,
+            "starting",
+            Some(&log_path),
+        );
+        let _ = fs::remove_file(&log_path);
+        assert_eq!(
+            notes, pre_launch_notes,
+            "the hint must not be duplicated once it is already present: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_reads_the_shared_engine_tail_budget() {
+        // The serve summary must read the same tail budget the engine's own OOM
+        // surfaces use (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`) so the two
+        // surfaces never disagree on what counts as "the tail" of a failed
+        // launch. Plant the OOM signature on the oldest line still inside that
+        // window (it must fire), then push it one line past the window (it must
+        // fall silent) — pinning the read to the shared constant rather than a
+        // drifting literal.
+        let budget = rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
+        let oom_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+
+        // OOM on the oldest line that still fits in the last `budget` lines.
+        let in_window = std::iter::once(oom_line)
+            .chain(std::iter::repeat_n("shutting down worker", budget - 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-in-window.log",
+            std::process::id()
+        ));
+        fs::write(&log_path, format!("{in_window}\n")).expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "an OOM line inside the shared tail budget must still surface the note: {notes:?}"
+        );
+
+        // Push the OOM line one row past the window: it must scroll out of view.
+        let out_of_window = std::iter::once(oom_line)
+            .chain(std::iter::repeat_n("shutting down worker", budget))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-out-window.log",
+            std::process::id()
+        ));
+        fs::write(&log_path, format!("{out_of_window}\n")).expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an OOM line beyond the shared tail budget must not surface the note: {notes:?}"
         );
     }
 
