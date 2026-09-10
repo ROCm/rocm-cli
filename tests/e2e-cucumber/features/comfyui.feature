@@ -12,8 +12,11 @@ Feature: ComfyUI application management
   # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
   # so the scenario also requires that: a bail-out (no runtime, download failure)
   # would otherwise leave the runtime trivially unchanged and report green having
-  # installed nothing. The runtime-health checks are the ADDITIONAL contract on top
-  # of a successful install, not a substitute for it.
+  # installed nothing. It further requires the runtime's package set to have GROWN,
+  # because a zero exit code alone still permits an empty filtered requirement list,
+  # which skips the dependency install outright. Together those two make the
+  # runtime-health checks the ADDITIONAL contract on top of an install that really
+  # happened, not a substitute for it.
   #
   # Genuinely destructive and expensive: it needs a real managed runtime (a
   # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
@@ -30,5 +33,6 @@ Feature: ComfyUI application management
     And the runtime's torch is a ROCm build
     When the user installs ComfyUI
     Then the install succeeds
+    And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch is still a ROCm build
     And no CUDA nvidia packages were added to the runtime

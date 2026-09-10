@@ -97,6 +97,12 @@ pub struct E2eWorld {
     /// exact version catches a swap to any other build (CUDA `+cu`, a plain
     /// `2.13.0` CPU wheel, etc.), which a "not a CUDA build" check alone would miss.
     pub comfyui_baseline_torch: Option<String>,
+    /// The managed runtime's installed distribution names captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require the set to have
+    /// grown. Without it a run that installs nothing — `comfyui::install` skips the
+    /// whole `uv` step on an empty requirement list and still exits 0 — would pass
+    /// every runtime-preservation assertion having exercised nothing.
+    pub comfyui_baseline_distributions: Option<Vec<String>>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -228,6 +234,7 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch: None,
+            comfyui_baseline_distributions: None,
             lifecycle: None,
         }
     }

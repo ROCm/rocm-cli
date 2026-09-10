@@ -140,12 +140,11 @@ const DISTRIBUTIONS_PROBE: &str = "import json,sys\n\
      \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
      sys.stdout.write(json.dumps(out))\n";
 
-/// The `nvidia-*` CUDA distributions installed in the interpreter's environment.
-/// A ROCm runtime should have none; ComfyUI's install dragging any in is the
-/// EAI-8051 defect. Panics if the interpreter cannot be run or the probe reports
-/// an error — a probe that cannot enumerate packages must NOT read as "no nvidia
-/// packages", which would pass the contract on a runtime it never actually checked.
-fn nvidia_distributions(python: &Path) -> Vec<String> {
+/// Every distribution name installed in the interpreter's environment, sorted.
+/// Panics if the interpreter cannot be run or the probe reports an error — a probe
+/// that cannot enumerate packages must NOT read as an empty environment, which
+/// would pass the nvidia check on a runtime it never actually inspected.
+fn installed_distributions(python: &Path) -> Vec<String> {
     let output = std::process::Command::new(python)
         .args(["-c", DISTRIBUTIONS_PROBE])
         .output()
@@ -168,8 +167,17 @@ fn nvidia_distributions(python: &Path) -> Vec<String> {
     names
         .iter()
         .filter_map(serde_json::Value::as_str)
-        .filter(|name| name.to_ascii_lowercase().starts_with("nvidia-"))
         .map(str::to_owned)
+        .collect()
+}
+
+/// The `nvidia-*` CUDA distributions installed in the interpreter's environment.
+/// A ROCm runtime should have none; ComfyUI's install dragging any in is the
+/// EAI-8051 defect.
+fn nvidia_distributions(python: &Path) -> Vec<String> {
+    installed_distributions(python)
+        .into_iter()
+        .filter(|name| name.to_ascii_lowercase().starts_with("nvidia-"))
         .collect()
 }
 
@@ -200,13 +208,19 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
          (torch version: {version:?}, python: {})",
         python.display()
     );
+    let distributions = installed_distributions(&python);
     assert!(
-        nvidia_distributions(&python).is_empty(),
+        !distributions
+            .iter()
+            .any(|name| name.to_ascii_lowercase().starts_with("nvidia-")),
         "runtime already has nvidia-* distributions before ComfyUI install; premise absent"
     );
     // Record the exact baseline version so the post-install step can require it to
-    // be unchanged (see `assert_torch_still_rocm`).
+    // be unchanged (see `assert_torch_still_rocm`), and the baseline package set so
+    // it can require the install to have actually added something (see
+    // `assert_dependencies_installed`).
     world.comfyui_baseline_torch = version;
+    world.comfyui_baseline_distributions = Some(distributions);
 }
 
 #[when("the user installs ComfyUI")]
@@ -239,6 +253,34 @@ async fn assert_install_succeeded(world: &mut E2eWorld) {
             world.cli_output.as_deref().unwrap_or(""),
             world.cli_stderr.as_deref().unwrap_or(""),
         )
+    );
+}
+
+#[then("ComfyUI's dependencies were installed into the runtime")]
+async fn assert_dependencies_installed(world: &mut E2eWorld) {
+    // Closes the last vacuity path a zero exit code leaves open. `comfyui::install`
+    // guards the whole `uv` install with `if !packages.is_empty()`
+    // (`apps/rocm/src/comfyui.rs`), so an empty filtered requirement list skips it
+    // and still exits 0 — leaving the runtime untouched and every invariant below
+    // passing having installed nothing.
+    //
+    // Deliberately asserts the package set GREW rather than naming an expected
+    // dependency: ComfyUI's requirements drift upstream independently of this
+    // contract, so a named package would rot, while "the install put something in
+    // the runtime" is exactly the premise the invariants need and cannot go stale.
+    let python = active_runtime_python(world);
+    let baseline = world
+        .comfyui_baseline_distributions
+        .as_ref()
+        .expect("no baseline distribution set was captured");
+    let after = installed_distributions(&python);
+    assert!(
+        after.iter().any(|name| !baseline.contains(name)),
+        "ComfyUI install added no distributions to the runtime, so it installed \
+         nothing and the runtime-preservation checks would pass vacuously \
+         ({} distributions before and after, python: {})",
+        after.len(),
+        python.display()
     );
 }
 
