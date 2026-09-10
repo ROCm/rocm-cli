@@ -2,14 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::cli_progress::AnimatedSpinner;
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
-    runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child, runtime_path_list_join,
-    runtime_path_list_split, runtime_paths_equivalent, unix_time_millis, uv_command_env,
-    uv_pip_install_base,
+    AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
+    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
+    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
+    uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -1352,7 +1353,17 @@ fn download_and_extract_source(
         )?;
     } else {
         writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
-        download_file(COMFYUI_SOURCE_ARCHIVE_URL, &archive_path)?;
+        let download_label = "Fetching ComfyUI source archive…";
+        let spinner = AnimatedSpinner::start(download_label);
+        let download_result = download_file(
+            COMFYUI_SOURCE_ARCHIVE_URL,
+            &archive_path,
+            &mut |bytes, total| {
+                spinner.set_progress(download_label, bytes, total);
+            },
+        );
+        drop(spinner);
+        download_result?;
     }
     let extract_root = app_root
         .join("extract")
@@ -1413,8 +1424,12 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    download_file_to_path(url, destination, Duration::from_mins(2))
+fn download_file(
+    url: &str,
+    destination: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_to_path_with_progress(url, destination, Duration::from_mins(2), on_progress)
 }
 
 fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
@@ -2229,6 +2244,7 @@ mod tests {
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2503,6 +2519,7 @@ mod tests {
                 ..Default::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2600,6 +2617,7 @@ mod tests {
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2630,5 +2648,74 @@ mod tests {
             data_dir: root.join("data"),
             cache_dir: root.join("cache"),
         }
+    }
+
+    #[test]
+    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
+        // A multi-chunk body (the streaming downloader reads in 64 KiB
+        // chunks) so a single callback firing wouldn't already satisfy the
+        // "monotonically increasing" assertion below.
+        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let served = body.clone();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )?;
+            stream.write_all(&served)?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/archive.tar.gz");
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-comfyui-download-progress-{}",
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root)?;
+        let destination = root.join("archive.tar.gz");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        download_file(&url, &destination, &mut |bytes, total| {
+            calls.push((bytes, total));
+        })?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&root);
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.len() >= 2,
+            "expected at least a pre-transfer and a final callback: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last callback must report the complete transfer: {calls:?}"
+        );
+        Ok(())
     }
 }

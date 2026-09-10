@@ -37,6 +37,7 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
 | `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
+| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
 
 The Strix Halo lanes pin the extra `native` label because two Linux runners
 share the `strix-halo` label (a native host and a WSL host) and the jobs'
@@ -55,10 +56,10 @@ named for.
 resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
-The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3`) run on AMD GPU systems, so they exercise
-host/GPU detection, engine `detect`/`capabilities`, and live serving scenarios
-that the mock job cannot. GPU availability is advisory in the WSL lane, as
+The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
+`e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p`) run on AMD GPU systems, so they
+exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
+scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
 
 `e2e-wsl` runs on an Ubuntu distro hosted in WSL2 on the Strix Halo Windows box
@@ -100,10 +101,11 @@ reports — including partial or failed runs — by scenario id into one HTML re
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
-`e2e-gpu-strix-wsl-report`) in every workflow, because the report derives each
-platform's name and OS from the artifact name. An unrecognised name renders as a
-guessed platform on Linux, which would report a Windows lane as Linux; `xtask`'s
+`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
+because the report derives each platform's name and OS from the artifact name.
+An unrecognised name renders as a guessed platform on Linux, which would report
+a Windows lane as Linux; `xtask`'s
 `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
 ## Triggers
@@ -128,11 +130,11 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`) — which self-hosted job(s) to run. `app-dev-gpu` maps to
-  `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `rad3` to
-  `e2e-gpu-rad3`. (The mock lane has its own `platform` input on `ci.yml`; it is
-  not part of this workflow.)
+  `strix-wsl`, `rad3`, `mi350p`) — which self-hosted job(s) to run. `app-dev-gpu`
+  maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
+  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3` to
+  `e2e-gpu-rad3`, and `mi350p` to `e2e-gpu-mi350p`. (The mock lane has its own
+  `platform` input on `ci.yml`; it is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -152,7 +154,10 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace and survives `git clean`.
+lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
+package layout cannot poison the cache consumed by code that only understands the
+previous layout.
 
 The tree may hold **more than one** runtime — the pre-warm installs a newer one
 side by side when the channel index publishes it (below) — so scenarios must not
@@ -163,24 +168,39 @@ tree's own `active.json`, which lives inside the shared tree and is therefore
 visible through the symlink. Without that, a serve fails with `no active ROCm
 runtime is configured` while the precondition still passes.
 
-It is a **cache with invalidation**, not a one-shot install. Each self-hosted lane calls
+It is a **cache with invalidation and repair**, not a one-shot install. Each
+self-hosted lane calls:
 
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
 
-before the suite, which asks `rocm update` whether the channel index has published
-a newer version and then:
+before the suite. `rocm update` compares both the channel version and the wheel
+composition recorded in the runtime manifest (source-layout generation and exact
+pinned package specs, including the `device-<target>` payload). A deterministic
+composition fingerprint is part of each wheel runtime key, so a corrected
+composition is installed beside — never over — the old environment. Each report
+line also carries `target=<key>`: the runtime key an apply from that line would
+produce, which on a superseded manifest is its already-installed replacement.
+Pre-warm then:
 
 - installs the SDK when nothing is present for that channel;
-- installs the newer runtime **side-by-side** and activates it
+- installs a newer runtime **side-by-side** and activates it
   (`rocm update --apply --runtime <key> --activate`) when the index is ahead;
+- replaces a same-version runtime side-by-side when its manifest has an older or
+  missing wheel composition, then activates the composition-keyed replacement;
+- treats that repair as complete while the matching replacement remains installed,
+  so retained legacy manifests do not trigger repeated repairs or notifications;
+- activates the runtime a reuse actually means — after a repair that is the
+  replacement named by `target=`, not the superseded manifest the line belongs to;
+- ensures the default engine is installed even when the runtime itself is reused;
 - reuses the existing tree when it is `up_to_date`, when it is `ahead_of_index`
-  (a pinned build newer than the index must not be rolled back), or when freshness
+  (a pinned build newer than the index must not be rolled back and cannot be
+  reproduced from the index, so it is never offered a repair), or when freshness
   cannot be established at all — an unreachable index reuses and warns rather than
   re-downloading gigabytes or failing the lane;
-- prunes with `rocm storage remove-old-installs` after any install or update, so
-  the multi-version cache stays bounded.
+- prunes with `rocm storage remove-old-installs` after any install, update, or
+  repair, so the multi-version cache stays bounded.
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
@@ -196,8 +216,9 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-rad3` — all run with `continue-on-error: true`, so a
-hardware failure that RUNS never gates a PR merge. Their results still surface
+`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
+`continue-on-error: true`, so a hardware failure that RUNS never gates a PR
+merge. Their results still surface
 in the self-hosted consolidated report for visibility.
 
 ### Timeouts on the shared Strix box
