@@ -296,6 +296,26 @@ async fn dashboard_receives_sigint(world: &mut E2eWorld) {
     signal_dashboard(world, TermSignal::Int).await;
 }
 
+/// Type a literal Ctrl-C at the running TUI and wait for it to exit. Shared by
+/// the dashboard and launcher wordings, which press the same key at the two
+/// separate key loops the process runs.
+async fn press_ctrl_c(world: &mut E2eWorld, subject: &str) {
+    session(world)
+        .press_ctrl_c_and_wait(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("{subject} did not exit after Ctrl-C: {e}"));
+}
+
+#[when("the user presses Ctrl-C in the dashboard")]
+async fn dashboard_ctrl_c(world: &mut E2eWorld) {
+    press_ctrl_c(world, "the dashboard").await;
+}
+
+#[when("the user presses Ctrl-C in the launcher")]
+async fn launcher_ctrl_c(world: &mut E2eWorld) {
+    press_ctrl_c(world, "the launcher").await;
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the dashboard home view is displayed")]
@@ -478,23 +498,24 @@ async fn dashboard_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 
-/// Assert the exit code stashed by the signal `When` step. Shared by the
+/// Assert the exit code stashed by the terminating `When` step. Shared by the
 /// dashboard and launcher wordings — the assertion is identical, only the
 /// process under test differs, and `subject` keeps the failure message honest
-/// about which one it was.
-fn assert_exited_from_signal(world: &mut E2eWorld, subject: &str, expected: i32) {
+/// about which one it was. `gesture` names how the exit was requested, so a
+/// failure says whether the signal path or the keystroke path is broken.
+fn assert_exited_with(world: &mut E2eWorld, subject: &str, gesture: &str, expected: i32) {
     let observed = session(world)
         .observed_exit_code()
-        .expect("no signal exit code was recorded; deliver the signal first");
+        .expect("no exit code was recorded; terminate the session first");
     assert_eq!(
         observed, expected,
-        "{subject} exited with {observed} after the signal, expected {expected}"
+        "{subject} exited with {observed} after {gesture}, expected {expected}"
     );
 }
 
 #[then(expr = "the dashboard exits from the signal with code {int}")]
 async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
-    assert_exited_from_signal(world, "the dashboard", expected);
+    assert_exited_with(world, "the dashboard", "the signal", expected);
 }
 
 // The launcher hub is a different process shape from a dashboard session (it
@@ -502,7 +523,21 @@ async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
 // rather than borrowing the dashboard's wording.
 #[then(expr = "the launcher exits from the signal with code {int}")]
 async fn launcher_exited_from_signal(world: &mut E2eWorld, expected: i32) {
-    assert_exited_from_signal(world, "the launcher", expected);
+    assert_exited_with(world, "the launcher", "the signal", expected);
+}
+
+// Separate wording from the signal steps on purpose: a typed Ctrl-C never
+// becomes a signal while the terminal is in raw mode, so a scenario that says
+// "from the signal" here would assert the wrong thing about how the exit
+// happened, even though the code it lands on is the same 130.
+#[then(expr = "the dashboard exits from the keystroke with code {int}")]
+async fn dashboard_exited_from_keystroke(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the dashboard", "the keystroke", expected);
+}
+
+#[then(expr = "the launcher exits from the keystroke with code {int}")]
+async fn launcher_exited_from_keystroke(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the launcher", "the keystroke", expected);
 }
 
 #[then("the launcher front door is displayed")]

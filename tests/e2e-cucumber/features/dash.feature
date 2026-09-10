@@ -138,8 +138,10 @@ Feature: Interactive dashboard
 
   @id:dash-sigint-restores-terminal @requires-os:linux
   Scenario: dash-12 - A SIGINT restores the terminal and exits 130
-    # The interactive Ctrl-C gesture (delivered as SIGINT) takes the same restore
-    # path and reports the conventional 128+2 exit code.
+    # An externally delivered SIGINT (`kill -INT` from another process) takes the
+    # same restore path and reports the conventional 128+2 exit code. This is NOT
+    # the typed Ctrl-C gesture: raw mode clears ISIG, so that keystroke never
+    # becomes a signal — dash-14 covers it as the key event it actually is.
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the dashboard receives a SIGINT
@@ -172,4 +174,33 @@ Feature: Interactive dashboard
     Then the launcher front door is displayed
     When the launcher receives a SIGTERM
     Then the launcher exits from the signal with code 143
+    And the terminal is restored to the normal screen
+
+  @id:dash-ctrl-c-restores-terminal @requires-os:linux
+  Scenario: dash-14 - Typing Ctrl-C in the dashboard restores the terminal and exits 130
+    # The gesture a user actually performs, and the one nothing covered. While
+    # the TUI holds the terminal in raw mode the driver's ISIG translation is off
+    # (ENABLE_PROCESSED_INPUT on Windows), so this keystroke is delivered to the
+    # process as the byte 0x03 — an ordinary key event — and never becomes a
+    # SIGINT. The signal watcher therefore cannot see it: before this was handled
+    # as a key, pressing Ctrl-C in the dashboard did nothing at all and left the
+    # user in a raw-mode terminal. The step sends the literal byte, not a signal,
+    # so it fails if the handling regresses to relying on the signal path.
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the terminal is restored to the normal screen
+
+  @id:dash-launcher-ctrl-c-restores-terminal @requires-os:linux
+  Scenario: dash-15 - Typing Ctrl-C at the launcher front door restores the terminal and exits 130
+    # The same keystroke at the hub's synchronous menu. That loop is a separate
+    # key loop from the dashboard's and had no Ctrl-C handling at all, so the
+    # gesture left bare `rocm` sitting at the front door in raw mode. Both loops
+    # must route it through the one restore path, or the key means different
+    # things in the two windows of the same process.
+    When the user opens the launcher
+    Then the launcher front door is displayed
+    When the user presses Ctrl-C in the launcher
+    Then the launcher exits from the keystroke with code 130
     And the terminal is restored to the normal screen

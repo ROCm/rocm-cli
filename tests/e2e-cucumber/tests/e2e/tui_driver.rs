@@ -89,7 +89,12 @@ pub fn default_timeout() -> Duration {
 pub enum TermSignal {
     /// SIGTERM — a supervisor stopping the dashboard (`kill <pid>`).
     Term,
-    /// SIGINT — the interactive Ctrl-C gesture delivered as a signal.
+    /// SIGINT — an externally delivered `kill -INT` from another process.
+    ///
+    /// Deliberately NOT described as "the Ctrl-C gesture": while the TUI holds
+    /// the terminal in raw mode the driver's `ISIG` translation is off, so a
+    /// typed Ctrl-C never becomes a SIGINT. That gesture is a different code
+    /// path and is covered by [`TuiSession::press_ctrl_c_and_wait`].
     Int,
 }
 
@@ -535,9 +540,32 @@ impl TuiSession {
         Ok(())
     }
 
+    /// Type a literal Ctrl-C at the TUI and wait for it to exit, stashing the
+    /// observed code for the scenario's `Then` steps.
+    ///
+    /// Sends the raw byte `0x03` — what a terminal actually transmits for the
+    /// keystroke — rather than a signal, and that distinction is the point.
+    /// While the TUI holds the terminal in raw mode, `ISIG` is off (and
+    /// `ENABLE_PROCESSED_INPUT` on Windows), so the driver does not turn the
+    /// keystroke into SIGINT: nothing in the process ever sees a signal, and the
+    /// byte arrives as an ordinary key event. Only sending it covers the gesture
+    /// a user performs; [`deliver_signal_and_wait`](Self::deliver_signal_and_wait)
+    /// covers the externally delivered signal, which is a genuinely different
+    /// path.
+    ///
+    /// As there, only harness faults are `Err`; the exit *value* and terminal
+    /// restoration are asserted by the scenario's `Then` steps.
+    pub async fn press_ctrl_c_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        self.send("\u{3}")?;
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
     /// The exit code recorded by the most recent
-    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait), read back by
-    /// the scenario's `Then` step to assert the conventional `128 + signo` value.
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) or
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait), read back by the
+    /// scenario's `Then` step to assert the expected `128 + signo` value.
     #[must_use]
     pub const fn observed_exit_code(&self) -> Option<i32> {
         self.observed_exit_code
