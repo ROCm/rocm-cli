@@ -98,6 +98,33 @@ async fn assert_preview_accepted(world: &mut E2eWorld) {
     );
 }
 
+#[then("the preview has not installed anything")]
+async fn assert_preview_installed_nothing(world: &mut E2eWorld) {
+    // The half of the contract that outlives the defect. Once `--dry-run` is
+    // accepted, this scenario stops pinning a bug and becomes a guard — and a
+    // guard that only checked the command was ALLOWED would be satisfied by a
+    // binary that accepted the preview and then performed the update, which is
+    // the one outcome a preview must never produce.
+    //
+    // Asked of the CLI's own report rather than of the filesystem, keyed on the
+    // line `update-01` already pins, so it reads the machine the way a user
+    // would. Host-invariant: this scenario runs against an isolated and empty
+    // `ROCM_CLI_DATA_DIR`, so nothing is managed before the preview and any
+    // runtime named after it was installed by the preview.
+    //
+    // Today this never runs — the step above fails first on the usage error —
+    // so it neither weakens nor satisfies the row that pins EAI-8010.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update"]);
+    assert_eq!(
+        rc, 0,
+        "could not read back what the machine manages after the preview:\n{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("managed runtimes: none"),
+        "previewing an update installed a runtime; the machine managed none before it:\n{stdout}"
+    );
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn ok_output(world: &E2eWorld) -> String {
