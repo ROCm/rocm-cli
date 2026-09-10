@@ -84,6 +84,20 @@ pub fn choice_for(sel: usize) -> LauncherChoice {
         .map_or(LauncherChoice::OpenDashboard, |(_, _, _, c)| *c)
 }
 
+/// Move the selection cursor one step, wrapping around `row_count`.
+///
+/// `forward` selects the next row (Down/j/Right); otherwise the previous row
+/// (Up/k/Left). Pulled out of `run_launcher`'s event loop so the wrapping
+/// arithmetic is unit-testable without a real terminal.
+#[must_use]
+pub const fn move_selection(sel: usize, row_count: usize, forward: bool) -> usize {
+    if forward {
+        (sel + 1) % row_count
+    } else {
+        (sel + row_count - 1) % row_count
+    }
+}
+
 /// True when a model is actively serving (drives the running vs idle variant).
 fn is_running(state: &AppState) -> bool {
     state.instances.values().any(|i| i.status.is_serving())
@@ -234,7 +248,7 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ move   Enter select   d dashboard   q quit",
+        "↑↓←→ move   Enter select   d dashboard   q quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);
@@ -301,9 +315,11 @@ pub fn run_launcher(
             KeyCode::Char('q') | KeyCode::Esc => break None,
             KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
             KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % row_count(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                sel = (sel + row_count() - 1) % row_count();
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                sel = move_selection(sel, row_count(), true);
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                sel = move_selection(sel, row_count(), false);
             }
             _ => {}
         }
@@ -462,6 +478,28 @@ mod tests {
         assert_eq!(ROWS[0].3, LauncherChoice::SetUp);
         assert_eq!(ROWS[1].1, "Serve a model");
         assert_eq!(ROWS[1].3, LauncherChoice::Serve);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        // Right must move the selection identically to Down, and Left
+        // identically to Up — `move_selection`'s `forward` flag is the only
+        // thing standing in for the aliased key, so compare it against the
+        // exact wrapping formulas the run_launcher match arms used to inline.
+        let rc = row_count();
+        let mut sel = 0usize;
+        for _ in 0..10 {
+            let via_right = move_selection(sel, rc, true);
+            let via_down = (sel + 1) % rc;
+            assert_eq!(via_right, via_down, "Right must match Down");
+            sel = via_right;
+        }
+        for _ in 0..10 {
+            let via_left = move_selection(sel, rc, false);
+            let via_up = (sel + rc - 1) % rc;
+            assert_eq!(via_left, via_up, "Left must match Up");
+            sel = via_left;
+        }
     }
 
     #[test]

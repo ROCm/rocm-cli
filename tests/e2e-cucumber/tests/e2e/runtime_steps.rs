@@ -128,6 +128,8 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Name the runtime rather than leaving the CLI to infer it: the shared tree
     // grows a second runtime whenever the channel index publishes one, and the
@@ -137,7 +139,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.activate_shared_runtime();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
-        !stdout.contains("installed: none"),
+        !stdout.contains("active_runtime_key: <unset>"),
         "no managed runtime is active:\n{stdout}"
     );
 }
@@ -152,6 +154,8 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
         crate::run_rocm_ok(world, &["install", "sdk"]);
+    } else {
+        activate_shared_runtime_if_unset(world, &stdout);
     }
     // Same reason as `a managed runtime is active`: pin the runtime explicitly,
     // or the serve that follows refuses to pick one. Not for `assert_engine_ready`
@@ -159,6 +163,26 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     // the active key, which is exactly why it cannot stand in for this call.
     world.activate_shared_runtime();
     assert_engine_ready(world);
+}
+
+/// Point a pre-warmed shared tree at its canonical runtime when nothing is
+/// active yet.
+///
+/// The pre-warm activates what it installs, but the marker lives in the shared
+/// tree while `active_runtime_key` is read per scenario, and a repaired tree
+/// holds a superseded runtime beside its replacement. Left unset, the CLI
+/// refuses to auto-select from more than one runtime and every serve behind this
+/// precondition fails for a reason that names none of this.
+fn activate_shared_runtime_if_unset(world: &mut E2eWorld, runtimes: &str) {
+    if !runtimes.contains("active_runtime_key: <unset>") {
+        return;
+    }
+    let runtime_key = e2e_cucumber::capability::canonical_wheel_runtime_key(runtimes)
+        .unwrap_or_else(|| {
+            panic!("shared runtime tree has no canonical wheel runtime:\n{runtimes}")
+        })
+        .to_owned();
+    crate::run_rocm_ok(world, &["runtimes", "activate", &runtime_key]);
 }
 
 /// Record the torch-alignment opt-out for this scenario's next `rocm` command.
@@ -409,6 +433,211 @@ fn assert_engine_ready(world: &mut E2eWorld) {
         "no engine runtime is ready:\n{stdout}"
     );
 }
+#[when("the user dry-runs a nightly SDK install for a known family")]
+async fn user_dry_runs_nightly_sdk(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx120X-all",
+            "--dry-run",
+        ],
+    );
+    world.cli_output = Some(stdout);
+}
+
+/// The value of a `  <key>: <value>` line in the stored `install sdk` preview.
+///
+/// The preview is the whole of what a user can check before committing to a
+/// multi-GiB install, so a key that is not there is a failure carrying the
+/// output rather than a silent `None`.
+fn preview_field<'a>(output: &'a str, key: &str) -> &'a str {
+    super::examine_steps::field_value(output, key)
+        .unwrap_or_else(|| panic!("the SDK preview has no `{key}` line:\n{output}"))
+}
+
+/// The `rocm[...]==<version>` requirement from the preview's `package_specs`
+/// line, which is always the first of the four pinned packages.
+fn preview_rocm_spec(output: &str) -> &str {
+    preview_field(output, "package_specs")
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("the SDK preview plans to install nothing:\n{output}"))
+}
+
+/// The extras inside a `rocm[...]==<version>` requirement.
+fn requested_rocm_extras(rocm_spec: &str) -> &str {
+    rocm_spec
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map_or_else(
+            || panic!("the SDK preview requests no extras at all: {rocm_spec}"),
+            |(extras, _)| extras,
+        )
+}
+
+#[then("the SDK preview reports canonical nightly provenance")]
+async fn assert_canonical_nightly_provenance(world: &mut E2eWorld) {
+    const AGGREGATE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+    let output = world.cli_output.as_deref().expect("no SDK preview output");
+
+    assert_eq!(
+        preview_field(output, "channel"),
+        "nightly",
+        "the preview is not previewing the nightly channel:\n{output}"
+    );
+    // `canonical_source` is the source the CLI declares it will read;
+    // `index_url` is the one it actually read. They are separate lines because
+    // the resolver is what drifted in rocm-cli#271, and a declaration that
+    // disagrees with it is worse than either alone.
+    assert_eq!(
+        preview_field(output, "canonical_source"),
+        AGGREGATE,
+        "the preview declares a source other than the canonical nightly aggregate:\n{output}"
+    );
+    assert_eq!(
+        preview_field(output, "index_url"),
+        AGGREGATE,
+        "the nightly install resolved something other than the canonical aggregate:\n{output}"
+    );
+    assert_eq!(
+        preview_field(output, "source_layout_generation"),
+        "multi-arch-v2",
+        "the preview read the aggregate as some other layout:\n{output}"
+    );
+    // A `selected_rocm_version` line is provenance only if it names the version
+    // that is about to be installed. On its own the line is present whatever it
+    // says, which is why it is asserted against the pin rather than for its own
+    // existence.
+    let version = preview_field(output, "selected_rocm_version");
+    let rocm_spec = preview_rocm_spec(output);
+    assert!(
+        rocm_spec.ends_with(&format!("=={version}")),
+        "the preview reports `selected_rocm_version: {version}` but plans to install \
+         `{rocm_spec}`:\n{output}"
+    );
+}
+
+#[when("the user dry-runs a release SDK install for this host")]
+async fn user_dry_runs_release_sdk(world: &mut E2eWorld) {
+    // Deliberately no `--family`: the device payload is chosen from the chip the
+    // CLI detects, so passing a family would override the thing under test.
+    // `--dry-run` keeps it to a plan — no venv, no download.
+    let stdout = crate::run_rocm_ok(
+        world,
+        &["install", "sdk", "--channel", "release", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the SDK preview reports canonical release provenance")]
+async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
+    const AGGREGATE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+    let output = world.cli_output.as_deref().expect("no SDK preview output");
+
+    assert_eq!(
+        preview_field(output, "channel"),
+        "release",
+        "the preview is not previewing the release channel:\n{output}"
+    );
+    // rocm-cli#271 was this URL with `/{family}` glued on the end: a per-family
+    // index frozen at 7.13.0 that publishes no device payloads at all. The
+    // release channel now reads one flat aggregate, and `index_url` is the line
+    // that says so — the URL the resolver chose, not the one it advertises.
+    assert_eq!(
+        preview_field(output, "canonical_source"),
+        AGGREGATE,
+        "the preview declares a source other than the canonical release aggregate:\n{output}"
+    );
+    assert_eq!(
+        preview_field(output, "index_url"),
+        AGGREGATE,
+        "the release install resolved something other than the flat aggregate index:\n{output}"
+    );
+    assert_eq!(
+        preview_field(output, "source_layout_generation"),
+        "multi-arch-v2",
+        "the preview read the aggregate as some other layout:\n{output}"
+    );
+    // The release channel installs stable versions only, and a stable version
+    // encodes no build date. Reporting that instead of a date is the honest
+    // form; a date here would mean a nightly reached the stable stream.
+    assert_eq!(
+        preview_field(output, "build_date"),
+        "not encoded in stable version",
+        "the release preview reported a build date:\n{output}"
+    );
+    // Asserting a version literal would pin whatever is current today. The
+    // falsifiable claim is that the version the provenance block reports is the
+    // version the plan pins — a block that reports one and installs another is
+    // the failure a user has no way to see.
+    let version = preview_field(output, "selected_rocm_version");
+    let rocm_spec = preview_rocm_spec(output);
+    assert!(
+        rocm_spec.ends_with(&format!("=={version}")),
+        "the preview reports `selected_rocm_version: {version}` but plans to install \
+         `{rocm_spec}`:\n{output}"
+    );
+}
+
+#[then("the SDK preview requests the device payload for this host's GPU")]
+async fn assert_release_device_payload(world: &mut E2eWorld) {
+    // Read the chip from the CLI's own detection surface rather than from this
+    // harness's host probe. That makes this a claim about two commands agreeing
+    // on which GPU is present, instead of a restatement of the plan.
+    let examine = crate::run_rocm_ok(world, &["examine"]);
+    // `examine` always prints the line, using `<unknown>` when it found nothing,
+    // so the placeholder has to be rejected explicitly — otherwise a host that
+    // reached here without a detectable GPU fails on the comparison below and
+    // reads as a device-selection bug rather than a scenario running where it
+    // should not.
+    let detected = super::examine_steps::field_value(&examine, "detected_gfx_target")
+        .filter(|target| target.starts_with("gfx"))
+        .unwrap_or_else(|| panic!("`rocm examine` detected no AMD GPU on this host:\n{examine}"));
+    // Some detection paths append feature flags to the target
+    // (`gfx90a:sramecc+:xnack-`); the payload is published under the bare chip.
+    let detected = detected.split(':').next().unwrap_or(detected);
+
+    let output = world.cli_output.as_deref().expect("no SDK preview output");
+
+    // Without this the next assertion would only say the payload matches
+    // whatever family the command line asked for. The scenario passes no
+    // `--family`, so anything but `host` means something else resolved it and
+    // the match below is no longer about this machine.
+    assert_eq!(
+        preview_field(output, "target_family_source"),
+        "host",
+        "the preview did not resolve its target family from the host:\n{output}"
+    );
+
+    // The payload is the detected chip verbatim: not the family bucket, not a
+    // neighbouring stepping. `undetermined` lands here too, and the reason the
+    // CLI gives for it is in the attached output.
+    let planned = preview_field(output, "device_target");
+    assert_eq!(
+        planned, detected,
+        "`rocm examine` detected {detected} but the install plans the {planned} device \
+         payload:\n{output}"
+    );
+    assert_eq!(
+        requested_rocm_extras(preview_rocm_spec(output)),
+        format!("libraries,devel,device-{detected}"),
+        "the install does not request exactly this host's device payload:\n{output}"
+    );
+
+    // The every-GPU payload was the previous answer whenever a chip could not be
+    // named: on an Instinct host it fetched 24 device wheels, roughly 4.3 GiB, to
+    // use one of them, and left the post-install probe reporting the first of the
+    // 24 as the target family. It is gone from the CLI; this is what keeps it out.
+    assert!(
+        !output.contains("device-all"),
+        "the install plans the every-GPU payload instead of this host's:\n{output}"
+    );
+}
 
 #[when("the user tries to adopt the existing install")]
 async fn user_tries_adopt(world: &mut E2eWorld) {
@@ -508,7 +737,13 @@ fn active_runtime_key(world: &E2eWorld) -> Option<String> {
 /// form used when the index cannot be reached. `xtask e2e-prewarm` routes on
 /// exactly these, so a rename here must break this scenario rather than silently
 /// turn every pre-warm into a no-op reuse.
-const UPDATE_STATUSES: [&str; 4] = ["up_to_date", "update_available", "ahead_of_index", "error"];
+const UPDATE_STATUSES: [&str; 5] = [
+    "up_to_date",
+    "update_available",
+    "repair_available",
+    "ahead_of_index",
+    "error",
+];
 
 #[then("the report states the runtime's freshness against the channel index")]
 async fn assert_update_reports_freshness(world: &mut E2eWorld) {
