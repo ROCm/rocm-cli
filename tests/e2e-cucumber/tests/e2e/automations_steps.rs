@@ -74,6 +74,13 @@ fn slug_of(display_name: &str) -> String {
 /// ambiguous forms below — a parenthesised token, a trailing column, a
 /// dash-separated tail — be read as an id without mistaking a display-name
 /// qualifier ("Server recovery (beta)") for one.
+///
+/// A separator-less id would not match here, which is deliberate: in those
+/// ambiguous positions a bare lowercase word is indistinguishable from display
+/// text, and accepting it is the false positive this exists to prevent. Such an
+/// id is still recognised through the shapes that need no disambiguation — a
+/// bracketed header token, or an `id`/`identifier`/`slug` detail line — so the
+/// requirement narrows the guess, never the contract.
 fn is_identifier_shaped(token: &str) -> bool {
     !token.is_empty()
         && token.contains(['-', '_'])
@@ -97,26 +104,31 @@ fn is_identifier_shaped(token: &str) -> bool {
 /// Returns `None` only when the block names no identifier at all, which is
 /// today's defect.
 fn exposed_identifier(block: &[&str]) -> Option<String> {
-    // A detail line that names the id outright.
-    for line in block {
-        let line = line.trim();
-        for key in [
-            "id:",
-            "id =",
-            "identifier:",
-            "identifier =",
-            "slug:",
-            "slug =",
-            "key:",
-            "key =",
-            "name:",
-            "name =",
-        ] {
-            if let Some(rest) = line.strip_prefix(key) {
+    // A detail line that names the id outright. Keys are tried in two tiers,
+    // each swept across the WHOLE block before the next: `id`/`identifier`/
+    // `slug` mean nothing but an identifier, so they win wherever they appear,
+    // while `key`/`name` are ambiguous and must additionally look like an id.
+    // Tiering rather than taking the first matching line is what stops a fix
+    // that prints `name: Server recovery` above its `id:` line from yielding
+    // the display name.
+    for (keys, must_look_like_an_id) in [
+        (["id", "identifier", "slug"].as_slice(), false),
+        (["key", "name"].as_slice(), true),
+    ] {
+        for line in block {
+            let line = line.trim();
+            for key in keys {
+                let Some(rest) = line
+                    .strip_prefix(&format!("{key}:"))
+                    .or_else(|| line.strip_prefix(&format!("{key} =")))
+                else {
+                    continue;
+                };
                 let id = rest.trim().trim_matches(|c| c == '"' || c == '`');
-                if !id.is_empty() {
-                    return Some(id.to_owned());
+                if id.is_empty() || (must_look_like_an_id && !is_identifier_shaped(id)) {
+                    continue;
                 }
+                return Some(id.to_owned());
             }
         }
     }

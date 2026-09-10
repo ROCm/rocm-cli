@@ -261,4 +261,4 @@ reason = "`rocm dash --replay` opens the interactive dashboard on a recording th
 [["engine-shell-activation-hint-is-usable"]]
 when = {}
 bug = "EAI-8049"
-reason = "`engines shell` prints an activation hint whose path does not exist, because the recorded env_path already includes the interpreter directory."
+reason = "`engines shell` prints an activation hint whose path does not exist, because the recorded env_path already includes the interpreter directory. The scenario plants a manifest in that recorded shape, so it clears only when the hint is composed correctly for an already-recorded env_path — changing what a fresh install writes does not on its own repair the environments already on disk."
