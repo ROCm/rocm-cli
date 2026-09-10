@@ -155,11 +155,11 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     if stdout.contains("installed: none") {
         // `--yes` for the same reason the sibling `a managed runtime is active`
         // passes it: the harness spawns `rocm` with null stdin, so anything the
-        // overwrite gate does not read as a fresh install refuses rather than
-        // prompts. The `installed: none` guard makes this a fresh install today,
-        // so the flag changes nothing — it keeps the step correct if that guard
-        // ever loosens, instead of failing the lane at a prompt nothing can
-        // answer.
+        // consent gate does not read as an install with no active default
+        // refuses rather than prompts. `installed: none` no longer implies that
+        // on its own — the gate now keys on the config's active default, and a
+        // shared tree can carry one from a scenario that ran earlier — so the
+        // flag is load-bearing here, not just defensive.
         crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     } else {
         activate_shared_runtime_if_unset(world, &stdout);
@@ -213,7 +213,7 @@ async fn user_installs_sdk(world: &mut E2eWorld) {
     // exit code is still asserted here, with the same diagnostic bundle
     // `run_rocm_ok` prints: an install that failed leaves every Then behind it
     // reading output that was never produced. `--yes` keeps the install
-    // non-interactive-safe: the e2e harness runs with null stdin, so an overwrite
+    // non-interactive-safe: the e2e harness runs with null stdin, so the consent
     // prompt would otherwise refuse rather than proceed.
     let args = ["install", "sdk", "--yes"];
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
@@ -237,6 +237,33 @@ async fn user_reinstalls_sdk_without_yes(world: &mut E2eWorld) {
 async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
     let stdout = crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     world.cli_output = Some(stdout);
+}
+
+/// TheRock package families this step may ask for, in preference order. Real
+/// published names, not placeholders: an unknown family is rejected during
+/// resolution, which would exit non-zero for a reason that has nothing to do
+/// with the consent gate and would still satisfy "the reinstall is refused".
+const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
+
+#[when("the user installs a different GPU family without confirming")]
+async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
+    // Pick a family the active runtime is not, rather than hard-coding one:
+    // this lane's GPU decides what the `Given` installed, and naming that same
+    // family would silently collapse this scenario into Scenario runtime-10.
+    // The runtime key carries the family, so the registry listing is enough.
+    let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let family = OTHER_FAMILY_CANDIDATES
+        .iter()
+        .find(|candidate| !runtimes.contains(*candidate))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
+        });
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["install", "sdk", "--family", family]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
 }
 
 #[when("the user installs the SDK again")]
@@ -708,13 +735,14 @@ async fn assert_install_reported_yes_approval(world: &mut E2eWorld) {
     // The registered-and-active Thens are true from the `Given` alone, so they
     // cannot tell an approved reinstall from a no-op. This asserts the approved
     // branch was actually taken: with `--yes` the gate resolves to
-    // `ProceedApproved`, whose only externally visible signal is this line. The
-    // `Approved by --yes:` prefix is what discriminates — the fresh-install line
-    // ("No existing ROCm SDK found") does not carry it, so if `--yes` regressed
-    // to a refusal, or the install silently took the fresh path, this fails.
+    // `ProceedApproved(AssumeYes)`, whose only externally visible signal is this
+    // line. The `Approved by --yes:` prefix is what discriminates — the
+    // fresh-install line ("No active ROCm SDK runtime is configured") does not
+    // carry it, so if `--yes` regressed to a refusal, or the install silently
+    // took the fresh path, this fails.
     let output = world.cli_output.as_deref().expect("no install output");
     assert!(
-        output.contains("Approved by --yes: an existing ROCm SDK was found"),
+        output.contains("Approved by --yes: an existing ROCm SDK is the active default runtime"),
         "reinstall with --yes did not report the approved replacement:\n{output}"
     );
 }
@@ -880,5 +908,26 @@ async fn assert_reinstall_error_explains_yes(world: &mut E2eWorld) {
     assert!(
         combined.contains("--yes"),
         "error does not mention --yes:\n{stdout}\n{stderr}"
+    );
+}
+
+#[then("the error names the active default runtime it would replace")]
+async fn assert_error_names_active_default(world: &mut E2eWorld) {
+    // What distinguishes the consent gate from any other non-zero exit that
+    // happens to print `--yes` in a usage line: only the gate reports the
+    // runtime it is about to displace, and for a family the host has never
+    // installed it must report the *active default* rather than claiming no SDK
+    // exists. Without this Then, a family the resolver rejected outright would
+    // satisfy the scenario.
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("is the active default runtime"),
+        "error does not name the active default runtime it would replace:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        combined.contains("replaces active default"),
+        "error does not describe the cross-family displacement:\n{stdout}\n{stderr}"
     );
 }

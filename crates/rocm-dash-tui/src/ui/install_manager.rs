@@ -154,10 +154,11 @@ impl InstallManagerState {
         if self.dry_run {
             args.push("--dry-run".to_string());
         } else {
-            // The dashboard spawns `rocm` with null stdin, so a real install that
-            // would overwrite an existing SDK cannot answer the confirmation
-            // prompt and would refuse. Pass `--yes` so the dashboard install
-            // proceeds; the dry-run preview never mutates, so it needs no flag.
+            // The dashboard spawns `rocm` with null stdin, so a real install
+            // that would displace the active default runtime cannot answer the
+            // confirmation prompt and would refuse. Pass `--yes` so the
+            // dashboard install proceeds; the dry-run preview never mutates, so
+            // it needs no flag.
             args.push("--yes".to_string());
         }
         Ok(args)
@@ -485,7 +486,7 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--prefix", "/opt/rocm-sdk"]));
         assert!(!args.contains(&"--dry-run".to_string()));
         // A real (non-dry-run) install must carry --yes so the null-stdin
-        // dashboard spawn is not refused at the overwrite prompt.
+        // dashboard spawn is not refused at the consent prompt.
         assert!(args.contains(&"--yes".to_string()));
     }
 

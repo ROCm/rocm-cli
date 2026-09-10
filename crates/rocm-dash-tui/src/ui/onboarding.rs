@@ -191,7 +191,7 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         "--format".to_string(),
         "wheel".to_string(),
         // Onboarding installs are spawned with null stdin, so a would-be
-        // overwrite prompt cannot be answered and the install would refuse.
+        // consent prompt cannot be answered and the install would refuse.
         // `--yes` keeps the first-run install non-interactive.
         "--yes".to_string(),
     ];

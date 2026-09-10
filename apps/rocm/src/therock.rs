@@ -758,6 +758,11 @@ pub(crate) fn install_sdk(
 ) -> Result<SdkInstallResult> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
+    let consent = if assume_yes {
+        SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes)
+    } else {
+        SdkInstallConsent::Ask
+    };
     match format {
         "wheel" => install_wheel_runtime(
             paths,
@@ -767,13 +772,13 @@ pub(crate) fn install_sdk(
             None,
             version_selector.as_ref(),
             dry_run,
-            assume_yes,
+            consent,
         ),
         "tarball" => {
             if version_selector.is_some() {
                 bail!("specific TheRock version selection is only supported for wheel installs")
             }
-            install_tarball_runtime(paths, channel, prefix, family_override, dry_run, assume_yes)
+            install_tarball_runtime(paths, channel, prefix, family_override, dry_run, consent)
         }
         other => bail!("unsupported install format: {other}"),
     }
@@ -781,10 +786,15 @@ pub(crate) fn install_sdk(
 
 /// Apply an update using the exact family and device payload resolved by its plan.
 ///
-/// `assume_yes` is passed through to the same approval gate `install_sdk` uses.
-/// Callers pass `true` unconditionally: an update targets the family and channel
-/// of the runtime it was resolved from, so displacing that runtime as the active
-/// default is the operation the user asked for, not a side effect of it.
+/// Consent is preapproved rather than asked for: the update targets the runtime
+/// the user selected (or the active default), so installing over it is the
+/// operation requested, and `rocm update` has no `--yes` flag and no terminal
+/// contract — reaching a prompt here would only fail the command.
+///
+/// `activate_after_install` mirrors `rocm update --apply --activate` so the
+/// approval line can state what will actually happen. Without it,
+/// `apply_runtime_update` installs beside the active default and leaves the
+/// default untouched, so the line must not claim an activation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk_for_update(
     paths: &AppPaths,
@@ -793,10 +803,13 @@ pub(crate) fn install_sdk_for_update(
     family: &str,
     device_target: Option<&str>,
     dry_run: bool,
-    assume_yes: bool,
+    activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
+    let consent = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::UpdateApply {
+        activates: activate_after_install,
+    });
     match format {
         "wheel" => install_wheel_runtime(
             paths,
@@ -806,11 +819,9 @@ pub(crate) fn install_sdk_for_update(
             device_target,
             None,
             dry_run,
-            assume_yes,
+            consent,
         ),
-        "tarball" => {
-            install_tarball_runtime(paths, channel, None, Some(family), dry_run, assume_yes)
-        }
+        "tarball" => install_tarball_runtime(paths, channel, None, Some(family), dry_run, consent),
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -1258,7 +1269,7 @@ fn install_wheel_runtime(
     device_target_override: Option<&str>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
-    assume_yes: bool,
+    consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
@@ -1457,29 +1468,28 @@ fn install_wheel_runtime(
         ));
     }
 
-    // Fresh installs proceed with just an informational line. Only an install
-    // that displaces an existing managed SDK for this family/channel as the
-    // active default asks for confirmation (and needs `--yes` when there is no
-    // terminal to answer the prompt).
-    let existing = existing_runtime_relation(
+    // Installs with no active default runtime proceed with just an informational
+    // line. Any install that would displace the current active default — whatever
+    // its family or channel, because activation is global — asks for confirmation
+    // (and needs `--yes` when there is no terminal to answer the prompt).
+    let existing = active_default_runtime_relation(
         paths,
         channel,
         &resolution.family,
         &resolution.latest_version,
     )?;
-    match sdk_install_approval(existing.is_some(), assume_yes, interactive_terminal()) {
+    match sdk_install_approval(existing.is_some(), consent, interactive_terminal()) {
         SdkInstallApproval::ProceedFresh => {
-            progress_line(format!(
-                "No existing ROCm SDK found; installing ROCm SDK {} for family {}.",
-                runtime_version_display(&resolution.latest_version),
-                resolution.family
+            progress_line(fresh_install_line(
+                &runtime_version_display(&resolution.latest_version),
+                &resolution.family,
             ));
         }
-        SdkInstallApproval::ProceedApproved => {
-            progress_line(format!(
-                "Approved by --yes: an existing ROCm SDK was found ({}); installing ROCm {}, which becomes the active default runtime.",
+        SdkInstallApproval::ProceedApproved(source) => {
+            progress_line(preapproved_install_line(
+                source,
                 existing.as_deref().unwrap_or_default(),
-                runtime_version_display(&resolution.latest_version)
+                &runtime_version_display(&resolution.latest_version),
             ));
         }
         SdkInstallApproval::PromptOverwrite => {
@@ -1497,10 +1507,9 @@ fn install_wheel_runtime(
             }
         }
         SdkInstallApproval::RefuseNonInteractive => {
-            bail!(
-                "an existing ROCm SDK was found ({}); continuing would make the newly installed ROCm the active default runtime. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`",
+            bail!(refuse_non_interactive_message(
                 existing.as_deref().unwrap_or_default()
-            );
+            ));
         }
     }
 
@@ -1683,40 +1692,76 @@ fn quote_display_arg(value: &str) -> String {
     }
 }
 
-/// Classify how the version rocm-cli is about to install relates to the managed
-/// runtime it would displace as the active default — the newest existing install
-/// for the same GPU family and channel. Returns `None` when no such runtime
-/// exists (a fresh install for this family/channel).
+/// Describe the managed runtime this install would displace as the active
+/// default: the one the runtime config's `active_runtime_key` (or an
+/// unambiguous `default_runtime_id`) currently resolves to. Returns `None` only
+/// when no active default resolves — a genuinely fresh install, where the new
+/// runtime takes a slot nothing occupies and there is nothing to consent to.
 ///
-/// Errors reading the manifest directory are propagated rather than treated as
-/// "no existing runtime": silently falling back to a fresh-install verdict on a
-/// read error would skip the overwrite confirmation gate precisely when we are
-/// least sure whether an existing SDK is present.
-fn existing_runtime_relation(
+/// Deliberately NOT scoped to the target family and channel. Activation is
+/// global: `finalize_successful_sdk_install` activates whatever was just
+/// installed regardless of family or channel, so `rocm install sdk --family
+/// gfx120X-all` displaces an active `gfx110X-all` runtime just as surely as a
+/// same-family upgrade does. A family/channel-scoped gate would wave exactly
+/// that case through unconfirmed while every message promised otherwise.
+///
+/// Errors reading the manifest directory or the config are propagated rather
+/// than treated as "no active default": silently falling back to a
+/// fresh-install verdict on a read error would skip the confirmation gate
+/// precisely when we are least sure what is currently active.
+fn active_default_runtime_relation(
     paths: &AppPaths,
     channel: TheRockChannel,
     family: &str,
     resolved_version: &str,
 ) -> Result<Option<String>> {
     let manifests = load_runtime_manifests(paths)?;
-    let mut matching = manifests
-        .into_iter()
-        .filter(|manifest| manifest.family == family && manifest.channel == channel.as_str())
-        .collect::<Vec<_>>();
-    matching.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
-    let Some(existing) = matching.into_iter().next() else {
+    let config = RocmCliConfig::load(paths)?;
+    let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
         return Ok(None);
     };
-    let relation = match compare_version_strings(resolved_version, &existing.version) {
-        Ordering::Greater => "upgrade",
-        Ordering::Less => "downgrade",
-        Ordering::Equal => "reinstall",
-    };
-    Ok(Some(format!(
-        "{relation} from installed {installed} ({key})",
-        installed = runtime_version_display(&existing.version),
-        key = existing.runtime_key
+    Ok(Some(active_default_relation_text(
+        active,
+        channel,
+        family,
+        resolved_version,
     )))
+}
+
+/// Pure wording for [`active_default_runtime_relation`].
+///
+/// Two shapes, because the two cases are not the same event. When the active
+/// default is the same family and channel the install targets, the version
+/// comparison is meaningful and the user wants to read "upgrade"/"downgrade"/
+/// "reinstall". When it is a different family or channel, comparing versions
+/// would invent a relation between two unrelated runtimes, so the text names
+/// what is actually being displaced instead.
+fn active_default_relation_text(
+    active: &InstalledRuntimeManifest,
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+) -> String {
+    if active.family == family && active.channel == channel.as_str() {
+        let relation = match compare_version_strings(resolved_version, &active.version) {
+            Ordering::Greater => "upgrade",
+            Ordering::Less => "downgrade",
+            Ordering::Equal => "reinstall",
+        };
+        format!(
+            "{relation} from installed {installed} ({key})",
+            installed = runtime_version_display(&active.version),
+            key = active.runtime_key
+        )
+    } else {
+        format!(
+            "replaces active default {installed} for family {active_family} on the {active_channel} channel ({key})",
+            installed = runtime_version_display(&active.version),
+            active_family = active.family,
+            active_channel = active.channel,
+            key = active.runtime_key
+        )
+    }
 }
 
 /// The host's legacy/system ROCm version when it is strictly newer than the
@@ -1784,45 +1829,116 @@ fn repo_version_without_wheels(
     }
 }
 
+/// Where an already-granted approval for displacing the active default came
+/// from. Carried rather than collapsed to a bare bool so the line the CLI
+/// prints can name the real source: `rocm update --apply` has no `--yes` flag,
+/// so a message crediting one would name a flag the user could not have passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SdkInstallApprovalSource {
+    /// The user passed `--yes` to `rocm install sdk`.
+    AssumeYes,
+    /// `rocm update --apply`, which owns its own consent: the user named the
+    /// runtime to update, so replacing it is the operation asked for. Non-
+    /// interactive by construction, so it must never reach a prompt.
+    ///
+    /// `activates` records whether `--activate` was given. Only then does the
+    /// new install become the active default; without it `apply_runtime_update`
+    /// leaves the current default alone and prints a `runtimes activate` hint.
+    UpdateApply { activates: bool },
+}
+
+/// How consent for displacing the active default runtime is obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SdkInstallConsent {
+    /// Ask the user: prompt when a terminal is attached, refuse when not.
+    Ask,
+    /// Already granted before the install started, by the named source.
+    Preapproved(SdkInstallApprovalSource),
+}
+
 /// Whether a real SDK install needs the user's approval before it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SdkInstallApproval {
-    /// No existing managed SDK for this family+channel — install without asking.
+    /// No active default runtime — nothing is displaced, so install without asking.
     ProceedFresh,
-    /// An existing SDK is present and `--yes` was given — displace it as the
-    /// active default without asking.
-    ProceedApproved,
-    /// An existing SDK is present and there is a terminal — prompt before
-    /// displacing it as the active default.
+    /// An active default runtime exists and consent was already granted —
+    /// displace it without asking, crediting the source.
+    ProceedApproved(SdkInstallApprovalSource),
+    /// An active default runtime exists and there is a terminal — prompt before
+    /// displacing it.
     PromptOverwrite,
-    /// An existing SDK is present but there is no terminal and no `--yes` — refuse.
+    /// An active default runtime exists but there is no terminal and no
+    /// preapproval — refuse.
     RefuseNonInteractive,
 }
 
-/// Decide whether an SDK install proceeds, prompts, or is refused. Fresh installs
-/// (no `existing` runtime) always proceed; displacing an existing SDK as the
-/// active default needs confirmation, and outside an interactive terminal that
-/// confirmation must come from `--yes`.
+/// Decide whether an SDK install proceeds, prompts, or is refused. Installs with
+/// no active default runtime to displace (`existing == false`) always proceed;
+/// displacing the active default needs consent, and outside an interactive
+/// terminal that consent must have been granted up front.
 const fn sdk_install_approval(
     existing: bool,
-    assume_yes: bool,
+    consent: SdkInstallConsent,
     interactive: bool,
 ) -> SdkInstallApproval {
-    if !existing {
-        SdkInstallApproval::ProceedFresh
-    } else if assume_yes {
-        SdkInstallApproval::ProceedApproved
-    } else if interactive {
-        SdkInstallApproval::PromptOverwrite
-    } else {
-        SdkInstallApproval::RefuseNonInteractive
+    match (existing, consent) {
+        (false, _) => SdkInstallApproval::ProceedFresh,
+        (true, SdkInstallConsent::Preapproved(source)) => {
+            SdkInstallApproval::ProceedApproved(source)
+        }
+        (true, SdkInstallConsent::Ask) if interactive => SdkInstallApproval::PromptOverwrite,
+        (true, SdkInstallConsent::Ask) => SdkInstallApproval::RefuseNonInteractive,
     }
 }
 
-/// Interactive confirmation gate for displacing an existing managed SDK. Prints
-/// what would be replaced, then reads a yes/no answer from stdin. Only reached
-/// when an existing SDK is present, `--yes` was not passed, and a terminal is
-/// attached (see `sdk_install_approval`).
+/// The progress line printed when an install displaces the active default
+/// without asking. Pure so the exact wording is pinned by unit tests.
+///
+/// Each arm states only what that caller will actually do. `update --apply`
+/// without `--activate` installs beside the active default and leaves it alone,
+/// so claiming the new install "becomes the active default runtime" there would
+/// be false — and crediting `--yes` would name a flag `rocm update` does not
+/// have.
+fn preapproved_install_line(
+    source: SdkInstallApprovalSource,
+    relation: &str,
+    resolved_display: &str,
+) -> String {
+    match source {
+        SdkInstallApprovalSource::AssumeYes => format!(
+            "Approved by --yes: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
+        SdkInstallApprovalSource::UpdateApply { activates: true } => format!(
+            "Requested by `rocm update --apply --activate`: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
+        SdkInstallApprovalSource::UpdateApply { activates: false } => format!(
+            "Requested by `rocm update --apply`: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display} alongside it. The active default runtime is unchanged; re-run with --activate, or use `rocm runtimes activate`, to switch to it."
+        ),
+    }
+}
+
+/// The progress line printed when nothing is displaced. States only that no
+/// active default exists, because whether this install *becomes* the active
+/// default depends on the caller: `rocm install sdk` activates what it
+/// installed, `rocm update --apply` without `--activate` does not.
+fn fresh_install_line(resolved_display: &str, family: &str) -> String {
+    format!(
+        "No active ROCm SDK runtime is configured; installing ROCm SDK {resolved_display} for family {family}."
+    )
+}
+
+/// The error raised when the active default would be displaced but there is no
+/// terminal to confirm it and no preapproval.
+fn refuse_non_interactive_message(relation: &str) -> String {
+    format!(
+        "an existing ROCm SDK is the active default runtime ({relation}); continuing would make the newly installed ROCm the active default runtime instead. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`"
+    )
+}
+
+/// Interactive confirmation gate for displacing the active default managed
+/// runtime. Prints what would be replaced, then reads a yes/no answer from
+/// stdin. Only reached when an active default runtime exists, consent was not
+/// preapproved, and a terminal is attached (see `sdk_install_approval`).
 ///
 /// "Displacing" rather than "overwriting" is deliberate: `runtime_key` embeds the
 /// resolved version, so an upgrade or downgrade lands in its own install root
@@ -1836,8 +1952,8 @@ fn confirm_overwrite_existing_sdk(
     resolved_version: &str,
     relation: &str,
 ) -> Result<bool> {
-    println!("sdk install: an existing ROCm SDK was found");
-    println!("  existing runtime: {relation}");
+    println!("sdk install: an existing ROCm SDK is the active default runtime");
+    println!("  active default runtime: {relation}");
     println!(
         "  replacing with: ROCm {} for family {family} ({} channel)",
         runtime_version_display(resolved_version),
@@ -1871,7 +1987,7 @@ fn install_tarball_runtime(
     prefix: Option<PathBuf>,
     family_override: Option<&str>,
     dry_run: bool,
-    assume_yes: bool,
+    consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
     let artifact = resolve_tarball_artifact(paths, channel, family_override)?;
     let runtime_key = runtime_key(
@@ -1930,24 +2046,23 @@ fn install_tarball_runtime(
         ));
     }
 
-    // Fresh installs proceed with just an informational line. Only an install
-    // that displaces an existing managed SDK for this family/channel as the
-    // active default asks for confirmation (and needs `--yes` when there is no
-    // terminal to answer the prompt).
-    let existing = existing_runtime_relation(paths, channel, &artifact.family, &artifact.version)?;
-    match sdk_install_approval(existing.is_some(), assume_yes, interactive_terminal()) {
+    // Same gate as the wheel path: only an install that would displace the
+    // current active default runtime asks for confirmation, and it asks
+    // regardless of family or channel because activation is global.
+    let existing =
+        active_default_runtime_relation(paths, channel, &artifact.family, &artifact.version)?;
+    match sdk_install_approval(existing.is_some(), consent, interactive_terminal()) {
         SdkInstallApproval::ProceedFresh => {
-            progress_line(format!(
-                "No existing ROCm SDK found; installing ROCm SDK {} for family {}.",
-                runtime_version_display(&artifact.version),
-                artifact.family
+            progress_line(fresh_install_line(
+                &runtime_version_display(&artifact.version),
+                &artifact.family,
             ));
         }
-        SdkInstallApproval::ProceedApproved => {
-            progress_line(format!(
-                "Approved by --yes: an existing ROCm SDK was found ({}); installing ROCm {}, which becomes the active default runtime.",
+        SdkInstallApproval::ProceedApproved(source) => {
+            progress_line(preapproved_install_line(
+                source,
                 existing.as_deref().unwrap_or_default(),
-                runtime_version_display(&artifact.version)
+                &runtime_version_display(&artifact.version),
             ));
         }
         SdkInstallApproval::PromptOverwrite => {
@@ -1965,10 +2080,9 @@ fn install_tarball_runtime(
             }
         }
         SdkInstallApproval::RefuseNonInteractive => {
-            bail!(
-                "an existing ROCm SDK was found ({}); continuing would make the newly installed ROCm the active default runtime. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`",
+            bail!(refuse_non_interactive_message(
                 existing.as_deref().unwrap_or_default()
-            );
+            ));
         }
     }
 
@@ -7224,41 +7338,102 @@ echo Python 3.12.10
         assert!(error.contains("rocm install sdk --format wheel"));
     }
 
+    /// Register `manifest` and make it the active default runtime, the way a
+    /// completed `install sdk` does.
+    fn write_active_test_runtime(
+        paths: &AppPaths,
+        manifest: &InstalledRuntimeManifest,
+    ) -> Result<()> {
+        write_test_runtime_manifest(paths, manifest)?;
+        let mut config = RocmCliConfig::load(paths)?;
+        config.default_runtime_id = Some(manifest.runtime_id.clone());
+        config.active_runtime_key = Some(manifest.runtime_key.clone());
+        config.save(paths)?;
+        Ok(())
+    }
+
     #[test]
-    fn existing_runtime_relation_classifies_upgrade_downgrade_reinstall() -> Result<()> {
-        let (root, paths) = test_paths("existing-runtime-relation");
+    fn active_default_relation_classifies_upgrade_downgrade_reinstall() -> Result<()> {
+        let (root, paths) = test_paths("active-default-relation");
         let mut manifest = test_runtime_manifest(
             "release-wheel-gfx120X-all",
             "therock-release:gfx120X-all",
             10,
         );
         manifest.version = "7.13.0".to_owned();
-        write_test_runtime_manifest(&paths, &manifest)?;
+        write_active_test_runtime(&paths, &manifest)?;
 
-        let upgrade =
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")?
-                .expect("relation should be reported for a matching runtime");
+        let upgrade = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
         assert!(upgrade.starts_with("upgrade from"), "got: {upgrade}");
         assert!(upgrade.contains("7.13.0"));
 
-        let downgrade =
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.12.0")?
-                .expect("relation should be reported for a matching runtime");
+        let downgrade = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.12.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
         assert!(downgrade.starts_with("downgrade from"), "got: {downgrade}");
 
-        let reinstall =
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.13.0")?
-                .expect("relation should be reported for a matching runtime");
+        let reinstall = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.13.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
         assert!(reinstall.starts_with("reinstall from"), "got: {reinstall}");
 
-        // A different family or channel is a fresh install, so no relation applies.
-        assert!(
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx110X-all", "7.14.0")?
-                .is_none()
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_gates_a_different_family_or_channel() -> Result<()> {
+        // The regression this gate exists for. `finalize_successful_sdk_install`
+        // activates whatever was installed last regardless of family or channel,
+        // so installing gfx120X-all while a gfx110X-all runtime is the active
+        // default displaces it. A family/channel-scoped gate reported "no
+        // existing SDK" here and let the displacement through unconfirmed.
+        let (root, paths) = test_paths("active-default-relation-cross-family");
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
         );
+        manifest.version = "7.13.0".to_owned();
+        write_active_test_runtime(&paths, &manifest)?;
+
+        let other_family = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("installing another family must still report the active default it displaces");
         assert!(
-            existing_runtime_relation(&paths, TheRockChannel::Nightly, "gfx120X-all", "7.14.0")?
-                .is_none()
+            other_family.contains("replaces active default") && other_family.contains("gfx110X-all"),
+            "got: {other_family}"
+        );
+
+        let other_channel = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Nightly,
+            "gfx110X-all",
+            "7.14.0",
+        )?
+        .expect("installing another channel must still report the active default it displaces");
+        assert!(
+            other_channel.contains("replaces active default")
+                && other_channel.contains("release channel"),
+            "got: {other_channel}"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -7266,30 +7441,58 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn existing_runtime_relation_none_without_managed_runtimes() -> Result<()> {
-        let (root, paths) = test_paths("existing-runtime-relation-empty");
+    fn active_default_relation_none_without_an_active_default() -> Result<()> {
+        // Nothing installed at all, and — the second case — a registered runtime
+        // that no config points at. Neither displaces anything, so neither may
+        // prompt: an install with no active default runtime is the fresh path.
+        let (root, paths) = test_paths("active-default-relation-empty");
         assert!(
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")?
-                .is_none()
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0"
+            )?
+            .is_none()
         );
+
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &manifest)?;
+        assert!(
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0"
+            )?
+            .is_none()
+        );
+
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
     #[test]
-    fn existing_runtime_relation_propagates_manifest_read_errors() -> Result<()> {
+    fn active_default_relation_propagates_manifest_read_errors() -> Result<()> {
         // A manifest entry that cannot be read (here, a directory sitting where a
         // `*.json` manifest file is expected) must surface as an error, not be
-        // silently treated as "no existing runtime" — that would skip the
-        // overwrite confirmation gate exactly when we're least sure whether an
-        // existing SDK is present.
-        let (root, paths) = test_paths("existing-runtime-relation-error");
+        // silently treated as "no active default" — that would skip the
+        // confirmation gate exactly when we're least sure what is active.
+        let (root, paths) = test_paths("active-default-relation-error");
         let registry_dir = paths.data_dir.join("runtimes").join("registry");
         fs::create_dir_all(registry_dir.join("broken.json"))?;
 
-        let error =
-            existing_runtime_relation(&paths, TheRockChannel::Release, "gfx120X-all", "7.14.0")
-                .expect_err("a manifest read failure should be propagated, not swallowed");
+        let error = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )
+        .expect_err("a manifest read failure should be propagated, not swallowed");
         assert!(!error.to_string().is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -7297,34 +7500,102 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn sdk_install_approval_only_prompts_when_overwriting_existing() {
-        // Fresh install: no existing SDK -> never prompt, regardless of terminal/--yes.
+    fn sdk_install_approval_only_prompts_when_an_active_default_is_displaced() {
+        let assume_yes = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes);
+        let update_apply = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::UpdateApply {
+            activates: false,
+        });
+
+        // No active default runtime -> never prompt, regardless of terminal/consent.
         assert_eq!(
-            sdk_install_approval(false, false, false),
+            sdk_install_approval(false, SdkInstallConsent::Ask, false),
             SdkInstallApproval::ProceedFresh
         );
         assert_eq!(
-            sdk_install_approval(false, false, true),
+            sdk_install_approval(false, SdkInstallConsent::Ask, true),
             SdkInstallApproval::ProceedFresh
         );
         assert_eq!(
-            sdk_install_approval(false, true, false),
+            sdk_install_approval(false, assume_yes, false),
             SdkInstallApproval::ProceedFresh
         );
 
-        // Existing SDK: --yes overwrites silently; a terminal prompts; neither refuses.
+        // Active default present: preapproved consent proceeds and is credited to
+        // its real source; a terminal prompts; neither refuses.
         assert_eq!(
-            sdk_install_approval(true, true, false),
-            SdkInstallApproval::ProceedApproved
+            sdk_install_approval(true, assume_yes, false),
+            SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::AssumeYes)
         );
         assert_eq!(
-            sdk_install_approval(true, false, true),
+            sdk_install_approval(true, update_apply, false),
+            SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::UpdateApply {
+                activates: false
+            })
+        );
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, true),
             SdkInstallApproval::PromptOverwrite
         );
         assert_eq!(
-            sdk_install_approval(true, false, false),
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
             SdkInstallApproval::RefuseNonInteractive
         );
+    }
+
+    #[test]
+    fn preapproved_install_line_credits_the_real_consent_source() {
+        // `rocm update --apply` has no `--yes` flag, so a line crediting one
+        // names something the user could not have passed. And without
+        // `--activate`, `apply_runtime_update` leaves the active default alone,
+        // so claiming the install "becomes the active default runtime" is false.
+        let by_yes = preapproved_install_line(
+            SdkInstallApprovalSource::AssumeYes,
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(by_yes.starts_with("Approved by --yes:"), "got: {by_yes}");
+        assert!(by_yes.contains("becomes the active default runtime"));
+
+        let update_activates = preapproved_install_line(
+            SdkInstallApprovalSource::UpdateApply { activates: true },
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            !update_activates.contains("--yes"),
+            "the update path must not credit a flag `rocm update` does not have: {update_activates}"
+        );
+        assert!(update_activates.contains("becomes the active default runtime"));
+
+        let update_only = preapproved_install_line(
+            SdkInstallApprovalSource::UpdateApply { activates: false },
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            !update_only.contains("--yes"),
+            "the update path must not credit a flag `rocm update` does not have: {update_only}"
+        );
+        assert!(
+            !update_only.contains("becomes the active default runtime"),
+            "`update --apply` without --activate does not change the active default: {update_only}"
+        );
+        assert!(update_only.contains("The active default runtime is unchanged"));
+    }
+
+    #[test]
+    fn fresh_install_line_claims_no_absent_sdk() {
+        // The fresh path is reached whenever no runtime is the active default,
+        // which does not mean no SDK is installed anywhere. Saying "no existing
+        // ROCm SDK found" there would be false on a host holding a registered
+        // but unactivated runtime.
+        let line = fresh_install_line("7.14.0", "gfx120X-all");
+        assert!(
+            !line.to_lowercase().contains("no existing rocm sdk"),
+            "got: {line}"
+        );
+        assert!(line.contains("No active ROCm SDK runtime is configured"));
+        assert!(line.contains("gfx120X-all"));
     }
 
     #[test]

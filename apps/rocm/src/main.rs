@@ -604,10 +604,13 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve replacing an existing ROCm SDK as the active default (and
+        /// Approve replacing the current active default ROCm runtime (and
         /// required system-package installs such as OpenMPI for vLLM) without
-        /// prompting; required to replace an existing SDK outside an interactive
-        /// terminal. A fresh install (no existing SDK) never prompts.
+        /// prompting; required outside an interactive terminal whenever a
+        /// managed runtime is already the active default — including when this
+        /// install targets a different GPU family or channel, which takes over
+        /// the active default just the same. An install with no active default
+        /// runtime never prompts.
         #[arg(long)]
         yes: bool,
     },
@@ -9340,7 +9343,7 @@ fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
-fn current_runtime_manifest<'a>(
+pub(crate) fn current_runtime_manifest<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
@@ -11693,7 +11696,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("install") if second.as_deref() == Some("sdk") => {
             // The chat/MCP surfaces spawn `rocm` with null stdin, so
-            // `interactive_terminal()` is false and an overwrite prompt would
+            // `interactive_terminal()` is false and the consent prompt would
             // refuse with "re-run with `--yes`" — a flag the user cannot supply
             // through chat. Add it here, matching the `install driver` and
             // `services stop/restart` arms below.
@@ -13514,7 +13517,7 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
                 json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
-                // The MCP surface runs `rocm` with null stdin, so an overwrite
+                // The MCP surface runs `rocm` with null stdin, so the consent
                 // prompt would refuse; `--yes` keeps the tool non-interactive,
                 // matching the chat `install sdk` arm and `stop_server`.
                 "--yes".to_owned(),
@@ -15884,7 +15887,7 @@ fn apply_runtime_update(
             &source.family,
             plan.device_target.as_deref(),
             true,
-            true,
+            activate,
         )?;
         let _ = writeln!(output, "  install_plan:");
         for line in install_plan.output.lines() {
@@ -15893,6 +15896,10 @@ fn apply_runtime_update(
         return Ok(output);
     }
 
+    // `activate` rather than a bare `true`: the update path is preapproved either
+    // way (there is no `--yes` on `rocm update`, and no terminal contract), but
+    // the approval line it prints must not promise an activation that only
+    // `--activate` performs below.
     let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
@@ -15900,7 +15907,7 @@ fn apply_runtime_update(
         &source.family,
         plan.device_target.as_deref(),
         false,
-        true,
+        activate,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     // By exact key, never by version: a same-version repair installs a sibling
@@ -19535,6 +19542,25 @@ mod tests {
     }
 
     #[test]
+    fn update_has_no_yes_flag_to_credit() {
+        // Pins the premise of `SdkInstallApprovalSource::UpdateApply`: the
+        // update path is preapproved, but it must never print a line crediting
+        // `--yes`, because `rocm update` offers no such flag for the user to
+        // have passed. If one is ever added, that message can be revisited —
+        // this test is what makes that a deliberate decision.
+        let help = Cli::command()
+            .find_subcommand_mut("update")
+            .expect("update subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            !help.contains("--yes"),
+            "`rocm update --help` gained a --yes flag; the install approval line \
+             for the update path must be revisited:\n{help}"
+        );
+    }
+
+    #[test]
     fn out_of_scope_commands_are_marked_preview_in_help() {
         let help = Cli::command().render_long_help().to_string();
         for command in ["chat", "comfyui", "automations"] {
@@ -22766,7 +22792,7 @@ model recipes
 
     #[test]
     fn install_sdk_chat_and_mcp_args_carry_yes_for_non_interactive_spawn() {
-        // The chat/MCP surfaces spawn `rocm` with null stdin, so an overwrite
+        // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
         // prompt would refuse with "re-run with `--yes`" — a flag the user has
         // no way to supply from chat or the dashboard. Both the chat classifier
         // arm and the MCP tool-args builder must inject `--yes` so a reinstall
