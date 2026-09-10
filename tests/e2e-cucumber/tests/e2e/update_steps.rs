@@ -98,30 +98,40 @@ async fn assert_preview_accepted(world: &mut E2eWorld) {
     );
 }
 
-#[then("the preview has not installed anything")]
-async fn assert_preview_installed_nothing(world: &mut E2eWorld) {
-    // The half of the contract that outlives the defect. Once `--dry-run` is
-    // accepted, this scenario stops pinning a bug and becomes a guard — and a
-    // guard that only checked the command was ALLOWED would be satisfied by a
-    // binary that accepted the preview and then performed the update, which is
-    // the one outcome a preview must never produce.
+#[then("the machine still manages no runtimes")]
+async fn assert_still_manages_no_runtimes(world: &mut E2eWorld) {
+    // Scoped deliberately narrowly, because the obvious stronger claim is one
+    // this fixture CANNOT make. It would be natural to read this as "the
+    // preview did not perform the update", but on an empty registry that
+    // outcome is unreachable whether the product is honest or not: `--apply`
+    // resolves a runtime to upgrade through `select_runtime_update_source`,
+    // which bails with "no managed runtimes are registered" when none is
+    // (`apps/rocm/src/main.rs:15939`). `update` upgrades a managed runtime; it
+    // never installs a first one. So "manages none" here is guaranteed by the
+    // fixture, and an assertion resting on it would be satisfied forever.
     //
-    // Asked of the CLI's own report rather than of the filesystem, keyed on the
-    // line `update-01` already pins, so it reads the machine the way a user
-    // would. Host-invariant: this scenario runs against an isolated and empty
-    // `ROCM_CLI_DATA_DIR`, so nothing is managed before the preview and any
-    // runtime named after it was installed by the preview.
+    // What it does hold is the readback path: after a preview, `update` still
+    // answers, exits 0, and reports the same machine `update-01` pins. That is
+    // worth asserting and it can fail — but it is not the non-mutation contract.
     //
-    // Today this never runs — the step above fails first on the usage error —
-    // so it neither weakens nor satisfies the row that pins EAI-8010.
+    // Proving THAT needs a scenario with a managed runtime registered, where a
+    // performed update is observable. It is not done here on purpose: with a
+    // manifest present, `render_update_report` resolves the latest version per
+    // runtime (`apps/rocm/src/therock.rs:810` → `resolve_latest_for_manifest`),
+    // which reaches the TheRock index — and this scenario runs on the mock lane,
+    // which has no network. Tracked on EAI-8010 rather than forced in here.
+    //
+    // Today this never runs: the step above fails first on the usage error, so
+    // it neither weakens nor satisfies the row that pins EAI-8010.
     let (stdout, stderr, rc) = crate::run_rocm(world, &["update"]);
     assert_eq!(
         rc, 0,
-        "could not read back what the machine manages after the preview:\n{stdout}{stderr}"
+        "`update` stopped answering after the preview:\n{stdout}{stderr}"
     );
     assert!(
         stdout.contains("managed runtimes: none"),
-        "previewing an update installed a runtime; the machine managed none before it:\n{stdout}"
+        "reading the machine back after the preview did not report the empty registry \
+         this scenario runs against:\n{stdout}"
     );
 }
 

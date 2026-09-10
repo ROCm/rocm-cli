@@ -27,4 +27,4 @@ Feature: Update report
   Scenario: update-02 - Previewing an update without asking to install it is accepted
     When the user asks to see what updating would do without asking for it to be done
     Then the request is accepted rather than refused as a misuse
-    And the preview has not installed anything
+    And the machine still manages no runtimes
