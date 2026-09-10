@@ -358,7 +358,8 @@ serve_timeout_secs = 240
 # single instantaneous screenshot of a TUI buys: the one look sometimes lands on
 # a frame painted before the clear, and the scenario "passes" without the
 # behaviour existing. Sampling the whole window instead of looking once (tried
-# here, then reverted as out of scope for a test-only change) measured the value
+# here, then reverted in `88f46e3` as out of scope for a test-only change; the
+# reverted diff is where to start if this is picked up) measured the value
 # disappearing 0.80 s and 1.27 s after the failed scrape on the mock runner —
 # comfortably inside a window that is meant to be at least 6 s, and far too fast
 # to be the harness being descheduled.
