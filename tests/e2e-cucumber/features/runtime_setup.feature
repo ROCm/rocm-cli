@@ -131,3 +131,47 @@ Feature: Runtime configuration
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  # Both channels now resolve from one canonical aggregate index each, so the
+  # provenance the preview prints is the whole of what the user can check before
+  # committing to a multi-GiB install. This pins the nightly half: the source that
+  # was selected, the version that came back from it, and the layout generation
+  # that source was read as. `--family` is supplied so the scenario needs no GPU,
+  # and `@nightly` because it resolves the real index over the network — the same
+  # cost that keeps scenario runtime-06 off the unserialized mock lane.
+  @id:runtime-resolve-canonical-nightly @nightly
+  Scenario: runtime-08 - Previewing a nightly SDK install reports canonical provenance
+    When the user dry-runs a nightly SDK install for a known family
+    Then the SDK preview reports canonical nightly provenance
+
+  # The release channel is where this went wrong in the field (rocm-cli#271). The
+  # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
+  # frozen at 7.13.0 and has no device payloads at all, so every release install
+  # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
+  # Both halves are fixed by the same canonical model: one flat aggregate index
+  # for the channel, and the device payload for the chip this host actually has.
+  #
+  # The obvious regression test for that history is the one that does not work.
+  # Asserting the broken per-family URL is *absent* passes with the bug present:
+  # the old resolver only ever printed a candidate it failed on, and the stale
+  # per-family index succeeded, so the URL never reached stdout either way. These
+  # Thens assert the positives instead — which source was selected, which version
+  # came back from it, which device payload the plan asks for. On the old resolver
+  # the first reports a per-family URL and the second finds no device payload.
+  #
+  # The two Thens are not one claim split in half. A preview can name the right
+  # source and still ask for the wrong payload — that is exactly what the earlier
+  # attempt at this fix did on Instinct hosts, resolving the aggregate correctly
+  # and then requesting every device wheel ROCm publishes. Only the second Then
+  # separates them.
+  #
+  # `@requires-gfx-target` is narrower than `@requires-gpu`: this preview only
+  # needs a detected chip name and never opens the device. It therefore runs on
+  # WSL hosts that can read the Windows-side target before ROCm passthrough is
+  # ready, while mock hosts with no target skip it.
+  @id:runtime-resolve-canonical-release @requires-gfx-target
+  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+    Given a machine with an AMD GPU
+    When the user dry-runs a release SDK install for this host
+    Then the SDK preview reports canonical release provenance
+    And the SDK preview requests the device payload for this host's GPU

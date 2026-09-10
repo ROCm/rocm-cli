@@ -212,12 +212,21 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
         ]));
     }
-    // Then recent jobs (tools run), newest-relevant first.
-    for job in state.jobs.jobs.values().take(feed.height as usize) {
+    // Then recent jobs (tools run), newest-relevant first. The Home tab's own
+    // update-check job is plumbing, not user activity — never show it here.
+    for job in state
+        .jobs
+        .jobs
+        .iter()
+        .filter(|(id, _)| id.as_str() != crate::app::HOME_UPDATE_CHECK_JOB_ID)
+        .map(|(_, job)| job)
+        .take(feed.height as usize)
+    {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
-            rocm_dash_core::state::JobStatus::Cancelled => ("⊘ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
+            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
             rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
         };
         lines.push(Line::from(vec![
@@ -231,14 +240,13 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
     }
-    // Glyph key: only when there's spare room beyond the actual feed content,
-    // so it never displaces real activity on a squeezed card.
-    if (feed.height as usize) > lines.len() {
-        lines.push(Line::from(Span::styled(
-            "● live  ✓ done  ✗ failed  ⋯ running  ⊘ cancelled",
-            Style::default().fg(theme.muted),
-        )));
-    }
+    // Glyph key, appended last: `truncate` below already drops it whenever
+    // there's no spare room, so it never displaces real activity on a
+    // squeezed card — no separate room check needed.
+    lines.push(Line::from(Span::styled(
+        "● live  ✓ done  ! warn  ✗ failed  ⋯ running  ○ cancelled",
+        Style::default().fg(theme.muted),
+    )));
     lines.truncate(feed.height as usize);
     f.render_widget(Paragraph::new(lines), feed);
 }
@@ -698,7 +706,13 @@ mod tests {
 
     #[test]
     fn updates_tile_shows_checking_while_pending() {
+        // Must be connected here — otherwise the reverted conn-derived tile
+        // would also render "Checking…" and this test couldn't discriminate.
         let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
         s.update_status_pending = true;
         let out = render(&s, 160, 30);
         assert!(
@@ -871,14 +885,18 @@ mod tests {
             out.contains("cancelled"),
             "activity glyph key must document the cancelled glyph: {out:?}"
         );
+        assert!(
+            out.contains("warn"),
+            "activity glyph key must document the nonzero-exit warn glyph: {out:?}"
+        );
     }
 
     #[test]
     fn cancelled_job_renders_distinct_glyph_from_running() {
         // Cancelled must not be silently folded into the `⋯ running` glyph —
         // it has its own entry in the match and the key. Assert on the job's
-        // own rendered line (not just presence of '⊘' anywhere in the frame —
-        // the glyph key appended below the feed also contains '⊘', so that
+        // own rendered line (not just presence of '○' anywhere in the frame —
+        // the glyph key appended below the feed also contains '○', so that
         // alone wouldn't catch a regression back to the shared wildcard arm).
         let mut s = state_with_gpu();
         s.jobs
@@ -886,8 +904,8 @@ mod tests {
             .insert("cancel-me".into(), job("long task", JobStatus::Cancelled));
         let out = render(&s, 160, 30);
         assert!(
-            out.contains("⊘ long task"),
-            "cancelled job should render its own ⊘ glyph: {out:?}"
+            out.contains("○ long task"),
+            "cancelled job should render its own ○ glyph: {out:?}"
         );
         assert!(
             !out.contains("⋯ long task"),
@@ -896,20 +914,61 @@ mod tests {
     }
 
     #[test]
-    fn activity_glyph_key_absent_when_feed_full() {
-        // Fill the feed past capacity with jobs so there's no spare room; the
-        // glyph key must not displace real activity on a squeezed card.
+    fn home_update_check_job_never_shown_in_activity_feed() {
+        // The Home tab's own background update-check job is plumbing, not
+        // user activity, even when there's ample spare room in the feed.
         let mut s = state_with_gpu();
-        for i in 0..10 {
-            s.jobs.jobs.insert(
-                format!("job-{i}"),
-                job(&format!("task {i}"), JobStatus::Running),
-            );
-        }
+        s.jobs.jobs.insert(
+            crate::app::HOME_UPDATE_CHECK_JOB_ID.to_owned(),
+            job("/path/to/rocm", JobStatus::Running),
+        );
         let out = render(&s, 160, 30);
         assert!(
-            !out.contains("● live  ✓ done  ✗ failed  ⋯ running  ⊘ cancelled"),
-            "glyph key must not appear when the feed has no spare room: {out:?}"
+            !out.contains("/path/to/rocm"),
+            "the update-check job must never render in the activity feed: {out:?}"
         );
+    }
+
+    #[test]
+    fn activity_feed_glyphs_match_job_console_vocabulary() {
+        use rocm_dash_core::state::StateEvent;
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.jobs.apply(StateEvent::StartJob {
+            id: "a".into(),
+            cmd: "ok".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "a".into(),
+            code: 0,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "b".into(),
+            cmd: "bad".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "b".into(),
+            code: 1,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "c".into(),
+            cmd: "cancelled".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::CancelJob("c".into()));
+        s.jobs.apply(StateEvent::StartJob {
+            id: "d".into(),
+            cmd: "running".into(),
+            args: vec![],
+        });
+
+        let out = render(&s, 160, 30);
+        assert!(out.contains('✓'), "zero-exit glyph missing: {out:?}");
+        assert!(out.contains('!'), "nonzero-exit glyph missing: {out:?}");
+        assert!(out.contains('○'), "cancelled glyph missing: {out:?}");
+        assert!(out.contains('⋯'), "running glyph missing: {out:?}");
     }
 }
