@@ -142,8 +142,17 @@ impl OwnedProcess {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Ok(None) => return true,
-                // Already reaped by an earlier call.
-                Err(_) => return false,
+                // Not treated as "stopped". The only caller asserts that the
+                // product stopped this process, so answering `false` here is
+                // answering "the product did its job" — which would turn a wait
+                // this harness could not perform into a pass for the very defect
+                // the scenario exists to catch. `Child` caches the status once
+                // it has reaped, so a repeated call returns `Ok(Some(_))` rather
+                // than an error and there is no benign case left to absorb.
+                Err(error) => panic!(
+                    "could not determine whether pid {} is still running: {error}",
+                    self.pid()
+                ),
             }
         }
     }
