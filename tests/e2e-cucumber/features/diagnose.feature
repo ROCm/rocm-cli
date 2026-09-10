@@ -209,3 +209,4 @@ Feature: Diagnosing failures and listing fixes
     Given a user who has chosen a fix that would change the machine
     When the user is asked interactively to apply it and types no
     Then the CLI declines on the terminal and explains that it needs agreement
+    And the file the fix would have changed is untouched

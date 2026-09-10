@@ -293,12 +293,24 @@ async fn user_applies_approved_fix(world: &mut E2eWorld) {
 #[when("the user is asked interactively to apply it and types no")]
 async fn user_declines_fix_interactively(world: &mut E2eWorld) {
     let fix_id = world.model_name.clone().expect("no fix id set");
+    let home = fix_home(world).display().to_string();
     // `run_rocm`'s piped stdin can never reach `confirm()`'s interactive
     // branch: `is_terminal()` is always false there. A real pseudo-terminal is
     // the only way to reach it, so this step (unlike every other one in this
     // file) drives the CLI through `TuiSession` instead of `run_rocm`.
-    let mut session = TuiSession::spawn(world, &["fix", &fix_id, "--device-index", "1"])
-        .unwrap_or_else(|e| panic!("failed to open the fix prompt: {e}"));
+    //
+    // `TuiSession`'s own isolation (`pty_env`) sets HOME to a PTY-only sandbox
+    // it owns and never sets SHELL, so without overriding both here the fix
+    // would resolve to a different — and possibly nonexistent — rc file than
+    // the one the `Given` step planted, the same way the piped sibling
+    // (`user_applies_fix_without_agreeing`) overrides them via
+    // `run_rocm_with_env`.
+    let mut session = TuiSession::spawn_with_env(
+        world,
+        &["fix", &fix_id, "--device-index", "1"],
+        &[("HOME", home.as_str()), ("SHELL", "/bin/bash")],
+    )
+    .unwrap_or_else(|e| panic!("failed to open the fix prompt: {e}"));
     session
         .wait_for_screen("[y/N]:", default_timeout())
         .await

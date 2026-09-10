@@ -1161,6 +1161,16 @@ impl std::fmt::Display for ClapExitCode {
 
 impl std::error::Error for ClapExitCode {}
 
+/// Print a clap usage/parse error on the stream and in the format clap itself
+/// chooses, then carry its exit code onward as a [`ClapExitCode`] instead of
+/// calling `err.exit()`, which would `std::process::exit` mid-stack and skip
+/// the `_log_guard` destructor.
+fn clap_exit_code(err: clap::Error) -> anyhow::Error {
+    let code = err.exit_code();
+    let _ = err.print();
+    ClapExitCode(code).into()
+}
+
 fn main() -> ExitCode {
     exit_code_for(run())
 }
@@ -1216,9 +1226,7 @@ fn run() -> Result<()> {
         // exit, instead of dumping a request plan from the natural-language
         // planner.
         if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
-            let code = err.exit_code();
-            let _ = err.print();
-            return Err(ClapExitCode(code).into());
+            return Err(clap_exit_code(err));
         }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
@@ -1258,14 +1266,13 @@ fn cli_command() -> clap::Command {
 ///
 /// Returns a [`ClapExitCode`]-carrying error instead of calling
 /// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
-/// after `_log_guard` has dropped rather than mid-stack.
+/// after `_log_guard` has dropped rather than mid-stack. This covers both
+/// places clap can fail here: `try_get_matches()` for an ordinary argv parse
+/// error (a bad flag, `--help`, a missing required argument — the common
+/// case), and `from_arg_matches()` for the derive step below it.
 fn parse_cli() -> Result<Cli> {
-    let matches = cli_command().get_matches();
-    Cli::from_arg_matches(&matches).map_err(|err| {
-        let code = err.exit_code();
-        let _ = err.print();
-        ClapExitCode(code).into()
-    })
+    let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
+    Cli::from_arg_matches(&matches).map_err(clap_exit_code)
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -19405,18 +19412,42 @@ mod tests {
         assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(2));
     }
 
-    /// `parse_cli`'s internal clap error now returns a `ClapExitCode` instead
-    /// of calling `err.exit()` directly. Exercise the real
-    /// `clap parse failure -> ClapExitCode -> exit_code_for` chain end to end
-    /// via `command_invocation_error`, which shares the same
-    /// `clap::Error::exit_code()`/`print()` handoff.
+    /// `run()`'s mistyped-subcommand branch and `parse_cli()` both route a
+    /// real `clap::Error` through the production `clap_exit_code` helper
+    /// (not a hand-built `ClapExitCode`), so this calls that same helper on a
+    /// real parse failure to exercise the actual
+    /// `clap parse failure -> clap_exit_code -> ClapExitCode -> exit_code_for`
+    /// chain end to end. Reverting `clap_exit_code` to call `err.exit()`
+    /// directly, or dropping its use from either call site, breaks this.
     #[test]
     fn clap_error_exit_code_survives_the_clap_exit_code_round_trip() {
         let err = command_invocation_error(&["instal".to_owned()])
             .expect("`instal` should read as a mistyped subcommand");
-        let code = err.exit_code();
-        let result: Result<()> = Err(super::ClapExitCode(code).into());
-        assert_eq!(super::exit_code_for(result), ExitCode::from(code as u8));
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// `parse_cli()` itself reads `std::env::args_os()` (via
+    /// `Command::try_get_matches()`), which a unit test cannot redirect, so
+    /// this exercises the same `cli_command()` builder with an explicit argv
+    /// instead: an unrecognised flag is the common case `parse_cli()` was
+    /// still routing through `err.exit()` before it switched from
+    /// `get_matches()` to `try_get_matches()`.
+    #[test]
+    fn cli_command_rejects_unknown_flag_through_clap_exit_code() {
+        let err = super::cli_command()
+            .try_get_matches_from(["rocm", "--this-flag-does-not-exist"])
+            .expect_err("an unknown flag must be a parse error");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
     }
 
     /// Any other error must still fail with exit 1, matching what
