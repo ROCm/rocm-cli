@@ -6,9 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-#[cfg(windows)]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -7316,45 +7314,23 @@ impl ManagedServiceRecord {
 
     /// Persist the record, atomically.
     ///
-    /// Written to a temp file in the same directory and renamed into place, so a
-    /// concurrent reader sees either the old record or the new one, never a
-    /// half-written file. A plain overwrite left a window in which a reader
-    /// (`load_managed_services`, or the uninstall gate that treats an unparseable
-    /// manifest as a live server it cannot account for) could observe a truncated
-    /// record and act on it. The temp name carries the pid, so concurrent writers
-    /// do not collide.
+    /// Staged next to the manifest and published over it, so a concurrent reader
+    /// sees either the old record or the new one, never a half-written file. A
+    /// plain overwrite left a window in which a reader (`load_managed_services`,
+    /// or the uninstall gate that treats an unparseable manifest as a live server
+    /// it cannot account for) could observe a truncated record and act on it.
+    ///
+    /// Uses the workspace's one [`write_file_atomically`] rather than a local
+    /// rename: this runs on every status transition, including the ones the
+    /// uninstall stop pass performs, where a failed publish aborts the uninstall.
     pub fn write(&self) -> Result<()> {
         let mut host_record = self.clone();
         host_record.normalize_paths_for_host();
-        let parent = host_record
-            .manifest_path
-            .parent()
-            .context("service manifest path must have a parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
         let storage_record = host_record.with_storage_paths();
         let bytes = serde_json::to_vec_pretty(&storage_record)
             .context("failed to serialize service record")?;
-        let file_name = host_record
-            .manifest_path
-            .file_name()
-            .context("service manifest path must have a file name")?
-            .to_string_lossy()
-            .into_owned();
-        let temp_path = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::write(&temp_path, &bytes)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        if let Err(error) = fs::rename(&temp_path, &host_record.manifest_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error).with_context(|| {
-                format!("failed to write {}", host_record.manifest_path.display())
-            });
-        }
-        Ok(())
+        write_file_atomically(&host_record.manifest_path, &bytes)
+            .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))
     }
 }
 
@@ -7624,6 +7600,144 @@ pub fn unix_time_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// How many temp names to try before giving up on staging an atomic write.
+const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let mut file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_os_string();
+    file_name.push(".tmp-");
+    file_name.push(suffix);
+    Ok(parent.join(file_name))
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
+///
+/// The single implementation of the publish step for the whole workspace. It
+/// lives here rather than in each caller because the Windows half is not
+/// something to re-derive: a plain `rename` over an existing file is not
+/// reliable while another process holds the destination open (an antivirus or
+/// indexer scanning a file this CLI just wrote is enough), so an existing
+/// destination goes through `ReplaceFileW`. Callers that got this wrong would
+/// fail in the direction that matters — `ManagedServiceRecord::write` is on the
+/// uninstall stop path, where a failed publish is reported as a service that
+/// could not be stopped and aborts the whole uninstall.
+#[cfg(not(windows))]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
+///
+/// See the non-Windows twin for why this is centralized.
+#[cfg(windows)]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if path.try_exists()? {
+        return replace_file_windows(path, tmp);
+    }
+
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            // The destination can appear between the check and the rename.
+            if path.try_exists()? {
+                replace_file_windows(path, tmp)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement_wide: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
+    // remain alive for the duration of the synchronous Windows API call. The
+    // optional backup, exclude, and reserved pointers are intentionally null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Write `bytes` to `path` so a concurrent reader sees either the old contents
+/// or the new ones, never a half-written file.
+///
+/// Staged under a unique sibling name reserved with `create_new` — so two
+/// writers cannot pick the same scratch file — and published with
+/// [`publish_temp_file`]. A failed publish takes the scratch file with it.
+pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    let mut reserved = None;
+    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+        let tmp = temp_sibling_path(path, &OsString::from(format!("{temp_id}-{attempt}")))?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                reserved = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
+    }
+    let Some((tmp, mut file)) = reserved else {
+        bail!(
+            "failed to reserve a temporary file next to {} after {ATOMIC_WRITE_TEMP_ATTEMPTS} \
+             attempts",
+            path.display()
+        );
+    };
+
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    drop(file);
+
+    publish_temp_file(&tmp, path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("failed to publish {}", path.display()))
 }
 
 #[cfg(test)]

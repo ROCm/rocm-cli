@@ -470,6 +470,29 @@ fn seed_isolated_dirs(world: &mut E2eWorld) {
     st.smoke_cache = Some(cache);
 }
 
+/// A single long-lived process to stand in for a managed server, on either OS.
+///
+/// One process, not a shell that spawns one: the CLI terminates the recorded
+/// PID, and a grandchild would leave the scenario asserting against the wrong
+/// process.
+fn spawn_long_lived_child() -> std::process::Child {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 600"]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("sleep");
+        command.arg("600");
+        command
+    };
+    command
+        .spawn()
+        .expect("failed to start the managed server stand-in")
+}
+
 /// Start a local server this machine manages: a real long-lived child process
 /// plus the on-disk service record `rocm serve --managed` would leave behind,
 /// planted in the isolated data dir the installed binary reads.
@@ -485,18 +508,13 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
         .as_ref()
         .expect("isolated data dir must be seeded before planting a service record")
         .join("services");
-    let server = Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("failed to start the managed server stand-in");
-    // Bind and drop, so the record carries a port nothing is listening on. The
-    // CLI's readiness probe then fails and liveness falls through to the
-    // recorded process, which is alive. A hardcoded port would make this
-    // scenario fail whenever the runner happened to hold it.
-    let free_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("reserve an unused port")
-        .port();
+    let server = spawn_long_lived_child();
+    // Port 0 is the one port nothing can ever be serving on: it resolves, so the
+    // CLI really does run its probe, and the connect always fails. Liveness then
+    // falls through to the recorded process, which is alive. Binding an
+    // ephemeral port and dropping it would leave a window in which something
+    // else on a busy runner grabs it and fails the scenario.
+    let free_port = 0;
     write_service_record_with(
         &services_dir,
         "amd/test-model",

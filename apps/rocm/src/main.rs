@@ -15494,6 +15494,24 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
 struct FailedManagedServiceStop {
     service_id: String,
     reason: String,
+    remedy: StopFailureRemedy,
+}
+
+/// What will actually clear a failed stop.
+///
+/// Not cosmetic. This gate refuses to remove anything while a stop is
+/// unconfirmed, so the advice it prints is the operator's only way out, and
+/// advice that cannot work turns the refusal into a dead end: `rocm services
+/// stop` re-reads the same unparseable JSON and fails the same way, so a record
+/// that will not parse would abort every retry identically. Each failure class
+/// carries the remedy that can actually clear it.
+#[derive(Debug, PartialEq, Eq)]
+enum StopFailureRemedy {
+    /// The record parses, so `rocm services stop` can act on it.
+    StopTheService,
+    /// The record does not parse, so no `rocm` command can act on it — the file
+    /// itself has to be repaired or removed.
+    RepairTheRecord,
 }
 
 /// What [`stop_managed_services_before_uninstall`] managed to do, so the caller
@@ -15553,12 +15571,14 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                     report.failed.push(FailedManagedServiceStop {
                         service_id: record.service_id.clone(),
                         reason: format!("still \"{status}\" after the stop attempt"),
+                        remedy: StopFailureRemedy::StopTheService,
                     });
                 }
             }
             Err(error) => report.failed.push(FailedManagedServiceStop {
                 service_id: record.service_id.clone(),
                 reason: format!("{error:#}"),
+                remedy: StopFailureRemedy::StopTheService,
             }),
         }
     }
@@ -15594,14 +15614,18 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                 "{}:{} still accepts connections after the stop",
                 record.host, record.port
             ),
+            remedy: StopFailureRemedy::StopTheService,
         });
     }
     for manifest in unreadable_service_manifests(paths)? {
         report.failed.push(FailedManagedServiceStop {
-            service_id: manifest,
+            // The full path, not the file name: the only remedy is to act on the
+            // file, so the message has to say which file.
+            service_id: manifest.display().to_string(),
             reason:
                 "service record could not be parsed, so its server cannot be located or stopped"
                     .to_owned(),
+            remedy: StopFailureRemedy::RepairTheRecord,
         });
     }
     Ok(report)
@@ -15611,6 +15635,14 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
 ///
 /// A service bound to a wildcard address is reachable on loopback; connecting to
 /// the wildcard itself is not portable.
+///
+/// The normalized form is what gets probed, not just what gets classified.
+/// `loopback_tcp_port_is_reachable` resolves with `(host, port)`, which rejects
+/// a bracketed literal like `[::1]` and anything with stray whitespace — and a
+/// resolution failure reads as "nothing is serving", which is the wrong
+/// direction for a check whose whole job is to catch a surviving engine
+/// grandchild. Records do carry bracketed spellings (`loopback_host_key`
+/// normalizes them too) because `--host` is free-form.
 fn probe_host(host: &str) -> String {
     // Trimmed and case-folded so the spellings a record can carry — `0.0.0.0`,
     // `::`, `[::]`, `0:0:0:0:0:0:0:0`, `*`, or empty — all resolve to loopback
@@ -15619,7 +15651,7 @@ fn probe_host(host: &str) -> String {
     let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
     match normalized.as_str() {
         "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0" | "*" | "" => "127.0.0.1".to_owned(),
-        _ => host.to_owned(),
+        _ => normalized,
     }
 }
 
@@ -15635,7 +15667,7 @@ fn probe_host(host: &str) -> String {
 /// state files live under their own engine directory
 /// ([`AppPaths::service_engine_state_path`]), so they are not misread as corrupt
 /// records here.
-fn unreadable_service_manifests(paths: &AppPaths) -> Result<Vec<String>> {
+fn unreadable_service_manifests(paths: &AppPaths) -> Result<Vec<PathBuf>> {
     let services_dir = paths.services_dir();
     if !services_dir.is_dir() {
         return Ok(Vec::new());
@@ -15651,12 +15683,7 @@ fn unreadable_service_manifests(paths: &AppPaths) -> Result<Vec<String>> {
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
         if serde_json::from_slice::<ManagedServiceRecord>(&bytes).is_err() {
-            unreadable.push(
-                path.file_name()
-                    .unwrap_or_else(|| path.as_os_str())
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            unreadable.push(path);
         }
     }
     unreadable.sort();
@@ -15694,11 +15721,42 @@ fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Result<Option<St
                 report.stopped.join(", ")
             )
         };
+        // Advice per failure class. A record that will not parse cannot be
+        // stopped by `rocm services stop` — that command loads the same file and
+        // fails identically — so pointing at it would make every retry abort the
+        // same way, which is exactly the dead end this gate must not create.
+        let mut remedies = Vec::new();
+        if report
+            .failed
+            .iter()
+            .any(|failure| failure.remedy == StopFailureRemedy::StopTheService)
+        {
+            remedies.push(
+                "Stop them with `rocm services stop <id> --yes`, then re-run uninstall. A server \
+                 started by another user, or one wedged in the kernel, needs elevated privileges \
+                 or a manual kill first."
+                    .to_owned(),
+            );
+        }
+        let unreadable = report
+            .failed
+            .iter()
+            .filter(|failure| failure.remedy == StopFailureRemedy::RepairTheRecord)
+            .map(|failure| failure.service_id.clone())
+            .collect::<Vec<_>>();
+        if !unreadable.is_empty() {
+            remedies.push(format!(
+                "No `rocm` command can act on an unparseable record, so these have to be handled \
+                 on disk: check whether the server each one describes is still running (`rocm \
+                 services list` skips them), stop it, then repair or delete the file and re-run \
+                 uninstall: {}.",
+                unreadable.join(", ")
+            ));
+        }
         bail!(
             "uninstall aborted: could not stop managed service(s): {detail}. Their endpoints may \
-             still be serving and holding the GPU. Stop them with `rocm services stop <id> --yes`, \
-             then re-run uninstall. A server started by another user, or one wedged in the kernel, \
-             needs elevated privileges or a manual kill first.{}",
+             still be serving and holding the GPU. {}{}",
+            remedies.join(" "),
             if already_stopped.is_empty() {
                 " No files were removed."
             } else {
@@ -30684,14 +30742,30 @@ ID_LIKE="suse opensuse"
             .iter()
             .map(|failure| failure.service_id.as_str())
             .collect();
+        let corrupt = services_dir.join("svc-corrupt.json");
         assert_eq!(
             failed,
-            vec!["svc-corrupt.json"],
+            vec![corrupt.display().to_string().as_str()],
             "an unparseable record must fail the gate: {report:?}"
         );
+        let error = uninstall_removal_gate(&report)
+            .expect_err("an unparseable record must abort uninstall")
+            .to_string();
+        // The abort has to be escapable. `rocm services stop` loads the same
+        // file and fails the same way, so prescribing it here would make every
+        // retry abort identically — a permanent block with no way out. The only
+        // remedy is on disk, so the message must name the file and say so.
         assert!(
-            uninstall_removal_gate(&report).is_err(),
-            "an unparseable record must abort uninstall"
+            error.contains(&corrupt.display().to_string()),
+            "names the file to act on: {error}"
+        );
+        assert!(
+            error.contains("repair or delete the file"),
+            "states the remedy that can actually clear it: {error}"
+        );
+        assert!(
+            !error.contains("rocm services stop"),
+            "must not prescribe a command that fails on the same unparseable file: {error}"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -30708,6 +30782,7 @@ ID_LIKE="suse opensuse"
             failed: vec![FailedManagedServiceStop {
                 service_id: "svc-stuck".to_owned(),
                 reason: "still \"ready\" after the stop attempt".to_owned(),
+                remedy: StopFailureRemedy::StopTheService,
             }],
         };
         let error = uninstall_removal_gate(&report)
@@ -30741,6 +30816,7 @@ ID_LIKE="suse opensuse"
             failed: vec![FailedManagedServiceStop {
                 service_id: "svc-stuck".to_owned(),
                 reason: "still \"ready\" after the stop attempt".to_owned(),
+                remedy: StopFailureRemedy::StopTheService,
             }],
         };
         let error = uninstall_removal_gate(&report)
@@ -30892,6 +30968,28 @@ ID_LIKE="suse opensuse"
                 probe_host(literal),
                 literal,
                 "a concrete host must be probed as recorded"
+            );
+        }
+        // A concrete host still has to come back in a form that resolves.
+        // `(host, port).to_socket_addrs()` rejects a bracketed literal and
+        // anything padded, and the caller reads a resolution failure as "nothing
+        // is serving" — so handing the raw spelling through would delete the
+        // recovery tooling while the endpoint is live.
+        for (recorded, probed) in [
+            ("[::1]", "::1"),
+            ("  127.0.0.1  ", "127.0.0.1"),
+            ("[FE80::1]", "fe80::1"),
+        ] {
+            assert_eq!(
+                probe_host(recorded),
+                probed,
+                "a concrete host must be probed in a resolvable form"
+            );
+            assert!(
+                (probe_host(recorded).as_str(), 1u16)
+                    .to_socket_addrs()
+                    .is_ok(),
+                "the probed form of {recorded:?} must resolve"
             );
         }
     }

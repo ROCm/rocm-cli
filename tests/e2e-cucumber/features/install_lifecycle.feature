@@ -278,3 +278,18 @@ Feature: Release install lifecycle
     Then uninstall reports skipping the running executable on Windows
     And the non-running installed rocmd binary is gone
     And the install manifest is gone
+
+  # The Windows half of EAI-8014. Worth its own scenario rather than trusting the
+  # Linux one: the port reality-check inside the gate exists *because* Windows
+  # terminates only the recorded process, so an engine grandchild can outlive it
+  # and keep serving while the record reads "stopped".
+  @id:lifecycle-windows-uninstall-stops-managed-server @lifecycle @requires-os:windows
+  Scenario: lifecycle-24 - Windows - uninstall stops the local server it manages
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated directories with state
+    And a local server this machine manages is running
+    When the user uninstalls from the installed binary
+    Then the removal is reported as complete
+    And the local server this machine manages is no longer running

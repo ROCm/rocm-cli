@@ -1135,60 +1135,10 @@ where
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// The publish step lives in `rocm-core` so there is one implementation of the
+/// Windows `ReplaceFileW` handling for the whole workspace.
 fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(tmp, path)
-}
-
-#[cfg(windows)]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
-        return replace_file_windows(path, tmp);
-    }
-
-    match fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            if path.try_exists()? {
-                replace_file_windows(path, tmp)
-            } else {
-                Err(rename_error)
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement_wide: Vec<u16> = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
-    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
-    // remain alive for the duration of the synchronous Windows API call. The
-    // optional backup, exclude, and reserved pointers are intentionally null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            path_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    rocm_core::publish_temp_file(tmp, path)
 }
 
 fn sandbox_check_updates_value(output: CommandCapture) -> Value {

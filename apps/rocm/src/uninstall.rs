@@ -100,8 +100,19 @@ mod tests {
 
     use super::stop_managed_services_then_remove;
     use crate::{
-        FailedManagedServiceStop, ManagedServiceStopReport, UninstallPlan, UninstallPlanEntry,
+        FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy, UninstallPlan,
+        UninstallPlanEntry,
     };
+
+    /// A port nothing can ever be serving on.
+    ///
+    /// These tests need a record whose endpoint reads as dead, and the gate
+    /// really does probe it. Port 0 resolves — so the probe runs rather than
+    /// being skipped by a resolution failure — and the connect always fails,
+    /// on every platform. Binding an ephemeral port and dropping it would leave
+    /// a window in which something else on a busy runner grabs the port and
+    /// fails these tests through the gate's own probe.
+    const UNSERVABLE_PORT: u16 = 0;
 
     /// An isolated root and a plan whose one action removes a real file in it.
     ///
@@ -146,6 +157,7 @@ mod tests {
                 failed: vec![FailedManagedServiceStop {
                     service_id: "svc-stuck".to_owned(),
                     reason: "still \"ready\" after the stop attempt".to_owned(),
+                    remedy: StopFailureRemedy::StopTheService,
                 }],
             })
         })
@@ -226,13 +238,7 @@ mod tests {
             .spawn()
             .expect("failed to spawn the managed server");
         let pid = child.id();
-        // Bind and drop, so the record carries a port nothing is listening on.
-        // A hardcoded port would flip this test to a failure the moment anything
-        // on the runner happened to hold it, via the gate's own port probe.
-        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("reserve an unused port")
-            .port();
+        let free_port = UNSERVABLE_PORT;
         let mut record = rocm_core::ManagedServiceRecord::new(
             &paths,
             "svc-live",
@@ -302,10 +308,7 @@ mod tests {
             .spawn()
             .expect("spawn the managed server");
         let pid = server.id();
-        let free_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("reserve an unused port")
-            .port();
+        let free_port = UNSERVABLE_PORT;
         let mut record = rocm_core::ManagedServiceRecord::new(
             &paths,
             "svc-cmd-live",
