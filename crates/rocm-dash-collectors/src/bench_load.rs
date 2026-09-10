@@ -505,7 +505,8 @@ fn prom_latency(
 /// cell issued between the before- and after-scrape. Returns `None` when the
 /// window cannot be measured: either scrape missing, the observation count did
 /// not advance (`Δcount ≤ 0`, no request recorded this metric in the window),
-/// or the counter reset (`Δsum < 0`, a server restart).
+/// the counter reset (`Δsum < 0`, a server restart), or either delta is `NaN`
+/// (Prometheus reports an unobserved histogram sum that way).
 ///
 /// The value is deliberately *not* backfilled from the after-scrape's lifetime
 /// `sum/count` average. That average covers every request the server process
@@ -524,7 +525,9 @@ fn latency_ms(
 ) -> Option<f64> {
     let delta_sum = sum_after? - sum_before?;
     let delta_count = count_after? - count_before?;
-    // Guard division by zero (flat counter) and counter resets.
+    // Phrased as acceptance, not rejection: every comparison against NaN is
+    // false, so this rejects a NaN delta where `if delta_count <= 0.0 || ...`
+    // would fall through and emit Some(NaN).
     (delta_count > 0.0 && delta_sum >= 0.0).then_some(delta_sum / delta_count * 1000.0)
 }
 
@@ -1639,6 +1642,35 @@ mod tests {
         assert_eq!(latency_ms(None, None, None, None), None);
         // count == 0 is not divisible → None, never a divide-by-zero number.
         assert_eq!(latency_ms(None, None, Some(0.0), Some(0.0)), None);
+    }
+
+    #[test]
+    fn latency_ms_is_none_when_a_counter_is_nan() {
+        // Prometheus emits NaN for a histogram sum with no observations, and
+        // `vllm_prom::parse` accepts it verbatim (`parse::<f64>()` parses
+        // "NaN"), so a NaN can reach this arithmetic from a real scrape.
+        //
+        // Every comparison against NaN is false, so a guard phrased as a
+        // rejection — `if delta_count <= 0.0 || delta_sum < 0.0 { None }` —
+        // falls through and writes Some(NaN) into an immutable CSV row. The
+        // acceptance phrasing used here rejects it instead. This test is what
+        // keeps the guard from being "simplified" back.
+        assert_eq!(
+            latency_ms(Some(1.0), Some(10.0), Some(f64::NAN), Some(12.0)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(1.0), Some(10.0), Some(2.0), Some(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(f64::NAN), Some(10.0), Some(2.0), Some(12.0)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(1.0), Some(f64::NAN), Some(2.0), Some(12.0)),
+            None
+        );
     }
 
     #[test]
