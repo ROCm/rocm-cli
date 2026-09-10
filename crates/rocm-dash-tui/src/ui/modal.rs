@@ -66,7 +66,10 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 /// past the viewport and render a blank pane. The clamp is computed from the
 /// *wrapped* row count (`Paragraph::line_count`), not `lines.len()` — `scroll`
 /// is applied post-wrap, so a pre-wrap count under-clamps whenever a line
-/// wraps and leaves trailing content permanently unreachable.
+/// wraps and leaves trailing content permanently unreachable. Returns that
+/// computed last-page offset so callers can write it back into app state
+/// (see `AppState::help_max_scroll`) and clamp future scroll deltas against
+/// the real content length instead of just this frame's render clamp.
 pub fn draw_scrollable_lines(
     f: &mut Frame,
     area: Rect,
@@ -74,10 +77,10 @@ pub fn draw_scrollable_lines(
     lines: Vec<Line>,
     scroll: u16,
     theme: &Theme,
-) {
+) -> u16 {
     let inner = draw_popup_frame(f, area, title, theme);
     if inner.height == 0 {
-        return;
+        return 0;
     }
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     let max_scroll = u16::try_from(p.line_count(inner.width))
@@ -85,6 +88,7 @@ pub fn draw_scrollable_lines(
         .saturating_sub(inner.height);
     let p = p.scroll((scroll.min(max_scroll), 0));
     f.render_widget(p, inner);
+    max_scroll
 }
 
 /// Render the Help modal for the active tab.
@@ -92,11 +96,10 @@ pub fn draw_scrollable_lines(
 /// Shares chrome (dimmed backdrop, popup geometry, scrollable single-column
 /// layout) with `draw_global_help` so the two help screens read as one
 /// family; unlike that screen, this one has an extra group — the active
-/// tab's own keys. `scroll` is the first visible line offset (see
-/// [`draw_scrollable_lines`]): a fixed two-column split used to clip content
-/// at small terminal sizes, since a group's rows could run past the popup's
-/// height with no way to reach them.
-pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scroll: u16) {
+/// tab's own keys. `scroll` is the first visible line offset; returns the
+/// last-page offset computed by [`draw_scrollable_lines`] so the caller can
+/// clamp future scroll deltas against it.
+pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scroll: u16) -> u16 {
     grey_overlay(f);
     let popup = centered_rect(80, 80, 100, 26, area);
 
@@ -156,7 +159,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scrol
     ];
 
     let lines = help_group_lines(groups, theme);
-    draw_scrollable_lines(f, popup, "Help", lines, scroll, theme);
+    draw_scrollable_lines(f, popup, "Help", lines, scroll, theme)
 }
 
 fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {
@@ -578,8 +581,9 @@ pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 /// Distinct from the contextual per-tab `?` help (`draw_help`), but shares its
 /// chrome — dimmed backdrop, popup geometry, and scrollable single-column
 /// layout (see [`draw_help`] for why). `scroll` is the first visible line
-/// offset (see [`draw_scrollable_lines`]).
-pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
+/// offset; returns the last-page offset computed by [`draw_scrollable_lines`]
+/// so the caller can clamp future scroll deltas against it.
+pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) -> u16 {
     grey_overlay(f);
     let popup = centered_rect(80, 80, 100, 26, area);
     let groups: &[(&str, &[(&str, &str)])] = &[
@@ -614,7 +618,7 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
         ),
     ];
     let lines = help_group_lines(groups, theme);
-    draw_scrollable_lines(f, popup, "Keyboard", lines, scroll, theme);
+    draw_scrollable_lines(f, popup, "Keyboard", lines, scroll, theme)
 }
 
 /// Flatten keyboard-help groups into the `Vec<Line>` shape `draw_help` and
@@ -848,7 +852,9 @@ mod ported_chrome_tests {
         );
         assert!(options.contains("General"), "options missing tab label");
 
-        let help = render(&|f| super::draw_global_help(f, area, &theme, 0));
+        let help = render(&|f| {
+            super::draw_global_help(f, area, &theme, 0);
+        });
         assert!(
             help.contains("Keyboard"),
             "global help missing title: {help:?}"
@@ -886,8 +892,10 @@ mod ported_chrome_tests {
         let area = Rect::new(0, 0, 80, 24);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| super::draw_help(f, area, ActiveTab::Home, &theme, i16::MAX as u16))
-            .unwrap();
+        term.draw(|f| {
+            super::draw_help(f, area, ActiveTab::Home, &theme, i16::MAX as u16);
+        })
+        .unwrap();
         let out = flat(&term);
         assert!(
             out.contains("REPLAY") && out.contains("pause / resume"),
@@ -909,8 +917,10 @@ mod ported_chrome_tests {
         let area = Rect::new(0, 0, 80, 24);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| super::draw_help(f, area, ActiveTab::Chat, &theme, i16::MAX as u16))
-            .unwrap();
+        term.draw(|f| {
+            super::draw_help(f, area, ActiveTab::Chat, &theme, i16::MAX as u16);
+        })
+        .unwrap();
         let out = flat(&term);
         assert!(
             out.contains("REPLAY") && out.contains("60s"),

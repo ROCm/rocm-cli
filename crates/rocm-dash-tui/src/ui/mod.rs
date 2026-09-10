@@ -123,7 +123,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll),
+        Modal::Help => {
+            state.help_max_scroll =
+                modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll);
+        }
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
@@ -137,7 +140,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme, state.help_scroll),
+        Modal::GlobalHelp => {
+            state.help_max_scroll = modal::draw_global_help(f, body, &theme, state.help_scroll);
+        }
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -430,7 +435,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     if state.approval.is_some() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" cancel  "));
-    } else if state.has_open_overlay() {
+    } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
     } else if state.modal != Modal::None {
@@ -592,10 +597,9 @@ mod tests {
         term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
             .unwrap();
 
-        let esc = chips
+        let _ = chips
             .iter()
             .find(|c| c.action == KeyAction::OpenMenu)
             .expect("a fallback Esc chip opening the menu must always be present");
-        let _ = esc;
     }
 }

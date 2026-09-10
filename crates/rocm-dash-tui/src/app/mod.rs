@@ -500,6 +500,12 @@ pub struct AppState {
     /// Scroll offset (in lines) inside the Help / GlobalHelp overlays. Both
     /// modals are mutually exclusive so one field suffices; reset on open.
     pub help_scroll: u16,
+    /// Last-measured upper bound for `help_scroll`, written back by the
+    /// renderer each frame (see `ui::modal::draw_help` /
+    /// `draw_global_help`), mirroring `chat_max_scroll`. Clamps `scroll_help`
+    /// so a "jump to end" (`i16::MAX`) can't leave the offset far past the
+    /// real content length.
+    pub help_max_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.
     /// Shared by whichever operational manager is showing its console; reset
     /// when an overlay opens (`close_overlays`).
@@ -697,6 +703,7 @@ impl AppState {
             theme_picker_sel,
             bench_detail_scroll: 0,
             help_scroll: 0,
+            help_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -986,7 +993,7 @@ impl AppState {
     /// manager is open at a time, so this reflects that one; `true` when none is
     /// open. Gates the Esc back-out so Esc cancels the innermost layer first
     /// (and is ignored while a job runs) before it can eject the manager.
-    fn active_overlay_at_root(&self) -> bool {
+    pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
             w.browser.is_none()
                 && w.picker.is_none()
@@ -1047,11 +1054,18 @@ impl AppState {
     /// mutation lives in the event-loop arm).
     ///
     /// Not just ROCm/Serving: a manager can be opened from a non-domain tab
-    /// (e.g. `examine_manager` from an Observe hotkey), and Esc must be able to
-    /// close it there too — otherwise it falls through to the global `OpenMenu`
-    /// arm while the manager overlay keeps rendering on top, leaving `Modal`
-    /// set but invisible. `pane_focus` is meaningless outside Rocm/Serving, so
-    /// resetting it there is a harmless no-op.
+    /// (e.g. `examine_manager` from an Observe hotkey). This used to be gated
+    /// on `active_tab == Rocm | Serving`, so on other tabs the manager's own
+    /// event-loop arm handled root Esc directly (every overlay type already
+    /// has a dedicated `Some(Ok(CtEvent::Key(k))) if state.<overlay>.is_some()`
+    /// arm ahead of the generic handler, and each self-closes on root Esc
+    /// regardless of `active_tab` — so there was no "Modal stays set but
+    /// invisible" bug to fix here). Dropping the tab guard is a harmless
+    /// generalization: it moves the close from the manager's own `on_key` to
+    /// this shared path (`close_overlays()` + `pane_focus = Actions`) so a
+    /// future manager doesn't need to duplicate that root-Esc handling.
+    /// `pane_focus` is meaningless outside Rocm/Serving, so resetting it there
+    /// is a harmless no-op.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -1119,11 +1133,15 @@ impl AppState {
         self.help_scroll = 0;
     }
 
-    /// Adjust the Help / GlobalHelp scroll. `delta` is in lines; clamped at 0
-    /// (no upper bound — the renderer clamps against the actual line count).
+    /// Adjust the Help / GlobalHelp scroll. `delta` is in lines; clamped
+    /// against `[0, help_max_scroll]` (the latter is last written back by the
+    /// renderer, see `help_max_scroll`), so `i16::MIN`/`i16::MAX` ("jump to
+    /// start/end") land exactly on `0`/`help_max_scroll` instead of
+    /// overflowing into an offset far past the real content length.
     pub fn scroll_help(&mut self, delta: i16) {
         let cur = i32::from(self.help_scroll);
-        let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
+        let max = i32::from(self.help_max_scroll);
+        let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
         self.help_scroll = next;
     }
 
@@ -3724,8 +3742,11 @@ mod tests {
         s.active_tab = ActiveTab::Rocm;
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
         // Manager open on a non-domain tab (opened from Observe hotkey) →
-        // Esc still backs out, closing the manager (item #35: no dead corner
-        // where an overlay survives a tab switch and swallows Esc silently).
+        // Esc backs out uniformly regardless of tab, now that the
+        // Rocm/Serving-only gate is gone. New coverage of the generalized
+        // behavior — the manager's own event-loop arm already closed it on
+        // this tab before the gate was removed, so this isn't a regression
+        // test for a prior bug.
         s.active_tab = ActiveTab::Observe;
         s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         assert!(s.has_open_overlay());
@@ -5505,6 +5526,22 @@ mod tests {
         s.help_scroll = 17;
         assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
         assert_eq!(s.modal, Modal::Help);
+        assert_eq!(s.help_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_help_clamps_jump_to_end_so_scrolling_back_up_moves_immediately() {
+        // Regression: `scroll_help` used to clamp only at 0, with no upper
+        // bound, so `G`/`End` (ScrollModal(i16::MAX)) set help_scroll to
+        // 32767 regardless of the real content length. Scrolling back up by
+        // one row then took ~32700 keypresses to have any visible effect.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.help_max_scroll = 10;
+        s.scroll_help(i16::MAX); // "jump to end"
+        assert_eq!(s.help_scroll, 10, "jump-to-end lands exactly on the max");
+        s.scroll_help(-1); // one `k`/`Up`
+        assert_eq!(s.help_scroll, 9, "scrolling up moves immediately, not after ~32k presses");
+        s.scroll_help(i16::MIN); // "jump to start"
         assert_eq!(s.help_scroll, 0);
     }
 

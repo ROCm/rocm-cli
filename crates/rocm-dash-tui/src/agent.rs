@@ -1608,9 +1608,11 @@ impl AgentClient for MockAgentClient {
                     && t.content.to_lowercase().contains(&trigger.phrase)
             );
             if fires {
-                let _ = trigger.tx.send(ClientMsg::ChatApprovalRequired {
+                if let Err(e) = trigger.tx.send(ClientMsg::ChatApprovalRequired {
                     intent: trigger.intent.clone(),
-                });
+                }) {
+                    warn!(error = %e, "mock approval trigger dropped: receiver gone");
+                }
                 return Ok(
                     "This action needs operator approval; it has been surfaced to \
                            the operator."
