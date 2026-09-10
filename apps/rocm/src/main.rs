@@ -602,10 +602,10 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve overwriting an existing ROCm SDK (and required system-package
-        /// installs such as OpenMPI for vLLM) without prompting; required to
-        /// overwrite an existing SDK outside an interactive terminal. A fresh
-        /// install (no existing SDK) never prompts.
+        /// Approve replacing an existing ROCm SDK as the active default (and
+        /// required system-package installs such as OpenMPI for vLLM) without
+        /// prompting; required to replace an existing SDK outside an interactive
+        /// terminal. A fresh install (no existing SDK) never prompts.
         #[arg(long)]
         yes: bool,
     },
@@ -19341,6 +19341,34 @@ mod tests {
                 "`{choice}` must be offered by `rocm examine --help`:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn install_sdk_help_describes_the_gate_as_replacing_the_active_default() {
+        // `rocm install sdk --help` is the most-read description of the `--yes`
+        // gate, and it is the one surface a "reword every site" pass can miss.
+        // The effect is a displacement, not a deletion: `runtime_key` embeds the
+        // resolved version, so an upgrade or downgrade lands in its own install
+        // root and the previous install stays on disk — only the active default
+        // moves. Claiming an overwrite here would promise a deletion that does
+        // not happen and contradict the prompt and the README.
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("active default"),
+            "`rocm install sdk --help` must describe --yes as approving a \
+             replacement of the active default:\n{help}"
+        );
+        assert!(
+            !help.to_lowercase().contains("overwrit"),
+            "`rocm install sdk --help` must not claim an overwrite; an upgrade \
+             or downgrade leaves the previous install on disk:\n{help}"
+        );
     }
 
     #[test]
