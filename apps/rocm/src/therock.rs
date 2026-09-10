@@ -5378,6 +5378,18 @@ mod tests {
         assert_eq!(version, "10.0.0");
     }
 
+    /// The rename `tarball_family_token` applies for the next catalog must not
+    /// drift from what `normalize_therock_family` maps back to `gfx103X-dgpu`;
+    /// a family manifests under is worthless if the catalog's own alias for it
+    /// no longer round-trips.
+    #[test]
+    fn next_tarball_family_token_round_trips_through_normalize_therock_family() {
+        assert_eq!(
+            normalize_therock_family(tarball_family_token(SourceLayout::Next, "gfx103X-dgpu")),
+            Some("gfx103X-dgpu".to_owned())
+        );
+    }
+
     /// A pinned tarball install must install what it named, not whatever is
     /// newest in the catalog.
     #[test]

@@ -9310,22 +9310,6 @@ mod tests {
         );
     }
 
-    /// The next tarball catalog names this family `gfx103X-all` while the
-    /// canonical catalog names it `gfx103X-dgpu`. Both spellings, and the raw
-    /// arch, have to resolve to the one canonical label the rest of the CLI
-    /// stores, so a `--family gfx103X-all` install is not a different runtime.
-    #[test]
-    fn normalize_therock_family_aliases_gfx103x_all_to_canonical_dgpu_label() {
-        assert_eq!(
-            normalize_therock_family("gfx103X-all"),
-            Some("gfx103X-dgpu".to_owned())
-        );
-        assert_eq!(
-            normalize_therock_family("gfx1030"),
-            Some("gfx103X-dgpu".to_owned())
-        );
-    }
-
     #[test]
     fn known_therock_families_all_round_trip() {
         for family in known_therock_families() {
