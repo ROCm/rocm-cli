@@ -120,6 +120,12 @@ pub struct ResolvedArgs {
     /// Background checks for the automations manager (Phase 3 Wave 3). Adapted
     /// by the bin. Empty when none are available.
     pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
+    /// System prompt for the chat assistant: the ROCm tool-use prompt plus this
+    /// machine's detected facts (OS, WSL, AMD GPU, available engines). Composed
+    /// by the bin (`apps/rocm`, which has `rocm-core`) so this crate needs no
+    /// `rocm-core` dep. `None` for demo/replay/`--chat-mock`, which have no bin
+    /// seam and keep the agent's built-in default preamble.
+    pub chat_system_prompt: Option<String>,
     /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
     /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
     pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
@@ -481,7 +487,14 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 /// Job id for the periodic background update check driven off the tick loop.
 /// Deliberately distinct from `update_manager`'s interactive `"update-check"`
 /// so the two never clobber each other's job slot / console output.
-const HOME_UPDATE_CHECK_JOB_ID: &str = "home-update-check";
+/// `pub(crate)` so the Home tab's activity feed (`ui::tabs::home`) can filter
+/// this job out — it is the tile's own plumbing, not user activity.
+pub(crate) const HOME_UPDATE_CHECK_JOB_ID: &str = "home-update-check";
+
+/// Bound on the background update check's own per-runtime index lookups, so a
+/// slow/unreachable index can't leave the job running indefinitely. Mirrors
+/// the CLI's `STARTUP_UPDATE_CHECK_TIMEOUT_SECS` convention.
+const HOME_UPDATE_CHECK_TIMEOUT_SECS: u64 = 5;
 
 pub struct AppState {
     pub connect: String,
@@ -1715,12 +1728,21 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
         return Vec::new();
     }
 
+    if std::env::var_os("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK").is_some() {
+        return Vec::new();
+    }
+
     let fx = state
         .jobs
         .apply(rocm_dash_core::state::StateEvent::StartJob {
             id: HOME_UPDATE_CHECK_JOB_ID.to_owned(),
             cmd: crate::ui::exec::resolve_exe(),
-            args: vec!["update".to_owned(), "--json".to_owned()],
+            args: vec![
+                "update".to_owned(),
+                "--json".to_owned(),
+                "--timeout-secs".to_owned(),
+                HOME_UPDATE_CHECK_TIMEOUT_SECS.to_string(),
+            ],
         });
     if !fx.is_empty() {
         state.update_status_pending = true;
@@ -1943,6 +1965,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                 Some(chat_tx.clone()),
             )
             .ok()
+            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
             .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
         } else {
             // A build failure leaves `agent` None; a submit surfaces an error turn.
@@ -1952,6 +1975,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     args.inference_params(),
                     state.tool_executor.clone(),
                     chat_tx.clone(),
+                    args.chat_system_prompt.clone(),
                 )
                 .ok(),
                 None => None,
@@ -2442,6 +2466,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         args.inference_params(),
                         state.tool_executor.clone(),
                         chat_tx.clone(),
+                        args.chat_system_prompt.clone(),
                     ) {
                         Ok(arc) => {
                             agent = Some(arc.clone());
@@ -5684,6 +5709,7 @@ mod tests {
             model_recipes: Vec::new(),
             runtimes: Vec::new(),
             automations: Vec::new(),
+            chat_system_prompt: None,
             tool_executor: None,
             bench_results_dir: None,
         }
@@ -7023,6 +7049,53 @@ mod tests {
         assert!(fx.is_empty());
         assert!(!s.update_status_pending);
         assert_eq!(s.update_status, UpdateStatus::Error);
+    }
+
+    // Serializes tests that toggle `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, since
+    // process env is shared across test threads.
+    static UPDATE_CHECK_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn refresh_update_status_spawn_args_include_bounded_timeout() {
+        let mut s = st();
+        let _ = refresh_update_status(&mut s);
+        let job = s
+            .jobs
+            .job(HOME_UPDATE_CHECK_JOB_ID)
+            .expect("job spawned on first due tick");
+        assert_eq!(
+            job.args.last().map(String::as_str),
+            Some(HOME_UPDATE_CHECK_TIMEOUT_SECS.to_string().as_str()),
+            "the background check must be bounded, matching the CLI's own \
+             STARTUP_UPDATE_CHECK_TIMEOUT_SECS convention: {:?}",
+            job.args
+        );
+        assert!(job.args.iter().any(|a| a == "--timeout-secs"));
+    }
+
+    #[test]
+    fn refresh_update_status_skips_spawn_when_disabled_via_env() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialized by `UPDATE_CHECK_ENV_TEST_LOCK`; no other thread
+        // reads/writes this var concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        }
+        let result = std::panic::catch_unwind(|| {
+            let mut s = st();
+            let fx = refresh_update_status(&mut s);
+            assert!(fx.is_empty(), "a disabled check must not spawn a job");
+            assert!(!s.update_status_pending);
+            assert!(s.jobs.job(HOME_UPDATE_CHECK_JOB_ID).is_none());
+        });
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK");
+        }
+        result.unwrap();
     }
 
     #[test]

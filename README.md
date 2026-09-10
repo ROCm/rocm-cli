@@ -255,6 +255,7 @@ rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
+                    [--json] [--timeout-secs N]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed

@@ -40,6 +40,17 @@ const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GG
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
+/// Records the extracted embeddable version inside the runtime tree itself
+/// (not the CLI's own manifest) so the version check survives even when the
+/// manifest lives under a data dir that is not shared with the runtime tree
+/// (e.g. each e2e scenario's isolated data dir vs. a shared runtime tree).
+/// Living inside `runtime_dir` rather than beside it also means a wipe of the
+/// tree removes the marker in the same operation — "marker present implies
+/// extraction completed" holds by construction. Without this marker,
+/// [`prepare_embeddable`] can never prove the shared tree is already current,
+/// wipes it, and re-extracts on every call — destroying any llama.cpp backend
+/// installed into it in the process.
+const RUNTIME_VERSION_MARKER: &str = "runtime-version.txt";
 #[cfg(feature = "e2e-test-hooks")]
 const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
 /// Preferred llama.cpp backends, best first. Lemonade reports per-GPU support;
@@ -1051,13 +1062,59 @@ fn needs_extraction(
     reinstall || !server_present || installed != Some(wanted)
 }
 
+/// The Lemonade runtime version last extracted into `runtime_dir`, if any.
+fn installed_runtime_version(runtime_dir: &Path) -> Option<String> {
+    fs::read_to_string(runtime_dir.join(RUNTIME_VERSION_MARKER))
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+/// Record `version` as installed into `runtime_dir`. Marker lives inside
+/// `runtime_dir` (not beside it) so `remove_dir_all(runtime_dir)` clears it as
+/// part of the same wipe that removes the tree it describes — "marker present
+/// implies extraction completed" holds by construction, with no separate
+/// bookkeeping to keep in sync.
+fn record_runtime_version(runtime_dir: &Path, version: &str) -> Result<()> {
+    fs::write(runtime_dir.join(RUNTIME_VERSION_MARKER), version).with_context(|| {
+        format!(
+            "failed to record installed Lemonade runtime version under {}",
+            runtime_dir.display()
+        )
+    })
+}
+
 fn prepare_embeddable(
     paths: &AppPaths,
     env_root: Option<&Path>,
     reinstall: bool,
 ) -> Result<LemonadeInstallManifest> {
+    prepare_embeddable_with(
+        paths,
+        env_root,
+        reinstall,
+        rocm_deps::LEMONADE_VERSION,
+        embeddable_archive_sha256(),
+        download_file,
+    )
+}
+
+/// Same as [`prepare_embeddable`], but with the archive version, its expected
+/// sha256, and the download step all injectable — the seam a test uses to
+/// exercise the real decision of which source `installed_version` trusts,
+/// rather than reimplementing that decision inline.
+fn prepare_embeddable_with<F>(
+    paths: &AppPaths,
+    env_root: Option<&Path>,
+    reinstall: bool,
+    version: &str,
+    expected_sha256: &str,
+    download: F,
+) -> Result<LemonadeInstallManifest>
+where
+    F: FnMut(&str, &Path) -> Result<()>,
+{
     let root = lemonade_root(paths, env_root);
-    let version = rocm_deps::LEMONADE_VERSION.to_owned();
+    let version = version.to_owned();
     let archive_name = embeddable_archive_name(&version);
     let archive_url = embeddable_url(&version);
     let downloads = root.join("downloads");
@@ -1065,21 +1122,22 @@ fn prepare_embeddable(
     fs::create_dir_all(&downloads)?;
     // Held until the archive bytes have been extracted and copied out: the
     // verified bytes and the extracted bytes must be the same read.
-    let archive_guard = ensure_cached_archive(
-        &archive_url,
-        &archive,
-        embeddable_archive_sha256(),
-        download_file,
-    )?;
+    let archive_guard = ensure_cached_archive(&archive_url, &archive, expected_sha256, download)?;
     let runtime_dir = runtime_dir_in(&root);
     // The runtime directory is not version-scoped, so a bump downloads a new
     // archive into a tree that already holds `lemond` from the previous
     // version. Without comparing versions the extraction would be skipped and
     // the old binaries reported as the new version.
-    let installed_version = read_manifest(paths)
-        .ok()
-        .filter(|manifest| manifest.runtime_dir == runtime_dir)
-        .map(|manifest| manifest.version);
+    //
+    // The version is read from a marker inside `runtime_dir` (the same shared
+    // tree it describes), not from the CLI's own manifest: the manifest lives
+    // under `paths` (the per-invocation data dir), which is not guaranteed to
+    // be the same data dir that last extracted into this `runtime_dir` (e.g.
+    // each e2e scenario gets an isolated data dir but shares one runtime
+    // tree). Sourcing the check from the isolated manifest would report
+    // "unknown version" on every call, wipe the shared tree, and re-extract
+    // over it — destroying any llama.cpp backend already installed there.
+    let installed_version = installed_runtime_version(&runtime_dir);
     if needs_extraction(
         reinstall,
         installed_version.as_deref(),
@@ -1098,6 +1156,7 @@ fn prepare_embeddable(
         let embeddable_root = find_embeddable_root(&extract_root)?;
         copy_tree(&embeddable_root, &runtime_dir)?;
         fs::remove_dir_all(&extract_root).ok();
+        record_runtime_version(&runtime_dir, &version)?;
     }
     drop(archive_guard);
     let lemond = lemond_path_in(&runtime_dir);
@@ -5006,6 +5065,169 @@ mod tests {
         assert!(needs_extraction(false, None, pin, true));
         assert!(needs_extraction(false, Some(pin), pin, false));
         assert!(needs_extraction(true, Some(pin), pin, true));
+    }
+
+    #[test]
+    fn runtime_version_marker_round_trips_through_needs_extraction() {
+        // Unit coverage for the helpers themselves and their wiring into
+        // `needs_extraction` — NOT a regression test for the bug this marker
+        // fixes (see `prepare_embeddable_trusts_the_runtime_tree_over_an_absent_manifest`
+        // below for that): this never calls `prepare_embeddable`, so it can't
+        // constrain which source it reads `installed_version` from.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_dir = dir.path();
+
+        assert_eq!(installed_runtime_version(runtime_dir), None);
+
+        record_runtime_version(runtime_dir, "7.13.0").unwrap();
+        let installed = installed_runtime_version(runtime_dir);
+        assert_eq!(installed.as_deref(), Some("7.13.0"));
+        assert!(!needs_extraction(
+            false,
+            installed.as_deref(),
+            "7.13.0",
+            true
+        ));
+        assert!(needs_extraction(
+            false,
+            installed.as_deref(),
+            "7.14.0",
+            true
+        ));
+    }
+
+    #[test]
+    fn prepare_embeddable_trusts_the_runtime_tree_over_an_absent_manifest() {
+        // The actual regression: `prepare_embeddable` must source
+        // `installed_version` from the marker inside `runtime_dir`, not from
+        // `paths`' manifest. An isolated caller (fresh `AppPaths`, no
+        // manifest on disk) sharing a runtime tree that a *different* caller
+        // already extracted must recognize it as current and skip
+        // re-extraction. Reverting to a manifest read (the original bug)
+        // makes every isolated caller miss, wipe, and re-extract — destroying
+        // any llama.cpp backend already installed there. Calling
+        // `prepare_embeddable_with` (the real function, seamed for an
+        // injectable download step) rather than reimplementing its decision
+        // inline is what makes this test fail under that reversion.
+        let env_root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: env_root.path().join("config"),
+            data_dir: env_root.path().join("data"), // no manifest ever written here
+            cache_dir: env_root.path().join("cache"),
+        };
+        let version = "7.13.0";
+        let root = lemonade_root(&paths, Some(env_root.path()));
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(lemond_path_in(&runtime_dir), b"fake lemond").unwrap();
+        fs::write(lemonade_path_in(&runtime_dir), b"fake lemonade").unwrap();
+        record_runtime_version(&runtime_dir, version).unwrap();
+        let sentinel = runtime_dir.join("llamacpp-rocm-backend.sentinel");
+        fs::write(&sentinel, b"a backend a prior scenario installed").unwrap();
+
+        let archive_bytes = b"never parsed unless extraction wrongly triggers";
+        let expected_sha256 = format!("{:x}", Sha256::digest(archive_bytes));
+
+        let manifest = prepare_embeddable_with(
+            &paths,
+            Some(env_root.path()),
+            false,
+            version,
+            &expected_sha256,
+            |_, destination| {
+                fs::write(destination, archive_bytes)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(manifest.version, version);
+        assert!(
+            sentinel.is_file(),
+            "prepare_embeddable wiped the shared runtime tree instead of recognizing it as current"
+        );
+    }
+
+    #[test]
+    fn prepare_embeddable_records_the_version_after_a_real_extraction() {
+        // The write-side sibling of the test above: an isolated caller
+        // extracting into an empty `runtime_dir` for the first time must
+        // leave a marker behind, or the *next* isolated caller sharing this
+        // tree sees no marker, wipes, and re-extracts on every call — the
+        // same defect the read-side regression guards against, from the
+        // write side instead. Dropping `record_runtime_version`'s call site
+        // in `prepare_embeddable` fails this test.
+        let env_root = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: env_root.path().join("config"),
+            data_dir: env_root.path().join("data"),
+            cache_dir: env_root.path().join("cache"),
+        };
+        let version = "7.13.0";
+
+        // A real, well-formed archive (unlike the stub above): this test
+        // exercises the extraction branch, so `extract_archive` must succeed.
+        // `extract_archive` dispatches on the destination's extension, which
+        // `prepare_embeddable_with` derives from the current platform (see
+        // `embeddable_os_arch`) — so the bytes built here must be in that
+        // same format, not always a tar.gz.
+        let (_, extension) = embeddable_os_arch();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join(format!("embeddable.{extension}"));
+        let entry_names = [
+            platform_binary_name("lemond"),
+            platform_binary_name("lemonade"),
+        ];
+        if runtime_is_windows() {
+            let file = fs::File::create(&archive).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for name in &entry_names {
+                writer
+                    .start_file(format!("embeddable/bin/{name}"), options)
+                    .unwrap();
+                writer.write_all(b"hello").unwrap();
+            }
+            writer.finish().unwrap();
+        } else {
+            let file = fs::File::create(&archive).unwrap();
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            for name in &entry_names {
+                let mut header = tar::Header::new_ustar();
+                header.set_size(5);
+                header.set_mode(0o755);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_path(format!("embeddable/bin/{name}")).unwrap();
+                header.set_cksum();
+                builder.append(&header, &b"hello"[..]).unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let expected_sha256 = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+
+        let root = lemonade_root(&paths, Some(env_root.path()));
+        let runtime_dir = runtime_dir_in(&root);
+        assert_eq!(installed_runtime_version(&runtime_dir), None);
+
+        prepare_embeddable_with(
+            &paths,
+            Some(env_root.path()),
+            false,
+            version,
+            &expected_sha256,
+            |_, destination| {
+                fs::copy(&archive, destination)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_runtime_version(&runtime_dir).as_deref(),
+            Some(version),
+            "prepare_embeddable extracted the archive but never recorded the version"
+        );
     }
 
     #[test]
