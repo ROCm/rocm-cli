@@ -1909,12 +1909,21 @@ jobs:
     # mock platform), and the actual work is gated at the STEP level. Gating
     # `heavy` at the job level would SKIP the job on a non-heavy PR, and a required
     # check that is never produced stalls the merge queue. `merge_group` forces
-    # heavy=true, so the mock gate always executes there as a backstop.
+    # heavy=true, so the mock gate always executes there as a backstop. (A
+    # fixed-name job skipped by `if:` still reports its name, as `skipped`, which
+    # branch protection counts as satisfied; a skipped templated matrix job like
+    # this one reports its raw `name:` expression instead, so the required name is
+    # never produced.)
     if: >-
       always()
       && needs.changes.result == 'success'
       && (github.event_name != 'workflow_dispatch'
           || inputs.platform == 'all' || inputs.platform == 'mock')
+    # Whether this lane executed scenarios, published for the consolidated
+    # report so it never downloads artifacts a no-op run did not produce. Both
+    # matrix legs compute the same value from the same inputs.
+    outputs:
+      ran: ${{ steps.gate.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2016,7 +2025,9 @@ jobs:
   # Consolidate the mock (GitHub-hosted) platform's report into the cross-platform
   # report: a platform × tier matrix in the run Summary plus a single merged HTML
   # artifact. `if: always()` so a failing platform still appears; runs on
-  # GitHub-hosted ubuntu (no GPU needed — it only parses report.json).
+  # GitHub-hosted ubuntu (no GPU needed — it parses report.json and reads the run's job list). It is also
+  # a required check, so its last step fails unless the required `E2E tests` job
+  # passed (see that step).
   #
   # The self-hosted GPU platforms are consolidated by e2e-selfhosted.yml's own
   # report job (they moved there so an offline runner can't stall this workflow's
@@ -2024,25 +2035,48 @@ jobs:
   # glob still auto-includes any new GitHub-hosted platform added here.
   e2e-report:
     name: E2E consolidated report
-    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
+    runs-on: ubuntu-24.04 # one LTS: merges report.json files and reads the job list
     # Bound the job (like every E2E job) so a stalled artifact download can't hang
     # a hosted runner indefinitely.
     timeout-minutes: 15
+    # `actions: read` lets the verdict step list this run's jobs. Job-level
+    # permissions replace the workflow-wide set, so contents:read is repeated
+    # for checkout.
+    permissions:
+      contents: read
+      actions: read
+    # `e2e` has to be a need: the verdict step reads that job's conclusion from
+    # the API, which is only final once the job has finished.
     needs:
       - changes
       - e2e
-    # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
-    # trigger was manual; `always()` still lets it collect partial/failed tiers.
+    # This is a REQUIRED check, so it must be produced whenever the `e2e` job
+    # is. Branch protection treats a SKIPPED required check as satisfied, so a
+    # clause narrowing this condition stops the check gating anything on the
+    # runs it skips. The condition therefore
+    # mirrors `e2e`'s exactly, and which work happens is decided per step;
+    # `consolidated_e2e_report_cannot_be_skipped_and_carries_the_required_legs_verdict`
+    # in xtask/src/workflow_contract.rs pins both. `always()` is kept so a
+    # failing platform still gets a rendered report.
     if: >-
       always()
-      && (needs.changes.outputs.heavy == 'true'
-        || github.event_name == 'workflow_dispatch')
+      && needs.changes.result == 'success'
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
+      # The report is only built when the lane executed scenarios (`e2e`'s
+      # `ran` output). The lane is a no-op, and there is nothing to render, when
+      # its gate decides not to run: a pull request touching no heavy path,
+      # `clippy` not succeeding, or `build-and-test` reaching no verdict. The
+      # verdict step at the end does not need the checkout or the toolchain, and
+      # runs either way.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.e2e.outputs.ran == 'true'
         with:
           persist-credentials: false
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        if: needs.e2e.outputs.ran == 'true'
         with:
           # rust-cache keys on "Linux-x64" only; name the image so a target dir
           # built against one Ubuntu release's glibc is never restored on another.
@@ -2058,12 +2092,14 @@ jobs:
       # layout is the norm here; `discover()` handles both (labeling the root
       # file from platform.json's slug).
       - name: Download all E2E reports
+        if: needs.e2e.outputs.ran == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: '*-report'
           path: e2e-artifacts
 
       - name: Build consolidated report + step summary
+        if: needs.e2e.outputs.ran == 'true'
         run: |
           mkdir -p consolidated
           cargo xtask e2e-report \
@@ -2071,8 +2107,78 @@ jobs:
             --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload consolidated report
-        if: always()
+        if: always() && needs.e2e.outputs.ran == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-consolidated-report
           path: consolidated/
+
+      # Rendering the report says nothing about whether the scenarios passed: it
+      # succeeds just as happily on a run in which every one failed. This job is
+      # a required check named after the E2E lane, so it carries that lane's
+      # verdict, and it runs last so the report above is still produced for a
+      # failing run. `E2E tests` is a required check too, so a failing lane is
+      # already blocked there; this makes the report an honest second signal and
+      # keeps it gating if `E2E tests` ever leaves the required list. A cancelled
+      # run is not covered: the step is skipped and the job concludes success
+      # (job-level `always()` still starts it), which is not a merge hole while
+      # `E2E tests`, `build-and-test` and `clippy` are required.
+      #
+      # The verdict is the conclusion of the `E2E tests` job, the 24.04 leg that
+      # is the required check, and NOT `needs.e2e.result`: `e2e` is a matrix over
+      # both Ubuntu images and its result aggregates both legs, so a failure on
+      # the 26.04 leg, which is not a required check, would fail this one. The
+      # run's job list is the only place the legs are told apart, so it is read
+      # from the API. REQUIRED_JOB must stay equal to the 24.04 leg's name
+      # (the bare one in `e2e`'s `name:`); xtask's
+      # `consolidated_e2e_report_cannot_be_skipped_and_carries_the_required_legs_verdict`
+      # ties the two, and `e2e_verdict_follows_the_required_leg_and_fails_closed`
+      # runs this script against stubbed job lists and pins its exits.
+      #
+      # It fails CLOSED. A job list that cannot be read, no job of that name
+      # (renamed, or not created), more than one, or any conclusion but
+      # `success` all fail the check: a verdict that could not be established
+      # must not read as a pass. When the lane's gate decides not to run (a pull
+      # request touching no heavy path, a `clippy` that did not succeed, a
+      # `build-and-test` with no verdict) `E2E tests` still runs and concludes
+      # `success` without executing a scenario, exactly as it does for its own
+      # required check, so this reports success there and gates nothing more than
+      # that check does. `!cancelled()` as in the other report job: a superseded
+      # run is not a failure.
+      - name: Require the required E2E tests job to have passed
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUIRED_JOB: E2E tests
+          RAN: ${{ needs.e2e.outputs.ran }}
+        run: |
+          jobs=
+          for attempt in 1 2 3; do
+            jobs=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100") && break
+            jobs=
+            [ "$attempt" -lt 3 ] && sleep "${RETRY_DELAY_SECS:-5}"
+          done
+          if [ -z "$jobs" ]; then
+            echo "::error::could not list this run's jobs, so the '$REQUIRED_JOB' verdict could not be established"
+            exit 1
+          fi
+          conclusions=$(jq -r --arg job "$REQUIRED_JOB" \
+            '.jobs[] | select(.name == $job) | .conclusion // "none"' <<<"$jobs") || {
+            echo "::error::could not read this run's job list, so the '$REQUIRED_JOB' verdict could not be established"
+            exit 1
+          }
+          count=$(grep -c . <<<"$conclusions" || true)
+          if [ "$count" != 1 ]; then
+            echo "::error::expected exactly one job named '$REQUIRED_JOB' in this run, found $count; it was renamed, was not created, or is no longer the only one, so the verdict could not be established"
+            exit 1
+          fi
+          if [ "$conclusions" != success ]; then
+            echo "::error::the required '$REQUIRED_JOB' job concluded '$conclusions'; failing the consolidated report"
+            exit 1
+          fi
+          if [ "$RAN" = true ]; then
+            echo "'$REQUIRED_JOB' concluded success"
+          else
+            echo "'$REQUIRED_JOB' concluded success without running any scenario (see its 'Decide whether to run' step), so there is no report to render"
+          fi
