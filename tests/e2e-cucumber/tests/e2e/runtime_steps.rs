@@ -829,10 +829,8 @@ async fn assert_adopt_error_explains(world: &mut E2eWorld) {
 
 #[when("the user asks for rollback help")]
 async fn ask_rollback_help(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback", "--help"]);
+    let stdout = crate::run_rocm_ok(world, &["runtimes", "rollback", "--help"]);
     world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
-    world.cli_rc = Some(rc);
 }
 
 #[then("the help states that rollback has no history")]
