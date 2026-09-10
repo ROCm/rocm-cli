@@ -6950,8 +6950,18 @@ mod tests {
 
     // --- Home tab update check (background job-bridge trigger) ---
 
+    // Serializes every test in this group against
+    // `refresh_update_status_skips_spawn_when_disabled_via_env`, which toggles
+    // `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK` — process env is shared across
+    // test threads, so an unguarded test can observe the var mid-toggle and
+    // spuriously see `refresh_update_status` skip the spawn it expects.
+    static UPDATE_CHECK_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn refresh_update_status_spawns_on_first_due_tick() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         assert!(!s.update_status_pending);
         let fx = refresh_update_status(&mut s);
@@ -6962,6 +6972,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_does_not_duplicate_spawn_while_running() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let fx = refresh_update_status(&mut s);
         assert!(!fx.is_empty());
@@ -6979,6 +6992,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_from_terminal_success_json() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
         assert!(s.update_status_pending);
@@ -7016,6 +7032,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_to_error_on_terminal_failure() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
         assert!(s.update_status_pending);
@@ -7033,6 +7052,9 @@ mod tests {
 
     #[test]
     fn refresh_update_status_resolves_to_error_on_unparsable_success_output() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
 
@@ -7051,12 +7073,11 @@ mod tests {
         assert_eq!(s.update_status, UpdateStatus::Error);
     }
 
-    // Serializes tests that toggle `ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK`, since
-    // process env is shared across test threads.
-    static UPDATE_CHECK_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn refresh_update_status_spawn_args_include_bounded_timeout() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut s = st();
         let _ = refresh_update_status(&mut s);
         let job = s
