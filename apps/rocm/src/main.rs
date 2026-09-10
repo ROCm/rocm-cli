@@ -15507,12 +15507,26 @@ struct FailedManagedServiceStop {
 /// carries the remedy that can actually clear it.
 #[derive(Debug, PartialEq, Eq)]
 enum StopFailureRemedy {
-    /// The record parses, so `rocm services stop` can act on it.
+    /// The record parses and its processes are still there, so `rocm services
+    /// stop` can act on it.
     StopTheService,
+    /// The recorded processes are gone but the endpoint still serves — an engine
+    /// grandchild outlived its supervisor. `rocm services stop` has nothing left
+    /// to kill, so the process holding the port has to be found and stopped.
+    StopWhatHoldsThePort,
     /// The record does not parse, so no `rocm` command can act on it — the file
     /// itself has to be repaired or removed.
     RepairTheRecord,
+    /// The background helper is still alive, so it can restart what was just
+    /// stopped. It has to go before anything is removed.
+    StopTheDaemon,
 }
+
+/// How long the gate waits for a still-listening endpoint to say what it serves.
+///
+/// Only reached when something already answered a TCP connect, and only for
+/// records that were already stopped, so it costs nothing on the normal path.
+const ENDPOINT_IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What [`stop_managed_services_before_uninstall`] managed to do, so the caller
 /// can report the services it stopped and refuse to proceed while any is still
@@ -15525,6 +15539,55 @@ struct ManagedServiceStopReport {
     /// an unverifiable process, or a record too corrupt to locate one. Uninstall
     /// must abort rather than remove the tooling that stops them.
     failed: Vec<FailedManagedServiceStop>,
+}
+
+/// Stop the background helper before uninstall stops the services it supervises.
+///
+/// `rocmd` recovers managed services: a `ready`/`running` record whose endpoint
+/// is unreachable is treated as recoverable and respawned
+/// (`endpoint_status_unreachable`). That is precisely the state the stop pass
+/// creates — the engine is killed, and the record still says `ready` until
+/// `stop_internal_managed_service` writes it back. A daemon polling in that
+/// window brings the server straight back, after which uninstall would delete
+/// the binaries and every service record while a brand-new engine holds the GPU.
+/// Stopping the supervisor first closes the window instead of racing it.
+///
+/// A daemon that cannot be confirmed stopped is a blocking failure for the same
+/// reason a service is: it can resurrect a server after the tooling is gone.
+fn stop_background_helper_before_uninstall(
+    paths: &AppPaths,
+    report: &mut ManagedServiceStopReport,
+) {
+    let Ok(Some(state)) = AutomationRuntimeState::load(paths) else {
+        return;
+    };
+    if state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
+        return;
+    }
+    if !rocm_core::process_is_running(state.daemon_pid) {
+        return;
+    }
+    println!("stopping the background helper (rocmd)");
+    // No start-time token is recorded for the daemon, so this is a best-effort
+    // identity match — the same contract the legacy service records get.
+    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, None);
+    let outcome = rocm_core::terminate_verified(
+        &identity,
+        rocm_core::KillScope::Tree,
+        MANAGED_STOP_GRACE,
+        true,
+    );
+    if outcome.stopped() {
+        report.stopped.push("rocmd (background helper)".to_owned());
+    } else {
+        report.failed.push(FailedManagedServiceStop {
+            service_id: format!("rocmd (pid {})", state.daemon_pid),
+            reason: "the background helper could not be confirmed stopped, and it restarts \
+                     managed services whose endpoint stops answering"
+                .to_owned(),
+            remedy: StopFailureRemedy::StopTheDaemon,
+        });
+    }
 }
 
 /// Stop every live managed service before uninstall removes the binaries and
@@ -15548,6 +15611,7 @@ struct ManagedServiceStopReport {
 /// [`unreadable_service_manifests`].
 fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedServiceStopReport> {
     let mut report = ManagedServiceStopReport::default();
+    stop_background_helper_before_uninstall(paths, &mut report);
     let records = load_managed_services(paths)?;
     let mut attempted: Vec<&ManagedServiceRecord> = Vec::new();
     for record in &records {
@@ -15587,14 +15651,26 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
     // recorded process only, so an engine grandchild can outlive it and keep the
     // port and the GPU while the record reads "stopped".
     //
-    // Only services this pass actually tried to stop are probed. A record that
-    // was already not live is NOT judged by its recorded port: a stopped record
-    // keeps its manifest and its old port forever (nothing prunes them, and
-    // there is no `services remove`), so any unrelated process that later binds
-    // that port would otherwise fail the gate on every run, with no way out.
-    // Restricting the probe to this pass's own work also keeps the failure
-    // self-clearing — a retry re-reads the record as stopped and skips it.
-    for record in attempted {
+    // Every record is probed, not just the ones this pass stopped. A stop
+    // persists `status = "stopped"` before this loop runs, so the record that
+    // failed the gate reads as not-live on the very next run — probing only this
+    // pass's own work would let the retry the abort message asks for sail
+    // through and remove the tooling while the survivor keeps serving. That is
+    // the defect this gate exists to prevent, reached by following its own
+    // instructions.
+    //
+    // What differs is the evidence required, because a stopped record keeps its
+    // manifest and its old port forever (nothing prunes them, and there is no
+    // `services remove`), so an unrelated process that later binds that port
+    // must not brick uninstall with no way out:
+    //
+    //   * stopped by this pass — any listener fails the gate. We killed the
+    //     recorded processes seconds ago; something answering there is the
+    //     survivor.
+    //   * already stopped before this run — a listener alone proves nothing, so
+    //     it has to identify itself as this record's own model before it counts.
+    //     An unrelated service on a recycled port does not, and is not blocked.
+    for record in &records {
         if report
             .failed
             .iter()
@@ -15605,6 +15681,36 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
         if !loopback_tcp_port_is_reachable(&probe_host(&record.host), record.port) {
             continue;
         }
+        let stopped_by_this_pass = attempted
+            .iter()
+            .any(|candidate| candidate.service_id == record.service_id);
+        if !stopped_by_this_pass {
+            let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
+            match rocm_core::managed_service_endpoint_model_ready(
+                record,
+                endpoint_api_key.as_deref(),
+                ENDPOINT_IDENTITY_PROBE_TIMEOUT,
+            ) {
+                // Serving this record's own model: the engine outlived the
+                // supervisor whose death marked the record stopped.
+                Ok(true) => {}
+                // Someone else's listener on a recycled port.
+                Ok(false) => continue,
+                // Listening but unidentifiable — a wedged engine, or something
+                // that is not an OpenAI endpoint at all. Aborting on this would
+                // put back the dead end that has no override and no recovery, so
+                // the removal proceeds; say so rather than deciding silently.
+                Err(_) => {
+                    println!(
+                        "warning: {}:{} still accepts connections but did not identify itself, \
+                         and service {} is already recorded stopped — proceeding. If that is a \
+                         server of yours, stop whatever holds that port first.",
+                        record.host, record.port, record.service_id
+                    );
+                    continue;
+                }
+            }
+        }
         report
             .stopped
             .retain(|stopped| stopped != &record.service_id);
@@ -15614,7 +15720,10 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                 "{}:{} still accepts connections after the stop",
                 record.host, record.port
             ),
-            remedy: StopFailureRemedy::StopTheService,
+            // Not `StopTheService`: the recorded processes are gone, so
+            // `rocm services stop` has nothing left to kill and every retry
+            // would abort identically.
+            remedy: StopFailureRemedy::StopWhatHoldsThePort,
         });
     }
     for manifest in unreadable_service_manifests(paths)? {
@@ -15735,6 +15844,33 @@ fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Result<Option<St
                 "Stop them with `rocm services stop <id> --yes`, then re-run uninstall. A server \
                  started by another user, or one wedged in the kernel, needs elevated privileges \
                  or a manual kill first."
+                    .to_owned(),
+            );
+        }
+        let orphaned = report
+            .failed
+            .iter()
+            .filter(|failure| failure.remedy == StopFailureRemedy::StopWhatHoldsThePort)
+            .map(|failure| failure.service_id.clone())
+            .collect::<Vec<_>>();
+        if !orphaned.is_empty() {
+            remedies.push(format!(
+                "Every process recorded for {} is gone, yet the endpoint still answers — the \
+                 engine outlived its supervisor, so `rocm services stop` has nothing left to \
+                 kill. Find what holds that port (`ss -ltnp` on Linux, `Get-NetTCPConnection \
+                 -LocalPort <port>` on Windows), stop it, then re-run uninstall.",
+                orphaned.join(", ")
+            ));
+        }
+        if report
+            .failed
+            .iter()
+            .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon)
+        {
+            remedies.push(
+                "The background helper restarts managed services on its own, so it has to be \
+                 stopped before uninstall can safely remove anything: kill that pid, then re-run \
+                 uninstall."
                     .to_owned(),
             );
         }
@@ -18054,16 +18190,22 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         let services_dir = paths.services_dir().display().to_string();
         let total = managed_services.len();
         plan.warnings.push(if live == 0 {
-            format!("{total} managed service record(s) exist under {services_dir}; none has a running server")
+            // "none is recorded as running", not "none has a running server":
+            // this counts statuses, and a record reads "stopped" the moment its
+            // supervisor is killed even if an engine grandchild kept the port.
+            // The stop pass probes for exactly that, so the plan must not
+            // promise it away — this line is the last thing read before
+            // confirming.
+            format!("{total} managed service record(s) exist under {services_dir}; none is recorded as running")
         } else if plan_removes_recovery_tooling(&plan, paths) {
             format!(
-                "{live} of {total} managed service record(s) under {services_dir} have a running server; those servers will be stopped before removal"
+                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; those servers will be stopped before removal"
             )
         } else {
             // Cache-only and other tooling-preserving runs: say what is true —
             // the servers keep running, and they remain stoppable afterwards.
             format!(
-                "{live} of {total} managed service record(s) under {services_dir} have a running server; this removal keeps `rocm services stop` and the service records, so those servers are left running"
+                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; this removal keeps `rocm services stop` and the service records, so those servers are left running"
             )
         });
     }
@@ -30941,6 +31083,80 @@ ID_LIKE="suse opensuse"
             "uninstall must not be permanently blocked by a recycled port"
         );
         drop(listener);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_record_still_serving_its_own_model_blocks_uninstall() {
+        // The retry the abort message asks for must not be the hole. A stop
+        // persists `status = "stopped"` BEFORE the gate probes the port, so the
+        // record that failed run 1 reads as not-live on run 2 — and if the gate
+        // only probed what it had just tried to stop, run 2 would sail through
+        // and remove the tooling while the survivor kept serving and holding the
+        // GPU. That is EAI-8014 reached by following the gate's own
+        // instructions, so the evidence has to survive the retry: an endpoint
+        // serving this record's own model blocks, whoever it belongs to.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the surviving engine");
+        let port = listener.local_addr().expect("socket address").port();
+        let serving = thread::spawn(move || {
+            use std::io::{Read, Write};
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                if stream.read(&mut buffer).is_err() {
+                    continue;
+                }
+                let body = r#"{"data":[{"id":"amd/orphaned-model"}]}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let (root, paths) = test_paths("uninstall-stopped-record-still-serving");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-orphaned-engine",
+            "vllm",
+            "amd/orphaned-model",
+            "amd/orphaned-model",
+            "127.0.0.1",
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        // Exactly the state run 1 leaves behind: supervisor killed, record
+        // written as stopped, engine grandchild still on the port.
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-orphaned-engine")
+            .unwrap_or_else(|| panic!("a still-serving engine must fail the gate: {report:?}"));
+        assert_eq!(
+            failure.remedy,
+            StopFailureRemedy::StopWhatHoldsThePort,
+            "the recorded processes are gone, so `rocm services stop` is not the remedy"
+        );
+        let error = uninstall_removal_gate(&report)
+            .expect_err("a still-serving engine must abort uninstall")
+            .to_string();
+        assert!(
+            error.contains("outlived its supervisor"),
+            "says why `rocm services stop` will not help: {error}"
+        );
+        drop(serving);
         let _ = fs::remove_dir_all(root);
     }
 

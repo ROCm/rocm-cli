@@ -7731,6 +7731,15 @@ pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(disk_space::map_write_error(error, &tmp));
     }
+    // Flush before publishing. Without this the rename can reach the disk while
+    // the bytes have not, leaving a zero-length file after a crash — which for a
+    // service record is not a lost update but an unparseable manifest, and the
+    // uninstall gate refuses to remove anything while one of those exists.
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
     drop(file);
 
     publish_temp_file(&tmp, path)
