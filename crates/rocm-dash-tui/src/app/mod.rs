@@ -1131,6 +1131,7 @@ impl AppState {
     /// modal, so a stale offset never carries over from a previous session).
     pub const fn reset_help_scroll(&mut self) {
         self.help_scroll = 0;
+        self.help_max_scroll = 0;
     }
 
     /// Adjust the Help / GlobalHelp scroll. `delta` is in lines; clamped
@@ -5540,7 +5541,10 @@ mod tests {
         s.scroll_help(i16::MAX); // "jump to end"
         assert_eq!(s.help_scroll, 10, "jump-to-end lands exactly on the max");
         s.scroll_help(-1); // one `k`/`Up`
-        assert_eq!(s.help_scroll, 9, "scrolling up moves immediately, not after ~32k presses");
+        assert_eq!(
+            s.help_scroll, 9,
+            "scrolling up moves immediately, not after ~32k presses"
+        );
         s.scroll_help(i16::MIN); // "jump to start"
         assert_eq!(s.help_scroll, 0);
     }

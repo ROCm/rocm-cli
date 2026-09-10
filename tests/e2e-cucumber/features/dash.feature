@@ -126,14 +126,21 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
 
-  @id:dash-manager-escape-closes-without-menu @requires-os:linux
-  Scenario: dash-11 - Escape closes a non-domain-tab manager overlay instead of opening the menu
+  # Characterization coverage: this scenario observes that Escape closes the
+  # manager on a non-domain tab, but the services manager's own event-loop arm
+  # would close it on root Esc even without the tab-independent back-out path
+  # this PR generalized, so a revert of that change would not turn this red.
+  # The discriminating regression test for that change is the unit test
+  # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
+  # app/mod.rs, which does fail on revert.
+  @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
+  Scenario: dash-11 - Escape closes a manager overlay on any tab
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the services manager
     Then the services manager is displayed
     When the user presses Escape
-    Then the services manager is closed without opening the menu
+    Then the services manager is closed
     When the user quits the dashboard
     Then the dashboard exits successfully
 

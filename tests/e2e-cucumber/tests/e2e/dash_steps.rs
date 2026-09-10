@@ -511,8 +511,8 @@ async fn services_manager_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
 }
 
-#[then("the services manager is closed without opening the menu")]
-async fn services_manager_closed_without_menu(world: &mut E2eWorld) {
+#[then("the services manager is closed")]
+async fn services_manager_closed(world: &mut E2eWorld) {
     let tui = session(world);
     tui.wait_until_gone("Services — managed inference servers", default_timeout())
         .await
@@ -524,7 +524,7 @@ async fn services_manager_closed_without_menu(world: &mut E2eWorld) {
     );
     assert!(
         !screen.contains("Options") && !screen.contains("Quit"),
-        "Escape opened the main menu instead of closing the manager:\n{screen}"
+        "the main menu is open on top of the closed manager:\n{screen}"
     );
 }
 

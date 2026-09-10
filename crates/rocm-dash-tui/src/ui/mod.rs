@@ -438,6 +438,13 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
+    } else if state.has_open_overlay() {
+        // A manager is open but not at its root layer (sub-popup, picker,
+        // approval, or job console) — Esc is handled by that layer's own
+        // event-loop arm, not by `should_pane_back_out`/`OpenMenu`. `None`
+        // keeps the chip non-clickable so it can't dispatch the wrong action.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
     } else if state.modal != Modal::None {
         segs.push(Seg::Key("Esc", Some(KeyAction::CloseModal)));
         segs.push(Seg::Sep(" close  "));
@@ -601,5 +608,41 @@ mod tests {
             .iter()
             .find(|c| c.action == KeyAction::OpenMenu)
             .expect("a fallback Esc chip opening the menu must always be present");
+    }
+
+    #[test]
+    fn footer_esc_chip_is_not_clickable_menu_when_overlay_has_a_sub_popup_open() {
+        // Regression: with a manager open but not at its root layer (here, a
+        // running job console), `has_open_overlay()` is true but
+        // `active_overlay_at_root()` is false. The chip must not fall through
+        // to the generic `OpenMenu` arm — that key is actually consumed by the
+        // manager's own event-loop arm, which cancels the sub-layer, not the
+        // menu. Any chip shown here must be non-clickable (`action == None`).
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenMenu,
+                "no chip may dispatch OpenMenu while a sub-popup owns Esc"
+            );
+        }
     }
 }
