@@ -7419,7 +7419,8 @@ echo Python 3.12.10
         )?
         .expect("installing another family must still report the active default it displaces");
         assert!(
-            other_family.contains("replaces active default") && other_family.contains("gfx110X-all"),
+            other_family.contains("replaces active default")
+                && other_family.contains("gfx110X-all"),
             "got: {other_family}"
         );
 

@@ -259,8 +259,7 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
         .unwrap_or_else(|| {
             panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
         });
-    let (stdout, stderr, rc) =
-        crate::run_rocm(world, &["install", "sdk", "--family", family]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["install", "sdk", "--family", family]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
