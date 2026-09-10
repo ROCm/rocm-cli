@@ -300,8 +300,10 @@ pub fn managed_pip_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("pip-cache")
 }
 
-/// `uv`'s content-addressed cache, kept under the managed root so it shares a filesystem
-/// with the environments `uv` populates and hardlinking keeps working (see issue #160).
+/// `uv`'s content-addressed cache, kept under the managed root so it is reachable from the
+/// environments `uv` populates without crossing a mount point and hardlinking keeps working
+/// (see issue #160). It is the mount, not the filesystem: a bind mount or `subPath` volume
+/// is enough to make Linux refuse the hardlink and send `uv` back to copying.
 pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("uv-cache")
 }
