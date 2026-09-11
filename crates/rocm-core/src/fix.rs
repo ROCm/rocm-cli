@@ -1521,6 +1521,43 @@ mod tests {
     }
 
     #[test]
+    fn the_utilization_hint_example_matches_the_recipe_command() {
+        // The shared hint carries a worked value, and `fix-16-vllm-oom` hands
+        // the user a command carrying another. They drifted once already: the
+        // docs and the recipe moved to 0.5 while the const kept recommending
+        // 0.1, so one `rocm diagnose` printed "e.g. 0.1 for a small model"
+        // directly above `rocm serve <model> --gpu-memory-utilization 0.5`.
+        // Nothing caught it -- the cross-check in `diagnose` exempts the summary
+        // as prose framing, and a line-based grep misses the const because the
+        // flag and the value sit on different continuation lines.
+        const FLAG: &str = "--gpu-memory-utilization";
+        let hint = crate::VLLM_GPU_MEMORY_UTILIZATION_HINT;
+        let example = hint
+            .split_once("e.g. ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!("the shared hint no longer carries a worked `e.g. <value>`:\n{hint}")
+            });
+        let recipe = find_recipe("fix-16-vllm-oom").expect("fix-16-vllm-oom is in the catalog");
+        let commanded = recipe
+            .commands
+            .iter()
+            .find_map(|line| line.split_once(FLAG))
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!(
+                    "fix-16-vllm-oom no longer commands `{FLAG}`:\n{:#?}",
+                    recipe.commands
+                )
+            });
+        assert_eq!(
+            example, commanded,
+            "the shared hint recommends `{FLAG} {example}` while `rocm fix fix-16-vllm-oom` \
+             commands `{FLAG} {commanded}`; both can print in a single `rocm diagnose` report"
+        );
+    }
+
+    #[test]
     fn auto_applicable_recipes_have_a_runner() {
         for r in RECIPES {
             assert_eq!(
