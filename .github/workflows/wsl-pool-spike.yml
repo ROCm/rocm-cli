@@ -19,11 +19,17 @@ name: WSL pool spike (throwaway)
 #      driver already installed on the host — independent of WSL itself, and
 #      not something this spike can fix if missing.
 #
-# workflow_dispatch only: never runs automatically, and this whole file is
-# throwaway once the above are answered (either build the real lane on its
-# findings, or delete this).
+# workflow_dispatch only, EXCEPT: a brand-new workflow file can't be
+# dispatched by name until it exists on the default branch, so the
+# pull_request trigger below (scoped to this file only) is a TEMPORARY way to
+# get one real run on this PR. Remove it once that run has happened; this
+# whole file is throwaway once the three questions above are answered (either
+# build the real lane on its findings, or delete this).
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/wsl-pool-spike.yml'
 
 permissions:
   contents: read
