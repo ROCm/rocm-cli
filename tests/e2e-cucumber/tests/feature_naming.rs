@@ -35,6 +35,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
+    ("remote.feature", "remote"),
     // Not `runtime`: `runtime_setup.feature` owns that key, and two files
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
