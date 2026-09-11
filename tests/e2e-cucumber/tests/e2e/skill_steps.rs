@@ -663,15 +663,21 @@ async fn assert_route_is_documented(world: &mut E2eWorld) {
                 documented.keys().collect::<Vec<_>>()
             )
         });
-    // Only where the reference actually writes the tracker down. It names
-    // PyTorch and llama.cpp as in scope without giving their URLs, so for those
-    // there is nothing to compare and the target check above is the whole test.
-    if let Some(expected) = known {
-        assert!(
-            url.starts_with(expected.as_str()),
-            "reference.md sends a {target} report to {expected}, the CLI to {url:?}"
-        );
-    }
+    // `documented` only ever collects bullets from the `route_when_no_match`
+    // list, and every bullet there carries a `-> https://...` URL, so this is
+    // Some in practice. It stays an `expect` rather than a bare index so a
+    // future bullet added without a URL fails loudly here instead of being
+    // silently skipped.
+    let expected = known.as_ref().unwrap_or_else(|| {
+        panic!(
+            "reference.md names {target} in the `route_when_no_match` list without a \
+             URL, so the CLI's {url:?} has nothing to be checked against"
+        )
+    });
+    assert!(
+        url.starts_with(expected.as_str()),
+        "reference.md sends a {target} report to {expected}, the CLI to {url:?}"
+    );
 }
 
 #[then("the inspection succeeds whatever it finds")]

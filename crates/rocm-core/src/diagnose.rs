@@ -1033,7 +1033,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             fix_id: "fix-9-igpu-dgpu".to_owned(),
             auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
-            notes: vec![note],
+            notes: vec![
+                note,
+                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
+                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
+                 --device-index N. Without it, `rocm fix` just prints the query that \
+                 identifies which index is the discrete GPU."
+                    .to_owned(),
+            ],
             ..Fix::default()
         }
     } else {
@@ -1055,7 +1062,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             // print it, so a wrong value here costs more than a stale sentence.
             auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![note],
+            notes: vec![
+                note,
+                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
+                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
+                 --device-index N. Without it, `rocm fix` just prints the query that \
+                 identifies which index is the discrete GPU."
+                    .to_owned(),
+            ],
             ..Fix::default()
         }
     };
