@@ -720,14 +720,12 @@ serve_timeout_secs = 90
                 &scenario,
                 &cap("wsl-no-passthrough"),
                 &matrix,
-                false,
-                false,
-                false,
+                Included::default(),
             ),
             Expectation::ExpectPass
         );
         assert!(matches!(
-            resolve(&scenario, &cap("mock"), &matrix, false, false, false,),
+            resolve(&scenario, &cap("mock"), &matrix, Included::default()),
             Expectation::Skip { .. }
         ));
     }
