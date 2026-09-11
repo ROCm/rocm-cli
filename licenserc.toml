@@ -1,6 +1,12 @@
 ## hawkeye license-header enforcement configuration.
 ## Run locally: hawkeye check
 ## Docs: https://github.com/fast/hawkeye
+##
+## `skills/rocm-doctor/` is excluded. It is a published Agent Skill, not repo
+## prose: its SKILL.md must open with a YAML frontmatter block for the skill
+## loader, which pushes any header out of hawkeye's detection window, and the
+## folder is vendored verbatim into the amd/skills catalog, whose skills carry
+## no headers. The licence is stated in the skill's own skill-card.md instead.
 
 [header]
 text = """
@@ -22,6 +28,7 @@ excludes = [
   ".claude/**",
   ".tmp-*/**",
   "third_party/**",
+  "skills/rocm-doctor/**",
 ]
 
 [[rules]]

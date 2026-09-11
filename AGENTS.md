@@ -168,6 +168,7 @@ When changing assistant-adjacent behavior, keep consistency with:
 
 - `docs/llm-tool-use.md`
 - `skills/rocm-cli-assistant/SKILL.md`
+- `skills/rocm-doctor/SKILL.md` and `skills/rocm-doctor/reference.md`
 
 Required consistency points:
 
@@ -175,6 +176,35 @@ Required consistency points:
 - mutating actions require approval flow
 - avoid invented shell/package-manager commands in assistant behavior paths
 - preserve built-in assistant constraints and no-CPU-fallback policy
+
+### `skills/rocm-doctor/` — published from here, and a test fixture
+
+`skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
+(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+on two counts, and both change how you edit it:
+
+- **This repo is its source of truth.** The skill is a thin driver over the
+  `rocm` binary, so it is versioned with the binary and lives here.
+  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
+  incubation for this skill: it carries no automated federation for
+  `rocm-doctor` yet — `.github/federation.json` there only declares
+  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
+  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
+  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
+  whenever it changes materially. So edit it here, and never edit the
+  `amd/skills` copy directly — the next hand-sync overwrites it.
+- **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
+  parses its closed-catalog table and compares it to what `rocm fix` reports.
+  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
+  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
+  means changing the CLI **first**, then the two docs. That feature is what
+  catches you if you forget.
+
+The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
+frontmatter for the skill loader, and skills published this way carry no
+license headers of their own. The licence is stated in `skill-card.md`
+instead.
 
 ## 8) Verification Matrix For This Repo
 
