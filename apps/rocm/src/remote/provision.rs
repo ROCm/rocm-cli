@@ -118,8 +118,6 @@ fn push_matched_artifact(
     platform: &RemotePlatform,
     channel: &str,
 ) -> Result<String> {
-    use std::fmt::Write as _;
-
     let staging = tempdir_for_download()?;
     let asset = download_for(platform, channel, &staging)?;
 
@@ -159,15 +157,7 @@ fn push_matched_artifact(
     // it to the remote's own install.sh, or the remote falls back to the pinned
     // production keys and rejects an archive this machine already trusted —
     // shortening the trust chain the comment above insists on not shortening.
-    let mut signing_env = String::new();
-    for var in [
-        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
-        "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM",
-    ] {
-        if let Ok(value) = std::env::var(var) {
-            let _ = write!(signing_env, "{var}={} ", super::shell_quote(&value));
-        }
-    }
+    let signing_env = signing_env_fragment()?.unwrap_or_default();
 
     let outcome = transport.exec(&format!(
         "{signing_env}ROCM_CLI_ARCHIVE={} sh {remote_dir}/install.sh {}",
@@ -182,6 +172,49 @@ fn push_matched_artifact(
     }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(asset)
+}
+
+/// Build the `NAME=value ` fragment (quoted, trailing space) that forwards an
+/// alternate signing key to the remote's install.sh, or `None` if this
+/// process's environment sets neither variable.
+///
+/// Only `_PEM` ever crosses the wire. `_PATH` names a file on *this* machine,
+/// and forwarding that path verbatim would tell the remote's shell to open a
+/// file that is not there — the variable would be set but useless. So a
+/// `_PATH` is read here and sent as `_PEM` instead; an explicit `_PEM` is
+/// forwarded as-is and takes precedence, matching install.sh's own
+/// resolution order.
+fn signing_env_fragment() -> Result<Option<String>> {
+    signing_env_fragment_from(
+        std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM").ok(),
+        std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH").ok(),
+        |path: &str| std::fs::read_to_string(path),
+    )
+}
+
+fn signing_env_fragment_from(
+    pem_env: Option<String>,
+    path_env: Option<String>,
+    read_to_string: impl Fn(&str) -> std::io::Result<String>,
+) -> Result<Option<String>> {
+    let pem = match pem_env {
+        Some(pem) => Some(pem),
+        None => match path_env {
+            Some(path) => Some(read_to_string(&path).with_context(|| {
+                format!(
+                    "failed to read the signing key at {path} \
+                     (from ROCM_CLI_SIGNING_PUBLIC_KEY_PATH)"
+                )
+            })?),
+            None => None,
+        },
+    };
+    Ok(pem.map(|pem| {
+        format!(
+            "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM={} ",
+            super::shell_quote(&pem)
+        )
+    }))
 }
 
 /// Run the installer here in download-only mode, targeting the remote's
@@ -232,12 +265,39 @@ fn parse_downloaded_asset(stdout: &str) -> Option<String> {
 }
 
 fn tempdir_for_download() -> Result<PathBuf> {
-    let directory =
-        std::env::temp_dir().join(format!("rocm-remote-provision-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory)
+    // A PID-keyed path under the shared, world-writable system temp directory
+    // is predictable and PIDs get reused, so another local user could pre-stage
+    // (or symlink) that exact path ahead of us; the old code then either wrote
+    // the archive and signing material into whatever was already there, or had
+    // its `remove_dir_all` above follow a planted symlink somewhere unintended.
+    // Mixing in a nanosecond nonce makes the path unguessable, `create_dir`
+    // (not `_all`) refuses to silently adopt an existing entry, and 0700 keeps
+    // the contents unreadable to anyone else even if the name did leak.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let directory = std::env::temp_dir().join(format!(
+        "rocm-remote-provision-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
+    restrict_to_owner(&directory)
+        .with_context(|| format!("failed to restrict access to {}", directory.display()))?;
     Ok(directory)
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 /// Confirm the freshly-installed CLI actually runs there.
@@ -334,5 +394,56 @@ mod tests {
             "the embedded installer must be the one supporting download-only mode"
         );
         assert!(INSTALLER.contains("ROCM_CLI_ARCHIVE"));
+    }
+
+    #[test]
+    fn neither_signing_var_set_forwards_nothing() {
+        let fragment =
+            signing_env_fragment_from(None, None, |path: &str| std::fs::read_to_string(path))
+                .expect("no file read is attempted");
+        assert_eq!(fragment, None);
+    }
+
+    #[test]
+    fn an_explicit_pem_is_forwarded_as_is_and_wins_over_a_path() {
+        // install.sh itself prefers an explicit _PEM over _PATH; matching that
+        // order here means the two never quietly disagree about which key wins.
+        let fragment = signing_env_fragment_from(
+            Some("pem-content".to_owned()),
+            Some("/should/not/be/read".to_owned()),
+            |path| panic!("must not read {path}: an explicit _PEM must win"),
+        )
+        .expect("no file read is attempted");
+        assert_eq!(
+            fragment.as_deref(),
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ")
+        );
+    }
+
+    #[test]
+    fn a_path_is_read_locally_and_its_content_is_forwarded_not_the_path() {
+        // The bug this guards against: forwarding _PATH verbatim names a file
+        // on this machine, which is meaningless to the remote shell that runs
+        // install.sh. Only file *content*, sent as _PEM, may cross the wire.
+        let fragment =
+            signing_env_fragment_from(None, Some("/etc/rocm-signing.pem".to_owned()), |path| {
+                assert_eq!(path, "/etc/rocm-signing.pem");
+                Ok("-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----\n".to_owned())
+            })
+            .expect("the fake reader succeeds");
+        let fragment = fragment.expect("a _PATH was set");
+        assert!(fragment.starts_with("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM="));
+        assert!(!fragment.contains("/etc/rocm-signing.pem"));
+        assert!(fragment.contains("BEGIN PUBLIC KEY"));
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_read_is_reported_rather_than_silently_dropped() {
+        let error = signing_env_fragment_from(None, Some("/no/such/file".to_owned()), |_| {
+            Err(std::io::Error::other("boom"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("/no/such/file"), "{error}");
     }
 }
