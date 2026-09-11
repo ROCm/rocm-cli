@@ -160,6 +160,17 @@ Feature: Model serving
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
+  #
+  # This is the live coverage for `--gpu` validation under either authority: the
+  # amd-smi device count, or — when amd-smi cannot count — membership in the
+  # KFD/DRM usable set (EAI-8058). Which one answers depends on the lane, so the
+  # step accepts either rejection wording. The *masked* sub-case that motivated
+  # the membership rule (a visibility mask leaving a non-contiguous usable set,
+  # e.g. `HIP_VISIBLE_DEVICES=2` on a 4-GPU host, where `--gpu 2` must pass and
+  # `--gpu 0` must be refused) has no scenario of its own: it is reachable only
+  # where amd-smi is *absent*, and faking that absence would assert against the
+  # seam rather than the product. It is unit-covered by
+  # `validate_pinned_gpu_index_falls_back_to_usable_set_membership`.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
@@ -187,3 +198,23 @@ Feature: Model serving
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
+
+  # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
+  # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
+  # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
+  # `diagnose`/`fix` catalog. The GPU lane's real cards are comfortably free, so the
+  # near-full reading is injected via `ROCM_E2E_FORCE_LOW_VRAM` in debug/test builds:
+  # a single synthetic device on this non-APU host keeps the warning honest, while
+  # the engine still launches against the real, free device. Runs on the vLLM GPU
+  # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
+  # legitimately withhold the warning. `--managed` serves under the GPU-required
+  # device policy, which refuses before it ever builds a plan unless a ROCm
+  # runtime is active — hence the same `a managed runtime is active` precondition
+  # every other real-serve scenario on this lane opens with.
+  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  Scenario: serve-19 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+    Given a managed runtime is active
+    And the selected GPU is reported nearly out of VRAM
+    When the user previews a vLLM serve plan pinned to that GPU
+    Then the serve plan warns the GPU is low on VRAM
+    And the serve plan explains how to lower vLLM's memory reservation

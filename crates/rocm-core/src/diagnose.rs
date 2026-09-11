@@ -82,9 +82,12 @@ pub struct DiagnoseReport {
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
-    /// Set when the host is out of scope for this catalog (e.g. WSL2). When
-    /// present, `matched` is empty — the catalog is deliberately not run, to
-    /// avoid emitting bare-metal-Linux diagnoses that don't apply.
+    /// Set when the host is out of scope for this catalog (e.g. WSL2). Present
+    /// whenever no checker cleared [`MIN_SCORE_FOR_MATCH`] on such a host; the
+    /// bare-metal Linux catalog is deliberately not run, so this carries the
+    /// routing note instead. `matched` may still hold sub-threshold entries
+    /// (e.g. a weak `out of memory` mention) alongside it — read
+    /// [`DiagnoseReport::has_match`] to tell a real cause from a weak signal.
     #[serde(default)]
     pub out_of_scope: Option<String>,
 }
@@ -288,6 +291,79 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
     ("out_of_registers", 30, "compiler OUT_OF_REGISTERS"),
 ];
 
+// vLLM's startup OOM. The distinctive signature is a torch/HIP allocation
+// failure while the engine is reserving KV-cache VRAM; a bare "out of memory"
+// on its own is deliberately sub-threshold so this only claims the failure mode
+// when the vLLM/HIP shape of the error is present.
+//
+// None of these tokens are vLLM-specific on their own: `torch.OutOfMemoryError:
+// CUDA out of memory` is the identical shape any ROCm PyTorch job emits (ROCm's
+// PyTorch build reports the CUDA-compat name), so this table alone cannot tell
+// vLLM's OOM apart from an arbitrary training script hitting the same
+// allocator error. `check_16_vllm_oom` therefore scores *only* the lines
+// carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
+// pasted log: an OOM on an unanchored line contributes nothing at all.
+//
+// Weighting splits the *allocator message* from the *exception class name*:
+//   - The HIP allocator's own messages (`HIP out of memory`, the
+//     `hipErrorOutOfMemory` status) and the CUDA-compat message ROCm's PyTorch
+//     prints clear `MIN_SCORE_FOR_MATCH` on their own — with the required
+//     anchor already establishing this is vLLM's line, one of those messages is
+//     a genuine OOM signal.
+//   - The bare exception *class* (`torch.OutOfMemoryError`, with or without the
+//     `.cuda.` module path) and a bare `out of memory` stay sub-threshold: any
+//     PyTorch job emits the class name, so it must corroborate rather than
+//     carry the verdict alone (`torch_oom_class_alone_is_not_a_vllm_match`).
+// This table alone is scored through `keyword_score_collapsing_overlaps`, which
+// de-duplicates overlapping spans, so `HIP out of memory` counts once (as the
+// 50-point message), not also as the nested 25-point `out of memory` — one
+// phrase yields one evidence bullet. Every other table keeps the catalog's
+// default "each entry is an independent signal" scoring.
+const KEYWORDS_VLLM_OOM: KeywordTable = &[
+    (
+        "hip out of memory",
+        50,
+        "error mentions 'HIP out of memory'",
+    ),
+    (
+        // ROCm's HIP runtime OOM status code, e.g. `RuntimeError:
+        // hipErrorOutOfMemory`. `\boutofmemory\b` does not match inside it (no
+        // word boundary after `hipError`), so it needs its own entry.
+        r"hiperroroutofmemory",
+        50,
+        "error mentions hipErrorOutOfMemory",
+    ),
+    (
+        r"cuda out of memory",
+        50,
+        "error mentions 'CUDA out of memory' (ROCm reports the CUDA-compat name)",
+    ),
+    (
+        // The exception class name, under either `torch.OutOfMemoryError` or the
+        // `.cuda.` module path ROCm's PyTorch reports it under. Sub-threshold
+        // alone: it is the class every PyTorch OOM raises, not vLLM's signature.
+        r"torch\.(?:cuda\.)?outofmemoryerror",
+        45,
+        "error mentions torch.OutOfMemoryError",
+    ),
+    (
+        r"tried to allocate .*(?:gib|mib)",
+        30,
+        "error names an allocation it could not satisfy",
+    ),
+    (
+        r"\boutofmemory\b",
+        30,
+        "error mentions standalone OutOfMemory",
+    ),
+    ("out of memory", 25, "error mentions 'out of memory'"),
+    (
+        r"gpu[-_]memory[-_]utilization",
+        20,
+        "log mentions gpu_memory_utilization (vLLM VRAM reservation)",
+    ),
+];
+
 /// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
 /// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
 ///
@@ -317,15 +393,49 @@ const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
 ];
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
+///
+/// Every entry that matches counts as an independent signal. This is the
+/// behaviour every table in the catalog except [`KEYWORDS_VLLM_OOM`] is tuned
+/// for -- see [`keyword_score_collapsing_overlaps`] for why that one differs and
+/// why the difference must not be generalized.
 fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, false)
+}
+
+/// Like [`keyword_score`], but collapses matches whose spans overlap to the
+/// strongest one, so a single phrase cannot masquerade as two independent
+/// signals (e.g. `HIP out of memory` must not also count the `out of memory`
+/// nested inside it).
+///
+/// This is **deliberately not** applied to the rest of the catalog. Several
+/// older tables pair a greedy `.*` pattern with a second, genuinely independent
+/// keyword, and the greedy span swallows it: `api-ms-win-crt-.*\.dll` runs to
+/// the last `.dll` on the line and covers an independent `msvcp140.dll`,
+/// `dkms .*failed` covers an independent `dpkg: error`, and so on. Since
+/// collapsing can only lower a score, applying it there would push real
+/// diagnoses below [`MIN_SCORE_FOR_MATCH`] and make them vanish
+/// (`overlap_dedup_does_not_demote_other_catalog_keyword_tables` pins this).
+/// [`KEYWORDS_VLLM_OOM`] is safe because its overlaps are true nestings of
+/// literal phrases, not artifacts of a greedy wildcard.
+fn keyword_score_collapsing_overlaps(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, true)
+}
+
+fn keyword_score_impl(
+    symptom: &str,
+    table: KeywordTable,
+    collapse_overlaps: bool,
+) -> (i32, Vec<String>) {
     if symptom.is_empty() {
         return (0, Vec::new());
     }
     let sym = symptom.to_lowercase();
-    let mut hits: Vec<(i32, &'static str)> = Vec::new();
+    let mut hits: Vec<(i32, &'static str, usize, usize)> = Vec::new();
     for (pattern, weight, label) in table {
-        if Regex::new(pattern).is_ok_and(|re| re.is_match(&sym)) {
-            hits.push((*weight, label));
+        if let Ok(re) = Regex::new(pattern)
+            && let Some(m) = re.find(&sym)
+        {
+            hits.push((*weight, label, m.start(), m.end()));
         }
     }
     if hits.is_empty() {
@@ -333,9 +443,18 @@ fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
     }
     // Mirror diagnose.py's `hits.sort(reverse=True)`: weight desc, then label desc.
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(a.1)));
-    hits.truncate(2);
-    let score = hits.iter().map(|(w, _)| *w).sum();
-    let labels = hits.iter().map(|(_, l)| (*l).to_owned()).collect();
+    // Keep the strongest hit for any overlapping span: the same substring must
+    // not contribute two evidence bullets (nor two weights toward the score).
+    let mut kept: Vec<(i32, &'static str, usize, usize)> = Vec::new();
+    for hit in hits {
+        let overlaps = collapse_overlaps && kept.iter().any(|k| hit.2 < k.3 && k.2 < hit.3);
+        if !overlaps {
+            kept.push(hit);
+        }
+    }
+    kept.truncate(2);
+    let score = kept.iter().map(|(w, ..)| *w).sum();
+    let labels = kept.iter().map(|(_, l, ..)| (*l).to_owned()).collect();
     (score, labels)
 }
 
@@ -1287,12 +1406,149 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         fix_id: "fix-15-msvc-redist".to_owned(),
         auto_applicable: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
-        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing (the HIP SDK install) rather than this fix.".to_owned()],
+        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-15-msvc-redist",
         "MSVC runtime missing (HIP DLLs cannot load)",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+/// A required anchor before [`KEYWORDS_VLLM_OOM`] is even scored: the word
+/// "vllm" itself, or its distinctive VRAM-reservation flag. Without one of
+/// these, a generic HIP/CUDA/PyTorch OOM string is not evidence of *this*
+/// failure mode -- see the comment on [`KEYWORDS_VLLM_OOM`]. `tensor[-_]parallel`
+/// is deliberately NOT an anchor: it is a Megatron/DeepSpeed term (rocm-cli does
+/// not serve one model across GPUs), so anchoring on it would misattribute those
+/// frameworks' OOMs to vLLM.
+///
+/// `gpu[-_]memory[-_]utilization` is also a (20-point) entry in
+/// [`KEYWORDS_VLLM_OOM`], so a line that only echoes the flag -- a config dump,
+/// or a paste of rocm-cli's own low-VRAM hint, which prints
+/// `--gpu-memory-utilization` -- is both anchored and self-scoring. That is
+/// harmless *because* only anchored lines are scored: such a line is worth 20,
+/// far below [`MIN_SCORE_FOR_MATCH`], so it can surface as a weak signal in
+/// `matched` but can never carry a verdict, and it can no longer lend its anchor
+/// to an OOM elsewhere in the paste. It stays an anchor because the flag is
+/// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
+const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
+
+/// A canonical vLLM-OOM `--symptom` string guaranteed to clear
+/// [`MIN_SCORE_FOR_MATCH`].
+///
+/// It carries two independent signals (the torch exception class *and* the HIP
+/// allocator message) on one anchored line, so it scores even after overlap
+/// de-duplication. The vLLM engine falls back to this when a user's actual
+/// failing line would not itself be diagnosable, so the `rocm diagnose` command
+/// it prints always reports a cause.
+pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
+
+/// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
+/// `gpu_memory_utilization`), joined by newlines — the only text
+/// [`check_16_vllm_oom`] is allowed to score.
+///
+/// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
+/// re-enables the very misattribution the anchor exists to prevent (a
+/// `llama.cpp` OOM in a paste that also names vLLM). Returning the anchored
+/// lines rather than a yes/no gate is what makes that true: regex matching
+/// ignores line boundaries, so scoring the whole symptom behind a boolean gate
+/// still counted keyword hits from *unanchored* lines at full weight, and one
+/// benign `gpu_memory_utilization` config echo was enough to hand another
+/// framework's OOM a HIGH_CONFIDENCE vLLM verdict
+/// (`only_the_anchored_lines_are_scored_not_the_whole_paste`).
+///
+/// The join is by `\n` so that no pattern can straddle two lines: the regexes
+/// here are literals or use `.*`, which does not match a newline. Dropping the
+/// unanchored lines therefore cannot fabricate a match across the seam.
+///
+/// The same-line "anchor + OOM token" requirement falls out of this: an anchored
+/// line with no OOM token contributes nothing, so the score is 0 and the checker
+/// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
+/// anchor and the error on one line by construction.
+fn vllm_anchored_lines(symptom: &str) -> String {
+    let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
+        return String::new();
+    };
+    symptom
+        .lines()
+        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
+/// mode.
+///
+/// The vLLM engine calls this to decide whether the user's actual failing line
+/// is worth routing into a `--symptom` example, or whether to fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`] so the printed command is guaranteed to report
+/// a cause rather than reading as "the tool checked and found nothing".
+#[must_use]
+pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
+    let e = Examination {
+        os_family: "linux".to_owned(),
+        ..Examination::default()
+    };
+    check_16_vllm_oom(&e, symptom).score >= MIN_SCORE_FOR_MATCH
+}
+
+/// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
+/// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
+/// the user must pass the error via `--symptom`, or arrive from the serve
+/// failure note that points here. `e` is therefore unused.
+fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
+    // Score the anchored lines only, never the whole paste. The anchor is the
+    // *only* thing separating this failure mode from any other framework's
+    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
+    // keyword hits from unanchored lines would still count at full weight. Any
+    // future change here must keep the scored text restricted to anchored lines.
+    let anchored = vllm_anchored_lines(symptom);
+    if anchored.is_empty() {
+        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
+    if score <= 0 {
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    // Two different faults share this error, and the remediation splits on which
+    // one it is: on a shared/busy GPU vLLM's fixed ~90% reservation collides
+    // with memory already in use, so lowering the reservation is the fix; for a
+    // model that genuinely does not fit, lowering it only trades an earlier OOM
+    // for a later one, so the wording must not present the knob as the answer in
+    // that case.
+    let summary = format!(
+        "{} If instead the model genuinely does not fit in this GPU's VRAM, lowering the \
+         reservation will not help — use a smaller or quantized model (rocm-cli serves one \
+         model on a single GPU; it does not shard a model across GPUs).",
+        crate::VLLM_GPU_MEMORY_UTILIZATION_HINT
+    );
+    let fix = Fix {
+        summary,
+        commands: vec![
+            "# If the GPU is shared/busy (tenancy collision), lower vLLM's reservation:".to_owned(),
+            "rocm serve <model> --gpu-memory-utilization 0.5".to_owned(),
+            "# ...or steer the server onto a less-busy device:".to_owned(),
+            "rocm serve <model> --gpu <index>".to_owned(),
+            "# If the model genuinely does not fit, the reservation is not the problem:".to_owned(),
+            "#   pick a smaller or quantized model (single-GPU serving only).".to_owned(),
+        ],
+        fix_id: "fix-16-vllm-oom".to_owned(),
+        auto_applicable: false,
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup".to_owned(),
+        notes: vec![
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.".to_owned(),
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-16-vllm-oom",
+        "vLLM ran the GPU out of memory at startup",
         score,
         evidence,
         fix,
@@ -1844,9 +2100,10 @@ const CHECKERS: &[Checker] = &[
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
+    (check_16_vllm_oom, &["linux", "wsl"]),
     // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
     // gated off native Windows. 17 rather than 16 because the vLLM
-    // out-of-memory entry reserves 16 on its own branch; the number is a stable
+    // out-of-memory entry above already holds 16; the number is a stable
     // handle, so the two do not get to share one.
     (check_17_torch_dlpack_cuda_variant, &["linux"]),
     (check_wsl_1_gpu_not_exposed, WSL_ONLY),
@@ -1928,6 +2185,10 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // WSL2 used to be short-circuited here as out of scope. It is a real platform
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
+    //
+    // `fix-16-vllm-oom` opts into `wsl` in CHECKERS for that reason: it is a
+    // keyword-only check whose failure mode is just as real under WSL2, so it
+    // still answers there alongside the WSL entries.
     //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
@@ -3109,6 +3370,492 @@ mod tests {
         ];
         let report = diagnose(&e, "");
         assert!(report.matched.iter().any(|d| d.id == "fix-11-iommu"));
+    }
+
+    #[test]
+    fn vllm_oom_signature_is_a_high_confidence_match() {
+        // The distinctive vLLM startup OOM: torch/HIP allocation failure, with
+        // the vLLM anchor that tells this apart from an arbitrary PyTorch OOM.
+        let report = diagnose(
+            &linux_base(),
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-16-vllm-oom");
+        assert!(top.score >= HIGH_CONFIDENCE, "score was {}", top.score);
+        assert!(report.has_match());
+        // The remediation must stay conditional: the reservation knob is right
+        // for a tenancy collision and wrong for a model that does not fit.
+        let fix = top.fix.as_ref().unwrap();
+        assert!(!fix.auto_applicable, "OOM workaround must be print-only");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+        assert!(
+            fix.summary.contains("does not fit"),
+            "the 'genuinely does not fit' caveat must survive: {}",
+            fix.summary
+        );
+    }
+
+    #[test]
+    fn generic_pytorch_oom_without_a_vllm_signal_does_not_match() {
+        // The reviewed false positive: `torch.OutOfMemoryError: CUDA out of
+        // memory` scores 45+45=90 under the keyword table alone, but nothing
+        // about that string is vLLM-specific -- any ROCm PyTorch job emits the
+        // identical shape (ROCm's PyTorch build reports the CUDA-compat name).
+        // Without an explicit vLLM anchor, this failure mode must not fire.
+        let report = diagnose(&linux_base(), "torch.OutOfMemoryError: CUDA out of memory");
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "a bare framework OOM with no vLLM signal must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn torch_oom_class_alone_is_not_a_vllm_match() {
+        // `outofmemory` is nested inside the exception class name. It must not
+        // count as a second, independent signal and turn one token into a
+        // high-confidence vLLM diagnosis for an arbitrary PyTorch workload.
+        let report = diagnose(&linux_base(), "vllm: torch.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak keyword signal remains visible");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn a_bare_out_of_memory_stays_below_the_match_threshold() {
+        // Without the vLLM/HIP shape, "out of memory" alone must not claim this
+        // failure mode -- it scores (the `vllm` anchor is present and "out of
+        // memory" is a keyword), but stays below MIN_SCORE_FOR_MATCH.
+        let report = diagnose(&linux_base(), "vllm: the process was killed: out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak `out of memory` keyword signal must remain visible in `matched`");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare OOM must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn vllm_oom_is_not_available_on_native_windows() {
+        // vLLM is Linux/WSL-only (native Windows is unsupported), so the checker
+        // must not fire on a Windows examination even with the error text.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(&e, "vllm: torch.OutOfMemoryError: HIP out of memory.");
+        assert!(report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn vllm_oom_keyword_diagnosis_is_available_on_wsl() {
+        let mut e = linux_base();
+        e.is_wsl = true;
+        let report = diagnose(
+            &e,
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(report.out_of_scope.is_none());
+        assert!(report.has_match());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn wsl_sub_threshold_vllm_signal_is_preserved_in_matched() {
+        // A weak (sub-threshold) vLLM OOM signal on WSL must still surface in
+        // `matched` per the `DiagnoseReport::matched` contract: `run_all_checks`
+        // drops only zero-score results, so a score-25 mention is reported as a
+        // WEAK row rather than silently discarded.
+        //
+        // This used to also assert that the weak hit did not bury a WSL
+        // out-of-scope routing note. There is no such note any more -- WSL2 is a
+        // covered platform with its own catalog entries -- so what is left to pin
+        // is the half that still has teeth: the entry survives in `matched`, and
+        // it does not promote itself into a match.
+        //
+        // `wsl_base()` (a healthy WSL GPU stack) rather than a default
+        // examination: a default one has no /dev/dxg, so fix-wsl-1 would fire at
+        // 55 and the report would match for reasons that have nothing to do with
+        // the signal under test.
+        let report = diagnose(&wsl_base(), "vllm: out of memory");
+        assert!(!report.has_match());
+        assert!(
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform, not an out-of-scope one"
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("a nonzero sub-threshold hit must stay in `matched`, not be dropped");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope() {
+        // The other side of the has_match gate: a real, at-or-above-threshold
+        // vLLM OOM on WSL is surfaced, and ranks top on a host whose own WSL GPU
+        // stack is healthy -- so the verdict is the OOM, not an incidental WSL
+        // finding.
+        let report = diagnose(&wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        assert!(report.has_match());
+        assert!(report.out_of_scope.is_none());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn hip_error_out_of_memory_status_is_a_match() {
+        // Regression: `RuntimeError: hipErrorOutOfMemory` previously scored 0
+        // (`\boutofmemory\b` has no word boundary after `hipError`), so the
+        // engine printed a diagnose command that reported nothing.
+        let report = diagnose(&linux_base(), "vllm: RuntimeError: hipErrorOutOfMemory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("hipErrorOutOfMemory must now be recognized");
+        assert!(
+            oom.score >= MIN_SCORE_FOR_MATCH,
+            "hipErrorOutOfMemory should clear the threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn torch_cuda_module_path_oom_class_is_recognized() {
+        // Regression: ROCm's PyTorch reports the class under the `.cuda.` module
+        // path (`torch.cuda.OutOfMemoryError`); the class pattern must match it.
+        // It is still the (sub-threshold) class name, not a stronger message.
+        let report = diagnose(&linux_base(), "vllm: torch.cuda.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the torch.cuda.* class name must be recognized as evidence");
+        assert!(oom.score > 0, "score was {}", oom.score);
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "the bare class name must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn hip_out_of_memory_yields_a_single_evidence_line() {
+        // Overlap guard: "HIP out of memory" must not be counted both as the
+        // 50-point HIP message and the 25-point `out of memory` nested inside
+        // it. One phrase, one evidence bullet.
+        let report = diagnose(&linux_base(), "vllm: HIP out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("HIP out of memory must match");
+        let fix = oom.fix.as_ref().unwrap();
+        let evidence_lines = oom
+            .evidence
+            .iter()
+            .filter(|e| e.to_lowercase().contains("out of memory"))
+            .count();
+        assert_eq!(
+            evidence_lines, 1,
+            "one phrase must yield one evidence line, got {:?}",
+            oom.evidence
+        );
+        assert_eq!(oom.score, 50, "the HIP message carries the match alone");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {
+        // The vLLM-OOM table needs overlapping spans collapsed ("out of memory"
+        // nested inside "HIP out of memory"). Other tables must NOT get that
+        // treatment: several of them pair a greedy `.*` pattern with a second,
+        // genuinely independent keyword, and the greedy span swallows the
+        // independent one. Collapsing there silently loses real diagnoses,
+        // because a keyword score can only fall.
+        //
+        // Each case below pins the score these tables produced before the
+        // de-duplication was introduced.
+
+        // `api-ms-win-crt-.*\.dll` (35) runs to the *last* `.dll` on the line,
+        // covering the independent `msvcp140.dll` (30). Two distinct missing
+        // DLLs, two signals -- 65 clears MIN_SCORE_FOR_MATCH, 35 does not.
+        let (score, ev) = keyword_score(
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+            KEYWORDS_MSVC_REDIST,
+        );
+        assert_eq!(
+            score, 65,
+            "two distinct missing DLLs are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `dkms .*failed` (45) spans the whole line, covering `dpkg: error` (25).
+        let (score, ev) = keyword_score(
+            "dkms status: dpkg: error processing amdgpu-dkms, build failed",
+            KEYWORDS_DPKG_BROKEN,
+        );
+        assert_eq!(
+            score, 70,
+            "a DKMS failure and a dpkg error are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `amdhip64.*not found` (50) spans past `could not find hip` (40):
+        // 90 is HIGH confidence, 50 is only a bare match.
+        let (score, ev) = keyword_score(
+            "amdhip64.dll: could not find hip runtime, not found",
+            KEYWORDS_HIP_SDK_MISSING,
+        );
+        assert_eq!(score, 90, "both HIP-SDK signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+
+        // `404.*repo\.radeon\.com` (50) runs to the *last* repo.radeon.com on
+        // the line, covering `unable to locate package rocm` (35).
+        let (score, ev) = keyword_score(
+            "e: failed to fetch https://repo.radeon.com/rocm/apt/jammy/release 404 not found, \
+             unable to locate package rocm, retrying https://repo.radeon.com/rocm/apt",
+            KEYWORDS_REPO_BROKEN,
+        );
+        assert_eq!(score, 85, "both apt-repo signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn windows_missing_dll_pair_still_reaches_the_msvc_redist_fix() {
+        // The user-visible half of the guard above: with no PATH probe result
+        // (`msvc_redist_present == None`) the keyword score alone decides, so a
+        // demoted table makes fix-15 vanish from the report entirely.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(
+            &e,
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+        );
+        let msvc = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("the MSVC redistributable fix must still be reported");
+        assert!(
+            msvc.score >= MIN_SCORE_FOR_MATCH,
+            "score was {}",
+            msvc.score
+        );
+        assert!(report.has_match());
+    }
+
+    #[test]
+    fn vllm_anchor_must_be_on_the_same_line_as_the_oom_token() {
+        // Co-occurrence anywhere is too loose: a paste that mentions vLLM on one
+        // line and an unrelated framework's OOM on another must not attribute
+        // the OOM to vLLM.
+        let report = diagnose(
+            &linux_base(),
+            "I installed vllm last week.\nToday my llama.cpp run died: CUDA out of memory",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on a different line from the vLLM mention must not match: {:?}",
+            report.matched
+        );
+        // The engine's emitted `vllm: <failing line>` keeps them on one line and
+        // still matches.
+        let anchored = diagnose(&linux_base(), "vllm: CUDA out of memory");
+        assert!(anchored.matched.iter().any(|d| d.id == "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn only_the_anchored_lines_are_scored_not_the_whole_paste() {
+        // Regression: the anchor was a boolean *gate*, after which the entire
+        // symptom was scored. Regex matching ignores line boundaries, so a
+        // benign vLLM config echo on one line unlocked full-weight scoring of
+        // another framework's OOM on a different line: `cuda out of memory`
+        // (50) + `torch.outofmemoryerror` (45) do not overlap, so both survived
+        // collapsing for 95 -- above HIGH_CONFIDENCE -- and the user got a
+        // confident "vLLM ran the GPU out of memory" verdict for a llama.cpp
+        // failure. Only the anchored lines may be scored.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the anchored config line is still a (weak) vLLM signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "an unanchored framework's OOM must not score for vLLM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+        assert!(
+            oom.evidence
+                .iter()
+                .all(|e| !e.to_lowercase().contains("out of memory")),
+            "evidence must come from the anchored line only: {:?}",
+            oom.evidence
+        );
+
+        // Same shape with the anchored line carrying no OOM token at all: the
+        // unanchored OOM must not be borrowed to reach a verdict either.
+        let report = diagnose(
+            &linux_base(),
+            "starting vllm serve on gpu 0\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on an unanchored line must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The control: once the OOM is on the anchored line, it still matches at
+        // full strength, so the scoping did not simply disable the checker.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             vllm: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM line must still match");
+        assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn rocm_cli_s_own_low_vram_hint_is_never_a_verdict_on_its_own() {
+        // `gpu[-_]memory[-_]utilization` is both an anchor and a scoring entry,
+        // so a line that merely echoes the flag anchors itself. rocm-cli's own
+        // low-VRAM hint prints `--gpu-memory-utilization`, and users paste it
+        // back in. That must stay a weak signal, never a diagnosis: worth 20,
+        // far below MIN_SCORE_FOR_MATCH, with nothing else on the line to
+        // corroborate it.
+        let report = diagnose(&linux_base(), crate::VLLM_GPU_MEMORY_UTILIZATION_HINT);
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the flag mention stays visible as a weak signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare flag echo must not diagnose an OOM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+    }
+
+    #[test]
+    fn canonical_vllm_oom_symptom_is_diagnosable() {
+        // The engine's fallback symptom must always clear the threshold, so the
+        // `rocm diagnose` command it prints never reports nothing.
+        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
+        // And a bare framework mention the engine would reject is not diagnosable.
+        assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
+    }
+
+    #[test]
+    fn every_checker_platform_is_covered_by_its_recipe() {
+        // `render_report_text` ends a matched diagnosis with `apply with: rocm
+        // fix {id}`, and `fix::apply` then gates that id on the recipe's
+        // `applies_on` against the *running* OS. So any platform family a
+        // checker is registered for but its recipe omits is a platform where the
+        // tool names a command and then refuses to run it -- which is exactly
+        // what `fix-16-vllm-oom` did on WSL2, where the checker opts into `wsl`
+        // and the recipe was LINUX_ONLY.
+        //
+        // Only one direction is an error. A recipe may legitimately apply more
+        // widely than its checker answers (a user can reach `rocm fix <id>`
+        // directly, without a diagnosis), so this asserts containment rather
+        // than equality.
+        for (check, families) in CHECKERS {
+            let id = check(&Examination::default(), "").id;
+            let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
+                panic!(
+                    "checker id `{id}` has no recipe in the fix catalog, so the \
+                     `apply with: rocm fix {id}` line diagnose prints is dead"
+                )
+            });
+            for family in *families {
+                assert!(
+                    applies_on.contains(family),
+                    "`{id}` is diagnosed on `{family}` but its recipe only applies on \
+                     {applies_on:?}; `rocm fix {id}` would print the plan and then exit 3 there"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
+        // fix-15 and fix-16 live in two places: the `rocm fix` catalog
+        // (crate::fix::RECIPES) and the Fix these checks embed in a Diagnosis.
+        // The prose *framing* legitimately differs by surface (a catalog
+        // rationale vs a diagnosis summary), but the actionable remediation must
+        // not silently diverge -- the verify command, the notes, and the
+        // executable command lines have to agree. This is the guard that they
+        // do; it caught a two-vs-three-space `verify` and a reworded note.
+        let vllm_oom = check_16_vllm_oom(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            VLLM_OOM_CANONICAL_SYMPTOM,
+        );
+        let msvc = check_15_msvc_redist(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_present: Some(false),
+                ..Examination::default()
+            },
+            "ImportError: DLL load failed: vcruntime140_1.dll not found",
+        );
+        for diag in [vllm_oom, msvc] {
+            assert!(
+                diag.score >= MIN_SCORE_FOR_MATCH,
+                "test setup must yield a real match for {}",
+                diag.id
+            );
+            let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
+            let (verify, notes, run_commands) =
+                crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
+                    .expect("a shared fix_id must exist in the recipe catalog");
+            assert_eq!(fix.verify, verify, "verify diverged for {}", fix.fix_id);
+            assert_eq!(
+                fix.notes,
+                notes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "notes diverged for {}",
+                fix.fix_id
+            );
+            let emitted_run = fix
+                .commands
+                .iter()
+                .map(String::as_str)
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                emitted_run, run_commands,
+                "executable command lines diverged for {}",
+                fix.fix_id
+            );
+        }
     }
 
     #[test]

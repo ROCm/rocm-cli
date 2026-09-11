@@ -377,7 +377,8 @@ Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
-per-GPU VRAM with `amd-smi` and picks the lowest-numbered GPU that is idle and
+per-GPU VRAM (via `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is
+not installed) and picks the lowest-numbered GPU that is idle and
 not already used by another rocm-cli server (managed or foreground), falling
 back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
 pin a specific device. The

@@ -266,3 +266,20 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that machine
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
+
+  # vLLM runs on Linux and WSL, but not native Windows. This scenario is
+  # GPU-independent: it supplies the captured startup error as symptom text and
+  # proves the public diagnosis output preserves both branches of the remedy.
+  @id:diagnose-vllm-oom-is-conditional @requires-os:linux
+  Scenario: diagnose-20 - A vLLM startup OOM receives conditional remediation
+    Given a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the diagnosis identifies the vLLM startup OOM
+    And the OOM remedy distinguishes a busy GPU from a model that does not fit
+    # A report that names `rocm fix <id>` and a `rocm fix` that then refuses that
+    # id leaves the user worse off than no fix path at all. The two halves are
+    # selected by separate platform lists -- the checker's, and the recipe's
+    # against the RUNNING os, where WSL2 is its own family -- so they can
+    # disagree while each looks right alone. Every Linux lane runs this step; the
+    # WSL one is where the two lists can differ.
+    And the CLI can act on the fix the diagnosis named

@@ -74,6 +74,12 @@ struct FixRecipe {
 /// move are the ones about wheels, environment variables and PATH.
 const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
 const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
+/// For entries whose fault is not tied to bare-metal kernel plumbing.
+///
+/// `fix-16-vllm-oom` is the case: its remediation is vLLM CLI flags, and its
+/// checker already opts into `wsl` for that reason, so a Linux-only recipe made
+/// `rocm diagnose` name a command `rocm fix` then refused to run.
+const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -389,9 +395,38 @@ const RECIPES: &[FixRecipe] = &[
         applies_on: WINDOWS_ONLY,
         runner: None,
     },
-    // The number is a stable handle, not a position: `fix-16` is reserved by the
-    // vLLM out-of-memory entry on its own branch, so this one takes 17 rather
-    // than colliding and forcing whichever lands second to rename a published id.
+    FixRecipe {
+        fix_id: "fix-16-vllm-oom",
+        title: "vLLM ran the GPU out of memory at startup",
+        rationale: "vLLM reserves a fixed fraction (~90%) of each GPU's TOTAL VRAM for its KV cache by default, regardless of the model size or how much is currently free. Two different faults surface the same OOM, and they need opposite responses. If the GPU is shared or already busy, that reservation collides with memory in use and lowering it (or moving to a less-busy GPU) is the fix. If the model genuinely does not fit in this GPU's VRAM, lowering the reservation only trades an earlier OOM for a later one -- use a smaller or quantized model instead (rocm-cli serves one model on a single GPU; it does not shard a model across GPUs).",
+        auto_applicable: false,
+        commands: &[
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,",
+            "# or steer vLLM onto a less-busy device:",
+            "rocm serve <model> --gpu-memory-utilization 0.5",
+            "rocm serve <model> --gpu <index>",
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the",
+            "# problem; pick a smaller or quantized model (single-GPU serving only).",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup",
+        notes: &[
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.",
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).",
+        ],
+        // Matches `check_16_vllm_oom`'s `["linux", "wsl"]` registration: WSL2 is
+        // the supported way to serve from a Windows host and the failure mode is
+        // just as real there, so the fix has to be runnable where the diagnosis
+        // is reachable. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        applies_on: LINUX_AND_WSL,
+        runner: None,
+    },
+    // The number is a stable handle, not a position: `fix-16` is held by the
+    // vLLM out-of-memory entry above, so this one takes 17 rather than
+    // colliding and forcing whichever lands second to rename a published id.
     FixRecipe {
         fix_id: "fix-17-torch-dlpack",
         title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
@@ -670,6 +705,35 @@ pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&st
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
+}
+
+/// Test-only view of a recipe's actionable remediation: its `verify` command,
+/// its `notes`, and its *executable* command lines (comment/prose lines
+/// stripped). Lets the diagnosis catalog cross-check that the Fix it emits for a
+/// shared `fix_id` has not silently diverged from this recipe.
+#[cfg(test)]
+pub(crate) fn recipe_verify_notes_and_run_commands(
+    fix_id: &str,
+) -> Option<(&'static str, &'static [&'static str], Vec<&'static str>)> {
+    find_recipe(fix_id).map(|recipe| {
+        let run_commands = recipe
+            .commands
+            .iter()
+            .copied()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>();
+        (recipe.verify, recipe.notes, run_commands)
+    })
+}
+
+/// Test-only view of the platform families a recipe is runnable on.
+///
+/// `None` when no recipe carries `fix_id`. Lets the diagnosis catalog assert
+/// that every platform a checker answers on is a platform `rocm fix` will
+/// actually act on, which `recipe_verify_notes_and_run_commands` cannot see.
+#[cfg(test)]
+pub(crate) fn recipe_applies_on(fix_id: &str) -> Option<&'static [&'static str]> {
+    find_recipe(fix_id).map(|recipe| recipe.applies_on)
 }
 
 /// The platform family a recipe's `applies_on` is matched against.
@@ -1417,8 +1481,9 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 16 bare-metal/Windows entries (including fix-17) plus the 7 WSL ones.
-        assert_eq!(count, 23, "expected 23 catalog entries");
+        // 17 bare-metal/Windows entries (including fix-16-vllm-oom and
+        // fix-17-torch-dlpack) plus the 7 WSL ones.
+        assert_eq!(count, 24, "expected 24 catalog entries");
     }
 
     #[test]
@@ -1456,6 +1521,43 @@ mod tests {
     }
 
     #[test]
+    fn the_utilization_hint_example_matches_the_recipe_command() {
+        // The shared hint carries a worked value, and `fix-16-vllm-oom` hands
+        // the user a command carrying another. They drifted once already: the
+        // docs and the recipe moved to 0.5 while the const kept recommending
+        // 0.1, so one `rocm diagnose` printed "e.g. 0.1 for a small model"
+        // directly above `rocm serve <model> --gpu-memory-utilization 0.5`.
+        // Nothing caught it -- the cross-check in `diagnose` exempts the summary
+        // as prose framing, and a line-based grep misses the const because the
+        // flag and the value sit on different continuation lines.
+        const FLAG: &str = "--gpu-memory-utilization";
+        let hint = crate::VLLM_GPU_MEMORY_UTILIZATION_HINT;
+        let example = hint
+            .split_once("e.g. ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!("the shared hint no longer carries a worked `e.g. <value>`:\n{hint}")
+            });
+        let recipe = find_recipe("fix-16-vllm-oom").expect("fix-16-vllm-oom is in the catalog");
+        let commanded = recipe
+            .commands
+            .iter()
+            .find_map(|line| line.split_once(FLAG))
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| {
+                panic!(
+                    "fix-16-vllm-oom no longer commands `{FLAG}`:\n{:#?}",
+                    recipe.commands
+                )
+            });
+        assert_eq!(
+            example, commanded,
+            "the shared hint recommends `{FLAG} {example}` while `rocm fix fix-16-vllm-oom` \
+             commands `{FLAG} {commanded}`; both can print in a single `rocm diagnose` report"
+        );
+    }
+
+    #[test]
     fn auto_applicable_recipes_have_a_runner() {
         for r in RECIPES {
             assert_eq!(
@@ -1483,6 +1585,12 @@ mod tests {
                 "fix-9-igpu-dgpu"
             ]
         );
+        // fix-16-vllm-oom carries a workaround the user must weigh (lowering the
+        // VRAM reservation is wrong for a model that genuinely does not fit), so
+        // it is deliberately PRINT-ONLY and must never join the AUTO set.
+        let oom = find_recipe("fix-16-vllm-oom").expect("OOM recipe is in the catalog");
+        assert!(!oom.auto_applicable, "fix-16-vllm-oom must stay PRINT-ONLY");
+        assert!(oom.runner.is_none(), "a PRINT-ONLY recipe has no runner");
     }
 
     #[test]
