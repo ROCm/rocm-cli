@@ -744,6 +744,10 @@ fn render_status(
                 Some(publish::PublishState::Absent) => "no".to_owned(),
                 Some(publish::PublishState::Foreign { forwards_to }) =>
                     format!("no — that port now forwards to {forwards_to}"),
+                Some(publish::PublishState::FunnelAllowed) => "no — Tailscale Funnel is allowed \
+                    on that port, which would expose it to the public internet; run `tailscale \
+                    funnel --tcp=<port> off` on the remote"
+                    .to_owned(),
                 // Both mean "could not tell", and neither may be read as "no":
                 // an endpoint that is still up must never render as one that is
                 // down, or the user stops looking for it.

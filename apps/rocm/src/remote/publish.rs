@@ -12,8 +12,14 @@
 //! is reachable from the user's other machines rather than only this one.
 //!
 //! The cost of that, and the reason [`super`] insists on a credential: a
-//! publish is visible to the whole tailnet, scoped only by its ACLs. Unlike a
-//! point-to-point tunnel it also *outlives a reboot*, because it is
+//! publish is visible to the whole tailnet, scoped only by its ACLs. That
+//! assumes Tailscale Funnel is not already enabled for the port — Funnel is
+//! what turns a tailnet-scoped forward into one reachable from the public
+//! internet, and it is not something this module ever asks for. If the remote
+//! already has it allowed for the target port, [`classify`] reports it as a
+//! distinct state rather than folding it into "free", and both [`publish`]
+//! and [`withdraw`] refuse to act until it is turned off by hand. Unlike a
+//! point-to-point tunnel a publish also *outlives a reboot*, because it is
 //! configuration rather than a process. A publish left behind is a GPU endpoint
 //! nobody is tracking, so withdrawal is treated as a first-class operation that
 //! reports failure loudly instead of being assumed to have worked.
@@ -31,6 +37,15 @@ use super::transport::Transport;
 
 /// Keys a real serve config carries. Seeing none of them in a non-empty
 /// document means we were handed something else, whatever it parses as.
+///
+/// Not all of these are actually inspected. `TCP`, `Foreground`, `Services`,
+/// and `AllowFunnel` are parsed into [`RawServeConfig`] and drive
+/// [`classify`]. `Web` is listed only as document-shape evidence — it
+/// confirms we are looking at a real serve config, but we never read an
+/// HTTPS/HTTP handler, because this design never asks Tailscale to terminate
+/// TLS on our behalf. Listing a key here without parsing it is exactly what let
+/// `AllowFunnel` go unchecked for a release, so if a key stays evidence-only,
+/// say so here rather than leaving a reader to assume otherwise.
 const SERVE_CONFIG_KEYS: &[&str] = &["TCP", "Web", "Services", "AllowFunnel", "Foreground"];
 
 /// Loopback address a published port forwards to. The model server binds here
@@ -54,11 +69,26 @@ struct RawServeConfig {
     /// belongs to someone else — but a forward is a forward, and missing one
     /// would report a live endpoint as absent.
     #[serde(rename = "Foreground", default)]
-    foreground: BTreeMap<String, RawForegroundConfig>,
+    foreground: BTreeMap<String, RawNestedConfig>,
+    /// Tailscale "Services" (VIP services), keyed by service name. Nests its
+    /// own `TCP` map the same way `Foreground` does — a forward declared here
+    /// is still a forward, and missing it has the same failure mode as
+    /// missing a foreground one: a live foreign endpoint reads as absent, and
+    /// the `Foreign` ownership guard never fires.
+    #[serde(rename = "Services", default)]
+    services: BTreeMap<String, RawNestedConfig>,
+    /// Keyed `host:port`. `true` means the port is exposed to the public
+    /// internet via Tailscale Funnel, not just the tailnet — something this
+    /// module never asks for. We only ever check this for our own target
+    /// port, so we do not track which host set it.
+    #[serde(rename = "AllowFunnel", default)]
+    allow_funnel: BTreeMap<String, bool>,
 }
 
+/// Shape shared by `Foreground` sessions and `Services` entries: both nest a
+/// `TCP` map under their own key.
 #[derive(Debug, Default, Deserialize)]
-struct RawForegroundConfig {
+struct RawNestedConfig {
     #[serde(rename = "TCP", default)]
     tcp: BTreeMap<String, RawTcpHandler>,
 }
@@ -81,6 +111,14 @@ pub(crate) enum PublishState {
     /// The port forwards somewhere else. Not ours to withdraw, and a warning
     /// that two things are competing for it.
     Foreign { forwards_to: String },
+    /// Tailscale Funnel is allowed for this port, regardless of what (if
+    /// anything) forwards to it. Funnel is what exposes a port to the public
+    /// internet rather than just the tailnet, and this module never turns it
+    /// on. Deliberately not folded into `Absent` or `Published`: publishing
+    /// over it would complete a public exposure nobody asked this command
+    /// for, and withdrawing our forward while it stays on would not close
+    /// anything.
+    FunnelAllowed,
     /// The remote answered with something we could not read.
     ///
     /// Deliberately not folded into `Absent`. "I looked and there is no
@@ -142,12 +180,25 @@ fn classify(status_json: &str, tailnet_port: u16, remote_port: u16) -> PublishSt
     };
 
     let key = tailnet_port.to_string();
-    let handler = config.tcp.get(&key).or_else(|| {
-        config
-            .foreground
-            .values()
-            .find_map(|session| session.tcp.get(&key))
-    });
+
+    // Checked before we ask whether anything forwards to the port at all: a
+    // Funnel-enabled port is a distinct hazard independent of what (if
+    // anything) currently forwards to it, and must never be read as merely
+    // "free" or folded into a normal `Published`/`Absent` result.
+    if funnel_allowed_for_port(&config.allow_funnel, tailnet_port) {
+        return PublishState::FunnelAllowed;
+    }
+
+    let handler = config
+        .tcp
+        .get(&key)
+        .or_else(|| {
+            config
+                .foreground
+                .values()
+                .find_map(|session| session.tcp.get(&key))
+        })
+        .or_else(|| config.services.values().find_map(|svc| svc.tcp.get(&key)));
 
     let Some(forward) = handler.and_then(|handler| handler.tcp_forward.clone()) else {
         return PublishState::Absent;
@@ -166,6 +217,18 @@ fn classify(status_json: &str, tailnet_port: u16, remote_port: u16) -> PublishSt
 /// Where a published port should point: the model server's loopback bind.
 fn forward_target(remote_port: u16) -> String {
     format!("{LOOPBACK}:{remote_port}")
+}
+
+/// True if Funnel is allowed for `port` in an `AllowFunnel` map.
+///
+/// `AllowFunnel` is keyed `host:port`, where the host is a tailnet DNS name we
+/// do not otherwise track. We only care whether *our* port is exposed, so we
+/// match on the port suffix rather than requiring an exact key.
+fn funnel_allowed_for_port(allow_funnel: &BTreeMap<String, bool>, port: u16) -> bool {
+    let port = port.to_string();
+    allow_funnel
+        .iter()
+        .any(|(host_port, allowed)| *allowed && host_port.rsplit(':').next() == Some(port.as_str()))
 }
 
 /// Command that declares the forward on the remote.
@@ -210,6 +273,12 @@ pub(crate) fn publish(
              Refusing to take it over — publishing here would silently break whatever \
              is using it. Choose another port with `--tailnet-port`."
         ),
+        PublishState::FunnelAllowed => bail!(
+            "port {tailnet_port} on the remote has Tailscale Funnel allowed, which exposes it \
+             to the public internet rather than just the tailnet.\n\
+             Refusing to publish over it — turn Funnel off first: \
+             `tailscale funnel --tcp={tailnet_port} off`."
+        ),
         PublishState::Unreadable => bail!(
             "port {tailnet_port} could not be checked before publishing, so there is no way \
              to tell whether something else is already using it.\n\
@@ -238,6 +307,14 @@ pub(crate) fn publish(
             "port {tailnet_port} on the remote now forwards to {forwards_to} rather than to \
              this model server; something else claimed it. Choose another port with \
              `--tailnet-port`."
+        ),
+        // Funnel was turned on between our check and our write. Reported the
+        // same way as the pre-check case: publishing must not be allowed to
+        // complete a public-internet exposure nobody asked for.
+        PublishState::FunnelAllowed => bail!(
+            "port {tailnet_port} on the remote now has Tailscale Funnel allowed, exposing it to \
+             the public internet rather than just the tailnet.\n\
+             Turn Funnel off: `tailscale funnel --tcp={tailnet_port} off`, then try again."
         ),
         PublishState::Unreadable => bail!(
             "the remote accepted the publish for port {tailnet_port} but its reply could \
@@ -272,6 +349,12 @@ pub(crate) fn withdraw(
              session's model server.\n\
              Refusing to turn it off — it belongs to something else."
         ),
+        PublishState::FunnelAllowed => bail!(
+            "port {tailnet_port} on the remote has Tailscale Funnel allowed. Withdrawing our \
+             forward would not close the public-internet exposure, so this needs a human \
+             decision, not a silent teardown.\n\
+             Turn Funnel off first: `tailscale funnel --tcp={tailnet_port} off`."
+        ),
         PublishState::Unreadable => bail!(
             "port {tailnet_port} could not be checked before withdrawing it, so there is no \
              way to tell whether it is still this session's endpoint.\n\
@@ -291,6 +374,14 @@ pub(crate) fn withdraw(
         PublishState::Published => {
             bail!("the remote still reports port {tailnet_port} as published after withdrawing it")
         }
+        // Our forward is gone, but Funnel is still allowed for the port. The
+        // port may still be reachable from the public internet, so this is
+        // not the clean close the caller asked for.
+        PublishState::FunnelAllowed => bail!(
+            "port {tailnet_port} was turned off, but Tailscale Funnel is still allowed for it, \
+             so it may still be reachable from the public internet.\n\
+             Turn it off: `tailscale funnel --tcp={tailnet_port} off`."
+        ),
         // An unreadable reply is not a withdrawal. Accepting it here would be the
         // exact failure this function exists to prevent: reporting an endpoint
         // gone while it is still published, on a machine nobody is watching.
@@ -424,6 +515,107 @@ mod tests {
         // Go renders integer map keys as strings; looking for a numeric key
         // would silently never match and report every endpoint as absent.
         assert_eq!(classify(PUBLISHED, 8001, 11434), PublishState::Absent);
+    }
+
+    #[test]
+    fn a_service_forward_is_still_a_forward() {
+        // Same blind spot as `Foreground`: a forward declared under a named
+        // Service still answers on that port. Missing it defeats the
+        // `Foreign` ownership guard for whatever it points to.
+        let service = r#"{
+          "Services": { "svc:my-app": { "TCP": { "8000": { "TCPForward": "127.0.0.1:9999" } } } }
+        }"#;
+        assert_eq!(
+            classify(service, 8000, 11434),
+            PublishState::Foreign {
+                forwards_to: "127.0.0.1:9999".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn our_own_forward_under_a_service_is_recognised() {
+        let service = r#"{
+          "Services": { "svc:my-app": { "TCP": { "8000": { "TCPForward": "127.0.0.1:11434" } } } }
+        }"#;
+        assert_eq!(classify(service, 8000, 11434), PublishState::Published);
+    }
+
+    #[test]
+    fn funnel_allowed_on_our_port_is_never_read_as_free() {
+        // No matching TCPForward at all: without the AllowFunnel check this
+        // reads as `Absent`, and `publish()` would happily complete the
+        // exposure it was never asked to create.
+        let funnel_only = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#;
+        assert_eq!(
+            classify(funnel_only, 8000, 11434),
+            PublishState::FunnelAllowed
+        );
+    }
+
+    #[test]
+    fn funnel_allowed_overrides_a_matching_forward() {
+        // Even when our own forward is in place, Funnel being allowed means
+        // the port is reachable from the public internet, not just the
+        // tailnet. That must not be reported as an ordinary `Published`.
+        let both = r#"{
+          "TCP": { "8000": { "TCPForward": "127.0.0.1:11434" } },
+          "AllowFunnel": { "my-machine.tail1234.ts.net:8000": true }
+        }"#;
+        assert_eq!(classify(both, 8000, 11434), PublishState::FunnelAllowed);
+    }
+
+    #[test]
+    fn funnel_allowed_on_another_port_does_not_affect_ours() {
+        let other_port = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:9000": true}}"#;
+        assert_eq!(classify(other_port, 8000, 11434), PublishState::Absent);
+    }
+
+    #[test]
+    fn funnel_disabled_entry_does_not_trip_the_guard() {
+        // The map can carry `false` entries for a port Funnel was allowed for
+        // and then turned off. Only `true` matters.
+        let disabled = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": false}}"#;
+        assert_eq!(classify(disabled, 8000, 11434), PublishState::Absent);
+    }
+
+    #[test]
+    fn publish_refuses_a_funnel_enabled_port() {
+        let transport = ScriptedTransport::new(vec![ScriptedStep::ok(
+            "tailscale serve status --json",
+            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#,
+        )]);
+        let error = publish(&transport, 8000, 11434).unwrap_err().to_string();
+        assert!(error.contains("tailscale funnel --tcp=8000 off"), "{error}");
+        // Nothing should have been written.
+        assert!(
+            !transport.calls().iter().any(|call| matches!(
+                call,
+                crate::remote::transport::TransportCall::Exec { command, .. }
+                    if command.contains("--bg")
+            )),
+            "{:?}",
+            transport.calls()
+        );
+    }
+
+    #[test]
+    fn withdraw_refuses_a_funnel_enabled_port() {
+        let transport = ScriptedTransport::new(vec![ScriptedStep::ok(
+            "tailscale serve status --json",
+            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#,
+        )]);
+        let error = withdraw(&transport, 8000, 11434).unwrap_err().to_string();
+        assert!(error.contains("tailscale funnel --tcp=8000 off"), "{error}");
+        assert!(
+            !transport.calls().iter().any(|call| matches!(
+                call,
+                crate::remote::transport::TransportCall::Exec { command, .. }
+                    if command.contains(" off")
+            )),
+            "{:?}",
+            transport.calls()
+        );
     }
 
     #[test]
