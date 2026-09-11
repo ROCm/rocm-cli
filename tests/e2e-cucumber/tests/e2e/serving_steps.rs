@@ -908,6 +908,69 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve pinned to GPU ordinal 1 while an active visibility mask
+/// (`HIP_VISIBLE_DEVICES=0`) hides every device except ordinal 0. On a multi-GPU
+/// host ordinal 1 exists but is masked out, so the CLI must reject it against the
+/// visible set (EAI-7194). The mask names device 0, which every GPU host has, so
+/// the visible set resolves on a single-GPU host as well and ordinal 1 is refused
+/// against it there too — which is why this scenario needs no multi-GPU gate.
+/// Either way the serve must be refused rather than remapped onto the one visible
+/// device.
+#[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
+async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("HIP_VISIBLE_DEVICES", "0")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve pinned to GPU ordinal 1 while `ROCR_VISIBLE_DEVICES=1` hides every
+/// device except the physical ordinal 1. ROCr re-indexes that survivor to HIP
+/// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
+/// (EAI-7194) — not read as the physical token and wrongly accepted.
+///
+/// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
+/// device that is not there: the visible set cannot be resolved and `--gpu`
+/// validation falls back to amd-smi's best-effort count, which does not honour
+/// the mask — so the outcome there depends on whether amd-smi is installed
+/// rather than on the mask. See the scenario comment in
+/// `features/model_serving.feature` for the full note on that gap.
+#[when("the user serves a model pinned past the ROCR-reindexed visible set")]
+async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("ROCR_VISIBLE_DEVICES", "1")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with both visibility variables set: `ROCR_VISIBLE_DEVICES=` hides every
+/// device at the ROCr level, and `HIP_VISIBLE_DEVICES=0` names an ordinal in the
+/// (now empty) set ROCr leaves behind. The two compose in that order, so the HIP
+/// mask cannot resurrect a device and the GPU-required serve must refuse
+/// (EAI-7194) — not read the HIP mask as though it were the only one set.
+#[when("the user serves a model with ROCR hiding every GPU a HIP mask names")]
+async fn user_serves_with_rocr_hiding_hip_named_gpus(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine],
+        &[("ROCR_VISIBLE_DEVICES", ""), ("HIP_VISIBLE_DEVICES", "0")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the user is told to allow public binding first")]
 async fn assert_public_bind_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1043,13 +1106,55 @@ async fn assert_negative_temperature_message(world: &mut E2eWorld) {
 #[then("the user is told that GPU index is unavailable")]
 async fn assert_absent_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // The named index must appear alongside an unavailability reason — whether the
-    // CLI rejects it against the detected count ("out of range") or the engine's
-    // probe rejects it ("not available") on a host where amd-smi can't count.
+    // The refusal itself must name ordinal 99; a bare `contains("99")` alongside a
+    // loose reason would also be satisfied by a port, a model tag, or any unrelated
+    // "not available" elsewhere in the output. Four whole-phrase shapes are
+    // legitimate, each pinned to the component that emits it:
+    //   - CLI, no mask set — the index is outside the usable visible set, so the
+    //     absence is the host's, not a mask's. The normal shape for this scenario.
+    //     The wording is deliberate: blaming HIP/ROCR variables the user never set
+    //     sends them chasing an environment problem that does not exist.
+    //   - CLI, a mask is active on the runner — refused against the visible set.
+    //   - CLI, no visible set could be enumerated — falls back to the raw detected
+    //     count.
+    //   - ENGINE, on a host where neither the visible set nor the count could be
+    //     probed: `--gpu` validation takes its permissive fallback and the engine's
+    //     own probe makes the late rejection. Accepted deliberately, unlike in the
+    //     masked sibling below: the CLI-side refusal for an absent index predates
+    //     EAI-7194, so excluding the engine wording here would discriminate no fix
+    //     and only fail the scenario on unprobeable hosts.
+    let refusals = [
+        "--gpu index 99 is not present on this host",
+        "--gpu index 99 is not available under the active visibility mask",
+        "--gpu index 99 is out of range",
+        "requested gpu 99 is not available on this host",
+    ];
     assert!(
-        output.contains("99")
-            && (output.contains("out of range") || output.contains("not available")),
+        refusals.iter().any(|phrase| output.contains(phrase)),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
+        serve_output(world)
+    );
+}
+
+#[then("the user is told the pinned GPU is unavailable")]
+async fn assert_masked_index_message(world: &mut E2eWorld) {
+    let output = serve_output(world).to_lowercase();
+    // Ordinal 1 must be named and refused by the CLI's own pre-flight: against the
+    // active visibility mask ("not available under the active visibility mask") on
+    // a multi-GPU host, or as out of range where no visible set could be
+    // enumerated. Never a silent remap onto the one visible device (ordinal 0).
+    //
+    // The accepted wording is deliberately narrow. A bare "not available" would
+    // also match the ENGINE's own late rejection ("requested GPU 1 is not
+    // available on this host"), which predates this pre-flight — so the scenario
+    // would still pass with the CLI-side fix reverted and prove nothing.
+    // Requiring the `--gpu index 1` prefix pins the refusal to the CLI and to the
+    // requested ordinal.
+    assert!(
+        output.contains("--gpu index 1")
+            && (output.contains("not available under the active visibility mask")
+                || output.contains("out of range")),
+        "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
 }
