@@ -77,6 +77,9 @@ const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
 const WSL_ONLY: &[&str] = &["wsl"];
+/// Both Linux families. For a problem that is neither about the `amdgpu` module
+/// nor about the Windows host driver, and so is real on either.
+const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 
 /// The recipe registry. Mirrors the diagnosis catalog; only the four small,
 /// safe fixes carry a `runner` and are auto-applicable.
@@ -577,6 +580,39 @@ const RECIPES: &[FixRecipe] = &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
         applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-18-comgr-conflict",
+        title: "Code object manager library does not belong to the active HIP runtime",
+        rationale: "HIP compiles device code at run time through libamd_comgr, and this machine holds more than one copy of it. The copy the loader picks belongs to a different installation than the HIP runtime that loads, so compilation fails with an error that names neither the library nor the second copy. A second copy is not itself a fault -- many correct installations hold one -- so what is reported here is specifically the mismatch.",
+        auto_applicable: false,
+        // No repair, and no recommendation between the two. Removing a stack or
+        // reordering the search path can each break a working Python
+        // environment, and which is right depends on which stack the user means
+        // to keep -- a question only they can answer. `rocm diagnose` fills in
+        // the real paths for this machine; these are the shapes.
+        commands: &[
+            "# Find every copy and which one loads:",
+            "rocm examine --json    # read comgr_paths, comgr_selected, hip_selected",
+            "# Then pick ONE of the following. They are alternatives, not steps.",
+            "# (a) Keep the system installation: remove or uninstall the wheel that",
+            "#     supplies the second copy.",
+            "# (b) Keep the wheel: order the search path so the runtime's own copy",
+            "#     is found first.",
+            "export LD_LIBRARY_PATH=\"<directory of the runtime's own copy>:$LD_LIBRARY_PATH\"",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"",
+        notes: &[
+            "Neither option is recommended over the other. Which is correct depends on which stack you mean to keep, and removing the wrong one breaks a working environment.",
+            "This describes the environment outside the CLI's managed runtimes. `rocm serve` puts a managed runtime's libraries first on purpose, so inside one the wheel copy wins by design and that is correct.",
+        ],
+        // Not `LINUX_ONLY`: which copy the loader picks has nothing to do with
+        // the amdgpu module, and the two copies collide on WSL2 just the same.
+        applies_on: LINUX_AND_WSL,
         runner: None,
     },
 ];
@@ -1418,7 +1454,7 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
         // 16 bare-metal/Windows entries (including fix-17) plus the 7 WSL ones.
-        assert_eq!(count, 23, "expected 23 catalog entries");
+        assert_eq!(count, 24, "expected 24 catalog entries");
     }
 
     #[test]

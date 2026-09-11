@@ -154,9 +154,13 @@ pub struct WslFacts {
     pub locally_probed: bool,
 }
 
-/// One copy of the AMD code object manager library found on the machine.
+/// One copy of a ROCm library found on the machine.
+///
+/// Used for both the code object manager and the HIP runtime, because the
+/// question asked of them is the same one: of the copies on this machine, which
+/// would load, and which installation does it belong to.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ComgrCopy {
+pub struct LibraryCopy {
     /// The path as found, before symlinks are resolved -- this is the name the
     /// loader would use, and the one a user will recognise.
     pub path: String,
@@ -173,6 +177,17 @@ pub struct ComgrCopy {
     /// Where the search found it: `ld-library-path`, `loader-cache`,
     /// `rocm-install`, or `managed-runtime`.
     pub source: String,
+    /// The installation this copy belongs to, empty when no known installation
+    /// claims it.
+    ///
+    /// Matched against the known installation roots rather than derived from the
+    /// path, and this is the detail the whole diagnosis turns on. A managed
+    /// runtime spreads its libraries across several `_rocm_sdk_*` directories;
+    /// deriving a root by walking up from `.../_rocm_sdk_core/lib` would make
+    /// each of them look like a separate installation, and the entry would then
+    /// report a conflict on every healthy managed install -- the exact false
+    /// report this design exists to avoid.
+    pub install_root: String,
 }
 
 /// Structured machine state consumed by the diagnosis catalog.
@@ -234,18 +249,26 @@ pub struct Examination {
     // picks, and that was invisible: nothing looked past the first match.
     /// Every copy found, in loader search order. The first is the one that would
     /// load.
-    pub comgr_paths: Vec<ComgrCopy>,
+    pub comgr_paths: Vec<LibraryCopy>,
     /// The copy the loader would pick. `None` when none were found.
-    pub comgr_selected: Option<ComgrCopy>,
+    pub comgr_selected: Option<LibraryCopy>,
     /// Version of the selected copy; empty when it cannot be read from the name.
     pub comgr_version: String,
-    /// Whether the selected copy belongs to the installation owning the active
-    /// HIP runtime.
+    /// Whether the selected code object manager copy belongs to the same
+    /// installation as the selected HIP runtime.
     ///
-    /// Always `None` today. The field is carried unset so that computing it does
-    /// not become a second change to the wire contract, and so a consumer can
-    /// tell "not yet answered" from "answered no".
+    /// `None` when either library was not found at all, which is the difference
+    /// between "they disagree" and "there was nothing to compare".
     pub comgr_matches_runtime: Option<bool>,
+
+    /// Every copy of the HIP runtime found, in loader search order.
+    ///
+    /// Searched the same way, and for the same reason: deciding whether the code
+    /// object manager belongs to the active runtime means knowing which runtime
+    /// is active, and that is the same question about a different file.
+    pub hip_paths: Vec<LibraryCopy>,
+    /// The HIP runtime copy the loader would pick. `None` when none were found.
+    pub hip_selected: Option<LibraryCopy>,
 
     // HIP SDK install (Windows)
     pub hip_sdk_path: String,
@@ -320,6 +343,8 @@ impl Default for Examination {
             comgr_selected: None,
             comgr_version: String::new(),
             comgr_matches_runtime: None,
+            hip_paths: Vec::new(),
+            hip_selected: None,
             hip_sdk_path: String::new(),
             hip_sdk_version: String::new(),
             hipinfo_present: false,
@@ -1716,33 +1741,17 @@ const COMGR_LIB_PREFIX: &str = "libamd_comgr";
 /// guarantee. Reporting the search honestly is worth more here than a confident
 /// answer that cannot be justified.
 fn probe_comgr(e: &mut Examination) {
-    let mut copies: Vec<ComgrCopy> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let roots = known_install_roots(e);
+    let comgr = find_library_copies(COMGR_LIB_PREFIX, &roots);
+    let hip = find_library_copies(HIP_RUNTIME_LIB_PREFIX, &roots);
 
-    // Order is the whole point: this is the order the loader consults, so the
-    // first copy recorded is the one that wins.
-    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    for path in libraries_on_ld_path(&ld, COMGR_LIB_PREFIX) {
-        record_comgr_copy(&mut copies, &mut seen, &path, "ld-library-path");
-    }
-    for path in comgr_paths_in_loader_cache() {
-        record_comgr_copy(&mut copies, &mut seen, &path, "loader-cache");
-    }
-    for (dir, source) in comgr_search_dirs(e) {
-        let mut hits = Vec::new();
-        collect_libraries_in_dir(&dir, COMGR_LIB_PREFIX, &mut hits);
-        for path in hits {
-            record_comgr_copy(&mut copies, &mut seen, &path, source);
-        }
-    }
-
-    if let Some(first) = copies.first() {
+    if let Some(first) = comgr.first() {
         e.comgr_version.clone_from(&first.version);
         e.comgr_selected = Some(first.clone());
-        if copies.len() > 1 {
+        if comgr.len() > 1 {
             e.notes.push(format!(
                 "{} copies of {COMGR_LIB_PREFIX} found; {} would load",
-                copies.len(),
+                comgr.len(),
                 first.path
             ));
         }
@@ -1751,7 +1760,67 @@ fn probe_comgr(e: &mut Examination) {
             "no {COMGR_LIB_PREFIX} found on the library path, in the loader cache, or in any known ROCm install"
         ));
     }
-    e.comgr_paths = copies;
+
+    // `None` rather than `false` when either side is missing: "they disagree" and
+    // "there was nothing to compare" are different answers, and a caller that
+    // cannot tell them apart reports a conflict on a machine with no ROCm at all.
+    e.comgr_matches_runtime = match (comgr.first(), hip.first()) {
+        (Some(comgr), Some(hip)) => {
+            Some(!comgr.install_root.is_empty() && comgr.install_root == hip.install_root)
+        }
+        _ => None,
+    };
+    e.hip_selected = hip.first().cloned();
+    e.comgr_paths = comgr;
+    e.hip_paths = hip;
+}
+
+/// The HIP runtime. Which copy of it loads decides which installation is the
+/// active one, which is the other half of the code object manager question.
+const HIP_RUNTIME_LIB_PREFIX: &str = "libamdhip64";
+
+/// Every copy of `prefix` on the machine, in loader search order, each attributed
+/// to the installation that owns it.
+fn find_library_copies(
+    prefix: &str,
+    roots: &[(std::path::PathBuf, &'static str)],
+) -> Vec<LibraryCopy> {
+    let mut copies: Vec<LibraryCopy> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Order is the whole point: this is the order the loader consults, so the
+    // first copy recorded is the one that wins.
+    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    for path in libraries_on_ld_path(&ld, prefix) {
+        record_library_copy(&mut copies, &mut seen, &path, "ld-library-path", roots);
+    }
+    for path in paths_in_loader_cache(prefix) {
+        record_library_copy(&mut copies, &mut seen, &path, "loader-cache", roots);
+    }
+    for (dir, source) in install_library_dirs(roots) {
+        let mut hits = Vec::new();
+        collect_libraries_in_dir(&dir, prefix, &mut hits);
+        for path in hits {
+            record_library_copy(&mut copies, &mut seen, &path, source, roots);
+        }
+    }
+    copies
+}
+
+/// The installation that owns `path`: the longest known root it sits under.
+///
+/// Longest-prefix rather than first match, so a runtime nested inside another
+/// directory that also happens to be a root is attributed to the nearer one.
+/// Empty when no known installation claims it -- a library somewhere unexpected
+/// is reported as belonging nowhere rather than guessed into an install it is
+/// not part of.
+fn owning_install_root(path: &str, roots: &[(std::path::PathBuf, &'static str)]) -> String {
+    roots
+        .iter()
+        .map(|(root, _)| root.to_string_lossy().into_owned())
+        .filter(|root| path.starts_with(&format!("{root}/")))
+        .max_by_key(String::len)
+        .unwrap_or_default()
 }
 
 /// Record `path` unless an earlier entry already resolved to the same file.
@@ -1759,11 +1828,12 @@ fn probe_comgr(e: &mut Examination) {
 /// Deduplicated on the resolved path, not the given one: ROCm ships a versioned
 /// library and an unversioned symlink beside it, and reporting those as two
 /// copies would invent a conflict on a perfectly ordinary install.
-fn record_comgr_copy(
-    copies: &mut Vec<ComgrCopy>,
+fn record_library_copy(
+    copies: &mut Vec<LibraryCopy>,
     seen: &mut std::collections::BTreeSet<String>,
     path: &str,
     source: &str,
+    roots: &[(std::path::PathBuf, &'static str)],
 ) {
     // A path that cannot be resolved is kept as given rather than dropped: a
     // dangling symlink is still something the loader would try, and reporting
@@ -1775,8 +1845,11 @@ fn record_comgr_copy(
     if !seen.insert(real_path.clone()) {
         return;
     }
-    copies.push(ComgrCopy {
+    copies.push(LibraryCopy {
         version: comgr_version_from_file_name(&real_path),
+        // Attributed by the resolved path: a symlink from one installation into
+        // another's file belongs to the installation holding the file.
+        install_root: owning_install_root(&real_path, roots),
         path: path.to_owned(),
         real_path,
         source: source.to_owned(),
@@ -1815,7 +1888,7 @@ fn comgr_version_from_file_name(real_path: &str) -> String {
 /// Its absence, or a nonzero exit, contributes nothing rather than failing the
 /// probe: plenty of hosts have no `ldconfig` on the path, and a machine with no
 /// loader cache is still a machine worth describing.
-fn comgr_paths_in_loader_cache() -> Vec<String> {
+fn paths_in_loader_cache(prefix: &str) -> Vec<String> {
     if !which("ldconfig") {
         return Vec::new();
     }
@@ -1824,32 +1897,30 @@ fn comgr_paths_in_loader_cache() -> Vec<String> {
         return Vec::new();
     }
     out.lines()
-        .filter(|line| line.contains(COMGR_LIB_PREFIX))
+        .filter(|line| line.contains(prefix))
         .filter_map(|line| line.split_once("=> "))
         .map(|(_, path)| path.trim().to_owned())
         .collect()
 }
 
-/// Directories to search after the library path and the loader cache, each
-/// paired with the source label it is recorded under.
-fn comgr_search_dirs(e: &Examination) -> Vec<(std::path::PathBuf, &'static str)> {
-    let mut dirs: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
-    let mut add = |dir: std::path::PathBuf, source: &'static str| {
-        if dir.is_dir() {
-            dirs.push((dir, source));
-        }
-    };
-
+/// Every ROCm installation on the machine, each paired with the source label its
+/// libraries are recorded under.
+///
+/// A managed runtime is **one** root even though its libraries are spread across
+/// several `_rocm_sdk_*` directories. That is what lets the diagnosis tell a
+/// mixed environment from a healthy managed one: split those directories into
+/// separate installations and every healthy managed install looks like a
+/// conflict.
+fn known_install_roots(e: &Examination) -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut roots: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
     if !e.rocm_path.is_empty() {
-        let root = std::path::PathBuf::from(&e.rocm_path);
-        add(root.join("lib"), "rocm-install");
-        add(root.join("lib64"), "rocm-install");
+        roots.push((std::path::PathBuf::from(&e.rocm_path), "rocm-install"));
     }
     // Sibling ROCm installs the active one does not cover. A versioned install
     // left behind by an upgrade is one of the two copies this entry exists to
     // find.
     if let Ok(entries) = std::fs::read_dir("/opt") {
-        let mut roots: Vec<std::path::PathBuf> = entries
+        let mut siblings: Vec<std::path::PathBuf> = entries
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
@@ -1857,20 +1928,82 @@ fn comgr_search_dirs(e: &Examination) -> Vec<(std::path::PathBuf, &'static str)>
                     .is_some_and(|name| name.to_string_lossy().starts_with("rocm"))
             })
             .collect();
-        roots.sort();
-        for root in roots {
-            add(root.join("lib"), "rocm-install");
-            add(root.join("lib64"), "rocm-install");
-        }
+        siblings.sort();
+        roots.extend(siblings.into_iter().map(|root| (root, "rocm-install")));
     }
-    // The copy this CLI installs itself. Reusing the layout the SDK probe
-    // already knows rather than restating it: a second description of where a
-    // managed runtime keeps its libraries is a second thing to keep correct.
-    for root in managed_runtime_roots() {
+    roots.extend(
+        managed_runtime_roots()
+            .into_iter()
+            .map(|root| (root, "managed-runtime")),
+    );
+    roots.dedup_by(|a, b| a.0 == b.0);
+    roots
+}
+
+/// The library directories of every known installation, in root order.
+///
+/// Reuses the layout the SDK probe already knows rather than restating it: a
+/// second description of where an installation keeps its libraries is a second
+/// thing to keep correct.
+fn install_library_dirs(
+    roots: &[(std::path::PathBuf, &'static str)],
+) -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut dirs = Vec::new();
+    for (root, source) in roots {
         let mut paths = Vec::new();
-        crate::collect_sdk_library_paths(&root, &mut paths);
-        for path in paths {
-            add(path, "managed-runtime");
+        crate::collect_sdk_library_paths(root, &mut paths);
+        // A managed runtime keeps its ROCm libraries inside the Python
+        // environment rather than at its own top level, so the root's own `lib`
+        // is not where they are.
+        if *source == "managed-runtime" {
+            paths.extend(sdk_package_library_dirs(root));
+        }
+        dirs.extend(
+            paths
+                .into_iter()
+                .filter(|path| path.is_dir())
+                .map(|path| (path, *source)),
+        );
+    }
+    dirs
+}
+
+/// Library directories of the `_rocm_sdk_*` packages inside a managed runtime's
+/// Python environment.
+///
+/// The installed layout is `<root>/lib/python3.X/site-packages/_rocm_sdk_*`. The
+/// exact `site-packages` path is normally discovered by asking the environment's
+/// interpreter, which is far more than a read-only probe should do; the venv
+/// layout is predictable enough to look directly, and a miss costs a directory
+/// that is simply not reported.
+///
+/// These belong to the runtime root, not to themselves. Attribution is by
+/// longest known root, and no `_rocm_sdk_*` directory is a known root, so every
+/// one of them resolves to the runtime that contains it -- which is what keeps a
+/// healthy managed install from looking like several installs in conflict.
+fn sdk_package_library_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    for lib in ["lib", "lib64"] {
+        let Ok(pythons) = std::fs::read_dir(root.join(lib)) else {
+            continue;
+        };
+        for python in pythons.flatten() {
+            let site_packages = python.path().join("site-packages");
+            let Ok(packages) = std::fs::read_dir(&site_packages) else {
+                continue;
+            };
+            let mut sdk_roots: Vec<std::path::PathBuf> = packages
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("_rocm_sdk_"))
+                })
+                .collect();
+            sdk_roots.sort();
+            for sdk_root in sdk_roots {
+                crate::collect_sdk_library_paths(&sdk_root, &mut dirs);
+            }
         }
     }
     dirs
@@ -2471,8 +2604,8 @@ mod tests {
 
         let mut copies = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        record_comgr_copy(&mut copies, &mut seen, &link.to_string_lossy(), "test");
-        record_comgr_copy(&mut copies, &mut seen, &real.to_string_lossy(), "test");
+        record_library_copy(&mut copies, &mut seen, &link.to_string_lossy(), "test", &[]);
+        record_library_copy(&mut copies, &mut seen, &real.to_string_lossy(), "test", &[]);
 
         assert_eq!(
             copies.len(),
@@ -2496,11 +2629,65 @@ mod tests {
 
         let mut copies = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        record_comgr_copy(&mut copies, &mut seen, &a.to_string_lossy(), "test");
-        record_comgr_copy(&mut copies, &mut seen, &b.to_string_lossy(), "test");
+        record_library_copy(&mut copies, &mut seen, &a.to_string_lossy(), "test", &[]);
+        record_library_copy(&mut copies, &mut seen, &b.to_string_lossy(), "test", &[]);
 
         assert_eq!(copies.len(), 2, "two files are two copies: {copies:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_library_deep_inside_a_managed_runtime_belongs_to_the_runtime() {
+        // The property the whole diagnosis rests on. A managed runtime spreads
+        // its libraries across separate `_rocm_sdk_*` packages several
+        // directories down. Attribution has to reach past all of that to the one
+        // installation that owns them -- anything that walked up from the file
+        // would stop at `_rocm_sdk_core` and call each package its own install,
+        // making every healthy managed install look like a conflict.
+        let runtime = std::path::PathBuf::from("/data/runtimes/therock/default");
+        let roots = vec![
+            (std::path::PathBuf::from("/opt/rocm"), "rocm-install"),
+            (runtime.clone(), "managed-runtime"),
+        ];
+
+        for package in ["_rocm_sdk_core", "_rocm_sdk_devel"] {
+            let path = format!(
+                "/data/runtimes/therock/default/lib/python3.12/site-packages/{package}/lib/libamd_comgr.so.2"
+            );
+            assert_eq!(
+                owning_install_root(&path, &roots),
+                runtime.to_string_lossy(),
+                "{package} belongs to the runtime that contains it, not to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nearest_enclosing_installation_claims_a_library() {
+        // Longest prefix, not first match: a runtime nested under a directory
+        // that also happens to be an installation belongs to the nearer one.
+        let roots = vec![
+            (std::path::PathBuf::from("/opt"), "rocm-install"),
+            (std::path::PathBuf::from("/opt/rocm-6.4"), "rocm-install"),
+        ];
+        assert_eq!(
+            owning_install_root("/opt/rocm-6.4/lib/libamd_comgr.so.2", &roots),
+            "/opt/rocm-6.4"
+        );
+    }
+
+    #[test]
+    fn a_library_no_installation_claims_is_attributed_to_none() {
+        // Empty rather than guessed. A library somewhere unexpected is a gap in
+        // what the search knows, and inventing an owner for it would turn that
+        // gap into a false finding about the user's machine.
+        let roots = vec![(std::path::PathBuf::from("/opt/rocm"), "rocm-install")];
+        assert_eq!(
+            owning_install_root("/somewhere/else/libamd_comgr.so.2", &roots),
+            ""
+        );
+        // A sibling whose name merely starts the same way is not a parent.
+        assert_eq!(owning_install_root("/opt/rocm-other/lib/x.so", &roots), "");
     }
 
     #[test]
@@ -2597,6 +2784,11 @@ mod tests {
             "comgr_selected",
             "comgr_version",
             "comgr_matches_runtime",
+            // The HIP runtime is searched the same way and for the same reason:
+            // deciding whether the code object manager belongs to the active
+            // runtime means knowing which runtime is active.
+            "hip_paths",
+            "hip_selected",
             "hip_sdk_path",
             "hip_sdk_version",
             "hipinfo_present",

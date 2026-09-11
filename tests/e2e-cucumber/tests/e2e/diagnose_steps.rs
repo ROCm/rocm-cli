@@ -88,6 +88,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-5-distro-too-old",
     "fix-wsl-6-host-driver-too-old",
     "fix-wsl-7-wsl1",
+    "fix-18-comgr-conflict",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
@@ -133,6 +134,11 @@ const fn fix_id_for_the_other_os() -> &'static str {
         "fix-13-hip-sdk-missing" // windows-only
     }
 }
+
+/// The entry for a code object manager library belonging to a different
+/// installation than the active runtime. Advisory by design: both remedies can
+/// break a working Python environment.
+const COMGR_CONFLICT_FIX_ID: &str = "fix-18-comgr-conflict";
 
 /// Contents planted in the scenario's own shell rc file. The assertion is that
 /// this survives the run byte for byte.
@@ -196,6 +202,11 @@ async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
 #[given("a user who has chosen a known fix")]
 async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen the fix for a shadowed compilation library")]
+async fn user_chose_comgr_conflict_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMGR_CONFLICT_FIX_ID.to_string());
 }
 
 #[given("a user who names a fix the CLI does not offer")]
@@ -1052,5 +1063,43 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     assert!(
         !stdout.contains("group membership NOT changed"),
         "the command-failure explanation must not also be on stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI explains that it will not make the change itself")]
+async fn assert_fix_is_advisory(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "printing advice is not a failure:\n{output}"
+    );
+    assert!(
+        output.contains("print-only") || output.contains("will NOT run it"),
+        "the user has to be told the CLI is not going to do this for them:\n{output}"
+    );
+}
+
+#[then("the CLI offers both options without ranking them")]
+async fn assert_both_options_unranked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Both remedies have to be present. Offering one is a recommendation by
+    // omission, and the wrong one breaks a working environment.
+    //
+    // Keyed on the option markers rather than on words like "remove", which also
+    // occur in the surrounding prose -- an assertion that matched those would
+    // still pass with one of the two options deleted, which is exactly the
+    // regression it exists to catch.
+    for option in ["(a)", "(b)"] {
+        assert!(
+            output.contains(option),
+            "only one way out was offered; option `{option}` is missing, which makes \
+             the other a recommendation by omission:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("Neither option is recommended"),
+        "the CLI has to say it is not choosing between them -- which is right \
+         depends on which stack the user means to keep:\n{output}"
     );
 }
