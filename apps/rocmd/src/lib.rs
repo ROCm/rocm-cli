@@ -1050,6 +1050,18 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
+/// Stage-and-publish a file here, sharing only the publish step with `rocm-core`.
+///
+/// Deliberately not [`rocm_core::write_file_atomically`], and not a copy of it
+/// either: only the Windows-sensitive publish (`ReplaceFileW` and its fallbacks)
+/// is single-sourced, via [`publish_temp_file`]. The staging half stays local
+/// because it carries the `suffix_for_attempt` and `before_publish` seams the
+/// tests below drive to force temp-name collisions, write failures and rename
+/// races — injection points `rocm_core`'s caller-facing helper does not expose.
+///
+/// Consequence worth knowing: this path does **not** `sync_all` before
+/// publishing, so unlike the `rocm-core` helper it is atomic but carries no
+/// crash-durability guarantee for the staged bytes.
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
