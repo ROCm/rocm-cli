@@ -1,35 +1,24 @@
 name: WSL pool spike (throwaway)
 
-# Answers three unknowns before building a real e2e-wsl lane on the DevLab
+# Answered three unknowns before building a real e2e-wsl lane on the DevLab
 # Dispatch pool (see #377's e2e-wsl, which stays on its static runner because
-# the pool has no wsl-labeled runner):
+# the pool has no wsl-labeled runner). Findings from run 34598787128:
 #
-#   1. WSL2 needs the "Virtual Machine Platform" + "Windows Subsystem for
-#      Linux" Windows features enabled, which normally needs a reboot to take
-#      effect. GitHub-hosted Windows runners only skip this because it is
-#      baked into their VM image at build time; whether the pool's image has
-#      it baked in too is unknown, and an ephemeral runner cannot survive a
-#      mid-job reboot.
-#   2. A self-hosted runner installed as a background service runs in Session
-#      0, where WSL / Microsoft Store app processes can fail to launch (see
+#   1. Reboot to enable WSL2 features? NO -- `wsl.exe --install` completed and
+#      the distro launched and ran commands within the same job.
+#   2. Session 0 isolation blocking WSL (see
 #      https://github.com/ubuntu/wsl-actions-example, which had to work
-#      around exactly this). Whether the pool's runner avoids Session 0 is
-#      also unknown.
-#   3. GPU passthrough (librocdxg.so, dxcore, /dev/dxg) depends on the AMD
-#      driver already installed on the host — independent of WSL itself, and
-#      not something this spike can fix if missing.
+#      around exactly this)? NO -- the distro genuinely started and executed
+#      `bash -c "..."`, returning real output.
+#   3. GPU passthrough available? Host-level: YES -- /dev/dxg is present. The
+#      ROCm-side userspace bridge (librocdxg.so) was not found, but that is
+#      expected on a fresh guest that never had ROCm's WSL driver package
+#      installed -- a solvable in-job install step, not a host limitation.
 #
-# workflow_dispatch only, EXCEPT: a brand-new workflow file can't be
-# dispatched by name until it exists on the default branch, so the
-# pull_request trigger below (scoped to this file only) is a TEMPORARY way to
-# get one real run on this PR. Remove it once that run has happened; this
-# whole file is throwaway once the three questions above are answered (either
-# build the real lane on its findings, or delete this).
+# Conclusion: a real ephemeral WSL lane looks buildable. This file is
+# throwaway pending a decision on whether/when to build it for real.
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - '.github/workflows/wsl-pool-spike.yml'
 
 permissions:
   contents: read
