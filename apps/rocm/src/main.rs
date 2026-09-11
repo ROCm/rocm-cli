@@ -1781,9 +1781,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             // Resolve the prompt from `--prompt` or, when it is omitted and
             // stdin is not a terminal, from piped standard input — the
             // documented `echo "…" | rocm chat` path. Only when neither
-            // supplies a prompt do we fall back to the status screen (stdin is
-            // an interactive TTY here, since the piped/interactive branches
-            // above already handled the other cases).
+            // supplies a prompt do we fall back to the status screen, which
+            // two kinds of invocation reach: stdin is a TTY that the
+            // interactive branch above declined (it also requires stdout to be
+            // one), or stdin was redirected and carried nothing but whitespace
+            // — an empty pipe or `< /dev/null`.
             let prompt = match prompt {
                 Some(prompt) => Some(prompt),
                 None => read_piped_prompt()?,
@@ -9742,8 +9744,18 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
 /// `None` when stdin is an interactive TTY or the piped input is blank, so the
 /// caller falls back to the status screen instead of blocking on input nobody
 /// can supply.
+///
+/// The read runs to EOF — the conventional filter contract that
+/// `read_provider_key_from_user` already follows. A caller that hands us a pipe
+/// it never writes to and never closes therefore waits, exactly as `cat` would;
+/// the TTY guard is what keeps that off an interactive user, and a
+/// non-interactive caller with no prompt to send should pass `/dev/null` (as
+/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
+/// prompt", so text that was piped but could not be decoded fails loudly rather
+/// than silently becoming a status screen and a zero exit.
 fn read_piped_prompt() -> Result<Option<String>> {
-    use std::io::{IsTerminal, Read};
+    use std::io::IsTerminal as _;
 
     if std::io::stdin().is_terminal() {
         return Ok(None);
@@ -9767,7 +9779,12 @@ fn read_piped_prompt() -> Result<Option<String>> {
 /// content, not shell punctuation.
 ///
 /// `trim()` is used only to classify the input: whitespace-only stdin (an empty
-/// pipe, or a bare newline) holds no prompt and yields `None`.
+/// pipe, or a bare newline) holds no prompt and yields `None`. That is the one
+/// deliberate divergence from `--prompt`, which forwards `"   "` as written: a
+/// bare `rocm chat` under any redirect — `< /dev/null`, a closed heredoc, a CI
+/// step with no stdin — has to keep printing the status screen rather than send
+/// a blank turn to a model, and a caller who really means to send whitespace
+/// can still say so with `--prompt`.
 fn piped_prompt_from_input(input: &str) -> Option<String> {
     if input.trim().is_empty() {
         return None;
@@ -30607,16 +30624,33 @@ ID_LIKE="suse opensuse"
 
     #[test]
     fn command_chat_reads_prompt_from_piped_stdin() {
-        // Regression for the documented `echo "…" | rocm chat` path: when
-        // `--prompt` is omitted the handler must read stdin via
-        // `read_piped_prompt` and route the piped text through
-        // `render_chat_prompt_text`, rather than dropping straight to the
-        // status screen (`render_chat_text`) and ignoring stdin.
+        // A structural guard on the wiring, not a behavioral test: the handler
+        // reads the real fd 0, which an in-process test cannot pipe. The
+        // behavior — piped text reaching the model unaltered — is covered end
+        // to end by the `chat-09` scenario (`@id:chat-cli-stdin-prompt`); what
+        // is checked here is that the `--prompt`-less arm still resolves the
+        // prompt from `read_piped_prompt`, with the result feeding the dispatch
+        // rather than being discarded or read after the send decision is
+        // already made.
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
             body.contains("read_piped_prompt("),
             "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
+        );
+        assert!(
+            body.contains("None => read_piped_prompt()?"),
+            "the piped read must supply the prompt that is dispatched (and \
+             propagate its error), not be a discarded call; body:\n{body}"
+        );
+        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let send_at = body
+            .find("render_chat_prompt_text(")
+            .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
+        assert!(
+            read_at < send_at,
+            "stdin must be read before the send/status-screen decision, or a \
+             piped prompt cannot influence it; body:\n{body}"
         );
     }
 
