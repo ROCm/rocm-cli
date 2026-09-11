@@ -183,13 +183,23 @@ fn push_matched_artifact(
 /// shell to open a file that is not there — the variable would be set but
 /// useless. So a `_PATH` is read here and its *contents* are sent as `_PEM`.
 ///
-/// `_PATH` is still sent, but deliberately empty, and only to switch off any
-/// the remote already has. `resolve_public_keys` consults `_PATH` first, so a
-/// value exported on the far side — through `/etc/environment` and pam_env,
-/// say, which apply to non-interactive sshd sessions — would win over the key
-/// we just forwarded, and the two machines would verify against different
-/// trust roots. An explicitly-empty export reads as unset to install.sh's
+/// When a key *is* forwarded, `_PATH` goes with it — deliberately empty — so
+/// that the forwarded key wins. `resolve_public_keys` consults `_PATH` first,
+/// so a value exported on the far side (through `/etc/environment` and pam_env,
+/// which apply to non-interactive sshd sessions) would otherwise beat the key
+/// we just sent, and the two machines would verify against different trust
+/// roots. An explicitly-empty export reads as unset to install.sh's
 /// `[ -n ... ]`, which is what makes one token enough to close that.
+///
+/// Note the scope: this guarantees *the key we send wins*, not that the
+/// remote's own is always off. Forward nothing — the default, with neither
+/// variable set here — and the fragment is empty, so a `_PATH` the remote
+/// exports for itself still stands while this machine verifies against the
+/// pinned keys. Blanking it unconditionally would close that too, at the cost
+/// of overriding a remote operator's deliberate mirror-key config in the case
+/// where we have no opinion at all. The divergence fails loud ("the remote
+/// rejected the build we fetched for it") rather than silently trusting the
+/// wrong root, so it is left as a decision rather than assumed.
 ///
 /// `_PATH` is therefore checked first, because that is the order install.sh's
 /// own `resolve_public_keys` uses. These two must not disagree: what they are
