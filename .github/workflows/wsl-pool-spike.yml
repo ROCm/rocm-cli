@@ -42,6 +42,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # `2>&1 | Out-String | Write-Host` still lets wsl.exe's own non-zero exit
+      # code (e.g. "not installed yet", entirely expected pre-install) fail
+      # the step under PowerShell's strict native-command handling, which
+      # would skip every step after it. `exit 0` makes these purely
+      # informational: only the printed text matters here, nothing gates on it.
       - name: WSL status before install
         shell: powershell
         run: |
@@ -49,14 +54,18 @@ jobs:
           wsl --status 2>&1 | Out-String | Write-Host
           Write-Host "--- wsl --list --verbose ---"
           wsl --list --verbose 2>&1 | Out-String | Write-Host
+          exit 0
 
       # ubuntu/WSL's own action (main@3b7a6b2, 2026-09-11): installs the WSL
       # Store app via winget, then installs+registers the named distro. Its
       # own first step is continue-on-error, so a failed WSL install falls
       # through to the distro-install step, which fails loudly with a real
-      # error — exactly the signal this spike wants.
+      # error — exactly the signal this spike wants. `if: always()` because
+      # this must run even though the diagnostic step above now always
+      # "succeeds" — belt and suspenders against the same skip-on-failure trap.
       - name: Install WSL + Ubuntu-24.04
         id: wsl_install
+        if: always()
         continue-on-error: true
         uses: ubuntu/WSL/.github/actions/wsl-install@3b7a6b2a43af18aa541eeee1669ac27656630097
         with:
@@ -70,6 +79,7 @@ jobs:
           wsl --status 2>&1 | Out-String | Write-Host
           Write-Host "--- wsl --list --verbose ---"
           wsl --list --verbose 2>&1 | Out-String | Write-Host
+          exit 0
 
       - name: GPU passthrough plumbing inside the distro
         if: always()
@@ -77,6 +87,7 @@ jobs:
         run: |
           Write-Host "--- inside Ubuntu-24.04 ---"
           wsl -d Ubuntu-24.04 -- bash -c "cat /proc/version; ls -la /dev/dxg 2>&1; ldconfig -p 2>&1 | grep -i rocdxg || echo 'librocdxg.so: not found'" 2>&1 | Out-String | Write-Host
+          exit 0
 
       - name: Summary
         if: always()
