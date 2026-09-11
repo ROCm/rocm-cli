@@ -21,6 +21,7 @@ mod e2e {
     pub mod automations_steps;
     pub mod bench_steps;
     pub mod chat_steps;
+    pub mod comfyui_steps;
     pub mod config_steps;
     pub mod dash_steps;
     pub mod dependency_guard_steps;

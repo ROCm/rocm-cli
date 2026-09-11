@@ -315,7 +315,7 @@ rocm update --apply --dry-run")]
         #[arg(long, requires = "apply")]
         dry_run: bool,
     },
-    /// List, choose, add, or remove ROCm installs (runtimes).
+    /// List, choose, add, or remove ROCm runtimes.
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
@@ -675,26 +675,26 @@ rocm engines install vllm --reinstall")]
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
-    /// Show ROCm installs known to ROCm CLI.
+    /// Show ROCm runtimes known to ROCm CLI.
     List,
-    /// Use the selected ROCm install by default.
+    /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Switch back to the previously selected ROCm install.
+    /// Switch back to the previously selected ROCm runtime.
     #[command(
         after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
     Rollback,
-    /// Remove a ROCm install from ROCm CLI.
+    /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Add a ROCm install from a saved manifest file.
+    /// Add a ROCm runtime from a saved manifest file.
     Import {
         /// Manifest file path.
         manifest: PathBuf,
@@ -778,7 +778,7 @@ enum ComfyuiCommand {
     },
     /// Install ComfyUI into ROCm CLI's app folder.
     Install {
-        /// ROCm runtime key to use.
+        /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
         /// Reinstall even if ComfyUI already exists.
@@ -19794,6 +19794,28 @@ mod tests {
                 "`{choice}` must be offered by `rocm examine --help`:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime".
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
     }
 
     #[test]
