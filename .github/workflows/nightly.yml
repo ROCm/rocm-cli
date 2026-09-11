@@ -332,10 +332,11 @@ jobs:
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
-  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
+  # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -353,7 +354,7 @@ jobs:
 
       # Reclaim the GPU before running: kill only e2e leftovers scoped to
       # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
-      # any /workload manual-testing processes (see ci.yml e2e-gpu for the same).
+      # any /workload manual-testing processes (see e2e-selfhosted.yml e2e-gpu for the same).
       - name: Reclaim GPU from stray E2E processes
         run: |
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
@@ -414,11 +415,12 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Share uv's wheel cache off the near-full PVC, on the roomy `/` overlay
-          # (see ci.yml e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Share uv's wheel cache on the same volume as the runtimes it populates,
+          # so uv hardlinks into them instead of copying (see e2e-selfhosted.yml
+          # e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
+          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
           # Share ONE installed managed runtime across serve/chat scenarios so
-          # install sdk runs once per runner, not per scenario (see ci.yml e2e-gpu).
+          # install sdk runs once per runner, not per scenario (see e2e-selfhosted.yml e2e-gpu).
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
           # post-install mv invalidates the absolute paths install sdk bakes into
           # the runtime manifest and every serve fails instantly (run 29320025393).
@@ -456,8 +458,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
-  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, own uv-cache
-  # PVC, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
+  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
+  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
   # the report crate asserts the nightly lanes publish the same platforms as the
   # per-PR lanes.
   e2e-gpu-nightly-rad3:
@@ -521,9 +523,9 @@ jobs:
           # being scaled away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Separate PVC mounted at exactly this path by the runner's cluster
-          # overlay; if you change this path, change the overlay that mounts it too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same volume as the runtimes it populates, so uv hardlinks into them
+          # instead of copying (see e2e-selfhosted.yml e2e-gpu).
+          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
@@ -640,7 +642,8 @@ jobs:
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
-  # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
+  # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
@@ -733,8 +736,9 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
-  # setup aligned with ci.yml's proven Strix Windows job while opting into the
-  # same platform-adaptive @nightly large-model scenario as the Linux runner.
+  # setup aligned with e2e-selfhosted.yml's proven Strix Windows job while
+  # opting into the same platform-adaptive @nightly large-model scenario as the
+  # Linux runner.
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90

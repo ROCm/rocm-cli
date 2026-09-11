@@ -46,12 +46,14 @@ choose a managed runtime folder and still place the pip cache inside that
 runtime folder at `<managed-runtime-folder>\pip-cache`.
 
 The `uv` package cache is separate from that pip cache and does **not** follow
-`--prefix`. It lives at `<data-dir>\uv-cache` so it shares a filesystem with the
-managed environments and `uv` can hardlink into them. With `--prefix` pointing at
-a different filesystem from `ROCM_CLI_DATA_DIR`, `uv` falls back to copying
-packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on the prefix filesystem to
-restore hardlinking. Making `--prefix` do this automatically is tracked
-separately.
+`--prefix`. It lives at `<data-dir>\uv-cache` so it is reachable from the managed
+environments without crossing a mount point and `uv` can hardlink into them. With
+`--prefix` pointing somewhere that is a separate mount from `ROCM_CLI_DATA_DIR`,
+`uv` falls back to copying packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on
+the prefix mount to restore hardlinking. Note it is the mount, not the
+filesystem: a bind mount is enough to trigger the fallback even when both paths
+resolve to one underlying filesystem. Making `--prefix` do this automatically is
+tracked separately.
 
 ## 1. First-Time Setup
 
