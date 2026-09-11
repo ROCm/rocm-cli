@@ -433,7 +433,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
         with:
           tool: nextest
 
@@ -801,7 +801,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
         with:
           tool: cargo-llvm-cov
 
