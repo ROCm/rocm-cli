@@ -4146,6 +4146,7 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
             site_packages: sdk.site_packages,
             root_path,
             bin_path,
+            library_paths: sdk.library_paths,
         });
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.installed_at_unix_ms));
@@ -4344,6 +4345,14 @@ pub(crate) struct TheRockSdkProbeCandidate {
     pub(crate) site_packages: Option<PathBuf>,
     pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
+    /// The SDK's own recorded library directories -- every package root the
+    /// probe script actually imported and asked Python for (see
+    /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
+    /// `root_path`/`site_packages` after the fact. This is what
+    /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
+    /// a caller that needs to find a managed runtime's actual libraries (comgr
+    /// included) should prefer this over re-deriving the layout.
+    pub(crate) library_paths: Vec<PathBuf>,
 }
 
 pub fn detect_host_gfx_target() -> Option<String> {
@@ -10565,6 +10574,57 @@ Class Name:                Display
         assert_eq!(
             detect_managed_therock_sdk_gfx_target(&paths),
             Some("gfx1201".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// `managed_therock_sdk_probe_candidates` surfaces the SDK's own recorded
+    /// `library_paths` rather than dropping them.
+    ///
+    /// Those are what `examine`'s comgr/HIP search now reads to find a managed
+    /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
+    /// `examine.rs`), in place of re-deriving the layout from `root_path` and
+    /// `site_packages` after the fact -- a guess that does not hold for every
+    /// real install shape, which is what left a managed runtime's own code
+    /// object manager library unseen on a real host
+    /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
+    /// candidate whose `library_paths` came back empty would defeat that fix
+    /// silently, so this pins the field surviving the read.
+    #[test]
+    fn managed_sdk_probe_candidate_carries_recorded_library_paths() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-library-paths");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        let comgr_dir = site_packages.join("_rocm_sdk_core").join("lib");
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&comgr_dir)?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin,
+                    "library_paths": [comgr_dir]
+                }
+            }))?,
+        )?;
+
+        let candidates = managed_therock_sdk_probe_candidates(&registry);
+        assert_eq!(candidates.len(), 1, "expected exactly one candidate");
+        assert_eq!(
+            candidates[0].library_paths,
+            vec![comgr_dir],
+            "the recorded library_paths must survive into the candidate, or the \
+             comgr/HIP search has nowhere else reliable to find them"
         );
         fs::remove_dir_all(root).ok();
         Ok(())

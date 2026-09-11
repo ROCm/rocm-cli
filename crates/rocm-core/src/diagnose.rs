@@ -208,6 +208,28 @@ const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
     ("no space left on device", 20, "the device reported full"),
 ];
 
+/// What a shadowed code object manager leaves in the error text.
+///
+/// Every one of these is a *weak* signal on its own — a failed device-code
+/// compilation has many causes, and this entry is established by the state of
+/// the machine rather than by the words. The keywords only raise an already
+/// structural finding; none of them reaches the match threshold alone.
+const KEYWORDS_COMGR_CONFLICT: KeywordTable = &[
+    (r"libamd_comgr", 40, "error mentions libamd_comgr"),
+    ("comgr", 30, "error mentions comgr"),
+    (
+        "code object",
+        25,
+        "error mentions a code object (what comgr produces)",
+    ),
+    (
+        "hiperrornobinaryforgpu",
+        25,
+        "HIP found no binary for the GPU",
+    ),
+    ("device code", 15, "error mentions device code (broad)"),
+];
+
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
     ("rocminfo: command not found", 50, "rocminfo not on PATH"),
     ("command not found.*hipcc", 40, "hipcc not on PATH"),
@@ -1399,6 +1421,113 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
+/// A code object manager library that does not belong to the active runtime.
+///
+/// The rule is symmetric, and that is what makes it safe. Rather than asking
+/// "is this the wheel copy?" and then carving out an exception for the managed
+/// runtime, it asks one question of both libraries: **does the copy of
+/// `libamd_comgr` that would load belong to the same installation as the copy of
+/// `libamdhip64` that would load?** If it does, there is nothing wrong, whichever
+/// installation that is.
+///
+/// Every case falls out of that instead of being legislated. A healthy managed
+/// install takes both libraries from the managed runtime, so nothing differs and
+/// nothing is reported -- no special case required. A user who has put a wheel's
+/// library directory on the search path while the runtime still resolves to the
+/// system install takes them from two different places, and that is the failure.
+///
+/// A control written as an exception is a rule that has not been stated
+/// correctly yet.
+fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-18-comgr-conflict";
+    const TITLE: &str = "code object manager library does not belong to the active HIP runtime";
+
+    let (Some(comgr), Some(hip)) = (e.comgr_selected.as_ref(), e.hip_selected.as_ref()) else {
+        // Nothing to compare. A machine with no ROCm at all is not a machine
+        // with a conflict, and saying otherwise would be the worst kind of false
+        // report: confident, and about something that is not there.
+        return zero(ID, TITLE);
+    };
+    // The same rule `probe_comgr` uses to compute `comgr_matches_runtime`. Calling
+    // it here rather than restating the conditions is what keeps `rocm examine
+    // --json` and this finding from disagreeing about one machine: an
+    // unattributed copy, a runtime with no code object manager of its own to
+    // prefer, or the two already agreeing are all `None`/`Some(true)` here and
+    // "nothing to report" below, exactly as they are for that field.
+    if crate::examine::comgr_matches_runtime(&e.comgr_paths, Some(comgr), Some(hip)) != Some(false)
+    {
+        return zero(ID, TITLE);
+    }
+    let Some(matching) = e
+        .comgr_paths
+        .iter()
+        .find(|copy| copy.install_root == hip.install_root)
+    else {
+        // Unreachable: `comgr_matches_runtime` only returns `Some(false)` when
+        // this search succeeds. Kept as a guard rather than an `unwrap` so a
+        // future change to either function fails safely instead of panicking.
+        return zero(ID, TITLE);
+    };
+
+    let mut score = 60;
+    let mut evidence = vec![
+        format!(
+            "the code object manager that would load is {} (from {})",
+            comgr.path, comgr.install_root
+        ),
+        format!(
+            "the HIP runtime that would load is {} (from {})",
+            hip.path, hip.install_root
+        ),
+        format!(
+            "{} also ships a code object manager at {}",
+            hip.install_root, matching.path
+        ),
+    ];
+    if !comgr.version.is_empty() && !matching.version.is_empty() {
+        evidence.push(format!(
+            "versions differ: {} would load, the runtime ships {}",
+            comgr.version, matching.version
+        ));
+    }
+    // Said out loud because the answer depends on which process asks. `rocm
+    // serve` puts the managed runtime's libraries first on purpose, and gets a
+    // different -- correct -- answer. This finding is about the plain shell the
+    // user's own command ran in.
+    evidence.push(
+        "this describes the environment as it stands outside the CLI's managed runtimes".to_owned(),
+    );
+
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_COMGR_CONFLICT);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary:
+            "Make the code object manager and the HIP runtime come from the same installation."
+                .to_owned(),
+        commands: vec![
+            format!("# The library that would load: {}", comgr.real_path),
+            format!("# The runtime that would load: {}", hip.real_path),
+            format!("# The runtime's own copy:      {}", matching.real_path),
+            "# Either keep one stack and remove the other, or order the search".to_owned(),
+            "# path so the runtime's own copy is found first:".to_owned(),
+            format!(
+                "export LD_LIBRARY_PATH=\"{}:$LD_LIBRARY_PATH\"",
+                std::path::Path::new(&matching.real_path)
+                    .parent()
+                    .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned())
+            ),
+        ],
+        fix_id: ID.to_owned(),
+        auto_applicable: false,
+        verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"".to_owned(),
+        notes: vec![crate::fix::COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED.to_owned()],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
 /// The vLLM engine-startup import failure (EAI-8012).
 ///
 /// Keyword-only, and not by preference. The fact that decides this failure is
@@ -2058,11 +2187,16 @@ const CHECKERS: &[Checker] = &[
     (check_wsl_5_distro_too_old, WSL_ONLY),
     (check_wsl_6_host_driver_too_old, WSL_ONLY),
     (check_wsl_7_wsl1, WSL_ONLY),
-    // Both families, opting in explicitly as the platform split requires. The
-    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
-    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
-    // leaving this tagged `linux` alone would silence it on one of the two
-    // platforms most likely to have it.
+    // Both families, opting in explicitly as the platform split requires. Which
+    // copy of a library the loader picks is not a question about the amdgpu
+    // module or the Windows host driver -- a wheel copy and a system copy
+    // collide on WSL2 exactly as they do on bare metal. Windows is deferred
+    // until this has proved the approach.
+    (check_18_comgr_conflict, &["linux", "wsl"]),
+    // Both families, for the same reason. The shortage has nothing to do with
+    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs -- and WSL2 ships the
+    // same 64 MB default a container does, so leaving this tagged `linux` alone
+    // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
 ];
 
@@ -2535,6 +2669,70 @@ mod tests {
         }
     }
 
+    /// A library copy belonging to `install_root`, sitting at `path`.
+    fn copy_in(install_root: &str, path: &str, version: &str) -> crate::examine::LibraryCopy {
+        crate::examine::LibraryCopy {
+            path: path.to_owned(),
+            real_path: path.to_owned(),
+            version: version.to_owned(),
+            source: "test".to_owned(),
+            install_root: install_root.to_owned(),
+        }
+    }
+
+    fn comgr_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-18-comgr-conflict")
+    }
+
+    #[test]
+    fn a_code_object_manager_from_another_installation_is_reported() {
+        // The failure this entry exists for: the runtime resolves to the system
+        // install while the library that compiles device code for it comes from
+        // a wheel, and the error the user sees names neither.
+        let mut e = linux_base();
+        let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        e.comgr_selected = Some(wheel.clone());
+        e.comgr_paths = vec![wheel, system];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        let report = diagnose(&e, "");
+        let finding = comgr_finding(&report).expect("the mismatch must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "a mismatch established from machine state alone has to clear the \
+             threshold without help from the symptom text: {}",
+            finding.score
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "both remedies can break a working Python environment, so nothing here \
+             may be applied for the user"
+        );
+        let evidence = finding.evidence.join("\n");
+        for expected in [
+            "/wheel/lib/libamd_comgr.so.2",
+            "/opt/rocm",
+            "2.8.0",
+            "3.0.0",
+        ] {
+            assert!(
+                evidence.contains(expected),
+                "the report has to name each copy, where it came from and its \
+                 version -- `{expected}` is missing:\n{evidence}"
+            );
+        }
+    }
+
     #[test]
     fn a_partly_used_allowance_reports_what_is_left_as_well_as_the_size() {
         // The two numbers answer different questions, and the evidence only
@@ -2579,6 +2777,40 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_managed_installation_raises_no_report() {
+        // The control, and the reason the rule is stated symmetrically. A managed
+        // runtime spreads its libraries across separate `_rocm_sdk_*` packages
+        // that sit *beside* each other under one `site-packages` -- not nested
+        // under the runtime's own root (`_rocm_sdk_devel`) at all -- so the two
+        // copies sit in different directories of ONE installation. Anything
+        // that decided ownership by walking up from the file would call these
+        // two installations and fire on the most common install we ship. (A
+        // fixture nesting `_rocm_sdk_core` under the root, the shape the
+        // installer never produces, would pass by construction without
+        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // `ROCM_SDK_PROBE_SCRIPT` instead.)
+        let mut e = linux_base();
+        let root = "/data/runtimes/therock/_rocm_sdk_devel";
+        let comgr = copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_core/lib/libamd_comgr.so.2",
+            "2.8.0",
+        );
+        e.comgr_selected = Some(comgr.clone());
+        e.comgr_paths = vec![comgr];
+        e.hip_selected = Some(copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_devel/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "both libraries come from one installation, so there is no conflict"
+        );
+    }
+
+    #[test]
     fn an_unmeasured_shared_memory_allowance_is_not_reported() {
         // Unknown is not zero. `None` means the path was absent or the query
         // failed, and a shortage reported on that basis would be a finding about
@@ -2590,6 +2822,31 @@ mod tests {
         assert!(
             shm_finding(&diagnose(&e, "")).is_none(),
             "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn a_second_copy_that_does_not_load_raises_no_report() {
+        // Holding two copies is not a fault. Only the one that loads matters.
+        let mut e = linux_base();
+        let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(winner.clone());
+        e.comgr_paths = vec![winner, loser];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the copy that loads belongs to the runtime, so nothing is wrong"
+        );
+        assert_eq!(
+            e.comgr_paths.len(),
+            2,
+            "the machine report still lists both copies; only the diagnosis stays quiet"
         );
     }
 
@@ -2622,6 +2879,154 @@ mod tests {
             "knowing it is a container makes the cause certain, so it should rank \
              higher there: {inside} vs {outside}"
         );
+    }
+
+    #[test]
+    fn nothing_is_reported_when_there_is_nothing_to_compare() {
+        // A machine with no ROCm is not a machine with a conflict. Reporting one
+        // would be the worst kind of false finding: confident, and about
+        // something that is not there.
+        let cases = [
+            ("neither library found", None, None),
+            (
+                "no runtime to attribute the library to",
+                Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3")),
+                None,
+            ),
+            (
+                "a copy no known installation claims",
+                Some(copy_in("", "/somewhere/libamd_comgr.so.3", "3")),
+                Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                )),
+            ),
+        ];
+        for (case, comgr, hip) in cases {
+            let mut e = linux_base();
+            e.comgr_paths = comgr.iter().cloned().collect();
+            e.comgr_selected = comgr;
+            e.hip_selected = hip;
+            assert!(
+                comgr_finding(&diagnose(&e, "")).is_none(),
+                "{case}: reported a conflict it could not have established"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_with_no_copy_of_its_own_is_not_a_conflict() {
+        // The second half of the rule. Without a copy belonging to the runtime
+        // there is nothing to switch to, so the advice would be empty -- and the
+        // machine is simply one where the only copy lives elsewhere.
+        let mut e = linux_base();
+        let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(only.clone());
+        e.comgr_paths = vec![only];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the runtime ships no code object manager of its own, so there is no \
+             alternative to point the user at"
+        );
+    }
+
+    #[test]
+    fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
+        // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
+        // fix-18 finding answer the same question about the same machine. Both
+        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // the two surfaces stay in lockstep across every shape the catalog
+        // itself tests -- including the case that used to disagree: a runtime
+        // whose own installation ships no code object manager at all.
+        let cases: Vec<(&str, Examination)> = vec![
+            ("neither library found", linux_base()),
+            {
+                let mut e = linux_base();
+                e.comgr_selected =
+                    Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3"));
+                e.comgr_paths = vec![e.comgr_selected.clone().unwrap()];
+                ("no runtime to attribute the library to", e)
+            },
+            {
+                let mut e = linux_base();
+                let unattributed = copy_in("", "/somewhere/libamd_comgr.so.3", "3");
+                e.comgr_selected = Some(unattributed.clone());
+                e.comgr_paths = vec![unattributed];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a copy no known installation claims", e)
+            },
+            {
+                // The disagreement this test guards against: the runtime's own
+                // install ships no comgr copy of its own to switch to.
+                let mut e = linux_base();
+                let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(only.clone());
+                e.comgr_paths = vec![only];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a runtime with no copy of its own", e)
+            },
+            {
+                let mut e = linux_base();
+                let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(winner.clone());
+                e.comgr_paths = vec![winner, loser];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("the copy that loads already belongs to the runtime", e)
+            },
+            {
+                let mut e = linux_base();
+                let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                e.comgr_selected = Some(wheel.clone());
+                e.comgr_paths = vec![wheel, system];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a genuine conflict", e)
+            },
+        ];
+
+        for (case, e) in cases {
+            let matches_runtime = crate::examine::comgr_matches_runtime(
+                &e.comgr_paths,
+                e.comgr_selected.as_ref(),
+                e.hip_selected.as_ref(),
+            );
+            let diagnosis_fires = comgr_finding(&diagnose(&e, "")).is_some();
+            assert_eq!(
+                matches_runtime == Some(false),
+                diagnosis_fires,
+                "{case}: comgr_matches_runtime={matches_runtime:?} but the \
+                 diagnosis {}",
+                if diagnosis_fires {
+                    "fired"
+                } else {
+                    "did not fire"
+                }
+            );
+        }
     }
 
     #[test]
