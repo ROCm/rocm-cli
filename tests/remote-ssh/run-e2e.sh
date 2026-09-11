@@ -138,10 +138,15 @@ export PATH="${WORK}/bin:${PATH}"
 rocm() { "${ROCM_BIN}" "$@" 2>&1; }
 in_container() { docker exec "${CONTAINER}" "$@"; }
 
+ready=0
 for _ in $(seq 1 60); do
-  ssh -o BatchMode=yes -o ConnectTimeout=5 -F "${ROCM_REMOTE_SSH_CONFIG}" gpu-box true >/dev/null 2>&1 && break
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -F "${ROCM_REMOTE_SSH_CONFIG}" gpu-box true >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 0.25
 done
+[[ "${ready}" -eq 1 ]] || { echo "the stand-in remote never accepted a connection" >&2; exit 1; }
 
 echo
 echo "discovery"
@@ -196,6 +201,9 @@ session_id="$(rocm remote status | sed -n 's/^- \(remote-.*\)$/\1/p' | head -n1)
 out="$(rocm remote attach "${session_id}")"
 expect_contains "attaching restores the endpoint" "Endpoint re-published" "${out}"
 expect_contains "without restarting the model" "not restarted" "${out}"
+
+serve_config="$(in_container tailscale serve status --json)"
+expect_contains "the remote published the endpoint" '"8000"' "${serve_config}"
 
 echo
 echo "teardown"

@@ -55,9 +55,9 @@ Feature: Working with GPU machines over a private network
     When the user asks to stop a remote session that does not exist
     Then the user is told no such session is recorded
 
-  @id:remote-doctor-refuses-to-install
+  @id:remote-doctor-refuses-to-install @requires-docker
   Scenario: remote-09 - Checking a machine's health never installs anything on it
-    Given a private network with a GPU machine and a phone
+    Given a reachable GPU machine with no ROCm CLI on the private network
     When the user checks the health of a machine that has no ROCm CLI
     Then the user is told nothing was installed and how to install it
     And they are pointed at serving as the command that provisions

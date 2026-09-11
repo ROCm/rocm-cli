@@ -81,8 +81,11 @@ docker build -q \
 
 PORT="$(find_free_port)"
 echo "starting it on port ${PORT}"
-docker run -d --name "${CONTAINER}" -p "127.0.0.1:${PORT}:22" "${IMAGE}" >/dev/null || \
-  docker run -d --name "${CONTAINER}" -p "${PORT}:22" "${IMAGE}" >/dev/null
+# Loopback-only, no fallback: this image ships a password account
+# (Dockerfile's `prompt-only`) so the batch-mode check has something real to
+# refuse. Falling back to an all-interfaces publish on a failed loopback bind
+# would put that guessable-password shell on the LAN instead of just failing.
+docker run -d --name "${CONTAINER}" -p "127.0.0.1:${PORT}:22" "${IMAGE}" >/dev/null
 
 ssh-keygen -q -t ed25519 -N '' -f "${WORK}/id" -C rocm-remote-test
 docker exec -i "${CONTAINER}" sh -c 'cat >> /root/.ssh/authorized_keys' < "${WORK}/id.pub"

@@ -44,10 +44,17 @@ RUN adduser -D prompt-only \
     '  PubkeyAuthentication no' \
     >> /etc/ssh/sshd_config.d/rocm-test.conf
 
-COPY fake-rocm.sh /usr/local/bin/rocm
+# Set to 0 to build a machine that is reachable over SSH but has no `rocm`
+# binary at all — the shape `remote doctor` needs to prove it refuses to
+# install rather than failing earlier for lack of a connection.
+ARG INCLUDE_ROCM_CLI=1
+
+COPY fake-rocm.sh /tmp/fake-rocm.sh
 COPY fake-tailscale.sh /usr/local/bin/tailscale
 COPY examination.json /var/lib/fake-rocm/examination.json
-RUN chmod +x /usr/local/bin/rocm /usr/local/bin/tailscale \
+RUN chmod +x /tmp/fake-rocm.sh /usr/local/bin/tailscale \
+    && if [ "${INCLUDE_ROCM_CLI}" = "1" ]; then cp /tmp/fake-rocm.sh /usr/local/bin/rocm; fi \
+    && rm -f /tmp/fake-rocm.sh \
     && echo '[]' > /var/lib/fake-rocm/services.json \
     && echo '{}' > /var/lib/fake-rocm/serve.json \
     # The readiness probe looks for a ROCm install independently of the CLI, so

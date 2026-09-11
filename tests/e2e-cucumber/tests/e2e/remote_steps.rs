@@ -192,9 +192,9 @@ async fn when_stop_unknown(world: &mut E2eWorld) {
 
 #[when("the user checks the health of a machine that has no ROCm CLI")]
 async fn when_doctor_without_cli(world: &mut E2eWorld) {
-    // No container: the machine is on the tailnet but unreachable over ssh, so
-    // the CLI cannot be found there. What matters is that the command refuses
-    // rather than reaching for an installer.
+    // Whatever `Given` ran set world.remote_env: either no container (the
+    // machine is unreachable over ssh) or the no-CLI container (reachable, but
+    // genuinely missing the binary). Both must refuse rather than install.
     let env = world.remote_env.clone();
     run_remote(world, &["remote", "doctor", "gpu-box"], &env);
 }
@@ -369,7 +369,25 @@ fn free_port() -> u16 {
 
 /// Build the image, start it, and set up everything the CLI needs to reach it.
 fn start_remote_machine(world: &E2eWorld) -> RemoteMachine {
+    start_remote_machine_variant(world, true)
+}
+
+/// Same stand-in, but built without a `rocm` binary at all. Used for the one
+/// scenario that has to prove a health check refuses to install onto a
+/// reachable machine, rather than merely failing to connect to one.
+fn start_remote_machine_without_cli(world: &E2eWorld) -> RemoteMachine {
+    start_remote_machine_variant(world, false)
+}
+
+fn start_remote_machine_variant(world: &E2eWorld, include_rocm_cli: bool) -> RemoteMachine {
     let fixtures = repo_root().join("tests").join("remote-ssh");
+    // A distinct tag per variant: the two must not clobber each other's image
+    // when scenarios run concurrently or interleaved.
+    let tag = if include_rocm_cli {
+        "rocm-remote-ssh-test"
+    } else {
+        "rocm-remote-ssh-test-no-cli"
+    };
     let build = docker(&[
         "build",
         "-q",
@@ -378,8 +396,10 @@ fn start_remote_machine(world: &E2eWorld) -> RemoteMachine {
             "APK_REPO_FLAGS={}",
             std::env::var("ROCM_TEST_APK_REPOS").unwrap_or_default()
         ),
+        "--build-arg",
+        &format!("INCLUDE_ROCM_CLI={}", i32::from(include_rocm_cli)),
         "-t",
-        "rocm-remote-ssh-test",
+        tag,
         fixtures.to_str().expect("fixtures path"),
     ]);
     assert!(
@@ -403,7 +423,7 @@ fn start_remote_machine(world: &E2eWorld) -> RemoteMachine {
         &container,
         "-p",
         &format!("127.0.0.1:{port}:22"),
-        "rocm-remote-ssh-test",
+        tag,
     ]);
     assert!(
         run.status.success(),
@@ -492,6 +512,13 @@ const fn machine(world: &E2eWorld) -> &RemoteMachine {
 #[given("a reachable GPU machine on the private network")]
 async fn given_reachable_machine(world: &mut E2eWorld) {
     let started = start_remote_machine(world);
+    world.remote_env = started.env.clone();
+    world.remote_machine = Some(started);
+}
+
+#[given("a reachable GPU machine with no ROCm CLI on the private network")]
+async fn given_reachable_machine_without_cli(world: &mut E2eWorld) {
+    let started = start_remote_machine_without_cli(world);
     world.remote_env = started.env.clone();
     world.remote_machine = Some(started);
 }
