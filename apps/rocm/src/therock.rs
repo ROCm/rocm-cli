@@ -25,8 +25,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
 const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
@@ -263,14 +264,21 @@ fn resolve_source(channel: TheRockChannel, layout: SourceLayout) -> ResolvedSour
 
 /// Whether `selector` names a ROCm release that only the next layout publishes.
 ///
-/// An exact pin is the only signal that qualifies. A build date names a nightly
-/// build, an unparseable string names nothing this CLI can reason about, and
-/// neither is evidence that the canonical stream cannot serve the request.
+/// An exact *stable* pin is the only signal that qualifies. A build date names
+/// a nightly build, an unparseable string names nothing this CLI can reason
+/// about, and neither is evidence that the canonical stream cannot serve the
+/// request. Nor is a pinned prerelease of a future major: the canonical
+/// nightly stream already serves those (see
+/// `nightly_accepts_future_prerelease_major_without_cli_changes`), so gating
+/// on major alone would route a nightly alpha pin like `10.1.0a20260822` into
+/// a refusal the release-channel retry it suggests could never satisfy.
 fn next_layout_requested(selector: &RuntimeVersionSelector) -> bool {
     let RuntimeVersionSelector::Version(version) = selector else {
         return false;
     };
-    parse_version(version).is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR)
+    parse_version(version).is_some_and(|parsed| {
+        parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR
+    })
 }
 
 /// The layout an install must read from, and the refusal when it cannot.
@@ -1224,6 +1232,21 @@ fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceL
     }))
 }
 
+/// The family override to re-resolve a wheel manifest's update with.
+///
+/// A grouped family (e.g. `gfx125X-dcgpu`) carries no exact arch, so passing
+/// it straight through would leave the next layout's device target
+/// undetermined and the whole resolve would bail — on the very host the
+/// runtime is already installed on. The composition recorded at install time
+/// carries that arch; recover it and pass the raw arch itself as the
+/// override, which `resolve_family` also normalizes back to this same family.
+fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String {
+    let recorded_arch =
+        wheel_composition_device_target(manifest.wheel_composition.as_ref()).map(str::to_owned);
+    raw_arch_agreeing_with_family(recorded_arch, &manifest.family)
+        .unwrap_or_else(|| manifest.family.clone())
+}
+
 fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
@@ -1248,10 +1271,11 @@ fn resolve_latest_for_manifest(
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
+            let family_override = manifest_wheel_family_override(manifest);
             let resolution = resolve_pip_runtime_with_timeout(
                 paths,
                 channel,
-                Some(manifest.family.as_str()),
+                Some(family_override.as_str()),
                 &wheel_compatibility,
                 None,
                 Some(layout),
@@ -2046,6 +2070,7 @@ fn resolve_pip_runtime_from_index(
             &rocm_version,
             device_target,
             wheel_compatibility,
+            download_timeout_secs,
         )?
     } else {
         let torch_versions = load_simple_index_versions(
@@ -2426,12 +2451,68 @@ fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageV
     })
 }
 
+/// Waits for `child` to exit, killing it and failing once `timeout` elapses.
+///
+/// `None` waits unbounded, matching an explicit user-invoked install with no
+/// budget to respect. Reads stdout/stderr on background threads throughout the
+/// wait so a slow or silent child can't deadlock the poll on a full pipe.
+fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Result<Output> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait_with_output()
+            .context("failed to wait for child process");
+    };
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll child process status")?
+        {
+            let stdout = stdout_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = stderr_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "timed out after {}s waiting for child process",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
     index_url: &str,
     rocm_version: &str,
     device_target: &str,
     compatibility: &WheelCompatibility,
+    download_timeout_secs: Option<u64>,
 ) -> Result<TheRockPipPackageVersions> {
     let uv =
         ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
@@ -2472,8 +2553,8 @@ fn resolve_published_pip_package_versions(
         .context("uv metadata resolver stdin was unavailable")?
         .write_all(requirements.as_bytes())
         .context("failed to send ROCm X requirements to uv")?;
-    let output = child
-        .wait_with_output()
+    let timeout = download_timeout_secs.map(Duration::from_secs);
+    let output = wait_with_output_bounded(child, timeout)
         .context("failed to wait for ROCm X metadata resolution")?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -5233,6 +5314,22 @@ mod tests {
         assert!(error.contains("--channel release"), "{error}");
     }
 
+    /// A pinned nightly prerelease of a future major (e.g. a ROCm 10 alpha
+    /// build) is not evidence the canonical stream can't serve it — only a
+    /// *stable* pin is. Gating on major alone would refuse this pin and then
+    /// suggest a release-channel retry that the stable-version filter would
+    /// also reject, leaving no working path.
+    #[test]
+    fn nightly_prerelease_pin_of_a_future_major_stays_canonical() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let pin = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin)).unwrap(),
+            SourceLayout::Canonical
+        );
+    }
+
     #[test]
     fn next_layout_resolves_its_own_bases() {
         let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
@@ -5266,6 +5363,43 @@ mod tests {
         // A variable that is present but blank is not a redirect.
         assert_eq!(select_base_override(true, Some("   "), default), default);
         assert_eq!(select_base_override(true, None, default), default);
+    }
+
+    /// The test above only proves the pure decision rule; it never reads
+    /// process environment, so it can't catch `env_override_base` or
+    /// `resolve_source` failing to wire that rule to the real variables. The
+    /// only thing that does today is `therock-next-06`, an e2e scenario gated
+    /// `@nightly` because it has to reach the live default index — so on the
+    /// blocking lane this trust boundary otherwise has zero coverage of the
+    /// actual env-reading path. Exercise it here instead, with no network.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn env_override_is_ignored_end_to_end_without_the_opt_in() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_override = std::env::var_os("ROCM_CLI_THEROCK_NEXT_PIP_BASE");
+        let old_allow = std::env::var_os("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", "http://127.0.0.1:9/whl");
+            std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        }
+
+        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
+
+        unsafe {
+            match old_override {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE"),
+            }
+            match old_allow {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE"),
+            }
+        }
+
+        assert_eq!(
+            next.wheel_index, THEROCK_NEXT_PIP_INDEX_BASE,
+            "an override named without the trust opt-in must not redirect resolution"
+        );
     }
 
     #[test]
@@ -5334,6 +5468,37 @@ mod tests {
             None
         );
         assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
+    }
+
+    /// Updating a next-layout manifest whose family is a group label (as
+    /// `gfx125X-dcgpu` always is) must recover the exact arch this runtime was
+    /// installed with from its composition, not resolve an undetermined
+    /// device target on the very host that arch came from.
+    #[test]
+    fn manifest_wheel_family_override_recovers_the_installed_arch() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx1250"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx1250");
+    }
+
+    /// A composition recorded for a different family (e.g. moved to another
+    /// host) must not be trusted — the plain family label is the safe fallback.
+    #[test]
+    fn manifest_wheel_family_override_ignores_a_disagreeing_composition() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx90a"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx125X-dcgpu");
+    }
+
+    /// No recorded composition at all (an older manifest, or an undetermined
+    /// install) falls back to the plain family label, same as before this fix.
+    #[test]
+    fn manifest_wheel_family_override_falls_back_without_a_composition() {
+        let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
     }
 
     /// The next catalog's gfx103X token differs from the canonical token, and
@@ -6435,6 +6600,56 @@ mod tests {
         };
         assert_eq!(uv_python_platform(&linux)?, "x86_64-unknown-linux-gnu");
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("sleep")
+            .arg(seconds.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("cmd")
+            .args(["/C", "timeout", "/t", &seconds.to_string(), "/nobreak"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn timeout")
+    }
+
+    /// A budget-constrained caller (the startup update check) must get its
+    /// child back, not blocked past the budget it asked for.
+    #[test]
+    fn wait_with_output_bounded_kills_a_slow_child_at_the_deadline() {
+        let child = spawn_test_sleep(30);
+        let started = Instant::now();
+
+        let error = wait_with_output_bounded(child, Some(Duration::from_millis(200)))
+            .expect_err("a 30s sleep must not complete inside a 200ms budget");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill was not prompt"
+        );
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    /// An unbounded wait (an explicit user-invoked install, not a budgeted
+    /// startup check) still returns the child's real output.
+    #[test]
+    fn wait_with_output_bounded_waits_unbounded_when_no_timeout_is_given() {
+        let child = spawn_test_sleep(1);
+
+        let output = wait_with_output_bounded(child, None).expect("child should exit");
+
+        assert!(output.status.success(), "{output:?}");
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it

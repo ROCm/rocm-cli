@@ -305,6 +305,35 @@ async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+/// Distinct from [`preview_pinned_wheel_install`]: this scenario's whole point
+/// is that the override is ignored and resolution falls through to the real
+/// `DEFAULT_NEXT_RELEASE_PIP_BASE`, so the pin has to be a version that source
+/// actually publishes right now — a hardcoded `10.0.0` would go stale the
+/// moment it is superseded, same reasoning as `discover_latest_next_rocm_version`'s
+/// other caller.
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to the latest published ROCm 10 version"
+)]
+async fn preview_pinned_wheel_install_latest_next_version(world: &mut E2eWorld) {
+    let version = discover_latest_next_rocm_version().await;
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            &version,
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user previews a wheel SDK install for family gfx120X-all pinned to ROCm 10.0.0")]
 async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
     preview(
