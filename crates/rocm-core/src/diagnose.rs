@@ -3471,20 +3471,27 @@ mod tests {
     }
 
     #[test]
-    fn wsl_sub_threshold_vllm_signal_is_preserved_but_still_routed_out_of_scope() {
+    fn wsl_sub_threshold_vllm_signal_is_preserved_in_matched() {
         // A weak (sub-threshold) vLLM OOM signal on WSL must still surface in
-        // `matched` per the `DiagnoseReport::matched` contract -- but it must
-        // NOT suppress the out-of-scope routing note. Suppression is gated on
-        // `has_match` (score >= MIN_SCORE_FOR_MATCH), not on `matched` being
-        // non-empty, so a score-25 mention no longer buries the WSL routing note
-        // for a user whose real problem is a missing WSL driver.
-        let mut e = linux_base();
-        e.is_wsl = true;
-        let report = diagnose(&e, "vllm: out of memory");
+        // `matched` per the `DiagnoseReport::matched` contract: `run_all_checks`
+        // drops only zero-score results, so a score-25 mention is reported as a
+        // WEAK row rather than silently discarded.
+        //
+        // This used to also assert that the weak hit did not bury a WSL
+        // out-of-scope routing note. There is no such note any more -- WSL2 is a
+        // covered platform with its own catalog entries -- so what is left to pin
+        // is the half that still has teeth: the entry survives in `matched`, and
+        // it does not promote itself into a match.
+        //
+        // `wsl_base()` (a healthy WSL GPU stack) rather than a default
+        // examination: a default one has no /dev/dxg, so fix-wsl-1 would fire at
+        // 55 and the report would match for reasons that have nothing to do with
+        // the signal under test.
+        let report = diagnose(&wsl_base(), "vllm: out of memory");
         assert!(!report.has_match());
         assert!(
-            report.out_of_scope.is_some(),
-            "a sub-threshold hit must not suppress the WSL routing note"
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform, not an out-of-scope one"
         );
         let oom = report
             .matched
@@ -3497,10 +3504,10 @@ mod tests {
     #[test]
     fn a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope() {
         // The other side of the has_match gate: a real, at-or-above-threshold
-        // vLLM OOM on WSL surfaces the diagnosis instead of the routing note.
-        let mut e = linux_base();
-        e.is_wsl = true;
-        let report = diagnose(&e, VLLM_OOM_CANONICAL_SYMPTOM);
+        // vLLM OOM on WSL is surfaced, and ranks top on a host whose own WSL GPU
+        // stack is healthy -- so the verdict is the OOM, not an incidental WSL
+        // finding.
+        let report = diagnose(&wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM);
         assert!(report.has_match());
         assert!(report.out_of_scope.is_none());
         assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
