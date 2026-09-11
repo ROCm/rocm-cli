@@ -199,7 +199,12 @@ Feature: Diagnosing failures and listing fixes
   # regression could move the explanation back to stdout, or off exit code 4,
   # while every other listed scenario kept passing. Linux-only because the
   # recipe itself is `applies_on: LINUX_ONLY`.
-  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux
+  #
+  # @requires-bare-metal on top of that, same reasoning as diagnose-08:
+  # `fix-4-render-group`'s `applies_on` does not include `wsl`, so on a WSL2
+  # host the CLI refuses it as the wrong platform before ever invoking the
+  # (faked) `usermod` — there is no command-failure branch to reach there.
+  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux @requires-bare-metal
   Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
     Given a user who has approved a fix whose helper command will fail
     When the user asks the CLI to apply the approved fix
@@ -213,7 +218,12 @@ Feature: Diagnosing failures and listing fixes
   # suite driven through the pseudo-terminal harness instead of piped stdin.
   # Linux-only for the same reason diagnose-08 is: the recipe under test
   # (`fix-9-igpu-dgpu`) only appends a shell rc file on Linux.
-  @id:diagnose-fix-interactive-decline-reported @requires-os:linux
+  #
+  # @requires-bare-metal for the same reason as diagnose-08: `fix-9-igpu-dgpu`
+  # does not apply on WSL2 (no per-device topology to collide over there), so
+  # the run stops at the wrong-platform refusal before the confirmation prompt
+  # is ever printed.
+  @id:diagnose-fix-interactive-decline-reported @requires-os:linux @requires-bare-metal
   Scenario: diagnose-16 - Declining the confirmation prompt on a real terminal is reported the same way
     Given a user who has chosen a fix that would change the machine
     When the user is asked interactively to apply it and types no
