@@ -183,11 +183,39 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the printed plan says which shell each step runs in
 
+  # diagnose-08/-11 cover the refusal branches (no agreement, wrong OS); this
+  # covers the third failure shape a fix can hit -- an approved, applicable fix
+  # whose underlying command itself fails (e.g. `usermod` exiting non-zero).
+  # Until now that branch of `fix-4-render-group` had no e2e coverage: a
+  # regression could move the explanation back to stdout, or off exit code 4,
+  # while every other listed scenario kept passing. Linux-only because the
+  # recipe itself is `applies_on: LINUX_ONLY`.
+  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux
+  Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
+    Given a user who has approved a fix whose helper command will fail
+    When the user asks the CLI to apply the approved fix
+    Then the CLI reports the command failure on stderr with exit code 4
+
+  # diagnose-08 proves the non-interactive refusal (piped stdin, `is_terminal()`
+  # false); this proves the sibling branch on a real terminal — the CLI must
+  # print the confirmation prompt, read the typed answer, and, on anything but
+  # y/yes, decline the same way. That branch has no piped-stdin equivalent: a
+  # real TTY is required to reach it at all, so this is the one scenario in the
+  # suite driven through the pseudo-terminal harness instead of piped stdin.
+  # Linux-only for the same reason diagnose-08 is: the recipe under test
+  # (`fix-9-igpu-dgpu`) only appends a shell rc file on Linux.
+  @id:diagnose-fix-interactive-decline-reported @requires-os:linux
+  Scenario: diagnose-16 - Declining the confirmation prompt on a real terminal is reported the same way
+    Given a user who has chosen a fix that would change the machine
+    When the user is asked interactively to apply it and types no
+    Then the CLI declines on the terminal and explains that it needs agreement
+    And the file the fix would have changed is untouched
+
   # vLLM runs on Linux and WSL, but not native Windows. This scenario is
   # GPU-independent: it supplies the captured startup error as symptom text and
   # proves the public diagnosis output preserves both branches of the remedy.
   @id:diagnose-vllm-oom-is-conditional @requires-os:linux
-  Scenario: diagnose-15 - A vLLM startup OOM receives conditional remediation
+  Scenario: diagnose-17 - A vLLM startup OOM receives conditional remediation
     Given a user whose vLLM server ran out of GPU memory
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the diagnosis identifies the vLLM startup OOM

@@ -413,6 +413,7 @@ fn parse_descriptor(name: &str) -> Descriptor {
         "" | "report" => ("Mock", "Linux"),
         "gpu" => ("MI300X", "Linux"),
         "gpu-rad3" => ("R9700", "Linux"),
+        "gpu-mi350p" => ("MI350P", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
         // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
@@ -1298,8 +1299,10 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
          forwarding — with no GPU, no model download, and no engine process, so it \
          runs on a GitHub-hosted runner. It **gates the PR**: it runs on every push, \
          and if it fails the PR's required check goes red and the PR cannot merge. \
-         **MI300X / Strix Halo** run on real self-hosted GPU hardware with real \
-         engines. They are **non-blocking**: they still run and are reported here, but \
+         **Every other platform** is a real self-hosted GPU host running real \
+         engines — the rows below are the list, so naming them here would only go \
+         stale as lanes are added. They are **non-blocking**: they still run and \
+         are reported here, but \
          a failure does NOT block the PR from merging (the hardware/runners are still \
          being proven out, so their results are informational rather than a merge \
          gate).\n\n\
@@ -1935,7 +1938,7 @@ fn legend() -> Markup {
                     "and gates the PR."
                 }
                 li {
-                    b { "MI300X / Strix Halo" }
+                    b { "Every other platform" }
                     " — real self-hosted GPU hardware; non-blocking while proven out."
                 }
                 li {
@@ -2219,6 +2222,7 @@ mod tests {
             ("e2e-report", "Mock", "Linux"),
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
+            ("e2e-gpu-mi350p-report", "MI350P", "Linux"),
             ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
             ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
             // Must not fall through to `fallback_descriptor`, which would render
