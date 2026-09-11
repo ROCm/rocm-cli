@@ -1,0 +1,81 @@
+name: WSL pool spike (throwaway)
+
+# Answers three unknowns before building a real e2e-wsl lane on the DevLab
+# Dispatch pool (see #377's e2e-wsl, which stays on its static runner because
+# the pool has no wsl-labeled runner):
+#
+#   1. WSL2 needs the "Virtual Machine Platform" + "Windows Subsystem for
+#      Linux" Windows features enabled, which normally needs a reboot to take
+#      effect. GitHub-hosted Windows runners only skip this because it is
+#      baked into their VM image at build time; whether the pool's image has
+#      it baked in too is unknown, and an ephemeral runner cannot survive a
+#      mid-job reboot.
+#   2. A self-hosted runner installed as a background service runs in Session
+#      0, where WSL / Microsoft Store app processes can fail to launch (see
+#      https://github.com/ubuntu/wsl-actions-example, which had to work
+#      around exactly this). Whether the pool's runner avoids Session 0 is
+#      also unknown.
+#   3. GPU passthrough (librocdxg.so, dxcore, /dev/dxg) depends on the AMD
+#      driver already installed on the host — independent of WSL itself, and
+#      not something this spike can fix if missing.
+#
+# workflow_dispatch only: never runs automatically, and this whole file is
+# throwaway once the above are answered (either build the real lane on its
+# findings, or delete this).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wsl-pool-spike:
+    name: WSL pool spike
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: WSL status before install
+        shell: powershell
+        run: |
+          Write-Host "--- wsl --status ---"
+          wsl --status 2>&1 | Out-String | Write-Host
+          Write-Host "--- wsl --list --verbose ---"
+          wsl --list --verbose 2>&1 | Out-String | Write-Host
+
+      # ubuntu/WSL's own action (main@3b7a6b2, 2026-09-11): installs the WSL
+      # Store app via winget, then installs+registers the named distro. Its
+      # own first step is continue-on-error, so a failed WSL install falls
+      # through to the distro-install step, which fails loudly with a real
+      # error — exactly the signal this spike wants.
+      - name: Install WSL + Ubuntu-24.04
+        id: wsl_install
+        continue-on-error: true
+        uses: ubuntu/WSL/.github/actions/wsl-install@3b7a6b2a43af18aa541eeee1669ac27656630097
+        with:
+          distro: Ubuntu-24.04
+
+      - name: WSL status after install
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "--- wsl --status ---"
+          wsl --status 2>&1 | Out-String | Write-Host
+          Write-Host "--- wsl --list --verbose ---"
+          wsl --list --verbose 2>&1 | Out-String | Write-Host
+
+      - name: GPU passthrough plumbing inside the distro
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "--- inside Ubuntu-24.04 ---"
+          wsl -d Ubuntu-24.04 -- bash -c "cat /proc/version; ls -la /dev/dxg 2>&1; ldconfig -p 2>&1 | grep -i rocdxg || echo 'librocdxg.so: not found'" 2>&1 | Out-String | Write-Host
+
+      - name: Summary
+        if: always()
+        shell: powershell
+        run: |
+          "## WSL pool spike" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "wsl-install step outcome: ${{ steps.wsl_install.outcome }}" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "See the job log for full wsl --status / GPU passthrough output." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
