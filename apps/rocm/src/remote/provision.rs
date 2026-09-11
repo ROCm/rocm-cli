@@ -118,6 +118,8 @@ fn push_matched_artifact(
     platform: &RemotePlatform,
     channel: &str,
 ) -> Result<String> {
+    use std::fmt::Write as _;
+
     let staging = tempdir_for_download()?;
     let asset = download_for(platform, channel, &staging)?;
 
@@ -152,8 +154,24 @@ fn push_matched_artifact(
         .push_file(&installer_path, &format!("{remote_dir}/install.sh"))
         .context("failed to copy the installer to the remote")?;
 
+    // An alternate signing key set in this machine's environment is an escape
+    // hatch for private mirrors (see install.sh's resolve_public_keys). Forward
+    // it to the remote's own install.sh, or the remote falls back to the pinned
+    // production keys and rejects an archive this machine already trusted —
+    // shortening the trust chain the comment above insists on not shortening.
+    let mut signing_env = String::new();
+    for var in [
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            let _ = write!(signing_env, "{var}={} ", super::shell_quote(&value));
+        }
+    }
+
     let outcome = transport.exec(&format!(
-        "ROCM_CLI_ARCHIVE={remote_dir}/{asset} sh {remote_dir}/install.sh {}",
+        "{signing_env}ROCM_CLI_ARCHIVE={} sh {remote_dir}/install.sh {}",
+        super::shell_quote(&format!("{remote_dir}/{asset}")),
         super::shell_quote(channel)
     ))?;
     if !outcome.success {

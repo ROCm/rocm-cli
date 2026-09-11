@@ -245,10 +245,26 @@ fn serve(request: &ServeRequest) -> Result<()> {
     let paths = AppPaths::discover()?;
     let peer_host = resolve_target(&request.target)?;
     let transport = SshTransport::new(&request.target, request.ssh_port)?;
+    serve_with_transport(&transport, &paths, &peer_host, request)
+}
 
+/// The body of [`serve`], taking its transport and paths rather than building
+/// them.
+///
+/// This is the seam that makes the credential handoff below testable end to
+/// end: a test can drive this with a [`transport::ScriptedTransport`] and an
+/// isolated [`AppPaths`], and see the same stdin write the real command path
+/// produces, instead of only checking [`remote_serve_command`] and
+/// [`Transport::exec_with_stdin`] in isolation with nothing pairing them.
+fn serve_with_transport(
+    transport: &dyn Transport,
+    paths: &AppPaths,
+    peer_host: &str,
+    request: &ServeRequest,
+) -> Result<()> {
     println!("Preparing {} ...", request.target);
     let remote_cli = bootstrap::ensure_ready_with(
-        &transport,
+        transport,
         &request.target,
         &request.channel,
         request.install_rocm,
@@ -258,9 +274,9 @@ fn serve(request: &ServeRequest) -> Result<()> {
     // unauthenticated and is then published is exposed for the window between
     // the two, and the whole point of publishing is that the window is visible
     // to every machine on the tailnet.
-    let session_id = RemoteSessionRecord::id_for(&peer_host, request.remote_port);
+    let session_id = RemoteSessionRecord::id_for(peer_host, request.remote_port);
     let api_key = rocm_core::generate_endpoint_api_key();
-    session::store_key(&paths, &session_id, &api_key).context(
+    session::store_key(paths, &session_id, &api_key).context(
         "refusing to publish a model endpoint whose API key could not be saved locally: \
          without it you would have no way to call the endpoint you are about to expose",
     )?;
@@ -276,7 +292,7 @@ fn serve(request: &ServeRequest) -> Result<()> {
             // while waiting — so the model's state is genuinely unknown from
             // here. Drop the key that now guards nothing, and say so rather
             // than leaving the user to assume nothing happened.
-            session::clear_key(&paths, &session_id);
+            session::clear_key(paths, &session_id);
             return Err(error.context(format!(
                 "lost contact with {} while starting the model, so it may or may not be \
                  running.\n\
@@ -286,7 +302,7 @@ fn serve(request: &ServeRequest) -> Result<()> {
         }
     };
     if !start.success {
-        session::clear_key(&paths, &session_id);
+        session::clear_key(paths, &session_id);
         bail!(
             "failed to start the model on {}: {}",
             request.target,
@@ -298,7 +314,7 @@ fn serve(request: &ServeRequest) -> Result<()> {
     // has to leave the machine in a state the user can find and act on, so each
     // one unwinds what has been done rather than returning and forgetting.
     let remote_service_id =
-        match discover_started_service(&transport, &remote_cli, request.remote_port) {
+        match discover_started_service(transport, &remote_cli, request.remote_port) {
             Ok(service_id) => service_id,
             Err(error) => {
                 // The key stays. The model is very likely running and it was
@@ -314,18 +330,18 @@ fn serve(request: &ServeRequest) -> Result<()> {
                     request.target,
                     request.remote_port,
                     request.target,
-                    session::key_path(&paths, &session_id).display()
+                    session::key_path(paths, &session_id).display()
                 )));
             }
         };
 
     println!("Publishing to the tailnet ...");
-    if let Err(error) = publish::publish(&transport, request.tailnet_port, request.remote_port) {
+    if let Err(error) = publish::publish(transport, request.tailnet_port, request.remote_port) {
         // The model is up but unreachable. Stop it rather than leaving a GPU
         // occupied by something nobody can call and nothing records.
         let leftovers = unwind_partial_serve(
-            &transport,
-            &paths,
+            transport,
+            paths,
             &session_id,
             &remote_cli,
             Some(&remote_service_id),
@@ -334,11 +350,11 @@ fn serve(request: &ServeRequest) -> Result<()> {
         return Err(describe_leftovers(error, &request.target, &leftovers));
     }
 
-    let base_url = base_url_for(&peer_host, request.tailnet_port);
+    let base_url = base_url_for(peer_host, request.tailnet_port);
     let record = RemoteSessionRecord {
         session_id: session_id.clone(),
         target: request.target.clone(),
-        peer_host,
+        peer_host: peer_host.to_owned(),
         ssh_port: request.ssh_port,
         model: request.model.clone(),
         remote_service_id: remote_service_id.clone(),
@@ -348,13 +364,13 @@ fn serve(request: &ServeRequest) -> Result<()> {
         base_url,
         created_at_unix_ms: RemoteSessionRecord::now(),
     };
-    if let Err(error) = record.write(&paths) {
+    if let Err(error) = record.write(paths) {
         // The endpoint is live and published at this point. Without a record
         // nothing on this machine knows it exists, so leaving it up would be
         // exactly the untracked exposure the whole design tries to avoid.
         let leftovers = unwind_partial_serve(
-            &transport,
-            &paths,
+            transport,
+            paths,
             &session_id,
             &remote_cli,
             Some(&remote_service_id),
@@ -368,7 +384,7 @@ fn serve(request: &ServeRequest) -> Result<()> {
     }
 
     println!();
-    println!("{}", render_started(&paths, &record, &api_key));
+    println!("{}", render_started(paths, &record, &api_key));
     Ok(())
 }
 
@@ -1410,17 +1426,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Everything a fully successful `serve` touches on the remote, in call
+    /// order: the readiness probe, the serve command itself, the service
+    /// registry lookup that follows it, and the publish that follows that.
+    fn full_serve_steps() -> Vec<ScriptedStep> {
+        let mut steps = ready_steps();
+        steps.push(ScriptedStep::ok("read -r", ""));
+        steps.push(ScriptedStep::ok(
+            "services list --json --all",
+            r#"[{"service_id":"svc-1","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+                "host":"127.0.0.1","port":11434,"endpoint_url":"http://127.0.0.1:11434/v1",
+                "mode":"managed","status":"ready","supervisor_pid":1,
+                "manifest_path":"/a","log_path":"/b","engine_state_path":"/c",
+                "created_at_unix_ms":1}]"#,
+        ));
+        // `publish` checks status once before writing and once after, to confirm
+        // the remote actually accepted the forward rather than trusting exit 0.
+        // Reporting it published both times keeps this fixture representing a
+        // machine with nothing else competing for the port.
+        steps.push(ScriptedStep::ok(
+            "tailscale serve status --json",
+            PUBLISHED_FIXTURE,
+        ));
+        steps.push(ScriptedStep::ok("tailscale serve --bg", ""));
+        steps
+    }
+
+    /// The readiness probe steps `bootstrap::ensure_ready_with` needs to find a
+    /// machine with an existing CLI, ROCm, and Tailscale already present — the
+    /// same fixture `bootstrap`'s own tests use for a ready machine.
+    fn ready_steps() -> Vec<ScriptedStep> {
+        vec![
+            ScriptedStep::ok("rocm --version", "rocm 1.2.3"),
+            ScriptedStep::ok("command -v rocminfo", ""),
+            ScriptedStep::ok("command -v tailscale", ""),
+            ScriptedStep::ok("uname -s", "Linux\nx86_64\n"),
+        ]
+    }
+
     #[test]
     fn serve_sends_the_key_over_stdin_when_it_starts_the_model() {
         // Guards the pairing: the command reads stdin, and the caller actually
         // supplies it. Either alone leaves the server without a credential.
-        let transport = ScriptedTransport::new(vec![ScriptedStep::ok("read -r", "")]);
-        transport
-            .exec_with_stdin(&remote_serve_command("rocm", &request()), Some("k"))
-            .expect("scripted");
-        assert!(matches!(
-            transport.calls().first(),
-            Some(TransportCall::Exec { stdin: Some(key), .. }) if key == "k"
-        ));
+        // Driving this through `serve_with_transport` rather than calling
+        // `exec_with_stdin` directly is the point: a regression that stops the
+        // real call site from passing the key (say, reverting to `None`) has to
+        // fail this test, not just a check that never sees production code.
+        let (root, paths) = temp_paths("serve-stdin");
+        let transport = ScriptedTransport::new(full_serve_steps());
+
+        serve_with_transport(
+            &transport,
+            &paths,
+            "gpu-box.example-tailnet.ts.net",
+            &request(),
+        )
+        .expect("scripted serve");
+
+        let sent_key = transport.calls().iter().find_map(|call| match call {
+            TransportCall::Exec {
+                command,
+                stdin: Some(key),
+            } if command.contains("read -r ROCM_SERVE_API_KEY") => Some(key.clone()),
+            _ => None,
+        });
+        assert!(
+            sent_key.is_some_and(|key| !key.is_empty()),
+            "the model-starting command must receive the key over stdin: {:?}",
+            transport.calls()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

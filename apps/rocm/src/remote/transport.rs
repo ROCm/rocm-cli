@@ -21,12 +21,6 @@
 //! the data path never runs through the control channel and no local process
 //! outlives the command.
 
-// The control channel lands before its first caller: discovery talks only to the
-// local Tailscale daemon, so nothing reaches a remote until `rocm remote serve`
-// exists. Until then only the tests below exercise this. Remove this attribute
-// in the change that adds the serve path.
-#![cfg_attr(not(test), allow(dead_code))]
-
 #[cfg(test)]
 use std::cell::RefCell;
 use std::io::Write as _;

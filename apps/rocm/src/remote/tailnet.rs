@@ -245,11 +245,6 @@ fn parse_status(json: &str) -> Result<(String, TailnetStatus)> {
 /// decide whether that is fatal. An ambiguous name *is* an error: silently
 /// picking one of several GPU boxes is the kind of guess that gets a model
 /// served on someone else's machine.
-// Resolution has no caller until a command takes a single target — `serve` and
-// `doctor` are the first. It ships with discovery because it is the same
-// question ("which machine did you mean") and shares the peer list. Remove this
-// attribute in the change that adds the serve path.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_peer<'a>(
     status: &'a TailnetStatus,
     needle: &str,
