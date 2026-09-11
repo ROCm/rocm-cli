@@ -123,3 +123,10 @@ Feature: Interactive dashboard
     Then the launcher shows the model serving
     When the user quits the launcher
     Then the launcher exits successfully
+
+  @id:dash-rocm-29846-wsl-gpu-telemetry @requires-wsl @requires-gpu
+  Scenario: dash-11 - Dashboard displays GPU telemetry through the WSL amd-smi backend
+    When the user opens the dashboard
+    Then the dashboard reports live WSL GPU telemetry
+    When the user quits the dashboard
+    Then the dashboard exits successfully

@@ -66,9 +66,9 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
-        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
-        amd_smi_skip_kfd_preflight: false,
+        amd_smi_skip_device_preflight: false,
     }
 }
 
