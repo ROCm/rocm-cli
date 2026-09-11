@@ -2591,7 +2591,7 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 ///
 /// Search the conventional locations, and report "could not ask" as `None`
 /// rather than as an empty answer.
-fn ldconfig_cache() -> Option<String> {
+pub(crate) fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Some(text) = capture_optional_command(program, &["-p"]) {
             return Some(text);
@@ -4108,7 +4108,9 @@ fn push_existing_runtime_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     paths.push(path);
 }
 
-fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkProbeCandidate> {
+pub(crate) fn managed_therock_sdk_probe_candidates(
+    registry_dir: &Path,
+) -> Vec<TheRockSdkProbeCandidate> {
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
     };
@@ -4165,20 +4167,11 @@ fn managed_sdk_tool_path(bin_path: &Path, tool: &str) -> Option<PathBuf> {
 
 fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<OsString> {
     let mut paths = Vec::new();
-    collect_sdk_library_paths(&candidate.root_path, &mut paths);
-    if let Some(site_packages) = candidate.site_packages.as_deref()
-        && let Ok(entries) = fs::read_dir(site_packages)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if name.starts_with("_rocm_sdk_") {
-                collect_sdk_library_paths(&path, &mut paths);
-            }
-        }
-    }
+    collect_managed_runtime_library_paths(
+        &candidate.root_path,
+        candidate.site_packages.as_deref(),
+        &mut paths,
+    );
     let wsl_lib = PathBuf::from("/usr/lib/wsl/lib");
     if wsl_lib.is_dir() {
         paths.push(wsl_lib);
@@ -4195,7 +4188,68 @@ fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<O
     }
 }
 
-fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+/// Every library directory a managed runtime keeps, given its root and the
+/// `site-packages` its SDK recorded.
+///
+/// One description of the layout, deliberately. A wheel-format runtime does not
+/// keep its ROCm libraries under the root: they sit in a sibling `_rocm_sdk_*`
+/// package inside `site-packages`, and a caller that walks the root alone sees
+/// an empty runtime rather than a populated one. That is not a difference a
+/// caller should have to remember, so it lives here and every search shares it.
+pub(crate) fn collect_managed_runtime_library_paths(
+    root: &Path,
+    site_packages: Option<&Path>,
+    paths: &mut Vec<PathBuf>,
+) {
+    collect_sdk_library_paths(root, paths);
+    match site_packages {
+        Some(recorded) => collect_sdk_package_library_paths(recorded, paths),
+        // No record to read. A read-only probe cannot depend on one being
+        // present and current, and a host whose registry is missing or stale is
+        // exactly the kind this is called on: reporting nothing there would read
+        // as a machine with nothing wrong rather than one we failed to inspect.
+        //
+        // `root` is never a venv root to search downward from -- it is one of
+        // the runtime's own `_rocm_sdk_*` package directories (the probe
+        // script's `_devel.get_devel_root()` result, or the first package root
+        // it found when there is no `devel` extra). Its sibling packages sit
+        // beside it, under its *parent*, which is the site-packages directory
+        // every one of them shares. A `root/lib/<python>/site-packages` guess
+        // never exists under a package directory, so it always found nothing;
+        // `root.parent()` is the one guess this shape actually supports.
+        None => {
+            if root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("_rocm_sdk_"))
+                && let Some(parent) = root.parent()
+            {
+                collect_sdk_package_library_paths(parent, paths);
+            }
+        }
+    }
+}
+
+/// Library directories of the `_rocm_sdk_*` packages inside `site_packages`.
+///
+/// They belong to the runtime that contains them, not to themselves.
+fn collect_sdk_package_library_paths(site_packages: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(site_packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("_rocm_sdk_"))
+        {
+            collect_sdk_library_paths(&path, paths);
+        }
+    }
+}
+
+pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
     for path in [
         root.join("bin"),
         root.join("lib"),
@@ -4285,10 +4339,10 @@ struct TheRockSdkProbeManifest {
 }
 
 #[derive(Debug, Clone)]
-struct TheRockSdkProbeCandidate {
+pub(crate) struct TheRockSdkProbeCandidate {
     installed_at_unix_ms: u128,
-    site_packages: Option<PathBuf>,
-    root_path: PathBuf,
+    pub(crate) site_packages: Option<PathBuf>,
+    pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
 }
 

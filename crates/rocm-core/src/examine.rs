@@ -155,6 +155,27 @@ pub struct WslFacts {
     pub locally_probed: bool,
 }
 
+/// One copy of the AMD code object manager library found on the machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComgrCopy {
+    /// The path as found, before symlinks are resolved -- this is the name the
+    /// loader would use, and the one a user will recognise.
+    pub path: String,
+    /// The file the path resolves to. Two entries naming one file through a
+    /// symlink are collapsed on this, so a versioned library and its unversioned
+    /// alias are not reported as two copies.
+    pub real_path: String,
+    /// Version read from the resolved file name, empty when it carries none.
+    ///
+    /// Empty is an honest answer. The version is read from the name rather than
+    /// by loading the library, so a renamed file yields nothing -- which is
+    /// better than a confident wrong answer.
+    pub version: String,
+    /// Where the search found it: `active-runtime`, `ld-library-path`,
+    /// `loader-cache`, `rocm-install`, or `managed-runtime`.
+    pub source: String,
+}
+
 /// Structured machine state consumed by the diagnosis catalog.
 ///
 /// Field order and names mirror `examine.py`'s `Examination` dataclass so the
@@ -205,6 +226,38 @@ pub struct Examination {
     pub rocminfo_status: String,
     pub hip_libs_on_ld_path: Option<bool>,
     pub rocm_repos_seen: Vec<String>,
+
+    // Code object manager (Linux). HIP compiles device code at run time through
+    // `libamd_comgr`, and a machine can hold more than one copy -- a system ROCm
+    // install and a ROCm Python wheel each ship one. Holding two is not a fault;
+    // every managed environment this CLI creates holds one, and there the wheel
+    // copy is the right copy to load. What matters is which copy the loader
+    // picks, and that was invisible: nothing looked past the first match.
+    // `serde(default)` on all four, because this structure is read back from
+    // *another machine*: `rocm remote doctor` deserializes an examination the
+    // remote's own CLI produced, and that CLI may predate these fields. Without
+    // a default, adding a field here refuses every remote running an older
+    // build -- reported to the user as "the remote CLI is probably a different
+    // version", which is true and useless, since the older CLI is the one that
+    // cannot be changed.
+    /// Every copy found, in loader search order. The first is the one that would
+    /// load.
+    #[serde(default)]
+    pub comgr_paths: Vec<ComgrCopy>,
+    /// The copy the loader would pick. `None` when none were found.
+    #[serde(default)]
+    pub comgr_selected: Option<ComgrCopy>,
+    /// Version of the selected copy; empty when it cannot be read from the name.
+    #[serde(default)]
+    pub comgr_version: String,
+    /// Whether the selected copy belongs to the installation owning the active
+    /// HIP runtime.
+    ///
+    /// Always `None` today. The field is carried unset so that computing it does
+    /// not become a second change to the wire contract, and so a consumer can
+    /// tell "not yet answered" from "answered no".
+    #[serde(default)]
+    pub comgr_matches_runtime: Option<bool>,
 
     // HIP SDK install (Windows)
     pub hip_sdk_path: String,
@@ -303,6 +356,10 @@ impl Default for Examination {
             rocminfo_status: String::new(),
             hip_libs_on_ld_path: None,
             rocm_repos_seen: Vec::new(),
+            comgr_paths: Vec::new(),
+            comgr_selected: None,
+            comgr_version: String::new(),
+            comgr_matches_runtime: None,
             hip_sdk_path: String::new(),
             hip_sdk_version: String::new(),
             hipinfo_present: false,
@@ -389,6 +446,10 @@ impl Examination {
             // WSL2 ships the same 64 MB default a container does, so this is one
             // of the platforms where the shortage is most likely to be real.
             probe_shared_memory(&mut e);
+            // A wheel copy and a system copy collide on WSL2 exactly as they do
+            // on bare metal, so skipping the search here would leave a WSL user
+            // unable to see a conflict that is really there.
+            probe_comgr(&mut e, interpreter);
             e.status = e.compute_status();
             return e;
         }
@@ -403,6 +464,9 @@ impl Examination {
             probe_secure_boot(&mut e);
             probe_rocm_install(&mut e);
             probe_env(&mut e);
+            // After both: the search consults `LD_LIBRARY_PATH` (read by
+            // `probe_env`) and the resolved ROCm install (`probe_rocm_install`).
+            probe_comgr(&mut e, interpreter);
             probe_container(&mut e);
             probe_shared_memory(&mut e);
             probe_dmesg_amdgpu(&mut e);
@@ -2074,27 +2138,7 @@ fn probe_env(e: &mut Examination) {
         e.env.insert((*key).to_owned(), value);
     }
     let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let mut hit: Option<String> = None;
-    for dir in ld.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("libamdhip64")
-                {
-                    hit = Some(entry.path().to_string_lossy().into_owned());
-                    break;
-                }
-            }
-        }
-        if hit.is_some() {
-            break;
-        }
-    }
+    let hit = libraries_on_ld_path(&ld, "libamdhip64").into_iter().next();
     if let Some(hit) = hit {
         e.hip_libs_on_ld_path = Some(true);
         e.notes
@@ -2102,6 +2146,339 @@ fn probe_env(e: &mut Examination) {
     } else {
         e.hip_libs_on_ld_path = if ld.is_empty() { None } else { Some(false) };
     }
+}
+
+/// Every file in `ld` whose name starts with `prefix`, in search order.
+///
+/// One walker, two callers. The HIP probe wants only the first hit; the code
+/// object manager scan wants all of them, because stopping at the first is
+/// exactly what made a second copy invisible. Written once so the two searches
+/// cannot come to disagree about what "on the library path" means.
+///
+/// `LD_LIBRARY_PATH` is a Linux concept and so is its `:` separator — a Windows
+/// path contains a colon, so splitting one here would destroy it. That costs
+/// nothing in practice: the variable is not what the Windows loader reads, the
+/// code object manager scan runs only on Linux, and on Windows the HIP caller
+/// sees an unset variable and finds nothing, exactly as it did before. It does
+/// mean the tests for this are Unix-only, and they say so.
+fn libraries_on_ld_path(ld: &str, prefix: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for dir in ld.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        collect_libraries_in_dir(std::path::Path::new(dir), prefix, &mut found);
+    }
+    found
+}
+
+/// Append every file in `dir` whose name starts with `prefix`, sorted so the
+/// result does not depend on directory iteration order.
+///
+/// An unreadable directory contributes nothing and is not an error: the library
+/// path routinely names directories that do not exist, and a probe that failed
+/// on one would report nothing about the machine it was asked to describe.
+fn collect_libraries_in_dir(dir: &std::path::Path, prefix: &str, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut matches: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .collect();
+    // Sorted, which does change the HIP probe's tie-break when one directory
+    // holds more than one matching file: it used to take whatever `read_dir`
+    // happened to yield first. Deterministic is the better answer for a report
+    // two people compare, but it is a change, not a no-op.
+    matches.sort();
+    found.append(&mut matches);
+}
+
+/// The library HIP uses to compile device code at run time.
+const COMGR_LIB_PREFIX: &str = "libamd_comgr";
+
+/// Find every copy of the code object manager library, in loader search order.
+///
+/// The first entry is the copy that would load. Every other entry is the part
+/// that was invisible before: a machine can hold a system copy and a wheel copy,
+/// and when the one that loads does not belong to the active runtime, device
+/// code compilation fails with an error naming neither.
+///
+/// `interpreter`'s `library_paths` -- the active managed runtime's own library
+/// directories, when there is one -- are checked **first**, ahead of this
+/// process's own `LD_LIBRARY_PATH`. That is not this process's search order; it
+/// is a served child's. `rocm serve`/`rocm chat` prepend exactly those
+/// directories onto `LD_LIBRARY_PATH` before launching the engine (see
+/// `lemonade_process_environment_vars` and its vLLM counterpart), so they win
+/// over whatever this process's own environment or the system loader cache
+/// would otherwise resolve to. Reporting the plain-environment answer instead
+/// would name the system's copy as "the one that would load" on a machine
+/// where every process the CLI actually launches loads the wheel's.
+///
+/// **This emulates the loader; it is not the loader.** It does not account for
+/// `RUNPATH`/`RPATH` on the calling binary, `ld.so.preload`, or a container that
+/// remaps paths at run time. The selected copy is the one that *would* load on
+/// the evidence available, and the list of copies is that evidence -- not a
+/// guarantee. Reporting the search honestly is worth more here than a confident
+/// answer that cannot be justified.
+fn probe_comgr(e: &mut Examination, interpreter: Option<&FrameworkInterpreter>) {
+    let active_runtime_dirs: Vec<PathBuf> = interpreter
+        .map(|interpreter| interpreter.library_paths.clone())
+        .unwrap_or_default();
+    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let loader_cache_paths = comgr_paths_in_loader_cache();
+    let search_dirs = comgr_search_dirs(e);
+
+    let (copies, note) =
+        find_comgr_copies(&active_runtime_dirs, &ld, &loader_cache_paths, &search_dirs);
+    if let Some(first) = copies.first() {
+        e.comgr_version.clone_from(&first.version);
+        e.comgr_selected = Some(first.clone());
+    }
+    if let Some(note) = note {
+        e.notes.push(note);
+    }
+    e.comgr_paths = copies;
+}
+
+/// Pure core of [`probe_comgr`]: given each source's evidence already gathered,
+/// find every copy in loader search order and say which one would load, plus
+/// the note (if any) `probe_comgr` should push.
+///
+/// Split out so the ordering -- the reason this entry exists -- can be pinned
+/// with directories built in a test's own temp folder, instead of needing a
+/// real `ldconfig`, a real `/opt`, or a real managed runtime to exercise.
+fn find_comgr_copies(
+    active_runtime_dirs: &[PathBuf],
+    ld_library_path: &str,
+    loader_cache_paths: &[String],
+    search_dirs: &[(PathBuf, &'static str)],
+) -> (Vec<ComgrCopy>, Option<String>) {
+    let mut copies: Vec<ComgrCopy> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Order is the whole point: this is the order a served child's loader
+    // would consult, so the first copy recorded is the one that wins.
+    for dir in active_runtime_dirs {
+        let mut hits = Vec::new();
+        collect_libraries_in_dir(dir, COMGR_LIB_PREFIX, &mut hits);
+        for path in hits {
+            record_comgr_copy(&mut copies, &mut seen, &path, "active-runtime");
+        }
+    }
+    for path in libraries_on_ld_path(ld_library_path, COMGR_LIB_PREFIX) {
+        record_comgr_copy(&mut copies, &mut seen, &path, "ld-library-path");
+    }
+    for path in loader_cache_paths {
+        record_comgr_copy(&mut copies, &mut seen, path, "loader-cache");
+    }
+    for (dir, source) in search_dirs {
+        let mut hits = Vec::new();
+        collect_libraries_in_dir(dir, COMGR_LIB_PREFIX, &mut hits);
+        for path in hits {
+            record_comgr_copy(&mut copies, &mut seen, &path, source);
+        }
+    }
+
+    let note = if let Some(first) = copies.first() {
+        (copies.len() > 1).then(|| {
+            format!(
+                "{} copies of {COMGR_LIB_PREFIX} found; {} would load",
+                copies.len(),
+                first.path
+            )
+        })
+    } else {
+        Some(format!(
+            "no {COMGR_LIB_PREFIX} found on the library path, in the loader cache, or in any known ROCm install"
+        ))
+    };
+    (copies, note)
+}
+
+/// Record `path` unless an earlier entry already resolved to the same file.
+///
+/// Deduplicated on the resolved path, not the given one: ROCm ships a versioned
+/// library and an unversioned symlink beside it, and reporting those as two
+/// copies would invent a conflict on a perfectly ordinary install.
+fn record_comgr_copy(
+    copies: &mut Vec<ComgrCopy>,
+    seen: &mut std::collections::BTreeSet<String>,
+    path: &str,
+    source: &str,
+) {
+    // A path that cannot be resolved is kept as given rather than dropped: a
+    // dangling symlink is still something the loader would try, and reporting
+    // it is more use than pretending the machine does not hold it.
+    let real_path = std::fs::canonicalize(path).map_or_else(
+        |_| path.to_owned(),
+        |resolved| resolved.to_string_lossy().into_owned(),
+    );
+    if !seen.insert(real_path.clone()) {
+        return;
+    }
+    copies.push(ComgrCopy {
+        version: comgr_version_from_file_name(&real_path),
+        path: path.to_owned(),
+        real_path,
+        source: source.to_owned(),
+    });
+}
+
+/// Read the version out of a resolved library file name.
+///
+/// `libamd_comgr.so.2.8.0` carries its version in the soname, which is where
+/// this reads it from. Deliberately not by loading the library and asking it:
+/// `dlopen` runs the library's initialisers, and running code out of an
+/// unknown library is not something a diagnostic tool should do on a machine it
+/// has been called to because something is already wrong. A renamed file yields
+/// an empty version, which is the honest answer.
+fn comgr_version_from_file_name(real_path: &str) -> String {
+    let name = std::path::Path::new(real_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some((_, version)) = name.split_once(".so.") else {
+        return String::new();
+    };
+    // Digits and dots only: `libamd_comgr.so.2.8.0` yields a version, while a
+    // file that merely happens to carry `.so.` in a longer name does not get a
+    // nonsense one read out of it.
+    if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        version.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Paths the loader cache knows for the library.
+///
+/// `ldconfig -p` prints `libamd_comgr.so.2 (libc6,x86-64) => /opt/rocm/lib/...`.
+/// Its absence, or a nonzero exit, contributes nothing rather than failing the
+/// probe: plenty of hosts have no `ldconfig` on the path, and a machine with no
+/// loader cache is still a machine worth describing.
+fn comgr_paths_in_loader_cache() -> Vec<String> {
+    // `which("ldconfig")` used to gate this, but `ldconfig` lives in `/sbin`,
+    // off a non-root user's `PATH` on Debian and derivatives — `which` alone
+    // would silently read a working install as having no loader-cache entry.
+    // `crate::ldconfig_cache` already searches the conventional locations for
+    // exactly this reason; reuse it instead of re-introducing the bug it was
+    // written to fix.
+    let Some(out) = crate::ldconfig_cache() else {
+        return Vec::new();
+    };
+    parse_ldconfig_cache_paths(&out, COMGR_LIB_PREFIX)
+}
+
+/// Parse `ldconfig -p`'s own output for every path it lists against `prefix`.
+///
+/// Split out of [`comgr_paths_in_loader_cache`] so the line format -- a fixed
+/// property of `ldconfig`, not of this host -- can be pinned against literal
+/// text instead of a real `ldconfig` binary, which not every machine running
+/// this test has on `PATH`.
+fn parse_ldconfig_cache_paths(cache_text: &str, prefix: &str) -> Vec<String> {
+    cache_text
+        .lines()
+        .filter(|line| line.contains(prefix))
+        .filter_map(|line| line.split_once("=> "))
+        .map(|(_, path)| path.trim().to_owned())
+        .collect()
+}
+
+/// Sibling ROCm installs under `/opt`, sorted for a deterministic search order.
+///
+/// A versioned install left behind by an upgrade is one of the two copies
+/// `probe_comgr` exists to find. Takes the directory to scan as a parameter
+/// -- always `/opt` in production -- so a test can point it at a temp folder
+/// instead of depending on what happens to live under the real `/opt` on the
+/// machine running the suite.
+fn rocm_install_siblings(opt_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(opt_dir) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("rocm"))
+        })
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Directories to search after the library path and the loader cache, each
+/// paired with the source label it is recorded under.
+fn comgr_search_dirs(e: &Examination) -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut dirs: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
+    let mut add = |dir: std::path::PathBuf, source: &'static str| {
+        if dir.is_dir() {
+            dirs.push((dir, source));
+        }
+    };
+
+    if !e.rocm_path.is_empty() {
+        let root = std::path::PathBuf::from(&e.rocm_path);
+        add(root.join("lib"), "rocm-install");
+        add(root.join("lib64"), "rocm-install");
+    }
+    for root in rocm_install_siblings(std::path::Path::new("/opt")) {
+        add(root.join("lib"), "rocm-install");
+        add(root.join("lib64"), "rocm-install");
+    }
+    // The copy this CLI installs itself. Reusing the layout the SDK probe
+    // already knows rather than restating it: a second description of where a
+    // managed runtime keeps its libraries is a second thing to keep correct.
+    for path in managed_comgr_dirs(&managed_runtime_roots()) {
+        add(path, "managed-runtime");
+    }
+    dirs
+}
+
+/// Library directories of every managed runtime, given each runtime's root and
+/// the `site-packages` its SDK recorded.
+///
+/// Shares `collect_managed_runtime_library_paths` with the loader path the CLI
+/// sets for processes it starts, so the search looks exactly where a managed
+/// runtime's libraries are actually loaded from.
+fn managed_comgr_dirs(
+    runtimes: &[(std::path::PathBuf, Option<std::path::PathBuf>)],
+) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for (root, site_packages) in runtimes {
+        crate::collect_managed_runtime_library_paths(root, site_packages.as_deref(), &mut paths);
+    }
+    paths
+}
+
+/// Every managed runtime, as `(root, site-packages)`.
+///
+/// Read from the runtime registry rather than by listing `<data>/runtimes` on
+/// disk. A directory listing yields a root and nothing else, and the root alone
+/// does not locate a wheel runtime's libraries -- only the SDK record knows
+/// which `site-packages` its interpreter uses. Listing the directory is also a
+/// second answer to "which runtimes exist", and the registry is the first one.
+///
+/// Resolved through [`crate::AppPaths::discover`], not
+/// `crate::runtime::default_data_dir` directly: the latter only knows
+/// `$HOME/.rocm` and the OS default, so it disagrees with the rest of the CLI
+/// -- and finds nothing at all -- on any host where `ROCM_CLI_DATA_DIR`
+/// relocates the data directory, which is exactly what every GPU e2e scenario
+/// does for isolation.
+fn managed_runtime_roots() -> Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    let Ok(paths) = crate::AppPaths::discover() else {
+        return Vec::new();
+    };
+    let registry = paths.data_dir.join("runtimes").join("registry");
+    let mut runtimes: Vec<(std::path::PathBuf, Option<std::path::PathBuf>)> =
+        crate::managed_therock_sdk_probe_candidates(&registry)
+            .into_iter()
+            .map(|candidate| (candidate.root_path, candidate.site_packages))
+            .collect();
+    runtimes.sort();
+    runtimes
 }
 
 /// Truncate `value` to at most `max_chars` characters, appending a marker when
@@ -2748,6 +3125,142 @@ mod tests {
         assert_eq!(distro_clears_wsl_floor("UBUNTU", "24.04"), Some(true));
     }
 
+    /// A scratch directory unique to the calling test, cleaned up by the caller.
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-comgr-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn plant(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"").expect("plant library");
+        path
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn the_library_path_is_searched_left_to_right_and_every_copy_is_kept() {
+        // The defect this whole entry exists for: the old scan stopped at the
+        // first hit, so a second copy could never be reported. Order matters as
+        // much as completeness -- the first entry is the claim about which copy
+        // wins.
+        let root = scratch_dir("order");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("create dir");
+        std::fs::create_dir_all(&second).expect("create dir");
+        plant(&first, "libamd_comgr.so.2.8.0");
+        plant(&second, "libamd_comgr.so.3.0.0");
+
+        let ld = format!("{}:{}", first.display(), second.display());
+        let found = libraries_on_ld_path(&ld, COMGR_LIB_PREFIX);
+
+        assert_eq!(found.len(), 2, "both copies must be reported: {found:?}");
+        assert!(
+            found[0].starts_with(first.to_string_lossy().as_ref()),
+            "the earlier library-path entry has to come first: {found:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_library_path_entry_is_skipped_rather_than_failing_the_probe() {
+        // `LD_LIBRARY_PATH` routinely names directories that do not exist. A
+        // probe that gave up on one would report nothing about the machine it
+        // was asked to describe.
+        let root = scratch_dir("missing");
+        plant(&root, "libamd_comgr.so.2.8.0");
+        let ld = format!("/nonexistent-{}:{}", std::process::id(), root.display());
+
+        let found = libraries_on_ld_path(&ld, COMGR_LIB_PREFIX);
+
+        assert_eq!(found.len(), 1, "the readable entry still counts: {found:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn a_versioned_library_and_its_symlink_count_as_one_copy() {
+        // ROCm ships `libamd_comgr.so.2` beside `libamd_comgr.so.2.8.0`, one a
+        // symlink to the other. Counting those as two copies would invent a
+        // conflict on an ordinary install -- the false report that matters most
+        // to avoid, since it would fire on healthy machines.
+        let root = scratch_dir("symlink");
+        let real = plant(&root, "libamd_comgr.so.2.8.0");
+        let link = root.join("libamd_comgr.so.2");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let mut copies = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        record_comgr_copy(&mut copies, &mut seen, &link.to_string_lossy(), "test");
+        record_comgr_copy(&mut copies, &mut seen, &real.to_string_lossy(), "test");
+
+        assert_eq!(
+            copies.len(),
+            1,
+            "one file reached by two names is one copy: {copies:?}"
+        );
+        assert_eq!(
+            copies[0].version, "2.8.0",
+            "the version comes from the resolved file, not the name used to reach it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_distinct_files_are_two_copies() {
+        // The converse of the symlink case, so that test cannot be satisfied by
+        // a probe that simply never reports more than one.
+        let root = scratch_dir("distinct");
+        let a = plant(&root, "libamd_comgr.so.2.8.0");
+        let b = plant(&root, "libamd_comgr.so.3.0.0");
+
+        let mut copies = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        record_comgr_copy(&mut copies, &mut seen, &a.to_string_lossy(), "test");
+        record_comgr_copy(&mut copies, &mut seen, &b.to_string_lossy(), "test");
+
+        assert_eq!(copies.len(), 2, "two files are two copies: {copies:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_version_is_read_only_when_the_name_actually_carries_one() {
+        for (name, expected) in [
+            ("libamd_comgr.so.2.8.0", "2.8.0"),
+            ("libamd_comgr.so.2", "2"),
+            // No version to read. Empty is the honest answer; the alternative
+            // is a confident wrong one, and the version is only ever report
+            // text.
+            ("libamd_comgr.so", ""),
+            ("libamd_comgr-renamed.so.beta", ""),
+        ] {
+            assert_eq!(
+                comgr_version_from_file_name(&format!("/x/{name}")),
+                expected,
+                "{name} read wrong"
+            );
+        }
+    }
+
     #[test]
     fn examination_serializes_expected_keys() {
         let e = Examination::default();
@@ -2823,6 +3336,14 @@ mod tests {
             "rocminfo_status",
             "hip_libs_on_ld_path",
             "rocm_repos_seen",
+            // CLI additions beyond examine.py, added deliberately: which copies
+            // of the code object manager library the machine holds, and which
+            // one would load. examine.py never looked, which is why a second
+            // copy shadowing the first was invisible.
+            "comgr_paths",
+            "comgr_selected",
+            "comgr_version",
+            "comgr_matches_runtime",
             "hip_sdk_path",
             "hip_sdk_version",
             "hipinfo_present",
@@ -2918,6 +3439,316 @@ mod tests {
     /// a change to the probe's contract lands in one place.
     #[cfg(unix)]
     const RUNTIME_TORCH_OK_JSON: &str = r#"{"ok":true,"version":"2.11.0+rocm7.14.1","hip":"7.14.60850","cuda":null,"is_available":true,"device_count":1,"arch_list":["gfx942"]}"#;
+
+    /// A wheel-format managed runtime, laid out the way the CLI installs one.
+    ///
+    /// `root` is one of the runtime's own `_rocm_sdk_*` package directories --
+    /// `_rocm_sdk_devel`, matching what the probe script's
+    /// `_devel.get_devel_root()` records as `root_path` when the `devel` extra
+    /// is installed -- never a venv root above `site_packages`. The ROCm
+    /// libraries do not sit under it either: they sit in the sibling
+    /// `_rocm_sdk_core` package, beside `root`, both directly under
+    /// `site_packages`. A fixture built as `root/lib/<python>/site-packages`
+    /// (a venv layout the installer never produces) would pass against a shape
+    /// production cannot create -- this one matches `apps/rocm/src/therock.rs`'s
+    /// `ROCM_SDK_PROBE_SCRIPT` instead.
+    #[cfg(target_os = "linux")]
+    fn wheel_runtime_on_disk(tag: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!(
+            "rocm-comgr-wheel-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let site_packages = base.join("site-packages");
+        let root = site_packages.join("_rocm_sdk_devel");
+        let sdk_lib = site_packages.join("_rocm_sdk_core").join("lib");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sdk_lib).unwrap();
+        fs::write(sdk_lib.join("libamd_comgr.so.3"), b"fake").unwrap();
+        (root, Some(site_packages))
+    }
+
+    /// The managed copy this CLI installs itself is reachable by the search.
+    ///
+    /// That copy is the whole reason this entry exists: the CLI puts ROCm
+    /// wheels into a managed environment, so a user who follows that path on a
+    /// host already carrying a system install ends up holding both, having done
+    /// nothing unusual. A search that cannot see the copy we put there reports
+    /// a conflict-free machine no matter what else is true of it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_managed_copy_this_cli_installs_is_reachable() {
+        let (root, site_packages) = wheel_runtime_on_disk("found");
+        let dirs = managed_comgr_dirs(&[(root.clone(), site_packages.clone())]);
+
+        let expected = site_packages
+            .expect("fixture always records site_packages")
+            .join("_rocm_sdk_core")
+            .join("lib");
+        assert!(
+            dirs.contains(&expected),
+            "the search missed the copy the CLI installs, which is the case this entry exists \
+             for. Looked in: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().and_then(|p| p.parent()).unwrap());
+    }
+
+    /// A wheel runtime the registry has no record for is still found.
+    ///
+    /// The recorded `site-packages` is the better answer and is preferred, but a
+    /// read-only probe cannot depend on a record being present and current. A
+    /// host whose registry is missing or stale is exactly the kind this command
+    /// is called on, and reporting no copies there would read as a machine with
+    /// nothing wrong rather than a machine we failed to inspect. With no record,
+    /// `root`'s own `_rocm_sdk_` prefix is the only thing that tells the search
+    /// its parent is a site-packages directory worth scanning for siblings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wheel_runtime_with_no_registry_record_is_still_found() {
+        let (root, recorded) = wheel_runtime_on_disk("norecord");
+        let expected = recorded.clone().unwrap().join("_rocm_sdk_core").join("lib");
+
+        // Non-vacuity: the same runtime, with its record, resolves to the same
+        // directory. Without this the assertion below could pass because the
+        // fallback found something else entirely.
+        assert!(
+            managed_comgr_dirs(&[(root.clone(), recorded)]).contains(&expected),
+            "the recorded path must resolve first, or this test is not comparing like with like"
+        );
+
+        let found = managed_comgr_dirs(&[(root.clone(), None)]);
+        assert!(
+            found.contains(&expected),
+            "with no record to read, the sibling package beside root's own `_rocm_sdk_` \
+             directory has to carry it: {found:?}"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().and_then(|p| p.parent()).unwrap());
+    }
+
+    /// A runtime whose SDK recorded no `site-packages` still contributes what
+    /// can be read from its root.
+    ///
+    /// Paired with the test above so "finds the wheel copy" cannot be satisfied
+    /// by a search that simply returns every directory it is handed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_with_no_recorded_site_packages_still_contributes_its_root() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!(
+            "rocm-comgr-rootonly-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("lib")).unwrap();
+
+        let dirs = managed_comgr_dirs(&[(root.clone(), None)]);
+        assert!(
+            dirs.contains(&root.join("lib")),
+            "a root-format runtime keeps its libraries under the root, and that has to keep \
+             working: {dirs:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A directory holding a `libamd_comgr` file, for [`find_comgr_copies`]
+    /// tests below. Each call gets its own temp directory so the tests can run
+    /// concurrently without seeing each other's files.
+    fn comgr_copy_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-comgr-copy-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("libamd_comgr.so.2"), b"fake").unwrap();
+        dir
+    }
+
+    /// The active managed runtime's own directory wins selection even when a
+    /// copy also sits on the plain `LD_LIBRARY_PATH` and in the loader cache.
+    ///
+    /// This is the fix for the case `probe_comgr`'s own doc comment describes:
+    /// `rocm serve`/`rocm chat` prepend the active runtime's library
+    /// directories onto `LD_LIBRARY_PATH` before launching the engine, so that
+    /// copy is the one a served process actually loads -- regardless of what
+    /// this process's own environment or the system loader cache would
+    /// otherwise resolve to. Before this fix, `find_comgr_copies` had no
+    /// `active_runtime_dirs` parameter at all, and a system copy reachable
+    /// through the loader cache was reported as "would load" even on a host
+    /// where every process the CLI actually launches loads the wheel's copy.
+    #[test]
+    fn the_active_runtimes_own_copy_outranks_the_ambient_environment() {
+        let active = comgr_copy_dir("active");
+        let ambient = comgr_copy_dir("ambient");
+        let cached = comgr_copy_dir("cached");
+
+        let (copies, _note) = find_comgr_copies(
+            std::slice::from_ref(&active),
+            &ambient.to_string_lossy(),
+            &[cached
+                .join("libamd_comgr.so.2")
+                .to_string_lossy()
+                .into_owned()],
+            &[],
+        );
+
+        assert_eq!(
+            copies.first().map(|copy| &copy.source),
+            Some(&"active-runtime".to_owned()),
+            "the active runtime's own copy must be selected ahead of the ambient \
+             `LD_LIBRARY_PATH` and the loader cache, found: {copies:?}"
+        );
+        assert_eq!(
+            copies.len(),
+            3,
+            "all three copies must still be reported: {copies:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&active);
+        let _ = std::fs::remove_dir_all(&ambient);
+        let _ = std::fs::remove_dir_all(&cached);
+    }
+
+    /// With no active-runtime evidence, the plain `LD_LIBRARY_PATH` still wins
+    /// over the loader cache and the trailing search directories -- the
+    /// ordering `find_comgr_copies`'s doc comment says is "the whole point".
+    #[test]
+    fn ld_library_path_outranks_loader_cache_and_search_dirs() {
+        let ld = comgr_copy_dir("ld");
+        let cached = comgr_copy_dir("cached2");
+        let known = comgr_copy_dir("known");
+
+        let (copies, _note) = find_comgr_copies(
+            &[],
+            &ld.to_string_lossy(),
+            &[cached
+                .join("libamd_comgr.so.2")
+                .to_string_lossy()
+                .into_owned()],
+            &[(known.clone(), "rocm-install")],
+        );
+
+        assert_eq!(
+            copies.first().map(|copy| &copy.source),
+            Some(&"ld-library-path".to_owned()),
+            "found: {copies:?}"
+        );
+        assert_eq!(copies.len(), 3, "found: {copies:?}");
+
+        let _ = std::fs::remove_dir_all(&ld);
+        let _ = std::fs::remove_dir_all(&cached);
+        let _ = std::fs::remove_dir_all(&known);
+    }
+
+    /// More than one copy produces the "N copies ... would load" note; exactly
+    /// one copy produces no note at all.
+    #[test]
+    fn the_multi_copy_note_only_fires_past_one_copy() {
+        let only = comgr_copy_dir("only");
+        let (one_copy, note) = find_comgr_copies(&[], &only.to_string_lossy(), &[], &[]);
+        assert_eq!(one_copy.len(), 1);
+        assert_eq!(
+            note, None,
+            "a single copy must not be reported as a conflict: {one_copy:?}"
+        );
+
+        let second = comgr_copy_dir("second");
+        let (two_copies, note) = find_comgr_copies(
+            &[],
+            &only.to_string_lossy(),
+            &[second
+                .join("libamd_comgr.so.2")
+                .to_string_lossy()
+                .into_owned()],
+            &[],
+        );
+        let note = note.expect("more than one copy must be noted");
+        assert!(
+            note.contains("2 copies"),
+            "the note must say how many copies were found: {note:?}"
+        );
+        assert!(
+            note.contains(&two_copies[0].path),
+            "the note must name the one that would load: {note:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&only);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// No copies anywhere produces the "no libamd_comgr found" note, naming
+    /// every place that was searched.
+    #[test]
+    fn no_copies_anywhere_names_every_place_searched() {
+        let (copies, note) = find_comgr_copies(&[], "", &[], &[]);
+        assert!(copies.is_empty());
+        let note = note.expect("an empty search must still explain itself");
+        assert!(note.contains("library path"), "{note:?}");
+        assert!(note.contains("loader cache"), "{note:?}");
+        assert!(note.contains("ROCm install"), "{note:?}");
+    }
+
+    /// `parse_ldconfig_cache_paths` reads the fixed `ldconfig -p` line format
+    /// without needing a real `ldconfig` on the machine running the test.
+    #[test]
+    fn ldconfig_cache_parsing_reads_only_matching_lines() {
+        let text = "2 libs found in cache `/etc/ld.so.cache'\n\
+             \tlibamd_comgr.so.2 (libc6,x86-64) => /opt/rocm/lib/libamd_comgr.so.2\n\
+             \tlibfoo.so.1 (libc6,x86-64) => /usr/lib/libfoo.so.1\n";
+        let paths = parse_ldconfig_cache_paths(text, COMGR_LIB_PREFIX);
+        assert_eq!(paths, vec!["/opt/rocm/lib/libamd_comgr.so.2".to_owned()]);
+    }
+
+    /// `parse_ldconfig_cache_paths` returns nothing when the cache lists no
+    /// match, rather than panicking on a header line with no `=>`.
+    #[test]
+    fn ldconfig_cache_parsing_handles_no_match() {
+        let text = "0 libs found in cache `/etc/ld.so.cache'\n";
+        assert!(parse_ldconfig_cache_paths(text, COMGR_LIB_PREFIX).is_empty());
+    }
+
+    /// `rocm_install_siblings` finds every `rocm*`-named directory under the
+    /// directory it is given, sorted, and ignores everything else -- without
+    /// depending on what happens to live under the real `/opt` on the machine
+    /// running the test.
+    #[test]
+    fn rocm_install_siblings_finds_only_rocm_named_dirs_sorted() {
+        let opt = std::env::temp_dir().join(format!(
+            "rocm-opt-siblings-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&opt);
+        for name in ["rocm-6.4", "rocm-5.7", "not-rocm", "other"] {
+            std::fs::create_dir_all(opt.join(name)).unwrap();
+        }
+
+        let found = rocm_install_siblings(&opt);
+        assert_eq!(
+            found,
+            vec![opt.join("rocm-5.7"), opt.join("rocm-6.4")],
+            "must list only `rocm`-prefixed directories, sorted: {found:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&opt);
+    }
+
+    /// A directory that does not exist (the common case: most hosts have no
+    /// `/opt`) contributes nothing rather than panicking.
+    #[test]
+    fn rocm_install_siblings_tolerates_a_missing_directory() {
+        let missing = std::env::temp_dir().join(format!(
+            "rocm-opt-missing-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(rocm_install_siblings(&missing).is_empty());
+    }
 
     /// A stand-in for a managed runtime's interpreter.
     ///
