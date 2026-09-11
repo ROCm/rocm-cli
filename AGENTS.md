@@ -200,6 +200,33 @@ The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
 frontmatter for the skill loader, and the catalog's skills carry no headers.
 The licence is stated in `skill-card.md` instead.
 
+Two checks gate it, and they cover different things:
+
+- **`skill-evals` (skillscope, advisory today)** — the frontmatter an agent
+  runtime parses, the `evals/evals.json` coverage bar (at least 3 prompts that
+  should trigger the skill and 2 near misses that should not), the
+  `skill-card.md` sections, and every internal markdown link. It is not yet a
+  required status check in branch protection: an admin must add its exact
+  context, `Skill checks (skillscope)` (the job's `name:`, not the
+  `skill-evals` job id), before a red run actually blocks a merge. Reproduce
+  it locally with
+  `uv tool install git+https://github.com/amd/skillscope@v0.1.0`, then
+  `skillscope structural --skills-dir 'skills/rocm-doctor' --skill-files
+  skill-card.md --skill-sections Description,Owner,License`. Add `--external`
+  to check the outbound URLs too; CI does not, because a rate-limited host is
+  not a broken link.
+- **`rocm_doctor_skill.feature` (e2e, blocking)** — whether the prose still
+  describes the binary, as above.
+
+Neither grades whether the skill actually *fires*. That is skillscope's
+`routing` and `behavioral`, which need an authenticated `claude` CLI and an
+`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
+so those can be switched on without further work.
+
+`skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
+verbatim into the chat system prompt with `include_str!`, so the YAML
+frontmatter a published skill needs would end up inside that prompt.
+
 ## 8) Verification Matrix For This Repo
 
 Minimum quality gate before upstream-ready status:

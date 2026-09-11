@@ -83,6 +83,7 @@ jobs:
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
       docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
+      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -162,6 +163,13 @@ jobs:
               - 'README.md'
               - 'CONTRIBUTING.md'
               - '.readthedocs.yaml'
+              - '.github/workflows/**'
+
+            # Published Agent Skills, graded by skillscope. The dataset and the
+            # skill's prose are one unit — a prompt can stop matching because the
+            # description changed — so any edit under skills/ re-runs the check.
+            skills:
+              - 'skills/**'
               - '.github/workflows/**'
 
       - name: Force full run off pull requests
@@ -876,6 +884,81 @@ jobs:
       - name: PSScriptAnalyzer (Windows PowerShell 5.1)
         if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell powershell
+
+  # Grades the published Agent Skills under skills/ with AMD's skillscope
+  # harness. Only the `structural` command runs: it needs no agent, no API key
+  # and no network beyond the install, so a red run is never wrong for a
+  # reason of its own. It is advisory today, not blocking: `Skill checks
+  # (skillscope)` (this job's `name:`, not the `skill-evals` job id) is not a
+  # required status check in branch protection, so a failing run does not
+  # stop a merge. An admin must add that exact context to make it blocking.
+  # It checks the frontmatter an agent runtime
+  # parses (a `name` that disagrees with the folder makes the skill unloadable),
+  # the dataset's coverage bar, and every internal markdown reference — a link
+  # into a renamed file is not cosmetic here, because the agent follows it,
+  # finds nothing, and improvises.
+  #
+  # `routing` and `behavioral` are deliberately NOT run: both need an
+  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
+  # such secret. Turning them on is a caller change to skillscope's
+  # `skill-evals.yml` reusable workflow once one exists — they are the half of
+  # the question that asks whether the skill actually fires, so this job is not
+  # a substitute for them.
+  #
+  # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
+  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # chat assistant's system prompt with include_str!, so giving it the YAML
+  # frontmatter this check requires would inject that frontmatter into a live
+  # prompt.
+  skill-evals:
+    name: Skill checks (skillscope)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The `skillscope` step below names skills/rocm-doctor explicitly, so a
+      # third skills/<name>/ folder added later would pass this job green
+      # while never being graded -- the same silent-non-grading failure this
+      # job exists to catch, just one level deeper. Fail loudly instead: any
+      # directory under skills/ that isn't graded above or excluded by design
+      # (rocm-cli-assistant -- see AGENTS.md #7) forces a deliberate edit here.
+      - name: Guard against an ungraded skills/ directory
+        run: |
+          set -euo pipefail
+          known="rocm-doctor rocm-cli-assistant"
+          for dir in skills/*/; do
+            name="${dir%/}"
+            name="${name#skills/}"
+            case " $known " in
+              *" $name "*) ;;
+              *)
+                echo "::error::skills/$name is neither graded by skill-evals nor excluded by design ($known). Add it to the skillscope step's 'skills:' input, or add it to this guard's exclusion list with the reason, before merging." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # The action is only a launcher: it sets up Python and uv, resolves which
+      # build of the harness to run, and execs it. It imports nothing from
+      # skillscope, so pinning it to a release SHA cannot break on a payload
+      # version it predates. What the pin does NOT cover: the composite's own
+      # steps (setup-python, setup-uv, setup-node) are on their own moving
+      # tags, and the harness itself is resolved at runtime via
+      # `uvx --from git+.../skillscope@<ref>` with no lockfile. Unlike this
+      # repo's usual SHA pin (AGENTS.md #6), this one does not reach the code
+      # that actually runs. install-claude stays off; structural needs no
+      # agent.
+      - name: Check skill structure, dataset, and references
+        uses: amd/skillscope@6dde8e8a34ad5456d3c2ff3418bc81c2cd9d5d69 # v0.1.0
+        with:
+          command: structural
+          skills: skills/rocm-doctor
+          args: --skill-files skill-card.md --skill-sections Description,Owner,License
+          install-claude: "false"
 
   license-headers:
     name: License header check (hawkeye)
