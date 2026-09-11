@@ -152,3 +152,22 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection explains the default-engine marker
     And the host's default engine is marked in the inspection's engine inventory
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of — a system ROCm install and a ROCm Python wheel each
+  # ship one, and this CLI installs the second itself. When the copy that loads
+  # is not the one the active runtime needs, compilation fails with an error
+  # naming neither the library nor the second copy. Nothing looked past the
+  # first match before, so the second copy could not be seen at all.
+  #
+  # Host-independent on purpose: the suite cannot install a second ROCm stack,
+  # so it cannot prove the two-copy case. What every lane can prove is that the
+  # inspection answers the question at all rather than staying silent, and that
+  # finding none is reported as a finding rather than a failure — which is the
+  # case the mock lane actually has. The two-copy behaviour is proven by unit
+  # tests that build the directory layout directly.
+  @id:examine-reports-code-object-manager-copies
+  Scenario: examine-15 - The inspection says which code object manager libraries the machine holds
+    When the user inspects the system in machine-readable form
+    Then the inspection lists the code object manager libraries it found
+    And it names which of them would load, or says it found none
