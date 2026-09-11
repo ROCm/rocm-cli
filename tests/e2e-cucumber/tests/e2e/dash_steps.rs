@@ -270,7 +270,7 @@ async fn quit_launcher(world: &mut E2eWorld) {
 async fn assert_replay_refused_promptly(world: &mut E2eWorld) {
     let tui = session(world);
     let rc = tui
-        .wait_for_any_exit(REPLAY_REJECTION_TIMEOUT)
+        .wait_for_exit_code(REPLAY_REJECTION_TIMEOUT)
         .await
         .unwrap_or_else(|e| {
             panic!(

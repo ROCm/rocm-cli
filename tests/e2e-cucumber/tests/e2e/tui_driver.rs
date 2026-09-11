@@ -132,6 +132,19 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
+    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
+    /// scenario's isolation environment — for a step whose `Given` planted
+    /// scenario-owned state (e.g. a shell rc file) that only the piped
+    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
+    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    pub fn spawn_with_env(
+        world: &E2eWorld,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+    }
+
     /// Spawn a specific `rocm` binary under a fresh PTY.
     ///
     /// Most scenarios use [`spawn`](Self::spawn) and exercise the harness-built
@@ -141,6 +154,15 @@ impl TuiSession {
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, binary, args, &[])
+    }
+
+    fn spawn_binary_with_env(
+        world: &E2eWorld,
+        binary: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -163,6 +185,11 @@ impl TuiSession {
             cmd.env(key, value);
         }
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
+            cmd.env(key, value);
+        }
+        // Caller-supplied overrides win over the scenario's own isolation
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        for (key, value) in extra_env {
             cmd.env(key, value);
         }
         // Provider configuration changes product startup semantics: a host API
@@ -508,31 +535,33 @@ impl TuiSession {
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
-        let status = self.wait_for_any_exit(timeout).await?;
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "TUI exited unsuccessfully (exit code {status}).\n{}",
+        match self.wait_for_exit_code(timeout).await? {
+            0 => Ok(()),
+            code => Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
                 self.framed_screen()
-            ))
+            )),
         }
     }
 
-    /// Poll until the child exits, returning its exit code without requiring zero.
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero.
     ///
-    /// Most journeys require a clean exit and use [`Self::wait_for_exit`]. A
-    /// command-rejection scenario needs the inverse contract: it must terminate
-    /// promptly and non-zero. Keeping the deadline/reap/record logic here avoids
-    /// teaching individual steps how to manipulate the PTY child directly.
-    pub async fn wait_for_any_exit(&mut self, timeout: Duration) -> Result<i32, String> {
+    /// Most journeys require a clean exit and use [`Self::wait_for_exit`]. Two
+    /// need the raw code instead, and both are cases where that method's
+    /// zero-only assertion would reject the very outcome under test: a declined
+    /// confirmation prompt, whose success case is a specific *nonzero* code, and
+    /// a command-rejection scenario, which must terminate promptly and non-zero.
+    /// Keeping the deadline/reap/record logic here avoids teaching individual
+    /// steps how to manipulate the PTY child directly.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.finished = true;
-                    let rc = i32::try_from(status.exit_code()).unwrap_or(-1);
-                    self.record_once(rc);
+                    self.record_once(code);
                     // Let the reader consume the child's final bytes before the
                     // caller inspects post-exit state (e.g. entered_alternate_
                     // screen). The child exiting closes the slave, so the reader
@@ -540,7 +569,7 @@ impl TuiSession {
                     // still buffered in the pipe would be missed. Bounded so a
                     // misbehaving PTY can't stall the scenario.
                     self.drain_reader().await;
-                    return Ok(rc);
+                    return Ok(code);
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),
