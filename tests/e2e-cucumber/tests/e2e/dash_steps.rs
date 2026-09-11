@@ -163,6 +163,14 @@ async fn open_instance_detail(world: &mut E2eWorld) {
     // a resend while the popup is already open would immediately close it.
     // Plain `send` + `wait_for_screen` instead.
     let tui = session(world);
+    // The `● Observe` marker asserted by `open_observe_view` only proves the
+    // tab switch rendered — the demo replay's `InstanceDiscovered` events
+    // land afterward. Sending Enter before they do finds an empty instance
+    // list (`selection_len()` == 0), so `OpenDetail` is silently ignored.
+    // Wait for the populated table before the (non-retryable) Enter.
+    tui.wait_for_screen("Instances · AI metrics", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("instance list did not populate: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to send Enter: {e}"));
     tui.wait_for_screen("Instance · ", default_timeout())
