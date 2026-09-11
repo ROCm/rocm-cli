@@ -182,6 +182,30 @@ const KEYWORDS_MODULE_NOT_LOADED: KeywordTable = &[
     ("hsa_status_error", 10, "HSA error (broad)"),
 ];
 
+/// What a shared-memory shortage leaves in the error text.
+///
+/// Weak on purpose, and none of them reaches the match threshold alone. The
+/// defining property of this failure is that the crash **does not** name shared
+/// memory — a bus error in a data-loader worker, or a write failure against a
+/// temporary file. An entry that needed the right words would never fire for the
+/// user who needs it, so the machine state has to carry the finding and these
+/// only raise it.
+const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
+    (r"/dev/shm", 40, "error mentions /dev/shm"),
+    ("shared memory", 35, "error mentions shared memory"),
+    (
+        "bus error",
+        25,
+        "bus error -- what a data-loader worker reports when the allowance runs out",
+    ),
+    (
+        "dataloader worker.*killed",
+        25,
+        "a data-loader worker was killed",
+    ),
+    ("no space left on device", 20, "the device reported full"),
+];
+
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
     ("rocminfo: command not found", 50, "rocminfo not on PATH"),
     ("command not found.*hipcc", 40, "hipcc not on PATH"),
@@ -1319,6 +1343,97 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
 /// than the symptom. Closing that gap means adding a diagnose hint to the
 /// service-failure output, which changes a shared surface for every failed
 /// service regardless of cause and belongs in its own change.
+/// The shared-memory allowance below which a serving workload is in trouble.
+///
+/// Chosen to separate the failure from the healthy majority rather than to
+/// describe what a workload wants. A container's default is 64 MB; an ordinary
+/// Linux host gives `/dev/shm` half its RAM, clearing this on anything with 2 GB
+/// or more. WSL2 ships the same 64 MB default a container does.
+///
+/// This deliberately under-reports. A container given 2 GB is still short for a
+/// large model and will not be flagged here. That is the right way to be wrong:
+/// a diagnosis that fires on healthy machines is one people stop reading, and a
+/// threshold set at what a workload *wants* would trip every ordinary laptop.
+const SHM_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What the catalog already tells users to ask for. Quoted rather than restated
+/// so the two cannot drift: `fix-10-container` prints `--shm-size=8g`.
+const SHM_RECOMMENDED: &str = "8g";
+
+/// `/dev/shm` too small for a serving workload.
+///
+/// Established from the state of the machine, not from the error text. That
+/// ordering is forced by the failure itself: the crash never names shared
+/// memory, which is exactly why the user cannot get from the message to the
+/// cause on their own.
+fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-19-shm-too-small";
+    const TITLE: &str = "shared memory allowance too small for a serving workload";
+
+    // Unmeasured is not short. `None` means the path was absent or the query
+    // failed, and reporting a shortage on that basis would be a finding about
+    // the probe rather than about the machine.
+    let Some(total) = e.shm_total_bytes else {
+        return zero(ID, TITLE);
+    };
+    if total >= SHM_MIN_BYTES {
+        return zero(ID, TITLE);
+    }
+
+    let mut score = 60;
+    let mut evidence = vec![format!(
+        "{} is {}, and a serving workload needs gigabytes",
+        crate::disk_space::format_bytes(total),
+        "the whole shared-memory allowance"
+    )];
+    if let Some(available) = e.shm_available_bytes
+        && available != total
+    {
+        evidence.push(format!(
+            "{} of it is free",
+            crate::disk_space::format_bytes(available)
+        ));
+    }
+    if e.in_container {
+        // Not more certain that the allowance is small -- that is measured. More
+        // certain about the cause and the remedy, because a container's default
+        // is exactly this, and restarting it with a larger one is a known step.
+        score += 10;
+        evidence.push(format!(
+            "this is a {} container, whose default allowance is 64 MiB",
+            if e.container_kind.is_empty() {
+                "linux"
+            } else {
+                &e.container_kind
+            }
+        ));
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_SHM_TOO_SMALL);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Raise the shared-memory allowance before running the workload.".to_owned(),
+        commands: vec![
+            "# In a container: restart it with a larger allowance.".to_owned(),
+            format!("#   docker run --shm-size={SHM_RECOMMENDED} ...    # see fix-10-container"),
+            "# On a host: remount it, and make that survive a reboot.".to_owned(),
+            format!("sudo mount -o remount,size={SHM_RECOMMENDED} /dev/shm"),
+            format!("# /etc/fstab:  tmpfs  /dev/shm  tmpfs  defaults,size={SHM_RECOMMENDED}  0 0"),
+        ],
+        needs_sudo: true,
+        fix_id: ID.to_owned(),
+        auto_applicable: false,
+        verify: "df -h /dev/shm".to_owned(),
+        notes: vec![
+            "A running container cannot have its allowance changed; it has to be started again."
+                .to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
 fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
     let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
     if score <= 0 {
@@ -1856,6 +1971,12 @@ const CHECKERS: &[Checker] = &[
     (check_wsl_5_distro_too_old, WSL_ONLY),
     (check_wsl_6_host_driver_too_old, WSL_ONLY),
     (check_wsl_7_wsl1, WSL_ONLY),
+    // Both families, opting in explicitly as the platform split requires. The
+    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
+    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
+    // leaving this tagged `linux` alone would silence it on one of the two
+    // platforms most likely to have it.
+    (check_19_shm_too_small, &["linux", "wsl"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2089,6 +2210,110 @@ mod tests {
             os_family: "linux".to_owned(),
             ..Examination::default()
         }
+    }
+
+    fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-19-shm-too-small")
+    }
+
+    #[test]
+    fn a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs() {
+        // The container default, which is also what WSL2 ships. The point of the
+        // entry is that it fires on machine state alone: the crash this prevents
+        // never names shared memory, so a user who pasted it would get nothing.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e.shm_available_bytes = Some(64 * 1024 * 1024);
+
+        let report = diagnose(&e, "");
+        let finding = shm_finding(&report).expect("a 64 MiB allowance must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the shortage is established by measurement, so it has to clear the \
+             threshold with no help from the symptom text: {}",
+            finding.score
+        );
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("64"),
+            "the report has to state what is actually available:\n{evidence}"
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "raising the allowance means restarting a container or remounting; \
+             neither is something to do on the user's behalf"
+        );
+        assert!(
+            fix.commands.iter().any(|c| c.contains("8g")),
+            "the steps have to name a size to raise it to:\n{:#?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn an_ordinary_shared_memory_allowance_is_not_reported() {
+        // The control. An ordinary Linux host gives /dev/shm half its RAM, so
+        // this is the common case -- and an entry that fired here would fire on
+        // nearly every machine, which is how a catalog stops being read.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        e.shm_available_bytes = Some(8 * 1024 * 1024 * 1024);
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "8 GiB is what the catalog itself tells users to ask for"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_shared_memory_allowance_is_not_reported() {
+        // Unknown is not zero. `None` means the path was absent or the query
+        // failed, and a shortage reported on that basis would be a finding about
+        // the probe rather than about the user's machine.
+        let mut e = linux_base();
+        e.shm_total_bytes = None;
+        e.shm_available_bytes = None;
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn being_in_a_container_raises_the_finding_without_creating_it() {
+        // The container flag says the cause and the remedy are known exactly, so
+        // it raises confidence. It must not be able to conjure a finding on a
+        // machine whose allowance is fine.
+        let mut healthy = linux_base();
+        healthy.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        healthy.in_container = true;
+        healthy.container_kind = "docker".to_owned();
+        assert!(
+            shm_finding(&diagnose(&healthy, "")).is_none(),
+            "a container with a healthy allowance has nothing wrong with it"
+        );
+
+        let mut short = linux_base();
+        short.shm_total_bytes = Some(64 * 1024 * 1024);
+        let outside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        short.in_container = true;
+        short.container_kind = "docker".to_owned();
+        let inside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        assert!(
+            inside > outside,
+            "knowing it is a container makes the cause certain, so it should rank \
+             higher there: {inside} vs {outside}"
+        );
     }
 
     #[test]

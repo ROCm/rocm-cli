@@ -77,6 +77,9 @@ const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
 const WSL_ONLY: &[&str] = &["wsl"];
+/// Both Linux families. For a problem that is neither about the `amdgpu` module
+/// nor about the Windows host driver, and so is real on either.
+const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 
 /// The recipe registry. Mirrors the diagnosis catalog; only the four small,
 /// safe fixes carry a `runner` and are auto-applicable.
@@ -577,6 +580,37 @@ const RECIPES: &[FixRecipe] = &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
         applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-19-shm-too-small",
+        title: "Raise the shared memory allowance",
+        rationale: "A serving workload needs gigabytes of /dev/shm; a container gives it 64 MB by default, and WSL2 ships the same default. When the allowance runs out the workload crashes without the message ever naming shared memory -- a data-loader worker killed by a bus error, or a failed write to a temporary file -- so there is no route from what the user sees back to the cause.",
+        auto_applicable: false,
+        // Two situations, one cause. A running container cannot be resized, so
+        // the container case is a restart rather than a command that changes
+        // this machine; the host case is a remount plus the fstab line that
+        // makes it survive a reboot.
+        commands: &[
+            "# Check what you have:",
+            "df -h /dev/shm",
+            "# In a container: start it again with a larger allowance.",
+            "#   docker run --shm-size=8g ...        # as fix-10-container shows",
+            "# On a host: remount, then make it stick across a reboot.",
+            "sudo mount -o remount,size=8g /dev/shm",
+            "# /etc/fstab:  tmpfs  /dev/shm  tmpfs  defaults,size=8g  0 0",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "df -h /dev/shm",
+        notes: &[
+            "A running container cannot have its allowance changed. It has to be started again with the larger value.",
+            "8g matches what fix-10-container already tells you to pass, so the two stay consistent.",
+        ],
+        // Not `LINUX_ONLY`: the size of a tmpfs has nothing to do with the
+        // amdgpu module, and WSL2 ships the same 64 MB default a container does.
+        applies_on: LINUX_AND_WSL,
         runner: None,
     },
 ];
@@ -1418,7 +1452,7 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
         // 16 bare-metal/Windows entries (including fix-17) plus the 7 WSL ones.
-        assert_eq!(count, 23, "expected 23 catalog entries");
+        assert_eq!(count, 24, "expected 24 catalog entries");
     }
 
     #[test]
