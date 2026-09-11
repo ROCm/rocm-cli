@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! GPU partition mode enums. See `../wiki/concepts/gpu-partition-modes.md`.
+//! GPU partition mode enums.
 
 use serde::{Deserialize, Serialize};
 

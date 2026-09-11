@@ -6,13 +6,12 @@
 //!
 //! This is a **render + event seam ONLY**. The decision *logic* — what an
 //! approval actually does (run a CLI command, enable full access, approve a
-//! proposal) — stays CLI-side per the working agreement
-//! (`rocm-cli-unification-working-agreements.md` §1). This module renders an
+//! proposal) — stays CLI-side by design. This module renders an
 //! [`ApprovalRequest`] and reports the user's [`ApprovalVerdict`]; the caller
 //! maps the verdict onto a CLI-side action.
 //!
 //! It must never gain a mutating capability and never touches the read-only
-//! chat seam (`agent.rs:59-62`).
+//! chat seam in `agent.rs`.
 //!
 //! Keymap mirrors the frozen rocm-cli `pending_approval` screen: Up/Down/Tab
 //! move the cursor; `y` approves; `n` denies; Esc cancels; Enter performs the

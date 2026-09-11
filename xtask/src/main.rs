@@ -12,6 +12,7 @@
 
 mod affected;
 mod demos;
+mod doc_paths;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
@@ -79,6 +80,11 @@ enum Command {
     /// `docs/keys/`, and that any configured CI signing key matches the pinned
     /// current release key. A no-op while no canonical keys are published.
     VerifyPinnedKeys,
+    /// Assert every relative documentation path cited in a Rust doc comment
+    /// (`//!` or `///`) resolves to a file, either next to the citing file or
+    /// against the workspace root. `rustdoc` does not resolve such paths, so a
+    /// citation of a file that never existed is otherwise invisible.
+    VerifyDocPaths,
     /// Print the workspace crates affected by a git range (changed crates plus
     /// their transitive dependents) as `cargo` package-selection flags, so CI
     /// can build/test only what a change can reach instead of `--workspace`.
@@ -240,6 +246,7 @@ fn run() -> Result<()> {
             signature,
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
+        Command::VerifyDocPaths => doc_paths::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {

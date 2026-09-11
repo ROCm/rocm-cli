@@ -11,7 +11,7 @@
 //!    sourced from each project's published palette. Theme catalogue
 //!    inspired by [ansicolor.com](https://ansicolor.com/).
 //!
-//! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
+//! Pattern borrowed from ctux.
 
 use ratatui::style::{Color, Modifier, Style};
 

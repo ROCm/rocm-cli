@@ -98,8 +98,11 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file.
-              - 'MANIFEST.md'
+              # clippy runs `cargo xtask manifest --check` against MANIFEST.md
+              # and `cargo xtask verify-doc-paths` over every doc-comment
+              # citation, so deleting or renaming any markdown file can break a
+              # Rust check with no *.rs file in the change.
+              - '**/*.md'
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
@@ -735,6 +738,10 @@ jobs:
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
+
+      - name: Doc-comment paths resolve
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask verify-doc-paths
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this

@@ -17,7 +17,7 @@
 //!
 //! Graceful degradation: an instance that matches nothing (empty `gpu_ids`,
 //! no container entry — e.g. Lemonade) resolves to `(0, 0)`, never a panic and
-//! never a confidently-wrong number. See `../wiki/concepts/metric-registry.md`.
+//! never a confidently-wrong number.
 
 use std::collections::HashMap;
 

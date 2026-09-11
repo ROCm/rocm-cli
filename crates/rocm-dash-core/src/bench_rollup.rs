@@ -8,19 +8,19 @@
 //! it whenever the row set changes rather than relying on the upstream
 //! `pass_n_of_n` / `pass_at_n` CSV columns.
 //!
-//! See `../wiki/concepts/benchmark-result-schema.md` and
-//! `../wiki/entities/normalize-results.md`: rows are grouped by
-//! `(cell, model, backend, concurrency)` and each group of N trials yields
-//! two verdicts — strict (all N passed) and lenient (at least one passed).
+//! Rows are grouped by `(cell, model, engine, tp, dtype, concurrency)`, and
+//! each group of N trials yields two verdicts — strict (all N passed) and
+//! lenient (at least one passed).
 
 use std::collections::BTreeMap;
 
 use crate::bench_schema::{BenchmarkRow, PassFail};
 
-/// Effective verdict for one row: prefer the rolled-up `pass_fail`, fall back
+/// Effective verdict for one row.
 ///
-/// to the judge verdict when the rollup is `Unknown`. A row that is `Unknown`
-/// under both returns `Unknown` and never counts as a pass.
+/// Prefers the rolled-up `pass_fail`, falling back to the judge verdict when the
+/// rollup is `Unknown`. A row that is `Unknown` under both returns `Unknown` and
+/// never counts as a pass.
 #[must_use]
 pub const fn row_verdict(row: &BenchmarkRow) -> PassFail {
     match row.pass_fail {
@@ -29,9 +29,11 @@ pub const fn row_verdict(row: &BenchmarkRow) -> PassFail {
     }
 }
 
-/// Grouping key for a trial set. Trials within a group differ only by `run`
-/// (and `trial_index`); everything that defines the backend config is held
-/// fixed so Pass^N / Pass@N compare like-for-like.
+/// Grouping key for a trial set: the fields Pass^N / Pass@N compare over.
+///
+/// Rows differing only in `run` and `trial_index` fall into the same group.
+/// Columns outside the key do not split one either: rows that differ in, say,
+/// `input_len` or `attention_backend` are folded into the same trial set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RollupKey {
     cell: String,
