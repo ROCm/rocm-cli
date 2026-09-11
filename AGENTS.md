@@ -90,7 +90,12 @@ features as well as fixes. If the change alters what a user of the CLI can obser
 command output, exit codes, files or paths the CLI creates, or which runtime/engine it
 selects — then that behavior must be covered by a Gherkin scenario in
 `tests/e2e-cucumber/features/`, adding or updating the scenario and its step
-definitions when no existing scenario already covers it:
+definitions when no existing scenario already covers it.
+
+Run those scenarios with `cargo xtask e2e`. `cargo xtask e2e -- -n <scenario>` filters by
+name for a quick loop, but `-n` replaces the harness's own filter and so bypasses OS
+applicability, xfail expectations, and lifecycle selection (see `docs/testing.md`) — the
+unfiltered run is the gate.
 
 - a unit test asserting the internal helper does NOT discharge this; it proves the
   function, not the behavior
@@ -139,6 +144,7 @@ Understand existing patterns first:
 - workspace topology from `Cargo.toml`
 - sibling implementations in `apps/`, `crates/`, and `engines/`
 - existing tests and conventions in `docs/testing.md`
+- setup, commit conventions, and the review bar in `CONTRIBUTING.md`
 
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
@@ -181,10 +187,24 @@ Required consistency points:
 Minimum quality gate before upstream-ready status:
 
 ```bash
+prek run --all-files                                   # hygiene, ruff, shellcheck, cargo fmt, license headers, generated manifests
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+cargo xtask e2e                                        # the Gherkin scenarios §3 mandates
 python scripts/smoke_local.py
 ```
+
+Why the list is longer than it looks:
+
+- `cargo test` cannot run the scenarios §3 requires. `tests/e2e-cucumber` sets `test = false` on its `e2e` target, so `cargo test --workspace --all-targets` and `cargo nextest` skip every scenario silently and still report success. Only `cargo xtask e2e` runs them.
+- That same `test = false` also excludes the e2e harness from `cargo clippy --workspace --all-targets`, which is why the separate `cargo clippy --locked -p e2e-cucumber --test e2e` line is listed. CI runs both clippy invocations.
+- `prek run --all-files` runs the pre-commit hooks from `.pre-commit-config.yaml`; the pre-push hooks (clippy, `cargo test`) are the separate lines above, not a subset of it. Install prek per `CONTRIBUTING.md`.
+
+Two of the hooks `prek run --all-files` runs are not equivalent to the CI jobs that gate the same thing:
+
+- license headers: the hook runs `hawkeye check --config licenserc.toml` and fails outright when `hawkeye` is missing, so install it (`cargo install hawkeye`) rather than skipping the hook. The `license-headers` CI job instead downloads a version-pinned, sha256-verified prebuilt (`HAWKEYE_VERSION` in `.github/workflows/ci.yml`), so an unpinned local install can be a different version than the gate.
+- third-party notices: the hook runs `cargo xtask tpn --if-available`, which no-ops when `cargo-about` is absent or not the pinned version — a green local run proves nothing here. Run `cargo xtask tpn --check`, the form the `third-party-notices` CI job uses, after changing the dependency graph, and install the pinned generator per `CONTRIBUTING.md`.
 
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
