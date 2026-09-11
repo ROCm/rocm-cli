@@ -336,6 +336,14 @@ async fn user_inspects_both_ways(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user inspects the system in machine-readable form")]
+async fn user_inspects_for_scripting(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects the system without probing frameworks")]
 async fn user_inspects_skipping_frameworks(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -620,4 +628,64 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
         "examine reported {reported}, but KFD reports gfx_target_version {packed} \
          ({major}.{minor}.{revision} = {expected})\n{output}"
     );
+}
+
+#[then("the inspection lists the code object manager libraries it found")]
+async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("comgr_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Each entry has to carry enough to act on. A list of bare paths would not
+    // say which install a copy belongs to, which is the whole question.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported copy is missing `{field}`, so a reader cannot tell \
+                 where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+#[then("it names which of them would load, or says it found none")]
+async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["comgr_paths"]
+        .as_array()
+        .expect("comgr_paths must be a list")
+        .clone();
+    let selected = value
+        .get("comgr_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    // The two have to agree. "Some copies exist but none was selected" would
+    // leave a reader unable to tell which one the loader picks, which is the
+    // only thing the list is for.
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("copies were found but none was selected:\n{value:#}"));
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
 }

@@ -154,6 +154,27 @@ pub struct WslFacts {
     pub locally_probed: bool,
 }
 
+/// One copy of the AMD code object manager library found on the machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComgrCopy {
+    /// The path as found, before symlinks are resolved -- this is the name the
+    /// loader would use, and the one a user will recognise.
+    pub path: String,
+    /// The file the path resolves to. Two entries naming one file through a
+    /// symlink are collapsed on this, so a versioned library and its unversioned
+    /// alias are not reported as two copies.
+    pub real_path: String,
+    /// Version read from the resolved file name, empty when it carries none.
+    ///
+    /// Empty is an honest answer. The version is read from the name rather than
+    /// by loading the library, so a renamed file yields nothing -- which is
+    /// better than a confident wrong answer.
+    pub version: String,
+    /// Where the search found it: `ld-library-path`, `loader-cache`,
+    /// `rocm-install`, or `managed-runtime`.
+    pub source: String,
+}
+
 /// Structured machine state consumed by the diagnosis catalog.
 ///
 /// Field order and names mirror `examine.py`'s `Examination` dataclass so the
@@ -204,6 +225,27 @@ pub struct Examination {
     pub rocminfo_status: String,
     pub hip_libs_on_ld_path: Option<bool>,
     pub rocm_repos_seen: Vec<String>,
+
+    // Code object manager (Linux). HIP compiles device code at run time through
+    // `libamd_comgr`, and a machine can hold more than one copy -- a system ROCm
+    // install and a ROCm Python wheel each ship one. Holding two is not a fault;
+    // every managed environment this CLI creates holds one, and there the wheel
+    // copy is the right copy to load. What matters is which copy the loader
+    // picks, and that was invisible: nothing looked past the first match.
+    /// Every copy found, in loader search order. The first is the one that would
+    /// load.
+    pub comgr_paths: Vec<ComgrCopy>,
+    /// The copy the loader would pick. `None` when none were found.
+    pub comgr_selected: Option<ComgrCopy>,
+    /// Version of the selected copy; empty when it cannot be read from the name.
+    pub comgr_version: String,
+    /// Whether the selected copy belongs to the installation owning the active
+    /// HIP runtime.
+    ///
+    /// Always `None` today. The field is carried unset so that computing it does
+    /// not become a second change to the wire contract, and so a consumer can
+    /// tell "not yet answered" from "answered no".
+    pub comgr_matches_runtime: Option<bool>,
 
     // HIP SDK install (Windows)
     pub hip_sdk_path: String,
@@ -274,6 +316,10 @@ impl Default for Examination {
             rocminfo_status: String::new(),
             hip_libs_on_ld_path: None,
             rocm_repos_seen: Vec::new(),
+            comgr_paths: Vec::new(),
+            comgr_selected: None,
+            comgr_version: String::new(),
+            comgr_matches_runtime: None,
             hip_sdk_path: String::new(),
             hip_sdk_version: String::new(),
             hipinfo_present: false,
@@ -339,6 +385,10 @@ impl Examination {
             probe_env(&mut e);
             probe_container(&mut e);
             probe_framework(&mut e, framework);
+            // A wheel copy and a system copy collide on WSL2 exactly as they do
+            // on bare metal, so skipping the search here would leave a WSL user
+            // unable to see a conflict that is really there.
+            probe_comgr(&mut e);
             e.status = e.compute_status();
             return e;
         }
@@ -354,6 +404,9 @@ impl Examination {
             probe_secure_boot(&mut e);
             probe_rocm_install(&mut e);
             probe_env(&mut e);
+            // After both: the search consults `LD_LIBRARY_PATH` (read by
+            // `probe_env`) and the resolved ROCm install (`probe_rocm_install`).
+            probe_comgr(&mut e);
             probe_container(&mut e);
             probe_dmesg_amdgpu(&mut e);
             probe_framework(&mut e, framework);
@@ -1593,27 +1646,7 @@ fn probe_env(e: &mut Examination) {
         e.env.insert((*key).to_owned(), value);
     }
     let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    let mut hit: Option<String> = None;
-    for dir in ld.split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("libamdhip64")
-                {
-                    hit = Some(entry.path().to_string_lossy().into_owned());
-                    break;
-                }
-            }
-        }
-        if hit.is_some() {
-            break;
-        }
-    }
+    let hit = libraries_on_ld_path(&ld, "libamdhip64").into_iter().next();
     if let Some(hit) = hit {
         e.hip_libs_on_ld_path = Some(true);
         e.notes
@@ -1621,6 +1654,244 @@ fn probe_env(e: &mut Examination) {
     } else {
         e.hip_libs_on_ld_path = if ld.is_empty() { None } else { Some(false) };
     }
+}
+
+/// Every file in `ld` whose name starts with `prefix`, in search order.
+///
+/// One walker, two callers. The HIP probe wants only the first hit; the code
+/// object manager scan wants all of them, because stopping at the first is
+/// exactly what made a second copy invisible. Written once so the two searches
+/// cannot come to disagree about what "on the library path" means.
+///
+/// `LD_LIBRARY_PATH` is a Linux concept and so is its `:` separator — a Windows
+/// path contains a colon, so splitting one here would destroy it. That costs
+/// nothing in practice: the variable is not what the Windows loader reads, the
+/// code object manager scan runs only on Linux, and on Windows the HIP caller
+/// sees an unset variable and finds nothing, exactly as it did before. It does
+/// mean the tests for this are Unix-only, and they say so.
+fn libraries_on_ld_path(ld: &str, prefix: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for dir in ld.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        collect_libraries_in_dir(std::path::Path::new(dir), prefix, &mut found);
+    }
+    found
+}
+
+/// Append every file in `dir` whose name starts with `prefix`, sorted so the
+/// result does not depend on directory iteration order.
+///
+/// An unreadable directory contributes nothing and is not an error: the library
+/// path routinely names directories that do not exist, and a probe that failed
+/// on one would report nothing about the machine it was asked to describe.
+fn collect_libraries_in_dir(dir: &std::path::Path, prefix: &str, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut matches: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .collect();
+    matches.sort();
+    found.append(&mut matches);
+}
+
+/// The library HIP uses to compile device code at run time.
+const COMGR_LIB_PREFIX: &str = "libamd_comgr";
+
+/// Find every copy of the code object manager library, in loader search order.
+///
+/// The first entry is the copy that would load. Every other entry is the part
+/// that was invisible before: a machine can hold a system copy and a wheel copy,
+/// and when the one that loads does not belong to the active runtime, device
+/// code compilation fails with an error naming neither.
+///
+/// **This emulates the loader; it is not the loader.** It does not account for
+/// `RUNPATH`/`RPATH` on the calling binary, `ld.so.preload`, or a container that
+/// remaps paths at run time. The selected copy is the one that *would* load on
+/// the evidence available, and the list of copies is that evidence -- not a
+/// guarantee. Reporting the search honestly is worth more here than a confident
+/// answer that cannot be justified.
+fn probe_comgr(e: &mut Examination) {
+    let mut copies: Vec<ComgrCopy> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Order is the whole point: this is the order the loader consults, so the
+    // first copy recorded is the one that wins.
+    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    for path in libraries_on_ld_path(&ld, COMGR_LIB_PREFIX) {
+        record_comgr_copy(&mut copies, &mut seen, &path, "ld-library-path");
+    }
+    for path in comgr_paths_in_loader_cache() {
+        record_comgr_copy(&mut copies, &mut seen, &path, "loader-cache");
+    }
+    for (dir, source) in comgr_search_dirs(e) {
+        let mut hits = Vec::new();
+        collect_libraries_in_dir(&dir, COMGR_LIB_PREFIX, &mut hits);
+        for path in hits {
+            record_comgr_copy(&mut copies, &mut seen, &path, source);
+        }
+    }
+
+    if let Some(first) = copies.first() {
+        e.comgr_version.clone_from(&first.version);
+        e.comgr_selected = Some(first.clone());
+        if copies.len() > 1 {
+            e.notes.push(format!(
+                "{} copies of {COMGR_LIB_PREFIX} found; {} would load",
+                copies.len(),
+                first.path
+            ));
+        }
+    } else {
+        e.notes.push(format!(
+            "no {COMGR_LIB_PREFIX} found on the library path, in the loader cache, or in any known ROCm install"
+        ));
+    }
+    e.comgr_paths = copies;
+}
+
+/// Record `path` unless an earlier entry already resolved to the same file.
+///
+/// Deduplicated on the resolved path, not the given one: ROCm ships a versioned
+/// library and an unversioned symlink beside it, and reporting those as two
+/// copies would invent a conflict on a perfectly ordinary install.
+fn record_comgr_copy(
+    copies: &mut Vec<ComgrCopy>,
+    seen: &mut std::collections::BTreeSet<String>,
+    path: &str,
+    source: &str,
+) {
+    // A path that cannot be resolved is kept as given rather than dropped: a
+    // dangling symlink is still something the loader would try, and reporting
+    // it is more use than pretending the machine does not hold it.
+    let real_path = std::fs::canonicalize(path).map_or_else(
+        |_| path.to_owned(),
+        |resolved| resolved.to_string_lossy().into_owned(),
+    );
+    if !seen.insert(real_path.clone()) {
+        return;
+    }
+    copies.push(ComgrCopy {
+        version: comgr_version_from_file_name(&real_path),
+        path: path.to_owned(),
+        real_path,
+        source: source.to_owned(),
+    });
+}
+
+/// Read the version out of a resolved library file name.
+///
+/// `libamd_comgr.so.2.8.0` carries its version in the soname, which is where
+/// this reads it from. Deliberately not by loading the library and asking it:
+/// `dlopen` runs the library's initialisers, and running code out of an
+/// unknown library is not something a diagnostic tool should do on a machine it
+/// has been called to because something is already wrong. A renamed file yields
+/// an empty version, which is the honest answer.
+fn comgr_version_from_file_name(real_path: &str) -> String {
+    let name = std::path::Path::new(real_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some((_, version)) = name.split_once(".so.") else {
+        return String::new();
+    };
+    // Digits and dots only: `libamd_comgr.so.2.8.0` yields a version, while a
+    // file that merely happens to carry `.so.` in a longer name does not get a
+    // nonsense one read out of it.
+    if !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        version.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Paths the loader cache knows for the library.
+///
+/// `ldconfig -p` prints `libamd_comgr.so.2 (libc6,x86-64) => /opt/rocm/lib/...`.
+/// Its absence, or a nonzero exit, contributes nothing rather than failing the
+/// probe: plenty of hosts have no `ldconfig` on the path, and a machine with no
+/// loader cache is still a machine worth describing.
+fn comgr_paths_in_loader_cache() -> Vec<String> {
+    if !which("ldconfig") {
+        return Vec::new();
+    }
+    let (rc, out, _) = run("ldconfig", &["-p"], SHORT);
+    if rc != 0 {
+        return Vec::new();
+    }
+    out.lines()
+        .filter(|line| line.contains(COMGR_LIB_PREFIX))
+        .filter_map(|line| line.split_once("=> "))
+        .map(|(_, path)| path.trim().to_owned())
+        .collect()
+}
+
+/// Directories to search after the library path and the loader cache, each
+/// paired with the source label it is recorded under.
+fn comgr_search_dirs(e: &Examination) -> Vec<(std::path::PathBuf, &'static str)> {
+    let mut dirs: Vec<(std::path::PathBuf, &'static str)> = Vec::new();
+    let mut add = |dir: std::path::PathBuf, source: &'static str| {
+        if dir.is_dir() {
+            dirs.push((dir, source));
+        }
+    };
+
+    if !e.rocm_path.is_empty() {
+        let root = std::path::PathBuf::from(&e.rocm_path);
+        add(root.join("lib"), "rocm-install");
+        add(root.join("lib64"), "rocm-install");
+    }
+    // Sibling ROCm installs the active one does not cover. A versioned install
+    // left behind by an upgrade is one of the two copies this entry exists to
+    // find.
+    if let Ok(entries) = std::fs::read_dir("/opt") {
+        let mut roots: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("rocm"))
+            })
+            .collect();
+        roots.sort();
+        for root in roots {
+            add(root.join("lib"), "rocm-install");
+            add(root.join("lib64"), "rocm-install");
+        }
+    }
+    // The copy this CLI installs itself. Reusing the layout the SDK probe
+    // already knows rather than restating it: a second description of where a
+    // managed runtime keeps its libraries is a second thing to keep correct.
+    for root in managed_runtime_roots() {
+        let mut paths = Vec::new();
+        crate::collect_sdk_library_paths(&root, &mut paths);
+        for path in paths {
+            add(path, "managed-runtime");
+        }
+    }
+    dirs
+}
+
+/// Every managed runtime root, `<data dir>/runtimes/<format>/<name>`.
+fn managed_runtime_roots() -> Vec<std::path::PathBuf> {
+    let Some(data_dir) = crate::runtime::default_data_dir() else {
+        return Vec::new();
+    };
+    let Ok(formats) = std::fs::read_dir(data_dir.join("runtimes")) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for format in formats.flatten() {
+        if let Ok(entries) = std::fs::read_dir(format.path()) {
+            roots.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    roots.sort();
+    roots
 }
 
 /// Truncate `value` to at most `max_chars` characters, appending a marker when
@@ -2115,6 +2386,142 @@ mod tests {
         assert_eq!(distro_clears_wsl_floor("UBUNTU", "24.04"), Some(true));
     }
 
+    /// A scratch directory unique to the calling test, cleaned up by the caller.
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-comgr-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    fn plant(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"").expect("plant library");
+        path
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn the_library_path_is_searched_left_to_right_and_every_copy_is_kept() {
+        // The defect this whole entry exists for: the old scan stopped at the
+        // first hit, so a second copy could never be reported. Order matters as
+        // much as completeness -- the first entry is the claim about which copy
+        // wins.
+        let root = scratch_dir("order");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).expect("create dir");
+        std::fs::create_dir_all(&second).expect("create dir");
+        plant(&first, "libamd_comgr.so.2.8.0");
+        plant(&second, "libamd_comgr.so.3.0.0");
+
+        let ld = format!("{}:{}", first.display(), second.display());
+        let found = libraries_on_ld_path(&ld, COMGR_LIB_PREFIX);
+
+        assert_eq!(found.len(), 2, "both copies must be reported: {found:?}");
+        assert!(
+            found[0].starts_with(first.to_string_lossy().as_ref()),
+            "the earlier library-path entry has to come first: {found:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_library_path_entry_is_skipped_rather_than_failing_the_probe() {
+        // `LD_LIBRARY_PATH` routinely names directories that do not exist. A
+        // probe that gave up on one would report nothing about the machine it
+        // was asked to describe.
+        let root = scratch_dir("missing");
+        plant(&root, "libamd_comgr.so.2.8.0");
+        let ld = format!("/nonexistent-{}:{}", std::process::id(), root.display());
+
+        let found = libraries_on_ld_path(&ld, COMGR_LIB_PREFIX);
+
+        assert_eq!(found.len(), 1, "the readable entry still counts: {found:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Unix-only: these drive `LD_LIBRARY_PATH` semantics and POSIX symlinks
+    // directly. The variable uses `:` as its separator, which a Windows path
+    // contains, and `symlink` needs privileges there. The code under test runs
+    // only on Linux, so gating the tests loses no coverage of a path that ships.
+    #[cfg(unix)]
+    #[test]
+    fn a_versioned_library_and_its_symlink_count_as_one_copy() {
+        // ROCm ships `libamd_comgr.so.2` beside `libamd_comgr.so.2.8.0`, one a
+        // symlink to the other. Counting those as two copies would invent a
+        // conflict on an ordinary install -- the false report that matters most
+        // to avoid, since it would fire on healthy machines.
+        let root = scratch_dir("symlink");
+        let real = plant(&root, "libamd_comgr.so.2.8.0");
+        let link = root.join("libamd_comgr.so.2");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let mut copies = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        record_comgr_copy(&mut copies, &mut seen, &link.to_string_lossy(), "test");
+        record_comgr_copy(&mut copies, &mut seen, &real.to_string_lossy(), "test");
+
+        assert_eq!(
+            copies.len(),
+            1,
+            "one file reached by two names is one copy: {copies:?}"
+        );
+        assert_eq!(
+            copies[0].version, "2.8.0",
+            "the version comes from the resolved file, not the name used to reach it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_distinct_files_are_two_copies() {
+        // The converse of the symlink case, so that test cannot be satisfied by
+        // a probe that simply never reports more than one.
+        let root = scratch_dir("distinct");
+        let a = plant(&root, "libamd_comgr.so.2.8.0");
+        let b = plant(&root, "libamd_comgr.so.3.0.0");
+
+        let mut copies = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        record_comgr_copy(&mut copies, &mut seen, &a.to_string_lossy(), "test");
+        record_comgr_copy(&mut copies, &mut seen, &b.to_string_lossy(), "test");
+
+        assert_eq!(copies.len(), 2, "two files are two copies: {copies:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_version_is_read_only_when_the_name_actually_carries_one() {
+        for (name, expected) in [
+            ("libamd_comgr.so.2.8.0", "2.8.0"),
+            ("libamd_comgr.so.2", "2"),
+            // No version to read. Empty is the honest answer; the alternative
+            // is a confident wrong one, and the version is only ever report
+            // text.
+            ("libamd_comgr.so", ""),
+            ("libamd_comgr-renamed.so.beta", ""),
+        ] {
+            assert_eq!(
+                comgr_version_from_file_name(&format!("/x/{name}")),
+                expected,
+                "{name} read wrong"
+            );
+        }
+    }
+
     #[test]
     fn examination_serializes_expected_keys() {
         let e = Examination::default();
@@ -2182,6 +2589,14 @@ mod tests {
             "rocminfo_status",
             "hip_libs_on_ld_path",
             "rocm_repos_seen",
+            // CLI additions beyond examine.py, added deliberately: which copies
+            // of the code object manager library the machine holds, and which
+            // one would load. examine.py never looked, which is why a second
+            // copy shadowing the first was invisible.
+            "comgr_paths",
+            "comgr_selected",
+            "comgr_version",
+            "comgr_matches_runtime",
             "hip_sdk_path",
             "hip_sdk_version",
             "hipinfo_present",
