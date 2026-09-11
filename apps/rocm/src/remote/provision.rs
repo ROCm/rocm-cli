@@ -178,10 +178,18 @@ fn push_matched_artifact(
 /// alternate signing key to the remote's install.sh, or `None` if this
 /// process's environment sets neither variable.
 ///
-/// Only `_PEM` ever crosses the wire. `_PATH` names a file on *this* machine,
-/// and forwarding that path verbatim would tell the remote's shell to open a
-/// file that is not there — the variable would be set but useless. So a
-/// `_PATH` is read here and its *contents* are sent as `_PEM` instead.
+/// Only `_PEM` ever carries a key across the wire. `_PATH` names a file on
+/// *this* machine, and forwarding that path verbatim would tell the remote's
+/// shell to open a file that is not there — the variable would be set but
+/// useless. So a `_PATH` is read here and its *contents* are sent as `_PEM`.
+///
+/// `_PATH` is still sent, but deliberately empty, and only to switch off any
+/// the remote already has. `resolve_public_keys` consults `_PATH` first, so a
+/// value exported on the far side — through `/etc/environment` and pam_env,
+/// say, which apply to non-interactive sshd sessions — would win over the key
+/// we just forwarded, and the two machines would verify against different
+/// trust roots. An explicitly-empty export reads as unset to install.sh's
+/// `[ -n ... ]`, which is what makes one token enough to close that.
 ///
 /// `_PATH` is therefore checked first, because that is the order install.sh's
 /// own `resolve_public_keys` uses. These two must not disagree: what they are
@@ -229,7 +237,7 @@ fn signing_env_fragment_from(
     };
     Ok(pem.map(|pem| {
         format!(
-            "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM={} ",
+            "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM={} ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ",
             super::shell_quote(&pem)
         )
     }))
@@ -448,7 +456,28 @@ mod tests {
         .expect("no file read is attempted");
         assert_eq!(
             fragment.as_deref(),
-            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ")
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ")
+        );
+    }
+
+    #[test]
+    fn the_forwarded_key_switches_off_any_path_the_remote_already_had() {
+        // Without the empty _PATH, an operator's key could be forwarded
+        // correctly and still lose. resolve_public_keys reads _PATH first, so a
+        // value the remote exports for itself — /etc/environment via pam_env
+        // reaches non-interactive sshd sessions — would beat the key we just
+        // sent, and the two machines would verify against different trust
+        // roots. That is the exact divergence the ordering fix above exists to
+        // prevent, arriving from the other side.
+        let fragment = signing_env_fragment_from(Some("pem-content".to_owned()), None, |path| {
+            panic!("must not read {path}: no _PATH was set")
+        })
+        .expect("no file read is attempted")
+        .expect("a _PEM was set");
+        assert!(
+            fragment.contains("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= "),
+            "an explicitly-empty _PATH is what install.sh's `[ -n ... ]` reads as unset: \
+             {fragment}"
         );
     }
 
@@ -471,7 +500,7 @@ mod tests {
         .expect("the fake reader succeeds");
         assert_eq!(
             fragment.as_deref(),
-            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ")
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ")
         );
     }
 
@@ -490,7 +519,7 @@ mod tests {
         .expect("the fake reader succeeds");
         assert_eq!(
             fragment.as_deref(),
-            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ")
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ")
         );
 
         // The mirror case: an empty _PATH must not be opened, and must not
@@ -503,7 +532,7 @@ mod tests {
         .expect("no file read is attempted");
         assert_eq!(
             fragment.as_deref(),
-            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ")
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ")
         );
 
         // Both empty is the same as neither set.
