@@ -2587,6 +2587,27 @@ fn build_install_sdk_args(
     }
     if dry_run {
         argv.push("--dry-run".to_owned());
+    } else {
+        // `run_rocm_capture_for_paths` spawns `rocm` with null stdin, so
+        // `interactive_terminal()` is false in the child and an active default
+        // managed runtime would make the approval gate refuse with "re-run with
+        // `--yes`" — a flag no MCP caller of this tool can supply.
+        //
+        // Not `--yes` itself: that flag carries a second, unrelated consent —
+        // approving required system-package installs, which run `sudo`. This
+        // spawn has no terminal, so it could never answer a sudo password
+        // prompt; granting that consent would make the vLLM/OpenMPI step attempt
+        // an install it cannot complete and abort the engine auto-install that
+        // previously warned and continued. `--approve-replacing-active-default`
+        // grants only the runtime-displacement consent the gate asks for.
+        //
+        // Consent is not bypassed: `install_sdk` is in
+        // `mcp_tool_requires_direct_approval`, so a direct `rocmd mcp-call`
+        // needs `--allow-mutation` after an explicit user approval, and over the
+        // MCP protocol the tool is annotated `destructiveHint` for the client's
+        // approval UI. Mirrors the chat/MCP arm in `apps/rocm`. The dry-run
+        // branch never reaches the gate (it returns earlier), so it stays bare.
+        argv.push("--approve-replacing-active-default".to_owned());
     }
     Ok(argv)
 }
@@ -5879,6 +5900,48 @@ mod tests {
             error.to_string().contains("allow_system_prefix=true"),
             "{error:#}"
         );
+    }
+
+    /// The `install_sdk` MCP tool spawns `rocm` with null stdin, so a real
+    /// install over an active default managed runtime would hit the approval
+    /// gate's non-interactive refusal and bail asking for a flag no MCP caller
+    /// can pass. The real-install argv must therefore carry the consent flag;
+    /// the dry-run argv must not, because a dry run never reaches the gate and
+    /// the flag there would claim an approval the caller did not give.
+    ///
+    /// It must be `--approve-replacing-active-default` and never `--yes`:
+    /// `--yes` additionally approves running `sudo` for required system
+    /// packages, and a null-stdin spawn has no terminal on which that password
+    /// prompt could be answered.
+    #[test]
+    fn install_sdk_real_install_args_approve_only_the_runtime_replacement() -> Result<()> {
+        let arguments = serde_json::Map::new();
+
+        let real = build_install_sdk_args(&arguments, false)?;
+        assert!(
+            real.contains(&"--approve-replacing-active-default".to_owned()),
+            "real install argv must approve the replacement for the null-stdin spawn: {real:?}"
+        );
+        assert!(
+            !real.contains(&"--yes".to_owned()),
+            "real install argv must not grant the system-package consent it cannot answer: {real:?}"
+        );
+        assert!(
+            !real.contains(&"--dry-run".to_owned()),
+            "real install argv must not be a dry run: {real:?}"
+        );
+
+        let dry = build_install_sdk_args(&arguments, true)?;
+        assert!(
+            !dry.contains(&"--approve-replacing-active-default".to_owned())
+                && !dry.contains(&"--yes".to_owned()),
+            "dry-run argv must not carry a consent flag: {dry:?}"
+        );
+        assert!(
+            dry.contains(&"--dry-run".to_owned()),
+            "dry-run argv must carry --dry-run: {dry:?}"
+        );
+        Ok(())
     }
 
     #[test]
