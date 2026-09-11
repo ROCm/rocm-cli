@@ -1086,11 +1086,15 @@ mod tests {
 
     #[test]
     fn cancelled_job_renders_distinct_glyph_from_running() {
-        // Cancelled must not be silently folded into the `⋯ running` glyph —
-        // it has its own entry in the match and the key. Assert on the job's
-        // own rendered line (not just presence of '○' anywhere in the frame —
-        // the glyph key appended below the feed also contains '○', so that
-        // alone wouldn't catch a regression back to the shared wildcard arm).
+        // Characterization guard for pre-existing base behavior (the
+        // `JobStatus::Cancelled` match arm predates this PR): it must not be
+        // silently folded into the `⋯ running` glyph in some future change.
+        // The glyph-key line documenting `○ cancelled`, which *is* new to this
+        // PR, is covered separately by `activity_glyph_key_present_with_room_to_spare`.
+        // Assert on the job's own rendered line (not just presence of '○'
+        // anywhere in the frame — the glyph key appended below the feed also
+        // contains '○', so that alone wouldn't catch a regression back to the
+        // shared wildcard arm).
         let mut s = state_with_gpu();
         s.jobs
             .jobs

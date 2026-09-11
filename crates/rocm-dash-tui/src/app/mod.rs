@@ -487,7 +487,16 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_hours(6);
 /// Job id for the periodic background update check driven off the tick loop.
 /// Deliberately distinct from `update_manager`'s interactive `"update-check"`
 /// so the two never clobber each other's job slot / console output.
-const HOME_UPDATE_CHECK_JOB_ID: &str = "home-update-check";
+/// `pub(crate)` so the Home tab's activity feed (`ui::tabs::home`) can filter
+/// this job out — it is the tile's own plumbing, not user activity.
+pub(crate) const HOME_UPDATE_CHECK_JOB_ID: &str = "home-update-check";
+
+/// Bound on the background update check's own per-runtime index lookups, so a
+/// slow/unreachable index can't leave the job running indefinitely — the same
+/// principle as the CLI's own `STARTUP_UPDATE_CHECK_TIMEOUT_SECS`. The two
+/// crates can't share the constant (`apps/rocm` depends on `rocm-dash-tui`,
+/// not the reverse), so this value isn't required to match it.
+const HOME_UPDATE_CHECK_TIMEOUT_SECS: u64 = 5;
 
 pub struct AppState {
     pub connect: String,
@@ -7072,11 +7081,14 @@ mod tests {
             .jobs
             .job(HOME_UPDATE_CHECK_JOB_ID)
             .expect("job spawned on first due tick");
+        // Pinned to a literal, not `HOME_UPDATE_CHECK_TIMEOUT_SECS`: comparing
+        // the constant to itself can never catch an unintentional change to
+        // its value. A literal forces a deliberate test update (and a second
+        // thought) whenever the bound changes.
         assert_eq!(
             job.args.last().map(String::as_str),
-            Some(HOME_UPDATE_CHECK_TIMEOUT_SECS.to_string().as_str()),
-            "the background check must be bounded, matching the CLI's own \
-             STARTUP_UPDATE_CHECK_TIMEOUT_SECS convention: {:?}",
+            Some("5"),
+            "the background check's timeout bound must stay a deliberate choice: {:?}",
             job.args
         );
         assert!(job.args.iter().any(|a| a == "--timeout-secs"));
