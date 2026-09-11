@@ -19,6 +19,7 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -896,6 +897,11 @@ pub(crate) fn render_update_json(
     paths: &AppPaths,
     download_timeout_secs: Option<u64>,
 ) -> Result<UpdateJson> {
+    // Resolving a wheel-format manifest's latest version can fall through to
+    // Python resolution/bootstrap, which otherwise prints progress lines (and
+    // an installer's raw stdout) ahead of the JSON below, breaking the
+    // documented single-line contract on `UpdateJson`.
+    let _quiet = SuppressProgressOutput::new();
     let manifests = load_runtime_manifests(paths)?;
     let mut runtimes = Vec::with_capacity(manifests.len());
     for manifest in &manifests {
@@ -3709,7 +3715,42 @@ except Exception as exc:
 print(json.dumps(out))
 "#;
 
+thread_local! {
+    /// Set while rendering `--json` output, whose "single compact JSON line"
+    /// contract [`progress_line`] and the managed-Python installer would
+    /// otherwise break by writing extra lines to stdout ahead of the JSON.
+    static SUPPRESS_PROGRESS_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that silences [`progress_line`] and redirects managed-Python
+/// installer output away from stdout for its lifetime, restoring the prior
+/// state on drop (so nested callers compose correctly).
+struct SuppressProgressOutput {
+    previous: bool,
+}
+
+impl SuppressProgressOutput {
+    fn new() -> Self {
+        let previous = SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for SuppressProgressOutput {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.set(previous));
+    }
+}
+
+fn progress_output_suppressed() -> bool {
+    SUPPRESS_PROGRESS_OUTPUT.with(Cell::get)
+}
+
 fn progress_line(message: impl AsRef<str>) {
+    if progress_output_suppressed() {
+        return;
+    }
     println!("{}", message.as_ref());
     let _ = std::io::stdout().flush();
 }
@@ -4044,16 +4085,29 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     progress_line(format!("Installing Python {version} via uv..."));
-    let status = Command::new(&uv)
+    let install_stdio = || {
+        if progress_output_suppressed() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let install_output = Command::new(&uv)
         .args(["python", "install", &version])
         .envs(uv_command_env(paths))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(install_stdio())
+        .stderr(install_stdio())
+        .output()
         .context("failed to launch uv python install")?;
-    if !status.success() {
-        bail!("uv python install {version} failed with {status}");
+    if !install_output.status.success() {
+        let status = install_output.status;
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("uv python install {version} failed with {status}");
+        }
+        bail!("uv python install {version} failed with {status}: {stderr}");
     }
 
     progress_line(format!("Finding Python {version}..."));
