@@ -536,6 +536,37 @@ async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
     );
 }
 
+/// The other half of the loop: the `apply with: rocm fix <id>` the report prints
+/// has to name a command this host will actually act on.
+///
+/// `rocm diagnose` selects a checker by the platform families the checker
+/// registers; `rocm fix` then re-gates the same id on the *recipe's* list
+/// against the running OS. WSL2 is its own family on both sides, so a recipe
+/// that omits it printed the plan and then exited 3 on a platform its checker
+/// deliberately answers for. This asserts the rc, not merely the output: the
+/// wrong-OS refusal prints the recipe first, so the text alone cannot tell the
+/// two outcomes apart.
+#[then("the CLI can act on the fix the diagnosis named")]
+async fn assert_named_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_vllm_oom(&report, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&["fix", &fix_id], rc, &fix_output, &fix_stderr)
+    );
+    assert!(
+        fix_output.to_lowercase().contains("print-only"),
+        "{fix_id} is advisory, so it must say it only printed a plan:\n{fix_output}"
+    );
+}
+
 #[then("the OOM remedy distinguishes a busy GPU from a model that does not fit")]
 async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
     let (report, output) = parsed_diagnosis(world);

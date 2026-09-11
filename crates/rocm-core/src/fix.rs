@@ -74,6 +74,12 @@ struct FixRecipe {
 /// move are the ones about wheels, environment variables and PATH.
 const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
 const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
+/// For entries whose fault is not tied to bare-metal kernel plumbing.
+///
+/// `fix-16-vllm-oom` is the case: its remediation is vLLM CLI flags, and its
+/// checker already opts into `wsl` for that reason, so a Linux-only recipe made
+/// `rocm diagnose` name a command `rocm fix` then refused to run.
+const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -410,7 +416,12 @@ const RECIPES: &[FixRecipe] = &[
             "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.",
             "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).",
         ],
-        applies_on: LINUX_ONLY,
+        // Matches `check_16_vllm_oom`'s `["linux", "wsl"]` registration: WSL2 is
+        // the supported way to serve from a Windows host and the failure mode is
+        // just as real there, so the fix has to be runnable where the diagnosis
+        // is reachable. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        applies_on: LINUX_AND_WSL,
         runner: None,
     },
     // The number is a stable handle, not a position: `fix-16` is held by the
@@ -713,6 +724,16 @@ pub(crate) fn recipe_verify_notes_and_run_commands(
             .collect::<Vec<_>>();
         (recipe.verify, recipe.notes, run_commands)
     })
+}
+
+/// Test-only view of the platform families a recipe is runnable on.
+///
+/// `None` when no recipe carries `fix_id`. Lets the diagnosis catalog assert
+/// that every platform a checker answers on is a platform `rocm fix` will
+/// actually act on, which `recipe_verify_notes_and_run_commands` cannot see.
+#[cfg(test)]
+pub(crate) fn recipe_applies_on(fix_id: &str) -> Option<&'static [&'static str]> {
+    find_recipe(fix_id).map(|recipe| recipe.applies_on)
 }
 
 /// The platform family a recipe's `applies_on` is matched against.

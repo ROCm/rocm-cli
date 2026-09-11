@@ -3772,6 +3772,38 @@ mod tests {
     }
 
     #[test]
+    fn every_checker_platform_is_covered_by_its_recipe() {
+        // `render_report_text` ends a matched diagnosis with `apply with: rocm
+        // fix {id}`, and `fix::apply` then gates that id on the recipe's
+        // `applies_on` against the *running* OS. So any platform family a
+        // checker is registered for but its recipe omits is a platform where the
+        // tool names a command and then refuses to run it -- which is exactly
+        // what `fix-16-vllm-oom` did on WSL2, where the checker opts into `wsl`
+        // and the recipe was LINUX_ONLY.
+        //
+        // Only one direction is an error. A recipe may legitimately apply more
+        // widely than its checker answers (a user can reach `rocm fix <id>`
+        // directly, without a diagnosis), so this asserts containment rather
+        // than equality.
+        for (check, families) in CHECKERS {
+            let id = check(&Examination::default(), "").id;
+            let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
+                panic!(
+                    "checker id `{id}` has no recipe in the fix catalog, so the \
+                     `apply with: rocm fix {id}` line diagnose prints is dead"
+                )
+            });
+            for family in *families {
+                assert!(
+                    applies_on.contains(family),
+                    "`{id}` is diagnosed on `{family}` but its recipe only applies on \
+                     {applies_on:?}; `rocm fix {id}` would print the plan and then exit 3 there"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
         // fix-15 and fix-16 live in two places: the `rocm fix` catalog
         // (crate::fix::RECIPES) and the Fix these checks embed in a Diagnosis.
