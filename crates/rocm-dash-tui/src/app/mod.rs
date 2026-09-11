@@ -503,6 +503,15 @@ pub struct AppState {
     pub theme_picker_sel: usize,
     /// Scroll offset (in lines) inside the Bench Detail modal. Reset on Open.
     pub bench_detail_scroll: u16,
+    /// Scroll offset (in lines) inside the Help / GlobalHelp overlays. Both
+    /// modals are mutually exclusive so one field suffices; reset on open.
+    pub help_scroll: u16,
+    /// Last-measured upper bound for `help_scroll`, written back by the
+    /// renderer each frame (see `ui::modal::draw_help` /
+    /// `draw_global_help`), mirroring `chat_max_scroll`. Clamps `scroll_help`
+    /// so a "jump to end" (`i16::MAX`) can't leave the offset far past the
+    /// real content length.
+    pub help_max_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.
     /// Shared by whichever operational manager is showing its console; reset
     /// when an overlay opens (`close_overlays`).
@@ -699,6 +708,8 @@ impl AppState {
             theme,
             theme_picker_sel,
             bench_detail_scroll: 0,
+            help_scroll: 0,
+            help_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -988,7 +999,7 @@ impl AppState {
     /// manager is open at a time, so this reflects that one; `true` when none is
     /// open. Gates the Esc back-out so Esc cancels the innermost layer first
     /// (and is ignored while a job runs) before it can eject the manager.
-    fn active_overlay_at_root(&self) -> bool {
+    pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
             w.browser.is_none()
                 && w.picker.is_none()
@@ -1043,10 +1054,24 @@ impl AppState {
     }
 
     /// Whether an `Esc` keypress should back out of an inline manager: true on
-    /// ROCm/Serving while a manager overlay is open AND that manager is at its
-    /// root screen. The event loop closes the manager and returns focus to the
+    /// any tab while a manager overlay is open AND that manager is at its root
+    /// screen. The event loop closes the manager and returns focus to the
     /// Actions list when this holds. Pure read so it is unit-testable (the
     /// mutation lives in the event-loop arm).
+    ///
+    /// Not just ROCm/Serving: a manager can be opened from a non-domain tab
+    /// (e.g. `examine_manager` from an Observe hotkey). This used to be gated
+    /// on `active_tab == Rocm | Serving`, so on other tabs the manager's own
+    /// event-loop arm handled root Esc directly (every overlay type already
+    /// has a dedicated `Some(Ok(CtEvent::Key(k))) if state.<overlay>.is_some()`
+    /// arm ahead of the generic handler, and each self-closes on root Esc
+    /// regardless of `active_tab` — so there was no "Modal stays set but
+    /// invisible" bug to fix here). Dropping the tab guard is a harmless
+    /// generalization: it moves the close from the manager's own `on_key` to
+    /// this shared path (`close_overlays()` + `pane_focus = Actions`) so a
+    /// future manager doesn't need to duplicate that root-Esc handling.
+    /// `pane_focus` is meaningless outside Rocm/Serving, so resetting it there
+    /// is a harmless no-op.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -1058,8 +1083,7 @@ impl AppState {
     /// returns focus from the Details preview to the Actions list via the normal
     /// `PaneFocusActions` key path.
     pub(crate) fn should_pane_back_out(&self, code: crossterm::event::KeyCode) -> bool {
-        matches!(self.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-            && self.has_open_overlay()
+        self.has_open_overlay()
             && self.active_overlay_at_root()
             && matches!(code, crossterm::event::KeyCode::Esc)
     }
@@ -1107,6 +1131,25 @@ impl AppState {
         let cur = i32::from(self.bench_detail_scroll);
         let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
         self.bench_detail_scroll = next;
+    }
+
+    /// Reset the Help / GlobalHelp scroll offset (called when opening either
+    /// modal, so a stale offset never carries over from a previous session).
+    pub const fn reset_help_scroll(&mut self) {
+        self.help_scroll = 0;
+        self.help_max_scroll = 0;
+    }
+
+    /// Adjust the Help / GlobalHelp scroll. `delta` is in lines; clamped
+    /// against `[0, help_max_scroll]` (the latter is last written back by the
+    /// renderer, see `help_max_scroll`), so `i16::MIN`/`i16::MAX` ("jump to
+    /// start/end") land exactly on `0`/`help_max_scroll` instead of
+    /// overflowing into an offset far past the real content length.
+    pub fn scroll_help(&mut self, delta: i16) {
+        let cur = i32::from(self.help_scroll);
+        let max = i32::from(self.help_max_scroll);
+        let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
+        self.help_scroll = next;
     }
 
     /// Install the resolved chat endpoint and set the initial consent state.
@@ -1338,7 +1381,9 @@ impl AppState {
         self.close_overlays();
         self.approval = Some(PendingApproval {
             req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
-            choice: crate::ui::approval::ApprovalChoice::Approve,
+            // An unreviewed tool call the model wants to run defaults to Deny,
+            // unlike the shared `ApprovalChoice` default (see its doc comment).
+            choice: crate::ui::approval::ApprovalChoice::Deny,
             name: intent.name,
             arguments: intent.arguments,
         });
@@ -1715,12 +1760,27 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
             }),
             true,
         );
-        Some(
-            std::sync::Arc::new(crate::agent::MockAgentClient::with_tool_call(
+        Some(std::sync::Arc::new(
+            crate::agent::MockAgentClient::with_tool_call_and_approval_trigger(
                 "GPU-2 is running hot: 87% util, 71°C, drawing 250 W (90 GB/192 GB VRAM).",
                 "gpu_status",
-            )) as std::sync::Arc<dyn crate::agent::AgentClient>,
-        )
+                "install the sdk",
+                crate::tool_exec::ApprovalIntent {
+                    title: "Install TheRock ROCm SDK?".to_string(),
+                    body: vec![
+                        "install_sdk --channel release --format wheel --prefix ~/rocm-sdk"
+                            .to_string(),
+                    ],
+                    name: "install_sdk".to_string(),
+                    arguments: serde_json::json!({
+                        "channel": "release",
+                        "format": "wheel",
+                        "prefix": "~/rocm-sdk",
+                    }),
+                },
+                chat_tx.clone(),
+            ),
+        ) as std::sync::Arc<dyn crate::agent::AgentClient>)
     } else {
         // An endpoint we launched ourselves (managed-services registry) takes
         // priority over the well-known default port — this is how a tool-launched
@@ -2538,6 +2598,7 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             state.modal = if state.modal == Modal::Help {
                 Modal::None
             } else {
+                state.reset_help_scroll();
                 Modal::Help
             };
         }
@@ -2636,7 +2697,10 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                     state.modal = Modal::Options;
                     state.options_tab = 0;
                 }
-                1 => state.modal = Modal::GlobalHelp,
+                1 => {
+                    state.reset_help_scroll();
+                    state.modal = Modal::GlobalHelp;
+                }
                 _ => return true, // Quit
             },
             Modal::Palette => {
@@ -2648,8 +2712,11 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             _ => {}
         },
         // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
-        // (the only scrollable detail) is no longer reachable, so modal scroll
-        // is a no-op until/unless a scrollable Observe detail is wired.
+        // is no longer reachable, so Detail itself has nothing to scroll. Help
+        // and GlobalHelp are the only modals that currently use this action.
+        KeyAction::ScrollModal(delta) if matches!(state.modal, Modal::Help | Modal::GlobalHelp) => {
+            state.scroll_help(delta);
+        }
         KeyAction::ScrollModal(_) => {}
         KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
         KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
@@ -3304,19 +3371,34 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
             _ => KeyAction::Nothing,
         };
     }
-    // Help absorbs everything except quit / close / ? toggle.
+    // Help absorbs everything except quit / close / ? toggle / scroll — the
+    // body can run longer than the popup at small terminal sizes.
     if *modal == Modal::Help {
         return match k.code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::ScrollModal(-1),
+            KeyCode::PageDown => KeyAction::ScrollModal(10),
+            KeyCode::PageUp => KeyAction::ScrollModal(-10),
+            KeyCode::Char('g') | KeyCode::Home => KeyAction::ScrollModal(i16::MIN),
+            KeyCode::Char('G') | KeyCode::End => KeyAction::ScrollModal(i16::MAX),
             _ => KeyAction::Nothing,
         };
     }
-    // Global help overlay (opened from the Esc menu): close-only.
+    // Global help overlay (opened from the Esc menu): close + scroll, same as
+    // the contextual Help above (shares `help_scroll`, the two are mutually
+    // exclusive).
     if *modal == Modal::GlobalHelp {
         return match k.code {
             KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
+            KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
+            KeyCode::Char('k') | KeyCode::Up => KeyAction::ScrollModal(-1),
+            KeyCode::PageDown => KeyAction::ScrollModal(10),
+            KeyCode::PageUp => KeyAction::ScrollModal(-10),
+            KeyCode::Char('g') | KeyCode::Home => KeyAction::ScrollModal(i16::MIN),
+            KeyCode::Char('G') | KeyCode::End => KeyAction::ScrollModal(i16::MAX),
             _ => KeyAction::Nothing,
         };
     }
@@ -3351,15 +3433,14 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
     }
     match k.code {
         KeyCode::Char('q') => KeyAction::Quit,
-        // Esc opens the main menu when idle, except on Chat (where Esc keeps its
-        // existing chat meaning) — managers/approval are routed upstream.
+        // Esc opens the main menu when idle — managers/approval are routed
+        // upstream, and Chat-focused Esc is handled by the short-circuit above.
         // On ROCm/Serving, Esc first steps out of the detail pane (resolved
         // against focus in `apply_action`); elsewhere it opens the main menu.
         KeyCode::Esc if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
             KeyAction::PaneEscape
         }
-        KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
-        KeyCode::Esc => KeyAction::Nothing,
+        KeyCode::Esc => KeyAction::OpenMenu,
         KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
@@ -3519,7 +3600,7 @@ mod tests {
     #[test]
     fn q_quits_esc_does_not() {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
-        // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
+        // P4: Esc opens the main menu (it never quits).
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
     }
 
@@ -3665,17 +3746,21 @@ mod tests {
     }
 
     #[test]
-    fn back_out_only_on_domain_tabs_with_a_manager() {
+    fn back_out_requires_an_open_manager_on_any_tab() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // No manager open → never backs out, even on a domain tab.
         s.active_tab = ActiveTab::Rocm;
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
-        // Manager open but on a non-domain tab (opened from Observe hotkey) →
-        // the manager keeps its own Esc handling; no domain back-out.
+        // Manager open on a non-domain tab (opened from Observe hotkey) →
+        // Esc backs out uniformly regardless of tab, now that the
+        // Rocm/Serving-only gate is gone. New coverage of the generalized
+        // behavior — the manager's own event-loop arm already closed it on
+        // this tab before the gate was removed, so this isn't a regression
+        // test for a prior bug.
         s.active_tab = ActiveTab::Observe;
         s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         assert!(s.has_open_overlay());
-        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
 
     #[test]
@@ -4341,12 +4426,12 @@ mod tests {
     }
 
     #[test]
-    fn esc_opens_menu_when_idle_but_not_on_chat() {
-        // Idle (non-Chat) tabs: Esc opens the btop main menu.
+    fn esc_opens_menu_when_idle_on_any_tab() {
+        // Idle tabs: Esc opens the btop main menu, Chat included when unfocused
+        // (Chat-focused Esc is handled by the short-circuit above this match).
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Home), KeyAction::OpenMenu);
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
-        // Chat keeps its existing Esc meaning (no menu).
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::Nothing);
+        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::OpenMenu);
         // While an overlay modal owns the screen, Esc closes it (not OpenMenu).
         assert_eq!(
             handle_key(
@@ -4596,12 +4681,47 @@ mod tests {
                 ChatKeyCtx::default(),
             )
         };
-        // j/k inside Help do nothing (Help has no scrollable body today).
-        assert_eq!(with_help(KeyCode::Char('j')), KeyAction::Nothing);
+        // j/k inside Help scroll its (now scrollable) body.
+        assert_eq!(with_help(KeyCode::Char('j')), KeyAction::ScrollModal(1));
+        assert_eq!(with_help(KeyCode::Char('k')), KeyAction::ScrollModal(-1));
         assert_eq!(with_help(KeyCode::Tab), KeyAction::Nothing);
         assert_eq!(with_help(KeyCode::Esc), KeyAction::CloseModal);
         assert_eq!(with_help(KeyCode::Enter), KeyAction::CloseModal);
         assert_eq!(with_help(KeyCode::Char('q')), KeyAction::Quit);
+    }
+
+    #[test]
+    fn global_help_modal_j_k_emit_scroll() {
+        let with_global_help = |c| {
+            handle_key(
+                press(c),
+                ActiveTab::Observe,
+                &Modal::GlobalHelp,
+                ChatKeyCtx::default(),
+            )
+        };
+        assert_eq!(
+            with_global_help(KeyCode::Char('j')),
+            KeyAction::ScrollModal(1)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('k')),
+            KeyAction::ScrollModal(-1)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::PageDown),
+            KeyAction::ScrollModal(10)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('g')),
+            KeyAction::ScrollModal(i16::MIN)
+        );
+        assert_eq!(
+            with_global_help(KeyCode::Char('G')),
+            KeyAction::ScrollModal(i16::MAX)
+        );
+        assert_eq!(with_global_help(KeyCode::Esc), KeyAction::CloseModal);
+        assert_eq!(with_global_help(KeyCode::Char('q')), KeyAction::Quit);
     }
 
     #[test]
@@ -5395,10 +5515,47 @@ mod tests {
     }
 
     #[test]
+    fn slash_help_resets_stale_scroll_offset() {
+        let mut s = st();
+        s.help_scroll = 42;
+        assert_eq!(s.handle_slash_command("/help"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+        assert_eq!(s.help_scroll, 0);
+    }
+
+    #[test]
     fn slash_question_mark_opens_help_modal() {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
         assert_eq!(s.modal, Modal::Help);
+    }
+
+    #[test]
+    fn slash_question_mark_resets_stale_scroll_offset() {
+        let mut s = st();
+        s.help_scroll = 17;
+        assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
+        assert_eq!(s.modal, Modal::Help);
+        assert_eq!(s.help_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_help_clamps_jump_to_end_so_scrolling_back_up_moves_immediately() {
+        // Regression: `scroll_help` used to clamp only at 0, with no upper
+        // bound, so `G`/`End` (ScrollModal(i16::MAX)) set help_scroll to
+        // 32767 regardless of the real content length. Scrolling back up by
+        // one row then took ~32700 keypresses to have any visible effect.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.help_max_scroll = 10;
+        s.scroll_help(i16::MAX); // "jump to end"
+        assert_eq!(s.help_scroll, 10, "jump-to-end lands exactly on the max");
+        s.scroll_help(-1); // one `k`/`Up`
+        assert_eq!(
+            s.help_scroll, 9,
+            "scrolling up moves immediately, not after ~32k presses"
+        );
+        s.scroll_help(i16::MIN); // "jump to start"
+        assert_eq!(s.help_scroll, 0);
     }
 
     #[test]
@@ -6481,7 +6638,8 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
         });
-        // Enter on the default (Approve) choice yields an Approve verdict.
+        // The modal defaults to Deny (item #16); move to Approve, then confirm.
+        s.on_approval_key(crossterm::event::KeyCode::Tab);
         let verdict = s.on_approval_key(crossterm::event::KeyCode::Enter);
         assert_eq!(verdict, Some(crate::ui::approval::ApprovalVerdict::Approve));
         let (name, args) = s.take_approval().expect("approval taken on approve");
@@ -6608,16 +6766,21 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({}),
         });
-        // Tab toggles the cursor to Deny without producing a verdict.
-        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        // Defaults to Deny (the safer default; see item #16).
         assert_eq!(
             s.approval.as_ref().unwrap().choice,
             crate::ui::approval::ApprovalChoice::Deny
         );
-        // Enter now confirms Deny.
+        // Tab toggles the cursor to Approve without producing a verdict.
+        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        assert_eq!(
+            s.approval.as_ref().unwrap().choice,
+            crate::ui::approval::ApprovalChoice::Approve
+        );
+        // Enter now confirms Approve.
         assert_eq!(
             s.on_approval_key(crossterm::event::KeyCode::Enter),
-            Some(crate::ui::approval::ApprovalVerdict::Deny)
+            Some(crate::ui::approval::ApprovalVerdict::Approve)
         );
     }
 

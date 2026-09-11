@@ -46,6 +46,8 @@ Feature: Interactive dashboard
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
+    When the user scrolls to the end of dashboard help
+    Then replay controls guidance is displayed
     When the user closes dashboard help
     And the user quits the dashboard
     Then the dashboard exits successfully
@@ -123,3 +125,60 @@ Feature: Interactive dashboard
     Then the launcher shows the model serving
     When the user quits the launcher
     Then the launcher exits successfully
+
+  # Characterization coverage: this scenario observes that Escape closes the
+  # manager on a non-domain tab, but the services manager's own event-loop arm
+  # would close it on root Esc even without the tab-independent back-out path
+  # this PR generalized, so a revert of that change would not turn this red.
+  # The discriminating regression test for that change is the unit test
+  # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
+  # app/mod.rs, which does fail on revert.
+  @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
+  Scenario: dash-11 - Escape closes a manager overlay on any tab
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-chat-approval-defaults-to-deny @requires-os:linux
+  Scenario: dash-12 - A surfaced tool call defaults to Deny and confirming without moving denies it
+    Given interactive chat uses an offline assistant
+    When the user opens interactive chat
+    And the user sends a message that triggers a tool approval
+    Then a tool approval prompt is displayed
+    When the user confirms the approval prompt without moving the cursor
+    Then the tool call is shown as declined
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+
+  @id:dash-instance-detail-dims-backdrop @requires-os:linux
+  Scenario: dash-13 - Opening instance detail dims the screen behind the popup
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens instance detail
+    Then instance details are displayed
+    And the backdrop behind the popup is dimmed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-chat-idle-escape-opens-menu @requires-os:linux
+  Scenario: dash-14 - Escape opens the menu when idle on the Chat tab
+    When the user opens the dashboard with demo data
+    And the user opens the Chat view
+    When the user presses Escape
+    Then the dashboard menu is displayed
+    When the user presses Escape
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-theme-picker-dims-backdrop @requires-os:linux
+  Scenario: dash-15 - Opening the theme picker dims the screen behind it
+    When the user opens the dashboard with demo data
+    And the user opens the theme picker
+    Then the backdrop behind the popup is dimmed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

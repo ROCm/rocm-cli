@@ -42,7 +42,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
+use crate::app::{ActiveTab, AppState, ChatConsent, ConnState, FooterChip, KeyAction, Modal};
 use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -123,7 +123,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
+        Modal::Help => {
+            state.help_max_scroll =
+                modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll);
+        }
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
@@ -137,7 +140,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::GlobalHelp => {
+            state.help_max_scroll = modal::draw_global_help(f, body, &theme, state.help_scroll);
+        }
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -419,23 +424,55 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    // On a domain tab with a manager open inline, the pane keys route to the
-    // manager — advertise the back-out instead of the (now wrong) select/open.
-    if is_action_tab && state.has_open_overlay() {
+    // Exactly one Esc chip is shown at all times, and it must match what Esc
+    // actually does — the real routing priority (highest first) is: a pending
+    // chat approval owns every key; then an open manager overlay backs itself
+    // out; then a `Modal::*` overlay closes; then a focused/gating Chat tab
+    // absorbs Esc; only once none of those apply does Esc fall through to the
+    // uniform "menu" fallback (item #35). Mirror that order here so the chip
+    // never advertises `menu` while a click on it would actually do something
+    // else.
+    if state.approval.is_some() {
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
-    } else if matches!(
-        state.active_tab,
-        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-    ) {
-        segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
-        segs.push(Seg::Sep(" select  "));
-        segs.push(Seg::Key("Enter", Some(enter_action)));
-        segs.push(Seg::Sep(if is_action_tab {
-            " open  "
-        } else {
-            " detail  "
-        }));
+    } else if state.has_open_overlay() {
+        // A manager is open but not at its root layer (sub-popup, picker,
+        // approval, or job console) — Esc is handled by that layer's own
+        // event-loop arm, not by `should_pane_back_out`/`OpenMenu`. `None`
+        // keeps the chip non-clickable so it can't dispatch the wrong action.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.modal != Modal::None {
+        segs.push(Seg::Key("Esc", Some(KeyAction::CloseModal)));
+        segs.push(Seg::Sep(" close  "));
+    } else if state.active_tab == ActiveTab::Chat
+        && state.chat_detect_offer.is_some()
+        && state.chat_consent != ChatConsent::Accepted
+    {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatDetectDismiss)));
+        segs.push(Seg::Sep(" dismiss  "));
+    } else if state.active_tab == ActiveTab::Chat && state.chat_focused {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatBlur)));
+        segs.push(Seg::Sep(" unfocus  "));
+    } else {
+        segs.push(Seg::Key("Esc", Some(KeyAction::OpenMenu)));
+        segs.push(Seg::Sep(" menu  "));
+        if matches!(
+            state.active_tab,
+            ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+        ) {
+            segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
+            segs.push(Seg::Sep(" select  "));
+            segs.push(Seg::Key("Enter", Some(enter_action)));
+            segs.push(Seg::Sep(if is_action_tab {
+                " open  "
+            } else {
+                " detail  "
+            }));
+        }
     }
     // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
     // ROCm/Serving the Actions list is the single path, so no letter chips.
@@ -551,5 +588,61 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+
+    #[test]
+    fn footer_shows_esc_menu_chip_when_no_overlay_open() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let state = AppState::new("t".into(), "default-dark".into());
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        let _ = chips
+            .iter()
+            .find(|c| c.action == KeyAction::OpenMenu)
+            .expect("a fallback Esc chip opening the menu must always be present");
+    }
+
+    #[test]
+    fn footer_esc_chip_is_not_clickable_menu_when_overlay_has_a_sub_popup_open() {
+        // Regression: with a manager open but not at its root layer (here, a
+        // running job console), `has_open_overlay()` is true but
+        // `active_overlay_at_root()` is false. The chip must not fall through
+        // to the generic `OpenMenu` arm — that key is actually consumed by the
+        // manager's own event-loop arm, which cancels the sub-layer, not the
+        // menu. Any chip shown here must be non-clickable (`action == None`).
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenMenu,
+                "no chip may dispatch OpenMenu while a sub-popup owns Esc"
+            );
+        }
     }
 }

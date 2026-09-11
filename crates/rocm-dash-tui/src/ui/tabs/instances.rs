@@ -16,7 +16,7 @@ use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
 use crate::app::{AppState, ConnState, KeyAction};
 use crate::ui::format;
-use crate::ui::modal::{centered_rect, draw_popup_frame};
+use crate::ui::modal::{centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::trunc;
@@ -616,6 +616,7 @@ const fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
 }
 
 pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    grey_overlay(f);
     let popup = centered_rect(85, 85, 120, 36, area);
 
     if state.instances.is_empty() {
@@ -978,6 +979,8 @@ mod tests {
             theme: Theme::default_dark(),
             theme_picker_sel: 0,
             bench_detail_scroll: 0,
+            help_scroll: 0,
+            help_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
