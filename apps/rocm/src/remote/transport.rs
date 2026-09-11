@@ -27,7 +27,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// Captured result of running a command on the remote host.
 ///
@@ -198,6 +198,23 @@ fn validate_destination(destination: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a local or remote `scp` path that would be read as an option
+/// rather than a path — the same risk [`validate_destination`] guards
+/// against for the ssh destination, but here for the two path arguments scp
+/// takes. Neither is expected to come from outside this process today, but
+/// an artifact name or staging path is not a hostname either, and both cross
+/// this boundary as plain strings rather than a type that already rules a
+/// leading `-` out.
+fn validate_scp_path(path: &str, which: &str) -> Result<()> {
+    if path.starts_with('-') {
+        bail!(
+            "`{path}` is not a usable {which} path for scp: a path starting with \
+             `-` would be read as an option rather than as a file"
+        );
+    }
+    Ok(())
+}
+
 /// SSH-backed control channel that shells out to the system `ssh`/`scp`.
 #[derive(Debug, Clone)]
 pub(crate) struct SshTransport {
@@ -266,7 +283,9 @@ impl SshTransport {
     }
 
     /// Argument vector for `scp`, excluding the `scp` program name.
-    fn scp_argv(&self, local_path: &str, remote_path: &str) -> Vec<String> {
+    fn scp_argv(&self, local_path: &str, remote_path: &str) -> Result<Vec<String>> {
+        validate_scp_path(local_path, "local")?;
+        validate_scp_path(remote_path, "remote")?;
         let mut args = config_args();
         args.extend([
             "-o".to_owned(),
@@ -283,7 +302,7 @@ impl SshTransport {
         }
         args.push(local_path.to_owned());
         args.push(format!("{}:{remote_path}", self.destination));
-        args
+        Ok(args)
     }
 }
 
@@ -306,18 +325,36 @@ impl Transport for SshTransport {
                 )
             })?;
 
-        if let Some(payload) = stdin {
+        // Writing the payload and reading stdout/stderr must not be sequenced
+        // one after the other: ssh does not have to drain stdin before it
+        // starts producing output, and with both pipes bounded by the OS
+        // (commonly ~64KiB), a payload larger than that paired with any
+        // remote output can deadlock — us blocked in `write_all` waiting for
+        // ssh to read more of stdin, ssh blocked writing stdout/stderr
+        // waiting for us to read it, and `wait_with_output` (which would
+        // drain both) never even reached. Writing on its own thread lets the
+        // main thread reach `wait_with_output` immediately, which drains
+        // stdout/stderr concurrently with the write.
+        let writer = if let Some(payload) = stdin {
             let mut handle = child
                 .stdin
                 .take()
                 .context("ssh stdin was not available to write to")?;
-            handle
-                .write_all(payload.as_bytes())
-                .with_context(|| format!("failed to send input to {}", self.destination))?;
-            // Dropping closes the pipe, which is what tells the remote reader the
-            // input has ended. Without it a remote `read` waits forever.
-            drop(handle);
-        }
+            let payload = payload.to_owned();
+            let destination = self.destination.clone();
+            Some(std::thread::spawn(move || -> Result<()> {
+                handle
+                    .write_all(payload.as_bytes())
+                    .with_context(|| format!("failed to send input to {destination}"))?;
+                // Dropping closes the pipe, which is what tells the remote
+                // reader the input has ended. Without it a remote `read`
+                // waits forever.
+                drop(handle);
+                Ok(())
+            }))
+        } else {
+            None
+        };
 
         let output = child.wait_with_output().with_context(|| {
             format!(
@@ -325,6 +362,12 @@ impl Transport for SshTransport {
                 self.destination
             )
         })?;
+
+        if let Some(writer) = writer {
+            writer.join().map_err(|_| {
+                anyhow!("the stdin writer thread for {} panicked", self.destination)
+            })??;
+        }
 
         // 255 is ssh's own: it could not connect, could not authenticate, or the
         // connection broke. Reporting it as a remote answer is what turns an
@@ -352,7 +395,7 @@ impl Transport for SshTransport {
     fn push_file(&self, local_path: &Path, remote_path: &str) -> Result<()> {
         let local = local_path.to_string_lossy();
         let output = Command::new("scp")
-            .args(self.scp_argv(&local, remote_path))
+            .args(self.scp_argv(&local, remote_path)?)
             .stdin(Stdio::null())
             .output()
             .with_context(|| format!("failed to launch scp to {}", self.destination))?;
@@ -602,11 +645,30 @@ mod tests {
     #[test]
     fn scp_argv_uses_uppercase_port_and_a_remote_colon_path() {
         let transport = SshTransport::new("user@gpubox", Some(2222)).unwrap();
-        let argv = transport.scp_argv("/tmp/rocm", "/tmp/rocm");
+        let argv = transport.scp_argv("/tmp/rocm", "/tmp/rocm").unwrap();
         // Capital -P: scp's port flag differs from ssh's, and getting it wrong
         // silently copies to the default port instead.
         assert!(argv.windows(2).any(|pair| pair == ["-P", "2222"]));
         assert_eq!(argv.last().unwrap(), "user@gpubox:/tmp/rocm");
+    }
+
+    #[test]
+    fn scp_argv_refuses_a_local_or_remote_path_starting_with_a_dash() {
+        // Mirrors validate_destination's guard for the ssh destination: scp
+        // reads a leading `-` as an option of its own, not as a file, on
+        // either side of the copy.
+        let transport = SshTransport::new("user@gpubox", None).unwrap();
+        let local = transport
+            .scp_argv("-oProxyCommand=evil", "/tmp/rocm")
+            .unwrap_err()
+            .to_string();
+        assert!(local.contains("local path"), "{local}");
+
+        let remote = transport
+            .scp_argv("/tmp/rocm", "-oProxyCommand=evil")
+            .unwrap_err()
+            .to_string();
+        assert!(remote.contains("remote path"), "{remote}");
     }
 
     #[test]
