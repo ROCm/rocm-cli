@@ -74,7 +74,7 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (24 failure modes)
+## Closed catalog (25 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -100,6 +100,7 @@ reporting confident nonsense.
 | `fix-14-adrenalin-too-old` | windows | Adrenalin / kernel-mode driver too old for the HIP SDK | `hipInfo` can't enumerate, "driver too old", HSA "no agents found" | no |
 | `fix-15-msvc-redist` | windows | MSVC runtime missing (HIP DLLs can't load) | `vcruntime140.dll` / `vcruntime140_1.dll` missing | no |
 | `fix-17-torch-dlpack` | linux | `torch-c-dlpack-ext` loads its CUDA prebuilt on a ROCm torch, aborting vLLM's engine start at import time | vLLM engine start fails on import; error names `torch_c_dlpack_ext` or tvm_ffi's `_optional_torch_c_dlpack` | no |
+| `fix-18-comgr-conflict` | linux/wsl | The code object manager library (`libamd_comgr`) that would load belongs to a different installation than the HIP runtime that would load, so device code compilation fails with an error naming neither | compilation error naming neither library; `rocm examine --json`'s `comgr_selected`/`hip_selected` resolve to two different `install_root`s | no |
 | `fix-19-shm-too-small` | linux/wsl | `/dev/shm` too small for a serving workload, which needs gigabytes where a container and WSL2 both default to 64 MB | reported under 1 GiB; a data-loader worker killed by a bus error, or a failed write to a temporary file, with nothing naming shared memory | no |
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | no |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | no |
@@ -116,7 +117,7 @@ they answer for a different platform family.
 
 Linux-only: fix-3, -4, -5, -7, -10, -11, -12, -17. Windows-only: fix-13, -14, -15.
 WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
-Linux + WSL: fix-19. Linux + Windows + WSL: fix-1, -2, -6, -8.
+Linux + WSL: fix-18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
 
 ## Framework routing
 

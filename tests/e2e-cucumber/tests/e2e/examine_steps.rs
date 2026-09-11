@@ -1039,7 +1039,7 @@ async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
     // Each entry has to carry enough to act on. A list of bare paths would not
     // say which install a copy belongs to, which is the whole question.
     for copy in copies {
-        for field in ["path", "real_path", "version", "source"] {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
             assert!(
                 copy.get(field).is_some(),
                 "a reported copy is missing `{field}`, so a reader cannot tell \
@@ -1049,14 +1049,117 @@ async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
     }
 }
 
+#[then("it lists the HIP runtime libraries the machine holds the same way")]
+async fn assert_hip_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("hip_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Whether the code object manager belongs to the active runtime is a
+    // question about two libraries, not one -- so the HIP side has to carry
+    // the same `install_root` attribution the comgr side does, or there is
+    // nothing for the conflict check to compare against.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported HIP runtime copy is missing `{field}`, so a reader \
+                 cannot tell where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+// Sources the loader itself actually consults, mirrored from
+// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
+// `managed-runtime` hit is evidence a copy exists, not evidence anything
+// would load it. Shared by the HIP and comgr selection assertions below so
+// the two cannot drift apart.
+const LOADER_PATH_SOURCES: [&str; 3] = ["active-runtime", "ld-library-path", "loader-cache"];
+
+#[then("it names which HIP runtime copy would load, or says it found none")]
+async fn assert_hip_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["hip_paths"]
+        .as_array()
+        .expect("hip_paths must be a list")
+        .clone();
+    let selected = value
+        .get("hip_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+        // Same reasoning as the comgr assertion below: `hip_paths: []` and
+        // `hip_selected: null` also hold by nothing more than `Examination`'s
+        // own defaults, so without this the assertion cannot tell "probed,
+        // found none" from "never probed".
+        let notes = value["notes"].as_array().expect("notes must be a list");
+        assert!(
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|note| note.contains("no libamdhip64 found")),
+            "no HIP runtime copies were reported, but the inspection's notes \
+             never say the search ran and found none -- so this cannot tell \
+             \"probed, found nothing\" from \"never probed\":\n{value:#}"
+        );
+    } else if selected.is_null() {
+        // Copies exist, but none sits on a tier the loader itself consults --
+        // every hit is a `rocm-install` or `managed-runtime` copy nothing has
+        // put on the library path, in the loader cache, or in front of an
+        // active runtime. This is `select_loader_copy` returning `None` on
+        // purpose (pinned there for `libamdhip64` directly), not a gap in the
+        // step -- without this arm it fell into the branch below and panicked
+        // on a state the CLI deliberately produces.
+        for copy in &copies {
+            let source = copy
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("every copy must name its source:\n{copy:#}"));
+            assert!(
+                !LOADER_PATH_SOURCES.contains(&source),
+                "a copy on a loader-consulted tier ({source}) was found, but none was \
+                 selected -- the selection must have missed a real loader-path hit:\n{value:#}"
+            );
+        }
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("copies were found but none was selected:\n{value:#}"));
+        let selected_source = selected
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name its source:\n{value:#}"));
+        assert!(
+            LOADER_PATH_SOURCES.contains(&selected_source),
+            "the selected copy's source ({selected_source}) is not one the loader actually \
+             consults; a rocm-install or managed-runtime hit must never be reported as \
+             \"would load\":\n{value:#}"
+        );
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
+}
+
 #[then("it names which of them would load, or says it found none")]
 async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
-    // Sources the loader itself actually consults, mirrored from
-    // `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
-    // `managed-runtime` hit is evidence a copy exists, not evidence anything
-    // would load it.
-    const LOADER_PATH_SOURCES: [&str; 3] = ["active-runtime", "ld-library-path", "loader-cache"];
-
     let value = parsed_json(world);
     let copies = value["comgr_paths"]
         .as_array()

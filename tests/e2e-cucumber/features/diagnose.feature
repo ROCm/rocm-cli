@@ -289,3 +289,29 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
     And the preview states that the CLI can run it automatically
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of. When the copy that loads belongs to a different
+  # installation than the runtime, compilation fails with an error naming
+  # neither. Both remedies — remove one stack, or reorder the search path — can
+  # break a working Python environment, and which is right depends on which
+  # stack the user means to keep. So the CLI states them and changes nothing.
+  #
+  # The conflict itself cannot be provoked here: the suite cannot install a
+  # second ROCm stack, and the detection rule is proven by unit tests that build
+  # the machine state directly. What this pins is the half that matters if the
+  # entry ever stops being advisory — that asking for it changes nothing and
+  # recommends neither option.
+  #
+  # `@requires-os:linux` because `fix-18-comgr-conflict` is registered for
+  # `["linux", "wsl"]` (comgr and LD_LIBRARY_PATH are POSIX-loader concepts, not
+  # Windows ones). Unlike diagnose-20's preview, this step applies the fix for
+  # real, so it goes through the fix's own platform gate and would be refused
+  # for the wrong reason -- "wrong OS", not "advisory" -- on a native Windows
+  # lane. `@requires-os:linux` matches WSL2 too, which is where this fix does
+  # apply.
+  @id:diagnose-fix-comgr-conflict-is-advisory-only @requires-os:linux
+  Scenario: diagnose-21 - The fix for a shadowed compilation library changes nothing and recommends nothing
+    Given a user who has chosen the fix for a shadowed compilation library
+    When the user asks the CLI to apply that fix
+    Then the CLI explains that it will not make the change itself
+    And the CLI offers both options without ranking them

@@ -247,6 +247,8 @@ Feature: GPU detection and system inspection
     When the user inspects the system in machine-readable form
     Then the inspection lists the code object manager libraries it found
     And it names which of them would load, or says it found none
+    And it lists the HIP runtime libraries the machine holds the same way
+    And it names which HIP runtime copy would load, or says it found none
 
   # The copy this CLI installs itself, which is the case the whole entry exists
   # for: the install path puts ROCm wheels into a managed environment, so a user
@@ -259,14 +261,15 @@ Feature: GPU detection and system inspection
   # described, not that it matches the one the installer actually produces. A
   # real managed runtime is the only thing that distinguishes those.
   #
-  # `@requires-os:linux` because `probe_comgr` only ever looks for
-  # `libamd_comgr` -- an ELF shared-object name, found via `LD_LIBRARY_PATH`,
+  # `@requires-os:linux` because `probe_comgr` only ever looks for `libamd_comgr`
+  # and `libamdhip64` -- ELF shared-object names, found via `LD_LIBRARY_PATH`,
   # the loader cache, or an install root's `lib/` tree. None of that exists on
-  # native Windows, which ships the equivalent library under a different name,
-  # so the assertion that a managed runtime's copy must be found does not hold
-  # there. WSL reports `os_family` "linux" (see `expectation.rs`), so this
-  # still runs on the WSL lane, where the managed runtime really does carry a
-  # `.so`.
+  # native Windows, which ships `.dll`s under other names, so the assertion
+  # that a managed runtime's library must be found does not hold there. WSL
+  # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
+  # the WSL lane, where the managed runtime really does carry a `.so`. This
+  # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
+  # diagnose.rs -- the same boundary, stated once there and once here.
   @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
   Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
     Given a managed runtime is active
