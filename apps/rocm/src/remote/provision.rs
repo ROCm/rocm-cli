@@ -181,13 +181,28 @@ fn push_matched_artifact(
 /// Only `_PEM` ever crosses the wire. `_PATH` names a file on *this* machine,
 /// and forwarding that path verbatim would tell the remote's shell to open a
 /// file that is not there — the variable would be set but useless. So a
-/// `_PATH` is read here and sent as `_PEM` instead; an explicit `_PEM` is
-/// forwarded as-is and takes precedence, matching install.sh's own
-/// resolution order.
+/// `_PATH` is read here and its *contents* are sent as `_PEM` instead.
+///
+/// `_PATH` is therefore checked first, because that is the order install.sh's
+/// own `resolve_public_keys` uses. These two must not disagree: what they are
+/// choosing between is the trust root a signature is verified against, so if
+/// they picked differently, a remote provision would accept a build that a
+/// local install would reject, and the mismatch would surface as "the remote
+/// rejected the build we fetched for it" — pointing at the artifact rather
+/// than at the key.
+///
+/// An empty value counts as unset, again matching install.sh, which tests
+/// these with `[ -n ... ]`. Rust's `env::var` does not make that distinction
+/// on its own: `FOO=` yields `Some("")`, which would otherwise forward an
+/// empty key and silently discard the operator's real one.
 fn signing_env_fragment() -> Result<Option<String>> {
+    fn set_and_non_empty(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    }
+
     signing_env_fragment_from(
-        std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM").ok(),
-        std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH").ok(),
+        set_and_non_empty("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"),
+        set_and_non_empty("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH"),
         |path: &str| std::fs::read_to_string(path),
     )
 }
@@ -197,17 +212,20 @@ fn signing_env_fragment_from(
     path_env: Option<String>,
     read_to_string: impl Fn(&str) -> std::io::Result<String>,
 ) -> Result<Option<String>> {
-    let pem = match pem_env {
-        Some(pem) => Some(pem),
-        None => match path_env {
-            Some(path) => Some(read_to_string(&path).with_context(|| {
-                format!(
-                    "failed to read the signing key at {path} \
-                     (from ROCM_CLI_SIGNING_PUBLIC_KEY_PATH)"
-                )
-            })?),
-            None => None,
-        },
+    // Defence in depth for callers that build these by hand rather than from
+    // the environment: the empty-is-unset rule belongs to the resolution, not
+    // to the one caller that happens to read env vars.
+    let pem_env = pem_env.filter(|value| !value.is_empty());
+    let path_env = path_env.filter(|value| !value.is_empty());
+
+    let pem = match path_env {
+        Some(path) => Some(read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read the signing key at {path} \
+                 (from ROCM_CLI_SIGNING_PUBLIC_KEY_PATH)"
+            )
+        })?),
+        None => pem_env,
     };
     Ok(pem.map(|pem| {
         format!(
@@ -281,22 +299,32 @@ fn tempdir_for_download() -> Result<PathBuf> {
         "rocm-remote-provision-{}-{nonce}",
         std::process::id()
     ));
-    std::fs::create_dir(&directory)
+    create_restricted_dir(&directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
-    restrict_to_owner(&directory)
-        .with_context(|| format!("failed to restrict access to {}", directory.display()))?;
     Ok(directory)
 }
 
+/// Create `path` readable only by its owner, with the mode applied *at*
+/// creation.
+///
+/// Creating first and tightening afterwards leaves the directory world- or
+/// group-readable for the width of the umask, and a staged signing key lands
+/// in here. `DirBuilder::mode` closes that window; this repo already uses the
+/// same pattern in `dash.rs`'s `create_private_dir`, which documents why.
+///
+/// Deliberately not recursive: the name carries a nonce, so an existing
+/// directory means someone else got there first and must be an error rather
+/// than something to adopt.
 #[cfg(unix)]
-fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+fn create_restricted_dir(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &std::path::Path) -> Result<()> {
+fn create_restricted_dir(path: &std::path::Path) -> Result<()> {
+    std::fs::create_dir(path)?;
     Ok(())
 }
 
@@ -405,19 +433,78 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_pem_is_forwarded_as_is_and_wins_over_a_path() {
-        // install.sh itself prefers an explicit _PEM over _PATH; matching that
-        // order here means the two never quietly disagree about which key wins.
+    fn an_explicit_pem_is_forwarded_as_is_when_it_is_the_only_one_set() {
+        let fragment = signing_env_fragment_from(Some("pem-content".to_owned()), None, |path| {
+            panic!("must not read {path}: no _PATH was set")
+        })
+        .expect("no file read is attempted");
+        assert_eq!(
+            fragment.as_deref(),
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ")
+        );
+    }
+
+    #[test]
+    fn a_path_wins_over_a_pem_because_that_is_what_install_sh_does() {
+        // install.sh's resolve_public_keys returns _PATH first and only falls
+        // through to _PEM. What the two are choosing between is the trust root
+        // a signature is checked against, so disagreeing here would let a
+        // remote provision verify against a different key than a local install
+        // — and the operator would see it as a rejected artifact, not a key
+        // mismatch. This test is the one that keeps the orders together.
         let fragment = signing_env_fragment_from(
             Some("pem-content".to_owned()),
-            Some("/should/not/be/read".to_owned()),
-            |path| panic!("must not read {path}: an explicit _PEM must win"),
+            Some("/etc/rocm-signing.pem".to_owned()),
+            |path| {
+                assert_eq!(path, "/etc/rocm-signing.pem");
+                Ok("path-content".to_owned())
+            },
+        )
+        .expect("the fake reader succeeds");
+        assert_eq!(
+            fragment.as_deref(),
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_counts_as_unset_the_way_install_sh_reads_it() {
+        // install.sh tests both with `[ -n ... ]`, so `FOO=` is unset to it.
+        // Rust's env::var disagrees — it yields Some(""). Without this, an
+        // empty _PEM alongside a real _PATH forwarded the empty one, throwing
+        // away the operator's chosen trust root with no diagnostic and quietly
+        // falling back to the pinned production keys.
+        let fragment = signing_env_fragment_from(
+            Some(String::new()),
+            Some("/etc/rocm-signing.pem".to_owned()),
+            |_| Ok("path-content".to_owned()),
+        )
+        .expect("the fake reader succeeds");
+        assert_eq!(
+            fragment.as_deref(),
+            Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=path-content ")
+        );
+
+        // The mirror case: an empty _PATH must not be opened, and must not
+        // suppress a real _PEM.
+        let fragment = signing_env_fragment_from(
+            Some("pem-content".to_owned()),
+            Some(String::new()),
+            |path| panic!("must not read {path:?}: an empty _PATH is unset"),
         )
         .expect("no file read is attempted");
         assert_eq!(
             fragment.as_deref(),
             Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ")
         );
+
+        // Both empty is the same as neither set.
+        let fragment =
+            signing_env_fragment_from(Some(String::new()), Some(String::new()), |path| {
+                panic!("must not read {path:?}: an empty _PATH is unset")
+            })
+            .expect("no file read is attempted");
+        assert_eq!(fragment, None);
     }
 
     #[test]
