@@ -295,7 +295,8 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
 rocm update --apply --activate\n  \
-rocm update --apply --dry-run")]
+rocm update --apply --dry-run\n  \
+rocm update --json")]
     Update {
         /// Install the selected update instead of only checking.
         #[arg(long)]
@@ -309,6 +310,12 @@ rocm update --apply --dry-run")]
         /// Show what would happen without changing files.
         #[arg(long, requires = "apply")]
         dry_run: bool,
+        /// Print the check result as a single line of JSON instead of text.
+        #[arg(long, conflicts_with = "apply")]
+        json: bool,
+        /// Bound the version-check network calls to this many seconds each.
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {
@@ -1902,6 +1909,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            json,
+            timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
             if apply {
@@ -1949,6 +1958,33 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 activate,
                                 dry_run
                             ),
+                            None,
+                        );
+                        return Err(error);
+                    }
+                }
+                return Ok(());
+            }
+            if json {
+                match therock::render_update_json(&paths, timeout_secs) {
+                    Ok(document) => {
+                        println!("{}", serde_json::to_string(&document)?);
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "info",
+                            "rendered update report (json)",
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "error",
+                            format!("update report failed: {error}"),
                             None,
                         );
                         return Err(error);
@@ -15979,7 +16015,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -20351,6 +20387,13 @@ mod tests {
     fn chat_rejects_zero_max_tokens() {
         let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
             .expect_err("zero max-tokens is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn update_rejects_zero_timeout_secs() {
+        let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
+            .expect_err("zero timeout-secs is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

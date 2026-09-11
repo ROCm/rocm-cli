@@ -7,7 +7,9 @@
 //! Composes the home layout against live `AppState` (read-only): a hero GPU
 //! gauge + spark, a stacked VRAM/TEMP/POWER mini-spark cluster, and Running /
 //! Health / Updates tiles. Empty/absent telemetry renders honest placeholders
-//! rather than synthetic numbers.
+//! rather than synthetic numbers — and pairs every "nothing to show" state
+//! with a hint at the tab/key that would produce something, so no tile is a
+//! dead end.
 //!
 //! ponytail: Home is added behind the existing default this phase (P2). It is
 //! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
@@ -19,7 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{AppState, ConnState};
+use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -191,8 +193,16 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
         ]));
     }
-    // Then recent jobs (tools run), newest-relevant first.
-    for job in state.jobs.jobs.values().take(feed.height as usize) {
+    // Then recent jobs (tools run), newest-relevant first. The Home tab's own
+    // update-check job is plumbing, not user activity — never show it here.
+    for job in state
+        .jobs
+        .jobs
+        .iter()
+        .filter(|(id, _)| id.as_str() != crate::app::HOME_UPDATE_CHECK_JOB_ID)
+        .map(|(_, job)| job)
+        .take(feed.height as usize)
+    {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
             rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
@@ -211,6 +221,13 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
     }
+    // Glyph key, appended last: `truncate` below already drops it whenever
+    // there's no spare room, so it never displaces real activity on a
+    // squeezed card — no separate room check needed.
+    lines.push(Line::from(Span::styled(
+        "● live  ✓ done  ! warn  ✗ failed  ⋯ running  ○ cancelled",
+        Style::default().fg(theme.muted),
+    )));
     lines.truncate(feed.height as usize);
     f.render_widget(Paragraph::new(lines), feed);
 }
@@ -440,28 +457,35 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme,
     );
     if running.height > 0 {
-        let line = state
+        let lines = state
             .instances
             .values()
             .find(|i| i.status.is_serving())
             .map_or_else(
                 || {
-                    Line::from(Span::styled(
+                    let mut lines = vec![Line::from(Span::styled(
                         "Nothing running",
                         Style::default().fg(theme.muted),
-                    ))
+                    ))];
+                    if running.height > 1 {
+                        lines.push(Line::from(Span::styled(
+                            "Press 3 → Serving to launch a model",
+                            Style::default().fg(theme.muted),
+                        )));
+                    }
+                    lines
                 },
                 |i| {
-                    Line::from(vec![
+                    vec![Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
                         Span::styled(
                             i.model_name.clone(),
                             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                         ),
-                    ])
+                    ])]
                 },
             );
-        f.render_widget(Paragraph::new(line), running);
+        f.render_widget(Paragraph::new(lines), running);
     }
 
     // Health tile — derive from snapshot/system-info presence + conn state.
@@ -501,37 +525,80 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    // Updates tile — honest placeholder (no update feed wired this run).
+    // Updates tile — backed by the periodic `home-update-check` job
+    // (`refresh_update_status`, driven off the tick loop). `state.simulated`
+    // sessions never spawn that job, so they always render `Unknown` — same
+    // as before the check existed, keeping "SIMULATED DATA never looks live".
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        let body = if state.simulated {
-            // No real update feed can be observed for simulated data.
-            Line::from(Span::styled("unknown", Style::default().fg(theme.muted)))
+        let hint = Line::from(Span::styled(
+            "Press 2 → ROCm → Check for updates",
+            Style::default().fg(theme.muted),
+        ));
+        let mut lines = if state.update_status_pending {
+            vec![Line::from(Span::styled(
+                "Checking…",
+                Style::default().fg(theme.muted),
+            ))]
         } else {
-            match state.conn {
-                ConnState::Connected { .. } => {
-                    Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+            match &state.update_status {
+                UpdateStatus::Unknown => {
+                    vec![Line::from(Span::styled(
+                        "unknown",
+                        Style::default().fg(theme.muted),
+                    ))]
                 }
-                _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
+                UpdateStatus::UpToDate => vec![Line::from(Span::styled(
+                    "Up to date",
+                    Style::default().fg(theme.fg),
+                ))],
+                UpdateStatus::UpdateAvailable { latest_version } => vec![
+                    Line::from(Span::styled(
+                        "Update available",
+                        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        latest_version.clone(),
+                        Style::default().fg(theme.warn),
+                    )),
+                ],
+                UpdateStatus::NoManagedRuntimes => vec![Line::from(Span::styled(
+                    "no managed runtimes",
+                    Style::default().fg(theme.muted),
+                ))],
+                UpdateStatus::Error => vec![Line::from(Span::styled(
+                    "check failed",
+                    Style::default().fg(theme.muted),
+                ))],
             }
         };
-        // No update-feed data source this run: simulated sessions show "unknown"
-        // (nothing observable), otherwise the tile is conn-derived rather than
-        // the mock's hardcoded "ROCm 6.3 ready".
-        f.render_widget(Paragraph::new(body), updates);
+        // No fabricated status, but never leave the tile a dead end — point at
+        // the one place that actually runs a real check on demand.
+        let wants_hint = !state.update_status_pending
+            && matches!(
+                state.update_status,
+                UpdateStatus::Unknown | UpdateStatus::Error
+            );
+        if wants_hint && updates.height > 1 {
+            lines.push(hint);
+        }
+        f.render_widget(Paragraph::new(lines), updates);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::ActiveTab;
+    use crate::app::{ActiveTab, ConnState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use rocm_dash_core::metrics::{
         GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
         ObservationMetadata, Snapshot, SystemMetrics,
     };
+    use rocm_dash_core::state::{JobState, JobStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn node_load_label_never_marks_simulated_live() {
@@ -820,6 +887,242 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "the finite held instance must still explain the aggregate; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_never_asserts_up_to_date_without_a_real_check() {
+        // `state.conn` must never be read as a proxy for "checked and
+        // current" — connectivity to the daemon says nothing about update
+        // status. Only a resolved `UpdateStatus::UpToDate` may render it.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("Up to date"),
+            "must not fabricate a version check from conn state: {out:?}"
+        );
+        assert!(
+            out.contains("unknown"),
+            "Updates tile should show unknown before any check resolves: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_shows_checking_while_pending() {
+        // Must be connected here — otherwise the reverted conn-derived tile
+        // would also render "Checking…" and this test couldn't discriminate.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        s.update_status_pending = true;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Checking…"),
+            "Updates tile should show Checking… while a check is in flight: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_up_to_date_from_a_real_check() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpToDate;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Up to date"),
+            "a resolved UpToDate status should render: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_update_available_with_version() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpdateAvailable {
+            latest_version: "7.1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Update available"),
+            "should surface an available update: {out:?}"
+        );
+        assert!(out.contains("7.1.0"), "should show the version: {out:?}");
+    }
+
+    #[test]
+    fn updates_tile_renders_no_managed_runtimes() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::NoManagedRuntimes;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("no managed runtimes"),
+            "should report nothing to check: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_hints_where_to_run_a_real_check() {
+        // "unknown" alone is a dead end — the tile must point at the real
+        // "Check for updates" verb (ROCm tab, digit 2) rather than leaving
+        // the user with no next step. Same for a failed check.
+        let s = state_with_gpu();
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check when unknown: {out:?}"
+        );
+
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::Error;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("check failed"),
+            "should report the failure: {out:?}"
+        );
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check when the check failed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn running_tile_hints_when_empty() {
+        // "Nothing running" alone is a dead end — hint at the Serving tab
+        // (digit 3) that would actually launch a model.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Nothing running"),
+            "empty running tile: {out:?}"
+        );
+        assert!(
+            out.contains("Serving"),
+            "Running tile should hint where to launch a model: {out:?}"
+        );
+    }
+
+    fn named_instance_with_obs(name: &str, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: name.into(),
+            container_name: name.into(),
+            status: InstanceStatus::Running,
+            model_name: name.into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(200.0),
+            tokens_per_watt: Some(200.0 / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn held_legend_visible_when_hero_data_is_held() {
+        let mut s = state_with_gpu();
+        let inst = named_instance_with_obs("m", Some(held_obs()));
+        s.instances.insert(inst.container_id.clone(), inst);
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must be visible when hero data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn held_legend_absent_when_hero_data_is_fresh() {
+        let mut s = state_with_gpu();
+        let inst = named_instance_with_obs("m", Some(fresh_obs()));
+        s.instances.insert(inst.container_id.clone(), inst);
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    fn job(cmd: &str, status: JobStatus) -> JobState {
+        JobState {
+            cmd: cmd.into(),
+            args: Vec::new(),
+            status,
+            output: std::collections::VecDeque::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn activity_glyph_key_present_with_room_to_spare() {
+        // Exercise the Gherkin precondition literally: a real serving instance
+        // plus a real job, not just the empty-feed placeholder line.
+        let mut s = state_with_gpu();
+        let inst = named_instance_with_obs("demo-model", None);
+        s.instances.insert(inst.container_id.clone(), inst);
+        s.jobs.jobs.insert(
+            "build".into(),
+            job("cargo build", JobStatus::Done { code: 0 }),
+        );
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("demo-model") && out.contains("cargo build"),
+            "expected real activity entries to render: {out:?}"
+        );
+        assert!(
+            out.contains("live") && out.contains("done") && out.contains("failed"),
+            "activity glyph key missing: {out:?}"
+        );
+        assert!(
+            out.contains("cancelled"),
+            "activity glyph key must document the cancelled glyph: {out:?}"
+        );
+        assert!(
+            out.contains("warn"),
+            "activity glyph key must document the nonzero-exit warn glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_job_renders_distinct_glyph_from_running() {
+        // Characterization guard for pre-existing base behavior (the
+        // `JobStatus::Cancelled` match arm predates this PR): it must not be
+        // silently folded into the `⋯ running` glyph in some future change.
+        // The glyph-key line documenting `○ cancelled`, which *is* new to this
+        // PR, is covered separately by `activity_glyph_key_present_with_room_to_spare`.
+        // Assert on the job's own rendered line (not just presence of '○'
+        // anywhere in the frame — the glyph key appended below the feed also
+        // contains '○', so that alone wouldn't catch a regression back to the
+        // shared wildcard arm).
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("cancel-me".into(), job("long task", JobStatus::Cancelled));
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("○ long task"),
+            "cancelled job should render its own ○ glyph: {out:?}"
+        );
+        assert!(
+            !out.contains("⋯ long task"),
+            "cancelled job must not render the running glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn home_update_check_job_never_shown_in_activity_feed() {
+        // The Home tab's own background update-check job is plumbing, not
+        // user activity, even when there's ample spare room in the feed.
+        let mut s = state_with_gpu();
+        s.jobs.jobs.insert(
+            crate::app::HOME_UPDATE_CHECK_JOB_ID.to_owned(),
+            job("/path/to/rocm", JobStatus::Running),
+        );
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("/path/to/rocm"),
+            "the update-check job must never render in the activity feed: {out:?}"
         );
     }
 

@@ -19,6 +19,7 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -807,7 +808,7 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     for manifest in &manifests {
-        let plan = match runtime_update_plan(paths, manifest, &manifests) {
+        let plan = match runtime_update_plan(paths, manifest, &manifests, None) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -865,6 +866,67 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     Ok(output)
+}
+
+/// Structured counterpart to [`render_update_report`], for `rocm update --json`.
+/// Consumed by the dash TUI's background update-check job (parsed off a
+/// single compact JSON line captured from the job's stdout), so field names
+/// are a stable-ish contract — extend, don't rename, without checking callers.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJson {
+    pub runtimes: Vec<UpdateJsonRuntime>,
+}
+
+/// `format`, `install_root`, and `source` are deliberately omitted: this
+/// contract only needs to answer "is an update available," and every consumer
+/// so far (the dash TUI's Updates tile) only reads `status`/`latest_version`.
+/// Add a field when a real consumer needs it, not preemptively.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJsonRuntime {
+    pub runtime_key: String,
+    pub channel: String,
+    pub family: String,
+    pub installed_version: String,
+    pub latest_version: Option<String>,
+    /// `"update_available"` | `"repair_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
+    pub status: String,
+    pub message: Option<String>,
+}
+
+pub(crate) fn render_update_json(
+    paths: &AppPaths,
+    download_timeout_secs: Option<u64>,
+) -> Result<UpdateJson> {
+    // Resolving a wheel-format manifest's latest version can fall through to
+    // Python resolution/bootstrap, which otherwise prints progress lines (and
+    // an installer's raw stdout) ahead of the JSON below, breaking the
+    // documented single-line contract on `UpdateJson`.
+    let _quiet = SuppressProgressOutput::new();
+    let manifests = load_runtime_manifests(paths)?;
+    let mut runtimes = Vec::with_capacity(manifests.len());
+    for manifest in &manifests {
+        match runtime_update_plan(paths, manifest, &manifests, download_timeout_secs) {
+            Ok(plan) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: Some(plan.latest_version),
+                status: plan.status,
+                message: None,
+            }),
+            Err(error) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: None,
+                status: "error".to_owned(),
+                message: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(UpdateJson { runtimes })
 }
 
 /// Whether the composition-keyed replacement for `source` is already installed.
@@ -953,8 +1015,9 @@ pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     manifests: &[InstalledRuntimeManifest],
+    download_timeout_secs: Option<u64>,
 ) -> Result<RuntimeUpdatePlan> {
-    let latest = resolve_latest_for_manifest(paths, manifest, None)?;
+    let latest = resolve_latest_for_manifest(paths, manifest, download_timeout_secs)?;
     let freshness = runtime_freshness_with_manifests(
         manifests,
         manifest,
@@ -3652,7 +3715,42 @@ except Exception as exc:
 print(json.dumps(out))
 "#;
 
+thread_local! {
+    /// Set while rendering `--json` output, whose "single compact JSON line"
+    /// contract [`progress_line`] and the managed-Python installer would
+    /// otherwise break by writing extra lines to stdout ahead of the JSON.
+    static SUPPRESS_PROGRESS_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that silences [`progress_line`] and redirects managed-Python
+/// installer output away from stdout for its lifetime, restoring the prior
+/// state on drop (so nested callers compose correctly).
+struct SuppressProgressOutput {
+    previous: bool,
+}
+
+impl SuppressProgressOutput {
+    fn new() -> Self {
+        let previous = SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for SuppressProgressOutput {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.set(previous));
+    }
+}
+
+fn progress_output_suppressed() -> bool {
+    SUPPRESS_PROGRESS_OUTPUT.with(Cell::get)
+}
+
 fn progress_line(message: impl AsRef<str>) {
+    if progress_output_suppressed() {
+        return;
+    }
     println!("{}", message.as_ref());
     let _ = std::io::stdout().flush();
 }
@@ -3987,16 +4085,29 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     progress_line(format!("Installing Python {version} via uv..."));
-    let status = Command::new(&uv)
+    let install_stdio = || {
+        if progress_output_suppressed() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let install_output = Command::new(&uv)
         .args(["python", "install", &version])
         .envs(uv_command_env(paths))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(install_stdio())
+        .stderr(install_stdio())
+        .output()
         .context("failed to launch uv python install")?;
-    if !status.success() {
-        bail!("uv python install {version} failed with {status}");
+    if !install_output.status.success() {
+        let status = install_output.status;
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("uv python install {version} failed with {status}");
+        }
+        bail!("uv python install {version} failed with {status}: {stderr}");
     }
 
     progress_line(format!("Finding Python {version}..."));
@@ -4540,6 +4651,79 @@ mod tests {
     // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
     // can fail with ENOENT while another test has temporarily narrowed `PATH`.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn suppress_progress_output_contract() {
+        // `SUPPRESS_PROGRESS_OUTPUT` is thread-local, so this doesn't race with
+        // other tests' threads.
+        assert!(!progress_output_suppressed());
+        {
+            let _outer = SuppressProgressOutput::new();
+            assert!(progress_output_suppressed());
+            {
+                let _inner = SuppressProgressOutput::new();
+                assert!(
+                    progress_output_suppressed(),
+                    "a nested guard must still suppress"
+                );
+            }
+            assert!(
+                progress_output_suppressed(),
+                "dropping the inner guard must not lift the outer guard's suppression"
+            );
+        }
+        assert!(
+            !progress_output_suppressed(),
+            "dropping the outer guard must restore the pre-guard state"
+        );
+    }
+
+    fn render_update_json_test_paths(name: &str) -> (PathBuf, AppPaths) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-render-update-json-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        (root, paths)
+    }
+
+    #[test]
+    fn render_update_json_restores_progress_suppression_on_ok_and_err_paths() {
+        // Ok path: no `runtimes` directory at all, so `load_runtime_manifests`
+        // returns `Ok(vec![])` and `render_update_json` succeeds trivially.
+        let (ok_root, ok_paths) = render_update_json_test_paths("ok");
+        fs::create_dir_all(&ok_root).unwrap();
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&ok_paths, Some(1));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Ok path"
+        );
+        fs::remove_dir_all(&ok_root).ok();
+
+        // Err path: `broken.json` is a directory, not a file, so the loader's
+        // `fs::read` on it fails and the error bubbles through
+        // `render_update_json`'s `?` before ever constructing an `UpdateJson`.
+        let (err_root, err_paths) = render_update_json_test_paths("err");
+        let registry_dir = err_root.join("data").join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json")).unwrap();
+        let result = render_update_json(&err_paths, Some(1));
+        assert!(
+            result.is_err(),
+            "a directory named *.json must fail to be read as manifest bytes"
+        );
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Err path too"
+        );
+        fs::remove_dir_all(&err_root).ok();
+    }
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -6415,6 +6599,47 @@ echo Python 3.12.10
 
         server.join().expect("localhost server thread panicked")?;
         let _ = fs::remove_dir_all(&temp);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
+        let (root, paths) = test_paths("update-json-empty");
+
+        let document = render_update_json(&paths, None)?;
+
+        assert!(document.runtimes.is_empty());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_per_manifest_error_without_failing_whole_report() -> Result<()> {
+        let (root, paths) = test_paths("update-json-error");
+        // An unsupported channel fails `TheRockChannel::parse` synchronously,
+        // so this error path is deterministic and never depends on real
+        // network reachability (unlike the manifest's placeholder index URL,
+        // which `resolve_pip_runtime_with_timeout` doesn't even consult).
+        //
+        // Deliberate gap: this only covers the all-error case. Asserting a
+        // successful row survives alongside a failing one would need a second
+        // manifest that resolves for real, and no fixture here stands up a
+        // resolvable wheel index — only a raw-body local HTTP server exists,
+        // for `native_http_download_and_get_round_trip_without_powershell`'s
+        // lower-level use. Not worth building just for this one assertion.
+        let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        manifest.channel = "unsupported-channel".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let document = render_update_json(&paths, None)?;
+
+        assert_eq!(document.runtimes.len(), 1);
+        let row = &document.runtimes[0];
+        assert_eq!(row.runtime_key, "active");
+        assert_eq!(row.status, "error");
+        assert!(row.latest_version.is_none());
+        assert!(row.message.is_some());
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
