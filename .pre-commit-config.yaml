@@ -91,7 +91,9 @@ repos:
         name: license header check (hawkeye)
         entry: hawkeye check --config licenserc.toml
         language: system
-        types_or: [rust, python, shell]
+        # One tag per extension family in licenserc.toml's `includes`; a type
+        # missing here means an edit touching only that type never runs the hook.
+        types_or: [rust, python, shell, powershell, markdown]
         pass_filenames: false
         groups: [local-tools] # runs in the dedicated `license-headers` CI job (hawkeye action)
 
