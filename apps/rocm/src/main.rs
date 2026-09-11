@@ -1872,6 +1872,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                     },
                 );
             }
+            // Resolve the prompt from `--prompt` or, when it is omitted and
+            // stdin is not a terminal, from piped standard input — the
+            // documented `echo "…" | rocm chat` path. Only when neither
+            // supplies a prompt do we fall back to the status screen, which
+            // two kinds of invocation reach: stdin is a TTY that the
+            // interactive branch above declined (it also requires stdout to be
+            // one), or stdin was redirected and carried nothing but whitespace
+            // — an empty pipe or `< /dev/null`.
+            let prompt = match prompt {
+                Some(prompt) => Some(prompt),
+                None => read_piped_prompt()?,
+            };
             match prompt {
                 Some(prompt) => print!(
                     "{}",
@@ -9827,6 +9839,65 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
         "  note: launch from an interactive terminal to enter the TUI."
     );
     output
+}
+
+/// Read a one-shot chat prompt from standard input when it is piped in.
+///
+/// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
+/// and stdin is not a terminal, the piped text becomes the prompt. Returns
+/// `None` when stdin is an interactive TTY or the piped input is blank, so the
+/// caller falls back to the status screen instead of blocking on input nobody
+/// can supply.
+///
+/// The read runs to EOF — the conventional filter contract that
+/// `read_provider_key_from_user` already follows. A caller that hands us a pipe
+/// it never writes to and never closes therefore waits, exactly as `cat` would;
+/// the TTY guard is what keeps that off an interactive user, and a
+/// non-interactive caller with no prompt to send should pass `/dev/null` (as
+/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
+/// prompt", so text that was piped but could not be decoded fails loudly rather
+/// than silently becoming a status screen and a zero exit.
+fn read_piped_prompt() -> Result<Option<String>> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read chat prompt from standard input")?;
+    Ok(piped_prompt_from_input(&buf))
+}
+
+/// Turn raw piped stdin into a chat prompt, or `None` when there is nothing to
+/// send.
+///
+/// `--prompt` reaches the send path verbatim, so a piped prompt must too:
+/// leading indentation and trailing spaces or tabs carry meaning for a model and
+/// are preserved byte for byte. The only thing removed is the line ending the
+/// writer appends — a single trailing `\n`, plus the `\r` in front of it on
+/// Windows — because `echo "…" |` and `printf '…\n' |` add it, not the user.
+/// Further blank lines stay: the second newline of `printf 'a\n\n'` is authored
+/// content, not shell punctuation.
+///
+/// `trim()` is used only to classify the input: whitespace-only stdin (an empty
+/// pipe, or a bare newline) holds no prompt and yields `None`. That is the one
+/// deliberate divergence from `--prompt`, which forwards `"   "` as written: a
+/// bare `rocm chat` under any redirect — `< /dev/null`, a closed heredoc, a CI
+/// step with no stdin — has to keep printing the status screen rather than send
+/// a blank turn to a model, and a caller who really means to send whitespace
+/// can still say so with `--prompt`.
+fn piped_prompt_from_input(input: &str) -> Option<String> {
+    if input.trim().is_empty() {
+        return None;
+    }
+    let prompt = match input.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+        None => input,
+    };
+    Some(prompt.to_owned())
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
@@ -31098,5 +31169,90 @@ ID_LIKE="suse opensuse"
             body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
+    }
+
+    #[test]
+    fn command_chat_reads_prompt_from_piped_stdin() {
+        // A structural guard on the wiring, not a behavioral test: the handler
+        // reads the real fd 0, which an in-process test cannot pipe. The
+        // behavior — piped text reaching the model unaltered — is covered end
+        // to end by the `chat-09` scenario (`@id:chat-cli-stdin-prompt`); what
+        // is checked here is that the `--prompt`-less arm still resolves the
+        // prompt from `read_piped_prompt`, with the result feeding the dispatch
+        // rather than being discarded or read after the send decision is
+        // already made.
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("read_piped_prompt("),
+            "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
+        );
+        assert!(
+            body.contains("None => read_piped_prompt()?"),
+            "the piped read must supply the prompt that is dispatched (and \
+             propagate its error), not be a discarded call; body:\n{body}"
+        );
+        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let send_at = body
+            .find("render_chat_prompt_text(")
+            .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
+        assert!(
+            read_at < send_at,
+            "stdin must be read before the send/status-screen decision, or a \
+             piped prompt cannot influence it; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {
+        // A piped prompt must reach the send path byte-identical to the same
+        // text passed with `--prompt`, which is forwarded verbatim. Only the
+        // line ending the writer appends is dropped; indentation and trailing
+        // spaces or tabs are content and have to survive.
+        assert_eq!(
+            piped_prompt_from_input("    indented line\n"),
+            Some("    indented line".to_owned()),
+            "leading indentation must survive; only the trailing newline goes"
+        );
+        assert_eq!(
+            piped_prompt_from_input("trailing spaces matter   \n"),
+            Some("trailing spaces matter   ".to_owned()),
+            "trailing spaces must survive the trailing-newline strip"
+        );
+        assert_eq!(
+            piped_prompt_from_input("\tleading tab"),
+            Some("\tleading tab".to_owned()),
+            "input without a trailing newline must pass through unchanged"
+        );
+        assert_eq!(
+            piped_prompt_from_input("crlf line\r\n"),
+            Some("crlf line".to_owned()),
+            "a Windows line ending must be stripped as one unit"
+        );
+        assert_eq!(
+            piped_prompt_from_input("fn main() {\n    body\n}\n"),
+            Some("fn main() {\n    body\n}".to_owned()),
+            "interior newlines and indentation must survive"
+        );
+        assert_eq!(
+            piped_prompt_from_input("blank line below\n\n"),
+            Some("blank line below\n".to_owned()),
+            "only one trailing line ending is shell punctuation; the rest is content"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_treats_whitespace_only_input_as_no_prompt() {
+        // The fallback that keeps the no-argument behavior intact: an empty
+        // pipe, a bare newline, or blank padding carries no prompt, so the
+        // caller must see `None` and render the status screen instead of
+        // sending whitespace to a model.
+        for input in ["", "\n", "\r\n", "   ", "  \t \n\n", "\n\n\n"] {
+            assert_eq!(
+                piped_prompt_from_input(input),
+                None,
+                "whitespace-only stdin must yield no prompt; input: {input:?}"
+            );
+        }
     }
 }

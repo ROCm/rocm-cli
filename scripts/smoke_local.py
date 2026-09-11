@@ -52,6 +52,12 @@ def run(
     completed = subprocess.run(
         argv,
         cwd=repo_root(),
+        # No smoke command takes input, and `rocm chat` without `--prompt` now
+        # reads a piped stdin to EOF: inheriting this script's stdin would make
+        # it hang whenever the harness running the smoke keeps a pipe open.
+        # Hand every child /dev/null so the gate does not depend on how it was
+        # launched (same reason as `vllm_therock_gpu_test.py`).
+        stdin=subprocess.DEVNULL,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
