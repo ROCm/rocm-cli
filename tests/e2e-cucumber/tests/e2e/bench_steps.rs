@@ -57,7 +57,7 @@ async fn benchmark_served_endpoint(world: &mut E2eWorld) {
         .endpoint
         .clone()
         .expect("no endpoint configured for the benchmark");
-    run_bench(world, &endpoint);
+    run_bench(world, &endpoint, None);
 }
 
 /// Benchmark using the bare `scheme://host:port` form, dropping the API-root
@@ -78,36 +78,49 @@ async fn benchmark_plain_host_address(world: &mut E2eWorld) {
         !plain.ends_with("/v1"),
         "the plain form must not keep the API-root suffix: {plain}"
     );
-    run_bench(world, &plain);
+    run_bench(world, &plain, None);
 }
 
-fn run_bench(world: &mut E2eWorld, endpoint: &str) {
+/// Run one `rocm bench load` cell against `endpoint`, optionally recording the
+/// row to `out`, and park the outcome on the world for the `then` steps.
+///
+/// Every scenario here runs the same single-cell shape; only the endpoint form
+/// and whether the row is written to a known path differ, so they share one
+/// argv builder rather than each keeping its own copy to drift.
+fn run_bench(world: &mut E2eWorld, endpoint: &str, out: Option<&std::path::Path>) {
     let model = world
         .model_name
         .clone()
         .expect("no model configured for the benchmark");
-    // `--out` lands inside the scenario's isolated data dir by default; the
-    // explicit model avoids depending on the endpoint's model-listing route,
-    // which the rejecting server deliberately fails.
-    let (stdout, stderr, rc) = crate::run_rocm(
-        world,
-        &[
-            "bench",
-            "load",
-            "--endpoint",
-            endpoint,
-            "--model",
-            &model,
-            "--concurrency",
-            "1",
-            "--isl",
-            "8",
-            "--osl",
-            "4",
-            "--requests",
-            BENCH_REQUESTS,
-        ],
-    );
+    // Without `--out` the row lands inside the scenario's isolated data dir by
+    // default; the explicit model avoids depending on the endpoint's
+    // model-listing route, which the rejecting server deliberately fails.
+    let mut args = vec![
+        "bench",
+        "load",
+        "--endpoint",
+        endpoint,
+        "--model",
+        &model,
+        "--concurrency",
+        "1",
+        "--isl",
+        "8",
+        "--osl",
+        "4",
+        "--requests",
+        BENCH_REQUESTS,
+    ];
+    let out = out.map(|path| {
+        path.to_str()
+            .expect("bench output path is not valid UTF-8")
+            .to_string()
+    });
+    if let Some(out) = out.as_deref() {
+        args.extend_from_slice(&["--out", out]);
+    }
+
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -125,36 +138,8 @@ fn run_bench_recording(world: &mut E2eWorld) {
         .endpoint
         .clone()
         .expect("no endpoint configured for the benchmark");
-    let model = world
-        .model_name
-        .clone()
-        .expect("no model configured for the benchmark");
     let out = bench_out_path(world);
-    let out = out.to_str().expect("bench output path is not valid UTF-8");
-    let (stdout, stderr, rc) = crate::run_rocm(
-        world,
-        &[
-            "bench",
-            "load",
-            "--endpoint",
-            endpoint.as_str(),
-            "--model",
-            &model,
-            "--concurrency",
-            "1",
-            "--isl",
-            "8",
-            "--osl",
-            "4",
-            "--requests",
-            BENCH_REQUESTS,
-            "--out",
-            out,
-        ],
-    );
-    world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
-    world.cli_rc = Some(rc);
+    run_bench(world, &endpoint, Some(&out));
 }
 
 /// Leave behind the results file a build that never populated `engine` would
@@ -281,10 +266,17 @@ async fn assert_row_engine_and_tpot(world: &mut E2eWorld) {
         "vllm",
         "the emitted row must carry engine=vllm from the recognised /metrics scrape:\n{data}"
     );
+    // The mock's TPOT histogram adds 0.4 s of `_sum` per 20 `_count` on every
+    // scrape, so Δsum/Δcount is exactly 0.020 s however many scrapes the window
+    // spans: 20 ms. Asserting the value rather than just its sign is what makes
+    // this pin the windowed arithmetic — a lifetime `sum/count` backfill or a
+    // unit slip would also be "positive".
+    const EXPECTED_TPOT_MS: f64 = 20.0;
     let tpot = col("tpot_ms");
     assert!(
-        tpot.parse::<f64>().is_ok_and(|v| v > 0.0),
-        "the emitted row must carry a positive tpot_ms from the advancing counter, got {tpot:?}:\n{data}"
+        tpot.parse::<f64>()
+            .is_ok_and(|v| (v - EXPECTED_TPOT_MS).abs() < 0.5),
+        "the emitted row must carry the mock's windowed tpot_ms of {EXPECTED_TPOT_MS} ms, got {tpot:?}:\n{data}"
     );
 }
 
