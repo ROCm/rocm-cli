@@ -27,6 +27,14 @@ async fn check_updates(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user checks for updates as machine-readable JSON")]
+async fn check_updates_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the report shows there are no managed runtimes to update")]
 async fn no_runtimes_to_update(world: &mut E2eWorld) {
     let out = ok_output(world);
@@ -62,6 +70,29 @@ async fn reports_feed_status(world: &mut E2eWorld) {
             None => panic!("no update feed line for {feed:?} in:\n{out}"),
         }
     }
+}
+
+#[then("stdout is a single line of JSON with an empty runtimes array")]
+async fn json_reports_empty_runtimes(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let mut lines = out.lines();
+    let line = lines
+        .next()
+        .unwrap_or_else(|| panic!("expected a line of JSON on stdout, got empty output"));
+    assert!(
+        lines.next().is_none(),
+        "expected exactly one stdout line (JSON must not share stdout with other output), got:\n{out}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(line)
+        .unwrap_or_else(|e| panic!("stdout line is not valid JSON: {e}\nline: {line}"));
+    let runtimes = doc
+        .get("runtimes")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a `runtimes` array in JSON, got: {doc}"));
+    assert!(
+        runtimes.is_empty(),
+        "expected an empty `runtimes` array, got: {runtimes:?}"
+    );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

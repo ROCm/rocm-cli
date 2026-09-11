@@ -311,6 +311,9 @@ rocm update --apply --dry-run")]
         /// Print the check result as a single line of JSON instead of text.
         #[arg(long, conflicts_with = "apply")]
         json: bool,
+        /// Bound the version-check network calls to this many seconds each.
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {

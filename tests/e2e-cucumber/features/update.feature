@@ -12,3 +12,9 @@ Feature: Update report
     When the user checks for updates
     Then the report shows there are no managed runtimes to update
     And it reports each update feed's status, marking unpublished feeds as not configured
+
+  @id:update-json-reports-empty-runtimes
+  Scenario: update-02 - The machine-readable update check reports an empty runtimes array
+    Given a machine with no managed runtimes
+    When the user checks for updates as machine-readable JSON
+    Then stdout is a single line of JSON with an empty runtimes array

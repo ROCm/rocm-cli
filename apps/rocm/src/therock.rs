@@ -887,7 +887,7 @@ pub(crate) struct UpdateJsonRuntime {
     pub family: String,
     pub installed_version: String,
     pub latest_version: Option<String>,
-    /// `"update_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
+    /// `"update_available"` | `"repair_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
     pub status: String,
     pub message: Option<String>,
 }
