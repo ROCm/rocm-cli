@@ -1034,6 +1034,12 @@ fn select_runtime(
     if manifest.format != "wheel" {
         bail!("ComfyUI installs require a rocm-cli managed Python ROCm runtime.");
     }
+    // Defence in depth, not a reachable branch on a settled filesystem: the
+    // `ready` check above ran `validate_wheel_runtime_manifest`, which already
+    // proved `python_executable` is `Some` and `is_file()`. This re-check only
+    // fires if the interpreter disappears in the window between the two calls,
+    // so keep it (a missing interpreter must not reach the installer) and do
+    // not spend further polish on its wording.
     let python = manifest
         .python_executable
         .as_deref()
@@ -1119,7 +1125,7 @@ fn select_single_ready_runtime(
         [] => {
             let statuses = format_runtime_statuses(manifests);
             bail!(
-                "No ROCm runtime is ready. Set up ROCm first from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
+                "No ROCm runtime is ready. Fix one or install another from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
             )
         }
         _ => {
@@ -2341,6 +2347,17 @@ mod tests {
         assert!(
             message.contains("rocm runtimes list"),
             "error should point to `rocm runtimes list`, got: {message}"
+        );
+        // The setup pointer names the `Set Up ROCm` screen once, as a label. It
+        // must not also use "set up" as the sentence verb: "Set up ROCm first
+        // from Set Up ROCm" made the label read like a repetition of the verb.
+        assert!(
+            message.contains("from Set Up ROCm"),
+            "error should still point at the `Set Up ROCm` screen, got: {message}"
+        );
+        assert!(
+            !message.contains("Set up ROCm first from Set Up ROCm"),
+            "the setup pointer must not repeat the verb and the screen label, got: {message}"
         );
         Ok(())
     }
