@@ -278,20 +278,18 @@ async fn dashboard_refused_before_takeover(world: &mut E2eWorld) {
         "dash entered the alt-screen before refusing a missing replay file:\n{}",
         tui.screen_text(),
     );
-    // Snapshot the drained final frame for the sibling message assertion.
-    let screen = tui.drain_final_screen().await;
-    world.cli_output = Some(screen);
 }
 
 #[then("the user is told the replay file was not found")]
 async fn told_replay_file_not_found(world: &mut E2eWorld) {
-    let output = world
-        .cli_output
-        .as_deref()
-        .expect("no dash screen captured");
+    // Read the screen from the PTY session itself rather than stashing it in
+    // `world.cli_output`, which carries piped stdout for the non-PTY steps.
+    // Draining first lets the reader thread commit the final buffered frame, so
+    // this does not race the PTY being drained after the child exits.
+    let screen = session(world).drain_final_screen().await;
     assert!(
-        output.to_lowercase().contains("replay file not found"),
-        "expected a clear 'replay file not found' error on screen, got:\n{output}"
+        screen.to_lowercase().contains("replay file not found"),
+        "expected a clear 'replay file not found' error on screen, got:\n{screen}"
     );
 }
 

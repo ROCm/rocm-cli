@@ -338,7 +338,11 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // runtime or entering the alt-screen — so a missing/unreadable file fails
     // fast with a clear error and non-zero exit instead of silently taking over
     // the terminal and surfacing a disconnect inside the TUI. `--demo` writes
-    // its own session below, so it is exempt.
+    // its own session below, so it is exempt: `--demo` overwrites `replay` with
+    // that generated path, so a caller-supplied one is never read in demo mode
+    // and must not be rejected. `conflicts_with` rules the pair out on the CLI,
+    // but this is a `pub fn` whose two flags arrive independently, so the guard
+    // is a real precondition at this boundary rather than dead code.
     if !demo && let Some(path) = replay.as_deref() {
         validate_replay_path(path)?;
     }
@@ -1158,6 +1162,11 @@ mod tests {
     ///
     /// A readable character device such as `/dev/null` cannot stand in here: it
     /// opens instantly, so it passes with or without the narrowing.
+    ///
+    /// Unix only: `mkfifo` has no Windows equivalent, and Windows named pipes
+    /// live in the `\\.\pipe\` namespace rather than on the filesystem, so the
+    /// blocking-open behaviour this pins cannot be staged there. The narrowing
+    /// under test is platform-independent, so this covers it for every target.
     #[cfg(unix)]
     #[allow(unsafe_code)] // libc FFI: mkfifo has no std equivalent
     #[test]
