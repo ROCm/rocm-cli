@@ -69,6 +69,13 @@ impl RocmToolExecutor for BinToolExecutor {
         // corruption.
         match crate::run_internal_mcp_call(&self.paths, name, args.clone(), true) {
             Ok(v) => RocmToolOutcome::Result(v),
+            // `Error` is *not* the failed-command arm. `run_rocm_capture_for_paths`
+            // captures a non-zero `rocm` exit, so a refused command still returns
+            // `Ok` — an `isError: true` envelope that takes the `Result` arm above
+            // and gets collapsed by `summarize_json_value`. This arm fires only
+            // when the call itself fails: validation, spawn, timeout, unknown
+            // tool. Pinned by `approved_command_failure_stays_a_collapsed_envelope`
+            // in `crates/rocm-dash-tui/src/app/mod.rs`.
             Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }

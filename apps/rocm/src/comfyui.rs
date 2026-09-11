@@ -1052,12 +1052,16 @@ fn select_runtime(
     Ok(SelectedRuntime { manifest, python })
 }
 
-/// Render a bare `key, key` list. Used only where the caller has already
-/// narrowed `manifests` to a candidate set the user may legitimately pick from
-/// (the ready runtimes, or the manifests a selector matched), so every key in
-/// it is a valid answer and a per-key status would be noise. Branches that
-/// enumerate the *whole* registry use `format_runtime_statuses` instead — see
-/// its doc comment for why the two labels differ.
+/// Render a bare `key, key` list. Sound only where the caller has already
+/// filtered `manifests` by `runtime_usability_status(...) == "ready"`, because
+/// that is the only filter that makes every listed key a valid answer to the
+/// `rocm runtimes activate <key>` advice these messages carry; a per-key status
+/// would then be noise. Matching a selector is *not* such a filter: two
+/// manifests can share a `runtime_id` with one of them unusable, so an
+/// id-matched set can contain a key that cannot be activated. Every branch
+/// whose set is not ready-filtered — the whole-registry ones and the two
+/// id-ambiguity ones — uses `format_runtime_statuses` instead; see its doc
+/// comment for why the two labels differ.
 fn format_available_runtime_keys<'a>(
     manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
 ) -> String {
@@ -1072,12 +1076,15 @@ fn format_available_runtime_keys<'a>(
 /// reason `runtime_usability_status` already computed (e.g.
 /// `unusable (install root is missing: …)`) instead of dropping it.
 ///
-/// Used by every branch that lists the entire registry — "none ready" and the
-/// two not-found branches. Those cannot promise the listed runtimes are
-/// pickable, so printing bare keys under `Available:` would invite the user to
+/// Used by every branch whose set is not ready-filtered: the whole-registry
+/// ones ("none ready" and the two not-found branches) and the two branches that
+/// report an ambiguous `runtime_id`. None of them can promise the listed
+/// runtimes are pickable — a shared `runtime_id` says nothing about readiness —
+/// so printing bare keys under `Available:` would invite the user to
 /// `rocm runtimes activate` an unusable one and land on a second error. The
 /// label split is deliberate and load-bearing: `Available:` means "any of these
-/// works", `Runtimes found:` means "here is everything registered, with why".
+/// works", `Runtimes found:` means "here is everything registered, with why",
+/// and `Runtimes matched:` means "here is what the selector matched, with why".
 fn format_runtime_statuses<'a>(
     manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
 ) -> String {
@@ -1120,9 +1127,12 @@ fn select_default_runtime<'a>(
             )
         }
         _ => {
-            let available = format_available_runtime_keys(matches.iter().copied());
+            // `matches` is filtered by `runtime_id` alone, so it can hold an
+            // unusable runtime next to a ready one. Statuses, not bare keys:
+            // `rocm runtimes activate` on the unusable match is a second error.
+            let statuses = format_runtime_statuses(matches.iter().copied());
             bail!(
-                "More than one ROCm runtime matches the configured default. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "More than one ROCm runtime matches the configured default. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Runtimes matched: {statuses}. See `rocm runtimes list`."
             )
         }
     }
@@ -1178,9 +1188,12 @@ fn select_runtime_by_selector<'a>(
             )
         }
         _ => {
-            let available = format_available_runtime_keys(matches.iter().copied());
+            // Same reasoning as the ambiguous configured-default branch: an
+            // id match is not a readiness check, so each entry carries its
+            // status rather than reading as pickable.
+            let statuses = format_runtime_statuses(matches.iter().copied());
             bail!(
-                "More than one ROCm runtime matches `{selector}`. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "More than one ROCm runtime matches `{selector}`. Pick one in `/runtimes`, set a default with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Runtimes matched: {statuses}. See `rocm runtimes list`."
             )
         }
     }
@@ -2444,6 +2457,47 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_configured_default_marks_the_unusable_match() -> Result<()> {
+        // The ambiguity set is filtered by `runtime_id` alone, and a shared
+        // runtime_id says nothing about readiness: one of the two matches here
+        // has a missing install root. A bare key list would tell the user to
+        // `rocm runtimes activate` it and land them on a second error, so each
+        // match must carry the status `runtime_usability_status` computes.
+        let paths = test_paths("comfyui-default-ambiguous-unusable");
+        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
+        assert_eq!(
+            ready.runtime_id, unusable.runtime_id,
+            "the two manifests must share a runtime_id to reach the ambiguity arm"
+        );
+
+        let manifests = [ready, unusable];
+        let config = RocmCliConfig {
+            default_runtime_id: Some("therock-release:gfx120X-all".to_owned()),
+            ..Default::default()
+        };
+        let error = select_default_runtime(&config, &manifests)
+            .expect_err("two manifests share the configured default id");
+        let message = error.to_string();
+
+        assert_actionable(&message);
+        assert!(
+            message.contains("More than one ROCm runtime matches the configured default"),
+            "error should be the ambiguous-configured-default branch, got: {message}"
+        );
+        assert!(
+            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
+            "the usable match must be listed as ready, got: {message}"
+        );
+        assert!(
+            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
+                && message.contains("install root is missing"),
+            "the unusable match must carry its reason, not read as pickable, got: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unknown_selector_is_actionable() -> Result<()> {
         // Whole-registry list again — see `configured_default_not_found_is_actionable`.
         let paths = test_paths("comfyui-selector-not-found");
@@ -2490,6 +2544,42 @@ mod tests {
         assert!(
             message.contains("More than one ROCm runtime matches `therock-release:gfx120X-all`"),
             "error should be the ambiguous-selector branch, got: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_selector_marks_the_unusable_match() -> Result<()> {
+        // Selector twin of `ambiguous_configured_default_marks_the_unusable_match`:
+        // the selector falls through to the `runtime_id` filter, which is not a
+        // readiness check, so the unusable match must be rendered with its
+        // reason rather than as a bare activatable key.
+        let paths = test_paths("comfyui-selector-ambiguous-unusable");
+        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
+        assert_eq!(
+            ready.runtime_id, unusable.runtime_id,
+            "the two manifests must share a runtime_id to reach the ambiguity arm"
+        );
+
+        let manifests = [ready, unusable];
+        let error = select_runtime_by_selector(&manifests, "therock-release:gfx120X-all")
+            .expect_err("selector id matches two runtimes");
+        let message = error.to_string();
+
+        assert_actionable(&message);
+        assert!(
+            message.contains("More than one ROCm runtime matches `therock-release:gfx120X-all`"),
+            "error should be the ambiguous-selector branch, got: {message}"
+        );
+        assert!(
+            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
+            "the usable match must be listed as ready, got: {message}"
+        );
+        assert!(
+            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
+                && message.contains("install root is missing"),
+            "the unusable match must carry its reason, not read as pickable, got: {message}"
         );
         Ok(())
     }
