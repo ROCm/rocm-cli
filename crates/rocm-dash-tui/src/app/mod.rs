@@ -1657,11 +1657,12 @@ fn open_overlay_for_focus(
 }
 
 /// Reduce a parsed `rocm update --json` document's `runtimes` array into an
-/// [`UpdateStatus`]. Empty ⇒ nothing managed to check; any update-available
-/// row wins over up-to-date/error rows (the tile surfaces the most actionable
-/// state); otherwise `UpToDate` only if every row resolved cleanly — a mixed
-/// result (some rows errored, some unrecognized) can't honestly assert
-/// freshness for the runtimes that didn't resolve, so it's `Error` too.
+/// [`UpdateStatus`]. Empty ⇒ nothing managed to check; any update-available or
+/// repair-available row wins over up-to-date/error rows (the tile surfaces the
+/// most actionable state — a repair is as actionable as an update); otherwise
+/// `UpToDate` only if every row resolved cleanly — a mixed result (some rows
+/// errored, some unrecognized) can't honestly assert freshness for the
+/// runtimes that didn't resolve, so it's `Error` too.
 fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
     fn status_of(row: &serde_json::Value) -> Option<&str> {
         row.get("status").and_then(serde_json::Value::as_str)
@@ -1676,13 +1677,16 @@ fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
         return UpdateStatus::NoManagedRuntimes;
     }
     if let Some(latest_version) = runtimes.iter().find_map(|row| {
-        (status_of(row) == Some("update_available"))
-            .then(|| {
-                row.get("latest_version")
-                    .and_then(serde_json::Value::as_str)
-            })
-            .flatten()
-            .map(str::to_owned)
+        matches!(
+            status_of(row),
+            Some("update_available" | "repair_available")
+        )
+        .then(|| {
+            row.get("latest_version")
+                .and_then(serde_json::Value::as_str)
+        })
+        .flatten()
+        .map(str::to_owned)
     }) {
         return UpdateStatus::UpdateAvailable { latest_version };
     }
@@ -7149,5 +7153,20 @@ mod tests {
             "runtimes": [{"status": "something_new"}]
         });
         assert_eq!(reduce_update_json(&doc), UpdateStatus::Error);
+    }
+
+    #[test]
+    fn reduce_update_json_repair_available_is_update_available_not_error() {
+        // A same-version composition repair is as actionable as a version
+        // bump — the tile must not report "check failed" for it.
+        let doc = serde_json::json!({
+            "runtimes": [{"status": "repair_available", "latest_version": "6.4.0"}]
+        });
+        assert_eq!(
+            reduce_update_json(&doc),
+            UpdateStatus::UpdateAvailable {
+                latest_version: "6.4.0".to_owned()
+            }
+        );
     }
 }

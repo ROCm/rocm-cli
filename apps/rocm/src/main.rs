@@ -313,7 +313,7 @@ rocm update --json")]
         #[arg(long, conflicts_with = "apply")]
         json: bool,
         /// Bound the version-check network calls to this many seconds each.
-        #[arg(long, requires = "json", conflicts_with = "apply")]
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
