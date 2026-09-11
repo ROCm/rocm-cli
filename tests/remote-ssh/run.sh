@@ -233,6 +233,24 @@ remote tailscale serve --tcp=8000 off
 expect_json "withdrawing actually removes the forward" '.TCP."8000" == null' \
   "$(remote tailscale serve status --json)"
 
+# Funnel is the hazard the publish path refuses over, and it lives in a
+# different key than the forwards do. Asserting its shape here is what lets the
+# e2e check below mean something: without it, a fake that wrote AllowFunnel in
+# the wrong place would make the CLI look correctly cautious while actually
+# reading nothing.
+remote tailscale funnel --tcp=8000 on
+funnel_config="$(remote tailscale serve status --json)"
+expect_json "allowing Funnel is keyed host:port, not by port alone" \
+  '.AllowFunnel | keys | length == 1 and (.[0] | endswith(":8000"))' "${funnel_config}"
+expect_json "and records it as allowed rather than merely present" \
+  '.AllowFunnel | to_entries[0].value == true' "${funnel_config}"
+expect_json "and says nothing about a forward, which is a separate question" \
+  '.TCP."8000" == null' "${funnel_config}"
+
+remote tailscale funnel --tcp=8000 off
+expect_json "turning Funnel off clears the exposure" \
+  '(.AllowFunnel // {}) | length == 0' "$(remote tailscale serve status --json)"
+
 echo
 echo "teardown"
 remote rocm services stop svc-fake-11434 --yes >/dev/null

@@ -217,6 +217,26 @@ out="$(rocm remote status)"
 expect_contains "and the session is gone from this machine" "No remote sessions" "${out}"
 
 echo
+echo "a Funnel-exposed port is refused"
+# Run last, on a torn-down machine, so the port is free and the only thing
+# standing between the CLI and publishing is the exposure itself. Funnel puts a
+# port on the public internet rather than just the tailnet, so publishing a
+# model endpoint over one turns "everyone on your tailnet" into "everyone".
+#
+# The unit tests cover this classification against hand-written fixtures. What
+# they cannot show is that the CLI reads the key the daemon actually writes,
+# which is the whole reason this runs here.
+in_container tailscale funnel --tcp=8000 on
+out="$(rocm remote serve gpu-box test-model || true)"
+expect_contains "publishing over it is refused" "Tailscale Funnel allowed" "${out}"
+expect_contains "and the way out is named" "tailscale funnel --tcp=8000 off" "${out}"
+
+serve_config="$(in_container tailscale serve status --json)"
+expect_absent "and nothing was published in spite of the refusal" '"TCPForward"' "${serve_config}"
+
+in_container tailscale funnel --tcp=8000 off
+
+echo
 if [[ "${FAILURES}" -eq 0 ]]; then
   echo "all checks passed"
 else

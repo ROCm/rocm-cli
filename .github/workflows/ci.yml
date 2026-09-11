@@ -677,6 +677,13 @@ jobs:
       - name: Check the control-channel contracts
         run: tests/remote-ssh/run.sh
 
+      # Every other cargo job in this workflow installs the pinned toolchain and
+      # takes its rust-cache with it. This one built against whatever the runner
+      # image happened to ship, uncached, which is both a different compiler
+      # from the rest of CI and a cold build of the whole workspace against a
+      # 30-minute timeout.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
       # The same container, driven by the real binary this time: discover a
       # target, probe it, serve, publish, reconcile status, re-publish after an
       # out-of-band withdrawal, tear down. Catches the orchestration mistakes a
