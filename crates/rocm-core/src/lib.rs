@@ -3922,7 +3922,7 @@ fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<O
     }
 }
 
-fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
     for path in [
         root.join("bin"),
         root.join("lib"),
