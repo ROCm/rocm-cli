@@ -1087,22 +1087,31 @@ async fn assert_negative_temperature_message(world: &mut E2eWorld) {
 #[then("the user is told that GPU index is unavailable")]
 async fn assert_absent_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // The named index must appear alongside an unavailability reason. Three shapes
-    // are legitimate, depending on what the host could probe:
-    //   - "not present on this host" — the index is outside the usable visible set
-    //     and NO visibility mask is set, so the absence is the host's, not a mask's.
-    //     This is the normal shape for this scenario. The wording is deliberate:
-    //     blaming HIP/ROCR variables the user never set sends them chasing an
-    //     environment problem that does not exist.
-    //   - "out of range" — no visible set could be enumerated, so the CLI falls
-    //     back to the raw detected count.
-    //   - "not available" — a mask IS active, or the engine's own probe rejects the
-    //     index on a host where amd-smi cannot count.
+    // The refusal itself must name ordinal 99; a bare `contains("99")` alongside a
+    // loose reason would also be satisfied by a port, a model tag, or any unrelated
+    // "not available" elsewhere in the output. Four whole-phrase shapes are
+    // legitimate, each pinned to the component that emits it:
+    //   - CLI, no mask set — the index is outside the usable visible set, so the
+    //     absence is the host's, not a mask's. The normal shape for this scenario.
+    //     The wording is deliberate: blaming HIP/ROCR variables the user never set
+    //     sends them chasing an environment problem that does not exist.
+    //   - CLI, a mask is active on the runner — refused against the visible set.
+    //   - CLI, no visible set could be enumerated — falls back to the raw detected
+    //     count.
+    //   - ENGINE, on a host where neither the visible set nor the count could be
+    //     probed: `--gpu` validation takes its permissive fallback and the engine's
+    //     own probe makes the late rejection. Accepted deliberately, unlike in the
+    //     masked sibling below: the CLI-side refusal for an absent index predates
+    //     EAI-7194, so excluding the engine wording here would discriminate no fix
+    //     and only fail the scenario on unprobeable hosts.
+    let refusals = [
+        "--gpu index 99 is not present on this host",
+        "--gpu index 99 is not available under the active visibility mask",
+        "--gpu index 99 is out of range",
+        "requested gpu 99 is not available on this host",
+    ];
     assert!(
-        output.contains("99")
-            && (output.contains("not present")
-                || output.contains("out of range")
-                || output.contains("not available")),
+        refusals.iter().any(|phrase| output.contains(phrase)),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
