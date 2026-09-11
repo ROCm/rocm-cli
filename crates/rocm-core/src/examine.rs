@@ -714,27 +714,7 @@ pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, S
         return Err("could not list WSL distributions".to_owned());
     }
     let distros = parse_wsl_distro_list(&listed);
-    let selected = match distro {
-        Some(name) => {
-            if !distros.iter().any(|d| d.eq_ignore_ascii_case(name)) {
-                return Err(format!(
-                    "no WSL distribution named '{name}'; found: {}",
-                    distros.join(", ")
-                ));
-            }
-            name.to_owned()
-        }
-        None => match distros.as_slice() {
-            [] => return Err("no WSL distributions were found".to_owned()),
-            [only] => only.clone(),
-            many => {
-                return Err(format!(
-                    "several WSL distributions are installed; name one with --distro: {}",
-                    many.join(", ")
-                ));
-            }
-        },
-    };
+    let selected = select_wsl_distro(distro, &distros)?;
 
     let (rc, out, _) = run(
         "wsl.exe",
@@ -789,6 +769,36 @@ pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, S
     sync_shared_fields_from_wsl(&mut e);
     e.status = "wsl".to_owned();
     Ok(e)
+}
+
+/// Choose which WSL distribution to inspect, given the requested name (if
+/// any) and the list of installed ones.
+///
+/// Pulled out of [`probe_wsl_distro_from_host`] so this refusal logic -- one
+/// of the few genuinely host-independent, blocking checks in the WSL host
+/// path -- can be exercised without `wsl.exe`, which the rest of that
+/// function requires and which this crate's e2e coverage otherwise never
+/// touches on a non-Windows test runner.
+fn select_wsl_distro(distro: Option<&str>, distros: &[String]) -> Result<String, String> {
+    match distro {
+        Some(name) => {
+            if !distros.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+                return Err(format!(
+                    "no WSL distribution named '{name}'; found: {}",
+                    distros.join(", ")
+                ));
+            }
+            Ok(name.to_owned())
+        }
+        None => match distros {
+            [] => Err("no WSL distributions were found".to_owned()),
+            [only] => Ok(only.clone()),
+            many => Err(format!(
+                "several WSL distributions are installed; name one with --distro: {}",
+                many.join(", ")
+            )),
+        },
+    }
 }
 
 /// Whether `rocminfo` enumerates a GPU agent.
@@ -1894,6 +1904,120 @@ mod tests {
         assert_eq!(
             host_driver_fields(WslHostDriverProbe::Version("32.0.1".to_owned())),
             (true, Some("32.0.1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_named_distro_that_does_not_exist_is_refused() {
+        // This is the blocking refusal `probe_wsl_distro_from_host` returns
+        // to the caller of `rocm diagnose --distro <name>` -- a plain error,
+        // not a `continue-on-error` note the e2e suite can shrug off. It sat
+        // behind `wsl.exe` and was untested outside a real Windows+WSL host,
+        // which is not a lane this crate's unit tests run on.
+        let distros = vec!["Ubuntu".to_owned(), "Debian".to_owned()];
+        let err = select_wsl_distro(Some("Fedora"), &distros).expect_err("must be refused");
+        assert!(err.contains("Fedora"), "names the distro asked for: {err}");
+        assert!(err.contains("Ubuntu"), "lists what does exist: {err}");
+        assert!(err.contains("Debian"), "lists what does exist: {err}");
+    }
+
+    #[test]
+    fn a_named_distro_that_exists_is_selected_case_insensitively() {
+        // Matched case-insensitively against the installed list, but the name
+        // handed to `wsl.exe -d` afterwards is what the caller typed, not the
+        // list's original casing -- pre-existing behavior, preserved as-is by
+        // this extraction.
+        let distros = vec!["Ubuntu-24.04".to_owned()];
+        assert_eq!(
+            select_wsl_distro(Some("ubuntu-24.04"), &distros).expect("must be selected"),
+            "ubuntu-24.04"
+        );
+    }
+
+    #[test]
+    fn no_distro_named_falls_back_to_the_lone_one_or_refuses_ambiguity() {
+        assert_eq!(
+            select_wsl_distro(None, &["Ubuntu".to_owned()]).expect("the only one"),
+            "Ubuntu"
+        );
+        assert!(select_wsl_distro(None, &[]).is_err(), "nothing installed");
+        let many = vec!["Ubuntu".to_owned(), "Debian".to_owned()];
+        let err = select_wsl_distro(None, &many).expect_err("ambiguous without --distro");
+        assert!(
+            err.contains("--distro"),
+            "tells the user how to resolve it: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_shared_fields_from_wsl_copies_the_actual_rocminfo_values() {
+        // The fields the cross-platform PATH and wheel/ROCm checks read.
+        // Asserting only that they are *set* would still pass if the sync
+        // copied the wrong value or a hardcoded default -- assert the actual
+        // values reached from each distinct `WslFacts` fixture instead.
+        let mut missing = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: false,
+                rocm_sees_gpu: None,
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut missing);
+        assert!(!missing.rocminfo_present);
+        assert_eq!(missing.rocminfo_status, "missing");
+
+        let mut healthy = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: Some(true),
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut healthy);
+        assert!(healthy.rocminfo_present);
+        assert_eq!(healthy.rocminfo_status, "ok");
+
+        let mut no_agents = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: Some(false),
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut no_agents);
+        assert!(no_agents.rocminfo_present);
+        assert_eq!(no_agents.rocminfo_status, "no-agents");
+
+        let mut unasked = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: None,
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut unasked);
+        assert!(unasked.rocminfo_present);
+        assert_eq!(unasked.rocminfo_status, "unknown");
+    }
+
+    #[test]
+    fn probe_wsl_leaves_rocminfo_status_synced_not_at_its_uninitialized_default() {
+        // `probe_wsl` never sets `rocminfo_status` itself -- only
+        // `sync_shared_fields_from_wsl`, called at its very end, does. If that
+        // call were ever removed, this field would stay at
+        // `Examination::default()`'s empty string on every host, WSL or not,
+        // regardless of whether rocminfo happens to be installed here -- so
+        // this holds without depending on real host state, unlike a test that
+        // compared against the actual probed rocminfo presence.
+        let mut e = Examination::default();
+        probe_wsl(&mut e);
+        assert_ne!(
+            e.rocminfo_status, "",
+            "sync_shared_fields_from_wsl must have run and set a real status"
         );
     }
 

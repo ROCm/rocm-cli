@@ -1719,8 +1719,18 @@ fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) -> Diagnosis 
         // not, and this check fired on a complete working stack. `Some(false)`
         // specifically -- `None` means rocminfo was absent so the question went
         // unasked, which is not evidence of anything.
+        //
+        // Guarded on the linker cache like fix-wsl-4: when `ldconfig` positively
+        // shows librocdxg is not registered, that is the root cause and this
+        // check must not also fire for the same symptom -- the user would be
+        // left choosing between "run ldconfig" and "update the host driver" for
+        // a fault that only the former explains.
         Some(version)
-            if w.dxg_device && w.dxcore && w.librocdxg && w.rocm_sees_gpu == Some(false) =>
+            if w.dxg_device
+                && w.dxcore
+                && w.librocdxg
+                && w.ldconfig_librocdxg != Some(false)
+                && w.rocm_sees_gpu == Some(false) =>
         {
             score += 40;
             evidence.push(format!(
@@ -2654,6 +2664,37 @@ mod tests {
         let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
         let top = &report.matched[0];
         assert_eq!(top.id, "fix-wsl-4-rocdxg-not-linked");
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_does_not_also_raise_the_host_driver_finding() {
+        // Same fault as above, but with `rocm_sees_gpu = Some(false)` added so
+        // this machine also satisfies every other condition
+        // check_wsl_6_host_driver_too_old's second arm checks (dxg_device,
+        // dxcore, librocdxg, rocminfo seeing no GPU). Without the ldconfig
+        // guard on that arm, it fires alongside fix-wsl-4 for the same
+        // underlying fault, leaving the user to guess between "run ldconfig"
+        // and "update the Windows host driver" when only the former is true.
+        //
+        // The symptom text also carries a generic "cannot open shared object
+        // file" keyword that fix-8-wheel-rocm scores on regardless of WSL
+        // state -- that overlap is real and expected, so this only asserts on
+        // the two WSL findings that fix #2's guard actually governs.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.rocm_sees_gpu = Some(false);
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert!(
+            ids.contains(&"fix-wsl-4-rocdxg-not-linked"),
+            "the unlinked-library finding must still fire: ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"fix-wsl-6-host-driver-too-old"),
+            "the host-driver-too-old finding must not overlap with the unlinked-library \
+             finding on the same fault: ids: {ids:?}"
+        );
     }
 
     #[test]

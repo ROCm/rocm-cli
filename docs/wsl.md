@@ -153,6 +153,11 @@ rocm diagnose
 rocm diagnose --json
 ```
 
+This catalog replaces the standalone preflight script this repo used to ship;
+it does not carry over that script's `--require-build-tools` flag or its
+Python venv-tooling check, so a distro missing only build tools or `venv`
+support reports clean here.
+
 The WSL entries, in the order a broken stack usually reveals them:
 
 | Fix id | Reported when |

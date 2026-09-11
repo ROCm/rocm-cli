@@ -1428,6 +1428,49 @@ mod tests {
         assert_engine_shell_boundary_is_labelled(recipe.fix_id, recipe.commands);
     }
 
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn current_os_reaches_wsl_only_when_the_distro_env_var_is_corroborated() {
+        // `current_os()`'s wsl branch is `crate::is_wsl_host()`, which trusts
+        // `/dev/dxg` outright but requires `$WSL_DISTRO_NAME` to be
+        // corroborated by a kernel string that actually names Microsoft/WSL
+        // (see `wsl_signals_indicate_wsl`). `recipe_applies_here` below cannot
+        // check this independently: it calls `current_os()` to answer its own
+        // question, so a bug in `current_os()` would agree with itself and no
+        // test built on that helper would ever notice. This test instead
+        // forces the one signal that can be forced portably
+        // ($WSL_DISTRO_NAME) and compares the result against ground truth
+        // computed straight from this machine's real `/dev/dxg` and
+        // `/proc/version`, so it holds whether it runs on a bare-metal CI
+        // runner, Windows, or a real WSL host.
+        let proc_version = std::fs::read_to_string("/proc/version")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let corroborated = std::path::Path::new("/dev/dxg").exists()
+            || proc_version.contains("microsoft")
+            || proc_version.contains("wsl");
+
+        let previous = std::env::var_os("WSL_DISTRO_NAME");
+        unsafe {
+            std::env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+        }
+        let os = current_os();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("WSL_DISTRO_NAME", value),
+                None => std::env::remove_var("WSL_DISTRO_NAME"),
+            }
+        }
+
+        assert_eq!(
+            os == "wsl",
+            corroborated,
+            "current_os() must land on \"wsl\" exactly when the forced \
+             $WSL_DISTRO_NAME is corroborated by this machine's real /dev/dxg \
+             or /proc/version, not merely because the variable is set"
+        );
+    }
+
     /// Whether a recipe applies on the platform the test is running on.
     ///
     /// Tests used to gate on `runtime_is_linux()`, which stopped being the same
