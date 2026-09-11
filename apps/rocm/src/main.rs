@@ -7389,8 +7389,12 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
 /// auto-install that used to warn and continue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SdkInstallConsents {
-    /// Approve replacing whatever runtime is currently the active default.
-    replace_active_default: bool,
+    /// Approve replacing whatever runtime is currently the active default, and
+    /// which flag granted it. The source is carried rather than flattened to a
+    /// bool because the install log names it: crediting `--yes` on a surface
+    /// that only ever passed the narrow flag would tell the reader that consent
+    /// to run `sudo` had been given when it had not.
+    replace_active_default: therock::SdkInstallConsent,
     /// Approve installing required system packages (OpenMPI, libatomic,
     /// libnuma) through the system package manager, which means `sudo`.
     system_packages: bool,
@@ -7398,8 +7402,17 @@ struct SdkInstallConsents {
 
 impl SdkInstallConsents {
     const fn resolve(yes: bool, approve_replacing_active_default: bool) -> Self {
+        let replace_active_default = if yes {
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes)
+        } else if approve_replacing_active_default {
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            )
+        } else {
+            therock::SdkInstallConsent::Ask
+        };
         Self {
-            replace_active_default: yes || approve_replacing_active_default,
+            replace_active_default,
             system_packages: yes,
         }
     }
@@ -7530,6 +7543,14 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             // past something the user asked for. The auto (unapproved) path keeps
             // the warn-and-continue behavior so a missing OpenMPI never blocks an
             // otherwise-unattended install.
+            //
+            // "Surface" is the exact claim, and it is not the same as failing the
+            // command: this error propagates out of the engine auto-install, and
+            // `finish_sdk_install` routes it through
+            // `engine_auto_install_failure_is_fatal`, which matches only
+            // `UnusableRuntimeAfterInstall`. So `rocm install sdk` still prints
+            // the failure and exits 0. Said here because the downgrade happens
+            // far away and reads as a non-zero exit from this site alone.
             if escalate_failure {
                 return Err(error.context(
                     "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
@@ -11922,7 +11943,8 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         Some("install") if second.as_deref() == Some("sdk") => {
             // The chat/MCP surfaces spawn `rocm` with null stdin, so
             // `interactive_terminal()` is false and the consent prompt would
-            // refuse with "re-run with `--yes`" — a flag the user cannot supply
+            // refuse with a "re-run with `--approve-replacing-active-default`"
+            // error — and neither consent flag is something the user can supply
             // through chat.
             //
             // Not `--yes`: that flag also approves system-package installs, and
@@ -13380,7 +13402,23 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    Ok(therock::install_sdk(paths, channel, format, prefix, selector, None, true, true)?.output)
+    // Dry run, so nothing is displaced and the consent gate is never reached;
+    // the narrow consent is what this chat surface would pass for a real
+    // install, and passing `--yes`'s source here would be a lie waiting to be
+    // printed if the preview ever grew a gate.
+    Ok(therock::install_sdk(
+        paths,
+        channel,
+        format,
+        prefix,
+        selector,
+        None,
+        true,
+        therock::SdkInstallConsent::Preapproved(
+            therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+        ),
+    )?
+    .output)
 }
 
 fn run_command_with_timeout(
@@ -23253,8 +23291,9 @@ model recipes
     #[test]
     fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
         // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
-        // prompt would refuse with "re-run with `--yes`" — a flag the user has
-        // no way to supply from chat or the dashboard. Both the chat classifier
+        // prompt would refuse with "re-run with
+        // `--approve-replacing-active-default`" — a flag the user has no way to
+        // supply from chat or the dashboard. Both the chat classifier
         // arm and the MCP tool-args builder must inject the consent so an
         // install over the active default runtime is not silently refused.
         let action = chat_rocm_command_action_from_args(vec![
@@ -23284,9 +23323,13 @@ model recipes
         let mcp_args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
 
         for args in [&chat_args, &mcp_args] {
-            assert!(
+            assert_eq!(
                 consents_for_install_sdk_argv(args).replace_active_default,
-                "the spawn must approve replacing the active default, got {args:?}"
+                therock::SdkInstallConsent::Preapproved(
+                    therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+                ),
+                "the spawn must approve replacing the active default, and be credited \
+                 to the flag it actually passed rather than to --yes, got {args:?}"
             );
         }
     }
@@ -23310,7 +23353,12 @@ model recipes
         let injected = consents_for_install_sdk_argv(
             &rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args"),
         );
-        assert!(injected.replace_active_default);
+        assert_eq!(
+            injected.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+            )
+        );
         assert!(
             !injected.system_packages,
             "an injected consent must not approve a privileged package install"
@@ -23329,7 +23377,12 @@ model recipes
             "sdk".to_owned(),
             "--yes".to_owned(),
         ]);
-        assert!(typed.replace_active_default && typed.system_packages);
+        assert_eq!(
+            typed.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes),
+            "a --yes the user typed must still be credited to --yes"
+        );
+        assert!(typed.system_packages);
         assert_eq!(
             system_package_install_action(typed.system_packages, false),
             SystemPackageInstallAction::RunPlan {

@@ -896,17 +896,32 @@ async fn assert_adopt_error_explains(world: &mut E2eWorld) {
 #[then("the reinstall is refused")]
 async fn assert_reinstall_refused(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command was run");
-    assert!(rc != 0, "install sdk unexpectedly succeeded without --yes");
+    assert!(
+        rc != 0,
+        "install sdk unexpectedly succeeded without consent"
+    );
 }
 
-#[then("the error explains that --yes is required")]
-async fn assert_reinstall_error_explains_yes(world: &mut E2eWorld) {
+#[then("the error explains how to approve the replacement non-interactively")]
+async fn assert_reinstall_error_explains_consent(world: &mut E2eWorld) {
     let stdout = world.cli_output.as_deref().unwrap_or("");
     let stderr = world.cli_stderr.as_deref().unwrap_or("");
-    let combined = format!("{stdout}{stderr}").to_lowercase();
+    let combined = format!("{stdout}{stderr}");
+    // The narrow flag first, because this message is what a script or CI job
+    // reads: it is the whole consent needed here, while `--yes` would also
+    // approve a `sudo` system-package install whose password prompt an
+    // unattended caller cannot answer.
+    let narrow = combined
+        .find("--approve-replacing-active-default")
+        .unwrap_or_else(|| {
+            panic!("error does not name the narrow consent flag:\n{stdout}\n{stderr}")
+        });
+    let yes = combined
+        .find("--yes")
+        .unwrap_or_else(|| panic!("error does not still explain --yes:\n{stdout}\n{stderr}"));
     assert!(
-        combined.contains("--yes"),
-        "error does not mention --yes:\n{stdout}\n{stderr}"
+        narrow < yes,
+        "error recommends --yes ahead of the narrow flag:\n{stdout}\n{stderr}"
     );
 }
 

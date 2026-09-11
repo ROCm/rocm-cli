@@ -480,11 +480,18 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
                 "pre-warm: installing the {channel} SDK into {}",
                 prewarm_dir.display()
             );
-            // `--yes` because the consent gate keys on the tree's active default
-            // runtime, not on the channel `decide()` inspected: a shared tree
-            // pre-warmed for `release` and then pre-warmed for `nightly` reaches
-            // here with a release runtime already active, and xtask has no
-            // terminal to answer a prompt with, so the install would refuse.
+            // `--yes` rather than `--approve-replacing-active-default`, and the
+            // second consent is why: pre-warm is provisioning, so it wants the
+            // required system packages installed too, and the runners it runs on
+            // have passwordless sudo for exactly that — no prompt is raised, and
+            // a package that cannot be installed warns and continues.
+            //
+            // The narrow flag would cover the first consent on its own: the gate
+            // keys on the tree's active default runtime, not on the channel
+            // `decide()` inspected, so a shared tree pre-warmed for `release` and
+            // then for `nightly` arrives here with a release runtime already
+            // active and no terminal to confirm on. It would just leave the
+            // packages behind.
             rocm_command(&rocm, prewarm_dir)
                 .args(["install", "sdk", "--channel", channel, "--yes"])
                 .status_ok("rocm install sdk")?;

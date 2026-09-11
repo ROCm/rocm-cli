@@ -490,9 +490,13 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--format", "tarball"]));
         assert!(args.windows(2).any(|p| p == ["--prefix", "/opt/rocm-sdk"]));
         assert!(!args.contains(&"--dry-run".to_string()));
-        // A real (non-dry-run) install must carry --yes so the null-stdin
-        // dashboard spawn is not refused at the consent prompt.
+        // A real (non-dry-run) install must carry
+        // --approve-replacing-active-default so the null-stdin dashboard spawn
+        // is not refused at the consent prompt. Deliberately not --yes, which
+        // would also approve a `sudo` system-package install this spawn has no
+        // terminal to answer a password prompt on.
         assert!(args.contains(&"--approve-replacing-active-default".to_string()));
+        assert!(!args.contains(&"--yes".to_string()));
     }
 
     #[test]

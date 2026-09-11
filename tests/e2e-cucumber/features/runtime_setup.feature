@@ -187,7 +187,10 @@ Feature: Runtime configuration
 
   # Installing over the active default managed runtime must not silently
   # displace it. Outside an interactive terminal (as every e2e invocation
-  # is here), `install sdk` without `--yes` must refuse rather than proceed.
+  # is here), `install sdk` with neither consent flag must refuse rather than
+  # proceed, and the refusal has to name the flag the caller should actually
+  # reach for: `--approve-replacing-active-default`, not `--yes`, which would
+  # additionally approve a `sudo` system-package install no script can answer.
   # GPU-gated because the precondition needs a GPU to have a runtime active.
   # The refusal is not free: the gate reports the version relation, so
   # it runs after the Python launcher is resolved and the channel index is read.
@@ -197,11 +200,11 @@ Feature: Runtime configuration
   # What the refusal does bail before is the SDK and torch download and any
   # change on disk.
   @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
-  Scenario: runtime-11 - Reinstalling the SDK over an existing runtime without --yes is refused
+  Scenario: runtime-11 - Reinstalling the SDK over an existing runtime without consent is refused
     Given a managed runtime is active
     When the user reinstalls the SDK without confirming
     Then the reinstall is refused
-    And the error explains that --yes is required
+    And the error explains how to approve the replacement non-interactively
 
   # Companion to Scenario runtime-11: with --yes the same reinstall proceeds and the
   # runtime stays registered and active afterward. Nightly-gated in addition to
@@ -228,15 +231,15 @@ Feature: Runtime configuration
   # No `@nightly` despite the second family: like Scenario runtime-11 this is a
   # refusal, so it bails before the multi-GiB download and costs a resolve, not
   # an install. The third Then is what separates a correct refusal from an
-  # unrelated failure (a bad family name would also exit non-zero and also
-  # mention `--yes` in the usage text): only the real gate names the runtime it
-  # would replace.
+  # unrelated failure (a bad family name would also exit non-zero and could also
+  # name the consent flags in a usage line): only the real gate names the
+  # runtime it would replace.
   @id:runtime-install-sdk-other-family-requires-yes @requires-gpu
-  Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without --yes
+  Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without consent
     Given a managed runtime is active
     When the user installs a different GPU family without confirming
     Then the reinstall is refused
-    And the error explains that --yes is required
+    And the error explains how to approve the replacement non-interactively
     And the error names the active default runtime it would replace
 
   # `--yes` approves two unrelated things: replacing the active default runtime,

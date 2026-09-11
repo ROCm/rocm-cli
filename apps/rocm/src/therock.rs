@@ -958,6 +958,14 @@ struct InstallSourceOverride<'a> {
     layout: Option<SourceLayout>,
 }
 
+/// Install a TheRock SDK runtime.
+///
+/// `consent` carries the *source* of any up-front approval rather than a bare
+/// bool, because the progress line names it: `--yes` and
+/// `--approve-replacing-active-default` both clear this gate, but only the
+/// former also approves a `sudo` system-package install, so collapsing them
+/// would print "Approved by --yes" on every install ROCm CLI's own
+/// terminal-less surfaces make.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk(
     paths: &AppPaths,
@@ -967,15 +975,10 @@ pub(crate) fn install_sdk(
     version_selector: Option<RuntimeVersionSelector>,
     family_override: Option<&str>,
     dry_run: bool,
-    assume_yes: bool,
+    consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
-    let consent = if assume_yes {
-        SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes)
-    } else {
-        SdkInstallConsent::Ask
-    };
     match format {
         "wheel" => install_wheel_runtime(
             paths,
@@ -2150,8 +2153,16 @@ fn repo_version_without_wheels(
 /// so a message crediting one would name a flag the user could not have passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SdkInstallApprovalSource {
-    /// The user passed `--yes` to `rocm install sdk`.
+    /// The user passed `--yes` to `rocm install sdk`, which also approves
+    /// installing required system packages with `sudo`.
     AssumeYes,
+    /// `--approve-replacing-active-default` was passed: the narrow consent, and
+    /// the one ROCm CLI's own terminal-less surfaces (chat, MCP, `rocmd`, the
+    /// dashboard, onboarding) inject. Kept distinct from `AssumeYes` so the
+    /// install log names the flag that was actually given — those surfaces never
+    /// pass `--yes`, and a line crediting it would tell a reader that consent to
+    /// run `sudo` had been granted when it was not.
+    ApproveReplacingActiveDefault,
     /// `rocm update --apply`, which owns its own consent: the user named the
     /// runtime to update, so replacing it is the operation asked for. Non-
     /// interactive by construction, so it must never reach a prompt.
@@ -2223,6 +2234,9 @@ fn preapproved_install_line(
         SdkInstallApprovalSource::AssumeYes => format!(
             "Approved by --yes: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
         ),
+        SdkInstallApprovalSource::ApproveReplacingActiveDefault => format!(
+            "Approved by --approve-replacing-active-default: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
         SdkInstallApprovalSource::UpdateApply { activates: true } => format!(
             "Requested by `rocm update --apply --activate`: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
         ),
@@ -2244,9 +2258,17 @@ fn fresh_install_line(resolved_display: &str, family: &str) -> String {
 
 /// The error raised when the active default would be displaced but there is no
 /// terminal to confirm it and no preapproval.
+///
+/// This is the only message a script or CI job sees when it hits this gate, so
+/// it names the narrow flag first: that is the whole consent the caller needs
+/// here, and recommending `--yes` instead would hand an unattended caller the
+/// second consent it carries — approval to install system packages with `sudo`,
+/// whose password prompt a job with no terminal cannot answer. `--yes` is still
+/// named, because a user at a terminal who wants both should not have to
+/// discover it elsewhere.
 fn refuse_non_interactive_message(relation: &str) -> String {
     format!(
-        "an existing ROCm SDK is the active default runtime ({relation}); continuing would make the newly installed ROCm the active default runtime instead. Re-run with --yes to approve this non-interactively, for example `rocm install sdk --yes`"
+        "an existing ROCm SDK is the active default runtime ({relation}); continuing would make the newly installed ROCm the active default runtime instead. Re-run with --approve-replacing-active-default to approve this non-interactively, for example `rocm install sdk --approve-replacing-active-default`. Use --yes instead only if you also want to approve installing required system packages with sudo, which needs a terminal to answer a password prompt"
     )
 }
 
@@ -8601,9 +8623,18 @@ echo Python 3.12.10
             cache_dir: root.join("cache"),
         };
 
-        let error = install_sdk(&paths, "release", "tarball", None, None, None, true, true)
-            .unwrap_err()
-            .to_string();
+        let error = install_sdk(
+            &paths,
+            "release",
+            "tarball",
+            None,
+            None,
+            None,
+            true,
+            SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("tarball installs are not supported on Windows"));
         assert!(error.contains("rocm install sdk --format wheel"));
@@ -8799,6 +8830,18 @@ echo Python 3.12.10
             SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::AssumeYes)
         );
         assert_eq!(
+            sdk_install_approval(
+                true,
+                SdkInstallConsent::Preapproved(
+                    SdkInstallApprovalSource::ApproveReplacingActiveDefault
+                ),
+                false
+            ),
+            SdkInstallApproval::ProceedApproved(
+                SdkInstallApprovalSource::ApproveReplacingActiveDefault
+            )
+        );
+        assert_eq!(
             sdk_install_approval(true, update_apply, false),
             SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::UpdateApply {
                 activates: false
@@ -8828,6 +8871,25 @@ echo Python 3.12.10
         assert!(by_yes.starts_with("Approved by --yes:"), "got: {by_yes}");
         assert!(by_yes.contains("becomes the active default runtime"));
 
+        // The narrow flag is not `--yes`: ROCm CLI's own terminal-less surfaces
+        // pass only this one, and a line crediting `--yes` would tell whoever
+        // reads the chat or dashboard transcript that consent to run `sudo` was
+        // given when it never was.
+        let by_narrow = preapproved_install_line(
+            SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            by_narrow.starts_with("Approved by --approve-replacing-active-default:"),
+            "got: {by_narrow}"
+        );
+        assert!(
+            !by_narrow.contains("--yes"),
+            "the narrow flag must not be credited to --yes: {by_narrow}"
+        );
+        assert!(by_narrow.contains("becomes the active default runtime"));
+
         let update_activates = preapproved_install_line(
             SdkInstallApprovalSource::UpdateApply { activates: true },
             "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
@@ -8853,6 +8915,44 @@ echo Python 3.12.10
             "`update --apply` without --activate does not change the active default: {update_only}"
         );
         assert!(update_only.contains("The active default runtime is unchanged"));
+    }
+
+    #[test]
+    fn refusal_recommends_the_narrow_flag_before_yes() {
+        // This is the only message a script or CI job reads when it hits the
+        // gate, and it is the audience the narrow flag exists for. Recommending
+        // `--yes` first would hand an unattended caller the second consent that
+        // flag carries — approval to install system packages with `sudo` — and
+        // park it on a password prompt it has no terminal to answer.
+        let message = refuse_non_interactive_message(
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+        );
+
+        let narrow = message
+            .find("--approve-replacing-active-default")
+            .unwrap_or_else(|| panic!("the refusal must name the narrow flag: {message}"));
+        // `--yes` still has to appear: a user at a terminal who wants both
+        // consents should not have to go looking for it.
+        let yes = message
+            .find("--yes")
+            .unwrap_or_else(|| panic!("the refusal must still explain --yes: {message}"));
+        assert!(
+            narrow < yes,
+            "the narrow flag must be recommended before --yes: {message}"
+        );
+        assert!(
+            message.contains("system packages"),
+            "the refusal must say what --yes additionally approves: {message}"
+        );
+        assert!(
+            message.contains("is the active default runtime"),
+            "the refusal must name what would be replaced: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("overwrit"),
+            "an upgrade leaves the previous install on disk; it replaces the \
+             active default rather than overwriting it: {message}"
+        );
     }
 
     #[test]
