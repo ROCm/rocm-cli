@@ -33,16 +33,19 @@ separate tier flag or tag filter to maintain.
 |---|---|---|---|
 | `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
-| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, strix-halo, native]` |
-| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on native Windows 11 | self-hosted `[self-hosted, windows, strix-halo, native]` |
+| `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
+| `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
 | `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
 | `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
 
-The Strix Halo lanes pin the extra `native` label because two Linux runners
-share the `strix-halo` label (a native host and a WSL host) and the jobs'
-hardcoded `/home/ubuntu/actions-runner` paths exist only on the native one. The
-WSL lane pins `wsl` for the same reason, from the other side.
+The Ubuntu and Windows Strix Halo lanes run on the AMD Ryzen DevLab Dispatch
+pool: a fresh runner is registered per job and destroyed after, opt-in only via
+the `devlab-dispatch` label, so the pool never picks up a job by accident even
+though its hosts also carry `strix-halo`. `e2e-wsl` stays on a static, always-on
+host (a WSL2 guest on a specific pre-configured Windows box, not generic Strix
+Halo hardware — the pool doesn't provide an equivalent) and pins the extra
+`wsl` label to disambiguate it from any other Linux Strix Halo runner.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
@@ -217,29 +220,34 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
 `e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
-`continue-on-error: true`, so a hardware failure that RUNS never gates a PR
-merge. Their results still surface
-in the self-hosted consolidated report for visibility.
+check names that are absent from branch protection's required-status-check
+list (see below), so a hardware failure never gates a PR merge no matter how
+it reports. Five of them run with `continue-on-error: false`, so a real
+regression shows red instead of always green; `e2e-gpu-mi350p` still runs with
+`continue-on-error: true`, unchanged and out of scope here. Their results also
+surface in the self-hosted consolidated report for visibility.
 
-### Timeouts on the shared Strix box
+### Timeouts on the Strix lanes
 
-Three of those lanes — the two native Strix ones and `e2e-wsl` — run on the same
-physical machine and can be in flight together, so a wait that is comfortable on
-an idle runner can expire while a sibling lane loads a model. Two budgets are
-raised there rather than letting contention read as a product failure:
-`E2E_SERVE_TIMEOUT_SECS` for serve readiness, and `E2E_TUI_TIMEOUT_SECS` for the
-PTY-driven dashboard waits. Both only lengthen how long a wait may take; a
-genuine hang still fails, just later.
+Every Strix Halo lane raises two budgets rather than letting a slow host read
+as a product failure: `E2E_SERVE_TIMEOUT_SECS` for serve readiness, and
+`E2E_TUI_TIMEOUT_SECS` for the PTY-driven dashboard waits. On the pool-hosted
+Ubuntu/Windows lanes this covers a busy or cold-starting pool host; `e2e-wsl`
+additionally shares its physical machine with nothing else in this workflow
+now that the other two lanes moved to the pool, but WSL2's own virtualization
+overhead can still make a wait that's comfortable on native hardware run long.
+Both budgets only lengthen how long a wait may take; a genuine hang still
+fails, just later.
 
-**Required-check caveat.** These three job names (plus, historically, a
-consolidated-report name) are still in `main`'s required-status-check list.
-`continue-on-error` neutralizes a job that ran and failed, but a required check
-that *never reports* — because its self-hosted runner is offline — is treated as
-missing and still blocks the merge. The workflow split removes the catastrophic
-concurrency stall (an offline runner can no longer freeze `ci.yml`'s hosted
-required checks), but fully unblocking merges while a runner is offline
-additionally requires removing these self-hosted checks from the required list —
-a branch-protection change tracked separately from the workflow split.
+**Required-check history.** These job names — and `E2E consolidated report
+(self-hosted)` — used to be in `main`'s required-status-check list, where a
+required check that *never reports* (because its self-hosted runner is
+offline) is treated as missing and still blocks the merge, `continue-on-error`
+notwithstanding. That branch-protection change has since landed: none of the
+self-hosted lane names, nor the self-hosted consolidated report, are in the
+required list anymore (`ci.yml`'s own mock `E2E tests` / `E2E consolidated
+report` are the required checks with those overlapping names). An offline or
+unclaimed self-hosted runner can no longer block a merge.
 
 ## Fork safety
 
