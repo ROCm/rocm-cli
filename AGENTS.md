@@ -202,10 +202,14 @@ The licence is stated in `skill-card.md` instead.
 
 Two checks gate it, and they cover different things:
 
-- **`skill-evals` (skillscope, blocking)** — the frontmatter an agent runtime
-  parses, the `evals/evals.json` coverage bar (at least 3 prompts that should
-  trigger the skill and 2 near misses that should not), the `skill-card.md`
-  sections, and every internal markdown link. Reproduce it locally with
+- **`skill-evals` (skillscope, advisory today)** — the frontmatter an agent
+  runtime parses, the `evals/evals.json` coverage bar (at least 3 prompts that
+  should trigger the skill and 2 near misses that should not), the
+  `skill-card.md` sections, and every internal markdown link. It is not yet a
+  required status check in branch protection: an admin must add its exact
+  context, `Skill checks (skillscope)` (the job's `name:`, not the
+  `skill-evals` job id), before a red run actually blocks a merge. Reproduce
+  it locally with
   `uv tool install git+https://github.com/amd/skillscope@v0.1.0`, then
   `skillscope structural --skills-dir 'skills/rocm-doctor' --skill-files
   skill-card.md --skill-sections Description,Owner,License`. Add `--external`
