@@ -18,6 +18,15 @@ use crate::E2eWorld;
 /// on throughput accuracy, and the GPU lane pays real inference time for each.
 const BENCH_REQUESTS: &str = "2";
 
+/// Windowed `tpot_ms` the metrics mock is built to produce, in milliseconds.
+///
+/// Its TPOT histogram adds 0.4 s of `_sum` per 20 `_count` on every scrape, so
+/// `Δsum/Δcount` is exactly 0.020 s however many scrapes the cell's window
+/// spans. Asserting the value rather than just its sign is what makes the CSV
+/// scenario pin the windowed arithmetic — a lifetime `sum/count` backfill or a
+/// unit slip would also be "positive".
+const EXPECTED_TPOT_MS: f64 = 20.0;
+
 /// Deterministic path, inside the scenario's isolated root, that the CSV-content
 /// scenario writes to via `--out` and reads back — so the `then` step can assert
 /// on the emitted row without depending on the default `<data_dir>` layout.
@@ -266,12 +275,6 @@ async fn assert_row_engine_and_tpot(world: &mut E2eWorld) {
         "vllm",
         "the emitted row must carry engine=vllm from the recognised /metrics scrape:\n{data}"
     );
-    // The mock's TPOT histogram adds 0.4 s of `_sum` per 20 `_count` on every
-    // scrape, so Δsum/Δcount is exactly 0.020 s however many scrapes the window
-    // spans: 20 ms. Asserting the value rather than just its sign is what makes
-    // this pin the windowed arithmetic — a lifetime `sum/count` backfill or a
-    // unit slip would also be "positive".
-    const EXPECTED_TPOT_MS: f64 = 20.0;
     let tpot = col("tpot_ms");
     assert!(
         tpot.parse::<f64>()
