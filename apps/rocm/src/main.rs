@@ -15769,8 +15769,18 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             .any(|candidate| candidate.service_id == record.service_id);
         if !stopped_by_this_pass {
             let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
+            // Ask the same address the reachability probe just succeeded against.
+            // `record.endpoint_url` is built from the recorded host, so a `0.0.0.0`
+            // or `::` bind would be connected to literally — which does not
+            // resolve, fails the probe, and takes the fail-open branch below,
+            // removing the tooling while a wildcard-bound engine is still
+            // serving. That is the defect this gate exists to close, so the
+            // identity probe gets the normalized host too.
+            let mut probe_record = record.clone();
+            probe_record.endpoint_url =
+                rocm_core::format_http_base_url(&probe_host(&record.host), record.port);
             match rocm_core::managed_service_endpoint_model_ready(
-                record,
+                &probe_record,
                 endpoint_api_key.as_deref(),
                 ENDPOINT_IDENTITY_PROBE_TIMEOUT,
             ) {
@@ -31332,6 +31342,68 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A fake OpenAI `/v1/models` endpoint on loopback that shuts itself down.
+    ///
+    /// `drop`ping a bare `JoinHandle` only detaches it: the thread stays parked
+    /// in `accept()` holding an ephemeral port for the life of the test binary,
+    /// and a failing assertion panics before any manual cleanup line. Owning the
+    /// shutdown in `Drop` means the port is released even when the test fails,
+    /// which is when it matters.
+    struct ServingEndpoint {
+        port: u16,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ServingEndpoint {
+        /// Serve `model_id` from `/v1/models` until dropped.
+        fn serving(model_id: &str) -> Self {
+            use std::sync::atomic::Ordering;
+
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind the surviving engine");
+            let port = listener.local_addr().expect("socket address").port();
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = std::sync::Arc::clone(&shutdown);
+            let body = format!(r#"{{"data":[{{"id":"{model_id}"}}]}}"#);
+            let thread = thread::spawn(move || {
+                use std::io::{Read, Write};
+                while let Ok((mut stream, _)) = listener.accept() {
+                    if stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buffer = [0_u8; 1024];
+                    if stream.read(&mut buffer).is_err() {
+                        continue;
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            Self {
+                port,
+                shutdown,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for ServingEndpoint {
+        fn drop(&mut self) {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Unblock the parked `accept()` so the thread observes the flag.
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     #[test]
     fn a_stopped_record_still_serving_its_own_model_blocks_uninstall() {
         // The retry the abort message asks for must not be the hole. A stop
@@ -31342,25 +31414,8 @@ ID_LIKE="suse opensuse"
         // GPU. That is EAI-8014 reached by following the gate's own
         // instructions, so the evidence has to survive the retry: an endpoint
         // serving this record's own model blocks, whoever it belongs to.
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the surviving engine");
-        let port = listener.local_addr().expect("socket address").port();
-        let serving = thread::spawn(move || {
-            use std::io::{Read, Write};
-            while let Ok((mut stream, _)) = listener.accept() {
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut buffer = [0_u8; 1024];
-                if stream.read(&mut buffer).is_err() {
-                    continue;
-                }
-                let body = r#"{"data":[{"id":"amd/orphaned-model"}]}"#;
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
+        let endpoint = ServingEndpoint::serving("amd/orphaned-model");
+        let port = endpoint.port;
 
         let (root, paths) = test_paths("uninstall-stopped-record-still-serving");
         let mut record = ManagedServiceRecord::new(
@@ -31402,7 +31457,61 @@ ID_LIKE="suse opensuse"
             error.contains("outlived its supervisor"),
             "says why `rocm services stop` will not help: {error}"
         );
-        drop(serving);
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_wildcard_bound_engine_is_identified_instead_of_waved_through() {
+        // `probe_host` normalizes a wildcard bind to loopback for the
+        // reachability check, but the identity probe used to be handed the raw
+        // record, whose `endpoint_url` still spells the wildcard. That address
+        // does not resolve, so the probe errored and took the fail-open branch:
+        // uninstall removed the tooling while a wildcard-bound engine was still
+        // serving — the exact outcome this gate exists to prevent.
+        //
+        // `*` is one of the spellings `probe_host` documents a record can carry,
+        // and unlike `0.0.0.0` it fails to resolve on every platform, so this
+        // pins the behaviour rather than a host quirk.
+        let endpoint = ServingEndpoint::serving("amd/wildcard-model");
+        let (root, paths) = test_paths("uninstall-wildcard-bound-engine");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-wildcard-engine",
+            "vllm",
+            "amd/wildcard-model",
+            "amd/wildcard-model",
+            "*",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-wildcard-engine")
+            .unwrap_or_else(|| {
+                panic!("a wildcard-bound engine still serving must fail the gate: {report:?}")
+            });
+        assert_eq!(
+            failure.remedy,
+            StopFailureRemedy::StopWhatHoldsThePort,
+            "its recorded processes are gone, so the port holder is the remedy"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the gate must refuse to remove anything"
+        );
+        drop(endpoint);
         let _ = fs::remove_dir_all(root);
     }
 
