@@ -7723,6 +7723,19 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> 
 /// Staged under a unique sibling name reserved with `create_new` — so two
 /// writers cannot pick the same scratch file — and published with
 /// [`publish_temp_file`]. A failed publish takes the scratch file with it.
+///
+/// Two limits worth knowing before reaching for this:
+///
+/// * **Atomic, not durable.** The staged bytes are `sync_all`ed before the
+///   publish, so a crash cannot leave a half-written or zero-length file. The
+///   containing *directory* is never fsynced, so the rename itself can still be
+///   lost by a power failure — the guarantee is that readers only ever see one
+///   complete version, not that the newest one survives a crash.
+/// * **Permissions are not carried over.** This replaces the target inode with
+///   a freshly created file, so an existing file's mode does not survive (a
+///   difference from the `fs::write` it usually replaces). Every current caller
+///   writes non-sensitive state into a directory `AppPaths` already restricts;
+///   a permission-sensitive caller would need this to set the mode explicitly.
 pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
@@ -7809,6 +7822,61 @@ mod tests {
                 name.contains(".tmp-").then_some(name)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_service_record_is_published_atomically() {
+        // `ManagedServiceRecord::write` runs on the uninstall stop path, where a
+        // torn manifest is not a lost update but an unparseable record that makes
+        // the gate refuse to remove anything. Reverting it to a plain `fs::write`
+        // would restore that hazard silently, so pin the atomic behaviour at the
+        // record level and not only on the helper: no reader ever observes a
+        // partial file, and no scratch sibling is left in the services directory
+        // for `unreadable_service_manifests` to trip over.
+        let root = atomic_write_root("service-record-publish");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-atomic-publish",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write().expect("first publish");
+        record.status = "stopped".to_owned();
+        record
+            .write()
+            .expect("republish over the existing manifest");
+
+        let services_dir = paths.services_dir();
+        let stray = fs::read_dir(&services_dir)
+            .expect("read the services directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stray.is_empty(),
+            "publishing a record must leave no scratch manifest: {stray:?}"
+        );
+        let written = fs::read(&record.manifest_path).expect("read the manifest back");
+        let parsed: ManagedServiceRecord =
+            serde_json::from_slice(&written).expect("the published manifest must always parse");
+        assert_eq!(parsed.status, "stopped", "the republish must have landed");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
