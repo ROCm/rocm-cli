@@ -50,7 +50,7 @@ tests/remote-ssh/run-e2e.sh   # the real binary, end to end
 `run.sh` covers argument handling, exit-code propagation, delivering a
 credential on stdin, file copy, batch-mode refusal, that withdrawing a
 published endpoint actually removes it, and the shape Tailscale Funnel takes in
-the serve config.
+the serve config — including that a port Funnel cannot serve is refused.
 
 `run-e2e.sh` runs the built `rocm` through the whole flow — discover, probe,
 serve, publish, reconcile status, re-publish after an out-of-band withdrawal,

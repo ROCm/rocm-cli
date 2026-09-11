@@ -654,11 +654,11 @@ jobs:
     # assumption against a real OpenSSH server in a container: argument
     # handling, exit-code propagation, stdin delivery of a credential, file
     # copy, batch-mode refusal, the shape Tailscale Funnel takes in the serve
-    # config, and — the one that matters most — that withdrawing a published
-    # endpoint actually removes it. A publish is
-    # configuration rather than a process, so it survives reboots, and a
-    # withdrawal that silently does nothing leaves a GPU endpoint exposed with
-    # nothing tracking it.
+    # config (including that the fake refuses the ports the real daemon
+    # refuses), and — the one that matters most — that withdrawing a published
+    # endpoint actually removes it. A publish is configuration rather than a
+    # process, so it survives reboots, and a withdrawal that silently does
+    # nothing leaves a GPU endpoint exposed with nothing tracking it.
     #
     # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
     # stand-ins that answer in the shapes the real tools do.
@@ -687,9 +687,10 @@ jobs:
 
       # The same container, driven by the real binary this time: discover a
       # target, probe it, serve, publish, reconcile status, re-publish after an
-      # out-of-band withdrawal, tear down. Catches the orchestration mistakes a
-      # scripted stand-in cannot — an argument the CLI builds wrongly, a session
-      # record it fails to clean up.
+      # out-of-band withdrawal, tear down, and refuse to publish over a
+      # Funnel-exposed port. Catches the orchestration mistakes a scripted
+      # stand-in cannot — an argument the CLI builds wrongly, a session record
+      # it fails to clean up.
       - name: Build the CLI for the end-to-end run
         run: cargo build -p rocm
 

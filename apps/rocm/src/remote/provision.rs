@@ -315,14 +315,23 @@ fn tempdir_for_download() -> Result<PathBuf> {
 /// Create `path` accessible only by its owner, with the mode applied *at*
 /// creation.
 ///
-/// What lands here is the release archive, its checksum, its signature and a
-/// copy of install.sh — all public material, so the point is not
-/// confidentiality. It is integrity: every one of those is about to be verified
-/// and then shipped to the remote, and another local user able to write into
-/// this directory could swap the archive or the installer in the window between
-/// the download and the check. (The signing key itself never lands here. It
-/// travels in the command prefix, and install.sh writes it into its own
-/// `mktemp -d` on the far side.)
+/// What lands here is the release archive, its checksum and its signature — all
+/// public material, so the point is not confidentiality. It is integrity, and
+/// the window is narrower than it looks: `download_for` runs install.sh in
+/// download-only mode, which fetches and verifies inside its *own* `mktemp -d`
+/// and only then copies the proven artifacts out to here. So nothing in this
+/// directory is waiting to be checked.
+///
+/// What it is waiting for is the push. Between landing and the `scp` above,
+/// another local user able to write here could swap the archive together with a
+/// matching `.sha256`, and the remote would re-verify the pair it was given. A
+/// signature stops that — but install.sh only requires one on the release
+/// channel with pinned keys present, or when a key is named explicitly
+/// (`install.sh:418-431`), so on any other channel the checksum is the only
+/// thing standing there. 0700 is what keeps a second local user out of the gap.
+///
+/// (The signing key itself never lands here. It travels in the command prefix,
+/// and install.sh writes it into its own `mktemp -d` on the far side.)
 ///
 /// Creating first and tightening afterwards leaves that window open for the
 /// width of the umask. `DirBuilder::mode` closes it; this repo already uses the
@@ -450,6 +459,13 @@ mod tests {
 
     #[test]
     fn an_explicit_pem_is_forwarded_as_is_when_it_is_the_only_one_set() {
+        // The trailing empty `_PATH` is load-bearing, so it is asserted as part
+        // of the whole fragment rather than trusted. Without it a key could be
+        // forwarded correctly and still lose: resolve_public_keys reads `_PATH`
+        // first, so a value the remote exports for itself — /etc/environment
+        // via pam_env reaches non-interactive sshd sessions — would beat the
+        // key we just sent. An explicitly-empty export is what install.sh's
+        // `[ -n ... ]` reads as unset.
         let fragment = signing_env_fragment_from(Some("pem-content".to_owned()), None, |path| {
             panic!("must not read {path}: no _PATH was set")
         })
@@ -457,27 +473,6 @@ mod tests {
         assert_eq!(
             fragment.as_deref(),
             Some("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM=pem-content ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= ")
-        );
-    }
-
-    #[test]
-    fn the_forwarded_key_switches_off_any_path_the_remote_already_had() {
-        // Without the empty _PATH, an operator's key could be forwarded
-        // correctly and still lose. resolve_public_keys reads _PATH first, so a
-        // value the remote exports for itself — /etc/environment via pam_env
-        // reaches non-interactive sshd sessions — would beat the key we just
-        // sent, and the two machines would verify against different trust
-        // roots. That is the exact divergence the ordering fix above exists to
-        // prevent, arriving from the other side.
-        let fragment = signing_env_fragment_from(Some("pem-content".to_owned()), None, |path| {
-            panic!("must not read {path}: no _PATH was set")
-        })
-        .expect("no file read is attempted")
-        .expect("a _PEM was set");
-        assert!(
-            fragment.contains("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH= "),
-            "an explicitly-empty _PATH is what install.sh's `[ -n ... ]` reads as unset: \
-             {fragment}"
         );
     }
 

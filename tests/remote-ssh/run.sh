@@ -43,6 +43,18 @@ expect() {
   fi
 }
 
+# Assert a value contains a substring. For output whose exact wording is not
+# the point but whose identity is — distinguishing a tool's own refusal from
+# ssh failing for reasons of its own, say.
+expect_contains() {
+  local name="$1" needle="$2" haystack="$3"
+  if [[ "${haystack}" == *"${needle}"* ]]; then
+    pass "${name}"
+  else
+    fail "${name}" "expected to find '${needle}' in:"$'\n'"${haystack}"
+  fi
+}
+
 # Assert a jq filter holds over a JSON document.
 expect_json() {
   local name="$1" filter="$2" document="$3"
@@ -250,11 +262,13 @@ expect_json "and records it as allowed rather than merely present" \
 expect_json "and says nothing about a forward, which is a separate question" \
   '.TCP."443" == null' "${funnel_config}"
 
-if remote tailscale funnel --tcp=8000 on 2>/dev/null; then
-  fail "a port Funnel cannot serve is refused" "8000 was accepted"
-else
-  pass "a port Funnel cannot serve is refused"
-fi
+# Asserting on the message, not merely on a non-zero exit: `remote` is an ssh
+# wrapper, and ssh fails non-zero for its own reasons too — a dropped control
+# socket, a missing fixture. Taking any failure as proof would let a broken
+# harness report this as passing.
+refusal="$(remote tailscale funnel --tcp=8000 on 2>&1 || true)"
+expect_contains "a port Funnel cannot serve is refused" \
+  "funnel is only supported on ports 443, 8443 and 10000" "${refusal}"
 
 remote tailscale funnel --tcp=443 off
 expect_json "turning Funnel off clears the exposure" \

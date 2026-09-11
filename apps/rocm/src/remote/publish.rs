@@ -546,9 +546,9 @@ mod tests {
         // No matching TCPForward at all: without the AllowFunnel check this
         // reads as `Absent`, and `publish()` would happily complete the
         // exposure it was never asked to create.
-        let funnel_only = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#;
+        let funnel_only = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:443": true}}"#;
         assert_eq!(
-            classify(funnel_only, 8000, 11434),
+            classify(funnel_only, 443, 11434),
             PublishState::FunnelAllowed
         );
     }
@@ -559,34 +559,34 @@ mod tests {
         // the port is reachable from the public internet, not just the
         // tailnet. That must not be reported as an ordinary `Published`.
         let both = r#"{
-          "TCP": { "8000": { "TCPForward": "127.0.0.1:11434" } },
-          "AllowFunnel": { "my-machine.tail1234.ts.net:8000": true }
+          "TCP": { "443": { "TCPForward": "127.0.0.1:11434" } },
+          "AllowFunnel": { "my-machine.tail1234.ts.net:443": true }
         }"#;
-        assert_eq!(classify(both, 8000, 11434), PublishState::FunnelAllowed);
+        assert_eq!(classify(both, 443, 11434), PublishState::FunnelAllowed);
     }
 
     #[test]
     fn funnel_allowed_on_another_port_does_not_affect_ours() {
-        let other_port = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:9000": true}}"#;
-        assert_eq!(classify(other_port, 8000, 11434), PublishState::Absent);
+        let other_port = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8443": true}}"#;
+        assert_eq!(classify(other_port, 443, 11434), PublishState::Absent);
     }
 
     #[test]
     fn funnel_disabled_entry_does_not_trip_the_guard() {
         // The map can carry `false` entries for a port Funnel was allowed for
         // and then turned off. Only `true` matters.
-        let disabled = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": false}}"#;
-        assert_eq!(classify(disabled, 8000, 11434), PublishState::Absent);
+        let disabled = r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:443": false}}"#;
+        assert_eq!(classify(disabled, 443, 11434), PublishState::Absent);
     }
 
     #[test]
     fn publish_refuses_a_funnel_enabled_port() {
         let transport = ScriptedTransport::new(vec![ScriptedStep::ok(
             "tailscale serve status --json",
-            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#,
+            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:443": true}}"#,
         )]);
-        let error = publish(&transport, 8000, 11434).unwrap_err().to_string();
-        assert!(error.contains("tailscale funnel --tcp=8000 off"), "{error}");
+        let error = publish(&transport, 443, 11434).unwrap_err().to_string();
+        assert!(error.contains("tailscale funnel --tcp=443 off"), "{error}");
         // Nothing should have been written.
         assert!(
             !transport.calls().iter().any(|call| matches!(
@@ -603,10 +603,10 @@ mod tests {
     fn withdraw_refuses_a_funnel_enabled_port() {
         let transport = ScriptedTransport::new(vec![ScriptedStep::ok(
             "tailscale serve status --json",
-            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:8000": true}}"#,
+            r#"{"AllowFunnel": {"my-machine.tail1234.ts.net:443": true}}"#,
         )]);
-        let error = withdraw(&transport, 8000, 11434).unwrap_err().to_string();
-        assert!(error.contains("tailscale funnel --tcp=8000 off"), "{error}");
+        let error = withdraw(&transport, 443, 11434).unwrap_err().to_string();
+        assert!(error.contains("tailscale funnel --tcp=443 off"), "{error}");
         assert!(
             !transport.calls().iter().any(|call| matches!(
                 call,

@@ -1198,7 +1198,15 @@ mod tests {
         // whether the endpoint is published. Leading the line with "no"
         // answered a question it had not looked at, and buried the one thing
         // on it that needs acting on.
-        let record = sample_record();
+        // Port 443, not the 8000 the other fixtures use: Funnel only serves
+        // 443, 8443 and 10000, so a session that can reach this state at all
+        // is one started with `--tailnet-port`. Rendering the remedy for a
+        // port Funnel cannot listen on would pin a line no user could ever
+        // see.
+        let record = RemoteSessionRecord {
+            tailnet_port: 443,
+            ..sample_record()
+        };
         let rendered = render_status(
             &render_paths(),
             &[(
