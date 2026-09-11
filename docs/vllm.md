@@ -170,16 +170,16 @@ a tiny model. rocm-cli helps in three ways:
   points at `--gpu-memory-utilization` as the fix.
 - **OOM failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
-  reservation, e.g. `--gpu-memory-utilization 0.1`, or targeting a less-busy GPU
+  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
   with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
   for the full conditional remediation (busy GPU vs. a model that does not fit).
 
 Explicitly, the workaround for an OOM on a shared card is:
 
 ```bash
-rocm serve <model> --engine vllm --gpu-memory-utilization 0.1
+rocm serve <model> --engine vllm --gpu-memory-utilization 0.5
 # optionally target a specific, less-busy GPU by index
-rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.1
+rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
 # for the full busy-GPU-vs-model-too-large breakdown, pass the error to diagnose
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
