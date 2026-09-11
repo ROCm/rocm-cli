@@ -209,3 +209,10 @@ when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-8031"
 reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
 serve_timeout_secs = 240
+
+# EAI-8051 had a row here — `comfyui install` pulling CUDA `nvidia-*` wheels into
+# the managed ROCm runtime and displacing its ROCm torch. The fix landed in
+# 3e59435a (#298): the install now pins the runtime's torch stack with a `uv
+# --constraint` file, so a transitive dependency can no longer resolve torch from
+# PyPI. `comfyui-install-preserves-the-rocm-runtime` therefore EXPECT-PASSES now;
+# keeping the row would make it a stale XPASS and fail the lane.
