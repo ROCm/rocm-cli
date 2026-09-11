@@ -1050,6 +1050,18 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
+/// Stage-and-publish a file here, sharing only the publish step with `rocm-core`.
+///
+/// Deliberately not [`rocm_core::write_file_atomically`], and not a copy of it
+/// either: only the Windows-sensitive publish (`ReplaceFileW` and its fallbacks)
+/// is single-sourced, via [`publish_temp_file`]. The staging half stays local
+/// because it carries the `suffix_for_attempt` and `before_publish` seams the
+/// tests below drive to force temp-name collisions, write failures and rename
+/// races — injection points `rocm_core`'s caller-facing helper does not expose.
+///
+/// Consequence worth knowing: this path does **not** `sync_all` before
+/// publishing, so unlike the `rocm-core` helper it is atomic but carries no
+/// crash-durability guarantee for the staged bytes.
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
@@ -1135,60 +1147,10 @@ where
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// The publish step lives in `rocm-core` so there is one implementation of the
+/// Windows `ReplaceFileW` handling for the whole workspace.
 fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(tmp, path)
-}
-
-#[cfg(windows)]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
-        return replace_file_windows(path, tmp);
-    }
-
-    match fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            if path.try_exists()? {
-                replace_file_windows(path, tmp)
-            } else {
-                Err(rename_error)
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement_wide: Vec<u16> = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
-    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
-    // remain alive for the duration of the synchronous Windows API call. The
-    // optional backup, exclude, and reserved pointers are intentionally null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            path_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    rocm_core::publish_temp_file(tmp, path)
 }
 
 fn sandbox_check_updates_value(output: CommandCapture) -> Value {
@@ -3374,6 +3336,10 @@ fn build_runtime_state(
         running: automations_enabled,
         automations_enabled,
         daemon_pid: std::process::id(),
+        // Captured here, while this process is by definition alive, so a later
+        // `rocm uninstall` can tell this daemon from an unrelated process that
+        // inherited the PID after a crash or reboot.
+        daemon_start_ticks: rocm_core::ProcessIdentity::capture(std::process::id()).start_ticks,
         started_at_unix_ms: now,
         last_tick_unix_ms: now,
         local_webhook_endpoint: None,
@@ -7619,6 +7585,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -7682,6 +7649,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -7715,6 +7683,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -7779,6 +7748,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -7868,6 +7838,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -7923,6 +7894,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
@@ -9260,6 +9232,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
