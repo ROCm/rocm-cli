@@ -27,7 +27,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 /// Captured result of running a command on the remote host.
 ///
@@ -198,18 +198,28 @@ fn validate_destination(destination: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reject a local or remote `scp` path that would be read as an option
-/// rather than a path — the same risk [`validate_destination`] guards
-/// against for the ssh destination, but here for the two path arguments scp
-/// takes. Neither is expected to come from outside this process today, but
-/// an artifact name or staging path is not a hostname either, and both cross
-/// this boundary as plain strings rather than a type that already rules a
+/// Reject an `scp` path argument that starts with `-`.
+///
+/// The two sides are not at equal risk, and it is worth being exact about
+/// which is which. The **local** path is pushed as its own argument, so a
+/// leading `-` genuinely is read as an option rather than a file — the same
+/// risk [`validate_destination`] guards against for the ssh destination. The
+/// **remote** path is not: it is built as `{destination}:{remote_path}`, so
+/// the argument always begins with the destination and scp can never take it
+/// for an option. Guarding it anyway is a shape check, not a safety one — a
+/// remote path in that shape means this process built the argument wrongly,
+/// and saying so here beats chasing an odd path on the far machine.
+///
+/// Neither is expected to come from outside this process today, but an
+/// artifact name or staging path is not a hostname either, and both cross
+/// this boundary as plain strings rather than as a type that already rules a
 /// leading `-` out.
 fn validate_scp_path(path: &str, which: &str) -> Result<()> {
     if path.starts_with('-') {
         bail!(
-            "`{path}` is not a usable {which} path for scp: a path starting with \
-             `-` would be read as an option rather than as a file"
+            "`{path}` is not a usable {which} path for scp: a path here never starts \
+             with `-`, and one that does is either read as an option or a sign the \
+             argument was built wrongly"
         );
     }
     Ok(())
@@ -341,11 +351,12 @@ impl Transport for SshTransport {
                 .take()
                 .context("ssh stdin was not available to write to")?;
             let payload = payload.to_owned();
-            let destination = self.destination.clone();
-            Some(std::thread::spawn(move || -> Result<()> {
-                handle
-                    .write_all(payload.as_bytes())
-                    .with_context(|| format!("failed to send input to {destination}"))?;
+            // `std::io::Result`, not `anyhow::Result`: the join site has to ask
+            // whether this was a broken pipe, and an `ErrorKind` it can match
+            // on directly is a far sturdier way to answer that than downcasting
+            // back out of a context chain.
+            Some(std::thread::spawn(move || -> std::io::Result<()> {
+                handle.write_all(payload.as_bytes())?;
                 // Dropping closes the pipe, which is what tells the remote
                 // reader the input has ended. Without it a remote `read`
                 // waits forever.
@@ -356,18 +367,18 @@ impl Transport for SshTransport {
             None
         };
 
-        let output = child.wait_with_output().with_context(|| {
+        let waited = child.wait_with_output();
+        // Joined before anything can return, including the error path below: an
+        // un-joined handle detaches the thread, leaving it blocked writing into
+        // a pipe with no reader for as long as the process lives.
+        let written = writer.map(std::thread::JoinHandle::join);
+
+        let output = waited.with_context(|| {
             format!(
                 "failed to read the result of a command on {}",
                 self.destination
             )
         })?;
-
-        if let Some(writer) = writer {
-            writer.join().map_err(|_| {
-                anyhow!("the stdin writer thread for {} panicked", self.destination)
-            })??;
-        }
 
         // 255 is ssh's own: it could not connect, could not authenticate, or the
         // connection broke. Reporting it as a remote answer is what turns an
@@ -376,12 +387,41 @@ impl Transport for SshTransport {
         // A remote command can in principle exit 255 itself; the cost of reading
         // that rare case as unreachable is far smaller than the cost of the
         // confident wrong diagnosis it replaces.
+        //
+        // Checked before the write result on purpose. ssh exiting without
+        // reading stdin breaks the pipe, so an unreachable host produces *two*
+        // errors describing one event; `output` is the ground truth and the
+        // write error is the echo. Consulting the echo first is what reported
+        // "failed to send input" for a host that was never reached, which
+        // `serve_with_transport` then wrapped as "may or may not be running".
         if output.status.code() == Some(SSH_TRANSPORT_FAILURE) {
             bail!(
                 "could not reach {} over ssh: {}",
                 self.destination,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+        }
+
+        match written {
+            // Not something a process outcome can explain away: the thread
+            // panicking is a bug on this side of the connection.
+            Some(Err(_)) => bail!("the stdin writer thread for {} panicked", self.destination),
+            Some(Ok(Err(error))) => {
+                // A broken pipe means the remote stopped reading. When the
+                // command also failed, its own exit code and stderr say why,
+                // and they say it better than "broken pipe" does — so the write
+                // error is demoted to a symptom. When the command *succeeded*,
+                // nothing explains the unread payload and it stays an error:
+                // the sole caller's payload is an API key, and a model started
+                // without the key that was meant to guard it is not a success.
+                let explained_by_the_command =
+                    error.kind() == std::io::ErrorKind::BrokenPipe && !output.status.success();
+                if !explained_by_the_command {
+                    return Err(error)
+                        .with_context(|| format!("failed to send input to {}", self.destination));
+                }
+            }
+            Some(Ok(Ok(()))) | None => {}
         }
 
         Ok(RemoteOutcome {
@@ -654,9 +694,12 @@ mod tests {
 
     #[test]
     fn scp_argv_refuses_a_local_or_remote_path_starting_with_a_dash() {
-        // Mirrors validate_destination's guard for the ssh destination: scp
-        // reads a leading `-` as an option of its own, not as a file, on
-        // either side of the copy.
+        // Both are refused, for different reasons. The local path is its own
+        // argument, so scp really would read a leading `-` as an option —
+        // that half mirrors validate_destination's guard. The remote path is
+        // prefixed with `{destination}:` before it is passed, so it can never
+        // be mistaken for an option; refusing it is a check on our own
+        // argument building rather than a safety guard.
         let transport = SshTransport::new("user@gpubox", None).unwrap();
         let local = transport
             .scp_argv("-oProxyCommand=evil", "/tmp/rocm")
@@ -686,6 +729,37 @@ mod tests {
             message.contains("could not reach"),
             "an unreachable host must say so rather than look like a command that failed: \
              {message}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_host_says_so_even_when_a_payload_was_being_written() {
+        // Same unreachable host as above, but with stdin to deliver. ssh exits
+        // 255 without ever reading it, so the writer thread's `write_all` ends
+        // in EPIPE. Two errors then describe the same event, and only one is
+        // the truth the user needs: consulting the write error first reports
+        // "failed to send input", which `serve_with_transport` wraps as "may
+        // or may not be running" — telling the user the model's state is
+        // unknown when in fact nothing was ever started. The process outcome
+        // is ground truth and must win.
+        //
+        // The payload is deliberately larger than a pipe buffer (commonly
+        // ~64KiB). A short one lands in the buffer and returns success with no
+        // reader on the other end, so the race decides whether the bug appears
+        // and the test would pass on a machine that simply scheduled the
+        // writer first. Overflowing the buffer makes `write_all` block until
+        // ssh exits, which makes the EPIPE certain rather than likely — and
+        // exercises the very overflow the writer thread exists to survive.
+        let unreachable = SshTransport::new("127.0.0.1", Some(1)).expect("valid destination");
+        let payload = "x".repeat(1 << 20);
+        let error = unreachable
+            .exec_with_stdin("true", Some(&payload))
+            .expect_err("an unreachable host must be a transport failure, not a remote answer");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not reach"),
+            "the broken pipe from the payload write must not displace ssh's own 255: {message}"
         );
     }
 

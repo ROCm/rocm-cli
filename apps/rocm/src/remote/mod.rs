@@ -287,11 +287,18 @@ fn serve_with_transport(
     {
         Ok(start) => start,
         Err(error) => {
-            // The command may already have reached the remote — this fails on a
-            // broken pipe while sending the key, or on losing the connection
-            // while waiting — so the model's state is genuinely unknown from
-            // here. Drop the key that now guards nothing, and say so rather
-            // than leaving the user to assume nothing happened.
+            // The command may already have reached the remote — contact can be
+            // lost after the remote has begun starting the model — so its state
+            // is not knowable from here. Drop the key that now guards nothing,
+            // and say so rather than leaving the user to assume nothing
+            // happened.
+            //
+            // Note this also catches the case where ssh never reached the host
+            // at all, where nothing was started and the uncertainty is
+            // overstated. The inner error says "could not reach" plainly, so
+            // the user is not misled, but telling the two apart here would need
+            // the transport to report unreachability as something richer than a
+            // message. Left as is rather than grown a typed error for it.
             session::clear_key(paths, &session_id);
             return Err(error.context(format!(
                 "lost contact with {} while starting the model, so it may or may not be \
@@ -744,10 +751,16 @@ fn render_status(
                 Some(publish::PublishState::Absent) => "no".to_owned(),
                 Some(publish::PublishState::Foreign { forwards_to }) =>
                     format!("no — that port now forwards to {forwards_to}"),
-                Some(publish::PublishState::FunnelAllowed) => "no — Tailscale Funnel is allowed \
-                    on that port, which would expose it to the public internet; run `tailscale \
-                    funnel --tcp=<port> off` on the remote"
-                    .to_owned(),
+                // Not "no": Funnel is classified before anything is asked about
+                // our own forward and short-circuits, so this state says
+                // nothing either way about whether the endpoint is published.
+                // Leading with "no" answered a question it had not looked at,
+                // and buried the one thing here that needs acting on.
+                Some(publish::PublishState::FunnelAllowed) =>
+                    "exposed — Tailscale Funnel is allowed on that port, which puts it on the \
+                     public internet; run `tailscale funnel --tcp=<port> off` on the remote, \
+                     then check again"
+                        .to_owned(),
                 // Both mean "could not tell", and neither may be read as "no":
                 // an endpoint that is still up must never render as one that is
                 // down, or the user stops looking for it.
