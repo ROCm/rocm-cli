@@ -94,6 +94,12 @@ pub struct TuiSession {
     /// terminal failure state after the one-time diagnostic is consumed, so a
     /// retry cannot lose the cause while the reader thread is still finishing.
     reader_failure: Arc<ReaderFailure>,
+    /// Latches `true` the first time the child switches the terminal to its
+    /// alternate screen (the full-screen TUI buffer). Set by the reader thread
+    /// after each parse and never cleared, so it survives the exit sequence that
+    /// switches back — a plain `screen().alternate_screen()` snapshot taken after
+    /// the process exits would read `false` and miss that the TUI ever opened.
+    entered_alternate_screen: Arc<AtomicBool>,
     /// Kept alive for the lifetime of the session: the reader/writer are cloned
     /// from it, and dropping it early would close the PTY.
     master: Box<dyn MasterPty + Send>,
@@ -231,11 +237,13 @@ impl TuiSession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let reader_failure = Arc::new(ReaderFailure::default());
+        let entered_alternate_screen = Arc::new(AtomicBool::new(false));
         let reader = spawn_reader(
             reader,
             Arc::clone(&parser),
             Arc::clone(&reader_stop),
             Arc::clone(&reader_failure),
+            Arc::clone(&entered_alternate_screen),
         );
 
         Ok(Self {
@@ -245,6 +253,7 @@ impl TuiSession {
             reader_stop,
             reader: Some(reader),
             reader_failure,
+            entered_alternate_screen,
             master: pair.master,
             finished: false,
             recorded: false,
@@ -259,11 +268,52 @@ impl TuiSession {
         self.finished
     }
 
+    /// Whether the child ever switched the terminal to its alternate screen —
+    /// i.e. opened the full-screen interactive view. Latched, so it stays true
+    /// after the child switches back on exit. Lets a "must be refused before the
+    /// TUI opens" contract be asserted, not just "exited non-zero".
+    pub fn entered_alternate_screen(&self) -> bool {
+        self.entered_alternate_screen.load(Ordering::Relaxed)
+    }
+
     /// The current visible screen as plain text (one row per line). `vt100` has
     /// already resolved escape sequences and styling into cells, so this is
     /// exactly what a user sees — color/attribute independent.
     pub fn screen_text(&self) -> String {
         self.screen_snapshot().0
+    }
+
+    /// The visible screen as LOGICAL lines: rows the terminal soft-wrapped are
+    /// rejoined into the single line the application actually emitted.
+    ///
+    /// [`Self::screen_text`] is the right lens for "what does the user see", and
+    /// most assertions look for a short marker where wrapping is irrelevant. A
+    /// step that must read a whole VALUE off the screen — a filesystem path, a
+    /// URL — needs this instead: at 80 columns a long path silently splits
+    /// across two rows, and a step parsing the raw rows would then assert
+    /// against a truncated value and fail for a reason that has nothing to do
+    /// with the product.
+    pub fn screen_logical_lines(&self) -> Vec<String> {
+        let parser = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<String> = Vec::new();
+        let mut continuing = false;
+        for row in 0..rows {
+            let text = screen.contents_between(row, 0, row, cols);
+            if continuing {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(&text);
+                }
+            } else {
+                lines.push(text);
+            }
+            continuing = screen.row_wrapped(row);
+        }
+        lines
     }
 
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
@@ -495,10 +545,15 @@ impl TuiSession {
     }
 
     /// Poll until the child exits, returning its raw exit code regardless of
-    /// whether it is zero. Used by journeys (e.g. a declined confirmation
-    /// prompt) whose success case is a specific *nonzero* code, where
-    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
-    /// would reject the very outcome under test.
+    /// whether it is zero.
+    ///
+    /// Most journeys require a clean exit and use [`Self::wait_for_exit`]. Two
+    /// need the raw code instead, and both are cases where that method's
+    /// zero-only assertion would reject the very outcome under test: a declined
+    /// confirmation prompt, whose success case is a specific *nonzero* code, and
+    /// a command-rejection scenario, which must terminate promptly and non-zero.
+    /// Keeping the deadline/reap/record logic here avoids teaching individual
+    /// steps how to manipulate the PTY child directly.
     pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -507,6 +562,13 @@ impl TuiSession {
                     let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.finished = true;
                     self.record_once(code);
+                    // Let the reader consume the child's final bytes before the
+                    // caller inspects post-exit state (e.g. entered_alternate_
+                    // screen). The child exiting closes the slave, so the reader
+                    // sees EOF and finishes; without this wait, an enter sequence
+                    // still buffered in the pipe would be missed. Bounded so a
+                    // misbehaving PTY can't stall the scenario.
+                    self.drain_reader().await;
                     return Ok(code);
                 }
                 Ok(None) => {}
@@ -526,6 +588,34 @@ impl TuiSession {
                     "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
                     self.framed_screen()
                 ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait, bounded by [`DRAIN_TIMEOUT`], for the reader thread to finish
+    /// consuming the child's final output after it exits. The reader sees EOF
+    /// once the exited child's slave closes, so this normally returns well
+    /// inside the bound; the cap only guards a misbehaving PTY. Idempotent and
+    /// safe to call once per exit.
+    ///
+    /// Takes `&mut self` even though it only reads: a shared `&TuiSession` held
+    /// across an `.await` is not `Send` (the struct holds `!Sync` PTY handles),
+    /// which `-D clippy::future-not-send` rejects and would propagate to every
+    /// awaiting step. `&mut TuiSession` is `Send`, matching the sibling waits.
+    async fn drain_reader(&mut self) {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            // Compute the check and drop every borrow of `self` BEFORE the await:
+            // a reference held across `.await` would make this future `!Send`,
+            // which `-D clippy::future-not-send` rejects (and which propagates to
+            // every step that awaits it).
+            let finished = self
+                .reader
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished);
+            if finished {
+                return;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -615,9 +705,22 @@ fn spawn_reader(
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
     reader_failure: Arc<ReaderFailure>,
+    entered_alternate_screen: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    // The escape sequence a terminal emits to switch to the alternate screen.
+    // Detected in the raw byte stream rather than via the parser's post-process
+    // `alternate_screen()` state: a single read can contain both the enter and
+    // the matching leave (`\x1b[?1049l`), which would leave the parser back on
+    // the primary screen and the evidence erased. Scanning the bytes catches the
+    // enter regardless of what follows it in the same chunk.
+    const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        // Carry the last few bytes of each read into the next scan so an enter
+        // sequence split across a read boundary is still found. One byte short
+        // of the marker length is all that can overlap.
+        let mut carry: Vec<u8> = Vec::new();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -625,11 +728,26 @@ fn spawn_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let chunk = &buf[..n];
+                    if !entered_alternate_screen.load(Ordering::Relaxed) {
+                        let mut window = std::mem::take(&mut carry);
+                        window.extend_from_slice(chunk);
+                        if window
+                            .windows(ALT_SCREEN_ENTER.len())
+                            .any(|w| w == ALT_SCREEN_ENTER)
+                        {
+                            entered_alternate_screen.store(true, Ordering::Relaxed);
+                        }
+                        // Keep just enough tail to bridge a boundary-split marker.
+                        let keep = ALT_SCREEN_ENTER.len().saturating_sub(1);
+                        let start = window.len().saturating_sub(keep);
+                        carry = window[start..].to_vec();
+                    }
                     let mut p = parser
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        p.process(&buf[..n]);
+                        p.process(chunk);
                     }));
                     drop(p);
                     if let Err(payload) = result {
