@@ -57,12 +57,19 @@ rather than printing a plan for the user. It is not a promise that the runner
 mutates anything.
 
 The ones that do mutate print the exact command, honor `--dry-run`, refuse on a
-non-interactive shell without `--yes`, and confirm first. **One exception:
-`fix-2-unset-override` mutates on Windows only.** Its Linux runner reports where
-the override is set and which rc files carry it, then stops — it will not edit
-your dotfiles. So on Linux it never prompts, `--dry-run` has nothing to preview,
-and `--yes` is never read. Do not tell a Linux user a dry run previewed a change
-that was never going to happen.
+non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
+
+- **`fix-2-unset-override` mutates on Windows only.** Its Linux runner reports
+  where the override is set and which rc files carry it, then stops — it will
+  not edit your dotfiles. So on Linux it never prompts, `--dry-run` has nothing
+  to preview, and `--yes` is never read. Do not tell a Linux user a dry run
+  previewed a change that was never going to happen.
+- **`fix-9-igpu-dgpu` mutates only when you pass `--device-index N`.** Without
+  it — on Linux and Windows alike — the runner just prints the
+  `rocminfo`/`hipInfo` query that identifies which index is the discrete GPU
+  and returns 0: no prompt, nothing for `--dry-run` to preview, nothing
+  pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
+  once you know N.
 
 ## Closed catalog (15 failure modes)
 
