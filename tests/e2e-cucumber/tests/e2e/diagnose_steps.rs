@@ -90,15 +90,61 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-7-wsl1",
 ];
 
-/// The fixes the CLI carries out itself. Every other entry only prints a plan.
+/// The fixes the CLI carries out itself **on the host running the suite**.
+///
 /// Pinned exactly: a mode quietly promoted to AUTO would begin changing
 /// machines that callers had been told it only ever advised on.
-const AUTO_APPLICABLE_FIX_IDS: &[&str] = &[
-    "fix-2-unset-override",
-    "fix-4-render-group",
-    "fix-6-path",
-    "fix-9-igpu-dgpu",
-];
+///
+/// Host-dependent because the catalog is. `fix-2-unset-override` persists the
+/// change through `setx` on Windows but only reports on Linux, where its runner
+/// takes no options and never writes. `fix-9-igpu-dgpu` is on neither list: it
+/// acts only once `--device-index` names a target, and is marked NEEDS-ARG.
+/// Both used to claim AUTO everywhere, which is the defect this pins.
+fn auto_applicable_fix_ids() -> &'static [&'static str] {
+    if cfg!(windows) {
+        return &["fix-2-unset-override", "fix-6-path"];
+    }
+    // WSL is its own catalog family, not "Linux with a flag", so `cfg!` cannot
+    // answer this -- it is a property of the running host. `fix-4-render-group`
+    // is bare-metal only and `fix-2-unset-override` only reports there, which
+    // leaves one entry the CLI actually carries out.
+    if e2e_cucumber::capability::host_capability().is_wsl {
+        return &["fix-6-path"];
+    }
+    &["fix-4-render-group", "fix-6-path"]
+}
+
+/// The one catalog entry whose behaviour splits by platform: it persists the
+/// change through `setx` on Windows, while on Linux `run_unset_override_linux`
+/// takes no options and only reports where the value is set.
+const PLATFORM_SPLIT_FIX_ID: &str = "fix-2-unset-override";
+
+/// What that entry does on the host running the suite. The listing has to agree
+/// with the machine in front of it — claiming AUTO on Linux is what told users
+/// a change was coming that never came.
+const fn platform_split_marker_here() -> &'static str {
+    // Windows persists the change; Linux and WSL both run the arm that only
+    // reports, so both see PRINT-ONLY.
+    if cfg!(windows) { "AUTO" } else { "PRINT-ONLY" }
+}
+
+/// The entry the CLI will carry out, but not until it is told which device to
+/// pin. Asked plainly it prints the identifying query and stops.
+const NEEDS_ARGUMENT_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// The argument it is waiting for. Named in the flags line, so a reader is not
+/// left to find it in the notes.
+const NEEDS_ARGUMENT_FLAG: &str = "--device-index";
+
+/// The marker in a listing row — the contents of its first `[...]` group.
+///
+/// Read rather than matched against a padded literal, so the assertions do not
+/// break when a longer marker widens the column.
+fn row_marker(line: &str) -> Option<&str> {
+    let open = line.find('[')?;
+    let close = line[open..].find(']')? + open;
+    Some(line[open + 1..close].trim())
+}
 
 /// A WSL distribution name no host will have. Deliberately not a plausible one:
 /// the scenario must fail for "this machine does not exist", never because the
@@ -203,6 +249,16 @@ async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
 }
 
+#[given("a fix the CLI carries out on one kind of machine and only explains on another")]
+async fn user_chose_platform_split_fix(world: &mut E2eWorld) {
+    world.model_name = Some(PLATFORM_SPLIT_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen a fix that cannot run until it is told what to act on")]
+async fn user_chose_fix_needing_an_argument(world: &mut E2eWorld) {
+    world.model_name = Some(NEEDS_ARGUMENT_FIX_ID.to_string());
+}
+
 #[given("a user who has chosen a fix that would change the machine")]
 async fn user_chose_mutating_fix(world: &mut E2eWorld) {
     let rc_file = fix_rc_file(world);
@@ -294,6 +350,17 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
 async fn user_lists_fixes(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["fix"]);
     world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply it without saying what to act on")]
+async fn user_applies_fix_without_its_argument(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    // Deliberately no `--device-index`: the branch under test is the one that
+    // reports what is still needed instead of acting.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
@@ -423,10 +490,15 @@ async fn assert_markers_explained(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     // The markers were printed with no legend, so a reader could not tell
     // whether PRINT-ONLY meant "advisory" or "not implemented yet".
-    assert!(
-        output.contains("AUTO =") && output.contains("PRINT-ONLY ="),
-        "expected the listing to explain its AUTO/PRINT-ONLY markers:\n{output}"
-    );
+    // Every marker the listing can print has to be explained, or the newer
+    // ones land in exactly the position PRINT-ONLY was in.
+    for marker in ["AUTO =", "NEEDS-ARG =", "PRINT-ONLY =", "DIAGNOSE-ONLY ="] {
+        assert!(
+            output.contains(marker),
+            "the listing prints markers it never explains; `{marker}` is missing \
+             from the legend:\n{output}"
+        );
+    }
 }
 
 #[then("the CLI always points to somewhere the problem can be reported")]
@@ -859,14 +931,69 @@ async fn assert_auto_set_is_exact(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     let marked_auto: Vec<&str> = output
         .lines()
-        .filter(|line| line.contains("[      AUTO]"))
+        .filter(|line| row_marker(line) == Some("AUTO"))
         .filter_map(|line| CATALOG_FIX_IDS.iter().copied().find(|id| line.contains(id)))
         .collect();
     // Exact, not "at least": a mode quietly promoted to AUTO would start
     // changing machines that callers were told it only ever advised.
     assert_eq!(
-        marked_auto, AUTO_APPLICABLE_FIX_IDS,
+        marked_auto,
+        auto_applicable_fix_ids(),
         "the set of fixes the CLI applies itself has changed:\n{output}"
+    );
+}
+
+#[then("that fix is shown as what it does on this machine")]
+async fn assert_platform_split_fix_is_listed_for_this_machine(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let row = output
+        .lines()
+        .find(|line| line.contains(&fix_id))
+        .unwrap_or_else(|| panic!("the listing has no row for {fix_id}:\n{output}"));
+    assert_eq!(
+        row_marker(row),
+        Some(platform_split_marker_here()),
+        "{fix_id} is listed as something other than what it does on this machine. \
+         The catalog is authoritative: if its behaviour here changed, change the \
+         catalog and this expectation together — do not loosen the assertion.\n{row}"
+    );
+}
+
+#[then("the CLI names what it still needs and reports no change")]
+async fn assert_missing_argument_is_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Exit 0, not an error code: nothing went wrong and nothing was attempted.
+    // A nonzero code would read as a failed fix rather than an unanswered
+    // question.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "reporting what it still needs is not a failure:\n{output}"
+    );
+    // The flags line specifically, not the output as a whole. The recipe's
+    // notes mention the argument either way, so a whole-output search passes
+    // even when the entry is marked as one the CLI applies outright -- which is
+    // exactly the defect, and an earlier version of this assertion missed it.
+    let flags = output
+        .lines()
+        .find(|line| line.starts_with("Flags:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no flags line, so nothing told the user the CLI is waiting on \
+                 `{NEEDS_ARGUMENT_FLAG}` rather than acting:\n{output}"
+            )
+        });
+    assert!(
+        flags.contains(NEEDS_ARGUMENT_FLAG),
+        "the flags line does not name `{NEEDS_ARGUMENT_FLAG}`, so the user is told \
+         only that the fix is unavailable, not what would make it available:\n{flags}"
+    );
+    // The whole defect was a report of a change that never happened, so the
+    // absence of that claim is the assertion.
+    assert!(
+        !output.contains("Applied"),
+        "nothing was applied, so nothing may say it was:\n{output}"
     );
 }
 

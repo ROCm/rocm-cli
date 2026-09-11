@@ -15,6 +15,7 @@
 
 use crate::examine::{run, which};
 use crate::{runtime_is_linux, runtime_is_windows};
+use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,42 +51,173 @@ pub struct FixOptions {
     pub device_index: Option<i64>,
 }
 
+/// What `rocm fix <id>` will do with an entry — the answer to "will running
+/// this plainly change my machine?".
+///
+/// This was a `bool` (`auto_applicable`), and a bool could not say two things
+/// the catalog needed to say. `fix-2-unset-override` applies itself on Windows
+/// but only reports on Linux, where its runner takes no [`FixOptions`] and
+/// never mutates. `fix-9-igpu-dgpu` applies itself only once it is told which
+/// device to pin, and merely prints the identifying query otherwise. Both were
+/// marked auto-applicable, so both told a user — and an agent — that the CLI
+/// was about to act when it was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FixClass {
+    /// `rocm fix <id>` carries it out (asking first, unless `--yes`).
+    Auto,
+    /// `rocm fix <id>` carries it out only once the argument named in
+    /// [`Platform::needs`] is supplied; without it, it reports what to pass and
+    /// changes nothing.
+    NeedsArgument,
+    /// `rocm fix <id>` leaves the machine alone. The fix is real; carrying it
+    /// out needs sudo, a reboot, a reinstall or a download.
+    ///
+    /// This says nothing about whether a runner runs. `fix-2-unset-override`
+    /// is print-only on Linux and still reads the live override and scans the
+    /// shell rc files to report where it is set — it just never writes.
+    #[default]
+    PrintOnly,
+    /// The problem can be detected and explained, but no reliable fix exists.
+    /// `rocm fix <id>` names it and applies nothing.
+    ///
+    /// Defaulting to [`FixClass::PrintOnly`] rather than this one is
+    /// deliberate: a missing class should understate what the CLI will do, and
+    /// "there is no fix" is a stronger claim than "here are the steps".
+    DiagnoseOnly,
+}
+
+impl FixClass {
+    /// Whether `rocm fix <id>`, invoked with no extra arguments, will change
+    /// the machine. This is the claim the old `auto_applicable` bool was making.
+    #[must_use]
+    pub const fn applies_itself(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// The marker shown in the catalog listing and in `diagnose` output.
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::NeedsArgument => "NEEDS-ARG",
+            Self::PrintOnly => "PRINT-ONLY",
+            Self::DiagnoseOnly => "DIAGNOSE-ONLY",
+        }
+    }
+}
+
+/// One operating system a recipe applies on, and what it does there.
+///
+/// Scope and class are held together rather than in two parallel lists because
+/// they are one fact: a fix applies *on Linux as print-only* and *on Windows as
+/// auto*. Splitting them is what let `fix-2`'s flat flag contradict its own
+/// platform-split runner.
+struct Platform {
+    os: &'static str,
+    class: FixClass,
+    /// The argument that moves [`FixClass::NeedsArgument`] to acting. `None`
+    /// for every other class; the pairing is held by
+    /// `a_needs_argument_platform_names_the_argument`.
+    needs: Option<&'static str>,
+}
+
+/// Shorthand for the common case: the same class on a platform, needing nothing.
+const fn on(os: &'static str, class: FixClass) -> Platform {
+    Platform {
+        os,
+        class,
+        needs: None,
+    }
+}
+
+const PRINT_ON_LINUX_WINDOWS_AND_WSL: &[Platform] = &[
+    on("linux", FixClass::PrintOnly),
+    on("windows", FixClass::PrintOnly),
+    on("wsl", FixClass::PrintOnly),
+];
+const PRINT_ON_LINUX: &[Platform] = &[on("linux", FixClass::PrintOnly)];
+const PRINT_ON_WINDOWS: &[Platform] = &[on("windows", FixClass::PrintOnly)];
+/// Every WSL recipe. All print-only: each one installs a package with sudo,
+/// edits loader configuration, or belongs to the Windows host, and none of that
+/// meets the bar an auto-applied fix has to clear.
+const PRINT_ON_WSL: &[Platform] = &[on("wsl", FixClass::PrintOnly)];
+const AUTO_ON_LINUX: &[Platform] = &[on("linux", FixClass::Auto)];
+const AUTO_ON_LINUX_WINDOWS_AND_WSL: &[Platform] = &[
+    on("linux", FixClass::Auto),
+    on("windows", FixClass::Auto),
+    on("wsl", FixClass::Auto),
+];
+
+/// `fix-2-unset-override`. `run_unset_override` splits by platform: the Windows
+/// arm takes `FixOptions` and does the dry-run/confirm dance, while
+/// `run_unset_override_linux` takes no options, reports where the override is
+/// set, and returns without touching a dotfile. WSL runs that same Linux arm.
+const PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS: &[Platform] = &[
+    on("linux", FixClass::PrintOnly),
+    on("windows", FixClass::Auto),
+    on("wsl", FixClass::PrintOnly),
+];
+
+/// `fix-9-igpu-dgpu`. Both arms short-circuit when no device index is given:
+/// they print the query that identifies the discrete GPU and return, so there
+/// is nothing for `--dry-run` to preview and no prompt to refuse.
+const NEEDS_DEVICE_INDEX: &[Platform] = &[
+    Platform {
+        os: "linux",
+        class: FixClass::NeedsArgument,
+        needs: Some("--device-index"),
+    },
+    Platform {
+        os: "windows",
+        class: FixClass::NeedsArgument,
+        needs: Some("--device-index"),
+    },
+];
+
 /// A remediation recipe keyed by the stable `fix-id`.
 struct FixRecipe {
     fix_id: &'static str,
     title: &'static str,
     rationale: &'static str,
-    auto_applicable: bool,
     commands: &'static [&'static str],
     needs_sudo: bool,
     needs_reboot: bool,
     needs_relogin: bool,
     verify: &'static str,
     notes: &'static [&'static str],
-    applies_on: &'static [&'static str],
+    /// Every operating system this applies on, and what it does on each.
+    applies_on: &'static [Platform],
     runner: Option<fn(&FixOptions) -> i32>,
 }
 
-/// Valid on bare-metal Linux, Windows and WSL alike.
-///
-/// WSL is named explicitly rather than folded into `linux`: the default for a
-/// bare-metal recipe has to be "does not apply on WSL", because the platform has
-/// no amdgpu module, no /dev/kfd and no render group. Recipes that survive the
-/// move are the ones about wheels, environment variables and PATH.
-const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
-const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
-const LINUX_ONLY: &[&str] = &["linux"];
-const WINDOWS_ONLY: &[&str] = &["windows"];
-const WSL_ONLY: &[&str] = &["wsl"];
+impl FixRecipe {
+    /// What this recipe does on `os`, or `None` when it does not apply there.
+    fn platform(&self, os: &str) -> Option<&Platform> {
+        self.applies_on.iter().find(|p| p.os == os)
+    }
 
-/// The recipe registry. Mirrors the diagnosis catalog; only the four small,
-/// safe fixes carry a `runner` and are auto-applicable.
+    /// What this recipe does on the running host. [`FixClass::PrintOnly`] when
+    /// it does not apply here at all — callers reach the OS gate in [`apply`]
+    /// before the class is ever acted on, and understating is the safe default.
+    fn class_here(&self) -> FixClass {
+        self.platform(current_os())
+            .map_or(FixClass::PrintOnly, |p| p.class)
+    }
+
+    /// The operating systems this applies on, in catalog order.
+    fn os_scope(&self) -> Vec<&'static str> {
+        self.applies_on.iter().map(|p| p.os).collect()
+    }
+}
+
+/// The recipe registry. Mirrors the diagnosis catalog; only the small, safe
+/// fixes carry a `runner`, and what each one does can differ by platform.
 const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-1-arch",
         title: "GPU gfx target not in framework arch list",
         rationale: "Your GPU's gfx target is not in the framework wheel's compiled kernel list. Re-install the framework from an index that includes this gfx, OR rebuild llama.cpp with AMDGPU_TARGETS=<gfx>.",
-        auto_applicable: false,
         commands: &[
             "# PyTorch (Linux): switch to the ROCm nightly that ships the gfx115x kernels.",
             "pip uninstall -y torch torchvision torchaudio",
@@ -104,14 +236,13 @@ const RECIPES: &[FixRecipe] = &[
             "TheRock per-gfx wheels are the recommended fallback when the official pytorch index does not yet cover your gfx (and the only first-party option on Windows AMD).",
             "HSA_OVERRIDE_GFX_VERSION is NOT the right fix here -- it papers over the mismatch and risks page faults at runtime.",
         ],
-        applies_on: LINUX_WINDOWS_AND_WSL,
+        applies_on: PRINT_ON_LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-2-unset-override",
         title: "Unset HSA_OVERRIDE_GFX_VERSION",
         rationale: "HSA_OVERRIDE_GFX_VERSION is set, but your GPU now has a native wheel. The override hides the real gfx and causes page faults / OUT_OF_REGISTERS at runtime.",
-        auto_applicable: true,
         commands: &[
             "# Linux:",
             "unset HSA_OVERRIDE_GFX_VERSION",
@@ -125,14 +256,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
         notes: &[],
-        applies_on: LINUX_WINDOWS_AND_WSL,
+        applies_on: PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS,
         runner: Some(run_unset_override),
     },
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
         rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun with --no-dkms and accept the risk.",
-        auto_applicable: false,
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -143,28 +273,26 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5",
         notes: &[],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-4-render-group",
         title: "Add user to render/video groups",
         rationale: "The current user can't open /dev/kfd because they aren't in the render group. Adding the user is the safe, standard fix.",
-        auto_applicable: true,
         commands: &["sudo usermod -a -G render,video \"$USER\""],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && rocminfo | head -n 5",
         notes: &[],
-        applies_on: LINUX_ONLY,
+        applies_on: AUTO_ON_LINUX,
         runner: Some(run_render_group),
     },
     FixRecipe {
         fix_id: "fix-5-amdgpu-load",
         title: "Load amdgpu (and clear any blacklist)",
         rationale: "The amdgpu kernel module is not loaded. Check /etc/modprobe.d for a blacklist entry, regenerate the initramfs, and modprobe.",
-        auto_applicable: false,
         commands: &[
             "grep -RIl 'blacklist amdgpu' /etc/modprobe.d /usr/lib/modprobe.d 2>/dev/null || true",
             "sudo $EDITOR <file shown above>     # remove the blacklist line",
@@ -179,14 +307,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If Secure Boot is enabled and amdgpu still won't load, the DKMS module isn't signed. Either sign it with mokutil or disable Secure Boot in firmware.",
         ],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-6-path",
         title: "Add the ROCm/HIP bin directory to PATH",
         rationale: "Linux: ROCm is installed but its bin directory isn't on PATH, so `rocminfo` / `hipcc` aren't visible to the shell. Windows: the HIP SDK is installed but its bin directory isn't on the User PATH, so `hipInfo.exe` and the runtime DLLs can't be found.",
-        auto_applicable: true,
         commands: &[
             "# Linux:",
             "echo 'export PATH=\"/opt/rocm/bin:$PATH\"' >> ~/.bashrc",
@@ -198,14 +325,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "rocminfo | head -n 5 && hipcc --version",
         notes: &[],
-        applies_on: LINUX_WINDOWS_AND_WSL,
+        applies_on: AUTO_ON_LINUX_WINDOWS_AND_WSL,
         runner: Some(run_path_export),
     },
     FixRecipe {
         fix_id: "fix-7-stale-repos",
         title: "Quarantine duplicate AMD repos",
         rationale: "More than one ROCm/AMDGPU repo file exists. The package manager is mixing versions; quarantine the extras before reinstalling.",
-        auto_applicable: false,
         commands: &[
             "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon'",
             "# For each duplicate file:",
@@ -217,14 +343,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "sudo apt update 2>&1 | tail -n 20",
         notes: &[],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-8-wheel-rocm",
         title: "Reinstall the framework against the system ROCm/HIP major",
         rationale: "The framework's bundled HIP version doesn't match the system ROCm (Linux) or HIP SDK (Windows). libamdhip64.so.X / amdhip64_X.dll load failures are the usual signal.",
-        auto_applicable: false,
         commands: &[
             "pip uninstall -y torch torchvision torchaudio",
             "# Linux: pick the index that matches your system ROCm major:",
@@ -238,14 +363,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())\"",
         notes: &[],
-        applies_on: LINUX_WINDOWS_AND_WSL,
+        applies_on: PRINT_ON_LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-9-igpu-dgpu",
         title: "Hide the iGPU with HIP_VISIBLE_DEVICES",
         rationale: "Both an APU iGPU and a discrete AMD GPU are visible. Pin the runtime to the dGPU so the iGPU doesn't destabilise it.",
-        auto_applicable: true,
         commands: &[
             "# Linux:",
             "rocminfo | grep -E 'Agent |Marketing|gfx'   # find the dGPU index",
@@ -261,14 +385,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Pass --device-index N to persist the env var; without it, this fix only prints the rocminfo / hipInfo query so you can identify N.",
         ],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: NEEDS_DEVICE_INDEX,
         runner: Some(run_hip_visible_devices),
     },
     FixRecipe {
         fix_id: "fix-10-container",
         title: "Re-launch the container with AMD devices passed through",
         rationale: "The container can't see /dev/kfd or /dev/dri/renderD*. Pass the devices and the host's render group via the runtime flags.",
-        auto_applicable: false,
         commands: &[
             "docker run --rm -it \\",
             "  --device=/dev/kfd \\",
@@ -285,14 +408,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Rootless podman additionally needs `--userns=keep-id` and a host user that is in the render group; podman maps it through.",
         ],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-11-iommu",
         title: "Add iommu=pt to the kernel command line",
         rationale: "Multi-GPU jobs hang when the IOMMU is in the default 'on' mode with translation; pass-through mode fixes the hang. This requires editing GRUB and rebooting; we will not do that for you.",
-        auto_applicable: false,
         commands: &[
             "cat /proc/cmdline",
             "sudo $EDITOR /etc/default/grub        # add iommu=pt to GRUB_CMDLINE_LINUX_DEFAULT",
@@ -305,14 +427,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'",
         notes: &[],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-12-installer",
         title: "Reset amdgpu-install state and reinstall",
         rationale: "amdgpu-install left a half-configured DKMS / repo state. Run the documented uninstall, clean up, and reinstall without the flag that broke things (commonly --accept-eula on newer installers).",
-        auto_applicable: false,
         commands: &[
             "sudo amdgpu-install --uninstall",
             "sudo apt autoremove --purge -y",
@@ -326,14 +447,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If `apt autoremove --purge` warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
         ],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-13-hip-sdk-missing",
         title: "Install the AMD HIP SDK for Windows",
         rationale: "Your framework links against HIP but the HIP SDK isn't installed on this host. The runtime DLLs (amdhip64_X.dll, hipblas.dll, hsa-runtime64.dll) and hipInfo.exe ship inside the SDK installer.",
-        auto_applicable: false,
         commands: &[
             "# Download and install the HIP SDK (matched to your framework's HIP major):",
             "#   https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html",
@@ -346,14 +466,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.",
         ],
-        applies_on: WINDOWS_ONLY,
+        applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-14-adrenalin-too-old",
         title: "Update the Adrenalin / kernel-mode driver",
         rationale: "The HIP SDK is installed but the AMD kernel-mode driver (Adrenalin / Adrenalin Pro) is older than the SDK release notes call out. The user-space SDK and the driver have to match.",
-        auto_applicable: false,
         commands: &[
             "# Cross-check the HIP SDK release notes for the exact driver pairing:",
             "#   https://rocm.docs.amd.com/projects/install-on-windows/en/latest/install/install.html",
@@ -366,14 +485,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"",
         notes: &[],
-        applies_on: WINDOWS_ONLY,
+        applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-15-msvc-redist",
         title: "Install the MSVC 2015-2022 runtime redistributable",
         rationale: "The HIP SDK's amdhip64_X.dll links against the MSVC 2015-2022 runtime. When vcruntime140.dll / vcruntime140_1.dll aren't on PATH, `import torch` fails with a missing-DLL error that points at vcruntime140_1.dll, not at the HIP runtime itself.",
-        auto_applicable: false,
         commands: &[
             "# Download and install (x64):",
             "#   https://aka.ms/vs/17/release/vc_redist.x64.exe",
@@ -386,7 +504,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.",
         ],
-        applies_on: WINDOWS_ONLY,
+        applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
     // The number is a stable handle, not a position: `fix-16` is reserved by the
@@ -395,9 +513,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-17-torch-dlpack",
         title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
-        rationale: "vLLM's engine start aborts at import time when torch-c-dlpack-ext loads its CUDA prebuilt on a ROCm torch: it picks the variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant. tvm_ffi imports it as OPTIONAL but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so the optional import kills the process. Both defects are upstream; nothing here is misconfigured. What you can change locally is the torch version: outside the 2.4-2.9 range there is no prebuilt to load, the extension raises the handled ImportError, and tvm_ffi falls back to its JIT path with a warning.",
-        auto_applicable: false,
-        // Three labelled groups, because the steps run in three different places
+        rationale: "vLLM's engine start aborts at import time when torch-c-dlpack-ext loads its CUDA prebuilt on a ROCm torch: it picks the variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant. tvm_ffi imports it as OPTIONAL but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so the optional import kills the process. Both defects are upstream; nothing here is misconfigured. What you can change locally is the torch version: outside the 2.4-2.9 range there is no prebuilt to load, the extension raises the handled ImportError, and tvm_ffi falls back to its JIT path with a warning.", // Three labelled groups, because the steps run in three different places
         // and `print_recipe` renders them as one undifferentiated `$`-prefixed
         // list. Unlabelled, a user pasting the block wholesale is relying on
         // terminal stdin buffering to land the probes in the subshell -- and on
@@ -434,7 +550,7 @@ const RECIPES: &[FixRecipe] = &[
             "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
             "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
-        applies_on: LINUX_ONLY,
+        applies_on: PRINT_ON_LINUX,
         runner: None,
     },
     // WSL2 recipes. All print-only: every one of them either installs a package
@@ -445,7 +561,6 @@ const RECIPES: &[FixRecipe] = &[
         fix_id: "fix-wsl-1-gpu-not-exposed",
         title: "Expose the GPU to the WSL distro (/dev/dxg)",
         rationale: "WSL reaches the GPU through /dev/dxg, provided by the Windows host driver via GPU-PV. Without that device nothing else in the ROCm stack can work, so this comes before any package or loader question. In a container the device has to be passed in explicitly; on a host it means the Windows driver or the WSL kernel needs attention.",
-        auto_applicable: false,
         commands: &[
             "# In a container, pass the device and the WSL libraries in:",
             "#   --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl",
@@ -460,14 +575,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "A container running on WSL2 reports itself as WSL but sees /dev/dxg only when it was started with the device. Check that before touching the Windows driver.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-2-dxcore-missing",
         title: "Restore the WSL DXCore libraries",
         rationale: "/usr/lib/wsl/lib holds the DXCore shims the ROCm runtime uses to talk to the Windows host driver. WSL mounts that directory itself, so a distro package manager can neither install nor repair it -- the fix is on the Windows side, plus a loader-path entry inside the distro.",
-        auto_applicable: false,
         commands: &[
             "# From Windows, refresh the WSL runtime that provides these libraries:",
             "#   wsl --update",
@@ -481,14 +595,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore",
         notes: &["apt cannot repair /usr/lib/wsl: it is a mount supplied by WSL, not a package."],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-3-rocdxg-missing",
         title: "Install ROCDXG in the WSL distro",
         rationale: "ROCDXG (librocdxg) is the ROCm-to-DXCore shim the WSL path runs on. It is a distro-side package, so unlike the driver and DXCore pieces this one is entirely in the user's hands.",
-        auto_applicable: false,
         commands: &[
             "bash scripts/wsl_setup_rocdxg.sh",
             "# To verify the download against a digest you trust:",
@@ -501,14 +614,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. rocm-cli does not run that for you, and the script does not bake in a production checksum -- set ROCDXG_SHA256 to one you trust.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-4-rocdxg-not-linked",
         title: "Refresh the linker cache so ROCDXG is loadable",
         rationale: "librocdxg is installed but absent from the linker cache, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
-        auto_applicable: false,
         commands: &["sudo ldconfig"],
         needs_sudo: true,
         needs_reboot: false,
@@ -517,14 +629,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-5-distro-too-old",
         title: "Move to a distro release the WSL path supports",
         rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
-        auto_applicable: false,
         commands: &[
             "# From Windows, install a supported distro alongside the current one:",
             "#   wsl --install -d Ubuntu-24.04",
@@ -536,14 +647,13 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-6-host-driver-too-old",
         title: "Update the AMD driver on the Windows host",
         rationale: "Under WSL the GPU kernel-mode driver lives on the Windows host, not in the distro. When the distro-side plumbing is complete and ROCm still sees no GPU, the host driver is the remaining variable.",
-        auto_applicable: false,
         commands: &[
             "# On the Windows host, not in this distro:",
             "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.",
@@ -556,14 +666,13 @@ const RECIPES: &[FixRecipe] = &[
             "Nothing inside the distro can carry this out, which is why it prints rather than runs.",
             "The ROCm release and the Adrenalin release are paired; check the WSL install guide for the version that matches your ROCm.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
     FixRecipe {
         fix_id: "fix-wsl-7-wsl1",
         title: "Convert the distro from WSL 1 to WSL 2",
         rationale: "WSL 1 translates syscalls rather than running a kernel, and exposes no GPU device at all. No driver or package work can give it ROCm support; the distro has to be converted.",
-        auto_applicable: false,
         commands: &[
             "# From Windows PowerShell:",
             "#   wsl --set-version <distro> 2",
@@ -576,7 +685,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
-        applies_on: WSL_ONLY,
+        applies_on: PRINT_ON_WSL,
         runner: None,
     },
 ];
@@ -672,14 +781,26 @@ fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
 
-/// The platform family a recipe's `applies_on` is matched against.
+/// What the catalog says `rocm fix <fix_id>` does on `os`.
 ///
-/// WSL2 is its own family rather than `linux`, mirroring `diagnose`. That is what
-/// makes `rocm fix fix-4-render-group` on a WSL host refuse with "wrong OS"
-/// instead of running `usermod` for a group that governs nothing there — and it
-/// is why recipes valid on both platforms have to name `wsl` explicitly.
+/// `None` when the id is not in the catalog, or when it is but does not apply
+/// on that operating system at all.
 ///
-/// Not `const fn`: unlike the OS, WSL has to be probed at runtime.
+/// This exists so `diagnose` can read the class off the catalog instead of
+/// restating it. The two were hand-maintained copies, and they had already
+/// drifted: `fix-9-igpu-dgpu` was `auto_applicable: true` here and `false` in
+/// the Linux arm of its checker, with no test comparing them.
+#[must_use]
+pub fn class_on(fix_id: &str, os: &str) -> Option<FixClass> {
+    find_recipe(fix_id)
+        .and_then(|r| r.platform(os))
+        .map(|p| p.class)
+}
+
+/// The platform family a recipe is selected by.
+///
+/// WSL is its own family, which is why recipes valid on both have to name `wsl`
+/// explicitly. Not `const fn`: unlike the OS, WSL has to be probed at runtime.
 fn current_os() -> &'static str {
     if runtime_is_windows() {
         "windows"
@@ -702,25 +823,25 @@ fn looks_like_a_diagnosis_position(value: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
-/// List every fix-id (id, kind, OS scope, title).
+/// List every fix-id (id, class on this machine, OS scope, title).
+///
+/// The marker is what the entry does **here**, not everywhere: `fix-2` reports
+/// on Linux and applies itself on Windows, and a listing that averaged the two
+/// would be wrong on both. The question a reader is asking is what happens if
+/// they run it on the machine in front of them.
 #[must_use]
 pub fn list_recipes() -> String {
     use std::fmt::Write as _;
     let mut out = String::from("Available fix-ids (mirror the diagnosis catalog):\n");
     // The markers were printed with nothing saying what they mean.
-    out.push_str(
-        "  AUTO = `rocm fix <id>` can carry it out; PRINT-ONLY = it prints the steps for you to run.\n",
-    );
+    out.push_str("  On this machine: AUTO = `rocm fix <id>` carries it out; NEEDS-ARG = it does once you supply an argument;\n");
+    out.push_str("  PRINT-ONLY = it prints the steps for you to run; DIAGNOSE-ONLY = it explains the problem and applies nothing.\n");
     for r in RECIPES {
-        let kind = if r.auto_applicable {
-            "AUTO"
-        } else {
-            "PRINT-ONLY"
-        };
-        let scope = r.applies_on.join("/");
+        let kind = r.class_here().marker();
+        let scope = r.os_scope().join("/");
         let _ = writeln!(
             out,
-            "  [{kind:>10}] [{scope:>14}] {}  -- {}",
+            "  [{kind:>13}] [{scope:>14}] {}  -- {}",
             r.fix_id, r.title
         );
     }
@@ -729,7 +850,7 @@ pub fn list_recipes() -> String {
 
 fn print_recipe(r: &FixRecipe) {
     println!("Fix:        {}  -- {}", r.fix_id, r.title);
-    println!("OS scope:   {}", r.applies_on.join(", "));
+    println!("OS scope:   {}", r.os_scope().join(", "));
     println!("Rationale:  {}", r.rationale);
     if !r.commands.is_empty() {
         println!("Commands:");
@@ -737,18 +858,34 @@ fn print_recipe(r: &FixRecipe) {
             println!("  $ {c}");
         }
     }
-    let mut flags = Vec::new();
+    // Owned, because the needs-argument flag names the argument and so cannot
+    // be a literal.
+    let mut flags: Vec<String> = Vec::new();
     if r.needs_sudo {
-        flags.push("requires sudo");
+        flags.push("requires sudo".to_owned());
     }
     if r.needs_reboot {
-        flags.push("requires reboot");
+        flags.push("requires reboot".to_owned());
     }
     if r.needs_relogin {
-        flags.push("requires re-login");
+        flags.push("requires re-login".to_owned());
     }
-    if !r.auto_applicable {
-        flags.push("manual only (this command will NOT run it)");
+    match r.class_here() {
+        FixClass::Auto => {}
+        FixClass::NeedsArgument => {
+            // Named rather than described as "manual only": the CLI *will* act,
+            // just not until it is told what to act on. Calling that manual
+            // sends the user off to run the steps by hand for no reason.
+            let needs = r
+                .platform(current_os())
+                .and_then(|p| p.needs)
+                .unwrap_or("an argument");
+            flags.push(format!("needs {needs} before this command will run it"));
+        }
+        FixClass::PrintOnly => flags.push("manual only (this command will NOT run it)".to_owned()),
+        FixClass::DiagnoseOnly => {
+            flags.push("no reliable fix (this command will NOT change anything)".to_owned());
+        }
     }
     if !flags.is_empty() {
         println!("Flags:      {}", flags.join(", "));
@@ -784,29 +921,43 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     println!();
 
     let os = current_os();
-    if !recipe.applies_on.contains(&os) {
+    let Some(platform) = recipe.platform(os) else {
         fail!(
             "This fix only applies on: {}. Running OS is: {os}.",
-            recipe.applies_on.join(", ")
+            recipe.os_scope().join(", ")
         );
         return 3;
-    }
-    if !recipe.auto_applicable {
-        println!("This fix is print-only (manual change required).");
-        println!("Copy the commands above, run them yourself, then verify with:");
-        if !recipe.verify.is_empty() {
-            println!("  $ {}", recipe.verify);
-        }
+    };
+    if platform.class == FixClass::DiagnoseOnly {
+        // Not an error, so not a nonzero code: the command did everything it
+        // could, which is name the problem. Exit 3 would say "not applicable
+        // *here*", a different claim that would send a caller looking for
+        // another machine to run it on.
+        println!("This problem has no reliable fix, so this command changes nothing.");
+        println!("The explanation above is the whole of what is known about it.");
         return 0;
     }
+    // The class says what happens to the *machine*; it does not say whether a
+    // runner runs. `fix-2-unset-override` is print-only on Linux and still has
+    // real work to do there -- it reads the live value and scans five rc files
+    // to name the ones that set it. Gating the runner on the class would throw
+    // that away and print a generic "copy the commands above" in its place.
     if let Some(runner) = recipe.runner {
-        runner(opts)
-    } else {
-        // Internal error (auto-applicable recipe with no runner) -> 1, not 4
-        // (4 is reserved for "attempted but the command failed").
-        fail!("Internal error: auto-applicable recipe has no runner.");
-        1
+        return runner(opts);
     }
+    if platform.class.applies_itself() {
+        // A recipe the catalog says the CLI carries out, with nothing to carry
+        // it out with -> 1, not 4 (4 is reserved for "attempted but the command
+        // failed"). Held by `a_recipe_that_acts_has_a_runner`.
+        fail!("Internal error: a recipe the catalog says is applied here has no runner.");
+        return 1;
+    }
+    println!("This fix is print-only (manual change required).");
+    println!("Copy the commands above, run them yourself, then verify with:");
+    if !recipe.verify.is_empty() {
+        println!("  $ {}", recipe.verify);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,6 +1478,15 @@ mod tests {
         }
     }
 
+    /// Whether a recipe applies on the platform the test is running on.
+    ///
+    /// Gating on `runtime_is_linux()` stopped being the same question once WSL
+    /// became its own family: a WSL host is Linux, but a Linux-scoped recipe is
+    /// correctly refused there.
+    fn recipe_applies_here(fix_id: &str) -> bool {
+        find_recipe(fix_id).is_some_and(|r| r.platform(current_os()).is_some())
+    }
+
     /// Plant a directory the shared resolver will accept as a ROCm install.
     /// `bin/rocminfo` is one of the markers it gates on; a bare directory is
     /// deliberately not enough.
@@ -1417,7 +1577,6 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 16 bare-metal/Windows entries (including fix-17) plus the 7 WSL ones.
         assert_eq!(count, 23, "expected 23 catalog entries");
     }
 
@@ -1428,61 +1587,92 @@ mod tests {
         assert_engine_shell_boundary_is_labelled(recipe.fix_id, recipe.commands);
     }
 
-    #[test]
-    fn current_os_reports_wsl_exactly_when_is_wsl_host_does() {
-        // `current_os()`'s wsl branch is `crate::is_wsl_host()`, which is
-        // `crate::wsl_signals_indicate_wsl()` against the real `/dev/dxg` and
-        // `/proc/version` -- `$WSL_DISTRO_NAME` plays no part any more, so
-        // there is nothing left to force portably here. The table-driven
-        // coverage of the predicate itself lives with
-        // `wsl_signals_indicate_wsl` in lib.rs; this test only checks that
-        // `current_os()` reports the same answer `is_wsl_host()` does on
-        // whatever machine actually runs it, whether that is a bare-metal CI
-        // runner, Windows, or a real WSL host.
-        assert_eq!(
-            current_os() == "wsl",
-            crate::is_wsl_host(),
-            "current_os() must agree with is_wsl_host()"
-        );
+    /// Every platform class a recipe carries, as `(fix-id, os, class)`.
+    fn classes() -> Vec<(&'static str, &'static str, FixClass)> {
+        RECIPES
+            .iter()
+            .flat_map(|r| r.applies_on.iter().map(|p| (r.fix_id, p.os, p.class)))
+            .collect()
     }
 
-    /// Whether a recipe applies on the platform the test is running on.
-    ///
-    /// Tests used to gate on `runtime_is_linux()`, which stopped being the same
-    /// question once WSL became its own family: a WSL host is Linux, but a
-    /// `LINUX_ONLY` recipe is correctly refused there.
-    fn recipe_applies_here(fix_id: &str) -> bool {
-        find_recipe(fix_id).is_some_and(|r| r.applies_on.contains(&current_os()))
-    }
-
+    /// One direction only, on purpose. A recipe the catalog says the CLI
+    /// carries out somewhere must have something to carry it out with, or
+    /// `apply` reaches its internal-error path. The converse is deliberately
+    /// not asserted: a print-only recipe may hold a runner that reports without
+    /// writing, which is exactly what `fix-2-unset-override` does on Linux.
     #[test]
-    fn auto_applicable_recipes_have_a_runner() {
+    fn a_recipe_that_acts_has_a_runner() {
         for r in RECIPES {
-            assert_eq!(
-                r.auto_applicable,
-                r.runner.is_some(),
-                "{}: auto_applicable must match presence of a runner",
+            let acts_somewhere = r
+                .applies_on
+                .iter()
+                .any(|p| matches!(p.class, FixClass::Auto | FixClass::NeedsArgument));
+            assert!(
+                !acts_somewhere || r.runner.is_some(),
+                "{}: the catalog says the CLI carries this out on some platform, \
+                 but there is no runner to do it",
                 r.fix_id
             );
         }
     }
 
     #[test]
-    fn exactly_the_four_known_fixes_are_auto() {
-        let auto: Vec<&str> = RECIPES
-            .iter()
-            .filter(|r| r.auto_applicable)
-            .map(|r| r.fix_id)
+    fn a_needs_argument_platform_names_the_argument() {
+        for (fix_id, os, class) in classes() {
+            let needs = RECIPES
+                .iter()
+                .find(|r| r.fix_id == fix_id)
+                .and_then(|r| r.platform(os))
+                .and_then(|p| p.needs);
+            assert_eq!(
+                class == FixClass::NeedsArgument,
+                needs.is_some(),
+                "{fix_id} on {os}: the argument is the whole difference between this \
+                 class and AUTO, so it has to be named -- and nothing else may name one"
+            );
+        }
+    }
+
+    /// Pinned exactly, per platform. Promoting an entry to `AUTO` starts
+    /// changing machines that callers were told it only ever advised on, and
+    /// the two corrections below were both silent precisely because a flat
+    /// `bool` could not record the platform the claim was true on.
+    #[test]
+    fn only_these_entries_act_on_the_machine_and_only_on_these_platforms() {
+        let acts: Vec<(&str, &str, FixClass)> = classes()
+            .into_iter()
+            .filter(|(_, _, c)| matches!(c, FixClass::Auto | FixClass::NeedsArgument))
             .collect();
         assert_eq!(
-            auto,
+            acts,
             vec![
-                "fix-2-unset-override",
-                "fix-4-render-group",
-                "fix-6-path",
-                "fix-9-igpu-dgpu"
+                // Linux reports and returns; only the Windows arm mutates.
+                ("fix-2-unset-override", "windows", FixClass::Auto),
+                ("fix-4-render-group", "linux", FixClass::Auto),
+                ("fix-6-path", "linux", FixClass::Auto),
+                ("fix-6-path", "windows", FixClass::Auto),
+                ("fix-6-path", "wsl", FixClass::Auto),
+                // Both arms short-circuit until `--device-index` names a target.
+                ("fix-9-igpu-dgpu", "linux", FixClass::NeedsArgument),
+                ("fix-9-igpu-dgpu", "windows", FixClass::NeedsArgument),
             ]
         );
+    }
+
+    #[test]
+    fn no_entry_claims_a_platform_twice() {
+        for r in RECIPES {
+            let mut seen: Vec<&str> = r.applies_on.iter().map(|p| p.os).collect();
+            let count = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen.len(),
+                count,
+                "{}: a platform listed twice makes `platform()` order-dependent",
+                r.fix_id
+            );
+        }
     }
 
     #[test]
@@ -1493,7 +1683,7 @@ mod tests {
 
     #[test]
     fn dry_run_never_mutates_and_returns_zero_for_auto_linux_fix() {
-        if !runtime_is_linux() {
+        if !recipe_applies_here("fix-2-unset-override") {
             return;
         }
         // fix-2 unset-override is print-only on linux (no mutation regardless);
@@ -1508,16 +1698,15 @@ mod tests {
 
     #[test]
     fn fix_9_without_device_index_is_print_only_and_returns_zero() {
+        if !recipe_applies_here("fix-9-igpu-dgpu") {
+            // Refused at the OS gate here (WSL is its own family), which is a
+            // different assertion -- covered by the inapplicable-recipe test.
+            return;
+        }
         // Regression: the missing `--device-index` branch only prints the
         // query that identifies the dGPU, so it is a print-only preview and
         // must return 0 -- not the environment/OS code 3. A dry-run without the
         // argument must likewise succeed, since the runner never mutates.
-        //
-        // fix-9 does not apply on WSL (no per-device topology to collide over),
-        // where the correct answer is the OS refusal this test exists to rule out.
-        if !recipe_applies_here("fix-9-igpu-dgpu") {
-            return;
-        }
         for dry_run in [false, true] {
             let opts = FixOptions {
                 dry_run,
@@ -1535,11 +1724,13 @@ mod tests {
     fn print_only_fix_returns_zero() {
         // Pick a recipe that applies on THIS platform rather than naming a Linux
         // one: the assertion is about print-only recipes succeeding, and hunting
-        // for an applicable one keeps that meaningful on every lane instead of
-        // skipping wherever the hardcoded id happens not to apply.
+        // for an applicable one keeps it meaningful on every lane.
         let fix_id = RECIPES
             .iter()
-            .find(|r| !r.auto_applicable && r.applies_on.contains(&current_os()))
+            .find(|r| {
+                r.platform(current_os())
+                    .is_some_and(|p| p.class == FixClass::PrintOnly)
+            })
             .map(|r| r.fix_id)
             .expect("every supported platform has at least one print-only recipe");
         let code = apply(fix_id, &FixOptions::default());

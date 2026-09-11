@@ -33,7 +33,20 @@ pub struct Fix {
     pub needs_reboot: bool,
     pub needs_relogin: bool,
     pub fix_id: String,
+    /// Whether `rocm fix <fix_id>`, run with no extra arguments, will change
+    /// the machine.
+    ///
+    /// Kept alongside [`Fix::class`], which it is derived from, because it is
+    /// the field published consumers already read. It is not redundant detail
+    /// so much as a narrower question: `class` says *what* the CLI will do,
+    /// this says only whether the machine is about to change.
     pub auto_applicable: bool,
+    /// What the CLI will do with this entry on the examined machine.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes; the default understates rather than overstates.
+    #[serde(default)]
+    pub class: crate::fix::FixClass,
     pub notes: Vec<String>,
     pub verify: String,
 }
@@ -433,7 +446,6 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx_target>".to_owned(),
         ],
         fix_id: "fix-1-arch".to_owned(),
-        auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
         notes: vec![
             "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
@@ -501,7 +513,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Or remove via System Properties -> Environment Variables.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','User')\"".to_owned(),
             ..Fix::default()
         }
@@ -513,7 +524,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Also remove it from ~/.bashrc / ~/.zshrc / ~/.profile if persisted.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET; python -c \"import torch; print(torch.cuda.is_available())\"".to_owned(),
             ..Fix::default()
         }
@@ -561,7 +571,6 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
-        auto_applicable: false,
         needs_reboot: true,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 20".to_owned(),
         ..Fix::default()
@@ -619,7 +628,6 @@ fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_relogin: true,
         fix_id: "fix-4-render-group".to_owned(),
-        auto_applicable: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5".to_owned(),
         notes: vec![
             "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
@@ -682,7 +690,6 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: !blacklisted.is_empty(),
         fix_id: "fix-5-amdgpu-load".to_owned(),
-        auto_applicable: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5".to_owned(),
         ..Fix::default()
     };
@@ -757,7 +764,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                     .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: format!(
                 "powershell -NoProfile -Command \"& \\\"{bin_dir}\\hipInfo.exe\\\" | Select-Object -First 5\""
             ),
@@ -771,7 +777,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                 format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: "rocminfo | head -n 5 && hipcc --version".to_owned(),
             ..Fix::default()
         }
@@ -821,7 +826,6 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         commands,
         needs_sudo: true,
         fix_id: "fix-7-stale-repos".to_owned(),
-        auto_applicable: false,
         verify: "sudo apt update 2>&1 | tail -n 20".to_owned(),
         ..Fix::default()
     };
@@ -875,7 +879,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -891,7 +894,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -969,7 +971,6 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
@@ -985,7 +986,6 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: false,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
@@ -1046,7 +1046,6 @@ fn check_10_container_devices(e: &Examination, symptom: &str) -> Diagnosis {
             "# host user is in the render group; podman maps it through.".to_owned(),
         ],
         fix_id: "fix-10-container".to_owned(),
-        auto_applicable: false,
         verify: "rocminfo | head -n 5".to_owned(),
         notes: vec!["Use rocm/pytorch or rocm/dev-ubuntu-22.04 as a known-good image. Mixing host ROCm + container ROCm versions is a separate footgun.".to_owned()],
         ..Fix::default()
@@ -1096,7 +1095,6 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-11-iommu".to_owned(),
-        auto_applicable: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'".to_owned(),
         ..Fix::default()
     };
@@ -1139,7 +1137,6 @@ fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
-        auto_applicable: false,
         verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
         notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
@@ -1189,7 +1186,6 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
         fix_id: "fix-13-hip-sdk-missing".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"& \\\"$env:HIP_PATH\\bin\\hipInfo.exe\\\" | Select-Object -First 5\"".to_owned(),
         notes: vec!["If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.".to_owned()],
         ..Fix::default()
@@ -1247,7 +1243,6 @@ fn check_14_adrenalin_too_old(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_reboot: true,
         fix_id: "fix-14-adrenalin-too-old".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"".to_owned(),
         ..Fix::default()
     };
@@ -1285,7 +1280,6 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
             "# After the install, reopen the shell and re-run your import / hipInfo check.".to_owned(),
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
-        auto_applicable: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
         notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing (the HIP SDK install) rather than this fix.".to_owned()],
         ..Fix::default()
@@ -1359,7 +1353,6 @@ fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagno
             "rocm engines install vllm --reinstall".to_owned(),
         ],
         fix_id: "fix-17-torch-dlpack".to_owned(),
-        auto_applicable: false,
         verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts".to_owned(),
         notes: vec![
             "Running vLLM on ROCm is not by itself a reason to apply this. The trigger is narrow: a ROCm build of torch in the 2.4-2.9 range (the versions torch-c-dlpack-ext ships prebuilts for), torch without a native __dlpack_c_exchange_api__, and torch-c-dlpack-ext present -- it arrives as a transitive dependency of tilelang, which vLLM pins.".to_owned(),
@@ -1934,11 +1927,12 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // known misconfiguration", which reads as "your machine looks fine" when the
     // truth is that nothing was ever checked.
     let out_of_scope = uncovered_platform_message(e);
-    let matched = if out_of_scope.is_some() {
+    let mut matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
         run_all_checks(e, symptom)
     };
+    take_applicability_from_the_catalog(&mut matched, platform_family(e));
     DiagnoseReport {
         has_match: any_cleared_threshold(&matched),
         matched,
@@ -1946,6 +1940,34 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         high_confidence_threshold: HIGH_CONFIDENCE,
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
+    }
+}
+
+/// Fill each finding's applicability from the catalog, for the operating system
+/// of the machine that was examined.
+///
+/// One place, deliberately. Every checker used to state `auto_applicable` by
+/// hand, which meant the catalog's answer existed twice in two modules with
+/// nothing comparing them — and they had already drifted: `fix-9-igpu-dgpu` was
+/// auto-applicable in the catalog and, in the Linux arm of its own checker,
+/// not. Deriving it here makes that disagreement unrepresentable rather than
+/// something a test has to go looking for.
+///
+/// Keyed on the examined machine's platform *family*, not the running host and
+/// not `os_family`. WSL reports an `os_family` of `linux` but is its own family
+/// for catalog purposes, so reading `os_family` here would look up every WSL
+/// recipe under the wrong platform and silently report them all as print-only.
+fn take_applicability_from_the_catalog(matched: &mut [Diagnosis], os_family: &str) {
+    for diagnosis in matched.iter_mut() {
+        let Some(fix) = diagnosis.fix.as_mut() else {
+            continue;
+        };
+        // An entry the catalog does not list for this OS keeps the default:
+        // the CLI will not act on it here, which is exactly what the OS gate in
+        // `fix::apply` would tell the user.
+        let class = crate::fix::class_on(&fix.fix_id, os_family).unwrap_or_default();
+        fix.class = class;
+        fix.auto_applicable = class.applies_itself();
     }
 }
 
@@ -2026,8 +2048,18 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             if fix.needs_relogin {
                 flags.push("re-login required");
             }
-            if fix.auto_applicable {
-                flags.push("rocm fix can run it");
+            // Reading the class rather than the bool, so the two entries whose
+            // runner only reports are not advertised as ones the CLI is about
+            // to act on.
+            match fix.class {
+                crate::fix::FixClass::Auto => flags.push("rocm fix can run it"),
+                crate::fix::FixClass::NeedsArgument => {
+                    flags.push("rocm fix can run it once given an argument");
+                }
+                crate::fix::FixClass::PrintOnly => {}
+                crate::fix::FixClass::DiagnoseOnly => {
+                    flags.push("no reliable fix; rocm fix will only explain it");
+                }
             }
             if !flags.is_empty() {
                 let _ = writeln!(out, "   flags: {}", flags.join(", "));

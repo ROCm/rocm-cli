@@ -266,3 +266,30 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that machine
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
+  # One entry behaves differently depending on the machine: it persists the
+  # change on Windows, and on Linux it only reports where the value is set,
+  # because the code that would write it takes no options and never does.
+  # The listing said "the CLI will run this" on both, so a user on Linux — and
+  # an agent reading the same listing — was told a change was coming that never
+  # came. Host-independent on purpose: the assertion is that the listing agrees
+  # with the machine in front of it, whichever machine that is.
+  @id:diagnose-fix-applicability-is-per-machine
+  Scenario: diagnose-20 - A fix that only explains itself here is not advertised as one the CLI will run
+    Given a fix the CLI carries out on one kind of machine and only explains on another
+    When the user asks the CLI which fixes it offers
+    Then that fix is shown as what it does on this machine
+
+  # The other half of the same defect. This entry does have a fix and the CLI
+  # will carry it out, but not until it is told which device to pin; asked
+  # plainly it prints the query that identifies one and stops. It was marked as
+  # a fix the CLI applies, so the report of a change that never happened looked
+  # like success.
+  # @requires-bare-metal because the entry under test is scoped to bare-metal
+  # Linux and Windows. On WSL it is refused at the platform gate instead, which
+  # is a different contract with its own scenario — and the right one, since the
+  # catalog does not claim this remedy applies there.
+  @id:diagnose-fix-needing-an-argument-says-so @requires-bare-metal
+  Scenario: diagnose-21 - A fix that needs more information says what it needs and changes nothing
+    Given a user who has chosen a fix that cannot run until it is told what to act on
+    When the user asks the CLI to apply it without saying what to act on
+    Then the CLI names what it still needs and reports no change
