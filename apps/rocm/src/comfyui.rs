@@ -1052,6 +1052,12 @@ fn select_runtime(
     Ok(SelectedRuntime { manifest, python })
 }
 
+/// Render a bare `key, key` list. Used only where the caller has already
+/// narrowed `manifests` to a candidate set the user may legitimately pick from
+/// (the ready runtimes, or the manifests a selector matched), so every key in
+/// it is a valid answer and a per-key status would be noise. Branches that
+/// enumerate the *whole* registry use `format_runtime_statuses` instead — see
+/// its doc comment for why the two labels differ.
 fn format_available_runtime_keys<'a>(
     manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
 ) -> String {
@@ -1062,10 +1068,16 @@ fn format_available_runtime_keys<'a>(
         .join(", ")
 }
 
-/// Render each known runtime as `` `key` (status) `` for the "none ready"
-/// error, surfacing the per-manifest reason `runtime_usability_status` already
-/// computed (e.g. `unusable (install root is missing: …)`) instead of dropping
-/// it and printing a generic "no runtime is ready".
+/// Render each known runtime as `` `key` (status) ``, surfacing the per-manifest
+/// reason `runtime_usability_status` already computed (e.g.
+/// `unusable (install root is missing: …)`) instead of dropping it.
+///
+/// Used by every branch that lists the entire registry — "none ready" and the
+/// two not-found branches. Those cannot promise the listed runtimes are
+/// pickable, so printing bare keys under `Available:` would invite the user to
+/// `rocm runtimes activate` an unusable one and land on a second error. The
+/// label split is deliberate and load-bearing: `Available:` means "any of these
+/// works", `Runtimes found:` means "here is everything registered, with why".
 fn format_runtime_statuses<'a>(
     manifests: impl IntoIterator<Item = &'a therock::InstalledRuntimeManifest>,
 ) -> String {
@@ -1099,9 +1111,12 @@ fn select_default_runtime<'a>(
     match matches.as_slice() {
         [manifest] => Ok(*manifest),
         [] => {
-            let available = format_available_runtime_keys(manifests);
+            // Whole-registry list, so it carries statuses: a not-found default
+            // is no evidence the survivors are usable, and advising `activate`
+            // on an unusable one just produces a second error.
+            let statuses = format_runtime_statuses(manifests);
             bail!(
-                "The configured default ROCm runtime was not found. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "The configured default ROCm runtime was not found. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`. Runtimes found: {statuses}. See `rocm runtimes list`."
             )
         }
         _ => {
@@ -1154,9 +1169,12 @@ fn select_runtime_by_selector<'a>(
     match matches.as_slice() {
         [manifest] => Ok(*manifest),
         [] => {
-            let available = format_available_runtime_keys(manifests);
+            // Same reasoning as the configured-default not-found branch: this
+            // enumerates every registered runtime, so each entry carries its
+            // status rather than implying all of them are pickable.
+            let statuses = format_runtime_statuses(manifests);
             bail!(
-                "ROCm runtime not found: `{selector}`. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Available: {available}. See `rocm runtimes list`."
+                "ROCm runtime not found: `{selector}`. Pick one in `/runtimes`, re-activate one with `rocm runtimes activate <key>`, or pass the exact runtime key with `--runtime-id <key>`. Runtimes found: {statuses}. See `rocm runtimes list`."
             )
         }
         _ => {
@@ -2364,10 +2382,15 @@ mod tests {
 
     #[test]
     fn configured_default_not_found_is_actionable() -> Result<()> {
+        // This branch enumerates the WHOLE registry, so it is planted with one
+        // ready and one unusable runtime: a bare key list here would advise
+        // `rocm runtimes activate` on the unusable one and land the user on a
+        // second error, so each entry must carry its status.
         let paths = test_paths("comfyui-default-not-found");
-        let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
 
-        let manifests = [runtime];
+        let manifests = [ready, unusable];
         let config = RocmCliConfig {
             default_runtime_id: Some("no-such-runtime-id".to_owned()),
             ..Default::default()
@@ -2380,6 +2403,15 @@ mod tests {
         assert!(
             message.contains("The configured default ROCm runtime was not found"),
             "error should be the configured-default-not-found branch, got: {message}"
+        );
+        assert!(
+            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
+            "the usable runtime must be listed as ready, got: {message}"
+        );
+        assert!(
+            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
+                && message.contains("install root is missing"),
+            "the unusable runtime must carry its reason, not read as pickable, got: {message}"
         );
         Ok(())
     }
@@ -2413,10 +2445,12 @@ mod tests {
 
     #[test]
     fn unknown_selector_is_actionable() -> Result<()> {
+        // Whole-registry list again — see `configured_default_not_found_is_actionable`.
         let paths = test_paths("comfyui-selector-not-found");
-        let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let ready = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
+        let unusable = unusable_runtime_manifest(&paths, "nightly-wheel-gfx94x-dcgpu-7-14-0")?;
 
-        let manifests = [runtime];
+        let manifests = [ready, unusable];
         let error = select_runtime_by_selector(&manifests, "no-such-key")
             .expect_err("selector matches no runtime");
         let message = error.to_string();
@@ -2425,6 +2459,15 @@ mod tests {
         assert!(
             message.contains("ROCm runtime not found: `no-such-key`"),
             "error should be the unknown-selector branch, got: {message}"
+        );
+        assert!(
+            message.contains("`release-wheel-gfx94x-dcgpu-7-13-0` (ready)"),
+            "the usable runtime must be listed as ready, got: {message}"
+        );
+        assert!(
+            message.contains("`nightly-wheel-gfx94x-dcgpu-7-14-0` (unusable")
+                && message.contains("install root is missing"),
+            "the unusable runtime must carry its reason, not read as pickable, got: {message}"
         );
         Ok(())
     }

@@ -424,7 +424,7 @@ fn managers_render_as_centered_modal() {
         (
             ActiveTab::Rocm,
             |s| s.runtime_manager = Some(RuntimeManagerState::default()),
-            "ROCm installs",
+            "managed ROCm SDKs",
         ),
         (
             ActiveTab::Rocm,
