@@ -29,33 +29,37 @@ doesn't match a known mode, route the user upstream instead of guessing.
 
 ## Scope gate — check before anything else
 
-Read the user's symptom and answer one question first: **is this an AMD GPU on
-native Linux or Windows?**
+Read the user's symptom and answer one question first: **is this an AMD GPU?**
 
-If it is **not** — an **NVIDIA / Intel / Apple** GPU, or anything running under
-**WSL2** — then **stop and decline**:
+If it is **not** — an **NVIDIA / Intel / Apple** GPU — then **stop and decline**:
 
-- Say plainly that it is **out of scope** for this skill and why (not an AMD GPU
-  / WSL2 is a separate platform).
+- Say plainly that it is **out of scope** for this skill and why (not an AMD GPU).
 - Give **no** troubleshooting for it: no commands to run, no driver or CUDA
   advice, no diagnostic checklist, no "try this first" — not even generic GPU
-  suggestions. Point at the vendor's own docs (or AMD's ROCm-on-WSL guide) and
-  stop there.
+  suggestions. Point at the vendor's own docs and stop there.
 - Do **not** run `rocm examine` / `rocm diagnose` / `rocm fix`.
 
 Being helpful here means being honest about the boundary — confidently-wrong
 advice for a stack this skill does not cover is worse than no advice. Only
-continue past this gate when the GPU is AMD and the platform is native Linux or
-Windows. See [Out of scope](#out-of-scope).
+continue past this gate when the GPU is AMD. See
+[Out of scope](#out-of-scope).
+
+**WSL2 is in scope** and does not stop this gate. It is a platform family of its
+own, with its own catalog entries covering `/dev/dxg`, the DXCore handoff,
+ROCDXG, the distro floor, the Windows host driver and WSL 1. Do not decline a
+WSL2 user or route them away untouched — run the workflow as for any other
+platform. The CLI scopes entries itself, so a bare-metal Linux fix is never
+offered there.
 
 ## Prerequisites
 
 - **The `rocm` CLI.** This skill is only a driver over it; Phase 0 below installs
   it with the user's consent if `rocm --version` fails. Nothing else here is
   assumed — the CLI does the probing.
-- **Platform:** native Linux (in-tree `amdgpu` module + `/dev/kfd`) or Windows
-  (HIP SDK). WSL2, NVIDIA/Intel/Apple GPUs, and clean-machine installs are out of
-  scope (see [Out of scope](#out-of-scope)).
+- **Platform:** native Linux (in-tree `amdgpu` module + `/dev/kfd`), Windows
+  (HIP SDK), or WSL2 (`/dev/dxg` + the Windows host driver). NVIDIA/Intel/Apple
+  GPUs and clean-machine installs are out of scope (see
+  [Out of scope](#out-of-scope)).
 - **No fixed ROCm version, GPU arch (`gfx…`), or container image is assumed** —
   `rocm examine`/`diagnose` detect the installed ROCm, the GPU's `gfx` target, and
   container context, and match fixes to what they find. Never hand-set
@@ -65,7 +69,7 @@ Windows. See [Out of scope](#out-of-scope).
 ## Workflow
 
 Only start here once the [Scope gate](#scope-gate--check-before-anything-else)
-passes — the GPU is AMD and the platform is native Linux or Windows.
+passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
 
 0. **Ensure the `rocm` CLI is present.** Everything below shells out to it, so
    check first and install it if missing:
@@ -116,12 +120,14 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
      `notes`, and the `needs_sudo` / `needs_reboot` / `needs_relogin` /
      `auto_applicable` flags). `score >= 75` = high confidence; `50–74` = likely
      (confirm one more piece of evidence with the user first).
-   - `out_of_scope` — when set (e.g. WSL2), do **not** diagnose. First, if the
-     user's symptom clearly names an app that ships its own runtime (Lemonade,
-     Ollama, LM Studio), route them to that app's tracker (see
+   - `out_of_scope` — set only when the host's platform family has no catalog
+     entries at all. Linux, Windows and WSL2 are all covered, so this does
+     **not** fire for WSL2. When it is set, nothing was checked — say so rather
+     than implying the machine looks fine. First, if the user's symptom clearly
+     names an app that ships its own runtime (Lemonade, Ollama, LM Studio),
+     route them to that app's tracker (see
      [Framework routing](#framework-routing)) — those trackers apply regardless
-     of platform. Otherwise relay the `out_of_scope` message and stop (see
-     [Out of scope](#out-of-scope)).
+     of platform. Otherwise relay the `out_of_scope` message and stop.
    - `route_when_no_match` — when `has_match` is false, hand the user this
      upstream tracker; **do not speculate**. Note the CLI picks this target from
      the *host-detected* framework, not from the symptom text — so for an app
@@ -139,7 +145,7 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only the four auto-applicable fixes are ones the CLI runs itself. The other 12
+   Only the four auto-applicable fixes are ones the CLI runs itself. The other 19
    are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
    fix <id>` just prints the plan for the user to run themselves — no prompt, and
    the CLI never performs those.
@@ -183,17 +189,17 @@ never name one of these apps. Use the list below.
 
 ## Out of scope
 
-- **WSL2** — a distinct platform (`/dev/dxg` + the Windows host driver, not the
-  in-tree `amdgpu` module or `/dev/kfd`). `rocm examine`/`diagnose` detect it and
-  route out; relay that guidance and point at AMD's ROCm-on-WSL guide.
 - **NVIDIA / Intel / Apple Silicon GPUs**, and **fresh installs on a clean
   machine** (a setup task, not a diagnosis). Exit cleanly and say so.
+
+WSL2 is **not** in this list. It is a supported platform family with its own
+catalog entries — see [reference.md](reference.md).
 
 ## Rules
 
 - Never run the workflow — or offer *any* troubleshooting, generic GPU fixes
-  included — for a non-AMD GPU or a WSL2 setup. State it is out of scope and
-  stop.
+  included — for a non-AMD GPU. State it is out of scope and stop. This does
+  not apply to WSL2, which is in scope and runs the normal workflow.
 - Never invent a fix. If `rocm diagnose` returns no match, route upstream.
 - Never run a mutating fix without the user's explicit OK; prefer `--dry-run`
   first. New failure modes are added to the CLI catalog, not improvised here.
