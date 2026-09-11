@@ -45,7 +45,7 @@ use rocm_core::{
     read_http_response_bounded, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    shell_command_for_host, uv_cache_source, write_all_tcp_stream,
+    shell_command_for_host, uv_cache_source, uv_python_install_dir_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -525,12 +525,13 @@ rocm logs --search error timeout")]
         /// Keep saved settings.
         #[arg(long)]
         keep_config: bool,
-        /// Keep app data such as logs, services, engines, and the uv package cache
-        /// (often the largest directory rocm-cli manages).
+        /// Keep app data such as logs, services, engines, the uv package cache, and the
+        /// uv-managed Python interpreter (often the largest directories rocm-cli manages).
         #[arg(long)]
         keep_data: bool,
-        /// Keep caches under the cache directory. Does not cover the uv package cache,
-        /// which lives under the data directory; use --keep-data for that.
+        /// Keep caches under the cache directory. Does not cover the uv package cache or
+        /// the uv-managed Python interpreter, which live under the data directory; use
+        /// --keep-data for those.
         #[arg(long)]
         keep_cache: bool,
         /// Allow removing development binaries inside the current build tree.
@@ -1221,6 +1222,7 @@ fn run() -> Result<()> {
 
     maybe_migrate_legacy_dashboard_config();
     maybe_notice_legacy_uv_cache();
+    maybe_notice_legacy_uv_python_install_dir();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     if raw_args.is_empty() {
@@ -1306,10 +1308,7 @@ fn maybe_notice_legacy_uv_cache() {
     if !cache.path().is_dir() {
         return;
     }
-    let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    else {
+    let Some(home) = rocm_core::runtime_home_dir() else {
         return;
     };
     let legacy = LEGACY_UV_CACHE_RELATIVE
@@ -1327,6 +1326,80 @@ fn maybe_notice_legacy_uv_cache() {
     eprintln!(
         "rocm: the uv cache now lives at {}; the previous cache at {} is no longer used by rocm-cli and can be removed if no other uv project needs it",
         cache.path().display(),
+        legacy.display()
+    );
+    let _ = fs::write(&marker, b"");
+}
+
+/// Where `uv` puts Python installs absent `UV_PYTHON_INSTALL_DIR`: a `python`
+/// subdirectory of its persistent data dir (`$XDG_DATA_HOME/uv`, else
+/// `$HOME/.local/share/uv` on Unix; `%APPDATA%\uv\data` on Windows — uv does not use
+/// `%USERPROFILE%\.local\share`).
+fn legacy_uv_python_install_dir() -> Option<PathBuf> {
+    resolve_legacy_uv_python_install_dir(
+        rocm_core::runtime_is_windows(),
+        std::env::var_os("APPDATA"),
+        std::env::var_os("XDG_DATA_HOME"),
+        rocm_core::runtime_home_dir(),
+    )
+}
+
+/// Pure resolution logic for [`legacy_uv_python_install_dir`]. Split out so the Windows
+/// branch is table-testable: `runtime_is_windows()` is `cfg!(windows)`, so it can never
+/// be exercised by a test running on Linux CI otherwise.
+fn resolve_legacy_uv_python_install_dir(
+    is_windows: bool,
+    appdata: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if is_windows {
+        let appdata = appdata
+            .map(PathBuf::from)
+            .filter(|value| !value.as_os_str().is_empty())?;
+        return Some(appdata.join("uv").join("data").join("python"));
+    }
+    if let Some(xdg_data_home) = xdg_data_home
+        .map(PathBuf::from)
+        .filter(|value| !value.as_os_str().is_empty())
+    {
+        return Some(xdg_data_home.join("uv").join("python"));
+    }
+    Some(home?.join(".local").join("share").join("uv").join("python"))
+}
+
+/// One-shot notice that pre-colocation `uv`-managed Python interpreters are still
+/// occupying space at the default `uv` location. Nothing is migrated or deleted: removing
+/// it is the user's call. Silent when the managed dir does not exist yet (nothing has
+/// moved) or when an override is in effect.
+fn maybe_notice_legacy_uv_python_install_dir() {
+    let Ok(paths) = AppPaths::discover() else {
+        return;
+    };
+    let install_dir = uv_python_install_dir_source(&paths);
+    if install_dir.is_override() {
+        return;
+    }
+    let Some(legacy) = legacy_uv_python_install_dir() else {
+        return;
+    };
+    // Gated on the legacy directory existing, not the managed one: relocation only
+    // happens when `uv python install` actually runs again (e.g. a manifest pointing
+    // outside the managed dir gets invalidated), which may never occur for a user
+    // whose PATH Python already satisfies every check. Waiting on the managed dir
+    // would leave such users with an un-reclaimed legacy install and no notice.
+    if !legacy.is_dir() {
+        return;
+    }
+    // One-shot: a standing reminder on every invocation would be noise, and the user may
+    // reasonably decide to keep the legacy interpreters for other uv projects.
+    let marker = paths.data_dir.join(".legacy-uv-python-install-dir-notice");
+    if marker.exists() {
+        return;
+    }
+    eprintln!(
+        "rocm: the uv-managed Python interpreter now lives at {}; the previous location at {} is no longer used by rocm-cli and can be removed if no other uv project needs it",
+        install_dir.path().display(),
         legacy.display()
     );
     let _ = fs::write(&marker, b"");
@@ -18021,7 +18094,7 @@ fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
         paths.data_dir.clone(),
         paths.cache_dir.clone(),
     ];
-    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
+    shared_cache_notes_for(&removed_roots, &shared_cache_candidates(paths))
 }
 
 /// The pure part of [`shared_cache_notes`], so the filtering is testable without
@@ -18039,20 +18112,34 @@ fn shared_cache_notes_for(
 }
 
 /// The shared caches worth reporting, with why each is left alone.
-fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
+fn shared_cache_candidates(paths: &AppPaths) -> Vec<(PathBuf, &'static str)> {
     let mut candidates = Vec::new();
 
-    // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
-    // rather than assuming a location, so this stays correct wherever the cache
-    // has been pointed.
-    let uv_cache = env_path("UV_CACHE_DIR")
-        .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
-    if let Some(path) = uv_cache {
-        candidates.push((
-            path,
-            "the uv package cache is shared with other uv projects on this computer and is",
-        ));
-    }
+    // Resolved through the same precedence `uv` is invoked with, so an override is
+    // reported at the location `uv` actually writes to. The managed location sits
+    // under the data directory and is filtered out by `shared_cache_notes_for`; this
+    // only surfaces when it has been pointed elsewhere.
+    candidates.push((
+        uv_cache_source(paths).path().to_path_buf(),
+        "the uv package cache is shared with other uv projects on this computer and is",
+    ));
+
+    // Same reasoning for the standalone interpreters `uv python install` downloads. Falls
+    // back to the legacy location when the managed one was never created, so uninstall
+    // still tells the truth about a still-existing legacy interpreter.
+    let python_install_dir = uv_python_install_dir_source(paths);
+    let python_install_path =
+        if !python_install_dir.is_override() && !python_install_dir.path().is_dir() {
+            legacy_uv_python_install_dir()
+                .filter(|legacy| legacy.is_dir())
+                .unwrap_or_else(|| python_install_dir.path().to_path_buf())
+        } else {
+            python_install_dir.path().to_path_buf()
+        };
+    candidates.push((
+        python_install_path,
+        "uv-managed Python interpreters are shared with other uv projects on this computer and are",
+    ));
 
     let hf_cache = env_path("HF_HOME")
         .map(|home| home.join("hub"))
@@ -19606,6 +19693,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The uv-managed Python interpreters are now the other large thing rocm-cli causes
+    /// to be downloaded, so uninstall must account for them the same way it does the uv
+    /// cache. Drives the real candidate list rather than a hand-made one, so deleting the
+    /// production code fails this test.
+    #[test]
+    fn shared_cache_candidates_include_the_uv_python_install_dir() {
+        let lock = super::BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("env lock poisoned");
+        let (root, paths) = test_paths("shared-cache-python-ambient");
+        let overridden = std::env::temp_dir().join(format!("rocm-uv-py-{}", std::process::id()));
+        let _scoped =
+            super::ScopedEnvVar::set_path(rocm_core::UV_PYTHON_INSTALL_DIR_ENV, &overridden);
+
+        let candidates = super::shared_cache_candidates(&paths);
+        let entry = candidates
+            .iter()
+            .find(|(path, _)| path == &overridden)
+            .unwrap_or_else(|| {
+                panic!("UV_PYTHON_INSTALL_DIR missing from uninstall candidates: {candidates:?}")
+            });
+        assert!(
+            entry.1.contains("uv-managed Python"),
+            "unexpected description: {}",
+            entry.1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The namespaced override takes precedence over the ambient variable when `uv` is
+    /// actually invoked, so uninstall reporting must resolve through the same
+    /// precedence for both the cache dir and the python install dir, or it reports a
+    /// path `uv` never wrote to.
+    #[test]
+    fn shared_cache_candidates_respect_the_namespaced_override() {
+        let lock = super::BUILTIN_ENGINE_ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("env lock poisoned");
+        let (root, paths) = test_paths("shared-cache-namespaced-override");
+        let overridden_cache =
+            std::env::temp_dir().join(format!("rocm-uv-cache-override-{}", std::process::id()));
+        let overridden_python =
+            std::env::temp_dir().join(format!("rocm-uv-python-override-{}", std::process::id()));
+        let _cache_scoped =
+            super::ScopedEnvVar::set_path(rocm_core::UV_CACHE_DIR_OVERRIDE_ENV, &overridden_cache);
+        let _python_scoped = super::ScopedEnvVar::set_path(
+            rocm_core::UV_PYTHON_INSTALL_DIR_OVERRIDE_ENV,
+            &overridden_python,
+        );
+
+        let candidates = super::shared_cache_candidates(&paths);
+        assert!(
+            candidates.iter().any(|(path, _)| path == &overridden_cache),
+            "ROCM_CLI_UV_CACHE_DIR override missing from uninstall candidates: {candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _)| path == &overridden_python),
+            "ROCM_CLI_UV_PYTHON_INSTALL_DIR override missing from uninstall candidates: {candidates:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A cache that does not exist is not worth mentioning.
     #[test]
     fn shared_cache_notes_ignore_missing_paths() {
@@ -19615,6 +19764,63 @@ mod tests {
             &[(missing, "the uv package cache")],
         );
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    // `resolve_legacy_uv_python_install_dir` is pure and table-tested directly so the
+    // Windows branch is covered even though `runtime_is_windows()` (`cfg!(windows)`)
+    // makes it unreachable through `legacy_uv_python_install_dir()` on Linux CI.
+    #[test]
+    fn legacy_uv_python_install_dir_windows_uses_appdata() {
+        let appdata = std::ffi::OsString::from("/fake/AppData/Roaming");
+        let expected = std::path::PathBuf::from(&appdata)
+            .join("uv")
+            .join("data")
+            .join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(true, Some(appdata), None, None),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_windows_without_appdata_is_none() {
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(
+                true,
+                None,
+                None,
+                Some(std::path::PathBuf::from("/home/jane"))
+            ),
+            None,
+            "a missing APPDATA must not fall back to the Unix layout"
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_unix_prefers_xdg_data_home() {
+        let xdg_data_home = std::ffi::OsString::from("/fake/xdg-data");
+        let expected = std::path::PathBuf::from(&xdg_data_home)
+            .join("uv")
+            .join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(
+                false,
+                None,
+                Some(xdg_data_home),
+                Some(std::path::PathBuf::from("/home/jane"))
+            ),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn legacy_uv_python_install_dir_unix_falls_back_to_home() {
+        let home = std::path::PathBuf::from("/home/jane");
+        let expected = home.join(".local").join("share").join("uv").join("python");
+        assert_eq!(
+            super::resolve_legacy_uv_python_install_dir(false, None, None, Some(home)),
+            Some(expected)
+        );
     }
 
     use super::*;
