@@ -5,14 +5,14 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
-    detect_host_gpu_diagnostics, detect_host_therock_family, detect_legacy_rocm_summary,
-    detect_managed_therock_family, disk_space, ensure_uv_binary, extract_first_gfx_token,
-    interactive_terminal, known_therock_families, managed_tools_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
-    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
-    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
-    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
+    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
+    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
+    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
+    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -25,15 +25,32 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
 const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
+/// ROCm 10's aggregate pip index. Same simple-index shape the canonical
+/// multi-arch stream publishes, on a separate host, with its own package
+/// generation; it is not a mirror of, or a fallback for, the canonical index.
+const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
+/// ROCm 10's tarball catalog. Same scrapeable listing the canonical catalog
+/// uses, but it publishes non-release sibling archives beside the real dist
+/// archive (see [`select_tarball_candidate`]).
+const THEROCK_NEXT_TARBALL_BASE: &str = "https://stable.repo.amd.com/rocm/core/tarball/";
 const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
+/// Recorded in a [`WheelRuntimeComposition`] installed from the ROCm 10 layout,
+/// so a later update reads back the layout that produced the runtime instead of
+/// guessing it from the version.
+const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
+/// The first ROCm major version published only in the next layout. A pin at or
+/// past it is the one request the canonical stream provably cannot serve, and
+/// therefore the only thing that selects [`SourceLayout::Next`].
+const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
@@ -49,17 +66,62 @@ const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
 /// misconfigured proxy or a hostile header rather than a real artifact, and
 /// must not be allowed to refuse an install on its own authority.
 const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+/// Maximum size accepted for index, catalog, and detached-signature responses.
+const THEROCK_MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
     Nightly,
 }
 
+/// Which published hosting layout a resolution reads from.
+///
+/// Orthogonal to [`TheRockChannel`]. `Canonical` is the release/nightly stream
+/// the CLI has always installed and remains the answer for every request that
+/// does not explicitly ask for something else. `Next` is ROCm 10's separately
+/// hosted layout — an extension, never a fallback: nothing degrades into it and
+/// nothing degrades out of it, so a canonical install resolves exactly the URLs,
+/// device target, and package specs it resolved before the layout existed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CanonicalSource {
-    wheel_index: &'static str,
-    tarball_catalog: &'static str,
-    layout_generation: &'static str,
+enum SourceLayout {
+    Canonical,
+    Next,
+}
+
+impl SourceLayout {
+    const fn generation(self) -> &'static str {
+        match self {
+            Self::Canonical => THEROCK_SOURCE_LAYOUT_GENERATION,
+            Self::Next => THEROCK_NEXT_LAYOUT_GENERATION,
+        }
+    }
+
+    /// The layout a recorded [`WheelRuntimeComposition`] was installed from.
+    ///
+    /// Manifests written before compositions existed carry no generation and
+    /// therefore came from the canonical stream. A non-empty generation is an
+    /// explicit provenance contract: reject values this build cannot reproduce
+    /// instead of silently redirecting an update to the canonical source.
+    fn from_generation(generation: Option<&str>) -> Result<Self> {
+        match generation {
+            None | Some(THEROCK_SOURCE_LAYOUT_GENERATION) => Ok(Self::Canonical),
+            Some(THEROCK_NEXT_LAYOUT_GENERATION) => Ok(Self::Next),
+            Some(other) => bail!(
+                "runtime records unsupported TheRock source layout generation `{other}`; update rocm-cli before updating this runtime"
+            ),
+        }
+    }
+}
+
+/// The concrete bases one (channel, layout) pair resolves artifacts from.
+///
+/// Owns its strings because every base is overridable for fixture testing; see
+/// [`env_override_base`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedSource {
+    wheel_index: String,
+    tarball_catalog: String,
+    layout: SourceLayout,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -120,25 +182,140 @@ impl TheRockChannel {
             Self::Nightly => "nightly",
         }
     }
+}
 
-    const fn canonical_source(self) -> CanonicalSource {
-        canonical_source(self)
+/// Whether a `ROCM_CLI_THEROCK_*_BASE` override is honoured at all.
+///
+/// Every artifact base is a trust boundary: a stray override left in a shell
+/// profile would silently redirect a real install to an untrusted host. Reading
+/// them requires a second, deliberate opt-in that no normal install sets, so the
+/// overrides exist for fixture servers and operators who mean it, and are inert
+/// otherwise. See `docs/release-trust.md`.
+fn therock_base_override_allowed() -> bool {
+    std::env::var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The base to use, given the opt-in flag and whatever the per-base variable
+/// says. Pure so the trust rule is stated once and can be checked without
+/// mutating process environment from a test.
+fn select_base_override(allowed: bool, override_value: Option<&str>, default: &str) -> String {
+    if !allowed {
+        return default.to_owned();
+    }
+    override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| default.to_owned(), str::to_owned)
+}
+
+fn env_override_base(env_var: &str, default: &str) -> String {
+    select_base_override(
+        therock_base_override_allowed(),
+        std::env::var(env_var).ok().as_deref(),
+        default,
+    )
+}
+
+/// The bases `channel` publishes under `layout`.
+///
+/// The next layout is hosted per-layout rather than per-channel: it has no
+/// nightly stream, and [`select_source_layout`] refuses to reach it from one, so
+/// there is nothing here to branch on.
+fn resolve_source(channel: TheRockChannel, layout: SourceLayout) -> ResolvedSource {
+    match layout {
+        SourceLayout::Canonical => match channel {
+            TheRockChannel::Release => ResolvedSource {
+                wheel_index: env_override_base(
+                    "ROCM_CLI_THEROCK_RELEASE_PIP_BASE",
+                    THEROCK_RELEASE_PIP_INDEX_BASE,
+                ),
+                tarball_catalog: env_override_base(
+                    "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+                    THEROCK_RELEASE_TARBALL_BASE,
+                ),
+                layout,
+            },
+            TheRockChannel::Nightly => ResolvedSource {
+                wheel_index: env_override_base(
+                    "ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE",
+                    THEROCK_NIGHTLY_PIP_INDEX_BASE,
+                ),
+                tarball_catalog: env_override_base(
+                    "ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE",
+                    THEROCK_NIGHTLY_TARBALL_BASE,
+                ),
+                layout,
+            },
+        },
+        SourceLayout::Next => ResolvedSource {
+            wheel_index: env_override_base(
+                "ROCM_CLI_THEROCK_NEXT_PIP_BASE",
+                THEROCK_NEXT_PIP_INDEX_BASE,
+            ),
+            tarball_catalog: env_override_base(
+                "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
+                THEROCK_NEXT_TARBALL_BASE,
+            ),
+            layout,
+        },
     }
 }
 
-const fn canonical_source(channel: TheRockChannel) -> CanonicalSource {
-    match channel {
-        TheRockChannel::Release => CanonicalSource {
-            wheel_index: THEROCK_RELEASE_PIP_INDEX_BASE,
-            tarball_catalog: THEROCK_RELEASE_TARBALL_BASE,
-            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
-        },
-        TheRockChannel::Nightly => CanonicalSource {
-            wheel_index: THEROCK_NIGHTLY_PIP_INDEX_BASE,
-            tarball_catalog: THEROCK_NIGHTLY_TARBALL_BASE,
-            layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION,
-        },
+/// Whether `selector` names a ROCm release that only the next layout publishes.
+///
+/// An exact *stable* pin is the only signal that qualifies. A build date names
+/// a nightly build, an unparseable string names nothing this CLI can reason
+/// about, and neither is evidence that the canonical stream cannot serve the
+/// request. Nor is a pinned prerelease of a future major: the canonical
+/// nightly stream already serves those (see
+/// `nightly_accepts_future_prerelease_major_without_cli_changes`), so gating
+/// on major alone would route a nightly alpha pin like `10.1.0a20260822` into
+/// a refusal the release-channel retry it suggests could never satisfy.
+fn next_layout_requested(selector: &RuntimeVersionSelector) -> bool {
+    let RuntimeVersionSelector::Version(version) = selector else {
+        return false;
+    };
+    parse_version(version).is_some_and(|parsed| {
+        parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR
+    })
+}
+
+/// The layout an install must read from, and the refusal when it cannot.
+///
+/// Only an explicit pin at ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] selects `Next`,
+/// because that is the one request the canonical stream provably cannot serve.
+/// No selector, a build date, an unparseable pin, or an older pin all stay
+/// canonical, so nothing that resolves today starts resolving somewhere else.
+/// A pin that does reach `Next` still needs an exact arch, because that layout
+/// picks its device payload by exact arch and a grouped family names none.
+fn select_source_layout(
+    channel: TheRockChannel,
+    family_resolution: &FamilyResolution,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Result<SourceLayout> {
+    let Some(selector) = version_selector.filter(|selector| next_layout_requested(selector)) else {
+        return Ok(SourceLayout::Canonical);
+    };
+    let RuntimeVersionSelector::Version(version) = selector else {
+        return Ok(SourceLayout::Canonical);
+    };
+    let major = parse_version(version).map_or(THEROCK_NEXT_MIN_MAJOR, |parsed| parsed.major);
+    if !matches!(channel, TheRockChannel::Release) {
+        bail!(
+            "ROCm {major} and newer is published only on the release channel; re-run `rocm install sdk --channel release --version {version}`"
+        );
     }
+    if family_resolution.raw_arch.is_none() {
+        bail!(
+            "installing ROCm {major} requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
+             ROCm {major} selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --version {version} --family gfx1200`.\n\n{}",
+            family_resolution.family,
+            detect_host_gpu_diagnostics()
+        );
+    }
+    Ok(SourceLayout::Next)
 }
 
 fn render_canonical_provenance(
@@ -246,7 +423,8 @@ enum AggregateDeviceTarget {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ResolvedAggregateWheelSource {
-    index_url: &'static str,
+    index_url: String,
+    layout: SourceLayout,
     device_target: AggregateDeviceTarget,
     published_device_targets: Vec<String>,
 }
@@ -308,6 +486,13 @@ impl AggregateDeviceTarget {
 struct FamilyResolution {
     family: String,
     source: String,
+    /// The exact GFX arch behind `family`, when one is genuinely known —
+    /// `gfx1200`, never the group `gfx120X-all`.
+    ///
+    /// A grouped family names no single arch, and the next layout selects its
+    /// device payload by exact arch, so `None` here is what makes a ROCm 10 pin
+    /// refuse instead of installing a runtime with the wrong kernels.
+    raw_arch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +500,9 @@ struct PipRuntimeResolution {
     family: String,
     family_source: String,
     index_url: String,
+    /// The layout `index_url` belongs to, carried forward so the composition
+    /// this resolution produces records the stream that produced it.
+    layout: SourceLayout,
     latest_version: String,
     /// Newest `rocm` version offered by the repository for this channel,
     /// regardless of whether it has a matching PyTorch wheel stack. When this is
@@ -323,10 +511,10 @@ struct PipRuntimeResolution {
     /// was requested (the "latest" concept does not apply).
     newest_repo_version: Option<String>,
     package_versions: TheRockPipPackageVersions,
-    /// The device payload the canonical source must supply for this host,
+    /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
     device_target: AggregateDeviceTarget,
-    /// Exact device payloads advertised by the canonical aggregate source.
+    /// Exact device payloads advertised by the resolved aggregate source.
     published_device_targets: Vec<String>,
 }
 
@@ -349,6 +537,11 @@ struct WheelCompatibility {
 struct TarballArtifact {
     family: String,
     family_source: String,
+    /// The catalog this archive was listed in, and which layout that catalog
+    /// is, so provenance reports the stream the artifact actually came from
+    /// rather than re-deriving it from the channel.
+    catalog_url: String,
+    layout: SourceLayout,
     file_name: String,
     version: String,
     url: String,
@@ -441,6 +634,9 @@ pub(crate) struct RuntimeUpdatePlan {
     pub target_runtime_key: String,
     /// Exact device payload encoded in the planned wheel composition.
     pub device_target: Option<String>,
+    /// The layout this runtime was installed from, carried into the apply so a
+    /// runtime never silently migrates between streams when it updates.
+    pub source_layout_generation: Option<String>,
     pub repair_required: bool,
     pub update_available: bool,
 }
@@ -487,6 +683,7 @@ struct ResolvedRuntimeUpdate {
     latest_source: String,
     target_runtime_key: String,
     format: String,
+    source_layout_generation: String,
     wheel_composition: Option<WheelRuntimeComposition>,
 }
 
@@ -501,6 +698,15 @@ pub(crate) struct InstalledRuntimeManifest {
     pub version: String,
     pub install_root: PathBuf,
     pub selected_artifact_url: String,
+    /// Which published layout this runtime's artifact came from.
+    ///
+    /// Provenance, not identity: an update reads it so a runtime resolves the
+    /// stream it was installed from instead of whichever stream the channel
+    /// happens to default to. Absent on every manifest written before the
+    /// layout existed, which reads back as the canonical stream those runtimes
+    /// came from.
+    #[serde(default)]
+    pub source_layout_generation: Option<String>,
     #[serde(default)]
     pub index_url: Option<String>,
     #[serde(default)]
@@ -745,6 +951,13 @@ impl SdkInstallResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct InstallSourceOverride<'a> {
+    family: Option<&'a str>,
+    device_target: Option<&'a str>,
+    layout: Option<SourceLayout>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk(
     paths: &AppPaths,
@@ -768,23 +981,43 @@ pub(crate) fn install_sdk(
             paths,
             channel,
             prefix,
-            family_override,
-            None,
+            InstallSourceOverride {
+                family: family_override,
+                ..InstallSourceOverride::default()
+            },
             version_selector.as_ref(),
             dry_run,
             consent,
         ),
         "tarball" => {
-            if version_selector.is_some() {
-                bail!("specific TheRock version selection is only supported for wheel installs")
+            // A tarball catalog lists whole archives, not a resolvable package
+            // graph, so there is nothing to pin a version against — except the
+            // ROCm 10 catalog, which is reachable *only* by naming a version,
+            // because nothing else distinguishes it from the canonical one.
+            if let Some(selector) = version_selector.as_ref()
+                && !next_layout_requested(selector)
+            {
+                bail!(
+                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                )
             }
-            install_tarball_runtime(paths, channel, prefix, family_override, dry_run, consent)
+            install_tarball_runtime(
+                paths,
+                channel,
+                prefix,
+                family_override,
+                version_selector.as_ref(),
+                None,
+                dry_run,
+                consent,
+            )
         }
         other => bail!("unsupported install format: {other}"),
     }
 }
 
-/// Apply an update using the exact family and device payload resolved by its plan.
+/// Apply an update using the exact family, device payload, and source layout
+/// resolved by its plan.
 ///
 /// Consent is preapproved rather than asked for: the update targets the runtime
 /// the user selected (or the active default), so installing over it is the
@@ -802,6 +1035,7 @@ pub(crate) fn install_sdk_for_update(
     format: &str,
     family: &str,
     device_target: Option<&str>,
+    source_layout_generation: Option<&str>,
     dry_run: bool,
     activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
@@ -810,18 +1044,31 @@ pub(crate) fn install_sdk_for_update(
     let consent = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::UpdateApply {
         activates: activate_after_install,
     });
+    let layout = Some(SourceLayout::from_generation(source_layout_generation)?);
     match format {
         "wheel" => install_wheel_runtime(
             paths,
             channel,
             None,
-            Some(family),
-            device_target,
+            InstallSourceOverride {
+                family: Some(family),
+                device_target,
+                layout,
+            },
             None,
             dry_run,
             consent,
         ),
-        "tarball" => install_tarball_runtime(paths, channel, None, Some(family), dry_run, consent),
+        "tarball" => install_tarball_runtime(
+            paths,
+            channel,
+            None,
+            Some(family),
+            None,
+            layout,
+            dry_run,
+            consent,
+        ),
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -1032,9 +1279,53 @@ pub(crate) fn runtime_update_plan(
         status: freshness.status().to_owned(),
         target_runtime_key: latest.target_runtime_key,
         device_target,
+        source_layout_generation: Some(latest.source_layout_generation),
         repair_required: freshness == RuntimeFreshness::RepairAvailable,
         update_available: freshness.update_available(),
     })
+}
+
+/// The layout a manifest's artifact came from.
+///
+/// Manifests written before the field existed fall back to the generation their
+/// wheel composition recorded, and manifests older than compositions fall back
+/// to the canonical stream, which is where they came from. No URL is inspected:
+/// a base can be overridden or rehosted, and the recorded generation is the only
+/// statement about the stream that survives that.
+fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceLayout> {
+    SourceLayout::from_generation(manifest.source_layout_generation.as_deref().or_else(|| {
+        manifest
+            .wheel_composition
+            .as_ref()
+            .map(|composition| composition.source_layout_generation.as_str())
+    }))
+}
+
+/// The family override to actually resolve a next-layout wheel request with,
+/// given a (possibly grouped) family and an exact arch recorded or requested
+/// alongside it.
+///
+/// A grouped family (e.g. `gfx125X-dcgpu`) carries no exact arch, so passing
+/// it straight through would leave the next layout's device target
+/// undetermined and the whole resolve would bail — on the very host the
+/// runtime is already installed on. `candidate_arch` is the exact arch a more
+/// authoritative source already recorded for this same family; when it
+/// agrees, pass it as the override itself, which `resolve_family` also
+/// normalizes back to this same family. Used by both halves of updating a
+/// next-layout manifest: `resolve_latest_for_manifest` (planning) and
+/// `install_wheel_runtime` via `device_target_override` (applying) — a fix to
+/// one without the other leaves the update path half-working.
+fn family_override_or_recovered_arch(family: &str, candidate_arch: Option<&str>) -> String {
+    raw_arch_agreeing_with_family(candidate_arch.map(str::to_owned), family)
+        .unwrap_or_else(|| family.to_owned())
+}
+
+/// The family override to re-resolve a wheel manifest's update *plan* with.
+/// See [`family_override_or_recovered_arch`] — the composition recorded at
+/// install time is this call's source for the exact arch.
+fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String {
+    let recorded_arch = wheel_composition_device_target(manifest.wheel_composition.as_ref());
+    family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
 fn resolve_latest_for_manifest(
@@ -1043,6 +1334,7 @@ fn resolve_latest_for_manifest(
     download_timeout_secs: Option<u64>,
 ) -> Result<ResolvedRuntimeUpdate> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
+    let layout = manifest_source_layout(manifest)?;
     match manifest.format.as_str() {
         "wheel" => {
             let manifest_python = manifest
@@ -1060,12 +1352,14 @@ fn resolve_latest_for_manifest(
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
+            let family_override = manifest_wheel_family_override(manifest);
             let resolution = resolve_pip_runtime_with_timeout(
                 paths,
                 channel,
-                Some(manifest.family.as_str()),
+                Some(family_override.as_str()),
                 &wheel_compatibility,
                 None,
+                Some(layout),
                 download_timeout_secs,
             )?;
             // Prefer the device payload this runtime was actually built with over
@@ -1101,6 +1395,7 @@ fn resolve_latest_for_manifest(
                 latest_source: resolution.index_url,
                 target_runtime_key,
                 format: "wheel".to_owned(),
+                source_layout_generation: resolution.layout.generation().to_owned(),
                 wheel_composition,
             })
         }
@@ -1109,6 +1404,8 @@ fn resolve_latest_for_manifest(
                 paths,
                 channel,
                 Some(manifest.family.as_str()),
+                None,
+                Some(layout),
                 download_timeout_secs,
             )?;
             let target_runtime_key = runtime_key(
@@ -1122,6 +1419,7 @@ fn resolve_latest_for_manifest(
                 latest_source: artifact.url,
                 target_runtime_key,
                 format: "tarball".to_owned(),
+                source_layout_generation: artifact.layout.generation().to_owned(),
                 wheel_composition: None,
             })
         }
@@ -1265,12 +1563,16 @@ fn install_wheel_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
-    family_override: Option<&str>,
-    device_target_override: Option<&str>,
+    source_override: InstallSourceOverride<'_>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
     consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
+    let InstallSourceOverride {
+        family: family_override,
+        device_target: device_target_override,
+        layout: layout_override,
+    } = source_override;
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
         managed_python_version()
@@ -1299,12 +1601,19 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
+    // for the next layout, which needs an exact arch before it can query
+    // package metadata at all. Recover it into the family override up front.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
-        family_override,
+        recovered_family_override.as_deref(),
         &wheel_compatibility,
         version_selector,
+        layout_override,
     )?;
     let device_target = device_target_override.map_or_else(
         || resolution.device_target.clone(),
@@ -1336,12 +1645,11 @@ fn install_wheel_runtime(
         output,
         "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
     );
-    let source = channel.canonical_source();
     render_canonical_provenance(
         &mut output,
         channel,
-        source.wheel_index,
-        source.layout_generation,
+        &resolution.index_url,
+        resolution.layout.generation(),
         &resolution.latest_version,
     );
     let _ = writeln!(output, "  format: wheel");
@@ -1404,7 +1712,7 @@ fn install_wheel_runtime(
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned target-complete rocm, torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
     let no_wheel_warning = repo_version_without_wheels(
         resolution.newest_repo_version.as_deref(),
@@ -1581,6 +1889,7 @@ fn install_wheel_runtime(
         version: installed_version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: resolution.index_url.clone(),
+        source_layout_generation: Some(resolution.layout.generation().to_owned()),
         index_url: Some(resolution.index_url.clone()),
         tarball_file_name: None,
         python_launcher: Some(python_launcher.executable.display().to_string()),
@@ -1651,7 +1960,7 @@ fn wheel_runtime_composition(
     device_target: &AggregateDeviceTarget,
 ) -> WheelRuntimeComposition {
     WheelRuntimeComposition {
-        source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
+        source_layout_generation: resolution.layout.generation().to_owned(),
         package_specs: therock_pip_package_specs(
             &resolution.package_versions,
             device_target.as_str(),
@@ -1981,15 +2290,24 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     Ok(matches!(normalized.as_str(), "y" | "yes"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_tarball_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     dry_run: bool,
     consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
-    let artifact = resolve_tarball_artifact(paths, channel, family_override)?;
+    let artifact = resolve_tarball_artifact(
+        paths,
+        channel,
+        family_override,
+        version_selector,
+        layout_override,
+    )?;
     let runtime_key = runtime_key(
         channel,
         "tarball",
@@ -2002,12 +2320,11 @@ fn install_tarball_runtime(
 
     let mut output = String::new();
     let _ = writeln!(output, "sdk install");
-    let source = channel.canonical_source();
     render_canonical_provenance(
         &mut output,
         channel,
-        source.tarball_catalog,
-        source.layout_generation,
+        &artifact.catalog_url,
+        artifact.layout.generation(),
         &artifact.version,
     );
     let _ = writeln!(output, "  format: tarball");
@@ -2118,6 +2435,7 @@ fn install_tarball_runtime(
         version: artifact.version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: artifact.url.clone(),
+        source_layout_generation: Some(artifact.layout.generation().to_owned()),
         index_url: None,
         tarball_file_name: Some(artifact.file_name.clone()),
         python_launcher: None,
@@ -2143,6 +2461,7 @@ fn resolve_pip_runtime(
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
 ) -> Result<PipRuntimeResolution> {
     resolve_pip_runtime_with_timeout(
         paths,
@@ -2150,28 +2469,38 @@ fn resolve_pip_runtime(
         family_override,
         wheel_compatibility,
         version_selector,
+        layout_override,
         None,
     )
 }
 
+/// `layout_override` is how an update keeps a runtime on the stream it was
+/// installed from; a fresh install passes `None` and lets the request decide.
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let source = channel.canonical_source();
+    let layout = match layout_override {
+        Some(layout) => layout,
+        None => select_source_layout(channel, &family_resolution, version_selector)?,
+    };
+    let source = resolve_source(channel, layout);
     let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
-    let root_html = download_text_cached(
-        paths,
-        &format!("canonical-wheel-root-{}", channel.as_str()),
-        &root_url,
-        download_timeout_secs,
-    )?
-    .text;
+    // Distinct cache keys per layout: the two streams answer the same request
+    // with different package sets, so one must never serve the other's listing.
+    let root_cache_key = match layout {
+        SourceLayout::Canonical => format!("canonical-wheel-root-{}", channel.as_str()),
+        SourceLayout::Next => format!("next-wheel-root-{}", channel.as_str()),
+    };
+    let root_html =
+        download_text_cached(paths, &root_cache_key, &root_url, download_timeout_secs)?.text;
     validate_aggregate_index_layout(&root_html).with_context(|| {
         format!(
             "failed to resolve TheRock {} wheel runtime from canonical source {}",
@@ -2180,10 +2509,20 @@ fn resolve_pip_runtime_with_timeout(
         )
     })?;
     let published_device_targets = parse_aggregate_device_targets(&root_html);
+    // The canonical stream validates against what this host reports, exactly as
+    // before. The next layout is reachable only through an explicit pin that
+    // already carried a validated exact arch, and that arch — not a second probe
+    // of whatever card happens to be plugged in — is what the pin asked to
+    // install for.
+    let detected_target = match layout {
+        SourceLayout::Canonical => detect_host_gfx_target(),
+        SourceLayout::Next => family_resolution.raw_arch.clone(),
+    };
     let source = ResolvedAggregateWheelSource {
         index_url: source.wheel_index,
+        layout,
         device_target: AggregateDeviceTarget::resolve(
-            detect_host_gfx_target().as_deref(),
+            detected_target.as_deref(),
             &family_resolution.family,
             &published_device_targets,
         ),
@@ -2217,7 +2556,7 @@ fn resolve_pip_runtime_from_index(
     version_selector: Option<&RuntimeVersionSelector>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
-    let index_url = source.index_url;
+    let index_url = source.index_url.as_str();
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -2230,41 +2569,78 @@ fn resolve_pip_runtime_from_index(
             "release channel only installs stable TheRock wheel versions, but no stable `rocm` package versions were found in {index_url}; try `rocm install sdk --channel release --format tarball` for stable release artifacts, or use `--channel nightly --format wheel` for preview builds"
         );
     }
-    let torch_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torch",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchvision_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchvision",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchaudio_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchaudio",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let package_versions = select_matching_pip_package_versions(
-        channel,
-        &rocm_versions,
-        &torch_versions,
-        &torchvision_versions,
-        &torchaudio_versions,
-        version_selector,
-    )
-    .with_context(|| {
-        let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
-        format!(
-            "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+    let package_versions = if matches!(source.layout, SourceLayout::Next) {
+        let device_target = match &source.device_target {
+            AggregateDeviceTarget::Exact(target) => target.as_str(),
+            AggregateDeviceTarget::Undetermined(reason) => {
+                bail!(
+                    "cannot resolve ROCm X package metadata without an exact device target: {reason}"
+                )
+            }
+        };
+        let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
+            .with_context(|| {
+                let requested = version_selector.map_or_else(
+                    || "latest compatible version".to_owned(),
+                    RuntimeVersionSelector::describe,
+                );
+                format!("no TheRock rocm package was found for {requested} in {index_url}")
+            })?;
+        // The canonical branch below budgets one `download_timeout_secs` per
+        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
+        // fetches). `uv pip compile` resolves that same four-package metadata
+        // set in one subprocess call, so it needs a comparable aggregate
+        // budget, not the single-fetch one — reusing the bare per-fetch value
+        // here would make a startup check that budgets 2s per fetch reliably
+        // time out a call doing 4 fetches' worth of work.
+        resolve_published_pip_package_versions(
+            paths,
+            index_url,
+            &rocm_version,
+            device_target,
+            wheel_compatibility,
+            download_timeout_secs.map(|secs| secs.saturating_mul(4)),
+        )?
+    } else {
+        let torch_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torch",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchvision_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchvision",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        select_matching_pip_package_versions(
+            channel,
+            &rocm_versions,
+            &torch_versions,
+            &torchvision_versions,
+            &torchaudio_versions,
+            version_selector,
         )
-    })?;
+        .with_context(|| {
+            let requested = version_selector.map_or_else(
+                || "latest compatible version".to_owned(),
+                RuntimeVersionSelector::describe,
+            );
+            format!(
+                "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            )
+        })?
+    };
     let latest_version = package_versions.rocm.clone();
     // The repo's newest version for this channel, ignoring wheel availability.
     // Only meaningful when we auto-selected "latest" (no explicit request), so a
@@ -2280,6 +2656,7 @@ fn resolve_pip_runtime_from_index(
         family: family_resolution.family.clone(),
         family_source: family_resolution.source.clone(),
         index_url: index_url.to_owned(),
+        layout: source.layout,
         latest_version,
         newest_repo_version,
         package_versions,
@@ -2292,22 +2669,41 @@ fn resolve_tarball_artifact(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
 ) -> Result<TarballArtifact> {
-    resolve_tarball_artifact_with_timeout(paths, channel, family_override, None)
+    resolve_tarball_artifact_with_timeout(
+        paths,
+        channel,
+        family_override,
+        version_selector,
+        layout_override,
+        None,
+    )
 }
 
 fn resolve_tarball_artifact_with_timeout(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let source = channel.canonical_source();
+    let layout = match layout_override {
+        Some(layout) => layout,
+        None => select_source_layout(channel, &family_resolution, version_selector)?,
+    };
+    let source = resolve_source(channel, layout);
+    let catalog_cache_key = match layout {
+        SourceLayout::Canonical => format!("tarball-index-{}", channel.as_str()),
+        SourceLayout::Next => format!("next-tarball-index-{}", channel.as_str()),
+    };
     let html = download_text_cached(
         paths,
-        &format!("tarball-index-{}", channel.as_str()),
-        source.tarball_catalog,
+        &catalog_cache_key,
+        &source.tarball_catalog,
         download_timeout_secs,
     )?
     .text;
@@ -2317,19 +2713,25 @@ fn resolve_tarball_artifact_with_timeout(
             source.tarball_catalog
         )
     })?;
-    let (file, version) = select_tarball_candidate(&files, channel, &family_resolution.family)
-        .with_context(|| {
-            format!(
-                "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
-                channel.as_str(),
-                family_resolution_hint(
-                    &family_resolution.source,
-                    &family_resolution.family,
-                    channel,
-                    "tarball",
-                )
+    let (file, version) = select_tarball_candidate(
+        &files,
+        channel,
+        layout,
+        &family_resolution.family,
+        version_selector,
+    )
+    .with_context(|| {
+        format!(
+            "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
+            channel.as_str(),
+            family_resolution_hint(
+                &family_resolution.source,
+                &family_resolution.family,
+                channel,
+                "tarball",
             )
-        })?;
+        )
+    })?;
     Ok(TarballArtifact {
         family: family_resolution.family,
         family_source: family_resolution.source,
@@ -2338,17 +2740,48 @@ fn resolve_tarball_artifact_with_timeout(
             source.tarball_catalog.trim_end_matches('/'),
             file.name
         ),
+        catalog_url: source.tarball_catalog,
+        layout,
         file_name: file.name,
         version,
     })
 }
 
+/// The filename token a catalog spells `family` with.
+///
+/// ROCm 10's catalog renamed exactly one family's archive token; every other
+/// family keeps its canonical spelling. Confined here rather than pushed into
+/// [`normalize_therock_family`] so a filename quirk cannot leak into the family
+/// a manifest records or the extras a wheel install requests.
+fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
+    if matches!(layout, SourceLayout::Next) && family == "gfx103X-dgpu" {
+        "gfx103X-all"
+    } else {
+        family
+    }
+}
+
+/// The newest archive in `files` that this request can actually install.
+///
+/// The release channel's stable-version filter does double duty on the next
+/// catalog: that catalog publishes non-release siblings beside the real dist
+/// archive (`...-tests-10.0.0.tar.gz`) whose leftover suffix is not a version at
+/// all, and whose mtime is *later* than the archive they shadow, so an unfiltered
+/// "newest wins" would pick the wrong file. Requiring a parseable stable version
+/// excludes them without inventing a second grammar for the canonical catalogs,
+/// which publish no such siblings and have never been held to one.
 fn select_tarball_candidate(
     files: &[TarballIndexFile],
     channel: TheRockChannel,
+    layout: SourceLayout,
     family: &str,
+    version_selector: Option<&RuntimeVersionSelector>,
 ) -> Option<(TarballIndexFile, String)> {
-    let prefix = format!("therock-dist-{}-{family}-", platform_tarball_token());
+    let prefix = format!(
+        "therock-dist-{}-{}-",
+        platform_tarball_token(),
+        tarball_family_token(layout, family)
+    );
     let mut candidates = files
         .iter()
         .filter_map(|file| {
@@ -2358,6 +2791,9 @@ fn select_tarball_candidate(
                 .strip_suffix(".tar.gz")?
                 .to_owned();
             if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            if version_selector.is_some_and(|selector| !selector.matches_version(&version)) {
                 return None;
             }
             Some((file.clone(), version))
@@ -2373,6 +2809,43 @@ fn select_tarball_candidate(
     candidates.pop()
 }
 
+/// Whether `value` is an exact GFX arch code (`gfx1200`, `gfx90a`) rather than
+/// a grouped family label (`gfx120X-all`) or prose with a gfx token in it.
+///
+/// Deliberately stricter than [`extract_first_gfx_token`], which digs a target
+/// out of noisy KFD output: a `--family` value is only evidence of an exact arch
+/// when the user typed exactly one, and `gfx120X-all` normalizing to a family
+/// must not be mistaken for naming a member of it.
+fn is_raw_gfx_arch_code(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("gfx") else {
+        return false;
+    };
+    let Some(last) = rest.len().checked_sub(1) else {
+        return false;
+    };
+    rest.bytes()
+        .enumerate()
+        .all(|(index, byte)| byte.is_ascii_digit() || (index == last && byte.is_ascii_lowercase()))
+}
+
+fn family_override_raw_arch(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    is_raw_gfx_arch_code(trimmed).then(|| trimmed.to_ascii_lowercase())
+}
+
+/// A host-probed arch, kept only when it belongs to the family some more
+/// authoritative source already resolved.
+///
+/// A managed runtime's manifest records the family but never the arch, so the
+/// arch can only be recovered by probing this host. That probe is trustworthy
+/// exactly when it agrees: a second card, or a machine the runtime was moved to,
+/// reports an arch from a different family, and installing its device payload
+/// would produce a runtime that cannot run the family's kernels.
+fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Option<String> {
+    raw_arch.filter(|raw| normalize_therock_family(raw).as_deref() == Some(family))
+}
+
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
     if let Some(value) = family_override
         && let Some(family) = normalize_therock_family(value)
@@ -2380,6 +2853,7 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "manifest".to_owned(),
+            raw_arch: family_override_raw_arch(value),
         });
     }
 
@@ -2389,20 +2863,26 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "env".to_owned(),
+            raw_arch: family_override_raw_arch(&value),
         });
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
+        let raw_arch = raw_arch_agreeing_with_family(detect_host_gfx_target(), &family);
         return Ok(FamilyResolution {
             family,
             source: "managed-runtime".to_owned(),
+            raw_arch,
         });
     }
 
-    if let Some(family) = detect_host_therock_family() {
+    if let Some(raw_arch) = detect_host_gfx_target()
+        && let Some(family) = normalize_therock_family(&raw_arch)
+    {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
+            raw_arch: Some(raw_arch),
         });
     }
 
@@ -2413,6 +2893,219 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
     )
+}
+
+fn select_rocm_version(
+    channel: TheRockChannel,
+    rocm_versions: &[String],
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Option<String> {
+    let mut candidates = if version_selector.is_some() {
+        rocm_versions.to_vec()
+    } else {
+        channel_rocm_candidates(rocm_versions, channel)
+    };
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates.sort_by(|left, right| compare_version_strings(left, right));
+    candidates.pop()
+}
+
+fn uv_python_version(compatibility: &WheelCompatibility) -> Result<String> {
+    let digits = compatibility
+        .python_tag
+        .strip_prefix("cp")
+        .context("managed Python reported an unsupported wheel tag")?;
+    if digits.len() < 2 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!(
+            "managed Python reported unsupported wheel tag `{}`",
+            compatibility.python_tag
+        );
+    }
+    Ok(format!("{}.{}", &digits[..1], &digits[1..]))
+}
+
+fn uv_python_platform(compatibility: &WheelCompatibility) -> Result<&'static str> {
+    if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "win_amd64")
+    {
+        Ok("x86_64-pc-windows-msvc")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_x86_64")
+    {
+        Ok("x86_64-unknown-linux-gnu")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_aarch64")
+    {
+        Ok("aarch64-unknown-linux-gnu")
+    } else {
+        bail!(
+            "managed Python reported unsupported platform wheel tags: {}",
+            compatibility.platform_tags.join(",")
+        )
+    }
+}
+
+fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageVersions> {
+    let mut versions = std::collections::HashMap::new();
+    for line in output.lines().map(str::trim) {
+        let Some((name, version)) = line.split_once("==") else {
+            continue;
+        };
+        versions.insert(name.to_ascii_lowercase(), version.to_owned());
+    }
+    let required = |name: &str| {
+        versions
+            .get(name)
+            .cloned()
+            .with_context(|| format!("uv metadata resolution did not pin `{name}`"))
+    };
+    let rocm = required("rocm")?;
+    let torch = required("torch")?;
+    let torchvision = required("torchvision")?;
+    let torchaudio = required("torchaudio")?;
+    for (name, version) in [
+        ("torch", torch.as_str()),
+        ("torchvision", torchvision.as_str()),
+        ("torchaudio", torchaudio.as_str()),
+    ] {
+        if package_rocm_suffix(version).as_deref() != Some(rocm.as_str()) {
+            bail!(
+                "published package metadata selected {name} {version}, which does not share ROCm build {rocm}"
+            );
+        }
+    }
+    Ok(TheRockPipPackageVersions {
+        compatibility_key: rocm.clone(),
+        rocm,
+        torch,
+        torchvision,
+        torchaudio,
+    })
+}
+
+/// Waits for `child` to exit, killing it and failing once `timeout` elapses.
+///
+/// `None` waits unbounded, matching an explicit user-invoked install with no
+/// budget to respect. Reads stdout/stderr on background threads throughout the
+/// wait so a slow or silent child can't deadlock the poll on a full pipe.
+fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Result<Output> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait_with_output()
+            .context("failed to wait for child process");
+    };
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll child process status")?
+        {
+            let stdout = stdout_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = stderr_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "timed out after {}s waiting for child process",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn resolve_published_pip_package_versions(
+    paths: &AppPaths,
+    index_url: &str,
+    rocm_version: &str,
+    device_target: &str,
+    compatibility: &WheelCompatibility,
+    download_timeout_secs: Option<u64>,
+) -> Result<TheRockPipPackageVersions> {
+    let uv =
+        ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
+    let python_version = uv_python_version(compatibility)?;
+    let python_platform = uv_python_platform(compatibility)?;
+    let device_extra = format!("device-{device_target}");
+    let requirements = format!(
+        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
+    );
+    let mut child = Command::new(&uv)
+        .args([
+            "pip",
+            "compile",
+            "-",
+            "--index-url",
+            index_url,
+            "--python-version",
+            &python_version,
+            "--python-platform",
+            python_platform,
+            "--no-header",
+            "--no-annotate",
+        ])
+        .envs(uv_command_env(paths))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch {} for ROCm X metadata resolution",
+                uv.display()
+            )
+        })?;
+    // ponytail: written before `wait_with_output_bounded` spawns its stdout/
+    // stderr reader threads, so a child that fills its stdout pipe before this
+    // write returns would deadlock outside the timeout below. `requirements`
+    // is a handful of short lines today; move the write onto its own thread
+    // (or start the readers first) if it ever grows enough to matter.
+    child
+        .stdin
+        .take()
+        .context("uv metadata resolver stdin was unavailable")?
+        .write_all(requirements.as_bytes())
+        .context("failed to send ROCm X requirements to uv")?;
+    let timeout = download_timeout_secs.map(Duration::from_secs);
+    let output = wait_with_output_bounded(child, timeout)
+        .context("failed to wait for ROCm X metadata resolution")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!("published ROCm X package metadata is not jointly installable: {detail}");
+    }
+    parse_uv_compiled_package_versions(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn select_matching_pip_package_versions(
@@ -3230,11 +3923,12 @@ fn download_file(
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    rocm_core::download_file_streaming_with_progress(
-        &rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT),
-        on_progress,
-    )
-    .with_context(|| format!("failed to fetch {url}"))?;
+    let request = rocm_core::DownloadRequest {
+        max_bytes: Some(THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES),
+        ..rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT)
+    };
+    rocm_core::download_file_streaming_with_progress(&request, on_progress)
+        .with_context(|| format!("failed to fetch {url}"))?;
     Ok(())
 }
 
@@ -3341,11 +4035,18 @@ fn http_get(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut reader = response.into_reader();
+    let mut reader = response
+        .into_reader()
+        .take(THEROCK_MAX_METADATA_BYTES.saturating_add(1));
     let mut body = Vec::new();
     reader
         .read_to_end(&mut body)
         .with_context(|| format!("failed to read HTTP response body for {url}"))?;
+    if body.len() as u64 > THEROCK_MAX_METADATA_BYTES {
+        bail!(
+            "HTTP response body for {url} exceeded the approved metadata limit of {THEROCK_MAX_METADATA_BYTES} bytes"
+        );
+    }
     Ok(HttpResponseBody {
         status,
         headers,
@@ -4722,7 +5423,55 @@ fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
         .find("];")
         .context("tarball index did not contain the end of the embedded file list")?;
     let json = format!("{}]", &rest[..end]);
-    serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")
+    let files: Vec<TarballIndexFile> =
+        serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")?;
+    for file in &files {
+        validate_tarball_file_name(&file.name)?;
+    }
+    Ok(files)
+}
+
+fn validate_tarball_file_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .trim_end_matches([' ', '.']);
+    let windows_reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if name.contains(['/', '\\', ':'])
+        || name.ends_with([' ', '.'])
+        || windows_reserved
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || name.chars().any(char::is_control)
+    {
+        bail!("tarball catalog contains unsafe file name `{name}`");
+    }
+    Ok(())
 }
 
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
@@ -5091,6 +5840,405 @@ mod tests {
     // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
     // can fail with ENOENT while another test has temporarily narrowed `PATH`.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
+        FamilyResolution {
+            family: family.to_owned(),
+            source: "manifest".to_owned(),
+            raw_arch: raw_arch.map(str::to_owned),
+        }
+    }
+
+    /// Everything a user can ask for today must keep resolving the canonical
+    /// stream. The next layout is an extension, so no existing request may start
+    /// answering from somewhere else.
+    #[test]
+    fn only_a_rocm_10_pin_leaves_the_canonical_layout() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let build_date = RuntimeVersionSelector::build_date("2026-06-05").unwrap();
+        let older_pin = RuntimeVersionSelector::version("7.14.0").unwrap();
+        let unparseable = RuntimeVersionSelector::version("main").unwrap();
+
+        for selector in [
+            None,
+            Some(&build_date),
+            Some(&older_pin),
+            Some(&unparseable),
+        ] {
+            assert_eq!(
+                select_source_layout(TheRockChannel::Release, &exact, selector).unwrap(),
+                SourceLayout::Canonical,
+                "selector {selector:?} must stay canonical"
+            );
+        }
+
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&pin)).unwrap(),
+            SourceLayout::Next
+        );
+    }
+
+    /// A grouped family names no single arch, and the next layout has no
+    /// grouped device payload to fall back to, so the refusal has to name the
+    /// flag and a value that would work.
+    #[test]
+    fn rocm_10_pin_without_an_exact_arch_refuses_actionably() {
+        let grouped = family_for_test("gfx120X-all", None);
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        let error = select_source_layout(TheRockChannel::Release, &grouped, Some(&pin))
+            .expect_err("a grouped family cannot select a device payload")
+            .to_string();
+
+        assert!(error.contains("requires an exact GPU arch"), "{error}");
+        assert!(error.contains("--family gfx1200"), "{error}");
+    }
+
+    #[test]
+    fn rocm_10_pin_on_nightly_refuses_instead_of_resolving() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        let error = select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin))
+            .expect_err("the next layout has no nightly stream")
+            .to_string();
+
+        assert!(error.contains("--channel release"), "{error}");
+    }
+
+    /// A pinned nightly prerelease of a future major (e.g. a ROCm 10 alpha
+    /// build) is not evidence the canonical stream can't serve it — only a
+    /// *stable* pin is. Gating on major alone would refuse this pin and then
+    /// suggest a release-channel retry that the stable-version filter would
+    /// also reject, leaving no working path.
+    #[test]
+    fn nightly_prerelease_pin_of_a_future_major_stays_canonical() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let pin = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin)).unwrap(),
+            SourceLayout::Canonical
+        );
+    }
+
+    #[test]
+    fn next_layout_resolves_its_own_bases() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
+
+        assert_eq!(
+            next.wheel_index,
+            "https://stable.repo.amd.com/rocm/whl-next"
+        );
+        assert_eq!(
+            next.tarball_catalog,
+            "https://stable.repo.amd.com/rocm/core/tarball/"
+        );
+        assert_eq!(next.layout.generation(), "next-v1");
+    }
+
+    /// A base override is a redirect to an arbitrary host, so naming the
+    /// variable must not be enough on its own.
+    #[test]
+    fn base_overrides_are_inert_without_the_explicit_opt_in() {
+        let default = THEROCK_NEXT_PIP_INDEX_BASE;
+        let fixture = "http://127.0.0.1:9/whl";
+
+        // Naming the variable is not enough; without the opt-in it is ignored.
+        assert_eq!(select_base_override(false, Some(fixture), default), default);
+        assert_eq!(
+            select_base_override(true, Some(fixture), default),
+            fixture,
+            "an opted-in override must be honoured"
+        );
+        // A variable that is present but blank is not a redirect.
+        assert_eq!(select_base_override(true, Some("   "), default), default);
+        assert_eq!(select_base_override(true, None, default), default);
+    }
+
+    /// The test above only proves the pure decision rule; it never reads
+    /// process environment, so it can't catch `env_override_base` or
+    /// `resolve_source` failing to wire that rule to the real variables. The
+    /// only thing that does today is `therock-next-06`, an e2e scenario gated
+    /// `@nightly` because it has to reach the live default index — so on the
+    /// blocking lane this trust boundary otherwise has zero coverage of the
+    /// actual env-reading path. Exercise it here instead, with no network.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn env_override_is_ignored_end_to_end_without_the_opt_in() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_override = std::env::var_os("ROCM_CLI_THEROCK_NEXT_PIP_BASE");
+        let old_allow = std::env::var_os("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", "http://127.0.0.1:9/whl");
+            std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        }
+
+        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
+
+        unsafe {
+            match old_override {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE"),
+            }
+            match old_allow {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE"),
+            }
+        }
+
+        assert_eq!(
+            next.wheel_index, THEROCK_NEXT_PIP_INDEX_BASE,
+            "an override named without the trust opt-in must not redirect resolution"
+        );
+    }
+
+    #[test]
+    fn tarball_catalog_rejects_unsafe_file_names_at_the_parser_boundary() {
+        for name in [
+            "../escape.tar.gz",
+            "folder/escape.tar.gz",
+            r"folder\escape.tar.gz",
+            "/absolute.tar.gz",
+            "control\nname.tar.gz",
+            "archive.tar.gz:payload",
+            "CON.tar.gz",
+            "archive.tar.gz.",
+            "archive.tar.gz ",
+        ] {
+            let html =
+                format!(r#"<script>const files = [{{"name":"{name}","mtime":1.0}}];</script>"#);
+            assert!(
+                parse_tarball_index_html(&html).is_err(),
+                "unsafe catalog name was accepted: {name:?}"
+            );
+        }
+        let html = r#"<script>const files = [{"name":"therock-dist-linux-gfx120X-all-10.0.0.tar.gz","mtime":1.0}];</script>"#;
+        assert_eq!(
+            parse_tarball_index_html(html)
+                .expect("safe catalog name must parse")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn family_override_raw_arch_accepts_only_exact_arch_codes() {
+        assert_eq!(
+            family_override_raw_arch("gfx1200"),
+            Some("gfx1200".to_owned())
+        );
+        assert_eq!(
+            family_override_raw_arch(" gfx90a "),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            family_override_raw_arch("GFX1250"),
+            Some("gfx1250".to_owned())
+        );
+        assert_eq!(family_override_raw_arch("gfx120X-all"), None);
+        assert_eq!(family_override_raw_arch("gfx103X-dgpu"), None);
+        assert_eq!(
+            family_override_raw_arch("gpu target gfx1030 detected"),
+            None
+        );
+        assert_eq!(family_override_raw_arch("gfx"), None);
+        assert_eq!(family_override_raw_arch(""), None);
+    }
+
+    /// A managed runtime records only its family, so the arch has to come from
+    /// a host probe — and is worth nothing when the host is a different card.
+    #[test]
+    fn managed_family_keeps_only_a_host_arch_from_the_same_family() {
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx1030".to_owned()), "gfx103X-dgpu"),
+            Some("gfx1030".to_owned())
+        );
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx90a".to_owned()), "gfx103X-dgpu"),
+            None
+        );
+        assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
+    }
+
+    /// Updating a next-layout manifest whose family is a group label (as
+    /// `gfx125X-dcgpu` always is) must recover the exact arch this runtime was
+    /// installed with from its composition, not resolve an undetermined
+    /// device target on the very host that arch came from.
+    #[test]
+    fn manifest_wheel_family_override_recovers_the_installed_arch() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx1250"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx1250");
+    }
+
+    /// A composition recorded for a different family (e.g. moved to another
+    /// host) must not be trusted — the plain family label is the safe fallback.
+    #[test]
+    fn manifest_wheel_family_override_ignores_a_disagreeing_composition() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx90a"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx125X-dcgpu");
+    }
+
+    /// No recorded composition at all (an older manifest, or an undetermined
+    /// install) falls back to the plain family label, same as before this fix.
+    #[test]
+    fn manifest_wheel_family_override_falls_back_without_a_composition() {
+        let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
+    }
+
+    /// The next catalog's gfx103X token differs from the canonical token, and
+    /// its later `-tests-` sibling must not win selection.
+    #[test]
+    fn next_gfx103x_tarball_selection_uses_alias_and_skips_tests_sibling() {
+        let platform = platform_tarball_token();
+        let next_prefix = format!("therock-dist-{platform}-gfx103X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{next_prefix}10.0.0.tar.gz"),
+                mtime: 1_787_612_008.0,
+            },
+            TarballIndexFile {
+                name: format!("{next_prefix}tests-10.0.0.tar.gz"),
+                mtime: 1_787_612_032.0,
+            },
+        ];
+
+        assert!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Canonical,
+                "gfx103X-dgpu",
+                None,
+            )
+            .is_none(),
+            "the canonical layout must not recognize the next-only family alias"
+        );
+
+        let (file, version) = select_tarball_candidate(
+            &files,
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            "gfx103X-dgpu",
+            None,
+        )
+        .expect("the next alias must select the real dist archive");
+
+        assert_eq!(file.name, format!("{next_prefix}10.0.0.tar.gz"));
+        assert_eq!(version, "10.0.0");
+    }
+
+    /// The rename `tarball_family_token` applies for the next catalog must not
+    /// drift from what `normalize_therock_family` maps back to `gfx103X-dgpu`;
+    /// a family manifests under is worthless if the catalog's own alias for it
+    /// no longer round-trips.
+    ///
+    /// The first assertion is the one that actually pins the rename:
+    /// `normalize_therock_family` already maps *both* `gfx103X-dgpu` and its
+    /// `gfx103X-all` alias back to `gfx103X-dgpu` (that is the whole point of
+    /// the alias), so asserting only the round-trip's final value passes
+    /// identically whether or not `tarball_family_token` renames anything —
+    /// it does not distinguish the rename from its absence.
+    #[test]
+    fn next_tarball_family_token_round_trips_through_normalize_therock_family() {
+        let token = tarball_family_token(SourceLayout::Next, "gfx103X-dgpu");
+        assert_eq!(token, "gfx103X-all");
+        assert_eq!(
+            normalize_therock_family(token),
+            Some("gfx103X-dgpu".to_owned())
+        );
+    }
+
+    /// A pinned tarball install must install what it named, not whatever is
+    /// newest in the catalog.
+    #[test]
+    fn pinned_tarball_selection_installs_the_named_version() {
+        let platform = platform_tarball_token();
+        let prefix = format!("therock-dist-{platform}-gfx120X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}10.0.0.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}10.1.0.tar.gz"),
+                mtime: 2.0,
+            },
+        ];
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Next,
+                "gfx120X-all",
+                Some(&pin)
+            )
+            .map(|(_, version)| version),
+            Some("10.0.0".to_owned())
+        );
+    }
+
+    /// The next catalog spells exactly one family differently; the canonical
+    /// catalog and every other family are untouched, and the family a manifest
+    /// records never changes.
+    #[test]
+    fn next_tarball_token_renames_only_the_gfx103x_family() {
+        assert_eq!(
+            tarball_family_token(SourceLayout::Next, "gfx103X-dgpu"),
+            "gfx103X-all"
+        );
+        assert_eq!(
+            tarball_family_token(SourceLayout::Canonical, "gfx103X-dgpu"),
+            "gfx103X-dgpu"
+        );
+        assert_eq!(
+            tarball_family_token(SourceLayout::Next, "gfx120X-all"),
+            "gfx120X-all"
+        );
+    }
+
+    /// An installed runtime must keep resolving the stream it came from, and a
+    /// manifest written before the field existed must still be readable.
+    #[test]
+    fn manifest_layout_survives_older_manifests() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-release:gfx120X-all", 0);
+        manifest.source_layout_generation = Some("next-v1".to_owned());
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Next
+        );
+
+        manifest.source_layout_generation = None;
+        manifest.wheel_composition = Some(WheelRuntimeComposition {
+            source_layout_generation: "next-v1".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx1200]==10.0.0".to_owned()],
+            rocm_sdk_target: Some("gfx1200".to_owned()),
+        });
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Next
+        );
+
+        manifest.wheel_composition = None;
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Canonical
+        );
+
+        manifest.source_layout_generation = Some("some-future-generation".to_owned());
+        let error = manifest_source_layout(&manifest).unwrap_err().to_string();
+        assert!(error.contains("unsupported TheRock source layout generation"));
+    }
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -5553,7 +6701,7 @@ mod tests {
 
     #[test]
     fn canonical_channels_use_only_their_aggregate_streams() {
-        let release = canonical_source(TheRockChannel::Release);
+        let release = resolve_source(TheRockChannel::Release, SourceLayout::Canonical);
         assert_eq!(
             release.wheel_index,
             "https://repo.amd.com/rocm/whl-multi-arch"
@@ -5562,9 +6710,9 @@ mod tests {
             release.tarball_catalog,
             "https://repo.amd.com/rocm/tarball/"
         );
-        assert_eq!(release.layout_generation, "multi-arch-v2");
+        assert_eq!(release.layout.generation(), "multi-arch-v2");
 
-        let nightly = canonical_source(TheRockChannel::Nightly);
+        let nightly = resolve_source(TheRockChannel::Nightly, SourceLayout::Canonical);
         assert_eq!(
             nightly.wheel_index,
             "https://rocm.nightlies.amd.com/whl-multi-arch"
@@ -5573,7 +6721,7 @@ mod tests {
             nightly.tarball_catalog,
             "https://rocm.nightlies.amd.com/tarball/"
         );
-        assert_eq!(nightly.layout_generation, "multi-arch-v2");
+        assert_eq!(nightly.layout.generation(), "multi-arch-v2");
     }
 
     #[test]
@@ -5606,26 +6754,38 @@ mod tests {
         ];
 
         assert_eq!(
-            select_tarball_candidate(&files, TheRockChannel::Release, "gfx120X-all")
-                .map(|(_, version)| version),
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Canonical,
+                "gfx120X-all",
+                None
+            )
+            .map(|(_, version)| version),
             Some("7.14.0".to_owned())
         );
         assert_eq!(
-            select_tarball_candidate(&files, TheRockChannel::Nightly, "gfx120X-all")
-                .map(|(_, version)| version),
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Nightly,
+                SourceLayout::Canonical,
+                "gfx120X-all",
+                None
+            )
+            .map(|(_, version)| version),
             Some("10.1.0a20260822".to_owned())
         );
     }
 
     #[test]
     fn canonical_provenance_reports_required_dry_run_fields() {
-        let source = canonical_source(TheRockChannel::Nightly);
+        let source = resolve_source(TheRockChannel::Nightly, SourceLayout::Canonical);
         let mut output = String::new();
         render_canonical_provenance(
             &mut output,
             TheRockChannel::Nightly,
-            source.wheel_index,
-            source.layout_generation,
+            &source.wheel_index,
+            source.layout.generation(),
             "10.1.0a20260822",
         );
 
@@ -5997,6 +7157,109 @@ mod tests {
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn uv_metadata_plan_accepts_non_arithmetic_audio_version() -> Result<()> {
+        let plan = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.0.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )?;
+
+        assert_eq!(plan.rocm, "10.0.0");
+        assert_eq!(plan.torch, "2.13.0+rocm10.0.0");
+        assert_eq!(plan.torchvision, "0.28.0+rocm10.0.0");
+        assert_eq!(plan.torchaudio, "2.11.0.2+rocm10.0.0");
+        Ok(())
+    }
+
+    #[test]
+    fn uv_metadata_plan_rejects_mixed_rocm_builds() {
+        let error = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.1.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )
+        .expect_err("a mixed ROCm build must fail closed")
+        .to_string();
+
+        assert!(error.contains("torchvision"), "{error}");
+        assert!(
+            error.contains("does not share ROCm build 10.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn uv_metadata_resolver_maps_supported_python_platforms() -> Result<()> {
+        let windows = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["win_amd64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_version(&windows)?, "3.12");
+        assert_eq!(uv_python_platform(&windows)?, "x86_64-pc-windows-msvc");
+
+        let linux = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_platform(&linux)?, "x86_64-unknown-linux-gnu");
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("sleep")
+            .arg(seconds.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    // `timeout.exe` refuses to run at all with its stdin redirected (it demands
+    // a real console even with `/nobreak`), exiting immediately instead of
+    // sleeping — which used to make both tests below pass or fail for the
+    // wrong reason. `Start-Sleep` has no such requirement.
+    #[cfg(windows)]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Start-Sleep -Seconds {seconds}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn Start-Sleep")
+    }
+
+    /// A budget-constrained caller (the startup update check) must get its
+    /// child back, not blocked past the budget it asked for.
+    #[test]
+    fn wait_with_output_bounded_kills_a_slow_child_at_the_deadline() {
+        let child = spawn_test_sleep(30);
+        let started = Instant::now();
+
+        let error = wait_with_output_bounded(child, Some(Duration::from_millis(200)))
+            .expect_err("a 30s sleep must not complete inside a 200ms budget");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill was not prompt"
+        );
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    /// An unbounded wait (an explicit user-invoked install, not a budgeted
+    /// startup check) still returns the child's real output.
+    #[test]
+    fn wait_with_output_bounded_waits_unbounded_when_no_timeout_is_given() {
+        let child = spawn_test_sleep(1);
+
+        let output = wait_with_output_bounded(child, None).expect("child should exit");
+
+        assert!(output.status.success(), "{output:?}");
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it
@@ -6642,13 +7905,13 @@ echo Python 3.12.10
 
     #[test]
     fn stable_provenance_uses_neutral_build_date_wording() {
-        let source = canonical_source(TheRockChannel::Release);
+        let source = resolve_source(TheRockChannel::Release, SourceLayout::Canonical);
         let mut output = String::new();
         render_canonical_provenance(
             &mut output,
             TheRockChannel::Release,
-            source.wheel_index,
-            source.layout_generation,
+            &source.wheel_index,
+            source.layout.generation(),
             "7.14.0",
         );
         assert!(output.contains("build_date: not encoded in stable version"));
@@ -7729,6 +8992,7 @@ echo Python 3.12.10
             version: "7.13.0a20260416".to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/rocm".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/simple".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),

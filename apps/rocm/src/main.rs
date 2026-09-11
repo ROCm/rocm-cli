@@ -146,6 +146,11 @@ enum Command {
         /// Emit the machine-readable diagnosis JSON.
         #[arg(long)]
         json: bool,
+        /// Diagnose a WSL distribution from the Windows host instead of this
+        /// machine. Needs nothing installed inside the distribution. Pass the
+        /// name only when more than one is installed.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        distro: Option<String>,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -1758,7 +1763,12 @@ fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
-        Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        Some(Command::Diagnose {
+            symptom,
+            top,
+            json,
+            distro,
+        }) => diagnose(symptom, top, json, distro),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2340,23 +2350,50 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let (text, summary) = examine_human_report(&paths, &config)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
-        // Informational route-out guidance for humans (the verdict is also in
+        // Informational platform guidance for humans (the verdict is also in
         // the `status` field for `--json` consumers).
-        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+        println!("\n{}", rocm_core::WSL_PLATFORM_NOTE);
     }
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
-    let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+    //
+    // `--distro` is the exception that still errors: the user named a machine to
+    // inspect, and silently reporting on a different one would be worse than
+    // failing. `--distro` with no value means "the only one installed".
+    let examination = match distro {
+        Some(name) => {
+            let selected = (!name.is_empty()).then_some(name);
+            rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+                .map_err(|reason| anyhow::anyhow!("{reason}"))?
+        }
+        None => rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto),
+    };
+    let inspected_remotely = examination
+        .wsl
+        .as_ref()
+        .is_some_and(|wsl| !wsl.locally_probed);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
+        // Inspecting a distribution from outside it collects no environment, so
+        // the checks that read one never run. Without saying so, "no known
+        // misconfiguration matched" reads as a clean bill of health for the
+        // whole installation, when it only covers the WSL GPU stack.
+        if inspected_remotely {
+            println!(
+                "\nNote: inspected from outside the distribution, which sees only its \
+                 WSL GPU stack.\nChecks that read the environment (HSA_OVERRIDE_GFX_VERSION, \
+                 PATH, the framework/ROCm pairing)\ndid not run. For those, run `rocm diagnose` \
+                 inside the distribution."
+            );
+        }
     }
     Ok(())
 }
@@ -3140,7 +3177,10 @@ fn build_driver_install_plan(
             reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned(), "scripts/wsl_preflight.py".to_owned()],
+            // `rocm diagnose` carries the WSL catalog, including the host-side
+            // form that inspects a distro over `wsl.exe` without needing anything
+            // installed inside it.
+            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
         };
     }
 
@@ -9307,6 +9347,7 @@ fn adopt_runtime_from_probe(
         version,
         install_root: install_root.clone(),
         selected_artifact_url: "adopted-read-only".to_owned(),
+        source_layout_generation: None,
         index_url: None,
         tarball_file_name: None,
         python_launcher: None,
@@ -16042,6 +16083,7 @@ fn apply_runtime_update(
             &source.format,
             &source.family,
             plan.device_target.as_deref(),
+            plan.source_layout_generation.as_deref(),
             true,
             activate,
         )?;
@@ -16062,6 +16104,7 @@ fn apply_runtime_update(
         &source.format,
         &source.family,
         plan.device_target.as_deref(),
+        plan.source_layout_generation.as_deref(),
         false,
         activate,
     )?;
@@ -30764,6 +30807,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: install_root.clone(),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
@@ -30822,6 +30866,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
