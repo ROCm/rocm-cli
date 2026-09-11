@@ -1200,14 +1200,32 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
         // Naming the variables is not enough: pointing them at `target\debug\`
         // would satisfy the check above while defeating the reuse this test is
-        // named for. Pin the whole assignment, exactly as
-        // `assert_prebuilt_e2e_lanes_export_rocmd` pins it for the other
-        // PowerShell prebuilt lanes.
+        // named for. Pin the whole assignment for BOTH, so neither can drift to a
+        // debug or stale target dir. `assert_prebuilt_e2e_lanes_export_rocmd` pins
+        // only `rocmd` for the other PowerShell prebuilt lanes; closing that half
+        // of the mirror belongs with the shared helper, not here.
+        for (var, exe) in [
+            ("ROCM_CLI_BINARY", "rocm.exe"),
+            ("ROCM_CLI_ROCMD_BINARY", "rocmd.exe"),
+        ] {
+            assert!(
+                lifecycle.contains(&format!("$env:{var} = \"$targetDir\\release\\{exe}\"")),
+                "the Windows lifecycle lane must export the RELEASE {exe} path — the \
+                 binaries the Build step produced, not a debug or stale target dir:\n{lifecycle}"
+            );
+        }
+
+        // The fail-fast guard is a deliberate part of this lane: without it a
+        // missing binary surfaces as a `failed to run` deep in the suite. Nothing
+        // else here references it, so without this assertion the whole
+        // `Test-Path`/`throw` block can be deleted with every test still green.
         assert!(
-            lifecycle.contains("$env:ROCM_CLI_ROCMD_BINARY = \"$targetDir\\release\\rocmd.exe\""),
-            "the Windows lifecycle lane must export the RELEASE rocmd.exe path — the \
-             binaries the Build step produced, not a debug or stale target dir:\n{lifecycle}"
+            lifecycle.contains("Test-Path -LiteralPath")
+                && lifecycle.contains("throw \"expected the Build step to have produced"),
+            "the Windows lifecycle lane must fail fast, naming the missing binary, \
+             when the Build step did not produce it:\n{lifecycle}"
         );
+
         assert!(
             !lifecycle.contains("e2e-test-hooks"),
             "the lifecycle-only lane packages and installs what a release ships, \
