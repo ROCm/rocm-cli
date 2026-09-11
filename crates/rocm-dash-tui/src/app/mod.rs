@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -1614,6 +1615,16 @@ fn open_overlay_for_focus(
 }
 
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
+    // Install the termination-signal watcher BEFORE switching the terminal into
+    // raw/alternate-screen mode. A signal that arrives during startup must find
+    // the listeners already registered; otherwise it takes the default
+    // disposition and kills the process while the terminal is still in raw mode
+    // — the exact broken-terminal state this guards against. Registration
+    // failure is propagated here (via `?`), before any terminal state is
+    // mutated, so we never enter raw mode without a working restore path. See
+    // `spawn_termination_watcher` for the exit-code and no-unwind semantics.
+    let signal_task = spawn_termination_watcher()?;
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1622,19 +1633,324 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 
     let res = event_loop(&mut terminal, &args).await;
 
-    // Best-effort terminal restoration: never let teardown failures override the
-    // session result. If the controlling terminal already went away (e.g. the
-    // PTY closed on quit), these writes can fail with a broken pipe — that must
-    // not turn a clean exit into a non-zero one.
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
+    // The session ended on its own — the signal watcher is no longer needed and
+    // must not linger to fire (and re-restore/exit) after a clean return.
+    signal_task.abort();
+
+    // Best-effort terminal restoration, reusing the exact teardown the signal
+    // path runs so the two cannot drift. Never let teardown failures override
+    // the session result: if the controlling terminal already went away (e.g.
+    // the PTY closed on quit), these writes can fail with a broken pipe — that
+    // must not turn a clean exit into a non-zero one (every step inside is
+    // best-effort).
+    restore_terminal();
     res
 }
+
+/// Best-effort teardown of the terminal modes `run` set up. Disables raw mode
+/// (process-global terminal state, so this can safely run from the signal
+/// watcher even though the [`Terminal`] backend owns its own `stdout` clone),
+/// then writes the alt-screen/mouse/cursor restore sequences to a fresh
+/// `stdout`. Every step is best-effort: on a signal we are about to exit anyway,
+/// and a vanished controlling terminal must not turn teardown into a panic.
+///
+/// # Ordering against the renderer
+///
+/// Nothing here locks the terminal, and this writer is genuinely concurrent with
+/// the renderer: the watcher runs on a Tokio worker thread while frames are
+/// drawn on the thread that owns the loop (`block_on`'s thread for a dashboard
+/// session, the synchronous menu thread for the launcher hub).
+///
+/// The consequence is not merely cosmetic, so it is closed rather than accepted.
+/// A frame that *completes after* this function returns cannot re-enter the
+/// alternate screen — `EnterAlternateScreen` is emitted exactly once at startup
+/// and `Terminal::draw` never re-emits it — but every frame ends by hiding (or
+/// repositioning) the cursor and repainting, so a late frame would undo the
+/// show-cursor half of this restore and paint a stale dashboard over the
+/// restored screen. The narrow serialization that closes that window, in
+/// preference to a process-global lock on every terminal write: both render
+/// loops consult [`shutdown_claimed`] before drawing, and the latch is claimed
+/// *before* the restore begins, so no frame can start after the claim.
+///
+/// What remains is a frame already in flight when the claim lands, which can
+/// still interleave *during* the restore. That one is cosmetic — out-of-order
+/// escapes on a terminal being reset in the same breath, with these restore
+/// bytes written last — and is accepted.
+fn restore_terminal() {
+    // `disable_raw_mode` mutates the real terminal (there is no in-memory
+    // equivalent), so it stays outside the testable sequence writer below.
+    let _ = disable_raw_mode();
+    let _ = write_restore_sequences(&mut io::stdout());
+}
+
+/// Write the escape sequences that undo `run`'s terminal setup — leave the
+/// alternate screen, disable mouse capture, show the cursor — to `out`. Split
+/// from [`restore_terminal`] so a unit test can drive an in-memory sink and
+/// assert the emitted bytes, rather than writing to the process's shared stdout
+/// (which races every other test in the single-process `cargo test` lane).
+fn write_restore_sequences<W: io::Write>(out: &mut W) -> io::Result<()> {
+    execute!(
+        out,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    )
+}
+
+/// Register the termination-signal listeners on the current Tokio runtime and
+/// spawn a detached watcher that restores the terminal and exits `128 + signo`.
+///
+/// Returns the task handle so a caller whose process ends with the session
+/// (`rocm dash`) can `abort()` it on a clean return; the persistent launcher hub
+/// instead keeps its runtime alive and drops the handle, letting the watcher
+/// live for the whole process so bare `rocm` stays killable across the sessions
+/// it builds and drops (Tokio never unregisters its libc handler, so a
+/// per-session watcher would go deaf the moment its runtime is dropped — see
+/// `dash::run_launcher`).
+///
+/// Registration happens here, synchronously, and is surfaced via `?`; callers
+/// invoke this BEFORE entering raw/alternate-screen mode so a failure never
+/// leaves the terminal switched with no restore path, and a signal arriving
+/// during startup is latched by the already-installed OS handlers.
+///
+/// The watcher ends the process with [`std::process::exit`], which does not
+/// unwind — this is deliberate. SIGTERM/SIGINT means "stop now", so we restore
+/// the terminal and leave promptly rather than racing an orderly teardown
+/// against an imminent default-disposition kill. Two consequences are accepted
+/// as the intended behavior: (1) an in-flight focused install/serve child is
+/// left to the OS rather than reaped via `kill_on_drop`, matching the
+/// pre-existing default disposition and avoiding truncating a mid-write child on
+/// the way out; and (2) `run_async`'s embedded-daemon socket is not unlinked
+/// here, but the daemon unlinks a stale socket on its next bind, so it self-heals.
+///
+/// More than one watcher can be live at once — bare `rocm` escalates from the
+/// hub into a dashboard session, so the hub's process-lifetime watcher and
+/// `run`'s session watcher coexist — and Tokio's signal registry is
+/// process-global: one `kill` notifies *every* subscriber regardless of which
+/// runtime registered it. Both watchers therefore wake on the same signal. The
+/// [`SHUTTING_DOWN`] latch arbitrates: only the first one through restores the
+/// terminal and exits, so two threads never race unsynchronised writes to
+/// stdout nor call `std::process::exit` concurrently. See [`await_termination`].
+pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle<()>> {
+    let termination = TerminationSignals::register()?;
+    Ok(tokio::spawn(async move {
+        let Some(code) = await_termination(termination, &SHUTTING_DOWN).await else {
+            // A sibling watcher already claimed the shutdown and is about to
+            // `exit`; this one must do nothing at all.
+            return;
+        };
+        restore_terminal();
+        std::process::exit(code);
+    }))
+}
+
+/// Process-global "some watcher has claimed the termination path" latch.
+///
+/// Deliberately process-global rather than threaded through `ResolvedArgs`: the
+/// hazard is two watchers on two *runtimes*, and a path-independent latch covers
+/// every call site (present and future) without each one having to know whether
+/// an outer watcher already exists.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Claim the single-shot shutdown path on `latch`. Returns `true` exactly once —
+/// for whichever caller wins the swap — and `false` for every caller after it.
+///
+/// `SeqCst` because correctness here is "exactly one winner across threads", not
+/// ordering of surrounding data; the stronger ordering costs nothing on a path
+/// that runs at most once per process.
+///
+/// Parameterised over the latch (rather than reading [`SHUTTING_DOWN`] directly)
+/// so tests can drive a fresh latch and stay order-independent — the process
+/// global cannot be reset once a test has set it.
+fn claim_shutdown(latch: &AtomicBool) -> bool {
+    !latch.swap(true, Ordering::SeqCst)
+}
+
+/// Whether the shutdown path has already been claimed — by a signal watcher or
+/// by a typed Ctrl-C — meaning the terminal is being restored and the process is
+/// about to exit.
+///
+/// Both render loops call this before every frame so a `draw` cannot land after
+/// [`restore_terminal`] has run and undo it. See the ordering note on
+/// [`restore_terminal`] for why that is the chosen fix rather than a lock on
+/// every terminal write.
+#[must_use]
+pub fn shutdown_claimed() -> bool {
+    shutdown_claimed_on(&SHUTTING_DOWN)
+}
+
+/// [`shutdown_claimed`] against an explicit latch, so a test can drive a fresh
+/// one and stay order-independent — the process global cannot be reset once a
+/// test has set it (same reason [`claim_shutdown`] is parameterised).
+fn shutdown_claimed_on(latch: &AtomicBool) -> bool {
+    latch.load(Ordering::SeqCst)
+}
+
+/// Whether `k` is a typed Ctrl-C.
+///
+/// Raw mode is why this must be a key match at all. `enable_raw_mode` clears
+/// `ISIG` on Unix and `ENABLE_PROCESSED_INPUT` on Windows; with those off the
+/// terminal driver does NOT translate the keystroke into SIGINT (or raise
+/// `CTRL_C_EVENT`) — it hands the application the byte `0x03` like any other
+/// key. So while the TUI is up, [`TerminationSignals`] covers an *externally*
+/// delivered `kill -INT` / `GenerateConsoleCtrlEvent` (and a Ctrl-C during the
+/// startup window before raw mode is entered), but never the gesture a user
+/// performs inside the dashboard. That one arrives here.
+///
+/// Matches lowercase `c` only, mirroring
+/// [`crate::ui::job_console::on_console_key`]: terminals commonly bind
+/// Ctrl+Shift+C to copy, and claiming it would break a paste workflow.
+pub(crate) const fn is_ctrl_c(k: KeyEvent) -> bool {
+    matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Whether a key event must end the dashboard session: a typed Ctrl-C, unless a
+/// job console is displayed.
+///
+/// Split out of the event loop's match guard so the precedence is testable
+/// without a terminal. The console exception is the whole reason this is not
+/// simply [`is_ctrl_c`]: while a job console is up, Ctrl+C already means "cancel
+/// this running job" (`ui::job_console::on_console_key`), which is the documented
+/// way to stop a focused install/serve without truncating it — killing the
+/// process instead would be a regression.
+fn ctrl_c_should_exit(state: &AppState, k: KeyEvent) -> bool {
+    is_ctrl_c(k) && !state.has_active_console()
+}
+
+/// End the process from a typed Ctrl-C, taking exactly the path an externally
+/// delivered SIGINT takes: claim the shutdown latch, restore the terminal, exit
+/// [`EXIT_CODE_SIGINT`]. Shared by the dashboard event loop and the launcher
+/// menu — the two key loops are separate, and routing both here is what stops
+/// the gesture from meaning different things in the two windows.
+///
+/// Never returns, and (like the watcher) exits without unwinding; see
+/// [`spawn_termination_watcher`] for the consequences that are accepted there
+/// and apply identically here.
+pub(crate) fn exit_on_ctrl_c() -> ! {
+    if claim_shutdown(&SHUTTING_DOWN) {
+        restore_terminal();
+        std::process::exit(EXIT_CODE_SIGINT);
+    }
+    // Lost the race to a watcher that has already claimed the shutdown and is
+    // microseconds from `exit`. Park rather than racing a second
+    // `std::process::exit`; the winner ends the process. `park` is allowed to
+    // wake spuriously, hence the loop.
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Park until a termination signal arrives, then arbitrate on `latch`.
+///
+/// Returns `Some(128 + signo)` for the single watcher that wins the latch — that
+/// caller must restore the terminal and exit with the code — and `None` for any
+/// other watcher woken by the same process-global signal delivery.
+///
+/// Split out of [`spawn_termination_watcher`]'s task body so a test can drive the
+/// whole register → receive → arbitrate path in-process; the body itself ends in
+/// `std::process::exit` and can never be unit-tested.
+async fn await_termination(termination: TerminationSignals, latch: &AtomicBool) -> Option<i32> {
+    let code = termination.recv().await;
+    claim_shutdown(latch).then_some(code)
+}
+
+/// Termination-signal listeners, registered up front so a signal that arrives
+/// during terminal setup is latched by the OS/Tokio rather than taking the
+/// default disposition.
+///
+/// [`TerminationSignals::register`] installs the OS handlers and is called
+/// BEFORE the terminal is switched into raw/alternate-screen mode, so a
+/// registration failure is surfaced (via `?`) before any terminal state is
+/// mutated. [`TerminationSignals::recv`] then parks the watcher task until a
+/// signal fires, returning the conventional `128 + signo` exit code the process
+/// should report (SIGINT → 130, SIGTERM → 143).
+///
+/// Scope, stated narrowly because it is easy to overclaim: this covers signals
+/// that arrive as signals — `kill -TERM` / `kill -INT` from a supervisor or
+/// another process, and anything delivered during the startup window before
+/// `enable_raw_mode`. It does NOT cover a Ctrl-C typed at the running TUI: raw
+/// mode clears `ISIG`, so the terminal driver never turns that keystroke into a
+/// SIGINT and it arrives as a key event instead. See [`is_ctrl_c`], which both
+/// key loops route to this same restore-and-exit path.
+#[cfg(unix)]
+struct TerminationSignals {
+    sigterm: tokio::signal::unix::Signal,
+    sigint: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn register() -> color_eyre::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // Register both handlers before entering raw mode. `?` on each
+        // propagates a setup failure instead of parking forever; and if the
+        // second registration fails, the first is dropped (unregistered) as we
+        // return the error, so we never leave one signal silently swallowed.
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())?,
+            sigint: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn recv(mut self) -> i32 {
+        tokio::select! {
+            _ = self.sigterm.recv() => EXIT_CODE_SIGTERM,
+            _ = self.sigint.recv() => EXIT_CODE_SIGINT,
+        }
+    }
+}
+
+/// Windows analog: console control events, which would otherwise skip terminal
+/// restoration the same way. Tokio exposes the two as separate streams, so BOTH
+/// are registered — `ctrl_c()` subscribes only to `CTRL_C_EVENT` and would miss
+/// a Ctrl-Break. Ctrl-Break is the harder "terminate" gesture and maps to the
+/// SIGTERM code; Ctrl-C maps to the SIGINT code.
+///
+/// Scope, narrowly, because the two arms differ and the difference matters:
+///
+/// - Ctrl-Break: `ENABLE_PROCESSED_INPUT` does not affect `CTRL_BREAK_EVENT`, so
+///   this arm is live for the whole session and is what actually terminates a
+///   running TUI through the signal path.
+/// - Ctrl-C: crossterm's raw mode clears `ENABLE_PROCESSED_INPUT`, and with that
+///   flag off the console delivers a typed Ctrl+C into the input buffer as a KEY
+///   EVENT and never raises `CTRL_C_EVENT`. This stream therefore cannot fire
+///   while the TUI is up; it is kept for the startup window before
+///   `enable_raw_mode` and for a `GenerateConsoleCtrlEvent` sent by another
+///   process. The typed gesture is handled as a key instead — see [`is_ctrl_c`],
+///   which routes it to the same restore path.
+#[cfg(windows)]
+struct TerminationSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl TerminationSignals {
+    fn register() -> color_eyre::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c};
+
+        // `?` propagates a registration failure before raw mode is entered,
+        // rather than the old `let _ = ctrl_c().await` which treated a failed
+        // registration as a received Ctrl-C and exited immediately.
+        Ok(Self {
+            ctrl_c: ctrl_c()?,
+            ctrl_break: ctrl_break()?,
+        })
+    }
+
+    async fn recv(mut self) -> i32 {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => EXIT_CODE_SIGINT,
+            _ = self.ctrl_break.recv() => EXIT_CODE_SIGTERM,
+        }
+    }
+}
+
+/// Conventional shell exit code for a process terminated by SIGINT (128 + 2).
+const EXIT_CODE_SIGINT: i32 = 130;
+/// Conventional shell exit code for a process terminated by SIGTERM (128 + 15).
+const EXIT_CODE_SIGTERM: i32 = 143;
 
 async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -1855,12 +2171,19 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let mut local_agent = agent.clone();
 
     loop {
+        // A termination is in flight on another thread (the signal watcher, or a
+        // typed Ctrl-C handled below): the terminal is being restored, so stop
+        // painting rather than have this frame land after the restore and undo
+        // it. See the ordering note on `restore_terminal`.
+        //
         // Focused host renders overlay-only (no header / tabs / dock / footer
         // chrome); the dashboard renders the full shell.
-        if should_skip_daemon(args.focus) {
-            terminal.draw(|f| ui::draw_focused(f, &mut state))?;
-        } else {
-            terminal.draw(|f| ui::draw(f, &mut state))?;
+        if !shutdown_claimed() {
+            if should_skip_daemon(args.focus) {
+                terminal.draw(|f| ui::draw_focused(f, &mut state))?;
+            } else {
+                terminal.draw(|f| ui::draw(f, &mut state))?;
+            }
         }
         tokio::select! {
             _ = tick.tick() => {
@@ -1926,6 +2249,22 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // the Press-only invariant holds for overlays too.
                     Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
                         let _ = k;
+                    }
+                    // A typed Ctrl-C. Raw mode means this reaches the app as a
+                    // key event and never as SIGINT / `CTRL_C_EVENT` (see
+                    // `is_ctrl_c`), so the signal watcher cannot see it: without
+                    // this arm the first gesture a user reaches for does nothing
+                    // at all and leaves them in a raw-mode terminal. Handled
+                    // above every overlay so no screen can trap it, and routed
+                    // through the same restore-and-exit path a real SIGINT takes.
+                    //
+                    // The one exception is a displayed job console, where Ctrl+C
+                    // already means "cancel this running job"
+                    // (`ui::job_console::on_console_key`, dispatched by the
+                    // overlay arms below). Exiting the process there would be a
+                    // regression, so that established meaning wins.
+                    Some(Ok(CtEvent::Key(k))) if ctrl_c_should_exit(&state, k) => {
+                        exit_on_ctrl_c();
                     }
                     // The approval modal, when open, owns ALL keys with the
                     // highest priority (above every operational overlay and the
@@ -3521,6 +3860,252 @@ mod tests {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
         // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
+    }
+
+    /// Serialises every test that touches the process-global signal machinery.
+    ///
+    /// The two lanes differ: Linux CI runs `cargo nextest` (one process per
+    /// test, so this lock is a no-op), while the required Windows lane runs
+    /// `cargo test`, which runs the whole binary's tests as THREADS IN ONE
+    /// PROCESS. There, `termination_watcher_parks_until_aborted` has a live
+    /// watcher whose body ends in `std::process::exit`; if the self-`kill` test
+    /// below ran concurrently, that watcher would wake on the other test's
+    /// signal and take the entire test binary down with exit 143. It would also
+    /// steal the signal the other test is asserting on. Holding this lock for
+    /// the whole of each test — including the runtime's `block_on` — makes the
+    /// two strictly sequential.
+    ///
+    /// The tests are written as plain `#[test]` + an explicit runtime (rather
+    /// than `#[tokio::test]`) precisely so the guard is held across `block_on`
+    /// without holding a `std` lock across an `.await`.
+    ///
+    /// One residue this lock cannot undo, recorded so it is not rediscovered as
+    /// a mystery: `TerminationSignals::register` installs Tokio's libc handler
+    /// for SIGINT/SIGTERM process-wide, and Tokio never unregisters it — not on
+    /// drop of the `Signal`, not on drop of the runtime. So from the first of
+    /// these tests onward, the rest of a single-process `cargo test` run (the
+    /// required Windows lane) is deaf to those signals: they are caught and
+    /// discarded instead of terminating the binary. Harmless for the suite as it
+    /// stands — nothing signals the test process except the test that does so
+    /// deliberately, under this lock — but any future test that expects a signal
+    /// to actually kill the test binary, or a CI step that relies on cancelling
+    /// it with SIGINT, must not assume the default disposition is still in place.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A current-thread runtime with the signal driver enabled, which
+    /// `TerminationSignals::register` needs.
+    fn signal_test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("building a current-thread runtime for the signal tests")
+    }
+
+    #[test]
+    fn only_the_first_caller_claims_the_shutdown_latch() {
+        // The guard that stops the hub's process-lifetime watcher and a
+        // session's watcher from both restoring the terminal and both calling
+        // `process::exit` on one signal. Driven on a local latch so the test
+        // never touches (or depends on the state of) the process global.
+        let latch = AtomicBool::new(false);
+        assert!(claim_shutdown(&latch), "the first claim must win");
+        assert!(!claim_shutdown(&latch), "a second claim must lose");
+        assert!(!claim_shutdown(&latch), "and so must every later one");
+
+        // Under contention there must still be exactly one winner: a
+        // non-atomic read-then-write would let several threads through.
+        let contended = AtomicBool::new(false);
+        let winners = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    if claim_shutdown(&contended) {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one of 16 racing watchers may claim the shutdown"
+        );
+    }
+
+    #[test]
+    fn claiming_the_shutdown_latch_suspends_rendering() {
+        // The narrow serialization that stops a frame landing after
+        // `restore_terminal()` has run and undoing it: both render loops gate on
+        // the SAME latch the shutdown path claims, and the claim happens before
+        // the restore begins. Driven on a local latch so the test never touches
+        // the process global.
+        let latch = AtomicBool::new(false);
+        assert!(
+            !shutdown_claimed_on(&latch),
+            "rendering must be allowed while no shutdown has been claimed"
+        );
+        assert!(claim_shutdown(&latch), "the first claim must win");
+        assert!(
+            shutdown_claimed_on(&latch),
+            "claiming the shutdown must suspend rendering, or a late frame can \
+             repaint over the restored terminal"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_is_recognised_as_a_key_because_raw_mode_suppresses_the_signal() {
+        // Raw mode clears ISIG (and ENABLE_PROCESSED_INPUT on Windows), so a
+        // typed Ctrl-C never becomes a signal — it arrives here as a key event.
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert!(is_ctrl_c(ctrl('c')), "Ctrl+C must be recognised");
+        assert!(
+            !is_ctrl_c(press(KeyCode::Char('c'))),
+            "a bare `c` must not terminate the session"
+        );
+        assert!(!is_ctrl_c(ctrl('d')), "Ctrl+D is a different key");
+        // Terminals commonly bind Ctrl+Shift+C to copy; claiming it would kill
+        // the session on a copy.
+        assert!(
+            !is_ctrl_c(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            "Ctrl+Shift+C is copy, not terminate"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_exits_the_session_but_a_job_console_keeps_cancelling_the_job() {
+        // Precedence for the event loop's Ctrl-C arm. With no console up, the
+        // gesture ends the session; with one up it must fall through to
+        // `job_console::on_console_key`, whose Ctrl+C cancels the running job —
+        // the documented way to stop a focused install/serve without killing the
+        // process mid-write.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut s = st();
+        assert!(
+            ctrl_c_should_exit(&s, ctrl_c),
+            "Ctrl+C with no job console must end the session"
+        );
+        assert!(
+            !ctrl_c_should_exit(&s, press(KeyCode::Char('q'))),
+            "an unrelated key must not take the terminate path"
+        );
+
+        let _ = open_overlay_for_focus(&mut s, Focus::Examine); // auto-runs a job
+        assert!(s.has_active_console(), "examine console is live");
+        assert!(
+            !ctrl_c_should_exit(&s, ctrl_c),
+            "Ctrl+C over a live job console must cancel the job, not the process"
+        );
+    }
+
+    #[test]
+    fn termination_watcher_parks_until_aborted() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signal_test_runtime().block_on(async {
+            // The real wiring `run` depends on: registration must succeed, and
+            // the spawned task must stay parked on `recv()` (never resolving on
+            // its own and exiting the process), until the clean-return path
+            // aborts it.
+            let handle = spawn_termination_watcher()
+                .expect("registering the termination-signal listeners must succeed");
+            // Let the task actually start and park; on a current-thread runtime
+            // a freshly spawned task has not been polled yet, so without this
+            // `is_finished` would be trivially false.
+            tokio::task::yield_now().await;
+            assert!(
+                !handle.is_finished(),
+                "the watcher must stay parked while no signal has arrived"
+            );
+
+            handle.abort();
+            let err = handle
+                .await
+                .expect_err("an aborted watcher must not report completion");
+            assert!(
+                err.is_cancelled(),
+                "the watcher must end by cancellation, not by panicking: {err:?}"
+            );
+        });
+    }
+
+    // Unix-only. This test sends real signals to its own process, which is safe
+    // ONLY because it drives `await_termination` directly: the watcher body that
+    // calls `std::process::exit` is never run here. `TerminationSignals::register`
+    // installs the handlers *before* the `kill`, so the signal is caught rather
+    // than taking its default (fatal) disposition. Both listeners are registered
+    // before the single `kill` on purpose — that is exactly the hub-watcher +
+    // session-watcher shape, and Tokio's process-global registry wakes both.
+    #[cfg(unix)]
+    #[test]
+    fn termination_signals_yield_shell_exit_codes_and_only_one_watcher_shuts_down() {
+        let _guard = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signal_test_runtime().block_on(async {
+            for (signo, expected) in [
+                (libc::SIGTERM, EXIT_CODE_SIGTERM),
+                (libc::SIGINT, EXIT_CODE_SIGINT),
+            ] {
+                // A fresh latch per kind keeps the test order-independent.
+                let latch = AtomicBool::new(false);
+                let hub_watcher = TerminationSignals::register()
+                    .expect("registering the hub listeners must succeed");
+                let session_watcher = TerminationSignals::register()
+                    .expect("registering the session listeners must succeed");
+
+                // SAFETY: `raise` is an async-signal-safe libc call with no
+                // arguments to get wrong, and both listeners above are already
+                // installed, so the signal is delivered to Tokio's handler
+                // instead of terminating the test binary.
+                #[allow(unsafe_code)] // libc FFI
+                let rc = unsafe { libc::raise(signo) };
+                assert_eq!(rc, 0, "raise({signo}) failed");
+
+                assert_eq!(
+                    await_termination(hub_watcher, &latch).await,
+                    Some(expected),
+                    "the first watcher must receive signal {signo} and map it to \
+                     the conventional 128 + signo exit code"
+                );
+                assert_eq!(
+                    await_termination(session_watcher, &latch).await,
+                    None,
+                    "the second watcher woken by the same signal must stand down \
+                     rather than race a concurrent restore + exit"
+                );
+            }
+        });
+    }
+
+    // Unix-only: crossterm emits ANSI escape sequences to a generic writer on
+    // Unix, so an in-memory sink captures the real bytes. On Windows crossterm
+    // drives the console via the WinAPI backend instead of writing ANSI, and
+    // `execute!` to a `Vec` errors with "Initial console modes not set" — there
+    // is no console to configure. Production `restore_terminal()` passes a real
+    // stdout handle, so the Windows path is exercised there, not by this sink.
+    #[cfg(unix)]
+    #[test]
+    fn write_restore_sequences_leaves_alt_screen_and_shows_cursor() {
+        // The restore path must leave the alternate screen and show the cursor.
+        // Driving an in-memory sink asserts the actual emitted bytes without
+        // touching the process's shared terminal state — the global
+        // `disable_raw_mode()` half is deliberately outside this function, so
+        // nothing here races other tests in the single-process `cargo test` lane.
+        let mut sink: Vec<u8> = Vec::new();
+        write_restore_sequences(&mut sink).expect("writing to a Vec cannot fail");
+        let emitted = String::from_utf8(sink).expect("restore sequences are ASCII escapes");
+        assert!(
+            emitted.contains("\x1b[?1049l"),
+            "expected the leave-alt-screen sequence in {emitted:?}"
+        );
+        assert!(
+            emitted.contains("\x1b[?25h"),
+            "expected the show-cursor sequence in {emitted:?}"
+        );
     }
 
     #[test]

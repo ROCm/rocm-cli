@@ -304,12 +304,27 @@ pub fn run_launcher(
 
     let mut sel = 0usize;
     let result = loop {
-        terminal.draw(|f| draw(f, f.area(), &state, sel, &theme))?;
+        // A termination is in flight on another thread (the hub's signal watcher
+        // runs on its own runtime while this menu loop owns the main thread):
+        // the terminal is being restored, so stop painting rather than let this
+        // frame land after the restore and undo it. See the ordering note on
+        // `crate::app::restore_terminal`.
+        if !crate::app::shutdown_claimed() {
+            terminal.draw(|f| draw(f, f.area(), &state, sel, &theme))?;
+        }
         let Event::Key(k) = event::read()? else {
             continue;
         };
         if k.kind != KeyEventKind::Press {
             continue;
+        }
+        // Raw mode delivers a typed Ctrl-C as a key event, not a signal, so the
+        // hub's termination watcher never sees it. This menu is the second of
+        // the process's two key loops; route it through the same
+        // restore-and-exit path a real SIGINT takes, so the gesture cannot mean
+        // one thing inside a session and nothing at all at the front door.
+        if crate::app::is_ctrl_c(k) {
+            crate::app::exit_on_ctrl_c();
         }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => break None,
