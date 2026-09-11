@@ -4653,6 +4653,79 @@ mod tests {
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn suppress_progress_output_contract() {
+        // `SUPPRESS_PROGRESS_OUTPUT` is thread-local, so this doesn't race with
+        // other tests' threads.
+        assert!(!progress_output_suppressed());
+        {
+            let _outer = SuppressProgressOutput::new();
+            assert!(progress_output_suppressed());
+            {
+                let _inner = SuppressProgressOutput::new();
+                assert!(
+                    progress_output_suppressed(),
+                    "a nested guard must still suppress"
+                );
+            }
+            assert!(
+                progress_output_suppressed(),
+                "dropping the inner guard must not lift the outer guard's suppression"
+            );
+        }
+        assert!(
+            !progress_output_suppressed(),
+            "dropping the outer guard must restore the pre-guard state"
+        );
+    }
+
+    fn render_update_json_test_paths(name: &str) -> (PathBuf, AppPaths) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-render-update-json-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        (root, paths)
+    }
+
+    #[test]
+    fn render_update_json_restores_progress_suppression_on_ok_and_err_paths() {
+        // Ok path: no `runtimes` directory at all, so `load_runtime_manifests`
+        // returns `Ok(vec![])` and `render_update_json` succeeds trivially.
+        let (ok_root, ok_paths) = render_update_json_test_paths("ok");
+        fs::create_dir_all(&ok_root).unwrap();
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&ok_paths, Some(1));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Ok path"
+        );
+        fs::remove_dir_all(&ok_root).ok();
+
+        // Err path: `broken.json` is a directory, not a file, so the loader's
+        // `fs::read` on it fails and the error bubbles through
+        // `render_update_json`'s `?` before ever constructing an `UpdateJson`.
+        let (err_root, err_paths) = render_update_json_test_paths("err");
+        let registry_dir = err_root.join("data").join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json")).unwrap();
+        let result = render_update_json(&err_paths, Some(1));
+        assert!(
+            result.is_err(),
+            "a directory named *.json must fail to be read as manifest bytes"
+        );
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Err path too"
+        );
+        fs::remove_dir_all(&err_root).ok();
+    }
+
+    #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
         // No HEAD response (unroutable host) must not block an install.
         let temp = std::env::temp_dir();

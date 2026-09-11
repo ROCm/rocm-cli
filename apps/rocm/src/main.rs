@@ -20167,6 +20167,13 @@ mod tests {
     }
 
     #[test]
+    fn update_rejects_zero_timeout_secs() {
+        let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
+            .expect_err("zero timeout-secs is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn completions_generate_for_every_shell() {
         use clap_complete::Shell;
         // The hidden, internal-only verbs that `--help` omits and that must
