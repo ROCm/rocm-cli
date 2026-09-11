@@ -197,6 +197,74 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
 }
 
+/// Registry key for the planted manifest below. Filename-safe (no `:`), same
+/// reasoning as `runtime_lifecycle_steps.rs`'s planted keys.
+const NEXT_GROUPED_FAMILY_RUNTIME_KEY: &str = "release-wheel-next-v1-gfx120x-all-9-0-0";
+
+/// Plants a `wheel`/`next-v1` runtime manifest whose family is a *group* label
+/// (`gfx120X-all` — every family this PR adds is one), with the exact arch it
+/// was installed for recorded in `wheel_composition.rocm_sdk_target`, exactly
+/// the shape a real ROCm 10 install produces. `apply_runtime_update` ->
+/// `install_sdk_for_update` -> `install_wheel_runtime` must resolve past this
+/// without the user ever typing `--family gfx1200` again.
+///
+/// Version `9.0.0` (older than the fixture's published `NEXT_ROCM_VERSION`) so
+/// the update plan finds one available; nothing about this scenario depends on
+/// a real ROCm 9 having existed, since the layout is read from
+/// `source_layout_generation`, not derived from the version string.
+#[given("a registered ROCm 10 wheel runtime with a grouped family")]
+async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld) {
+    let install_root = root(world).join("runtime-next-grouped-family");
+    std::fs::create_dir_all(&install_root).expect("failed to create install root");
+
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    std::fs::create_dir_all(&registry).expect("failed to create registry dir");
+    let manifest = serde_json::to_string_pretty(&serde_json::json!({
+        "runtime_key": NEXT_GROUPED_FAMILY_RUNTIME_KEY,
+        "runtime_id": format!("therock-release:{GROUP_FAMILY}"),
+        "channel": "release",
+        "format": "wheel",
+        "family": GROUP_FAMILY,
+        "family_source": "manual",
+        "version": "9.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/rocm",
+        "source_layout_generation": "next-v1",
+        "read_only": false,
+        "wheel_composition": {
+            "source_layout_generation": "next-v1",
+            "package_specs": [
+                format!("rocm[libraries,devel,device-{RAW_ARCH}]==9.0.0"),
+                "torch==2.9.0+rocm9.0.0",
+                "torchvision==0.24.0+rocm9.0.0",
+                "torchaudio==2.9.0+rocm9.0.0",
+            ],
+            "rocm_sdk_target": RAW_ARCH,
+        },
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    }))
+    .expect("failed to serialize runtime manifest");
+    std::fs::write(
+        registry.join(format!("{NEXT_GROUPED_FAMILY_RUNTIME_KEY}.json")),
+        manifest,
+    )
+    .expect("failed to write runtime manifest");
+}
+
+#[when("the user previews applying the pending update to that runtime")]
+async fn preview_apply_pending_update(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "update",
+            "--apply",
+            "--dry-run",
+            "--runtime",
+            NEXT_GROUPED_FAMILY_RUNTIME_KEY,
+        ],
+    );
+}
+
 #[given("an untrusted ROCm 10 pip base override")]
 async fn untrusted_pip_index_fixture(world: &mut E2eWorld) {
     let served = root(world).join("untrusted-therock-pip-fixture");

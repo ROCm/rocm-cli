@@ -103,3 +103,18 @@ Feature: TheRock "next" ROCm 10 install layout
     And the runtime is set as active
     And the runtime includes an inference engine
     And the ROCm 10 runtime passes SDK and Torch GPU probes
+
+  # The regression this pins is distinct from therock-next-02's: that scenario
+  # proves a *fresh* install resolves an exact arch when the user supplies one.
+  # This one proves *updating* an already-installed next-layout runtime works
+  # when all the CLI has on hand is the manifest's group family (`gfx120X-all`)
+  # — exactly what every installed ROCm 10 runtime's manifest carries, since
+  # `--family` is only ever typed once. A fix that recovers the exact arch for
+  # planning (deciding a newer version exists) but not for applying (actually
+  # resolving and installing it) leaves this scenario red.
+  @id:therock-next-08-update-apply-recovers-exact-arch-from-grouped-family
+  Scenario: therock-next-08 - Updating a ROCm 10 wheel runtime resolves past its grouped family
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a registered ROCm 10 wheel runtime with a grouped family
+    When the user previews applying the pending update to that runtime
+    Then the preview requests the gfx1200 device extras

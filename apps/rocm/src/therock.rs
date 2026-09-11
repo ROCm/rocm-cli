@@ -954,7 +954,9 @@ pub(crate) fn install_sdk(
             if let Some(selector) = version_selector.as_ref()
                 && !next_layout_requested(selector)
             {
-                bail!("specific TheRock version selection is only supported for wheel installs")
+                bail!(
+                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                )
             }
             install_tarball_runtime(
                 paths,
@@ -1232,19 +1234,31 @@ fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceL
     }))
 }
 
-/// The family override to re-resolve a wheel manifest's update with.
+/// The family override to actually resolve a next-layout wheel request with,
+/// given a (possibly grouped) family and an exact arch recorded or requested
+/// alongside it.
 ///
 /// A grouped family (e.g. `gfx125X-dcgpu`) carries no exact arch, so passing
 /// it straight through would leave the next layout's device target
 /// undetermined and the whole resolve would bail — on the very host the
-/// runtime is already installed on. The composition recorded at install time
-/// carries that arch; recover it and pass the raw arch itself as the
-/// override, which `resolve_family` also normalizes back to this same family.
+/// runtime is already installed on. `candidate_arch` is the exact arch a more
+/// authoritative source already recorded for this same family; when it
+/// agrees, pass it as the override itself, which `resolve_family` also
+/// normalizes back to this same family. Used by both halves of updating a
+/// next-layout manifest: `resolve_latest_for_manifest` (planning) and
+/// `install_wheel_runtime` via `device_target_override` (applying) — a fix to
+/// one without the other leaves the update path half-working.
+fn family_override_or_recovered_arch(family: &str, candidate_arch: Option<&str>) -> String {
+    raw_arch_agreeing_with_family(candidate_arch.map(str::to_owned), family)
+        .unwrap_or_else(|| family.to_owned())
+}
+
+/// The family override to re-resolve a wheel manifest's update *plan* with.
+/// See [`family_override_or_recovered_arch`] — the composition recorded at
+/// install time is this call's source for the exact arch.
 fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String {
-    let recorded_arch =
-        wheel_composition_device_target(manifest.wheel_composition.as_ref()).map(str::to_owned);
-    raw_arch_agreeing_with_family(recorded_arch, &manifest.family)
-        .unwrap_or_else(|| manifest.family.clone())
+    let recorded_arch = wheel_composition_device_target(manifest.wheel_composition.as_ref());
+    family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
 fn resolve_latest_for_manifest(
@@ -1518,10 +1532,16 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
+    // for the next layout, which needs an exact arch before it can query
+    // package metadata at all. Recover it into the family override up front.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
-        family_override,
+        recovered_family_override.as_deref(),
         &wheel_compatibility,
         version_selector,
         layout_override,
@@ -2064,13 +2084,20 @@ fn resolve_pip_runtime_from_index(
                 );
                 format!("no TheRock rocm package was found for {requested} in {index_url}")
             })?;
+        // The canonical branch below budgets one `download_timeout_secs` per
+        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
+        // fetches). `uv pip compile` resolves that same four-package metadata
+        // set in one subprocess call, so it needs a comparable aggregate
+        // budget, not the single-fetch one — reusing the bare per-fetch value
+        // here would make a startup check that budgets 2s per fetch reliably
+        // time out a call doing 4 fetches' worth of work.
         resolve_published_pip_package_versions(
             paths,
             index_url,
             &rocm_version,
             device_target,
             wheel_compatibility,
-            download_timeout_secs,
+            download_timeout_secs.map(|secs| secs.saturating_mul(4)),
         )?
     } else {
         let torch_versions = load_simple_index_versions(
@@ -2547,6 +2574,11 @@ fn resolve_published_pip_package_versions(
                 uv.display()
             )
         })?;
+    // ponytail: written before `wait_with_output_bounded` spawns its stdout/
+    // stderr reader threads, so a child that fills its stdout pipe before this
+    // write returns would deadlock outside the timeout below. `requirements`
+    // is a handful of short lines today; move the write onto its own thread
+    // (or start the readers first) if it ever grows enough to matter.
     child
         .stdin
         .take()
@@ -5547,10 +5579,19 @@ mod tests {
     /// drift from what `normalize_therock_family` maps back to `gfx103X-dgpu`;
     /// a family manifests under is worthless if the catalog's own alias for it
     /// no longer round-trips.
+    ///
+    /// The first assertion is the one that actually pins the rename:
+    /// `normalize_therock_family` already maps *both* `gfx103X-dgpu` and its
+    /// `gfx103X-all` alias back to `gfx103X-dgpu` (that is the whole point of
+    /// the alias), so asserting only the round-trip's final value passes
+    /// identically whether or not `tarball_family_token` renames anything —
+    /// it does not distinguish the rename from its absence.
     #[test]
     fn next_tarball_family_token_round_trips_through_normalize_therock_family() {
+        let token = tarball_family_token(SourceLayout::Next, "gfx103X-dgpu");
+        assert_eq!(token, "gfx103X-all");
         assert_eq!(
-            normalize_therock_family(tarball_family_token(SourceLayout::Next, "gfx103X-dgpu")),
+            normalize_therock_family(token),
             Some("gfx103X-dgpu".to_owned())
         );
     }
@@ -6613,15 +6654,23 @@ mod tests {
             .expect("spawn sleep")
     }
 
+    // `timeout.exe` refuses to run at all with its stdin redirected (it demands
+    // a real console even with `/nobreak`), exiting immediately instead of
+    // sleeping — which used to make both tests below pass or fail for the
+    // wrong reason. `Start-Sleep` has no such requirement.
     #[cfg(windows)]
     fn spawn_test_sleep(seconds: u64) -> std::process::Child {
-        Command::new("cmd")
-            .args(["/C", "timeout", "/t", &seconds.to_string(), "/nobreak"])
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Start-Sleep -Seconds {seconds}"),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn timeout")
+            .expect("spawn Start-Sleep")
     }
 
     /// A budget-constrained caller (the startup update check) must get its
