@@ -1,4 +1,5 @@
-# Ruff configuration for the Python helper scripts (scripts/) and engine workers.
+# Ruff configuration for the repository's Python files: the helper scripts in
+# scripts/ and the Sphinx config in docs/rocm-docs/. (engines/ is Rust-only.)
 # Formatting uses Ruff's defaults (88-column, double quotes), which the
 # `ruff-format` pre-commit hook enforces.
 
@@ -15,7 +16,36 @@ select = [
     "SIM", # flake8-simplify
     "C4",  # flake8-comprehensions
     "RUF", # Ruff-specific rules
+    "ARG", # flake8-unused-arguments
+    "BLE", # flake8-blind-except
+    "SLF", # flake8-self (private-member access)
+    "PL",  # Pylint (PLC/PLE/PLR/PLW)
 ]
 ignore = [
     "E501", # line length is enforced by the formatter; long comments/URLs are fine
+    #
+    # Pylint refactor metrics. These are standalone operational scripts: their
+    # entry points, self-tests and archive/probe validation helpers are
+    # deliberately long and linear rather than split behind indirection. Mirrors
+    # the `too_many_lines` allow that Cargo.toml grants clippy for the same reason.
+    "PLR0911", # too-many-return-statements: early returns beat a nested result variable
+    "PLR0912", # too-many-branches: entry-point and validation flows are deliberately linear
+    "PLR0913", # too-many-arguments: mostly keyword-only subprocess, HTTP, workflow-builder and config helpers
+    "PLR0915", # too-many-statements: splitting these entry points and self-tests adds no clarity
+    "PLR2004", # magic-value-comparison: HTTP statuses, byte sizes, mode bits, lengths, time budgets and self-test literals are clearer inline
 ]
+
+[lint.per-file-ignores]
+# Blind excepts in the GPU, SDK-install and TUI test harnesses are intentional
+# last-resort handlers: each reports the error, hands it to the owning thread,
+# keeps it for the eventual timeout message, or — in a teardown path —
+# deliberately ignores it, so a probe or cleanup failure ends in a clear
+# diagnostic instead of an unhandled traceback. Scoped per file so a blind
+# except added to the build, release or docs config still fails lint.
+"scripts/comfyui_therock_gpu_test.py" = ["BLE001"] # blind-except
+"scripts/therock_sdk_install_test.py" = ["BLE001"] # blind-except
+"scripts/vllm_therock_gpu_test.py" = ["BLE001"]    # blind-except
+# The PTY harness needs the same allowance, and additionally imports winpty on
+# Windows and fcntl/pty/struct/termios on POSIX inside the platform branch;
+# neither set can be imported on the other OS.
+"scripts/tui_e2e_smoke.py" = ["BLE001", "PLC0415"] # blind-except + import-outside-top-level
