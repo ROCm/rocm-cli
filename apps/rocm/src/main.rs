@@ -15520,6 +15520,10 @@ enum StopFailureRemedy {
     /// The background helper is still alive, so it can restart what was just
     /// stopped. It has to go before anything is removed.
     StopTheDaemon,
+    /// The helper's runtime-state file does not parse, so no pid was ever
+    /// recovered from it — "kill that pid" is advice nobody can act on. The file
+    /// itself has to be repaired or deleted, so the remedy names it.
+    RepairTheDaemonState,
 }
 
 /// How long the gate waits for a still-listening endpoint to say what it serves.
@@ -15539,6 +15543,18 @@ struct ManagedServiceStopReport {
     /// an unverifiable process, or a record too corrupt to locate one. Uninstall
     /// must abort rather than remove the tooling that stops them.
     failed: Vec<FailedManagedServiceStop>,
+}
+
+/// The failure recorded when the background helper is live but cannot be proven
+/// to be `rocmd`, so it was deliberately left alone.
+fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
+    FailedManagedServiceStop {
+        service_id: format!("rocmd (pid {daemon_pid})"),
+        reason: "the background helper's identity could not be verified, so it was left running \
+                 rather than risk signalling an unrelated process that inherited its pid"
+            .to_owned(),
+        remedy: StopFailureRemedy::StopTheDaemon,
+    }
 }
 
 /// Stop the background helper before uninstall stops the services it supervises.
@@ -15567,18 +15583,6 @@ struct ManagedServiceStopReport {
 /// On a platform without `/proc` no start-time exists to record or compare, so
 /// this degrades to the same best-effort match the managed-service kills already
 /// use there rather than making uninstall unusable whenever the daemon is up.
-/// The failure recorded when the background helper is live but cannot be proven
-/// to be `rocmd`, so it was deliberately left alone.
-fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
-    FailedManagedServiceStop {
-        service_id: format!("rocmd (pid {daemon_pid})"),
-        reason: "the background helper's identity could not be verified, so it was left running \
-                 rather than risk signalling an unrelated process that inherited its pid"
-            .to_owned(),
-        remedy: StopFailureRemedy::StopTheDaemon,
-    }
-}
-
 fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -15594,13 +15598,17 @@ fn stop_background_helper_before_uninstall(
         Ok(Some(state)) => state,
         Ok(None) => return,
         Err(error) => {
+            // Name the file, not a pid: nothing parsed, so no pid was ever
+            // recovered and "kill that pid" would be advice nobody can follow.
+            // Repairing or deleting this file is the only action that clears it,
+            // and uninstall has no `--force`, so the abort has to say so.
             report.failed.push(FailedManagedServiceStop {
-                service_id: "rocmd (runtime state unreadable)".to_owned(),
+                service_id: format!("rocmd ({})", paths.automation_state_path().display()),
                 reason: format!(
                     "the background helper's runtime state could not be read, so it cannot be \
                      confirmed stopped: {error:#}"
                 ),
-                remedy: StopFailureRemedy::StopTheDaemon,
+                remedy: StopFailureRemedy::RepairTheDaemonState,
             });
             return;
         }
@@ -15969,6 +15977,21 @@ fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Result<Option<St
                  uninstall."
                     .to_owned(),
             );
+        }
+        let unreadable_daemon_state = report
+            .failed
+            .iter()
+            .filter(|failure| failure.remedy == StopFailureRemedy::RepairTheDaemonState)
+            .map(|failure| failure.service_id.clone())
+            .collect::<Vec<_>>();
+        if !unreadable_daemon_state.is_empty() {
+            remedies.push(format!(
+                "The background helper's runtime state does not parse, so no pid could be read \
+                 from it and `rocm` cannot tell whether the helper is running. Check for a live \
+                 `rocmd` process and stop it, then repair or delete the file and re-run \
+                 uninstall: {}.",
+                unreadable_daemon_state.join(", ")
+            ));
         }
         let unreadable = report
             .failed
@@ -31066,12 +31089,28 @@ ID_LIKE="suse opensuse"
             report
                 .failed
                 .iter()
-                .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon),
+                .any(|failure| failure.remedy == StopFailureRemedy::RepairTheDaemonState),
             "an unreadable runtime state must abort the uninstall: {report:?}"
         );
+        let error = uninstall_removal_gate(&report)
+            .expect_err("the gate must refuse to remove anything")
+            .to_string();
+        // The abort has to be followable. No pid was ever parsed out of this
+        // file, so "kill that pid" would be a dead end — uninstall has no
+        // `--force`, and repairing or deleting the named file is the only way
+        // out.
+        let state_path = paths.automation_state_path();
         assert!(
-            uninstall_removal_gate(&report).is_err(),
-            "the gate must refuse to remove anything"
+            error.contains(&state_path.display().to_string()),
+            "the abort must name the file to repair or delete: {error}"
+        );
+        assert!(
+            error.contains("repair or delete"),
+            "the abort must say what to do with it: {error}"
+        );
+        assert!(
+            !error.contains("kill that pid"),
+            "no pid was ever read from this file, so that advice cannot be followed: {error}"
         );
         let _ = fs::remove_dir_all(root);
     }

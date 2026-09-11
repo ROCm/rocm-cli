@@ -7824,15 +7824,81 @@ mod tests {
             .collect()
     }
 
+    /// Linux/unix: relies on a rename replacing the directory entry while an
+    /// already-open descriptor keeps reading the previous inode. Windows
+    /// publishes through `ReplaceFileW` and does not offer the same observation.
+    #[cfg(unix)]
     #[test]
-    fn a_service_record_is_published_atomically() {
+    fn a_service_record_write_never_shows_a_reader_a_truncated_manifest() {
         // `ManagedServiceRecord::write` runs on the uninstall stop path, where a
         // torn manifest is not a lost update but an unparseable record that makes
-        // the gate refuse to remove anything. Reverting it to a plain `fs::write`
-        // would restore that hazard silently, so pin the atomic behaviour at the
-        // record level and not only on the helper: no reader ever observes a
-        // partial file, and no scratch sibling is left in the services directory
-        // for `unreadable_service_manifests` to trip over.
+        // the gate refuse to remove anything.
+        //
+        // Asserting "the bytes landed" would not pin that: a plain `fs::write`
+        // also leaves correct final bytes and creates no scratch file, so such a
+        // test passes either way. The property only the atomic path has is what a
+        // *concurrent reader* sees — `fs::write` truncates the existing inode in
+        // place, so a reader holding it open watches the record disappear and
+        // come back, while the publish swaps in a new inode and leaves the old
+        // one whole. Hold the manifest open across a rewrite and require the old
+        // view to still be a complete, parseable record.
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = atomic_write_root("service-record-reader-safety");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-reader-safety",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().expect("seed the manifest");
+
+        // A reader that opened the manifest before the rewrite began.
+        let mut reader = fs::File::open(&record.manifest_path).expect("open the manifest");
+
+        record.status = "stopped".to_owned();
+        record.write().expect("rewrite the manifest");
+
+        reader.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut seen = Vec::new();
+        reader
+            .read_to_end(&mut seen)
+            .expect("read the open manifest");
+        let parsed: ManagedServiceRecord = serde_json::from_slice(&seen)
+            .expect("a reader holding the manifest open must never see a truncated document");
+        assert_eq!(
+            parsed.status, "ready",
+            "the open descriptor must still see the pre-write record, not a rewritten inode"
+        );
+
+        // And the published file is the new one.
+        let published: ManagedServiceRecord =
+            serde_json::from_slice(&fs::read(&record.manifest_path).expect("read back"))
+                .expect("the published manifest must parse");
+        assert_eq!(published.status, "stopped", "the rewrite must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_service_record_is_published_atomically() {
+        // Companion to the reader-safety test above: the services directory must
+        // not accumulate scratch siblings, because `unreadable_service_manifests`
+        // treats stray files there as records it cannot parse.
         let root = atomic_write_root("service-record-publish");
         let paths = AppPaths {
             config_dir: root.join("config"),
