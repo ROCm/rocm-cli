@@ -808,6 +808,15 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
+          # See e2e-gpu-strix-windows in e2e-selfhosted.yml: the harness's own
+          # isolate_env() derives HF_HOME/PIP_CACHE_DIR/ROCM_CLI_CACHE_DIR from
+          # this per scenario. Without it every serve scenario here re-downloads
+          # its model checkpoint cold, which raced serve-08's readiness timeout
+          # (EAI-8031 / #260) on every nightly run — this host was never actually
+          # warm for it, since Windows doesn't set HOME by default and the
+          # engine's cache lookup didn't fall back to USERPROFILE.
+          $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
+
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
           # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
