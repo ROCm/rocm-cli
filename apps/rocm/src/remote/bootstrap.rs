@@ -130,6 +130,21 @@ pub(crate) fn ensure_ready_with(
 ) -> Result<String> {
     let readiness = probe(transport)?;
 
+    // Checked before anything else runs, including a ROCm install below — not
+    // just before the model starts. The endpoint is published by the remote's
+    // own Tailscale; without it, a `--install-rocm` run would still install
+    // ROCm (minutes, possibly a reboot), mint and store a credential, and start
+    // a model, only to fail at `publish::publish` afterwards. Hoisted above the
+    // `rocm_present` branch so it guards both paths, not just the one where
+    // ROCm is already there.
+    if !readiness.tailscale_present {
+        bail!(
+            "{target} has no Tailscale, so it cannot publish an endpoint.\n\
+             `rocm remote` reaches a model over the tailnet, not through this machine.\n\
+             Install Tailscale there and run `tailscale up`, then try again."
+        );
+    }
+
     if !readiness.rocm_present {
         if !install_rocm {
             bail!(
@@ -146,17 +161,6 @@ pub(crate) fn ensure_ready_with(
         // the machine a second time, and a hiccup during that redundant install
         // failed the whole command after ROCm was already in place.
         return install_rocm_on(transport, target, channel, &readiness);
-    }
-
-    if !readiness.tailscale_present {
-        // Checked before the model starts, not after. The endpoint is published
-        // by the remote's own Tailscale; without it a started model would be
-        // unreachable and untracked.
-        bail!(
-            "{target} has ROCm but no Tailscale, so it cannot publish an endpoint.\n\
-             `rocm remote` reaches a model over the tailnet, not through this machine.\n\
-             Install Tailscale there and run `tailscale up`, then try again."
-        );
     }
 
     match readiness.cli {
@@ -287,6 +291,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cannot publish an endpoint"), "{error}");
+    }
+
+    #[test]
+    fn install_rocm_does_not_skip_the_tailscale_check() {
+        // On a machine with neither ROCm nor Tailscale, `--install-rocm` must
+        // still refuse here rather than running a multi-minute ROCm install,
+        // minting a credential, and starting a model, only to fail afterwards
+        // at `publish::publish`.
+        let transport = ScriptedTransport::new(vec![
+            ScriptedStep::fails("rocm --version", 127, "not found"),
+            ScriptedStep::fails("command -v rocminfo", 1, ""),
+            ScriptedStep::fails("command -v tailscale", 1, ""),
+            ScriptedStep::ok("uname -s", "Linux\nx86_64\n"),
+        ]);
+        let error = ensure_ready_with(&transport, "gpu-box", "release", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot publish an endpoint"), "{error}");
+        assert!(
+            !transport.calls().iter().any(|call| matches!(
+                call,
+                crate::remote::transport::TransportCall::Exec { command, .. }
+                    if command.contains("install.sh")
+            )),
+            "ROCm install must not run before the Tailscale check: {:?}",
+            transport.calls()
+        );
     }
 
     #[test]
