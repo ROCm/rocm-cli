@@ -496,9 +496,12 @@ fn host_has_usable_gpu_with_mask(
 ///
 /// It must answer the same "how many devices are PRESENT" question the product's
 /// `--gpu` validation is built on, which is why it reads sysfs rather than
-/// counting `amd-smi list`: amd-smi honours `ROCR_VISIBLE_DEVICES`, and masking
-/// is exactly what the scenarios gated on this do. The combine rule is
-/// unit-tested below; the sysfs readers are not (they need a real host).
+/// counting `amd-smi list`. `amd-smi list` is a different answer: it is a
+/// best-effort subprocess the product only falls back to, it is absent on hosts
+/// that serve fine without it, and it can disagree with KFD+DRM (see
+/// `combine_amd_gpu_counts`). Gating on it would skip these scenarios wherever
+/// amd-smi is not installed. The combine rule is unit-tested below; the sysfs
+/// readers are not (they need a real host).
 #[cfg(target_os = "linux")]
 fn probe_amd_gpu_count() -> Option<usize> {
     combine_amd_gpu_counts(kfd_gpu_node_count(), drm_amdgpu_card_count())

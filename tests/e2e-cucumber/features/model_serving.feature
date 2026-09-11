@@ -224,15 +224,34 @@ Feature: Model serving
   # `usable_amd_gpu_indices_from` cannot resolve the visible set and reports
   # "unknown" (`None`) rather than an authoritative answer. On a SINGLE-GPU host
   # `ROCR_VISIBLE_DEVICES=1` is exactly that shape, and `--gpu` validation then
-  # falls back to the detected count — itself unknown there, because amd-smi
-  # honours the same mask — so the serve is ALLOWED, not refused. That permissive
-  # fallback is deliberate (an unprobeable host must not be blocked from serving)
-  # and EAI-7194 does not change it, so the refusal is only asserted where a
-  # second device makes the mask resolvable. Sibling scenario serve-19 uses a
-  # `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible set
-  # resolves on one GPU too and it stays ungated.
+  # falls back to `detect_gpu_count()`'s best-effort `amd-smi list` count. That
+  # count does NOT honour the mask (amd-smi reads sysfs/KFD, not ROCr), so where
+  # amd-smi is installed it answers 1 and the ordinal is refused as "out of
+  # range"; where amd-smi is absent or unparseable it answers `None` and the serve
+  # is ALLOWED, not refused — which is what the single-GPU lane observed. So the
+  # outcome on one GPU turns on whether amd-smi happens to be present, and only a
+  # second device makes the refusal follow from the mask itself. The permissive
+  # unknown-mask fallback is deliberate (an unprobeable host must not be blocked
+  # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
+  # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
+  # set resolves on one GPU too and it stays ungated.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
+
+  # Both visibility variables at once (EAI-7194): they compose, they are not
+  # alternatives. ROCr applies first and HIP only re-indexes and selects among the
+  # survivors, so `ROCR_VISIBLE_DEVICES=` (hide everything) leaves HIP nothing to
+  # see and `HIP_VISIBLE_DEVICES=0` cannot bring a device back. The GPU-required
+  # serve must therefore refuse, exactly as serve-15 does for a HIP-only empty
+  # mask. Before the fix the probe preferred the HIP mask and discarded the ROCR
+  # one entirely, resolved the visible set to [0], and let the serve proceed onto a
+  # device the runtime had already hidden. Runs on GPU hardware: on a no-GPU host
+  # the same refusal fires for having no device at all and would prove nothing.
+  @id:serve-rocr-empty-mask-beats-hip-mask @requires-gpu @requires-os:linux
+  Scenario: serve-21 - Serving is refused when ROCR hides every GPU a HIP mask names
+    When the user serves a model with ROCR hiding every GPU a HIP mask names
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected

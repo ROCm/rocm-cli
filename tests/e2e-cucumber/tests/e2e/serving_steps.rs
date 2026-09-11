@@ -935,9 +935,10 @@ async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
 /// (EAI-7194) — not read as the physical token and wrongly accepted.
 ///
 /// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
-/// device that is not there: the visible set cannot be resolved, `--gpu`
-/// validation takes its permissive unprobeable-host fallback, and the serve is
-/// allowed rather than refused. See the scenario comment in
+/// device that is not there: the visible set cannot be resolved and `--gpu`
+/// validation falls back to amd-smi's best-effort count, which does not honour
+/// the mask — so the outcome there depends on whether amd-smi is installed
+/// rather than on the mask. See the scenario comment in
 /// `features/model_serving.feature` for the full note on that gap.
 #[when("the user serves a model pinned past the ROCR-reindexed visible set")]
 async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
@@ -946,6 +947,24 @@ async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
         world,
         &["serve", model, "--engine", engine, "--gpu", "1"],
         &[("ROCR_VISIBLE_DEVICES", "1")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with both visibility variables set: `ROCR_VISIBLE_DEVICES=` hides every
+/// device at the ROCr level, and `HIP_VISIBLE_DEVICES=0` names an ordinal in the
+/// (now empty) set ROCr leaves behind. The two compose in that order, so the HIP
+/// mask cannot resurrect a device and the GPU-required serve must refuse
+/// (EAI-7194) — not read the HIP mask as though it were the only one set.
+#[when("the user serves a model with ROCR hiding every GPU a HIP mask names")]
+async fn user_serves_with_rocr_hiding_hip_named_gpus(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine],
+        &[("ROCR_VISIBLE_DEVICES", ""), ("HIP_VISIBLE_DEVICES", "0")],
     );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);

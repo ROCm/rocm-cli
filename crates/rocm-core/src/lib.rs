@@ -5045,58 +5045,87 @@ fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
         .is_ok_and(|version| version != 0)
 }
 
-/// A GPU visibility mask read from the environment, tagged with which variable
-/// produced it. The source matters for how the surviving devices are numbered:
+/// The GPU visibility mask read from the environment: both variables, kept
+/// separately because they apply at different layers and in a fixed order.
 /// `ROCR_VISIBLE_DEVICES` masks at the ROCr level and HIP then re-indexes the
-/// survivors as `0..N`, whereas `HIP_VISIBLE_DEVICES` values are already in that
-/// HIP-ordinal space. See [`usable_amd_gpu_indices_from`].
+/// survivors as `0..N`; `HIP_VISIBLE_DEVICES` selects *within* that re-indexed
+/// set. Collapsing the two into one "winning" value loses the composition and
+/// makes HIP tokens look like physical ordinals. See
+/// [`usable_amd_gpu_indices_from`].
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
 struct GpuVisibilityMask {
-    value: String,
-    /// True when the mask came from `ROCR_VISIBLE_DEVICES` (with no
-    /// `HIP_VISIBLE_DEVICES` override), so its physical token ordinals must be
-    /// re-indexed into HIP space before they can be selected/exported.
-    rocr_reindexed: bool,
+    /// `ROCR_VISIBLE_DEVICES`, when set. Its tokens are physical ordinals.
+    rocr: Option<String>,
+    /// `HIP_VISIBLE_DEVICES`, when set. Its tokens are ordinals in the space ROCr
+    /// leaves behind — the same as physical ordinals only when `rocr` is unset.
+    hip: Option<String>,
 }
 
-/// The active GPU visibility mask, preferring `HIP_VISIBLE_DEVICES` then
-/// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
-/// is returned with an empty string so callers can distinguish "unset" (all
-/// visible) from "set to nothing" (all masked out). The returned mask records
-/// whether it came from `ROCR_VISIBLE_DEVICES`, which decides whether its
-/// ordinals need HIP re-indexing.
+/// The active GPU visibility mask: whichever of `ROCR_VISIBLE_DEVICES` and
+/// `HIP_VISIBLE_DEVICES` are set, and both when both are. `None` when neither is
+/// set; an explicitly empty value is carried through as an empty string so
+/// callers can distinguish "unset" (all visible) from "set to nothing" (all
+/// masked out).
 ///
 /// Linux-only: its sole caller is the Linux probe. (Not `+ test` — no test
 /// references it directly, so compiling it into a non-Linux test build would be
 /// dead code, which the workspace lints deny.)
 #[cfg(target_os = "linux")]
 fn visibility_mask_from_env() -> Option<GpuVisibilityMask> {
-    if let Some(value) = std::env::var_os("HIP_VISIBLE_DEVICES") {
-        return Some(GpuVisibilityMask {
-            value: value.to_string_lossy().into_owned(),
-            rocr_reindexed: false,
-        });
+    let read = |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let mask = GpuVisibilityMask {
+        rocr: read("ROCR_VISIBLE_DEVICES"),
+        hip: read("HIP_VISIBLE_DEVICES"),
+    };
+    if mask.rocr.is_none() && mask.hip.is_none() {
+        return None;
     }
-    std::env::var_os("ROCR_VISIBLE_DEVICES").map(|value| GpuVisibilityMask {
-        value: value.to_string_lossy().into_owned(),
-        rocr_reindexed: true,
-    })
+    Some(mask)
 }
 
-/// Apply a visibility `mask` to the present device ordinals (`0..present`).
-/// `None` means no mask is set (every present device is visible). An empty value
-/// hides every device. A nonempty mask containing UUIDs or invalid ordinals
-/// returns `None`: the ordinal-only probe cannot interpret it authoritatively,
-/// so callers must not mistake it for "no GPU".
+/// The tokens of `mask` naming a device in `0..count`, de-duplicated and in mask
+/// order. An empty mask yields an empty set (every device hidden). `None` when
+/// the mask cannot be interpreted by ordinal alone — a UUID token, or an ordinal
+/// outside `0..count` — so callers must not mistake it for "no GPU".
+#[cfg(any(target_os = "linux", test))]
+fn mask_tokens_within(count: usize, mask: &str) -> Option<Vec<u32>> {
+    if mask.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut visible = Vec::new();
+    for token in mask.split(',') {
+        let index = token.trim().parse::<u32>().ok()?;
+        if (index as usize) >= count {
+            return None;
+        }
+        if !visible.contains(&index) {
+            visible.push(index);
+        }
+    }
+    Some(visible)
+}
+
+/// Apply the visibility `mask` to the present device ordinals (`0..present`).
+/// A `None` `mask` means no mask is set (every present device is visible); a
+/// `None` *return* means the mask could not be interpreted authoritatively, so
+/// callers must not mistake it for "no GPU".
 ///
 /// The returned ordinals are always in HIP space — the space rocm-cli pins its
-/// selection through `HIP_VISIBLE_DEVICES`. For a `HIP_VISIBLE_DEVICES` mask the
-/// tokens are already HIP ordinals and are kept as-is. For a
-/// `ROCR_VISIBLE_DEVICES` mask the tokens are physical ordinals that ROCr hides
-/// below HIP, which then re-indexes the survivors as `0..N`; returning the raw
-/// physical tokens would make `--gpu` validation reject the ordinals that
-/// actually bind and accept ones that do not, so they are re-indexed here.
+/// selection through `HIP_VISIBLE_DEVICES`. The two variables are therefore
+/// composed in the order the runtime applies them, not treated as alternatives:
+///
+/// 1. `ROCR_VISIBLE_DEVICES` hides physical devices *below* HIP, which then
+///    re-indexes the survivors as `0..N`. Returning the raw physical tokens would
+///    make `--gpu` validation reject the ordinals that actually bind and accept
+///    ones that do not.
+/// 2. `HIP_VISIBLE_DEVICES` then selects within that `0..N` space. Its tokens are
+///    already HIP ordinals and are kept as-is — but they must be range-checked
+///    against `N`, not against `present`: under an active ROCR mask a HIP token
+///    can sit below the physical count and still name no device HIP can see
+///    (EAI-7194). Checking it against `present` accepted a `--gpu` ordinal that
+///    cannot bind, and steered `--gpu auto` onto it — the exact failure this
+///    composition exists to prevent, reached through the other variable.
 #[cfg(any(target_os = "linux", test))]
 fn usable_amd_gpu_indices_from(
     present: usize,
@@ -5105,26 +5134,25 @@ fn usable_amd_gpu_indices_from(
     let Some(mask) = mask else {
         return Some((0..present as u32).collect());
     };
-    if mask.value.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut visible = Vec::new();
-    for token in mask.value.split(',') {
-        let index = token.trim().parse::<u32>().ok()?;
-        if (index as usize) >= present {
-            return None;
+    // How many devices HIP can see at all: the ROCr survivors, or every present
+    // device when no ROCR mask is set.
+    let hip_space = match mask.rocr.as_deref() {
+        None => present,
+        Some(rocr) => {
+            let survivors = mask_tokens_within(present, rocr)?;
+            if survivors.is_empty() {
+                // ROCr hid every device, so there is nothing for HIP to select
+                // from whatever HIP_VISIBLE_DEVICES names. Authoritatively empty.
+                return Some(Vec::new());
+            }
+            survivors.len()
         }
-        if !visible.contains(&index) {
-            visible.push(index);
-        }
-    }
-    if mask.rocr_reindexed {
-        // ROCR-hidden survivors are seen by HIP as 0..N, and rocm-cli selects and
-        // exports through HIP_VISIBLE_DEVICES on top of ROCR, so the selectable
-        // ordinals are those HIP positions, not the physical ROCR token values.
-        return Some((0..visible.len() as u32).collect());
-    }
-    Some(visible)
+    };
+    let Some(hip) = mask.hip.as_deref() else {
+        // No HIP mask: every device HIP can see is selectable, numbered 0..N.
+        return Some((0..hip_space as u32).collect());
+    };
+    mask_tokens_within(hip_space, hip)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -12225,13 +12253,7 @@ last_installed_runtime_id = "therock-release"
         // An explicit empty mask still wins, so a user can opt out on WSL as
         // anywhere — HIP_VISIBLE_DEVICES="" hides the device.
         assert_eq!(
-            usable_amd_gpu_indices_from(
-                usize::from(true),
-                Some(GpuVisibilityMask {
-                    value: String::new(),
-                    rocr_reindexed: false
-                })
-            ),
+            usable_amd_gpu_indices_from(usize::from(true), hip_mask("")),
             Some(vec![])
         );
     }
@@ -12267,21 +12289,30 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(usable_amd_gpu_indices_from(3, None), Some(vec![0, 1, 2]));
     }
 
-    /// A `HIP_VISIBLE_DEVICES`-sourced mask: its ordinals are already in HIP space
-    /// and are used as-is.
+    /// Only `HIP_VISIBLE_DEVICES` set: its ordinals are already in HIP space and
+    /// are used as-is.
     fn hip_mask(value: &str) -> Option<GpuVisibilityMask> {
         Some(GpuVisibilityMask {
-            value: value.to_owned(),
-            rocr_reindexed: false,
+            rocr: None,
+            hip: Some(value.to_owned()),
         })
     }
 
-    /// A `ROCR_VISIBLE_DEVICES`-sourced mask: its physical ordinals are
-    /// re-indexed into HIP space (survivors become `0..N`).
+    /// Only `ROCR_VISIBLE_DEVICES` set: its physical ordinals are re-indexed into
+    /// HIP space (survivors become `0..N`).
     fn rocr_mask(value: &str) -> Option<GpuVisibilityMask> {
         Some(GpuVisibilityMask {
-            value: value.to_owned(),
-            rocr_reindexed: true,
+            rocr: Some(value.to_owned()),
+            hip: None,
+        })
+    }
+
+    /// Both variables set. ROCr applies first and HIP re-indexes the survivors,
+    /// so `hip`'s tokens are ordinals *within* `rocr`'s survivor list.
+    fn rocr_then_hip_mask(rocr: &str, hip: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            rocr: Some(rocr.to_owned()),
+            hip: Some(hip.to_owned()),
         })
     }
 
@@ -12344,5 +12375,63 @@ last_installed_runtime_id = "therock-release"
         );
         // An out-of-range token is still "cannot interpret", regardless of source.
         assert_eq!(usable_amd_gpu_indices_from(2, rocr_mask("5")), None);
+    }
+
+    #[test]
+    fn a_hip_mask_under_a_rocr_mask_is_bounded_by_the_rocr_survivors() {
+        // EAI-7194, second half: both variables set. ROCr applies first and HIP
+        // re-indexes the survivors as 0..N, so HIP tokens are ordinals within that
+        // reduced set — NOT physical ordinals. Range-checking them against the
+        // physical `present` accepted ordinals that cannot bind.
+        //
+        // 4 GPUs present, ROCR=2,3 leaves two devices HIP numbers 0 and 1.
+        // HIP=3 names nothing HIP can see, even though 3 < 4 physically: the probe
+        // cannot resolve the visible set and must say "unknown", not confidently
+        // hand back [3] for `--gpu 3` to be accepted against and `--gpu auto` to be
+        // steered onto.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "3")),
+            None
+        );
+        // The same shape one ordinal lower is a real device: HIP ordinal 1 is the
+        // second ROCr survivor (physical 3), and it stays selectable.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "1")),
+            Some(vec![1])
+        );
+        // Selecting every survivor keeps both re-indexed ordinals.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "1,0")),
+            Some(vec![1, 0])
+        );
+        // A one-device ROCr set leaves only HIP ordinal 0; ordinal 1 is unknown,
+        // not physical ordinal 1.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("3", "0")),
+            Some(vec![0])
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("3", "1")),
+            None
+        );
+        // Either variable hiding everything is authoritative: an empty ROCR mask
+        // leaves HIP nothing to select, so a HIP mask cannot resurrect a device.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("", "0")),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "")),
+            Some(Vec::new())
+        );
+        // An uninterpretable ROCR mask is still "unknown" whatever HIP says.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("GPU-deadbeef", "0")),
+            None
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, rocr_then_hip_mask("5", "0")),
+            None
+        );
     }
 }
