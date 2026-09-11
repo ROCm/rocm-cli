@@ -176,6 +176,15 @@ Feature: Runtime configuration
     Then the SDK preview reports canonical release provenance
     And the SDK preview requests the device payload for this host's GPU
 
+  # `rollback` can only ever undo one step, not walk a history. A unit test on
+  # `render_long_help()` proves clap renders the NOTE, but not that the built
+  # binary prints it to a real user (examine.feature:15-18 sets this precedent
+  # for `--help` text). No runtime state needed, so this runs on the mock lane.
+  @id:runtime-rollback-help-states-single-level-limit
+  Scenario: runtime-10 - Stating rollback's single-level limit in --help
+    When the user asks for rollback help
+    Then the help states that rollback has no history
+
   # Installing over the active default managed runtime must not silently
   # displace it. Outside an interactive terminal (as every e2e invocation
   # is here), `install sdk` without `--yes` must refuse rather than proceed.
@@ -188,20 +197,20 @@ Feature: Runtime configuration
   # What the refusal does bail before is the SDK and torch download and any
   # change on disk.
   @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
-  Scenario: runtime-10 - Reinstalling the SDK over an existing runtime without --yes is refused
+  Scenario: runtime-11 - Reinstalling the SDK over an existing runtime without --yes is refused
     Given a managed runtime is active
     When the user reinstalls the SDK without confirming
     Then the reinstall is refused
     And the error explains that --yes is required
 
-  # Companion to Scenario runtime-10: with --yes the same reinstall proceeds and the
+  # Companion to Scenario runtime-11: with --yes the same reinstall proceeds and the
   # runtime stays registered and active afterward. Nightly-gated in addition to
-  # GPU because, unlike Scenario runtime-10, this exercises a real second SDK install.
+  # GPU because, unlike Scenario runtime-11, this exercises a real second SDK install.
   # The registered/active Thens hold from the Given alone, so the approval Then
   # is what actually distinguishes this from a no-op: it fails if --yes ever
   # regresses to a refusal or silently takes the fresh-install path.
   @id:runtime-install-sdk-overwrite-with-yes @requires-gpu @nightly
-  Scenario: runtime-11 - Reinstalling the SDK over an existing runtime with --yes proceeds
+  Scenario: runtime-12 - Reinstalling the SDK over an existing runtime with --yes proceeds
     Given a managed runtime is active
     When the user reinstalls the SDK with --yes
     Then the install reports that --yes approved replacing the existing runtime
@@ -212,18 +221,18 @@ Feature: Runtime configuration
   # global — whatever finishes installing last becomes the active default, no
   # matter which family it was built for — so installing a family this host has
   # never held displaces the active runtime exactly as a same-family reinstall
-  # does, and has to ask exactly as loudly. Scenario runtime-10 cannot catch
+  # does, and has to ask exactly as loudly. Scenario runtime-11 cannot catch
   # this: it reinstalls the same family, so it passes under both the old
   # family-scoped gate and this one.
   #
-  # No `@nightly` despite the second family: like Scenario runtime-10 this is a
+  # No `@nightly` despite the second family: like Scenario runtime-11 this is a
   # refusal, so it bails before the multi-GiB download and costs a resolve, not
   # an install. The third Then is what separates a correct refusal from an
   # unrelated failure (a bad family name would also exit non-zero and also
   # mention `--yes` in the usage text): only the real gate names the runtime it
   # would replace.
   @id:runtime-install-sdk-other-family-requires-yes @requires-gpu
-  Scenario: runtime-12 - Installing a different GPU family while a runtime is active is refused without --yes
+  Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without --yes
     Given a managed runtime is active
     When the user installs a different GPU family without confirming
     Then the reinstall is refused

@@ -930,3 +930,18 @@ async fn assert_error_names_active_default(world: &mut E2eWorld) {
         "error does not describe the cross-family displacement:\n{stdout}\n{stderr}"
     );
 }
+
+#[when("the user asks for rollback help")]
+async fn ask_rollback_help(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["runtimes", "rollback", "--help"]);
+    world.cli_output = Some(stdout);
+}
+
+#[then("the help states that rollback has no history")]
+async fn rollback_help_states_limit(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        out.contains("rollback has no history"),
+        "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
+    );
+}
