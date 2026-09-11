@@ -71,7 +71,7 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (15 failure modes)
+## Closed catalog (16 failure modes)
 
 | id | OS | Failure mode | Typical signal | Auto-fix |
 | --- | --- | --- | --- | --- |
@@ -90,8 +90,13 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
 | `fix-13-hip-sdk-missing` | windows | HIP SDK not installed | no HIP SDK under Program Files, `hipInfo` not recognized | no |
 | `fix-14-adrenalin-too-old` | windows | Adrenalin / kernel-mode driver too old for the HIP SDK | `hipInfo` can't enumerate, "driver too old", HSA "no agents found" | no |
 | `fix-15-msvc-redist` | windows | MSVC runtime missing (HIP DLLs can't load) | `vcruntime140.dll` / `vcruntime140_1.dll` missing | no |
+| `fix-17-torch-dlpack` | linux | `torch-c-dlpack-ext` loads its CUDA prebuilt on a ROCm torch, aborting vLLM's engine start at import time | vLLM engine start fails on import; error names `torch_c_dlpack_ext` or tvm_ffi's `_optional_torch_c_dlpack` | no |
 
-Linux-only: fix-3, -4, -5, -7, -10, -11, -12. Windows-only: fix-13, -14, -15.
+The numbering has a gap: `fix-16` is a reserved handle, not a missing row. Ids
+are stable handles rather than positions, so the catalog holds 16 modes
+numbered 1-15 and 17.
+
+Linux-only: fix-3, -4, -5, -7, -10, -11, -12, -17. Windows-only: fix-13, -14, -15.
 Cross-platform: fix-1, -2, -6, -8, -9.
 
 ## Framework routing

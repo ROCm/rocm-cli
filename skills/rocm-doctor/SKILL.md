@@ -139,7 +139,7 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   Only the four auto-applicable fixes are ones the CLI runs itself. The other 11
+   Only the four auto-applicable fixes are ones the CLI runs itself. The other 12
    are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
    fix <id>` just prints the plan for the user to run themselves — no prompt, and
    the CLI never performs those.
