@@ -226,15 +226,20 @@ echo "a Funnel-exposed port is refused"
 # The unit tests cover this classification against hand-written fixtures. What
 # they cannot show is that the CLI reads the key the daemon actually writes,
 # which is the whole reason this runs here.
-in_container tailscale funnel --tcp=8000 on
-out="$(rocm remote serve gpu-box test-model || true)"
+#
+# On 443, because that is one of the three ports Funnel can actually serve —
+# the CLI has to be driven at `--tailnet-port 443` to meet the state at all.
+# That is worth knowing on its own: at the default tailnet port of 8000 this
+# guard can never fire, since Funnel cannot listen there.
+in_container tailscale funnel --tcp=443 on
+out="$(rocm remote serve gpu-box test-model --tailnet-port 443 || true)"
 expect_contains "publishing over it is refused" "Tailscale Funnel allowed" "${out}"
-expect_contains "and the way out is named" "tailscale funnel --tcp=8000 off" "${out}"
+expect_contains "and the way out is named" "tailscale funnel --tcp=443 off" "${out}"
 
 serve_config="$(in_container tailscale serve status --json)"
 expect_absent "and nothing was published in spite of the refusal" '"TCPForward"' "${serve_config}"
 
-in_container tailscale funnel --tcp=8000 off
+in_container tailscale funnel --tcp=443 off
 
 echo
 if [[ "${FAILURES}" -eq 0 ]]; then

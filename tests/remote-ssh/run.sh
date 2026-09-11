@@ -238,16 +238,25 @@ expect_json "withdrawing actually removes the forward" '.TCP."8000" == null' \
 # e2e check below mean something: without it, a fake that wrote AllowFunnel in
 # the wrong place would make the CLI look correctly cautious while actually
 # reading nothing.
-remote tailscale funnel --tcp=8000 on
+#
+# 443 rather than 8000: Funnel only serves 443, 8443 and 10000, so an
+# AllowFunnel entry for any other port is a document the daemon cannot produce.
+remote tailscale funnel --tcp=443 on
 funnel_config="$(remote tailscale serve status --json)"
 expect_json "allowing Funnel is keyed host:port, not by port alone" \
-  '.AllowFunnel | keys | length == 1 and (.[0] | endswith(":8000"))' "${funnel_config}"
+  '.AllowFunnel | keys | length == 1 and (.[0] | endswith(":443"))' "${funnel_config}"
 expect_json "and records it as allowed rather than merely present" \
   '.AllowFunnel | to_entries[0].value == true' "${funnel_config}"
 expect_json "and says nothing about a forward, which is a separate question" \
-  '.TCP."8000" == null' "${funnel_config}"
+  '.TCP."443" == null' "${funnel_config}"
 
-remote tailscale funnel --tcp=8000 off
+if remote tailscale funnel --tcp=8000 on 2>/dev/null; then
+  fail "a port Funnel cannot serve is refused" "8000 was accepted"
+else
+  pass "a port Funnel cannot serve is refused"
+fi
+
+remote tailscale funnel --tcp=443 off
 expect_json "turning Funnel off clears the exposure" \
   '(.AllowFunnel // {}) | length == 0' "$(remote tailscale serve status --json)"
 

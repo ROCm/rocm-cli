@@ -304,12 +304,20 @@ fn tempdir_for_download() -> Result<PathBuf> {
     Ok(directory)
 }
 
-/// Create `path` readable only by its owner, with the mode applied *at*
+/// Create `path` accessible only by its owner, with the mode applied *at*
 /// creation.
 ///
-/// Creating first and tightening afterwards leaves the directory world- or
-/// group-readable for the width of the umask, and a staged signing key lands
-/// in here. `DirBuilder::mode` closes that window; this repo already uses the
+/// What lands here is the release archive, its checksum, its signature and a
+/// copy of install.sh — all public material, so the point is not
+/// confidentiality. It is integrity: every one of those is about to be verified
+/// and then shipped to the remote, and another local user able to write into
+/// this directory could swap the archive or the installer in the window between
+/// the download and the check. (The signing key itself never lands here. It
+/// travels in the command prefix, and install.sh writes it into its own
+/// `mktemp -d` on the far side.)
+///
+/// Creating first and tightening afterwards leaves that window open for the
+/// width of the umask. `DirBuilder::mode` closes it; this repo already uses the
 /// same pattern in `dash.rs`'s `create_private_dir`, which documents why.
 ///
 /// Deliberately not recursive: the name carries a nonce, so an existing

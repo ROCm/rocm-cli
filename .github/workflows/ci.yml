@@ -653,8 +653,9 @@ jobs:
     # assumes the real tools behave a certain way. This job checks that
     # assumption against a real OpenSSH server in a container: argument
     # handling, exit-code propagation, stdin delivery of a credential, file
-    # copy, batch-mode refusal, and — the one that matters most — that
-    # withdrawing a published endpoint actually removes it. A publish is
+    # copy, batch-mode refusal, the shape Tailscale Funnel takes in the serve
+    # config, and — the one that matters most — that withdrawing a published
+    # endpoint actually removes it. A publish is
     # configuration rather than a process, so it survives reboots, and a
     # withdrawal that silently does nothing leaves a GPU endpoint exposed with
     # nothing tracking it.

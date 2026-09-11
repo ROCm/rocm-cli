@@ -48,13 +48,15 @@ tests/remote-ssh/run-e2e.sh   # the real binary, end to end
 ```
 
 `run.sh` covers argument handling, exit-code propagation, delivering a
-credential on stdin, file copy, batch-mode refusal, and that withdrawing a
-published endpoint actually removes it.
+credential on stdin, file copy, batch-mode refusal, that withdrawing a
+published endpoint actually removes it, and the shape Tailscale Funnel takes in
+the serve config.
 
 `run-e2e.sh` runs the built `rocm` through the whole flow — discover, probe,
 serve, publish, reconcile status, re-publish after an out-of-band withdrawal,
-tear down — and needs `cargo build -p rocm` first. It does not prove the
-endpoint carries traffic; that needs a real two-node tailnet.
+tear down, and refuse to publish over a Funnel-exposed port — and needs
+`cargo build -p rocm` first. It does not prove the endpoint carries traffic;
+that needs a real two-node tailnet.
 
 The `rocm remote` cucumber scenarios that need a second machine carry
 `@requires-docker` and run only when `E2E_INCLUDE_DOCKER=1`, which the

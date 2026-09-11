@@ -403,8 +403,13 @@ impl Transport for SshTransport {
         }
 
         match written {
-            // Not something a process outcome can explain away: the thread
-            // panicking is a bug on this side of the connection.
+            // A panic here is a bug on this side of the connection, so it is
+            // reported rather than folded into the outcome. Note it is only
+            // reached when the two returns above did not fire: an unreachable
+            // host or an unreadable outcome is the more actionable answer, and
+            // a panic in *this* closure — `write_all`, `drop`, `Ok(())` — is
+            // not something that happens in practice. Grow the closure and
+            // that ordering is worth revisiting.
             Some(Err(_)) => bail!("the stdin writer thread for {} panicked", self.destination),
             Some(Ok(Err(error))) => {
                 // A broken pipe means the remote stopped reading. When the
@@ -414,6 +419,13 @@ impl Transport for SshTransport {
                 // nothing explains the unread payload and it stays an error:
                 // the sole caller's payload is an API key, and a model started
                 // without the key that was meant to guard it is not a success.
+                //
+                // What keeps a *truncated* key from slipping through the first
+                // branch is a property of the caller, not of this function:
+                // `remote_serve_command` puts `IFS= read -r` first in the
+                // remote command, so a broken pipe means the read never
+                // finished, which means the command cannot have exited 0.
+                // Reorder that command and this demotion needs rechecking.
                 let explained_by_the_command =
                     error.kind() == std::io::ErrorKind::BrokenPipe && !output.status.success();
                 if !explained_by_the_command {

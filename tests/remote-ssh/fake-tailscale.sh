@@ -59,6 +59,18 @@ done
 # what makes it a usable fixture: a port can be Funnel-exposed with no forward
 # behind it, or with one, and the CLI has to refuse in both cases.
 if [ "${command}" = "funnel" ]; then
+  # The real daemon serves Funnel on 443, 8443 and 10000 only, and rejects
+  # anything else. Refusing the same ports here keeps the fixture from
+  # encoding an AllowFunnel entry that tailscaled could never emit — a test
+  # that passes against an impossible document proves nothing about the
+  # states the CLI will actually meet.
+  case "${port}" in
+    443|8443|10000) ;;
+    *)
+      echo "fake tailscale: funnel is only supported on ports 443, 8443 and 10000" >&2
+      exit 1
+      ;;
+  esac
   if [ "${off}" -eq 1 ]; then
     jq --arg key "${FUNNEL_HOST}:${port}" \
       'if .AllowFunnel then .AllowFunnel |= del(.[$key]) else . end' \

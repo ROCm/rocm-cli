@@ -756,11 +756,12 @@ fn render_status(
                 // nothing either way about whether the endpoint is published.
                 // Leading with "no" answered a question it had not looked at,
                 // and buried the one thing here that needs acting on.
-                Some(publish::PublishState::FunnelAllowed) =>
+                Some(publish::PublishState::FunnelAllowed) => format!(
                     "exposed — Tailscale Funnel is allowed on that port, which puts it on the \
-                     public internet; run `tailscale funnel --tcp=<port> off` on the remote, \
-                     then check again"
-                        .to_owned(),
+                     public internet; run `tailscale funnel --tcp={} off` on the remote, then \
+                     check again",
+                    record.tailnet_port
+                ),
                 // Both mean "could not tell", and neither may be read as "no":
                 // an endpoint that is still up must never render as one that is
                 // down, or the user stops looking for it.
@@ -1187,6 +1188,44 @@ mod tests {
         assert!(
             rendered.contains("rocm remote attach"),
             "a live model with no endpoint should point at attach, not a restart: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_funnel_exposed_port_is_reported_as_exposure_not_as_a_publish_answer() {
+        // Funnel is classified before anything is asked about our own forward
+        // and short-circuits, so this state says nothing either way about
+        // whether the endpoint is published. Leading the line with "no"
+        // answered a question it had not looked at, and buried the one thing
+        // on it that needs acting on.
+        let record = sample_record();
+        let rendered = render_status(
+            &render_paths(),
+            &[(
+                record.clone(),
+                SessionObservation {
+                    server: ServerHealth::Healthy,
+                    publish: Some(publish::PublishState::FunnelAllowed),
+                },
+            )],
+        );
+        assert!(
+            !rendered.contains("endpoint published: no"),
+            "Funnel exposure must not be rendered as an answer about publishing: {rendered}"
+        );
+        assert!(rendered.contains("exposed"), "{rendered}");
+        assert!(
+            rendered.contains("public internet"),
+            "the reason it matters must be on the line: {rendered}"
+        );
+        // The remedy has to be copy-pasteable, so the real port belongs here
+        // rather than a `<port>` placeholder the user has to substitute.
+        assert!(
+            rendered.contains(&format!(
+                "tailscale funnel --tcp={} off",
+                record.tailnet_port
+            )),
+            "{rendered}"
         );
     }
 
