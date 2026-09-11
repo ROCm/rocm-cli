@@ -160,10 +160,14 @@ enum Command {
     /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
     /// With no id it lists the whole catalog.
     ///
-    /// Fixes are marked AUTO or PRINT-ONLY: AUTO means this command carries the
-    /// change out, PRINT-ONLY means it prints the steps for you to run yourself
-    /// (typically because they need sudo or a reboot). Use `--dry-run` to see any
-    /// fix's plan without changing anything.
+    /// Every fix carries a marker saying what happens on the machine in front of
+    /// you: AUTO means this command carries the change out; NEEDS-ARG means it
+    /// will, once told what to act on; PRINT-ONLY means it prints the steps for
+    /// you to run yourself (typically because they need sudo or a reboot); and
+    /// DIAGNOSE-ONLY means no reliable fix exists and nothing will be changed
+    /// (no catalog entry carries this marker today; it is reserved for a
+    /// future detect-but-cannot-repair failure).
+    /// Use `--dry-run` to see any fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,

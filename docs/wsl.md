@@ -209,8 +209,9 @@ larger and adding the matching `/etc/fstab` line inside the distro.
 
 Every WSL remedy is print-only. `rocm fix <id>` shows the commands and does not
 run them: they either install packages with `sudo`, edit loader configuration, or
-belong to the Windows host, and none of that meets the bar the four
-auto-applicable fixes clear.
+belong to the Windows host, and none of that meets the bar an auto-applied fix
+has to clear. On WSL the CLI carries out exactly one catalog entry itself,
+`fix-6-path`, which is not one of the WSL entries.
 
 Two deliberate silences, so a report can be trusted:
 
