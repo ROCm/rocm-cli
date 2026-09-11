@@ -254,7 +254,8 @@ the JSON report, not the human-readable one.
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--yes] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--yes | --approve-replacing-active-default]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
@@ -268,7 +269,12 @@ the new install takes over as the active default. That gate is not scoped to the
 family or channel you are installing: a `--family` or `--channel` you have never
 installed before takes over the active default just as a same-family upgrade
 does, so it asks too. Pass `--yes` to approve that non-interactively (for example
-in scripts or CI, where the prompt would otherwise refuse). Because the install
+in scripts or CI, where the prompt would otherwise refuse). `--yes` also approves
+installing required system packages (such as OpenMPI for vLLM), which means
+`sudo`; if you want only the first approval — because nothing can answer a sudo
+password prompt where your command runs — pass
+`--approve-replacing-active-default` instead. That is what ROCm CLI's own
+non-interactive surfaces (chat, MCP, the dashboard) pass. Because the install
 root and manifest are keyed by version, an upgrade or downgrade keeps the
 previous install on disk — only a same-version reinstall reuses the same install
 root. `install driver` installs the AMD kernel driver on Linux

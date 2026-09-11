@@ -238,3 +238,18 @@ Feature: Runtime configuration
     Then the reinstall is refused
     And the error explains that --yes is required
     And the error names the active default runtime it would replace
+
+  # `--yes` approves two unrelated things: replacing the active default runtime,
+  # and running `sudo` to install required system packages such as OpenMPI for
+  # vLLM. ROCm CLI's own non-interactive surfaces (chat, MCP, the dashboard)
+  # spawn `rocm` with null stdin, so they need the first and can never answer a
+  # password prompt for the second; they pass the narrow flag instead. A reader
+  # who believes the two flags are synonyms will reach for `--yes` from a script
+  # and get a sudo prompt nothing can answer, so `--help` has to state the
+  # difference (Scenario runtime-10 sets the precedent for pinning help text
+  # that a unit test on `render_long_help()` cannot prove reaches a real user).
+  # No runtime state needed, so this runs on the mock lane.
+  @id:runtime-install-sdk-help-separates-consents
+  Scenario: runtime-14 - Stating that the non-interactive consent flag does not approve sudo in --help
+    When the user asks for SDK install help
+    Then the help offers a consent flag that does not approve system-package installs

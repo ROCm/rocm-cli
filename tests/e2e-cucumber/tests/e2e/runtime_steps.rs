@@ -945,3 +945,25 @@ async fn rollback_help_states_limit(world: &mut E2eWorld) {
         "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
     );
 }
+
+#[when("the user asks for SDK install help")]
+async fn ask_install_sdk_help(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["install", "sdk", "--help"]);
+    world.cli_output = Some(stdout);
+}
+
+#[then("the help offers a consent flag that does not approve system-package installs")]
+async fn install_sdk_help_separates_consents(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        out.contains("--approve-replacing-active-default"),
+        "expected `rocm install sdk --help` to offer the narrow consent flag, got:\n{out}"
+    );
+    // The distinction is the point: without it a script author reads the flag as
+    // a synonym for `--yes` and reaches for `--yes`, which on a host without
+    // passwordless sudo raises a password prompt the script cannot answer.
+    assert!(
+        out.contains("does not approve system-package installs"),
+        "expected `rocm install sdk --help` to say the narrow flag excludes system-package installs, got:\n{out}"
+    );
+}

@@ -1672,12 +1672,16 @@ fn install_wheel_runtime(
         "  latest_compatible_version: {}",
         runtime_version_display(&resolution.latest_version)
     );
-    if let Some(host_version) = host_rocm_version_newer_than(&resolution.latest_version) {
+    // Probed once and reused by the progress line below: each call is a full
+    // filesystem scan for a legacy ROCm, and the summary block and the visible
+    // note report the same answer about the same resolved version.
+    let host_version_newer = host_rocm_version_newer_than(&resolution.latest_version);
+    if let Some(host_version) = host_version_newer.as_deref() {
         let _ = writeln!(
             output,
             "  version_note: {}",
             wheel_host_version_note(
-                &host_version,
+                host_version,
                 &runtime_version_display(&resolution.latest_version)
             )
         );
@@ -1769,7 +1773,7 @@ fn install_wheel_runtime(
     // when this host reports a newer legacy ROCm (the ticket's 7.14 case). The
     // same note is recorded in the summary block above; surfacing it here keeps
     // it from being buried at the end of a long key/value dump.
-    if let Some(host_version) = host_rocm_version_newer_than(&resolution.latest_version) {
+    if let Some(host_version) = host_version_newer.as_deref() {
         progress_line(format!(
             "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm with a matching PyTorch stack for this repository; installing {resolved} (pass `--version <VERSION>` to override).",
             resolved = runtime_version_display(&resolution.latest_version)
@@ -2087,11 +2091,13 @@ fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
 fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
     let host_version = host_version?;
     // Only claim the host is newer when BOTH versions parse and the host is
-    // strictly greater. An unparseable host string — an odd build suffix
-    // (`7.2.4-98`) or a truncated two-component report (`7.4`) — is "can't
-    // tell", not "newer". Falling back to a lexicographic compare here wrongly
-    // ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at the third
-    // char), inventing a host-newer note that misleads the user.
+    // strictly greater. `parse_host_version` normalises the shapes hosts
+    // actually report — a build suffix (`7.2.4-98` -> 7.2.4) and a
+    // two-component report (`7.4` -> 7.4.0) — so those are compared, not
+    // discarded. Only a string that still fails to parse is "can't tell", and
+    // "can't tell" is never "newer". Falling back to a lexicographic compare
+    // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
+    // the third char), inventing a host-newer note that misleads the user.
     let host_parsed = parse_host_version(&host_version)?;
     let resolved_parsed = parse_host_version(resolved_version)?;
     (host_parsed > resolved_parsed).then_some(host_version)
@@ -2337,11 +2343,13 @@ fn install_tarball_runtime(
         "  latest_version: {}",
         runtime_version_display(&artifact.version)
     );
-    if let Some(host_version) = host_rocm_version_newer_than(&artifact.version) {
+    // Probed once and reused by the progress line below; see the wheel path.
+    let host_version_newer = host_rocm_version_newer_than(&artifact.version);
+    if let Some(host_version) = host_version_newer.as_deref() {
         let _ = writeln!(
             output,
             "  version_note: {}",
-            tarball_host_version_note(&host_version, &runtime_version_display(&artifact.version))
+            tarball_host_version_note(host_version, &runtime_version_display(&artifact.version))
         );
     }
     let _ = writeln!(output, "  target: {}", install_root.display());
@@ -2356,7 +2364,7 @@ fn install_tarball_runtime(
     // Mirror the wheel path: surface the host-newer ROCm explanation as a visible
     // line so "why this version and not the host's newer ROCm" is in the install
     // log rather than only in the trailing summary block.
-    if let Some(host_version) = host_rocm_version_newer_than(&artifact.version) {
+    if let Some(host_version) = host_version_newer.as_deref() {
         progress_line(format!(
             "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm tarball for this GPU family; installing {resolved}.",
             resolved = runtime_version_display(&artifact.version)

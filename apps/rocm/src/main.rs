@@ -619,6 +619,14 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// runtime never prompts.
         #[arg(long)]
         yes: bool,
+        /// Approve replacing the current active default ROCm runtime, and only
+        /// that: unlike --yes it does not approve system-package installs, so it
+        /// never runs sudo. ROCm CLI's own non-interactive surfaces (chat, MCP,
+        /// the dashboard) pass this, because they spawn `rocm` with no terminal
+        /// and so have no way to answer a sudo password prompt; a missing system
+        /// package stays a warning there, as it was before. --yes implies this.
+        #[arg(long)]
+        approve_replacing_active_default: bool,
     },
     /// Preview or install Linux AMD driver support.
     Driver {
@@ -2553,7 +2561,9 @@ fn install(target: InstallTarget) -> Result<()> {
             family,
             dry_run,
             yes,
+            approve_replacing_active_default,
         } => {
+            let consents = SdkInstallConsents::resolve(yes, approve_replacing_active_default);
             let format_name = match format {
                 InstallFormat::Wheel => "wheel",
                 InstallFormat::Tarball => "tarball",
@@ -2574,7 +2584,7 @@ fn install(target: InstallTarget) -> Result<()> {
                 version_selector,
                 family.as_deref(),
                 dry_run,
-                yes,
+                consents.replace_active_default,
             ) {
                 Ok(result) => {
                     let therock::SdkInstallResult { output, mutated } = result;
@@ -2591,8 +2601,8 @@ fn install(target: InstallTarget) -> Result<()> {
                         // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
                         // present for every SDK install, independent of which
                         // engine (if any) is auto-installed below.
-                        ensure_libatomic_for_torch(yes);
-                        ensure_libnuma_for_torch(yes);
+                        ensure_libatomic_for_torch(consents.system_packages);
+                        ensure_libnuma_for_torch(consents.system_packages);
                     }
                     finish_sdk_install(
                         &paths,
@@ -2617,7 +2627,11 @@ fn install(target: InstallTarget) -> Result<()> {
                             )
                         },
                         |paths, finalized| {
-                            maybe_auto_install_sdk_preferred_engine(paths, finalized, yes)
+                            maybe_auto_install_sdk_preferred_engine(
+                                paths,
+                                finalized,
+                                consents.system_packages,
+                            )
                         },
                     )?;
                 }
@@ -7359,6 +7373,80 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
     preferred_serve_engine_for_host_gpu_summary(&summary)
 }
 
+/// The two unrelated consents `rocm install sdk` can be given.
+///
+/// They are separate because they authorize different things and are answerable
+/// in different places. Replacing the active default runtime is a decision, and
+/// an argv can express it fully. Approving a system-package install means
+/// approving `sudo`, which — unless the host is root or has passwordless sudo —
+/// needs a human at a terminal to type a password.
+///
+/// `--yes` grants both, which is what a user typing it at a terminal means.
+/// ROCm CLI's own non-interactive surfaces need only the first: they spawn
+/// `rocm` with null stdin, so a sudo password prompt there can never be
+/// answered, and treating their approval as covering it would run sudo they
+/// cannot complete — and, for the vLLM/OpenMPI plan, abort the engine
+/// auto-install that used to warn and continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdkInstallConsents {
+    /// Approve replacing whatever runtime is currently the active default.
+    replace_active_default: bool,
+    /// Approve installing required system packages (OpenMPI, libatomic,
+    /// libnuma) through the system package manager, which means `sudo`.
+    system_packages: bool,
+}
+
+impl SdkInstallConsents {
+    const fn resolve(yes: bool, approve_replacing_active_default: bool) -> Self {
+        Self {
+            replace_active_default: yes || approve_replacing_active_default,
+            system_packages: yes,
+        }
+    }
+}
+
+/// What to do with a distro-aware system-package install plan, given the caller's
+/// approval and what this host lets us do without a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemPackageInstallAction {
+    /// Print the commands (and the preflight checks) and continue without them.
+    /// Nothing privileged is run, so nothing can block on a password prompt.
+    PrintManualCommands,
+    /// Run the plan. `run_system_package_install_plan` inherits stdin so an
+    /// interactive `sudo` password prompt can be answered.
+    RunPlan {
+        /// The `approval:` line explaining why this was allowed to run.
+        approval: &'static str,
+        /// Whether a failed command is an error rather than a warning. Only an
+        /// explicit approval escalates: the automatic (root/passwordless) path
+        /// must never let a missing system package fail an unattended install.
+        escalate_failure: bool,
+    },
+}
+
+/// Decide between the two, given whether the *system-package* consent was granted
+/// and whether the host can install without prompting.
+///
+/// Split out from the two callers below so the decision is testable without a
+/// package manager, and so the "approved but no way to answer a password prompt"
+/// case has one place to be reasoned about.
+const fn system_package_install_action(
+    approved: bool,
+    can_autoinstall: bool,
+) -> SystemPackageInstallAction {
+    if !approved && !can_autoinstall {
+        return SystemPackageInstallAction::PrintManualCommands;
+    }
+    SystemPackageInstallAction::RunPlan {
+        approval: if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        },
+        escalate_failure: approved,
+    }
+}
+
 /// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
 /// is installed. On Linux/WSL, when OpenMPI is missing, this installs it through
 /// the system package manager.
@@ -7409,7 +7497,11 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    let SystemPackageInstallAction::RunPlan {
+        approval,
+        escalate_failure,
+    } = system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -7418,16 +7510,9 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return Ok(());
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if rocm_core::openmpi::detect_openmpi().present {
@@ -7445,7 +7530,7 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             // past something the user asked for. The auto (unapproved) path keeps
             // the warn-and-continue behavior so a missing OpenMPI never blocks an
             // otherwise-unattended install.
-            if approved {
+            if escalate_failure {
                 return Err(error.context(
                     "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
                 ));
@@ -7556,7 +7641,11 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    // `escalate_failure` is deliberately ignored here: a missing libatomic/libnuma
+    // only warns, whatever approved the attempt.
+    let SystemPackageInstallAction::RunPlan { approval, .. } =
+        system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -7568,16 +7657,9 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return;
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if (dep.present)() {
@@ -11841,9 +11923,15 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             // The chat/MCP surfaces spawn `rocm` with null stdin, so
             // `interactive_terminal()` is false and the consent prompt would
             // refuse with "re-run with `--yes`" — a flag the user cannot supply
-            // through chat. Add it here, matching the `install driver` and
-            // `services stop/restart` arms below.
-            ensure_flag(&mut args, "--yes");
+            // through chat.
+            //
+            // Not `--yes`: that flag also approves system-package installs, and
+            // this spawn has no terminal on which to answer the `sudo` password
+            // prompt such an install can raise. Granting it here would make the
+            // vLLM/OpenMPI step run a sudo it cannot complete and abort the
+            // engine auto-install that previously warned and continued. The
+            // narrow flag grants exactly the consent the prompt is asking for.
+            ensure_flag(&mut args, "--approve-replacing-active-default");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ROCm".to_owned(),
@@ -13661,9 +13749,11 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 "--format".to_owned(),
                 json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
                 // The MCP surface runs `rocm` with null stdin, so the consent
-                // prompt would refuse; `--yes` keeps the tool non-interactive,
-                // matching the chat `install sdk` arm and `stop_server`.
-                "--yes".to_owned(),
+                // prompt would refuse. This keeps the tool non-interactive,
+                // matching the chat `install sdk` arm. Deliberately not `--yes`:
+                // that would additionally approve a `sudo` system-package
+                // install this spawn has no terminal to answer.
+                "--approve-replacing-active-default".to_owned(),
             ];
             if let Some(prefix) = json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
@@ -19863,6 +19953,32 @@ mod tests {
     }
 
     #[test]
+    fn install_sdk_help_separates_the_two_consents_yes_carries() {
+        // `--yes` approves two unrelated things: replacing the active default
+        // runtime, and running `sudo` for required system packages. The whole
+        // point of the narrow flag is that a caller with no terminal can grant
+        // the first without the second, so the help has to say so — a reader who
+        // believes it is a synonym for `--yes` will reach for `--yes` from a
+        // script and get a sudo prompt nothing can answer.
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--approve-replacing-active-default"),
+            "`rocm install sdk --help` must document the narrow consent flag:\n{help}"
+        );
+        assert!(
+            help.contains("does not approve system-package installs"),
+            "`rocm install sdk --help` must say the narrow flag excludes \
+             system-package installs:\n{help}"
+        );
+    }
+
+    #[test]
     fn update_has_no_yes_flag_to_credit() {
         // Pins the premise of `SdkInstallApprovalSource::UpdateApply`: the
         // update path is preapproved, but it must never print a line crediting
@@ -22058,7 +22174,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --yes --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -22081,7 +22197,7 @@ mod tests {
                 "release".to_owned(),
                 "--format".to_owned(),
                 "wheel".to_owned(),
-                "--yes".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\ROCm\\therock_venvs".to_owned(),
             ]
@@ -22104,7 +22220,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --yes"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
             )
         );
         let approval =
@@ -22124,7 +22240,7 @@ mod tests {
                 "D:\\ROCm\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
                 "06052026".to_owned(),
-                "--yes".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
             ]
         );
     }
@@ -22582,7 +22698,7 @@ model recipes
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --yes --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
                 ),
                 false,
             ),
@@ -23111,13 +23227,36 @@ model recipes
         }
     }
 
+    /// Resolve the argv a non-interactive surface produces the way `install()`
+    /// does, so a test can assert what that argv actually consents to rather
+    /// than which flag string it happens to contain.
+    fn consents_for_install_sdk_argv(args: &[String]) -> SdkInstallConsents {
+        let cli =
+            Cli::try_parse_from(std::iter::once("rocm".to_owned()).chain(args.iter().cloned()))
+                .unwrap_or_else(|error| {
+                    panic!("{args:?} must parse as a `rocm` invocation: {error}")
+                });
+        let Some(Command::Install {
+            target:
+                InstallTarget::Sdk {
+                    yes,
+                    approve_replacing_active_default,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("{args:?} is not an `install sdk` invocation");
+        };
+        SdkInstallConsents::resolve(yes, approve_replacing_active_default)
+    }
+
     #[test]
-    fn install_sdk_chat_and_mcp_args_carry_yes_for_non_interactive_spawn() {
+    fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
         // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
         // prompt would refuse with "re-run with `--yes`" — a flag the user has
         // no way to supply from chat or the dashboard. Both the chat classifier
-        // arm and the MCP tool-args builder must inject `--yes` so a reinstall
-        // over an existing SDK is not silently refused.
+        // arm and the MCP tool-args builder must inject the consent so an
+        // install over the active default runtime is not silently refused.
         let action = chat_rocm_command_action_from_args(vec![
             "install".to_owned(),
             "sdk".to_owned(),
@@ -23128,27 +23267,85 @@ model recipes
             "/home/tester/rocm-managed".to_owned(),
         ])
         .expect("install sdk classifies");
-        match action {
-            ChatRocmCommandAction::Approval { args, .. } => assert!(
-                args.iter().any(|arg| arg == "--yes"),
-                "chat `install sdk` approval must carry --yes, got {args:?}"
-            ),
+        let chat_args = match action {
+            ChatRocmCommandAction::Approval { args, .. } => args,
             other @ ChatRocmCommandAction::ReadOnly(_) => {
                 panic!("install sdk must require approval, got {other:?}")
             }
-        }
+        };
 
         // The MCP `install_sdk` tool builds its own argv (it does not route
-        // through the classifier above), so it must add `--yes` independently.
+        // through the classifier above), so it must add the flag independently.
         let call = providers::ChatToolCall {
             id: None,
             name: "install_sdk".to_owned(),
             arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
         };
-        let args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
+        let mcp_args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
+
+        for args in [&chat_args, &mcp_args] {
+            assert!(
+                consents_for_install_sdk_argv(args).replace_active_default,
+                "the spawn must approve replacing the active default, got {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_injected_consent_does_not_approve_privileged_package_installs() {
+        // The worked regression: Linux, a vLLM-preferred GPU family, OpenMPI
+        // absent, and neither root nor passwordless sudo. The chat, MCP and
+        // daemon surfaces spawn `rocm` with null stdin, so there is no terminal
+        // on which a `sudo` password prompt could ever be answered. Injecting
+        // `--yes` to clear the runtime-replacement prompt used to grant the
+        // second, unrelated consent that flag carries, which made
+        // `ensure_openmpi_for_vllm` run a sudo it cannot complete and then
+        // escalate the failure — aborting `maybe_auto_install_sdk_preferred_engine`
+        // before the vLLM engine install that previously warned and continued.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let injected = consents_for_install_sdk_argv(
+            &rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args"),
+        );
+        assert!(injected.replace_active_default);
         assert!(
-            args.iter().any(|arg| arg == "--yes"),
-            "MCP install_sdk args must carry --yes, got {args:?}"
+            !injected.system_packages,
+            "an injected consent must not approve a privileged package install"
+        );
+        assert_eq!(
+            system_package_install_action(injected.system_packages, false),
+            SystemPackageInstallAction::PrintManualCommands,
+            "on a host without passwordless sudo the spawn must print the commands, not run sudo"
+        );
+
+        // And the other half of the property: a `--yes` the user actually typed
+        // still approves both, and a failure of the install it asked for is
+        // still an error rather than a warning.
+        let typed = consents_for_install_sdk_argv(&[
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--yes".to_owned(),
+        ]);
+        assert!(typed.replace_active_default && typed.system_packages);
+        assert_eq!(
+            system_package_install_action(typed.system_packages, false),
+            SystemPackageInstallAction::RunPlan {
+                approval: "granted by --yes",
+                escalate_failure: true,
+            },
+        );
+
+        // Root or passwordless sudo installs without any approval, as before —
+        // the consent split must not have made the automatic path conditional.
+        assert_eq!(
+            system_package_install_action(injected.system_packages, true),
+            SystemPackageInstallAction::RunPlan {
+                approval: "auto (root or passwordless sudo available)",
+                escalate_failure: false,
+            },
         );
     }
 

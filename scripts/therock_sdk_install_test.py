@@ -476,12 +476,20 @@ def main() -> int:
         args.channel,
         "--format",
         "wheel",
-        "--yes",
     ]
     if args.prefix is not None:
         install_argv.extend(["--prefix", str(args.prefix)])
     if args.dry_run:
         install_argv.append("--dry-run")
+    else:
+        # Approve replacing whatever runtime is the active default, so a reused
+        # test root stays non-interactive. Only on the real-install path: a dry
+        # run returns before the consent gate, and passing the flag there would
+        # claim an approval this harness was not asked for. `--yes` rather than
+        # `--approve-replacing-active-default` because this harness is meant to
+        # install the system packages the SDK needs too, and it runs either as
+        # root in CI or from a developer's terminal.
+        install_argv.append("--yes")
     install_output = run(
         "rocm install sdk pip",
         install_argv,
