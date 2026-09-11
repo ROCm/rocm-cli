@@ -6499,6 +6499,86 @@ mod tests {
         );
     }
 
+    /// The exact CLI refusal `rocm comfyui install` prints when two managed ROCm
+    /// runtimes are ready and none is activated.
+    const AMBIGUOUS_RUNTIME_REFUSAL: &str = "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default \
+         with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`.";
+
+    /// An executor whose approved replay reproduces what the real seam returns
+    /// for a `rocm` subprocess that exited non-zero: `run_rocm_capture_for_paths`
+    /// *captures* the failure, so `run_internal_mcp_call` returns `Ok` with an
+    /// `isError: true` envelope and the stderr buried in `structuredContent` —
+    /// it never returns `Err`, so the seam never builds `RocmToolOutcome::Error`.
+    #[derive(Debug)]
+    struct CapturedFailureExecutor;
+    impl crate::tool_exec::RocmToolExecutor for CapturedFailureExecutor {
+        fn execute(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
+                title: "Install ComfyUI".to_string(),
+                body: vec!["rocm comfyui install".to_string()],
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+        }
+        fn execute_approved(
+            &self,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Ran `rocm` command.\n\nstderr:\n{AMBIGUOUS_RUNTIME_REFUSAL}"),
+                }],
+                "structuredContent": {
+                    "argv": ["rocm", "comfyui", "install"],
+                    "exit_status": 1,
+                    "stdout": "",
+                    "stderr": AMBIGUOUS_RUNTIME_REFUSAL,
+                },
+                "isError": true,
+            }))
+        }
+    }
+
+    #[test]
+    fn approved_command_failure_stays_a_collapsed_envelope() {
+        // Pins the premise the ComfyUI e2e scenario's CLI-only scope rests on
+        // (`tests/e2e-cucumber/features/comfyui.feature`). A failing
+        // approval-gated `/comfyui install` is NOT an `Error` outcome: the exit
+        // code is captured into an envelope, so `run_approved` takes the
+        // `Result` arm and `summarize_json_value` collapses every field. The
+        // refusal text therefore stays out of the chat — reading the `Error` arm
+        // (`Approved · … failed: {e}`) as this path's renderer is wrong.
+        let shared: crate::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(CapturedFailureExecutor);
+        let summary = run_approved(
+            &shared,
+            "rocm_command",
+            &serde_json::json!({ "args": ["comfyui", "install"] }),
+        );
+        assert!(
+            summary.contains("content: [1 items]"),
+            "the command envelope is collapsed, not inlined: {summary}"
+        );
+        assert!(
+            summary.contains("structuredContent: {4 fields}"),
+            "the captured stdout/stderr subtree is collapsed too: {summary}"
+        );
+        assert!(
+            !summary.contains("Multiple ROCm runtimes are ready"),
+            "the CLI refusal must not reach the chat: {summary}"
+        );
+        assert!(
+            !summary.contains("failed:"),
+            "a captured non-zero exit is not the Error arm: {summary}"
+        );
+    }
+
     #[test]
     fn deny_path_runs_nothing_and_appends_declined_turn() {
         // (b) deny: a Deny/Cancel verdict appends a declined turn and never

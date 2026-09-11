@@ -10,10 +10,16 @@
 //! and manifest state, so no GPU is needed) and assert the refusal is actionable
 //! in `rocm comfyui install`'s command output (`--runtime-id`,
 //! `rocm runtimes activate`, and the `/runtimes` pointer). The text is CLI-only
-//! today: approval-gated slash commands in the TUI collapse the command envelope
-//! via `summarize_json_value`, so `/comfyui install` does not surface it in the
-//! chat. Black-box: the planted registry manifests are plain JSON matching the
-//! CLI's on-disk schema, not typed imports from the product crates.
+//! today — not for want of a TUI error path: `/comfyui install` is
+//! approval-gated, and a non-zero `rocm` exit is *captured* into an
+//! `isError: true` envelope rather than raised, so the seam yields
+//! `RocmToolOutcome::Result` (never the `Error` arm that prints a message
+//! verbatim) and `summarize_json_value` collapses the envelope to
+//! `content: [1 items]`. Pinned by
+//! `approved_command_failure_stays_a_collapsed_envelope` in
+//! `crates/rocm-dash-tui/src/app/mod.rs`. Black-box: the planted registry
+//! manifests are plain JSON matching the CLI's on-disk schema, not typed imports
+//! from the product crates.
 
 use std::path::{Path, PathBuf};
 
@@ -51,6 +57,13 @@ fn write_stub(path: &Path, body: &str) {
 /// that points at them. The readiness gate validates recorded manifest state and
 /// that these paths exist — it never executes anything — so a GPU-less host can
 /// present a runtime the CLI accepts as "ready".
+///
+/// This JSON must stay schema-exact. `therock::load_runtime_manifests` skips
+/// registry entries that fail to deserialize *silently* (`if let Ok(manifest)`),
+/// so a typo or dropped required field here does not fail the run — it quietly
+/// turns "two ready runtimes" into one or zero, and the scenario then fails on a
+/// confusing downstream assertion instead of on the fixture. If this step starts
+/// failing after an edit here, suspect the manifest shape first.
 fn plant_ready_runtime(data: &Path, key: &str) {
     let install_root = data.join("runtimes").join("roots").join(key);
     let sdk_root = install_root.join("sdk");
