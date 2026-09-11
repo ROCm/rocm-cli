@@ -7770,6 +7770,91 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
 
+    /// A private root for one test, removed on the way out.
+    fn atomic_write_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-atomic-write-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("failed to create the test root");
+        root
+    }
+
+    /// The scratch files `write_file_atomically` stages under, if any survived.
+    ///
+    /// `temp_sibling_path` names them `<file>.tmp-<pid>-<millis>-<attempt>`, so
+    /// a leftover is visible as a sibling containing `.tmp-`.
+    fn leftover_scratch_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("failed to read the test root")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn write_file_atomically_replaces_contents_and_leaves_no_scratch_file() {
+        // The publish must land the new bytes and take its staging file with it;
+        // a leaked scratch sibling in `services_dir` would be a file the uninstall
+        // gate has to reason about.
+        let root = atomic_write_root("replaces");
+        let target = root.join("record.json");
+        fs::write(&target, b"old contents").expect("seed the file");
+
+        write_file_atomically(&target, b"new contents").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&target).expect("read back"),
+            b"new contents",
+            "the published file must hold the new bytes"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a successful publish must leave no scratch file: {:?}",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_creates_the_parent_directory() {
+        // `ManagedServiceRecord::write` targets a services dir that may not exist
+        // yet on a first write.
+        let root = atomic_write_root("creates-parent");
+        let target = root.join("nested").join("deeper").join("record.json");
+
+        write_file_atomically(&target, b"contents").expect("the write must succeed");
+
+        assert_eq!(fs::read(&target).expect("read back"), b"contents");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_cleans_up_when_publishing_fails() {
+        // A failed publish must not strand its staging file. The destination is a
+        // non-empty directory, which no platform will let a file replace, so the
+        // failure happens at the publish step with the scratch file already
+        // written — exactly the path that has to clean up after itself.
+        let root = atomic_write_root("publish-fails");
+        let target = root.join("record.json");
+        fs::create_dir_all(&target).expect("seed a directory where the file goes");
+        fs::write(target.join("occupant"), b"x").expect("make it non-empty");
+
+        let error = write_file_atomically(&target, b"contents")
+            .expect_err("replacing a non-empty directory must fail");
+
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a failed publish must remove its scratch file, got {:?} ({error:#})",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn service_id_accepts_generated_and_plain_ids() {
         // A freshly generated id must always validate.
