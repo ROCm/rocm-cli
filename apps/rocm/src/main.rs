@@ -9328,6 +9328,7 @@ fn adopt_runtime_from_probe(
         version,
         install_root: install_root.clone(),
         selected_artifact_url: "adopted-read-only".to_owned(),
+        source_layout_generation: None,
         index_url: None,
         tarball_file_name: None,
         python_launcher: None,
@@ -16053,6 +16054,7 @@ fn apply_runtime_update(
             &source.format,
             &source.family,
             plan.device_target.as_deref(),
+            plan.source_layout_generation.as_deref(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -16068,6 +16070,7 @@ fn apply_runtime_update(
         &source.format,
         &source.family,
         plan.device_target.as_deref(),
+        plan.source_layout_generation.as_deref(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
@@ -30679,6 +30682,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: install_root.clone(),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
@@ -30737,6 +30741,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
