@@ -601,6 +601,21 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
                 report.failed, report.attempted, row.cell
             );
         }
+        // `engine` is a rollup key, so rows this file already holds for the cell
+        // without one — written before the column was populated, or by a run
+        // whose /metrics was unreachable — do not group with the rows written
+        // now. N trials become two smaller groups and the Bench panel has no
+        // `engine` column to explain it, so the run has to say so itself. The
+        // sweep raises this at most once, so it prints once per run.
+        if let Some(notice) = &report.engine_split {
+            eprintln!(
+                "warning: {} already has rows for {} with a blank engine column; `engine` is a rollup key, so those trials group separately from this run's engine=vllm rows",
+                notice.path, notice.cell
+            );
+            eprintln!(
+                "hint: rotate or move that file if you are comparing trials across the change"
+            );
+        }
     }
     println!(
         "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
