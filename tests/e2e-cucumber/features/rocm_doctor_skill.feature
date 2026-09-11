@@ -13,6 +13,13 @@ Feature: The ROCm Doctor skill's instructions match the CLI they drive
   # that seam — `diagnose.feature` deliberately asserts only the SHAPE of a
   # diagnosis so it stays host-independent.
   #
+  # That guarantee covers the table's cells and the auto-applicable prose line —
+  # what `skill_steps.rs` actually parses. Free-standing prose that only
+  # restates those same facts in words — the "(N failure modes)" count in the
+  # catalog heading, the Linux-only/Windows-only recap line beneath the table,
+  # SKILL.md's "the other M are print-only" — is not parsed here and can go
+  # stale even while the table itself stays correct.
+  #
   # The catalog is authoritative in `crates/rocm-core`. When one of these fails,
   # the CLI is right and `skills/rocm-doctor/reference.md` is what changes.
   #

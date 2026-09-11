@@ -97,6 +97,11 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # this job too, same as ci.yml's `heavy` filter.
+              - 'skills/**'
               - 'install*'
               - 'docs/keys/**'
               - '.github/workflows/**'

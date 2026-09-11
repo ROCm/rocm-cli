@@ -184,21 +184,27 @@ Required consistency points:
 on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the
-  `rocm` binary, so it is versioned with the binary and lives here. The
-  [`amd/skills`](https://github.com/amd/skills) catalog federates it: a nightly
-  job vendors the folder from `main` and opens a pull request there. So edit it
-  here, and never edit the catalog's copy — the next federation run overwrites
-  it. Federation does not carry the skill's `evals/` folder, which is why the
-  catalog keeps a dataset of its own.
+  `rocm` binary, so it is versioned with the binary and lives here.
+  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
+  incubation for this skill: it carries no automated federation for
+  `rocm-doctor` yet — `.github/federation.json` there only declares
+  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
+  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
+  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
+  whenever it changes materially. So edit it here, and never edit the
+  `amd/skills` copy directly — the next hand-sync overwrites it.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
-  The catalog is authoritative in `crates/rocm-core/src/fix.rs` — adding,
-  renaming, or re-scoping a failure mode means changing the CLI **first**, then
-  the two docs. That feature is what catches you if you forget.
+  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
+  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
+  means changing the CLI **first**, then the two docs. That feature is what
+  catches you if you forget.
 
 The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
-frontmatter for the skill loader, and the catalog's skills carry no headers.
-The licence is stated in `skill-card.md` instead.
+frontmatter for the skill loader, and skills published this way carry no
+license headers of their own. The licence is stated in `skill-card.md`
+instead.
 
 ## 8) Verification Matrix For This Repo
 

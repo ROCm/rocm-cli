@@ -272,10 +272,16 @@ in this feature does not read `reference.md`, it is in the wrong file.
 Reading that document as test data is a deliberate, narrow exception to
 **Black-box only** above: nothing is imported from the rocm-cli codebase — a
 *documentation artifact* is read as test data, and that artifact is the thing
-under test. `skill_steps.rs` parses its claims rather than restating them as
-constants, so a claim added upstream starts being checked with no code change,
-and every parser asserts it found something — a heading reworded upstream must
-fail loudly rather than quietly reduce an assertion to a no-op.
+under test. `skill_steps.rs` parses the specific claims each scenario names —
+the catalog table's cells, the auto-applicable prose line, the framework-routing
+bullets, the diagnose fields and thresholds — rather than restating them as
+constants, so editing one of those in `reference.md` starts being checked with
+no code change, and every one of those parsers asserts it found something — a
+heading it depends on being reworded upstream must fail loudly rather than
+quietly reduce an assertion to a no-op. Free-standing prose outside those
+spots — the failure-mode count in the catalog heading, the Linux-only/
+Windows-only recap line under the table, SKILL.md's "the other N are
+print-only" — is not parsed, so it can drift without failing anything here.
 
 Two rules follow:
 

@@ -144,12 +144,19 @@ passes — the GPU is AMD and the platform is native Linux or Windows.
    fix <id>` just prints the plan for the user to run themselves — no prompt, and
    the CLI never performs those.
 
-   Of the four, one does not mutate on every platform: **`fix-2-unset-override`
-   mutates on Windows only.** On Linux it reports where the override is set and
-   which rc files carry it, then stops — it will not edit the user's dotfiles. So
-   there is no prompt to answer and nothing for `--dry-run` to preview. Tell the
-   Linux user what to edit; do not describe it as a change the CLI made or
-   previewed.
+   Of the four, two do not always mutate:
+
+   - **`fix-2-unset-override` mutates on Windows only.** On Linux it reports
+     where the override is set and which rc files carry it, then stops — it
+     will not edit the user's dotfiles. So there is no prompt to answer and
+     nothing for `--dry-run` to preview. Tell the Linux user what to edit; do
+     not describe it as a change the CLI made or previewed.
+   - **`fix-9-igpu-dgpu` mutates only when `--device-index N` is passed.**
+     Without it — on either platform — the runner just prints the
+     `rocminfo`/`hipInfo` query that identifies the discrete GPU's index and
+     returns 0; there is no prompt, no `--dry-run` preview, and nothing is
+     pinned. Once the user knows N, re-run with
+     `rocm fix fix-9-igpu-dgpu --device-index N`.
 
 4. **Verify.** Have the user run the `verify` command from the diagnosis.
 
