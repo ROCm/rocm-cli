@@ -534,8 +534,8 @@ fn prom_latency(
 /// cell issued between the before- and after-scrape. Returns `None` when the
 /// window cannot be measured: either scrape missing, the observation count did
 /// not advance (`Δcount ≤ 0`, no request recorded this metric in the window),
-/// the counter reset (`Δsum < 0`, a server restart), or either delta is `NaN`
-/// (defensive: see the guard below).
+/// the counter reset (`Δsum < 0`, a server restart), or either delta is not
+/// finite (defensive: see the guard below).
 ///
 /// The value is deliberately *not* backfilled from the after-scrape's lifetime
 /// `sum/count` average. That average covers every request the server process
@@ -568,7 +568,15 @@ fn latency_ms(
     // with `parse::<f64>()`, which accepts a `NaN` token from a malformed or
     // non-conforming exporter, and this is the last place to stop it before it
     // reaches an immutable CSV row.
-    (delta_count > 0.0 && delta_sum >= 0.0).then_some(delta_sum / delta_count * 1000.0)
+    //
+    // `±Inf` arrives the same way and needs its own conjunct, because the
+    // ordered comparisons above accept it: an infinite `Δsum` satisfies
+    // `>= 0.0` and reaches `opt_f64`, whose `{:.6}` writes a literal `inf` into
+    // a numeric column, while an infinite `Δcount` silently collapses a real
+    // `Δsum` to `0.000000`. Requiring both deltas finite closes both, and makes
+    // the "blank when unmeasurable" contract exact rather than NaN-only.
+    (delta_count > 0.0 && delta_sum >= 0.0 && delta_count.is_finite() && delta_sum.is_finite())
+        .then_some(delta_sum / delta_count * 1000.0)
 }
 
 /// Concurrency levels tried by [`run_auto_ramp`] in order.
@@ -1783,6 +1791,32 @@ mod tests {
         );
         assert_eq!(
             latency_ms(Some(1.0), Some(f64::NAN), Some(2.0), Some(12.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn latency_ms_is_none_when_a_counter_is_infinite() {
+        // Same class as the NaN case and the same entry point: `+Inf`/`-Inf`
+        // are legal exposition tokens that `parse::<f64>()` accepts verbatim.
+        // Unlike NaN they survive the ordered comparisons — an infinite `Δsum`
+        // is `>= 0.0`, so without the `is_finite` conjuncts `opt_f64` would
+        // write a literal `inf` into a numeric CSV column, and an infinite
+        // `Δcount` would report a real window as `0.000000` ms.
+        assert_eq!(
+            latency_ms(Some(1.0), Some(10.0), Some(f64::INFINITY), Some(12.0)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(f64::NEG_INFINITY), Some(10.0), Some(2.0), Some(12.0)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(1.0), Some(10.0), Some(2.0), Some(f64::INFINITY)),
+            None
+        );
+        assert_eq!(
+            latency_ms(Some(1.0), Some(f64::NEG_INFINITY), Some(2.0), Some(12.0)),
             None
         );
     }
