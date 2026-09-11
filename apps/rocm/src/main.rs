@@ -26179,6 +26179,24 @@ install therock";
             "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
         );
 
+        // The literal fragments the GPU-lane scenario
+        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
+        // only where a real card exists, so pin the wording here too: a rename
+        // then fails on every lane rather than silently on the one lane that can
+        // observe it. `GPU 0 has only` is what makes the warning provably about
+        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
+        // pre-launch hint from any other line that merely names the flag.
+        assert!(
+            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
+            "the warning must name the selected GPU: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("vLLM reserves ~90%")),
+            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
+        );
+
         // The same busy card on a non-vLLM engine keeps the warning but omits the
         // vLLM-only knob, which that engine cannot honor.
         let lemonade = collect_serve_notes(

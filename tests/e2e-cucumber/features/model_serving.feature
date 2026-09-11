@@ -160,6 +160,17 @@ Feature: Model serving
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
+  #
+  # This is the live coverage for `--gpu` validation under either authority: the
+  # amd-smi device count, or — when amd-smi cannot count — membership in the
+  # KFD/DRM usable set (EAI-8058). Which one answers depends on the lane, so the
+  # step accepts either rejection wording. The *masked* sub-case that motivated
+  # the membership rule (a visibility mask leaving a non-contiguous usable set,
+  # e.g. `HIP_VISIBLE_DEVICES=2` on a 4-GPU host, where `--gpu 2` must pass and
+  # `--gpu 0` must be refused) has no scenario of its own: it is reachable only
+  # where amd-smi is *absent*, and faking that absence would assert against the
+  # seam rather than the product. It is unit-covered by
+  # `validate_pinned_gpu_index_falls_back_to_usable_set_membership`.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist

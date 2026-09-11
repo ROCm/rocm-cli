@@ -859,6 +859,13 @@ async fn user_previews_vllm_low_vram_serve_plan(world: &mut E2eWorld) {
 /// The serve must have actually launched, not just printed a plausible plan: a
 /// non-zero rc after a good plan-print would otherwise go undetected since this
 /// scenario only inspects the plan lines (mirrors `assert_vllm_default`).
+///
+/// This step states the scenario's *premise*, not its verdict: the low-VRAM
+/// warning itself is long-standing behaviour, so the warning text alone proves
+/// nothing about the vLLM guidance this scenario exists for — that is
+/// `assert_serve_plan_names_memory_knob`'s job. What it does pin is that the
+/// warning names the GPU the serve was *pinned to* (`--gpu 0`), so a warning
+/// raised for some other device cannot stand in for the premise.
 #[then("the serve plan warns the GPU is low on VRAM")]
 async fn assert_serve_plan_low_vram_warning(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
@@ -885,14 +892,29 @@ async fn assert_serve_plan_low_vram_warning(world: &mut E2eWorld) {
         output.contains("serving may fail on VRAM"),
         "expected a low-VRAM serve-plan warning, got:\n{output}"
     );
+    assert!(
+        output.contains("GPU 0 has only"),
+        "the low-VRAM warning must be about the pinned GPU 0, got:\n{output}"
+    );
 }
 
+/// The scenario's discriminating assertion — the behaviour added for EAI-8058.
+///
+/// Matching the flag name alone would be too weak to be that: `rocm serve` echoes
+/// engine recipe flags in the same plan, so a `--gpu-memory-utilization` the user
+/// passed themselves would satisfy it. Require the note's own explanation of *why*
+/// a busy GPU OOMs (vLLM's fixed total-VRAM reservation) alongside the flag, so
+/// only the pre-launch hint can satisfy this step.
 #[then("the serve plan explains how to lower vLLM's memory reservation")]
 async fn assert_serve_plan_names_memory_knob(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no serve output");
     assert!(
         output.contains("--gpu-memory-utilization"),
         "expected the vLLM memory-utilization note in the serve plan, got:\n{output}"
+    );
+    assert!(
+        output.contains("vLLM reserves ~90%"),
+        "the note must explain vLLM's total-VRAM reservation, not merely name the flag, got:\n{output}"
     );
 }
 
