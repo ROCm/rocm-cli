@@ -1020,6 +1020,10 @@ jobs:
       && needs.changes.result == 'success'
       && (github.event_name != 'workflow_dispatch'
           || inputs.platform == 'all' || inputs.platform == 'mock')
+    # Whether this lane actually executed; the consolidated report reuses it so
+    # it never tries to download artifacts a no-op run never produced.
+    outputs:
+      ran: ${{ steps.gate.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1082,12 +1086,17 @@ jobs:
     needs:
       - changes
       - e2e
-    # Consolidate whatever ran. On dispatch `heavy` is unset, so also run when the
-    # trigger was manual; `always()` still lets it collect partial/failed tiers.
+    # Mirrors the `e2e` job's condition exactly so the two are produced and
+    # skipped together. This is a REQUIRED check, so it must always be produced:
+    # branch protection treats a skipped required check as SATISFIED, so any
+    # extra clause narrowing this condition would silently stop the check from
+    # gating anything. `always()` is kept so a failing platform still gets a
+    # rendered report. Which work actually happens is decided per step below.
     if: >-
       always()
-      && (needs.changes.outputs.heavy == 'true'
-        || github.event_name == 'workflow_dispatch')
+      && needs.changes.result == 'success'
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1103,12 +1112,14 @@ jobs:
       # layout is the norm here; `discover()` handles both (labeling the root
       # file from platform.json's slug).
       - name: Download all E2E reports
+        if: needs.e2e.outputs.ran == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: '*-report'
           path: e2e-artifacts
 
       - name: Build consolidated report + step summary
+        if: needs.e2e.outputs.ran == 'true'
         run: |
           mkdir -p consolidated
           cargo xtask e2e-report \
@@ -1116,8 +1127,26 @@ jobs:
             --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload consolidated report
-        if: always()
+        if: always() && needs.e2e.outputs.ran == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-consolidated-report
           path: consolidated/
+
+      # Rendering the report says nothing about whether the scenarios passed —
+      # it succeeds just as happily on a run full of failures. This job is the
+      # required check that reports on the E2E lane, so it has to carry that
+      # lane's verdict. Runs last because the summary is written by the step
+      # above. `E2E tests` is itself a required check, so this blocks nothing
+      # that was not already blocked.
+      - name: Require the E2E lane to have passed
+        if: always()
+        env:
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: |
+          if [ "$E2E_RESULT" = "success" ]; then
+            echo "E2E tests concluded: success"
+            exit 0
+          fi
+          echo "::error::E2E tests concluded '$E2E_RESULT'; failing the consolidated report."
+          exit 1
