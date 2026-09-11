@@ -8,12 +8,13 @@ name: E2E self-hosted
 # with their OWN concurrency group — means an offline runner can only ever stall
 # THIS workflow's supersession, never the required checks in ci.yml.
 #
-# These lanes are non-blocking (continue-on-error), and as of 2026-09 their
-# check names do not gate a merge either: PRs #334, #335 and #343 all landed
-# while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the merge_group
-# ref, which a required check under ALLGREEN would have blocked. Renaming a lane
-# is therefore safe. (Branch protection is not readable without admin, so this is
-# inferred from those merges rather than read from the required list.)
+# These lanes are non-blocking because none of their check names are in
+# branch protection's required-status-check list (confirmed 2026-09-11) — not
+# because of `continue-on-error`, which is `false` below so a real hardware
+# regression shows red instead of always green. PRs #334, #335 and #343 all
+# landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
+# merge_group ref, which a required check under ALLGREEN would have blocked;
+# renaming a lane is therefore safe.
 
 on:
   push:
@@ -143,8 +144,9 @@ jobs:
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
-    # the rocm binary itself and is continue-on-error; ci.yml's required
-    # build-and-test / mock e2e remain the authoritative pre-merge build gate.
+    # the rocm binary itself, and this check isn't in the required list (see the
+    # file header), so a broken build here still can't block a merge; ci.yml's
+    # required build-and-test / mock e2e remain the authoritative build gate.
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -154,7 +156,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'app-dev-gpu'))
       )
-    continue-on-error: true
+    continue-on-error: false
     env:
       # Bound serve readiness below the 35-min job cap so a serve that never comes
       # ready fails the scenario with a real error instead of hanging until the
@@ -330,18 +332,27 @@ jobs:
           name: e2e-gpu-report
           path: tests/e2e-cucumber/results/
 
-  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu runner, targeted
-  # by the `strix-halo` label. These hosts carry `amd-gpu` as well — it marks any
-  # AMD GPU runner, so it never distinguishes one architecture from another.
-  # Non-blocking while this hardware is proven out.
+  # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
+  # Dispatch ephemeral pool, opt-in only via the `devlab-dispatch` label (see
+  # e2e-gpu for why an unscoped label can silently mis-route a job to the wrong
+  # architecture; these hosts also carry `strix-halo`, but nothing reaches them
+  # without `devlab-dispatch`). A fresh runner is registered per job and
+  # destroyed after, so there is no cross-run disk to protect: no HOME/
+  # CARGO_HOME override (pool hosts have room under the default paths, unlike
+  # the full-partition static host this replaced), though CARGO_TARGET_DIR
+  # still points at RUNNER_WORKSPACE to dodge checkout's `git clean -ffdx`
+  # mid-job. Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
-    # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
+    # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
-    timeout-minutes: 35
-    # `native` disambiguates the two Linux Strix runners: the WSL host also
-    # carries `strix-halo`, but the paths below exist only on the native one.
-    runs-on: [self-hosted, linux, strix-halo, native]
+    # Raised from 35 after moving to the pool: RUNNER_WORKSPACE (CARGO_TARGET_DIR,
+    # e2e-shared, the prewarm tree) is cold every job here, unlike the static host
+    # this replaced, and a run took 26m54s against the old 35min cap (run
+    # 34489547654) versus 18-19m on a warm static host — keep the same headroom
+    # ratio the 35 was chosen for.
+    timeout-minutes: 45
+    runs-on: [self-hosted, linux, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-ubuntu.
     if: >-
@@ -353,27 +364,13 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-ubuntu'))
       )
-    continue-on-error: true
-    # On this runner `/`, `/home/ubuntu`, and `/tmp` are ALL on a full root
-    # partition; only /home/ubuntu/actions-runner (a 1.7T nvme) has space. So
-    # EVERYTHING the job writes must land on the nvme. Point HOME there (catches
-    # ~/.cache/pip, ~/.config, and any other $HOME writer — pip's cache under the
-    # real /home/ubuntu is what previously failed `install sdk` with ENOSPC),
-    # plus the toolchain, temp, and pip cache. The rustup bootstrap still uses
-    # --no-modify-path so it doesn't touch $HOME/.profile. These paths are
-    # specific to that host, which is why `runs-on` pins `native` above.
+    continue-on-error: false
     env:
-      HOME: /home/ubuntu/actions-runner/e2e-home
-      CARGO_HOME: /home/ubuntu/actions-runner/.cargo
-      RUSTUP_HOME: /home/ubuntu/actions-runner/.rustup
-      TMPDIR: /home/ubuntu/actions-runner/tmp
-      PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_SERVE_TIMEOUT_SECS: "300"
-      # The three Strix lanes share one physical machine, and this workflow now
-      # runs a third of them, so a TUI frame that renders well inside the 30s
-      # default on an idle runner can miss it while a sibling lane loads a model.
-      # Raise the wait budget rather than let that read as a product failure; a
-      # genuine hang still fails, just later.
+      # A pool host can be busy with other CI work between GPU preflight and
+      # the TUI checks, so a frame that renders well inside the 30s default on
+      # an idle runner can miss it. Raise the wait budget rather than let that
+      # read as a product failure; a genuine hang still fails, just later.
       E2E_TUI_TIMEOUT_SECS: "90"
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
@@ -383,17 +380,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
+      - name: Reclaim GPU from stray E2E processes
         run: |
-          mkdir -p /home/ubuntu/actions-runner/e2e-home /home/ubuntu/actions-runner/tmp /home/ubuntu/actions-runner/pip-cache
-          # Reclaim the GPU from any serve leaked by a killed/timed-out prior run
-          # (see e2e-gpu). Scoped to e2e leftovers only.
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
           pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
           pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
           pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "prepared + reclaimed"
+          echo "reclaimed"
 
       # GPU preflight: bounded wait so a missing/wedged/held GPU fails fast (~90s)
       # instead of hanging to the job cap. Transient contention (VRAM still
@@ -427,17 +421,17 @@ jobs:
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
           exit 1
 
-      # Bootstrap rustup ourselves with --no-modify-path so it never writes to
-      # $HOME/.profile (setup-rust-toolchain doesn't expose that flag).
-      # rust-toolchain.toml pins the exact toolchain, installed on first cargo
-      # use. Idempotent.
+      # Pool hosts don't preinstall cargo/rustup; bootstrap ourselves with
+      # --no-modify-path so it never writes to $HOME/.profile (setup-rust-
+      # toolchain doesn't expose that flag). rust-toolchain.toml pins the exact
+      # toolchain, installed on first cargo use. Idempotent.
       - name: Ensure Rust toolchain
         run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Run E2E tests on Strix Halo
         run: |
@@ -495,7 +489,7 @@ jobs:
     # 35min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     timeout-minutes: 35
-    runs-on: [self-hosted, windows, strix-halo, native]
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
@@ -507,13 +501,12 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-windows'))
       )
-    continue-on-error: true
+    continue-on-error: false
     env:
-      # The three Strix lanes share one physical machine, and this workflow now
-      # runs a third of them, so a TUI frame that renders well inside the 30s
-      # default on an idle runner can miss it while a sibling lane loads a model.
-      # Raise the wait budget rather than let that read as a product failure; a
-      # genuine hang still fails, just later.
+      # A pool host can be busy with other CI work between GPU preflight and
+      # the TUI checks, so a frame that renders well inside the 30s default on
+      # an idle runner can miss it. Raise the wait budget rather than let that
+      # read as a product failure; a genuine hang still fails, just later.
       E2E_TUI_TIMEOUT_SECS: "90"
       # Same cold-start budget as every other lane and as this lane's own nightly
       # twin: a first serve on shared hardware loads the model before it answers,
@@ -608,6 +601,18 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
+          # E2E_SHARED_CACHE_DIR: every Linux lane sets this; the harness's own
+          # isolate_env() (tests/e2e-cucumber/tests/e2e.rs) derives HF_HOME,
+          # PIP_CACHE_DIR, and ROCM_CLI_CACHE_DIR (the therock/tool archive cache)
+          # from it per scenario, rather than each scenario's isolated TempDir —
+          # this lane never set it, so on the ephemeral pool (no warm cache
+          # carried over from prior jobs) every one of those downloads was cold
+          # every scenario. Model downloads in particular can outrun serve
+          # readiness (observed: serve-08 never became ready within 240s).
+          # Scenarios reusing the same download within THIS run now get a warm
+          # hit after the first.
+          $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
+
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
           # This job does not set CARGO_TARGET_DIR, so the binaries land in
           # the default target\release (fall back to it when the env var is unset).
@@ -656,6 +661,12 @@ jobs:
     # scenario, so match the dedicated nightly lane's cap and leave room for
     # build, runtime pre-warm, the rest of the suite, and platform.json.
     timeout-minutes: 90
+    # Tried devlab-dispatch here too (2026-09-10): a scoped dispatch sat queued
+    # for 3.5min+ with zero pickup, vs. ~85s for both the Ubuntu and Windows
+    # lanes on the same pool — no pool runner carries `wsl`. This lane isn't
+    # really "Strix Halo hardware," it's a WSL2 guest inside a specific
+    # pre-configured Windows box, which the pool doesn't appear to provide.
+    # Stays on the static runner until/unless that changes.
     runs-on: [self-hosted, linux, strix-halo, wsl]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
@@ -671,14 +682,13 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'strix-wsl'))
       )
-    continue-on-error: true
+    continue-on-error: false
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
-      # The three Strix lanes share one physical machine, and this workflow now
-      # runs a third of them, so a TUI frame that renders well inside the 30s
-      # default on an idle runner can miss it while a sibling lane loads a model.
-      # Raise the wait budget rather than let that read as a product failure; a
-      # genuine hang still fails, just later.
+      # WSL2's virtualization overhead can make a TUI frame that renders well
+      # inside the 30s default on native hardware miss it here. Raise the wait
+      # budget rather than let that read as a product failure; a genuine hang
+      # still fails, just later.
       E2E_TUI_TIMEOUT_SECS: "90"
       # Match the other hardware lanes: opt into the platform-adaptive
       # large-model scenario only when the manual include_nightly input is on.
@@ -850,7 +860,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'rad3'))
       )
-    continue-on-error: true
+    continue-on-error: false
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
