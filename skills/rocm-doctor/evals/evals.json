@@ -58,9 +58,23 @@
     },
     {
       "id": "rocm-under-wsl2",
+      "skill_should_trigger": true,
+      "note": "ROCm vocabulary and an AMD GPU, but WSL2 is a separate platform the scope gate declines rather than troubleshoots -- the skill still has to load to make that call, so this grades the decline itself, not a diagnosis.",
+      "prompt": "I'm running ROCm inside WSL2 on Windows and torch.cuda.is_available() is False for my AMD GPU. How do I fix it?",
+      "expected_behavior": [
+        "State plainly that WSL2 is out of scope for this skill and why, and point at AMD's ROCm-on-WSL guide",
+        "Give no troubleshooting for it: no commands to run, no driver advice, no diagnostic checklist"
+      ],
+      "unexpected_behavior": [
+        "Run `rocm examine`, `rocm diagnose`, or `rocm fix`",
+        "Offer any WSL2 troubleshooting steps or generic GPU advice"
+      ]
+    },
+    {
+      "id": "nvidia-container-toolkit-unrelated",
       "skill_should_trigger": false,
-      "note": "ROCm vocabulary and an AMD GPU, but WSL2 is a separate platform the skill declines rather than troubleshoots.",
-      "prompt": "I'm running ROCm inside WSL2 on Windows and torch.cuda.is_available() is False for my AMD GPU. How do I fix it?"
+      "note": "NVIDIA GPU and a container runtime error, with no ROCm/AMD vocabulary at all -- doesn't match this skill's frontmatter description, so nothing should load. Restores the two-negative floor `rocm-under-wsl2` moved off of.",
+      "prompt": "My NVIDIA Docker container can't see the GPU -- 'nvidia-container-cli: initialization error: nvml error: driver/library version mismatch'. How do I get the NVIDIA Container Toolkit working?"
     }
   ]
 }
