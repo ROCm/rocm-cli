@@ -1145,21 +1145,21 @@ serve_timeout_secs = 90
         for wsl in ["wsl", "wsl2"] {
             assert!(
                 matches!(
-                    resolve(&d, &cap(wsl), &m, false, false, false),
+                    resolve(&d, &cap(wsl), &m, Included::default()),
                     Expectation::Skip { .. }
                 ),
                 "{wsl} is linux but not bare metal, so the scenario has no premise"
             );
         }
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            resolve(&d, &cap("strix-windows"), &m, Included::default()),
             Expectation::Skip { .. }
         ));
         // `mock` is deliberately absent: the fixture models it as os_family
         // "other", so it cannot stand for the real mock lane here.
         for host in ["mi300x", "strix-ubuntu"] {
             assert_eq!(
-                resolve(&d, &cap(host), &m, false, false, false),
+                resolve(&d, &cap(host), &m, Included::default()),
                 Expectation::ExpectPass,
                 "{host} is native Linux and must still run the scenario"
             );
