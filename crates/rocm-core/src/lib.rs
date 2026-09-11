@@ -5877,6 +5877,15 @@ pub struct AutomationRuntimeState {
     /// `None` on two very different occasions, which callers must not conflate:
     /// a state file written before this field existed, and a platform without
     /// `/proc` where [`process_start_ticks`] can never return anything.
+    ///
+    /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
+    /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm
+    /// — so **no recycling check happens at all** and a caller that signals on
+    /// that verdict is killing on a bare pid. Tell the two apart by asking the
+    /// platform: if [`process_start_ticks`] returns `Some` for a live pid while
+    /// this is `None`, the record predates the field and the pid is unverifiable;
+    /// if it returns `None`, no identity is obtainable here and best-effort is
+    /// the only option (macOS and Windows, permanently).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
@@ -5900,15 +5909,21 @@ impl AutomationRuntimeState {
         Ok(Some(state))
     }
 
+    /// Publish the runtime state atomically.
+    ///
+    /// Written on every daemon tick, and read by `rocm uninstall` to decide
+    /// whether a background helper is still up. A plain `fs::write` leaves a
+    /// truncated file if the daemon dies mid-write, and uninstall has to treat an
+    /// unreadable state file as "cannot confirm the helper is stopped" — so a
+    /// crash at the wrong moment would block uninstall until the operator
+    /// repaired the file by hand.
     pub fn write(&self, paths: &AppPaths) -> Result<()> {
         paths.ensure()?;
         let path = paths.automation_state_path();
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self)
-                .context("failed to serialize automation runtime state")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .context("failed to serialize automation runtime state")?;
+        write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 

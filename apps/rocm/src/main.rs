@@ -15567,12 +15567,43 @@ struct ManagedServiceStopReport {
 /// On a platform without `/proc` no start-time exists to record or compare, so
 /// this degrades to the same best-effort match the managed-service kills already
 /// use there rather than making uninstall unusable whenever the daemon is up.
+/// The failure recorded when the background helper is live but cannot be proven
+/// to be `rocmd`, so it was deliberately left alone.
+fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
+    FailedManagedServiceStop {
+        service_id: format!("rocmd (pid {daemon_pid})"),
+        reason: "the background helper's identity could not be verified, so it was left running \
+                 rather than risk signalling an unrelated process that inherited its pid"
+            .to_owned(),
+        remedy: StopFailureRemedy::StopTheDaemon,
+    }
+}
+
 fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
 ) {
-    let Ok(Some(state)) = AutomationRuntimeState::load(paths) else {
-        return;
+    // Three outcomes, not two. `load` returns `Ok(None)` only when there is no
+    // state file at all; a permission error or a half-written file returns
+    // `Err`, and discarding that would skip the daemon stop silently and let
+    // uninstall delete the tooling while a live `rocmd` respawns what the
+    // service pass just stopped — the exact defect this gate exists to close.
+    // The service side already treats an unparseable record as a hard failure
+    // (see `unreadable_service_manifests`); this is the same call.
+    let state = match AutomationRuntimeState::load(paths) {
+        Ok(Some(state)) => state,
+        Ok(None) => return,
+        Err(error) => {
+            report.failed.push(FailedManagedServiceStop {
+                service_id: "rocmd (runtime state unreadable)".to_owned(),
+                reason: format!(
+                    "the background helper's runtime state could not be read, so it cannot be \
+                     confirmed stopped: {error:#}"
+                ),
+                remedy: StopFailureRemedy::StopTheDaemon,
+            });
+            return;
+        }
     };
     if state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
         return;
@@ -15583,13 +15614,24 @@ fn stop_background_helper_before_uninstall(
     // Kill nothing this cannot identify. `terminate_verified` with `force` is a
     // SIGKILL across the whole process tree, and `runtime-state.json` outlives a
     // crash, OOM-kill or reboot with `running` still true — so the recorded PID
-    // can belong to an unrelated process by the time uninstall runs. Recycling is
-    // only detectable when a start-time was recorded at spawn AND can be read
-    // back now; without both, refusing to signal is the only safe answer, since
-    // the failure mode is uninstall destroying something the user never
-    // installed. The operator gets the PID and the `StopTheDaemon` remedy
-    // instead, which is recoverable; a wrong kill is not.
+    // can belong to an unrelated process by the time uninstall runs.
+    //
+    // `identity_state` maps an unrecorded start-time to `Matches` (best-effort,
+    // for legacy state files), which is exactly wrong here: a state file written
+    // by a pre-upgrade `rocmd` has no `daemon_start_ticks`, and treating that as
+    // a match would force-kill a whole tree at a PID this cannot prove is ours —
+    // the ordinary upgrade path. So when this platform *can* read a start-time
+    // (`/proc`) yet none was recorded, the record simply predates the field:
+    // treat it as unverifiable, leave the process alone, and abort. Being told
+    // to kill a PID is recoverable; killing an unrelated process tree is not.
+    //
+    // Only where no start-time can ever be read (no `/proc`: macOS, Windows) does
+    // this fall back to the best-effort match the managed-service kills already
+    // use there — otherwise uninstall could never stop a live daemon on those
+    // platforms. That residual gap is documented on `daemon_start_ticks`.
     let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
+    let unverifiable_pre_upgrade_record = state.daemon_start_ticks.is_none()
+        && rocm_core::process_start_ticks(state.daemon_pid).is_some();
     match rocm_core::identity_state(&identity) {
         rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled => {
             // Nothing of ours is running: either the PID is free or it now
@@ -15598,14 +15640,15 @@ fn stop_background_helper_before_uninstall(
             return;
         }
         rocm_core::IdentityState::Indeterminate => {
-            report.failed.push(FailedManagedServiceStop {
-                service_id: format!("rocmd (pid {})", state.daemon_pid),
-                reason: "the background helper's identity could not be verified, so it was left \
-                         running rather than risk signalling an unrelated process that inherited \
-                         its pid"
-                    .to_owned(),
-                remedy: StopFailureRemedy::StopTheDaemon,
-            });
+            report
+                .failed
+                .push(daemon_identity_unverified(state.daemon_pid));
+            return;
+        }
+        rocm_core::IdentityState::Matches if unverifiable_pre_upgrade_record => {
+            report
+                .failed
+                .push(daemon_identity_unverified(state.daemon_pid));
             return;
         }
         rocm_core::IdentityState::Matches => {}
@@ -30943,6 +30986,82 @@ ID_LIKE="suse opensuse"
         assert!(
             !rocm_core::process_is_running(pid),
             "the background helper must be stopped before uninstall proceeds"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_never_kills_a_daemon_pid_from_a_state_file_that_predates_start_ticks() {
+        // The ordinary upgrade path: `runtime-state.json` written by a pre-upgrade
+        // `rocmd` carries no `daemon_start_ticks`. `identity_state` calls that
+        // `Matches` (its legacy best-effort arm), so signalling on that verdict
+        // would force-kill a whole tree at a pid nothing has verified. On a
+        // platform that CAN read start-times, an unrecorded one means the record
+        // is stale, not that the pid is ours.
+        let stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn unrelated process");
+        let pid = stranger.id();
+        let (root, paths) = test_paths("uninstall-daemon-legacy-record");
+        let state = runtime_state(true, pid);
+        assert!(
+            state.daemon_start_ticks.is_none(),
+            "this test is about the unrecorded-identity path"
+        );
+        state.write(&paths).expect("write runtime state");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            rocm_core::process_is_running(pid),
+            "an unverifiable pid must never be signalled: uninstall killed an unrelated process"
+        );
+        assert!(
+            report.stopped.is_empty(),
+            "nothing was confirmed stopped: {report:?}"
+        );
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon
+                    && failure.service_id.contains(&pid.to_string())),
+            "an unverifiable helper must abort the uninstall and name its pid: {report:?}"
+        );
+        let mut stranger = stranger;
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_refuses_when_the_daemon_runtime_state_cannot_be_read() {
+        // `load` returns `Err` for a corrupt or unreadable state file and
+        // `Ok(None)` only when there is none. Discarding that `Err` would skip the
+        // daemon stop silently and remove the tooling while a live `rocmd` can
+        // still respawn what the service pass just stopped. Reachable in practice:
+        // the file is rewritten on every tick.
+        let (root, paths) = test_paths("uninstall-daemon-state-corrupt");
+        paths.ensure().expect("create the app directories");
+        fs::write(paths.automation_state_path(), b"{ not json")
+            .expect("seed a corrupt runtime state");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon),
+            "an unreadable runtime state must abort the uninstall: {report:?}"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the gate must refuse to remove anything"
         );
         let _ = fs::remove_dir_all(root);
     }
