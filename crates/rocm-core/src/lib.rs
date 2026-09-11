@@ -2420,17 +2420,18 @@ fn normalize_cpu_model(value: &str) -> String {
 /// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
 /// matrix by reading one of them.
 ///
-/// `/dev/dxg` is trusted on its own. `$WSL_DISTRO_NAME` is not — it is an
-/// ordinary environment variable that can survive into a shell that merely
-/// inherited it — so it is corroborated against `/proc/version` before being
-/// believed. See [`wsl_signals_indicate_wsl`] for why a false positive is no
-/// longer cheap.
+/// `/dev/dxg` is trusted on its own, and so is the kernel's own build string in
+/// `/proc/version` — nothing else stamps a kernel `-microsoft-standard-WSL2` or
+/// `-Microsoft`. `$WSL_DISTRO_NAME` is not trusted at all: it is an ordinary
+/// environment variable that can survive into a shell that merely inherited it
+/// (over `ssh`, in a `systemd` unit, under `sudo` without `-E`, under `env -i` or
+/// cron) without corroborating anything. See [`wsl_signals_indicate_wsl`] for why
+/// a false positive is no longer cheap.
 #[must_use]
 pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
-            std::env::var_os("WSL_DISTRO_NAME").is_some(),
             &fs::read_to_string("/proc/version").unwrap_or_default(),
         )
 }
@@ -2502,20 +2503,22 @@ fn rocm_relative_file_exists(relative: &str) -> bool {
 /// tested — including the two cases that used to split the old implementations.
 ///
 /// `/dev/dxg` alone is trusted outright — nothing but WSLg's GPU passthrough
-/// creates that device node. `$WSL_DISTRO_NAME` alone is not: it is an ordinary
-/// environment variable that survives into a shell someone launched with it
-/// inherited or forwarded (e.g. over `ssh`), so it is corroborated against
-/// `/proc/version` before being believed. A false positive here no longer costs
-/// only a route-out note — this catalog now runs the WSL diagnosis and fix set
-/// directly, so a bare-metal host that merely inherited the variable would have
-/// its entire bare-metal catalog silently disabled.
-fn wsl_signals_indicate_wsl(dxg_device: bool, distro_name_set: bool, proc_version: &str) -> bool {
+/// creates that device node. The kernel's own build string in `/proc/version` is
+/// also trusted alone: only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+/// `-Microsoft`, and that string cannot be inherited, forwarded, or left behind
+/// by an unrelated shell the way `$WSL_DISTRO_NAME` can. `$WSL_DISTRO_NAME` plays
+/// no part here at all — an ordinary bare-metal host that merely inherited it
+/// (over `ssh`, from a parent shell, under `sudo` without `-E`) has no
+/// `/proc/version` match to go with it, so it still reads as Linux. A false
+/// positive the other way no longer costs only a route-out note — this catalog
+/// now runs the WSL diagnosis and fix set directly, so a bare-metal host
+/// misread as WSL would have its entire bare-metal catalog silently disabled.
+fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
     if dxg_device {
         return true;
     }
     let proc_version = proc_version.to_ascii_lowercase();
-    let proc_version_matches = proc_version.contains("microsoft") || proc_version.contains("wsl");
-    distro_name_set && proc_version_matches
+    proc_version.contains("microsoft") || proc_version.contains("wsl")
 }
 
 fn detect_wsl_summary() -> Option<WslSummary> {
@@ -12073,100 +12076,67 @@ last_installed_runtime_id = "therock-release"
     fn dev_dxg_is_believed_on_its_own() {
         // Nothing but WSLg's GPU passthrough creates this device node, so it is
         // trusted without corroboration.
-        assert!(wsl_signals_indicate_wsl(true, false, ""), "/dev/dxg");
+        assert!(wsl_signals_indicate_wsl(true, ""), "/dev/dxg");
         assert!(
-            wsl_signals_indicate_wsl(true, false, "Linux version 6.8.0-51-generic"),
+            wsl_signals_indicate_wsl(true, "Linux version 6.8.0-51-generic"),
             "/dev/dxg overrides an otherwise ordinary kernel string"
         );
     }
 
     #[test]
-    fn distro_name_alone_is_not_enough_any_more() {
-        // $WSL_DISTRO_NAME is an ordinary environment variable: it can survive
-        // into a shell that merely inherited it (e.g. over ssh), so on its own
-        // it no longer counts. A false positive here now silently disables the
-        // entire bare-metal catalog instead of costing a route-out note, so the
-        // bar for believing it went up.
+    fn proc_version_alone_is_believed() {
+        // Only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+        // `-Microsoft` -- unlike $WSL_DISTRO_NAME, that string cannot be
+        // inherited or forwarded into an unrelated shell, so it needs no
+        // corroboration. This is also what makes a WSL2 container correctly
+        // read as WSL even when it was not started with /dev/dxg passed in:
+        // it shares the host kernel, so /proc/version still carries the
+        // marker even though the container has no $WSL_DISTRO_NAME of its own.
         assert!(
-            !wsl_signals_indicate_wsl(false, true, ""),
-            "$WSL_DISTRO_NAME with no /proc/version corroboration is not enough"
+            wsl_signals_indicate_wsl(false, "Linux version 6.6.87.2-microsoft-standard-WSL2"),
+            "microsoft in /proc/version is enough on its own"
         );
         assert!(
-            !wsl_signals_indicate_wsl(false, true, "Linux version 6.8.0-51-generic"),
-            "$WSL_DISTRO_NAME with an ordinary kernel string is not enough"
-        );
-    }
-
-    #[test]
-    fn proc_version_alone_is_not_enough_any_more() {
-        // Symmetric with the distro-name case: a kernel string naming Microsoft
-        // or WSL no longer suffices without $WSL_DISTRO_NAME alongside it.
-        assert!(
-            !wsl_signals_indicate_wsl(
-                false,
-                false,
-                "Linux version 6.6.87.2-microsoft-standard-WSL2"
-            ),
-            "microsoft in /proc/version alone is not enough"
-        );
-        assert!(
-            !wsl_signals_indicate_wsl(false, false, "Linux version 5.15.0 wsl2"),
-            "wsl in /proc/version alone is not enough"
-        );
-    }
-
-    #[test]
-    fn distro_name_and_proc_version_together_are_believed() {
-        assert!(
-            wsl_signals_indicate_wsl(
-                false,
-                true,
-                "Linux version 6.6.87.2-microsoft-standard-WSL2"
-            ),
-            "$WSL_DISTRO_NAME corroborated by microsoft in /proc/version"
-        );
-        assert!(
-            wsl_signals_indicate_wsl(false, true, "Linux version 5.15.0 wsl2"),
-            "$WSL_DISTRO_NAME corroborated by wsl in /proc/version"
+            wsl_signals_indicate_wsl(false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version is enough on its own"
         );
     }
 
     #[test]
     fn an_ordinary_kernel_with_no_signals_is_not_wsl() {
         assert!(
-            !wsl_signals_indicate_wsl(false, false, "Linux version 6.8.0-51-generic"),
+            !wsl_signals_indicate_wsl(false, "Linux version 6.8.0-51-generic"),
             "an ordinary kernel is not WSL"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, ""),
+            "no device and no /proc/version to read is not WSL"
         );
     }
 
     #[test]
-    fn real_wsl2_and_wsl1_hosts_still_carry_a_corroborating_signal() {
-        // Real WSL hosts are never "distro name only": WSL sets
-        // $WSL_DISTRO_NAME for every session, and its own doc comment above
-        // records that WSL 1 kernels always end in "-microsoft" and WSL 2
-        // kernels always carry "microsoft-standard" -- so /proc/version always
-        // corroborates it. The tightened predicate still recognises both.
+    fn real_wsl2_and_wsl1_hosts_are_recognised_by_proc_version_alone() {
+        // Its own doc comment above records that WSL 1 kernels always end in
+        // "-microsoft" and WSL 2 kernels always carry "microsoft-standard" --
+        // so every real WSL host is recognised without needing $WSL_DISTRO_NAME
+        // or /dev/dxg at all.
         let wsl2 = "Linux version 5.15.167.4-microsoft-standard-WSL2";
         let wsl2_early = "Linux version 4.19.104-microsoft-standard";
         let wsl1 = "Linux version 4.4.0-19041-Microsoft";
         for proc_version in [wsl2, wsl2_early, wsl1] {
             assert!(
-                wsl_signals_indicate_wsl(false, true, proc_version),
-                "a real WSL host with $WSL_DISTRO_NAME set was not recognised: {proc_version:?}"
+                wsl_signals_indicate_wsl(false, proc_version),
+                "a real WSL host was not recognised: {proc_version:?}"
             );
         }
         // WSL 2 with GPU passthrough enabled also has /dev/dxg, which is
-        // believed regardless of the other two signals.
-        assert!(wsl_signals_indicate_wsl(true, true, wsl2));
+        // believed regardless of /proc/version.
+        assert!(wsl_signals_indicate_wsl(true, wsl2));
     }
 
     #[test]
     fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
-        assert!(wsl_signals_indicate_wsl(
-            false,
-            true,
-            "MICROSOFT-STANDARD-WSL2"
-        ));
+        assert!(wsl_signals_indicate_wsl(false, "MICROSOFT-STANDARD-WSL2"));
     }
 
     #[test]
