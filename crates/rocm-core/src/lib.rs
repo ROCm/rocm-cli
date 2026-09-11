@@ -5866,6 +5866,19 @@ pub struct AutomationRuntimeState {
     pub running: bool,
     pub automations_enabled: bool,
     pub daemon_pid: u32,
+    /// The daemon's kernel start-time, captured at spawn, so `daemon_pid` can be
+    /// checked for PID recycling before anything signals it.
+    ///
+    /// `daemon_pid` alone is not safe to kill: this file survives a crash,
+    /// OOM-kill or reboot with `running` still true, after which the OS can
+    /// reissue that PID to an unrelated process. Pairing the PID with its
+    /// start-time makes a recycled PID detectable ([`identity_state`]).
+    ///
+    /// `None` on two very different occasions, which callers must not conflate:
+    /// a state file written before this field existed, and a platform without
+    /// `/proc` where [`process_start_ticks`] can never return anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
     pub last_tick_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]

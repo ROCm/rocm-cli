@@ -15554,6 +15554,19 @@ struct ManagedServiceStopReport {
 ///
 /// A daemon that cannot be confirmed stopped is a blocking failure for the same
 /// reason a service is: it can resurrect a server after the tooling is gone.
+///
+/// It is never killed on the recorded pid alone. `runtime-state.json` outlives a
+/// crash, OOM-kill or reboot with `running` still true, so that pid can name an
+/// unrelated process — and this call site signals a whole tree with `force`.
+/// Only a pid whose recorded start-time still matches is signalled; a recycled
+/// one means the daemon is already gone (nothing to stop), and one that can be
+/// neither confirmed nor refuted is left alone and reported as a failure, which
+/// aborts the uninstall with the tooling intact. Being told to kill a pid is
+/// recoverable; having an unrelated process tree killed is not.
+///
+/// On a platform without `/proc` no start-time exists to record or compare, so
+/// this degrades to the same best-effort match the managed-service kills already
+/// use there rather than making uninstall unusable whenever the daemon is up.
 fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -15567,10 +15580,37 @@ fn stop_background_helper_before_uninstall(
     if !rocm_core::process_is_running(state.daemon_pid) {
         return;
     }
+    // Kill nothing this cannot identify. `terminate_verified` with `force` is a
+    // SIGKILL across the whole process tree, and `runtime-state.json` outlives a
+    // crash, OOM-kill or reboot with `running` still true — so the recorded PID
+    // can belong to an unrelated process by the time uninstall runs. Recycling is
+    // only detectable when a start-time was recorded at spawn AND can be read
+    // back now; without both, refusing to signal is the only safe answer, since
+    // the failure mode is uninstall destroying something the user never
+    // installed. The operator gets the PID and the `StopTheDaemon` remedy
+    // instead, which is recoverable; a wrong kill is not.
+    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
+    match rocm_core::identity_state(&identity) {
+        rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled => {
+            // Nothing of ours is running: either the PID is free or it now
+            // belongs to someone else. Both mean this daemon cannot resurrect a
+            // service, and neither is ours to kill.
+            return;
+        }
+        rocm_core::IdentityState::Indeterminate => {
+            report.failed.push(FailedManagedServiceStop {
+                service_id: format!("rocmd (pid {})", state.daemon_pid),
+                reason: "the background helper's identity could not be verified, so it was left \
+                         running rather than risk signalling an unrelated process that inherited \
+                         its pid"
+                    .to_owned(),
+                remedy: StopFailureRemedy::StopTheDaemon,
+            });
+            return;
+        }
+        rocm_core::IdentityState::Matches => {}
+    }
     println!("stopping the background helper (rocmd)");
-    // No start-time token is recorded for the daemon, so this is a best-effort
-    // identity match — the same contract the legacy service records get.
-    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, None);
     let outcome = rocm_core::terminate_verified(
         &identity,
         rocm_core::KillScope::Tree,
@@ -15701,7 +15741,10 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                 // put back the dead end that has no override and no recovery, so
                 // the removal proceeds; say so rather than deciding silently.
                 Err(_) => {
-                    println!(
+                    // stderr, not stdout: this is the one fail-open left on a
+                    // destructive path, so it must survive the operator piping
+                    // uninstall's output somewhere.
+                    eprintln!(
                         "warning: {}:{} still accepts connections but did not identify itself, \
                          and service {} is already recorded stopped — proceeding. If that is a \
                          server of yours, stop whatever holds that port first.",
@@ -29670,6 +29713,7 @@ ID_LIKE="suse opensuse"
             running: true,
             automations_enabled: true,
             daemon_pid: 123,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 2,
             local_webhook_endpoint: Some("http://127.0.0.1:19191/automation-events".to_owned()),
@@ -30865,6 +30909,89 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_stops_a_background_helper_whose_identity_it_can_verify() {
+        // The daemon restarts a managed service whose endpoint stops answering,
+        // which is exactly the state the stop pass creates before writing the
+        // record back — so it goes first. This is the path that must still kill.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn daemon stand-in");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-stops-verified-daemon");
+        let mut state = runtime_state(true, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        assert!(
+            state.daemon_start_ticks.is_some(),
+            "the recorded identity is the point of this test"
+        );
+        state.write(&paths).expect("write runtime state");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(report.failed.is_empty(), "nothing should fail: {report:?}");
+        assert_eq!(
+            report.stopped,
+            vec!["rocmd (background helper)".to_owned()],
+            "a verified daemon is stopped and reported: {report:?}"
+        );
+        let mut child = child;
+        let _ = child.wait();
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the background helper must be stopped before uninstall proceeds"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_never_kills_a_daemon_pid_that_was_recycled() {
+        // `runtime-state.json` survives a crash, OOM-kill or reboot with
+        // `running` still true, so the recorded pid can belong to a stranger by
+        // the time uninstall runs. Killing on a bare pid would make uninstall
+        // destroy something the user never installed — with `KillScope::Tree`
+        // and `force`, an unrelated process AND all its children.
+        //
+        // The stand-in plays the recycled process: a real live pid recorded with
+        // a start-time that is not its own. It must come through untouched.
+        let stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn unrelated process");
+        let pid = stranger.id();
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let (root, paths) = test_paths("uninstall-recycled-daemon-pid");
+        let mut state = runtime_state(true, pid);
+        // The daemon that recorded this pid started at a different time; this pid
+        // has since been reissued to `stranger`.
+        state.daemon_start_ticks = Some(real.wrapping_add(1));
+        state.write(&paths).expect("write runtime state");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            rocm_core::process_is_running(pid),
+            "a recycled pid must never be signalled: uninstall killed an unrelated process"
+        );
+        assert!(
+            report.stopped.is_empty(),
+            "nothing of ours was running, so nothing was stopped: {report:?}"
+        );
+        assert!(
+            report.failed.is_empty(),
+            "a recycled pid means the daemon is already gone, not that it is stuck: {report:?}"
+        );
+        let mut stranger = stranger;
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn uninstall_refuses_when_a_service_record_cannot_be_parsed() {
         // `load_managed_services` skips a manifest it cannot parse, which is
@@ -31370,11 +31497,15 @@ ID_LIKE="suse opensuse"
     }
 
     /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
+    ///
+    /// `daemon_start_ticks` is left unrecorded; tests that care about the
+    /// daemon's identity set it explicitly.
     fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
         AutomationRuntimeState {
             running,
             automations_enabled: true,
             daemon_pid,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,

@@ -179,6 +179,44 @@ mod tests {
     }
 
     #[test]
+    fn a_background_helper_that_cannot_be_stopped_leaves_every_planned_path_in_place() {
+        // The daemon is the one failure class that is not a service: it restarts
+        // managed servers on its own, so removing the tooling while it is up
+        // recreates EAI-8014 from the other end. When its identity cannot be
+        // verified it is deliberately left running, which must abort the
+        // uninstall rather than quietly proceed.
+        let (root, plan) = plan_removing_one_file("daemon-unconfirmed");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_managed_services_then_remove(&plan, || {
+            Ok(ManagedServiceStopReport {
+                stopped: Vec::new(),
+                failed: vec![FailedManagedServiceStop {
+                    service_id: "rocmd (pid 4321)".to_owned(),
+                    reason: "the background helper's identity could not be verified".to_owned(),
+                    remedy: StopFailureRemedy::StopTheDaemon,
+                }],
+            })
+        })
+        .expect_err("an unstopped background helper must abort uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rocmd (pid 4321)"),
+            "the abort names the pid the operator has to kill: {message}"
+        );
+        assert!(
+            message.contains("background helper"),
+            "the abort explains it is the helper, not a service: {message}"
+        );
+        assert!(
+            doomed.is_file(),
+            "the planned path must survive an aborted uninstall"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_stop_pass_that_cannot_run_leaves_every_planned_path_in_place() {
         // Discovery failing (an unreadable services directory) is the same class
         // of danger as a stop failing: uninstall would be removing the tooling
