@@ -451,6 +451,37 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     );
 }
 
+#[then("the machine-readable report names a GPU target for the GPU it found")]
+async fn assert_json_names_target_per_gpu(world: &mut E2eWorld) {
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let json = parsed_json(world);
+    // The human report's target comes from sysfs and has always been right; the
+    // per-GPU records in the machine-readable form come from rocminfo, whose
+    // ISA `Name:` lines used to clobber the agent name (#393). The two must
+    // name the same target for the GPU this host has.
+    let expected = human_states(human, "detected_gfx_target")
+        .filter(|t| t.starts_with("gfx"))
+        .expect("the human report names no gfx target on a host that has a GPU");
+    let targets: Vec<String> = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .map(|gpus| {
+            gpus.iter()
+                .filter_map(|g| g.get("gfx_target").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        targets.iter().any(|t| t == &expected),
+        "`examine --json` names no GPU with gfx_target {expected:?} \
+         (per-GPU targets: {targets:?}); the human report found it"
+    );
+}
+
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
