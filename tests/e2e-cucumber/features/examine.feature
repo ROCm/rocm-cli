@@ -174,3 +174,16 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system both for reading and for scripting
     Then the framework report names the runtime's interpreter
+
+  # `examine --json` fills `gpus[].gfx_target` from rocminfo, but rocminfo
+  # prints a GPU agent's ISA sub-entries as further `Name:` lines after the
+  # agent's own, so the parser used to overwrite the agent name with
+  # `amdgcn-amd-amdhsa--...` and drop every GPU (#393). The human report was
+  # never affected — its `detected_gfx_target` comes from sysfs — which is why
+  # examine-04 stayed green. This pins the machine-readable form's per-GPU
+  # record against the target the human report names, on any host with a GPU.
+  @id:examine-json-names-target-per-gpu @requires-gpu
+  Scenario: examine-16 - The scripting report names a target for the GPU it found
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then the machine-readable report names a GPU target for the GPU it found
