@@ -6790,6 +6790,14 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 }
             }
 
+            if waited_on_confirmation {
+                // The confirmation prompt can block indefinitely; reload the
+                // config another process may have written while we waited,
+                // so both revalidation and the apply step below see (and
+                // save over) the current on-disk state rather than clobbering
+                // a concurrent change with what we loaded before the prompt.
+                config = RocmCliConfig::load(&paths)?;
+            }
             let plan = if waited_on_confirmation {
                 revalidate_runtime_uninstall_plan(&paths, &config, plan)?
             } else {
@@ -7270,6 +7278,7 @@ fn revalidate_runtime_uninstall_plan(
 ) -> Result<RuntimeUninstallPlan> {
     let fresh = plan_runtime_uninstall(paths, config, &plan.manifest.runtime_key)?;
     if fresh.manifest.runtime_id != plan.manifest.runtime_id
+        || fresh.manifest.install_root != plan.manifest.install_root
         || fresh.was_active != plan.was_active
         || fresh.install_root_decision != plan.install_root_decision
     {
@@ -28335,6 +28344,50 @@ ID_LIKE="suse opensuse"
         assert!(plan.will_remove_install_root());
         assert!(manifest.install_root.exists());
         assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process relocating this runtime's install root
+        // while the uninstall confirmation prompt was waiting on the user.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        fs::rename(&manifest.install_root, &relocated_root)?;
+        let mut relocated_manifest = manifest.clone();
+        relocated_manifest.install_root = relocated_root.clone();
+        fs::write(
+            relocated_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root moved since it was shown"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
