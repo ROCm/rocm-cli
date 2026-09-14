@@ -82,12 +82,14 @@ pub struct DiagnoseReport {
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
-    /// Set when the host is out of scope for this catalog (e.g. WSL2). Present
-    /// whenever no checker cleared [`MIN_SCORE_FOR_MATCH`] on such a host; the
-    /// bare-metal Linux catalog is deliberately not run, so this carries the
-    /// routing note instead. `matched` may still hold sub-threshold entries
-    /// (e.g. a weak `out of memory` mention) alongside it — read
-    /// [`DiagnoseReport::has_match`] to tell a real cause from a weak signal.
+    /// Set when the catalog has no entries at all for the running platform, and
+    /// carrying the routing note that says so.
+    ///
+    /// Decided purely by platform coverage ([`catalog_covers`]) — never by a
+    /// score. When this is `Some`, no checker ran, so `matched` is empty and
+    /// `has_match` is false; a consumer must not wait for sub-threshold rows
+    /// alongside it. Pinned by
+    /// `an_out_of_scope_report_never_carries_matched_entries`.
     #[serde(default)]
     pub out_of_scope: Option<String>,
 }
@@ -3542,6 +3544,42 @@ mod tests {
         );
         assert!(report.matched.is_empty());
         assert!(!report.has_match());
+    }
+
+    #[test]
+    fn an_out_of_scope_report_never_carries_matched_entries() {
+        // The serialized JSON contract on `out_of_scope`: when it is set the
+        // catalog did not run, so `matched` cannot hold anything -- not even a
+        // weak sub-threshold signal. One direction only: a covered platform with
+        // nothing wrong also has an empty `matched`, with `out_of_scope` unset.
+        // Nothing else in the tree pins the pair, which is how the field's own
+        // doc comment came to claim the opposite. Two independent mechanisms
+        // uphold it today -- `diagnose` clears `matched` when `out_of_scope` is
+        // set, and `run_all_checks` filters on the same platform family
+        // `catalog_covers` consults -- so this fails once both are gone, which
+        // is exactly the "a checker somehow ran on an uncovered host" shape the
+        // JSON contract must not develop.
+        let mut uncovered = linux_base();
+        uncovered.os_family = "other".to_owned();
+        let mut windows = linux_base();
+        windows.os_family = "windows".to_owned();
+        for e in [linux_base(), wsl_base(), windows, uncovered] {
+            // A symptom that scores for at least one entry where the catalog
+            // applies, so "matched is empty" is a real consequence of the
+            // platform being uncovered rather than of a silent symptom.
+            let report = diagnose(&e, VLLM_OOM_CANONICAL_SYMPTOM);
+            assert!(
+                report.out_of_scope.is_none() || report.matched.is_empty(),
+                "out_of_scope set with matched entries on {}: {:?}",
+                e.os_family,
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+            assert!(
+                report.out_of_scope.is_none() || !report.has_match(),
+                "out_of_scope set alongside has_match on {}",
+                e.os_family
+            );
+        }
     }
 
     #[test]

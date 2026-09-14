@@ -173,6 +173,10 @@ a tiny model. rocm-cli helps in three ways:
   reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
   with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
   for the full conditional remediation (busy GPU vs. a model that does not fit).
+  The printed command quotes your actual failing line when it can be rendered as
+  one intact single-quoted argument; a line carrying an apostrophe or terminal
+  control bytes falls back to the canonical symptom below rather than handing you
+  a command whose quoting the log text broke.
 
 Explicitly, the workaround for an OOM on a shared card is:
 

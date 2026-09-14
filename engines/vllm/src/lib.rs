@@ -2231,20 +2231,26 @@ fn oom_utilization_hint(log_tail: &str) -> String {
         return String::new();
     }
     // Route the user's *actual* failing line into the `--symptom` example when
-    // the diagnose checker would actually score it; otherwise fall back to the
-    // canonical symptom so the printed command always reports a cause. The
-    // detector here is a coarse substring scan that accepts lines the scorer
-    // rates sub-threshold (e.g. a bare "... out of memory"), so without this
-    // fallback the diagnose command could report nothing -- which reads as "the
-    // tool checked and there's no known cause", worse than not printing it.
-    let symptom_line = log_tail
+    // the diagnose checker would actually score it *and* it can be rendered as
+    // one intact single-quoted argument; otherwise fall back to the canonical
+    // symptom so the printed command always reports a cause. The detector here
+    // is a coarse substring scan that accepts lines the scorer rates
+    // sub-threshold (e.g. a bare "... out of memory"), so without this fallback
+    // the diagnose command could report nothing -- which reads as "the tool
+    // checked and there's no known cause", worse than not printing it.
+    let raw_line = log_tail
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty() && log_tail_shows_oom(line))
         .unwrap_or("out of memory");
-    let candidate = format!("vllm: {symptom_line}");
-    let symptom = if rocm_core::vllm_oom_symptom_is_diagnosable(&candidate) {
+    // The line is subprocess output, so it is echoed only after the terminal
+    // control bytes vLLM's colourised logger emits are removed.
+    let symptom_line = strip_terminal_control_sequences(raw_line);
+    let candidate = format!("vllm: {raw_line}");
+    let symptom = if quotable_in_single_quotes(&candidate)
+        && rocm_core::vllm_oom_symptom_is_diagnosable(&candidate)
+    {
         candidate
     } else {
         rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
@@ -2254,6 +2260,57 @@ fn oom_utilization_hint(log_tail: &str) -> String {
          For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
         rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
     )
+}
+
+/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
+///
+/// The value is untrusted subprocess output (the vLLM startup log tail) and the
+/// message it lands in invites the user to paste the command into a shell, so a
+/// bare `'` would close the quote and let text nobody vetted become shell
+/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
+/// `model 'foo'`), and a line only has to mention running out of memory to be
+/// selected, so this is an ordinary case rather than an exotic one.
+///
+/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
+/// the exact bytes but yields a command a reader cannot check by eye, and a
+/// wrong escape is *runnable* and misleading rather than obviously broken;
+/// control bytes would still reach the terminal. The canonical fallback is the
+/// branch that already exists for "this line cannot be used", and it is
+/// guaranteed to report a cause. The user's own line stays visible in the
+/// human-readable sentence above the command (and in the log tail printed with
+/// it), so nothing is lost but the copy-paste convenience.
+fn quotable_in_single_quotes(symptom: &str) -> bool {
+    !symptom.contains('\'') && !symptom.chars().any(char::is_control)
+}
+
+/// Removes ANSI escape sequences and any remaining control characters, so a
+/// colourised or bell-bearing log line cannot repaint the user's terminal from
+/// inside rocm-cli's own error message.
+fn strip_terminal_control_sequences(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                // CSI (what a colourised logger emits): skip the parameter and
+                // intermediate bytes up to and including the final byte.
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            } else {
+                // Any other escape: drop the byte it introduces too.
+                chars.next();
+            }
+            continue;
+        }
+        if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
@@ -2779,6 +2836,74 @@ mod tests {
                 "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
             );
         }
+    }
+
+    /// The `--symptom` value the hint actually hands the user, read back out of
+    /// the rendered text exactly the way a shell would: everything between the
+    /// opening quote that follows `--symptom ` and the next `'`.
+    fn quoted_symptom_argument(hint: &str) -> &str {
+        hint.split("--symptom '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("hint must carry a --symptom value")
+    }
+
+    #[test]
+    fn an_apostrophe_in_the_failing_line_cannot_break_out_of_the_printed_command() {
+        // A realistic vLLM/PyTorch failing line: apostrophes are routine in
+        // Python error text, and this one scores well above MIN_SCORE_FOR_MATCH
+        // (torch.OutOfMemoryError + HIP out of memory), so the "route the user's
+        // real line" branch selects it.
+        let log_tail = concat!(
+            "ERROR 09-14 12:00:01 engine.py:389] torch.OutOfMemoryError: HIP out of memory. ",
+            "Tried to allocate 7.21 GiB. GPU 0 can't allocate the model's weights."
+        );
+        assert!(log_tail_shows_oom(log_tail));
+        let hint = oom_utilization_hint(log_tail);
+
+        // The rendered command must be one intact single-quoted argument: no
+        // user-controlled byte may close the quote, so nothing the subprocess
+        // printed can land outside it in a command the user is told to paste.
+        let command = hint
+            .split("run `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("hint must print a runnable command");
+        assert_eq!(
+            command.matches('\'').count(),
+            2,
+            "the --symptom argument must stay a single balanced quoted word: {command}"
+        );
+        let symptom = quoted_symptom_argument(&hint);
+        assert!(
+            !symptom.contains('\''),
+            "no apostrophe may reach the single-quoted argument: {symptom:?}"
+        );
+        // ...and the command it does print must still report a cause.
+        assert!(
+            rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
+            "the fallback symptom must still be diagnosable: {symptom:?}"
+        );
+    }
+
+    #[test]
+    fn control_bytes_from_the_log_are_stripped_from_the_echoed_line() {
+        // vLLM's logger colourises; an ANSI-coloured OOM line must not repaint
+        // the user's terminal from inside rocm-cli's own error message.
+        let log_tail = "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}";
+        let hint = oom_utilization_hint(log_tail);
+        assert!(
+            !hint.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte may survive into the printed hint: {hint:?}"
+        );
+        assert!(
+            !hint.contains("[31m") && !hint.contains("[0m"),
+            "the ANSI sequence must be removed whole, not just its escape byte: {hint:?}"
+        );
+        assert!(
+            hint.contains("RuntimeError: HIP out of memory"),
+            "the readable part of the failing line must survive: {hint:?}"
+        );
     }
 
     #[test]
