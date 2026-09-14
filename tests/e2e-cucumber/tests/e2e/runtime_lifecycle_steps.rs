@@ -153,6 +153,19 @@ async fn uninstall(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user tries to uninstall that runtime without confirming")]
+async fn uninstall_without_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user dry-runs an uninstall of that runtime")]
+async fn uninstall_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--dry-run"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user imports the runtime")]
 async fn import(world: &mut E2eWorld) {
     let path = world.model_name.clone().expect("no import manifest path");
@@ -313,6 +326,50 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("- {SECOND_KEY}")),
         "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
+    );
+}
+
+#[then("the CLI refuses and requires --yes")]
+async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    assert!(
+        combined(world).contains("requires --yes"),
+        "expected a --yes-required error, got:\n{}",
+        combined(world)
+    );
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let entry = root
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{FIRST_KEY}.json"));
+    assert!(
+        entry.exists(),
+        "registry entry must survive a refused uninstall: {}",
+        entry.display()
+    );
+}
+
+#[then("the dry run reports the plan without confirming or changing anything")]
+async fn uninstall_dry_run_reports_plan(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
+        "expected a dry-run plan with no changes made, got:\n{out}"
+    );
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let entry = root
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{FIRST_KEY}.json"));
+    assert!(
+        entry.exists(),
+        "registry entry must survive a dry-run uninstall: {}",
+        entry.display()
     );
 }
 
