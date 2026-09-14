@@ -28,10 +28,19 @@ Feature: Update report
   # `--dry-run` used to `requires = "apply"` in clap, so `rocm update --dry-run`
   # alone failed with a bare usage error instead of previewing. It no longer
   # requires `--apply`, so this asserts the command reaches real business logic
-  # (the "no managed runtimes" bail, worded nothing like a clap usage error)
+  # (the "no managed runtimes" bail, which reads nothing like a clap usage error)
   # rather than being rejected before `rocm` even looks at the registry.
   @id:update-dry-run-reaches-preview-path-without-apply
   Scenario: update-04 - Previewing an update with --dry-run does not require --apply
     Given a machine with no managed runtimes
     When the user previews an update
     Then the CLI refuses because no managed runtimes are registered
+
+  # `--runtime`/`--activate` are apply-only flags: without `--apply` or
+  # `--dry-run` alongside them, the old code silently fell through to the plain
+  # report and ignored both. This pins the refusal instead of the silent no-op.
+  @id:update-runtime-or-activate-without-apply-or-dry-run-is-refused
+  Scenario: update-05 - --runtime or --activate without --apply or --dry-run is refused
+    Given a machine with no managed runtimes
+    When the user requests updating a specific runtime without --apply or --dry-run
+    Then the CLI refuses because --apply or --dry-run is required with --runtime or --activate
