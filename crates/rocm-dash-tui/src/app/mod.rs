@@ -1010,7 +1010,10 @@ impl AppState {
             .as_ref()
             .is_none_or(|m| m.browser.is_none() && m.approval.is_none() && m.active_job.is_none())
             && self.onboarding.as_ref().is_none_or(|m| {
-                m.browser.is_none() && m.approval.is_none() && m.active_job.is_none()
+                m.browser.is_none()
+                    && m.install_config.is_none()
+                    && m.approval.is_none()
+                    && m.active_job.is_none()
             })
             && self.runtime_manager.as_ref().is_none_or(|m| {
                 m.browser.is_none()
@@ -1066,12 +1069,18 @@ impl AppState {
     /// has a dedicated `Some(Ok(CtEvent::Key(k))) if state.<overlay>.is_some()`
     /// arm ahead of the generic handler, and each self-closes on root Esc
     /// regardless of `active_tab` — so there was no "Modal stays set but
-    /// invisible" bug to fix here). Dropping the tab guard is a harmless
-    /// generalization: it moves the close from the manager's own `on_key` to
-    /// this shared path (`close_overlays()` + `pane_focus = Actions`) so a
-    /// future manager doesn't need to duplicate that root-Esc handling.
-    /// `pane_focus` is meaningless outside Rocm/Serving, so resetting it there
-    /// is a harmless no-op.
+    /// invisible" bug to fix here — true of every manager except onboarding,
+    /// see below). Dropping the tab guard moves the close from the manager's
+    /// own `on_key` to this shared path (`close_overlays()` + `pane_focus =
+    /// Actions`) so a future manager doesn't need to duplicate that root-Esc
+    /// handling. `pane_focus` is meaningless outside Rocm/Serving, so
+    /// resetting it there is a harmless no-op.
+    ///
+    /// This generalization is only correct if `active_overlay_at_root`'s
+    /// per-manager clause enumerates every nesting field the manager's state
+    /// struct has — see the note on `OnboardingState` (and its sibling
+    /// manager-state structs) about keeping that enumeration in sync when a
+    /// new nested sub-view field is added.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -3780,6 +3789,28 @@ mod tests {
         );
         // Once the console is dismissed (back at root), Esc backs out.
         s.install_manager.as_mut().unwrap().active_job = None;
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+    }
+
+    #[test]
+    fn esc_defers_to_onboarding_install_config_subview() {
+        // Regression coverage for the `install_config` nesting field: the
+        // onboarding wizard's Configure sub-view is a nested sub-view just
+        // like a manager's job console, so root Esc must defer to it instead
+        // of ejecting the whole wizard.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.onboarding = Some(crate::ui::onboarding::OnboardingState {
+            install_config: Some(crate::ui::onboarding::InstallConfig::default()),
+            ..Default::default()
+        });
+        assert!(s.has_open_overlay());
+        assert!(
+            !s.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must defer to onboarding while the Configure sub-view is open"
+        );
+        // Once the sub-view is closed (back at root), Esc backs out again.
+        s.onboarding.as_mut().unwrap().install_config = None;
         assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
 
