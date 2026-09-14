@@ -914,6 +914,10 @@ jobs:
             Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
+          # See e2e-wsl in e2e-selfhosted.yml: GitHub's own PowerShell step
+          # wrapper fails on any left-over non-zero $LASTEXITCODE regardless
+          # of our own tolerant `if` above.
+          exit 0
 
       - name: Install Ubuntu-24.04 distro
         shell: powershell
