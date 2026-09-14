@@ -6,6 +6,7 @@ mod automations;
 mod bootstrap;
 mod chat_host_facts;
 mod cli_progress;
+mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -312,8 +313,11 @@ rocm update --apply --dry-run")]
         #[arg(long, requires = "apply")]
         activate: bool,
         /// Show what would happen without changing files.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; applying never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {
@@ -693,6 +697,12 @@ left, so it cannot undo more than one activation."
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Do not ask for interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Show what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Add a ROCm install from a saved manifest file.
     Import {
@@ -787,6 +797,9 @@ enum ComfyuiCommand {
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; installing never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Start ComfyUI and print its local URL.
     Start {
@@ -799,9 +812,16 @@ enum ComfyuiCommand {
         /// Do not try to open a browser window.
         #[arg(long)]
         no_open_browser: bool,
+        /// Accepted for consistency with other mutating commands; starting never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
-    Stop,
+    Stop {
+        /// Accepted for consistency with other mutating commands; stopping never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -932,7 +952,11 @@ enum SetupCommand {
     /// Show first-time setup status.
     Status,
     /// Reset setup so the next TUI launch shows first-time setup again.
-    Reset,
+    Reset {
+        /// Accepted for consistency with other mutating commands; resetting never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Which framework `rocm examine` should probe.
@@ -1426,7 +1450,7 @@ fn setup(command: Option<SetupCommand>) -> Result<()> {
         SetupCommand::Status => {
             print!("{}", render_setup_status_text(&paths, &config)?);
         }
-        SetupCommand::Reset => {
+        SetupCommand::Reset { yes: _ } => {
             print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
         }
     }
@@ -1912,6 +1936,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            yes: _,
         }) => {
             let paths = AppPaths::discover()?;
             if apply {
@@ -2759,14 +2784,10 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, true))?;
 
-    let _ = writeln!(output, "execution:");
-    let _ = writeln!(output, "  status: completed");
-    let _ = writeln!(output, "  reboot_required: true");
-    let _ = writeln!(
-        output,
-        "  state: {}",
-        driver_install_state_path(paths).display()
-    );
+    let report = cli_report::ActionReport::new("driver install completed")
+        .detail("reboot_required", true)
+        .detail("state", driver_install_state_path(paths).display());
+    output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
@@ -6499,6 +6520,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             runtime_id,
             reinstall,
             dry_run,
+            yes: _,
         } => {
             match comfyui::install(
                 &paths,
@@ -6556,6 +6578,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             host,
             port,
             no_open_browser,
+            yes: _,
         } => match comfyui::start(
             &paths,
             comfyui::ComfyUiStartOptions {
@@ -6588,7 +6611,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
                 Err(error)
             }
         },
-        ComfyuiCommand::Stop => match comfyui::stop(&paths) {
+        ComfyuiCommand::Stop { yes: _ } => match comfyui::stop(&paths) {
             Ok(text) => {
                 print!("{text}");
                 record_cli_audit_event(
@@ -6743,8 +6766,30 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall { runtime } => {
-            let result = uninstall_runtime(&paths, &mut config, &runtime)?;
+        RuntimesCommand::Uninstall {
+            runtime,
+            yes,
+            dry_run,
+        } => {
+            let plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
+            print_runtime_uninstall_plan(&plan);
+
+            if dry_run {
+                println!("dry run: no changes made");
+                return Ok(());
+            }
+
+            if !yes {
+                if !interactive_terminal() {
+                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
+                }
+                if !confirm_uninstall()? {
+                    println!("runtime uninstall cancelled");
+                    return Ok(());
+                }
+            }
+
+            let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
             println!("runtime removed");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
@@ -6754,6 +6799,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None if result.read_only => {
                     println!("  folder_removed: no");
                     println!("  note: existing external runtime folder was left untouched");
+                }
+                None if result.manifest_mismatch => {
+                    println!("  folder_removed: no");
+                    println!(
+                        "  note: local runtime manifest did not match the registry; the \
+                         folder was left in place to avoid deleting the wrong install"
+                    );
                 }
                 None => println!("  folder_removed: no"),
             }
@@ -6888,6 +6940,7 @@ struct RuntimeUninstallResult {
     registry_path: PathBuf,
     removed_install_root: Option<PathBuf>,
     read_only: bool,
+    manifest_mismatch: bool,
     was_active: bool,
 }
 
@@ -7114,23 +7167,119 @@ fn rollback_runtime(
     })
 }
 
-fn uninstall_runtime(
+/// A runtime's install folder is only ever removed when ROCm CLI is confident
+/// it owns that folder; `ReadOnly` and `ManifestMismatch` are distinct reasons
+/// for leaving it alone, surfaced separately so a real problem (a stale or
+/// corrupt local manifest) doesn't look identical to an intentional no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallRootDecision {
+    Remove,
+    ReadOnly,
+    ManifestMismatch,
+}
+
+impl InstallRootDecision {
+    const fn should_remove(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeUninstallPlan {
+    manifest: therock::InstalledRuntimeManifest,
+    all_manifests: Vec<therock::InstalledRuntimeManifest>,
+    registry_path: PathBuf,
+    was_active: bool,
+    install_root_decision: InstallRootDecision,
+}
+
+impl RuntimeUninstallPlan {
+    fn will_remove_install_root(&self) -> bool {
+        self.install_root_decision.should_remove() && self.manifest.install_root.exists()
+    }
+}
+
+fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
+    println!("runtime uninstall plan");
+    println!("  runtime_id: {}", plan.manifest.runtime_id);
+    println!("  runtime_key: {}", plan.manifest.runtime_key);
+    println!("  registry_entry: {}", plan.registry_path.display());
+    if plan.will_remove_install_root() {
+        println!(
+            "  install_folder: {} (would be removed)",
+            plan.manifest.install_root.display()
+        );
+    } else {
+        match plan.install_root_decision {
+            InstallRootDecision::Remove => {
+                println!("  install_folder: not present, nothing to remove");
+            }
+            InstallRootDecision::ReadOnly => {
+                println!("  install_folder: left untouched (external/read-only runtime)");
+            }
+            InstallRootDecision::ManifestMismatch => {
+                println!(
+                    "  install_folder: left untouched (local runtime manifest did not match \
+                     the registry)"
+                );
+            }
+        }
+    }
+    if plan.was_active {
+        println!("  default_runtime: would be cleared");
+    }
+}
+
+fn plan_runtime_uninstall(
     paths: &AppPaths,
-    config: &mut RocmCliConfig,
+    config: &RocmCliConfig,
     selector: &str,
-) -> Result<RuntimeUninstallResult> {
+) -> Result<RuntimeUninstallPlan> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, selector)?.clone();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
     let was_active = current_runtime_manifest(config, &manifests)
         .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let remove_install_root = should_remove_runtime_install_root(&manifest)?;
+    let install_root_decision = should_remove_runtime_install_root(&manifest)?;
+    Ok(RuntimeUninstallPlan {
+        manifest,
+        all_manifests: manifests,
+        registry_path,
+        was_active,
+        install_root_decision,
+    })
+}
+
+fn uninstall_runtime(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    selector: &str,
+) -> Result<RuntimeUninstallResult> {
+    let plan = plan_runtime_uninstall(paths, config, selector)?;
+    apply_runtime_uninstall(paths, config, plan)
+}
+
+fn apply_runtime_uninstall(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallResult> {
+    let RuntimeUninstallPlan {
+        manifest,
+        all_manifests: manifests,
+        registry_path,
+        was_active,
+        install_root_decision,
+    } = plan;
 
     let mut removed_install_root = None;
-    if remove_install_root && manifest.install_root.exists() {
+    if install_root_decision.should_remove() && manifest.install_root.exists() {
         fs::remove_dir_all(&manifest.install_root).with_context(|| {
             format!(
-                "failed to remove runtime folder {}",
+                "failed to remove runtime folder {} — the runtime registry entry has not \
+                 been removed yet, so `rocm runtimes list` will still show this runtime as \
+                 installed and pointing at this (now possibly partially deleted) folder \
+                 until the removal succeeds",
                 manifest.install_root.display()
             )
         })?;
@@ -7209,21 +7358,22 @@ fn uninstall_runtime(
         registry_path,
         removed_install_root,
         read_only: manifest.read_only,
+        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
         was_active,
     })
 }
 
 fn should_remove_runtime_install_root(
     manifest: &therock::InstalledRuntimeManifest,
-) -> Result<bool> {
+) -> Result<InstallRootDecision> {
     if manifest.read_only || manifest.imported_from.is_some() {
-        return Ok(false);
+        return Ok(InstallRootDecision::ReadOnly);
     }
     if !local_runtime_manifest_matches(manifest)? {
-        return Ok(false);
+        return Ok(InstallRootDecision::ManifestMismatch);
     }
     ensure_runtime_install_root_is_safe_to_remove(&manifest.install_root)?;
-    Ok(true)
+    Ok(InstallRootDecision::Remove)
 }
 
 fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) -> Result<bool> {
@@ -11834,10 +11984,27 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Apply ROCm update".to_owned(),
                 command_title: "Update".to_owned(),
+            })
+        }
+        Some("runtimes")
+            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove")
+                && args.iter().any(|arg| arg == "--dry-run") =>
+        {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("runtimes")
+            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove") =>
+        {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Remove ROCm install".to_owned(),
+                command_title: "Runtimes".to_owned(),
             })
         }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
@@ -11911,6 +12078,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("install") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ComfyUI".to_owned(),
@@ -11918,6 +12086,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("start") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Start ComfyUI".to_owned(),
@@ -11925,6 +12094,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("stop") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Stop ComfyUI".to_owned(),
@@ -11935,6 +12105,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("setup") if second.as_deref() == Some("reset") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Reset first-time setup".to_owned(),
@@ -22508,7 +22679,7 @@ model recipes
                     name: "rocm_command".to_owned(),
                     arguments: serde_json::json!({ "args": ["comfyui", "install"] }),
                 },
-                Some("rocm comfyui install"),
+                Some("rocm comfyui install --yes"),
                 false,
             ),
             (
@@ -22555,7 +22726,7 @@ model recipes
         assert!(!chat_tool_call_is_read_only(&comfy_install));
         assert_eq!(
             rocm_chat_tool_requested_command(&comfy_install).as_deref(),
-            Some("rocm comfyui install")
+            Some("rocm comfyui install --yes")
         );
         let approval = chat_tool_approval_request(&comfy_install, Some("Install ComfyUI now."))
             .expect("approval should be built");
@@ -22563,7 +22734,11 @@ model recipes
         assert_eq!(approval.command_title, "ComfyUI");
         assert_eq!(
             approval.args,
-            vec!["comfyui".to_owned(), "install".to_owned()]
+            vec![
+                "comfyui".to_owned(),
+                "install".to_owned(),
+                "--yes".to_owned()
+            ]
         );
 
         let lemonade = providers::ChatToolCall {
@@ -22999,6 +23174,18 @@ model recipes
             vec!["comfyui".to_owned(), "logs".to_owned()],
             vec!["uninstall".to_owned(), "--dry-run".to_owned()],
             vec!["setup".to_owned(), "status".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -23016,14 +23203,31 @@ model recipes
             vec!["comfyui".to_owned(), "stop".to_owned()],
             vec!["uninstall".to_owned()],
             vec!["setup".to_owned(), "reset".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+            ],
         ];
         for args in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            assert!(
-                matches!(action, ChatRocmCommandAction::Approval { .. }),
-                "{args:?} should require approval, got {action:?}"
-            );
+            match &action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "{args:?} should have --yes injected for the approval path"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("{args:?} should require approval, got {other:?}")
+                }
+            }
         }
     }
 
@@ -24852,6 +25056,14 @@ install therock";
             .expect("services stop should accept --yes");
         Cli::try_parse_from(["rocm", "services", "restart", "svc-qwen", "--yes"])
             .expect("services restart should accept --yes");
+    }
+
+    #[test]
+    fn update_dry_run_does_not_require_apply() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run"])
+            .expect("update --dry-run should preview without --apply");
+        Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
+            .expect("update --apply --dry-run should still parse");
     }
 
     #[test]
@@ -28040,6 +28252,53 @@ ID_LIKE="suse opensuse"
         );
         assert!(!prefix_root.exists());
         assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_leaves_folder_on_local_manifest_mismatch() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        let mut config = RocmCliConfig::default();
+
+        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
+
+        assert!(removed.manifest_mismatch);
+        assert!(!removed.read_only);
+        assert_eq!(removed.removed_install_root, None);
+        assert!(manifest.install_root.exists());
+        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_plan_dry_run_makes_no_changes() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+
+        assert!(plan.will_remove_install_root());
+        assert!(manifest.install_root.exists());
+        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
 
         let _ = fs::remove_dir_all(root);
         Ok(())
