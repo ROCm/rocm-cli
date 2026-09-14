@@ -175,3 +175,12 @@ Feature: Runtime configuration
     When the user dry-runs a release SDK install for this host
     Then the SDK preview reports canonical release provenance
     And the SDK preview requests the device payload for this host's GPU
+
+  # `rollback` can only ever undo one step, not walk a history. A unit test on
+  # `render_long_help()` proves clap renders the NOTE, but not that the built
+  # binary prints it to a real user (examine.feature:15-18 sets this precedent
+  # for `--help` text). No runtime state needed, so this runs on the mock lane.
+  @id:runtime-rollback-help-states-single-level-limit
+  Scenario: runtime-10 - Stating rollback's single-level limit in --help
+    When the user asks for rollback help
+    Then the help states that rollback has no history

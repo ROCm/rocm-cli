@@ -93,12 +93,27 @@ Feature: Chat and endpoint detection
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
 
+  # `rocm chat --help` documents `echo "…" | rocm chat` — the prompt is read
+  # from stdin when `--prompt` is omitted. This drives that path (piped stdin,
+  # no `--prompt`) and asserts the assistant reply is produced, proving stdin is
+  # consumed and routed through the same send path as `--prompt`. The piped text
+  # is indented and trailing-spaced, so the second assertion also proves it
+  # reaches the model unaltered apart from the newline the shell appends —
+  # indentation is meaningful to a model and must not be trimmed away.
+  @id:chat-cli-stdin-prompt
+  Scenario: chat-09 - The chat CLI reads a one-shot prompt from stdin
+    Given a model is being served
+    And the model is registered with the CLI
+    When the user pipes a one-shot chat prompt through the CLI
+    Then the CLI prints the assistant's reply
+    And the model receives the piped prompt with its whitespace intact
+
   # Expected to FAIL. Scenario 7 names the model and works; this one leaves the
   # choice to the CLI and is told nothing is running — on the very machine whose
   # services list shows a ready local server. Asking to chat locally should use
   # the local server that is there, whichever model the user chose to serve.
   @id:chat-local-uses-the-running-server
-  Scenario: chat-09 - Chatting locally uses the local server that is already running
+  Scenario: chat-10 - Chatting locally uses the local server that is already running
     Given a model is being served
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt without naming a model

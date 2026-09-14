@@ -130,13 +130,36 @@ Feature: GPU detection and system inspection
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder
 
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing
+
+  # `rocm examine`'s own engine_inventory block prefixes the effective default
+  # engine with the same `*` marker, via a renderer separate from `engines
+  # list`'s (see `append_examine_engine_inventory` vs
+  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # two used to be able to drift apart. examine-13 only ever drove `engines
+  # list`, leaving this second renderer's legend unexercised end-to-end.
+  @id:examine-shows-default-engine-legend
+  Scenario: examine-14 - Inspecting the system explains the default-engine marker
+    When the user inspects the system
+    Then the inspection explains the default-engine marker
+    And the host's default engine is marked in the inspection's engine inventory
+
   # The help's own worked examples are the first thing a new user copies, so a
   # model named there has to be one this CLI can actually serve. The check
   # accepts either form the README documents — a name the model listing knows,
   # or an explicit `owner/repo` reference — and so does not prescribe which
   # model the examples should use.
   @id:examine-help-serve-example-names-a-resolvable-model
-  Scenario: examine-13 - Every model the help offers as an example is one the CLI can resolve
+  Scenario: examine-15 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
 
@@ -145,6 +168,6 @@ Feature: GPU detection and system inspection
   # no way to learn what the plain command does or that there is anything else
   # to reach.
   @id:examine-help-describes-the-default-command
-  Scenario: examine-14 - The help tells the two ways of opening a screen apart
+  Scenario: examine-16 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command

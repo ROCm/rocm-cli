@@ -5,6 +5,7 @@
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
+mod cli_progress;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -62,6 +63,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -144,6 +146,11 @@ enum Command {
         /// Emit the machine-readable diagnosis JSON.
         #[arg(long)]
         json: bool,
+        /// Diagnose a WSL distribution from the Windows host instead of this
+        /// machine. Needs nothing installed inside the distribution. Pass the
+        /// name only when more than one is installed.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        distro: Option<String>,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -293,7 +300,8 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
 rocm update --apply --activate\n  \
-rocm update --apply --dry-run")]
+rocm update --apply --dry-run\n  \
+rocm update --json")]
     Update {
         /// Install the selected update instead of only checking.
         #[arg(long)]
@@ -307,6 +315,12 @@ rocm update --apply --dry-run")]
         /// Show what would happen without changing files.
         #[arg(long, requires = "apply")]
         dry_run: bool,
+        /// Print the check result as a single line of JSON instead of text.
+        #[arg(long, conflicts_with = "apply")]
+        json: bool,
+        /// Bound the version-check network calls to this many seconds each.
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
     Runtimes {
@@ -676,6 +690,10 @@ enum RuntimesCommand {
         runtime: String,
     },
     /// Switch back to the previously selected ROCm install.
+    #[command(
+        after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
+left, so it cannot undo more than one activation."
+    )]
     Rollback,
     /// Remove a ROCm install from ROCm CLI.
     #[command(alias = "remove")]
@@ -1120,7 +1138,84 @@ fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn main() -> Result<()> {
+/// Marker error carrying `rocm fix`'s exit code back through `main()`'s
+/// ordinary return path, instead of calling `std::process::exit` mid-stack
+/// and skipping the `_log_guard` destructor held in `run()`.
+///
+/// `exit_code_for` recovers the code via `downcast_ref`, which searches the
+/// whole error chain — wrapping the `fix()` call with `.context(...)` is
+/// fine. What does break it is discarding this error instead of chaining it,
+/// e.g. `.map_err(|e| anyhow!("fix failed: {e}"))`, which loses the
+/// underlying type and silently falls through to the generic "Error: ..."
+/// branch instead of the carried exit code.
+#[derive(Debug)]
+struct FixExitCode(i32);
+
+impl std::fmt::Display for FixExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fix exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for FixExitCode {}
+
+/// Marker error carrying a clap usage/parse error's exit code back through
+/// `main()`'s ordinary return path, for the same reason [`FixExitCode`]
+/// exists: `clap::Error::exit()` calls `std::process::exit` mid-stack, which
+/// would skip the `_log_guard` destructor held in `run()`. The error is
+/// printed at the point it's constructed (clap knows which stream and
+/// formatting a given error kind wants); this type only carries the exit
+/// code onward.
+#[derive(Debug)]
+struct ClapExitCode(i32);
+
+impl std::fmt::Display for ClapExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clap exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ClapExitCode {}
+
+/// Print a clap usage/parse error on the stream and in the format clap itself
+/// chooses, then carry its exit code onward as a [`ClapExitCode`] instead of
+/// calling `err.exit()`, which would `std::process::exit` mid-stack and skip
+/// the `_log_guard` destructor.
+fn clap_exit_code(err: clap::Error) -> anyhow::Error {
+    let code = err.exit_code();
+    let _ = err.print();
+    ClapExitCode(code).into()
+}
+
+fn main() -> ExitCode {
+    exit_code_for(run())
+}
+
+/// Maps `run()`'s result to a process exit code, unwrapping a `FixExitCode`
+/// or `ClapExitCode` to its carried code and otherwise reproducing the
+/// standard `Result<(), anyhow::Error>` `Termination` behavior (print the
+/// error to stderr, exit 1).
+fn exit_code_for(result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if let Some(FixExitCode(code)) = e.downcast_ref::<FixExitCode>() {
+                ExitCode::from(*code as u8)
+            } else if let Some(ClapExitCode(code)) = e.downcast_ref::<ClapExitCode>() {
+                ExitCode::from(*code as u8)
+            } else {
+                // Match the standard `Result<(), E>` `Termination` behavior exactly:
+                // ignore a failed write here rather than `eprintln!`, which panics.
+                // A caller with a closed stderr pipe must still see exit code 1, not
+                // a panic that replaces it.
+                let _ = writeln!(io::stderr(), "Error: {e:?}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     reset_sigpipe();
 
     // Held for the whole process lifetime: dropping it flushes and stops the
@@ -1147,7 +1242,7 @@ fn main() -> Result<()> {
         // exit, instead of dumping a request plan from the natural-language
         // planner.
         if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
-            err.exit();
+            return Err(clap_exit_code(err));
         }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
@@ -1160,7 +1255,7 @@ fn main() -> Result<()> {
         );
     }
 
-    dispatch(parse_cli())
+    dispatch(parse_cli()?)
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
@@ -1184,9 +1279,16 @@ fn cli_command() -> clap::Command {
 /// `rocm help` list subcommands alphabetically. Mirrors the derived
 /// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
 /// cannot pick up the reordering.
-fn parse_cli() -> Cli {
-    let matches = cli_command().get_matches();
-    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+///
+/// Returns a [`ClapExitCode`]-carrying error instead of calling
+/// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
+/// after `_log_guard` has dropped rather than mid-stack. This covers both
+/// places clap can fail here: `try_get_matches()` for an ordinary argv parse
+/// error (a bad flag, `--help`, a missing required argument — the common
+/// case), and `from_arg_matches()` for the derive step below it.
+fn parse_cli() -> Result<Cli> {
+    let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
+    Cli::from_arg_matches(&matches).map_err(clap_exit_code)
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1662,7 +1764,16 @@ fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
-        Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        Some(Command::Diagnose {
+            symptom,
+            top,
+            json,
+            distro,
+        }) => diagnose(symptom, top, json, distro),
+        // Keep this error chained rather than discarding it into a fresh
+        // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
+        // `FixExitCode`'s doc comment for why that would silently break its
+        // exit-code-carrying downcast. `.context(...)` is fine.
         Some(Command::Fix {
             fix_id,
             yes,
@@ -1778,6 +1889,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                     },
                 );
             }
+            // Resolve the prompt from `--prompt` or, when it is omitted and
+            // stdin is not a terminal, from piped standard input — the
+            // documented `echo "…" | rocm chat` path. Only when neither
+            // supplies a prompt do we fall back to the status screen, which
+            // two kinds of invocation reach: stdin is a TTY that the
+            // interactive branch above declined (it also requires stdout to be
+            // one), or stdin was redirected and carried nothing but whitespace
+            // — an empty pipe or `< /dev/null`.
+            let prompt = match prompt {
+                Some(prompt) => Some(prompt),
+                None => read_piped_prompt()?,
+            };
             match prompt {
                 Some(prompt) => print!(
                     "{}",
@@ -1808,6 +1931,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            json,
+            timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
             if apply {
@@ -1855,6 +1980,33 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 activate,
                                 dry_run
                             ),
+                            None,
+                        );
+                        return Err(error);
+                    }
+                }
+                return Ok(());
+            }
+            if json {
+                match therock::render_update_json(&paths, timeout_secs) {
+                    Ok(document) => {
+                        println!("{}", serde_json::to_string(&document)?);
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "info",
+                            "rendered update report (json)",
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "error",
+                            format!("update report failed: {error}"),
                             None,
                         );
                         return Err(error);
@@ -2240,23 +2392,50 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let (text, summary) = examine_human_report(&paths, &config)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
-        // Informational route-out guidance for humans (the verdict is also in
+        // Informational platform guidance for humans (the verdict is also in
         // the `status` field for `--json` consumers).
-        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+        println!("\n{}", rocm_core::WSL_PLATFORM_NOTE);
     }
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
-    let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+    //
+    // `--distro` is the exception that still errors: the user named a machine to
+    // inspect, and silently reporting on a different one would be worse than
+    // failing. `--distro` with no value means "the only one installed".
+    let examination = match distro {
+        Some(name) => {
+            let selected = (!name.is_empty()).then_some(name);
+            rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+                .map_err(|reason| anyhow::anyhow!("{reason}"))?
+        }
+        None => rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto),
+    };
+    let inspected_remotely = examination
+        .wsl
+        .as_ref()
+        .is_some_and(|wsl| !wsl.locally_probed);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
+        // Inspecting a distribution from outside it collects no environment, so
+        // the checks that read one never run. Without saying so, "no known
+        // misconfiguration matched" reads as a clean bill of health for the
+        // whole installation, when it only covers the WSL GPU stack.
+        if inspected_remotely {
+            println!(
+                "\nNote: inspected from outside the distribution, which sees only its \
+                 WSL GPU stack.\nChecks that read the environment (HSA_OVERRIDE_GFX_VERSION, \
+                 PATH, the framework/ROCm pairing)\ndid not run. For those, run `rocm diagnose` \
+                 inside the distribution."
+            );
+        }
     }
     Ok(())
 }
@@ -2273,7 +2452,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     };
     let code = rocm_core::apply_fix(&fix_id, &opts);
     if code != 0 {
-        std::process::exit(code);
+        return Err(FixExitCode(code).into());
     }
     Ok(())
 }
@@ -3027,7 +3206,10 @@ fn build_driver_install_plan(
             reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned(), "scripts/wsl_preflight.py".to_owned()],
+            // `rocm diagnose` carries the WSL catalog, including the host-side
+            // form that inspects a distro over `wsl.exe` without needing anything
+            // installed inside it.
+            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
         };
     }
 
@@ -5275,7 +5457,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
     if background {
         let mut spinner =
-            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
         let report = start_managed_service(
             &selected_engine,
@@ -6566,6 +6748,9 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             println!(
                 "  note: running services keep their recorded runtime until they are restarted"
             );
+            if result.previous_runtime_key.is_some() {
+                println!("{ROLLBACK_RECOVERY_HINT}");
+            }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
             record_cli_audit_event(
@@ -7188,6 +7373,7 @@ struct SdkInstallFinalization {
     runtime_key: String,
     install_root: PathBuf,
     family: String,
+    previous_runtime_key: Option<String>,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -8906,11 +9092,15 @@ fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck)
 }
 
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
-    format!(
+    let mut output = format!(
         "ROCm SDK installed successfully.\n  install folder: {}\n  active runtime: {}\n  next step: run `rocm help` to see how to use rocm-cli.\n",
         finalized.install_root.display(),
         finalized.runtime_key
-    )
+    );
+    if finalized.previous_runtime_key.is_some() {
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
+    output
 }
 
 fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstallFinalization>> {
@@ -8946,6 +9136,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
         runtime_key: activation.runtime_key,
         install_root: manifest.install_root,
         family: manifest.family,
+        previous_runtime_key: activation.previous_runtime_key,
     }))
 }
 
@@ -9185,6 +9376,7 @@ fn adopt_runtime_from_probe(
         version,
         install_root: install_root.clone(),
         selected_artifact_url: "adopted-read-only".to_owned(),
+        source_layout_generation: None,
         index_url: None,
         tarball_file_name: None,
         python_launcher: None,
@@ -9724,6 +9916,65 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
         "  note: launch from an interactive terminal to enter the TUI."
     );
     output
+}
+
+/// Read a one-shot chat prompt from standard input when it is piped in.
+///
+/// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
+/// and stdin is not a terminal, the piped text becomes the prompt. Returns
+/// `None` when stdin is an interactive TTY or the piped input is blank, so the
+/// caller falls back to the status screen instead of blocking on input nobody
+/// can supply.
+///
+/// The read runs to EOF — the conventional filter contract that
+/// `read_provider_key_from_user` already follows. A caller that hands us a pipe
+/// it never writes to and never closes therefore waits, exactly as `cat` would;
+/// the TTY guard is what keeps that off an interactive user, and a
+/// non-interactive caller with no prompt to send should pass `/dev/null` (as
+/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
+/// prompt", so text that was piped but could not be decoded fails loudly rather
+/// than silently becoming a status screen and a zero exit.
+fn read_piped_prompt() -> Result<Option<String>> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read chat prompt from standard input")?;
+    Ok(piped_prompt_from_input(&buf))
+}
+
+/// Turn raw piped stdin into a chat prompt, or `None` when there is nothing to
+/// send.
+///
+/// `--prompt` reaches the send path verbatim, so a piped prompt must too:
+/// leading indentation and trailing spaces or tabs carry meaning for a model and
+/// are preserved byte for byte. The only thing removed is the line ending the
+/// writer appends — a single trailing `\n`, plus the `\r` in front of it on
+/// Windows — because `echo "…" |` and `printf '…\n' |` add it, not the user.
+/// Further blank lines stay: the second newline of `printf 'a\n\n'` is authored
+/// content, not shell punctuation.
+///
+/// `trim()` is used only to classify the input: whitespace-only stdin (an empty
+/// pipe, or a bare newline) holds no prompt and yields `None`. That is the one
+/// deliberate divergence from `--prompt`, which forwards `"   "` as written: a
+/// bare `rocm chat` under any redirect — `< /dev/null`, a closed heredoc, a CI
+/// step with no stdin — has to keep printing the status screen rather than send
+/// a blank turn to a model, and a caller who really means to send whitespace
+/// can still say so with `--prompt`.
+fn piped_prompt_from_input(input: &str) -> Option<String> {
+    if input.trim().is_empty() {
+        return None;
+    }
+    let prompt = match input.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+        None => input,
+    };
+    Some(prompt.to_owned())
 }
 
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
@@ -13659,11 +13910,43 @@ pub(crate) fn render_engine_inventory_text() -> String {
     render_engine_inventory_text_with_paths(paths.as_ref())
 }
 
+/// Marker shown beside the engine `serve`/CLI commands default to. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const DEFAULT_ENGINE_MARKER: &str = "*";
+
+/// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
+/// engine-inventory renderers so the two copies cannot drift apart.
+fn write_default_engine_legend(output: &mut String) {
+    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+}
+
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    // A configured `default_engine` still wins over the host preference, mirroring
+    // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
+    // the legend could mark an engine `serve` will not actually default to.
+    let configured_default_engine = paths.and_then(|paths| {
+        RocmCliConfig::load(paths)
+            .ok()
+            .and_then(|config| config.default_engine)
+    });
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or the marker would land on an engine name
+    // that is empty rather than falling back.
+    let default_engine = configured_default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == default_engine);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -13680,8 +13963,15 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     } else {
         let _ = writeln!(output, "  Plugin folders: not checked");
     }
+    if any_marked {
+        write_default_engine_legend(&mut output);
+    }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine { "*" } else { " " };
+        let marker = if *name == default_engine {
+            DEFAULT_ENGINE_MARKER
+        } else {
+            " "
+        };
         let _ = writeln!(output, "{marker} {name:10} {note}");
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -13797,11 +14087,23 @@ fn append_examine_engine_inventory(
     config: &RocmCliConfig,
     host_default_engine: &str,
 ) {
-    let configured_default = config.default_engine.as_deref();
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or `effective_default` below would become
+    // an engine name that is empty rather than falling back.
+    let configured_default = config
+        .default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     // A configured value still wins, mirroring `select_serve_engine`. Only the
     // fallback becomes GPU-aware: it used to be the platform constant, which
     // reported Lemonade on Instinct where serve picks vLLM.
     let effective_default = configured_default.unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == effective_default);
     let _ = writeln!(output, "engine_inventory:");
     // Unchanged on purpose: this line means "what the user configured", so an
     // unset value must keep reading as unset rather than borrowing the host default.
@@ -13842,9 +14144,12 @@ fn append_examine_engine_inventory(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if any_marked {
+        write_default_engine_legend(output);
+    }
     for (engine, note) in engine_inventory() {
         let marker = if *engine == effective_default {
-            "*"
+            DEFAULT_ENGINE_MARKER
         } else {
             " "
         };
@@ -15822,7 +16127,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -15856,6 +16161,7 @@ fn apply_runtime_update(
             &source.format,
             &source.family,
             plan.device_target.as_deref(),
+            plan.source_layout_generation.as_deref(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -15871,6 +16177,7 @@ fn apply_runtime_update(
         &source.format,
         &source.family,
         plan.device_target.as_deref(),
+        plan.source_layout_generation.as_deref(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
@@ -15894,23 +16201,7 @@ fn apply_runtime_update(
     if activate {
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
         config.save(paths)?;
-        let _ = writeln!(
-            output,
-            "  activated_runtime_key: {}",
-            activation.runtime_key
-        );
-        let _ = writeln!(
-            output,
-            "  previous_runtime_key: {}",
-            activation
-                .previous_runtime_key
-                .as_deref()
-                .unwrap_or("<unset>")
-        );
-        let _ = writeln!(
-            output,
-            "  note: running services keep their recorded runtime until they are restarted"
-        );
+        append_update_activate_summary(&mut output, &activation);
     } else {
         let _ = writeln!(
             output,
@@ -15923,6 +16214,43 @@ fn apply_runtime_update(
         let _ = writeln!(output, "    {line}");
     }
     Ok(output)
+}
+
+/// Shown after any activation (direct `runtimes activate`, `update --apply
+/// --activate`, or an `install sdk` that switches the active runtime) that
+/// recorded a previous runtime, so every path that reaches this state gives
+/// the same advice — see `RuntimesCommand::Activate` in `runtimes()`,
+/// `append_update_activate_summary`, and `render_sdk_install_success` for the
+/// call sites.
+const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
+(no history — undoes only this one activation)";
+
+/// Appends the `--activate` branch of the `update --apply` summary. The
+/// rollback hint is only shown when a previous runtime was actually recorded —
+/// `rocm runtimes rollback` hard-errors otherwise (no prior runtime to return
+/// to), so hinting it unconditionally would point users at a command that
+/// immediately fails on their very first activation.
+fn append_update_activate_summary(output: &mut String, activation: &RuntimeActivationResult) {
+    let _ = writeln!(
+        output,
+        "  activated_runtime_key: {}",
+        activation.runtime_key
+    );
+    let _ = writeln!(
+        output,
+        "  previous_runtime_key: {}",
+        activation
+            .previous_runtime_key
+            .as_deref()
+            .unwrap_or("<unset>")
+    );
+    let _ = writeln!(
+        output,
+        "  note: running services keep their recorded runtime until they are restarted"
+    );
+    if activation.previous_runtime_key.is_some() {
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
 }
 
 fn select_runtime_update_source<'a>(
@@ -19240,6 +19568,107 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
+
+    /// `Ok(())` must map to a clean exit so `rocm`'s successful commands don't
+    /// regress to a nonzero code.
+    #[test]
+    fn exit_code_for_ok_is_success() {
+        assert_eq!(super::exit_code_for(Ok(())), ExitCode::SUCCESS);
+    }
+
+    /// `fix()`'s marker error must carry its exact code through, since that
+    /// code (2/3/4/5) is part of `rocm fix`'s documented contract.
+    #[test]
+    fn exit_code_for_fix_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::FixExitCode(3));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(3));
+    }
+
+    /// `ClapExitCode` exists so a usage/parse error can reach `main()` through
+    /// the ordinary return path (letting `_log_guard` drop) instead of
+    /// `clap::Error::exit()` calling `std::process::exit` mid-stack. Guard the
+    /// downcast the same way `exit_code_for_fix_exit_code_carries_the_code`
+    /// guards `FixExitCode`'s.
+    #[test]
+    fn exit_code_for_clap_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::ClapExitCode(2));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(2));
+    }
+
+    /// `run()`'s mistyped-subcommand branch and `parse_cli()` both route a
+    /// real `clap::Error` through the production `clap_exit_code` helper
+    /// (not a hand-built `ClapExitCode`), so this calls that same helper on a
+    /// real parse failure to exercise the actual
+    /// `clap parse failure -> clap_exit_code -> ClapExitCode -> exit_code_for`
+    /// chain end to end. Reverting `clap_exit_code` to call `err.exit()`
+    /// directly, or dropping its use from either call site, breaks this.
+    #[test]
+    fn clap_error_exit_code_survives_the_clap_exit_code_round_trip() {
+        let err = command_invocation_error(&["instal".to_owned()])
+            .expect("`instal` should read as a mistyped subcommand");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// `parse_cli()` itself reads `std::env::args_os()` (via
+    /// `Command::try_get_matches()`), which a unit test cannot redirect, so
+    /// this exercises the same `cli_command()` builder with an explicit argv
+    /// instead: an unrecognised flag is the common case `parse_cli()` was
+    /// still routing through `err.exit()` before it switched from
+    /// `get_matches()` to `try_get_matches()`.
+    #[test]
+    fn cli_command_rejects_unknown_flag_through_clap_exit_code() {
+        let err = super::cli_command()
+            .try_get_matches_from(["rocm", "--this-flag-does-not-exist"])
+            .expect_err("an unknown flag must be a parse error");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// Any other error must still fail with exit 1, matching what
+    /// `Result<(), anyhow::Error>`'s `Termination` impl already does today for
+    /// every subcommand other than `fix`.
+    #[test]
+    fn exit_code_for_generic_error_is_failure() {
+        let err = anyhow::anyhow!("boom");
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`
+    /// chain end to end, not just `exit_code_for` in isolation. Guards against
+    /// a future change at the `Command::Fix` dispatch arm (e.g. discarding the
+    /// error into a fresh `anyhow!(...)`) silently breaking the downcast and
+    /// falling through to the generic exit 1.
+    #[test]
+    fn dispatch_carries_fixs_exit_code_through_to_exit_code_for() {
+        // Skip the startup update check: it's a side effect unrelated to what
+        // this test verifies, and could otherwise touch the network. Goes
+        // through `ScopedTestEnv` so it's serialized against every other test
+        // that touches process env and restored on drop even on panic.
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let cli = super::Cli {
+            command: Some(super::Command::Fix {
+                fix_id: Some("fix-does-not-exist".to_owned()),
+                yes: true,
+                dry_run: false,
+                device_index: None,
+            }),
+        };
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(super::exit_code_for(result), ExitCode::from(2));
+    }
+
     /// A cache that has moved inside a directory uninstall already removes must
     /// not be reported as "not removed" — the note would be false.
     #[test]
@@ -20072,6 +20501,13 @@ mod tests {
     fn chat_rejects_zero_max_tokens() {
         let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
             .expect_err("zero max-tokens is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn update_rejects_zero_timeout_secs() {
+        let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
+            .expect_err("zero timeout-secs is rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
@@ -27006,11 +27442,62 @@ ID_LIKE="suse opensuse"
         assert!(success.contains(&manifest.install_root.display().to_string()));
         assert!(!success.contains("config:"));
         assert!(!success.contains("marker:"));
+        assert!(
+            !success.contains("rocm runtimes rollback"),
+            "the first install has no previous runtime, so rollback would hard-error; \
+             must not hint at a command that immediately fails:\n{success}"
+        );
 
         let mut examine = String::new();
         append_examine_runtime_state(&mut examine, &rebased_paths, &config)?;
         assert!(examine.contains("active_runtime_status: ready"));
         assert!(examine.contains("setup_runtime_root:"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A second `install sdk` switches the active runtime the same way
+    /// `runtimes activate` does, and `activate_runtime` records the previous
+    /// runtime either way — so this path must surface the same rollback hint
+    /// `runtimes activate` and `update --apply --activate` already do, not
+    /// silently drop the recovery advice because it went through the install
+    /// finalization path instead.
+    #[test]
+    fn sdk_install_finalization_hints_rollback_after_a_second_install() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization-second-install");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-first",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let first = finalize_successful_sdk_install(&paths)?
+            .context("first sdk install finalization should select the installed runtime")?;
+        assert_eq!(first.previous_runtime_key, None);
+
+        let second_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-second",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let second = finalize_successful_sdk_install(&paths)?
+            .context("second sdk install finalization should select the newest runtime")?;
+        assert_eq!(second.runtime_key, second_manifest.runtime_key);
+        assert_eq!(
+            second.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-first")
+        );
+
+        let success = render_sdk_install_success(&second);
+        assert!(
+            success.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            "a previous runtime was recorded, so the install summary should hint at rollback \
+             as a recovery path, got:\n{success}"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -27247,6 +27734,20 @@ ID_LIKE="suse opensuse"
         assert_eq!(
             config.previous_runtime_key.as_deref(),
             Some("release-pip-gfx120x-all-7-13-0")
+        );
+
+        // Rolling back a second time toggles back to where the first rollback
+        // came from — this is the guarantee the `rollback --help` text makes
+        // ("it remembers only the runtime you just left"). This test fails the
+        // moment that toggle stops holding.
+        let rolled_back_again = rollback_runtime(&paths, &mut config)?;
+        assert_eq!(
+            rolled_back_again.runtime_key,
+            "release-pip-gfx120x-all-7-13-0"
+        );
+        assert_eq!(
+            config.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -28334,6 +28835,7 @@ ID_LIKE="suse opensuse"
             runtime_key: "wheel-gfx942-7.13.0".to_owned(),
             install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
             family: "gfx94X-dcgpu".to_owned(),
+            previous_runtime_key: None,
         }
     }
 
@@ -29104,6 +29606,84 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn render_engine_inventory_text_includes_marker_legend() {
+        let (root, paths) = test_paths("engine-inventory-marker-legend");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        // Anchor on the marked row itself (not just `"{DEFAULT_ENGINE_MARKER} "`,
+        // which also matches inside the legend line and would pass even if no
+        // row were actually marked).
+        let marker_pos = rendered
+            .find(&format!("{DEFAULT_ENGINE_MARKER} {host_default}"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
+        // A configured default naming an external plugin (or a stale/typo'd
+        // name) matches zero rows in `engine_inventory()`'s built-ins list —
+        // the legend would then explain a marker that appears nowhere.
+        let (root, paths) = test_paths("engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !rendered.contains("legend:"),
+            "legend must be absent when the configured default matches no built-in engine; got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
@@ -29761,6 +30341,47 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn examine_engine_inventory_includes_marker_legend() {
+        let (root, paths) = test_paths("examine-engine-inventory-marker-legend");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = output.find(&legend).expect("legend line present");
+        let marker_pos = output
+            .find(&format!("{DEFAULT_ENGINE_MARKER} vllm"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{output}"
+        );
+    }
+
+    #[test]
+    fn examine_engine_inventory_omits_legend_when_effective_default_matches_nothing() {
+        // Same gap as `render_engine_inventory_text_with_paths`: an effective
+        // default naming an external plugin (or a stale/typo'd name) matches
+        // zero rows in `engine_inventory()`'s built-ins list.
+        let (root, paths) = test_paths("examine-engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !output.contains("legend:"),
+            "legend must be absent when the effective default matches no built-in engine; got:\n{output}"
+        );
+    }
+
     // ---------- engine shell prompt shim ----------
 
     #[test]
@@ -29957,6 +30578,14 @@ ID_LIKE="suse opensuse"
             output.contains("rocm config clear-default-engine"),
             "the note must name the remedy, not just the problem:\n{output}"
         );
+        assert!(
+            output.contains("  * lemonade "),
+            "the '*' marker must land on the configured engine, not the host's:\n{output}"
+        );
+        assert!(
+            !output.contains("  * vllm "),
+            "the host's preferred engine must not also be marked once overridden:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -29974,6 +30603,36 @@ ID_LIKE="suse opensuse"
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_treats_a_blank_configured_engine_as_unset() {
+        // Mirrors `select_serve_engine`'s guard: a config file with
+        // `default_engine = ""` must fall back to the host preference rather
+        // than reporting an empty engine name as "effective" and marking none
+        // of the real ones.
+        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
+        let config = RocmCliConfig {
+            default_engine: Some(String::new()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("configured_default_engine: <platform default>"),
+            "a blank configured value must read as unset:\n{output}"
+        );
+        assert!(
+            output.contains("effective_default_engine: vllm"),
+            "a blank configured value must fall back to the host default:\n{output}"
+        );
+        assert!(
+            output.contains("  * vllm "),
+            "the '*' marker must land on the host's default, not an empty name:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -30059,6 +30718,38 @@ ID_LIKE="suse opensuse"
         );
     }
 
+    #[test]
+    fn update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists() {
+        let with_previous = RuntimeActivationResult {
+            runtime_id: "therock-release:gfx942".to_owned(),
+            runtime_key: "release-wheel-gfx942".to_owned(),
+            previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
+        };
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &with_previous);
+        assert!(
+            rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("undoes only this one activation"),
+            "the hint should state the single-step limit up front, not just in --help:\n{rendered}"
+        );
+
+        let without_previous = RuntimeActivationResult {
+            runtime_id: "therock-release:gfx942".to_owned(),
+            runtime_key: "release-wheel-gfx942".to_owned(),
+            previous_runtime_key: None,
+        };
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &without_previous);
+        assert!(
+            !rendered.contains("rocm runtimes rollback"),
+            "no previous runtime is recorded, so `rocm runtimes rollback` would hard-error; \
+             must not hint at a command that immediately fails:\n{rendered}"
+        );
+    }
+
     fn write_test_pip_runtime(
         paths: &AppPaths,
         runtime_key: &str,
@@ -30105,6 +30796,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: install_root.clone(),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
@@ -30163,6 +30855,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
@@ -30564,5 +31257,90 @@ ID_LIKE="suse opensuse"
             body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
+    }
+
+    #[test]
+    fn command_chat_reads_prompt_from_piped_stdin() {
+        // A structural guard on the wiring, not a behavioral test: the handler
+        // reads the real fd 0, which an in-process test cannot pipe. The
+        // behavior — piped text reaching the model unaltered — is covered end
+        // to end by the `chat-09` scenario (`@id:chat-cli-stdin-prompt`); what
+        // is checked here is that the `--prompt`-less arm still resolves the
+        // prompt from `read_piped_prompt`, with the result feeding the dispatch
+        // rather than being discarded or read after the send decision is
+        // already made.
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("read_piped_prompt("),
+            "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
+        );
+        assert!(
+            body.contains("None => read_piped_prompt()?"),
+            "the piped read must supply the prompt that is dispatched (and \
+             propagate its error), not be a discarded call; body:\n{body}"
+        );
+        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let send_at = body
+            .find("render_chat_prompt_text(")
+            .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
+        assert!(
+            read_at < send_at,
+            "stdin must be read before the send/status-screen decision, or a \
+             piped prompt cannot influence it; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {
+        // A piped prompt must reach the send path byte-identical to the same
+        // text passed with `--prompt`, which is forwarded verbatim. Only the
+        // line ending the writer appends is dropped; indentation and trailing
+        // spaces or tabs are content and have to survive.
+        assert_eq!(
+            piped_prompt_from_input("    indented line\n"),
+            Some("    indented line".to_owned()),
+            "leading indentation must survive; only the trailing newline goes"
+        );
+        assert_eq!(
+            piped_prompt_from_input("trailing spaces matter   \n"),
+            Some("trailing spaces matter   ".to_owned()),
+            "trailing spaces must survive the trailing-newline strip"
+        );
+        assert_eq!(
+            piped_prompt_from_input("\tleading tab"),
+            Some("\tleading tab".to_owned()),
+            "input without a trailing newline must pass through unchanged"
+        );
+        assert_eq!(
+            piped_prompt_from_input("crlf line\r\n"),
+            Some("crlf line".to_owned()),
+            "a Windows line ending must be stripped as one unit"
+        );
+        assert_eq!(
+            piped_prompt_from_input("fn main() {\n    body\n}\n"),
+            Some("fn main() {\n    body\n}".to_owned()),
+            "interior newlines and indentation must survive"
+        );
+        assert_eq!(
+            piped_prompt_from_input("blank line below\n\n"),
+            Some("blank line below\n".to_owned()),
+            "only one trailing line ending is shell punctuation; the rest is content"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_treats_whitespace_only_input_as_no_prompt() {
+        // The fallback that keeps the no-argument behavior intact: an empty
+        // pipe, a bare newline, or blank padding carries no prompt, so the
+        // caller must see `None` and render the status screen instead of
+        // sending whitespace to a model.
+        for input in ["", "\n", "\r\n", "   ", "  \t \n\n", "\n\n\n"] {
+            assert_eq!(
+                piped_prompt_from_input(input),
+                None,
+                "whitespace-only stdin must yield no prompt; input: {input:?}"
+            );
+        }
     }
 }
