@@ -1497,7 +1497,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Setup will show again the next time you run `rocm`.",
+        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -25366,7 +25366,7 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
-        assert!(rendered.contains("Setup will show again"));
+        assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
         assert!(!rendered.contains("request plan"));
