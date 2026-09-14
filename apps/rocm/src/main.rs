@@ -30941,7 +30941,6 @@ ID_LIKE="suse opensuse"
         }
     }
 
-    #[cfg(unix)]
     /// Assert `child` exits within a bounded grace, and reap it either way.
     ///
     /// NOT `wait()`. These tests spawn a stand-in that exits on its own after a
@@ -30969,6 +30968,7 @@ ID_LIKE="suse opensuse"
         assert!(exited, "{message}");
     }
 
+    #[cfg(unix)]
     fn managed_record_for_pid(
         paths: &AppPaths,
         pid: u32,
