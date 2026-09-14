@@ -130,13 +130,16 @@ fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
-/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
-/// on the runner's persistent disk; unset for local runs, where every scenario
-/// stays fully isolated (nothing shared).
+/// (HF model weights, the pip cache, and the CLI's own therock/tool archive
+/// download cache). Set by CI to a path on the runner's persistent disk; unset
+/// for local runs, where every scenario stays fully isolated (nothing shared).
 ///
-/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
-/// model weights per scenario. Only immutable artifacts are shared — service
-/// records, config, and per-service engine state stay isolated per scenario.
+/// Sharing these read-only artifacts avoids re-downloading the therock
+/// SDK/tool archives and model weights per scenario. Only immutable artifacts
+/// are shared — service records, config, and the runtimes registry stay
+/// isolated per scenario (see [`shared_runtimes_dir`] for the runtimes' own,
+/// opt-in, shared tree, which is what actually covers engine backends like
+/// `llamacpp:rocm`).
 fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
 }
@@ -232,7 +235,29 @@ impl E2eWorld {
             let root = root.path();
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
-            env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+            // The CLI's own therock/tool archive download cache — every archive
+            // in it is content-addressed and re-fetchable (see
+            // storage::download_cache_dir / tool_download_cache_dir). Route it
+            // through the same shared, persistent dir as HF_HOME/PIP_CACHE_DIR
+            // below instead of this scenario's TempDir, so therock SDK/tool
+            // archives are downloaded once per runner rather than once per
+            // scenario. Local runs (no shared dir) keep the old fully-isolated
+            // cache. This does NOT cover the ~3.3GB llamacpp:rocm Lemonade backend
+            // (EAI-8572) — that lives under the shared runtimes tree (see
+            // `use_shared_runtimes`) and was actually fixed by making
+            // `prepare_embeddable` stop wiping that shared tree on every scenario
+            // (rocm-engine-lemonade's `RUNTIME_VERSION_MARKER`).
+            //
+            // Two paths under this cache are mutable rather than content-
+            // addressed: `cache/therock/startup-update-check.json` and
+            // `cache/therock/metadata/*.json` (the etag revalidation cache).
+            // Both are now written atomically (`save_startup_update_check` /
+            // `write_cached_http_entry`), so concurrent scenarios sharing this
+            // dir can't tear either into a state `load_startup_update_check`
+            // would hard-error on.
+            let cache_dir = shared_cache_dir()
+                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -1129,7 +1154,25 @@ async fn main() {
     // one scenario at a time whenever a GPU is present. The no-GPU mock job keeps
     // the default parallelism (its scenarios use isolated in-process mock servers
     // on OS-assigned ports, so they're safe to run concurrently).
-    let max_concurrent = if cap.has_amd_gpu { 1 } else { 64 };
+    //
+    // This `max_concurrent == 1` is ALSO what makes it safe for a GPU lane to
+    // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
+    // at one persistent dir (see `isolate_env`): readers extracting an archive
+    // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
+    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
+    // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
+    // lane actually exports (e.g. a missing GPU driver reads `false` while a
+    // shared dir env var is still set) — so derive the cap from the hazards
+    // themselves rather than only from the probe. `shared_uv_cache_dir()` is
+    // deliberately excluded: uv's cache is content-addressed and uv does its
+    // own locking. A lane that races becomes serialized-and-slower instead.
+    let max_concurrent =
+        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
+            1
+        } else {
+            64
+        };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every

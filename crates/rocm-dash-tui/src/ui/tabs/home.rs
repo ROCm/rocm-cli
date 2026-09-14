@@ -195,8 +195,10 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     for job in state.jobs.jobs.values().take(feed.height as usize) {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
-            _ => ("⋯ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
+            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
+            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
         };
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::default().fg(color)),
@@ -258,13 +260,18 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Tokens/watt: summed across running instances when available.
     // Mark held if any contributing instance has a held gen_tps observation
     // (tok/W derives from gen_tps; aggregate inherits held status).
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (and, for `any_tpw_held`, count as held without ever being displayed) —
+    // filtered out the same way `tokens_per_watt` is guarded per-instance
+    // elsewhere in this tab.
     let tpw: f64 = state
         .instances
         .values()
         .filter_map(|i| i.tokens_per_watt)
+        .filter(|v| v.is_finite())
         .sum();
     let any_tpw_held = state.instances.values().any(|i| {
-        i.tokens_per_watt.is_some()
+        i.tokens_per_watt.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -288,6 +295,19 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))),
         lh[4],
     );
+    // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
+    // held AND rendered with a marker — `tpw > 0.0` mirrors the gate on
+    // `tpw_label` above so a zero-throughput aggregate (which prints
+    // "tokens / watt —" with no marker) never shows an unexplained legend.
+    if tpw > 0.0 && any_tpw_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            lh[5],
+        );
+    }
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -362,9 +382,18 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         false,
         theme,
     );
-    let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
+    // without ever contributing a displayed value — guarded the same way
+    // `gen_tps_cell` guards a single instance's value.
+    let tps: f64 = state
+        .instances
+        .values()
+        .filter_map(|i| i.gen_tps)
+        .filter(|v| v.is_finite())
+        .sum();
     let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some()
+        i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -375,6 +404,17 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         format!("{tps:.0}")
     };
     mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
+    // Show the shared HELD_LEGEND only when the tok/s aggregate is actually
+    // held — keeps the hero quiet when data is fully fresh.
+    if any_tps_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            rh[5],
+        );
+    }
 }
 
 fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -488,7 +528,10 @@ mod tests {
     use crate::app::ActiveTab;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
+        ObservationMetadata, Snapshot, SystemMetrics,
+    };
 
     #[test]
     fn node_load_label_never_marks_simulated_live() {
@@ -583,5 +626,243 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    fn instance_with_obs(gen_tps: f64, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(gen_tps),
+            tokens_per_watt: Some(gen_tps / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    fn state_with_instance(inst: Instance) -> AppState {
+        let mut s = state_with_gpu();
+        s.instances.insert(inst.container_id.clone(), inst);
+        s
+    }
+
+    #[test]
+    fn home_held_legend_visible_when_tpw_and_tps_held() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(held_obs()))),
+            160,
+            30,
+        );
+        // Assert the specific rendered cells, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregates stopped being marked.
+        assert!(
+            out.contains(&format!("{:.0}{}", 300.0, format::HELD_MARKER)),
+            "held tok/s aggregate must show the held marker; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{:.1} tokens / watt{}", 1.0, format::HELD_MARKER)),
+            "held tok/W aggregate must show the held marker; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when instance data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_when_all_fresh() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_for_legacy_none_metadata() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, None)),
+            160,
+            30,
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_legend_absent_when_aggregate_is_zero_even_if_held() {
+        // tokens_per_watt sums to 0.0 (the "tokens / watt —" branch, no marker
+        // rendered) while gen_tps is absent (so the tok/s side never fires
+        // either). Held metadata alone must not add an unexplained legend.
+        let inst = Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.0),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let out = render(&state_with_instance(inst), 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tps_aggregate_ignores_nonfinite_instance() {
+        // A NaN `gen_tps` on one instance must not poison the summed hero
+        // value for every other (finite) instance, nor suppress the held
+        // marker/legend a genuinely held finite instance still earns.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(150.0),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(f64::NAN),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("NaN"),
+            "a non-finite instance must not poison the tok/s aggregate; got:\n{out}"
+        );
+        // Assert the specific rendered cell, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregate stopped being marked.
+        assert!(
+            out.contains(&format!("{:.0}{}", 150.0, format::HELD_MARKER)),
+            "the finite held instance must still mark the tok/s aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the held tok/s aggregate must still be explained by the legend; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_aggregate_ignores_nonfinite_instance() {
+        // Symmetric with the tok/s case above: an infinite `tokens_per_watt`
+        // on one instance must not poison the summed tok/W aggregate.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.5),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(f64::INFINITY),
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("0.5 tokens / watt"),
+            "a non-finite instance must not poison the tok/W aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the finite held instance must still explain the aggregate; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn activity_feed_glyphs_match_job_console_vocabulary() {
+        use rocm_dash_core::state::StateEvent;
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.jobs.apply(StateEvent::StartJob {
+            id: "a".into(),
+            cmd: "ok".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "a".into(),
+            code: 0,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "b".into(),
+            cmd: "bad".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "b".into(),
+            code: 1,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "c".into(),
+            cmd: "cancelled".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::CancelJob("c".into()));
+        s.jobs.apply(StateEvent::StartJob {
+            id: "d".into(),
+            cmd: "running".into(),
+            args: vec![],
+        });
+
+        let out = render(&s, 160, 30);
+        assert!(out.contains('✓'), "zero-exit glyph missing: {out:?}");
+        assert!(out.contains('!'), "nonzero-exit glyph missing: {out:?}");
+        assert!(out.contains('○'), "cancelled glyph missing: {out:?}");
+        assert!(out.contains('⋯'), "running glyph missing: {out:?}");
     }
 }

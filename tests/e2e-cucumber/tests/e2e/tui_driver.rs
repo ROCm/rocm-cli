@@ -128,11 +128,16 @@ impl TuiSession {
 
     /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
     ///
-    /// Used by scenarios that must set a variable the CLI reads at startup (e.g.
-    /// the test-only `ROCM_E2E_SIMULATE_OOM_LAUNCH` fault-injection switch). The
-    /// vars are applied per-child on the `CommandBuilder`, never via the shared
-    /// process environment, so concurrent scenarios on the no-GPU lane cannot
-    /// observe each other's overrides.
+    /// Two kinds of step need this. One sets a variable the CLI reads at startup
+    /// (e.g. the test-only `ROCM_E2E_SIMULATE_OOM_LAUNCH` fault-injection
+    /// switch). The other has a `Given` that planted scenario-owned state (e.g. a
+    /// shell rc file) which only the piped `run_rocm_with_env` path would
+    /// otherwise pick up, since [`pty_env`]'s `HOME`/lack of `SHELL` are the
+    /// PTY's own isolation rather than that state.
+    ///
+    /// The vars are applied per-child on the `CommandBuilder`, never via the
+    /// shared process environment, so concurrent scenarios on the no-GPU lane
+    /// cannot observe each other's overrides.
     pub fn spawn_with_env(
         world: &E2eWorld,
         args: &[&str],
@@ -157,7 +162,7 @@ impl TuiSession {
     /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
     /// `binary <args>` under a PTY with the isolated environment, then overlay
     /// `extra_env` on the child.
-    pub fn spawn_binary_with_env(
+    fn spawn_binary_with_env(
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
@@ -184,6 +189,11 @@ impl TuiSession {
             cmd.env(key, value);
         }
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
+            cmd.env(key, value);
+        }
+        // Caller-supplied overrides win over the scenario's own isolation
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        for (key, value) in extra_env {
             cmd.env(key, value);
         }
         // Provider configuration changes product startup semantics: a host API
@@ -491,20 +501,29 @@ impl TuiSession {
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
+        match self.wait_for_exit_code(timeout).await? {
+            0 => Ok(()),
+            code => Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero. Used by journeys (e.g. a declined confirmation
+    /// prompt) whose success case is a specific *nonzero* code, where
+    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
+    /// would reject the very outcome under test.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.finished = true;
-                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully ({status:?}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
+                    self.record_once(code);
+                    return Ok(code);
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),

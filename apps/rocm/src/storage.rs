@@ -969,6 +969,7 @@ mod tests {
             pip_cache_dir: None,
             rocm_sdk: None,
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
