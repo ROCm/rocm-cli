@@ -219,7 +219,7 @@ form works depends on the engine your GPU selects.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
-| `rocm fix <fix-id>` | Apply a fix reported by `rocm diagnose` |
+| `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
