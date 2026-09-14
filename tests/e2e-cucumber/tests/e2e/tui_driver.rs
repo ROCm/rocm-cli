@@ -278,6 +278,13 @@ impl TuiSession {
     /// reliable proxy for "the screen behind the popup was dimmed" without
     /// importing the product crate's own color constant. Unlike
     /// `screen_text`, this deliberately inspects style, not just text content.
+    ///
+    /// This check is only as good as its two hardcoded assumptions: the
+    /// `(0, 0)` corner and the literal wash RGB. If a future popup's geometry
+    /// ever grows to cover the corner, or `grey_overlay`'s color constant
+    /// changes, this silently stops discriminating (always false) instead of
+    /// failing loudly — keep both in sync with `grey_overlay` and
+    /// `centered_rect` if either changes.
     pub fn corner_backdrop_is_dimmed(&self) -> bool {
         const WASH: vt100::Color = vt100::Color::Rgb(0x1c, 0x1e, 0x22);
         let p = self

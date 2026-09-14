@@ -314,6 +314,26 @@ mod tests {
     }
 
     #[test]
+    fn console_esc_closes_tracks_job_terminality() {
+        // Direct coverage for the seam itself: `on_console_key` and the
+        // footer's Esc-chip label both call through `console_esc_closes`, so
+        // a regression here would silently desync the two without this test.
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "x".into(),
+            args: vec![],
+        });
+        assert!(console_esc_closes(s.job("j")));
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        assert!(!console_esc_closes(s.job("j")));
+        assert!(!console_esc_closes(None));
+    }
+
+    #[test]
     fn status_labels_track_lifecycle() {
         let mut s = State::default();
         s.apply(StateEvent::StartJob {

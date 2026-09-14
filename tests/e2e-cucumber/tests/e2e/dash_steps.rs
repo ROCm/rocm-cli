@@ -688,7 +688,7 @@ async fn backdrop_is_dimmed(world: &mut E2eWorld) {
     let tui = session(world);
     assert!(
         tui.corner_backdrop_is_dimmed(),
-        "the screen behind the instance detail popup was not dimmed:\n{}",
+        "the screen behind the popup was not dimmed:\n{}",
         tui.screen_text()
     );
 }
