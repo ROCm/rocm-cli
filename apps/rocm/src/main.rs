@@ -6871,7 +6871,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 }
                 None => println!("  folder_removed: no"),
             }
-            if result.was_active {
+            if result.default_runtime_cleared {
                 println!("  default_runtime: cleared");
                 println!("  next step: rocm runtimes activate <runtime_key>");
             }
@@ -6882,13 +6882,16 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 "runtime_uninstall",
                 "info",
                 format!(
-                    "removed runtime_key={} runtime_id={} removed_install_root={}",
+                    "removed runtime_key={} runtime_id={} removed_install_root={} \
+                     was_active={} default_runtime_cleared={}",
                     result.runtime_key,
                     result.runtime_id,
                     result
                         .removed_install_root
                         .as_ref()
-                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+                    result.was_active,
+                    result.default_runtime_cleared,
                 ),
                 None,
             );
@@ -7004,6 +7007,7 @@ struct RuntimeUninstallResult {
     read_only: bool,
     manifest_mismatch: bool,
     was_active: bool,
+    default_runtime_cleared: bool,
 }
 
 /// Marker shown beside the active runtime in `rocm runtimes list`. Every
@@ -7249,9 +7253,15 @@ impl InstallRootDecision {
 #[derive(Debug, Clone)]
 struct RuntimeUninstallPlan {
     manifest: therock::InstalledRuntimeManifest,
-    all_manifests: Vec<therock::InstalledRuntimeManifest>,
     registry_path: PathBuf,
     was_active: bool,
+    /// Whether applying this plan will clear `config.default_runtime_id`.
+    /// This is true when the config's default still points at this
+    /// manifest's `runtime_id` and either this manifest was the active one,
+    /// or it is the last remaining install sharing that `runtime_id` (the
+    /// id is shared across side-by-side installs, so removing one sibling
+    /// does not by itself orphan the default while others remain).
+    clears_default_runtime: bool,
     install_root_decision: InstallRootDecision,
 }
 
@@ -7287,7 +7297,7 @@ fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
             }
         }
     }
-    if plan.was_active {
+    if plan.clears_default_runtime {
         println!("  default_runtime: would be cleared");
     }
 }
@@ -7302,12 +7312,21 @@ fn plan_runtime_uninstall(
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
     let was_active = current_runtime_manifest(config, &manifests)
         .is_some_and(|current| current.runtime_key == manifest.runtime_key);
+    let clears_default_runtime = config
+        .default_runtime_id
+        .as_deref()
+        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
+        && (was_active
+            || !manifests.iter().any(|other| {
+                other.runtime_key != manifest.runtime_key
+                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
+            }));
     let install_root_decision = should_remove_runtime_install_root(&manifest)?;
     Ok(RuntimeUninstallPlan {
         manifest,
-        all_manifests: manifests,
         registry_path,
         was_active,
+        clears_default_runtime,
         install_root_decision,
     })
 }
@@ -7328,6 +7347,7 @@ fn revalidate_runtime_uninstall_plan(
     if fresh.manifest.runtime_id != plan.manifest.runtime_id
         || fresh.manifest.install_root != plan.manifest.install_root
         || fresh.was_active != plan.was_active
+        || fresh.clears_default_runtime != plan.clears_default_runtime
         || fresh.install_root_decision != plan.install_root_decision
     {
         bail!(
@@ -7355,9 +7375,9 @@ fn apply_runtime_uninstall(
 ) -> Result<RuntimeUninstallResult> {
     let RuntimeUninstallPlan {
         manifest,
-        all_manifests: manifests,
         registry_path,
         was_active,
+        clears_default_runtime,
         install_root_decision,
     } = plan;
 
@@ -7401,16 +7421,7 @@ fn apply_runtime_uninstall(
         config.previous_runtime_key = None;
         config_changed = true;
     }
-    if config
-        .default_runtime_id
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
-        && (was_active
-            || !manifests.iter().any(|other| {
-                other.runtime_key != manifest.runtime_key
-                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
-            }))
-    {
+    if clears_default_runtime {
         config.default_runtime_id = None;
         config_changed = true;
     }
@@ -7449,6 +7460,7 @@ fn apply_runtime_uninstall(
         read_only: manifest.read_only,
         manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
         was_active,
+        default_runtime_cleared: clears_default_runtime,
     })
 }
 
@@ -28501,6 +28513,87 @@ ID_LIKE="suse opensuse"
         assert!(
             result.is_err(),
             "revalidation should refuse a plan whose install_root moved since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_clears_default_runtime_id_for_last_sibling_even_when_not_active()
+    -> Result<()> {
+        // `runtime_id` is shared across side-by-side installs of the same
+        // release, while `runtime_key` is unique per install and
+        // `config.default_runtime_id` tracks by the shared `runtime_id`,
+        // independently of `config.active_runtime_key`. A stale
+        // `default_runtime_id` left over from before a *different* runtime
+        // was activated must still be cleared once its last remaining
+        // sibling is uninstalled — even though that sibling is not, and
+        // never was, the active runtime (`was_active` is pinned to the
+        // unrelated active runtime and never falls back to the
+        // default-id-uniqueness check while that active runtime is still
+        // installed).
+        let (root, paths) = test_paths("runtime-uninstall-shared-default-id");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let manifest_a = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-a",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let manifest_b = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-b",
+            shared_runtime_id,
+            "7.13.0",
+            21,
+        )?;
+        let active_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-0",
+            "therock-release:gfx1151",
+            "7.14.0",
+            22,
+        )?;
+        // `default_runtime_id` is stale, left over from before
+        // `active_manifest` was activated; `active_runtime_key` now points
+        // at a manifest with a completely different `runtime_id`.
+        let mut config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(active_manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+
+        // Removing the first sibling leaves the other one behind, so the
+        // stale default (which still resolves to a real, remaining install)
+        // must not be cleared.
+        let plan_b = plan_runtime_uninstall(&paths, &config, &manifest_b.runtime_key)?;
+        assert!(!plan_b.was_active);
+        assert!(!plan_b.clears_default_runtime);
+        let removed_b = uninstall_runtime(&paths, &mut config, &manifest_b.runtime_key)?;
+        assert!(!removed_b.was_active);
+        assert!(!removed_b.default_runtime_cleared);
+        assert_eq!(
+            config.default_runtime_id.as_deref(),
+            Some(shared_runtime_id)
+        );
+
+        // Removing the last remaining sibling must clear the stale default
+        // even though this install was never the active one, and
+        // `active_runtime_key` still points at the unrelated, still-installed
+        // `active_manifest` throughout.
+        let plan_a = plan_runtime_uninstall(&paths, &config, &manifest_a.runtime_key)?;
+        assert!(!plan_a.was_active);
+        assert!(plan_a.clears_default_runtime);
+        let removed_a = uninstall_runtime(&paths, &mut config, &manifest_a.runtime_key)?;
+        assert!(!removed_a.was_active);
+        assert!(removed_a.default_runtime_cleared);
+        assert_eq!(config.default_runtime_id, None);
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(active_manifest.runtime_key.as_str())
         );
 
         let _ = fs::remove_dir_all(root);
