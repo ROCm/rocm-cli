@@ -143,6 +143,9 @@ Understand existing patterns first:
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
+- when a command's flags, defaults, arguments, or observable behavior
+  change, update README.md, its --help/doc comment, and docs/testing.md
+  in the same change — do not leave user-facing docs for a follow-up
 - the same behavior claim (e.g. "does X automatically") often repeats across
   README.md, --help doc comments, printed CLI output, and docs/*.md; each
   drifts independently, so grep for the claim's wording across all of them,
