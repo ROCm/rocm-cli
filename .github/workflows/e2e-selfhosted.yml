@@ -720,6 +720,11 @@ jobs:
       )
     continue-on-error: false
     env:
+      # wsl.exe emits UTF-16 by default; without this its own error/status text
+      # comes back mangled ("T h e   f i l e   c a n n o t ...") when captured
+      # through PowerShell, which is exactly what a genuine wsl.exe error looks
+      # like without it. Matches the ubuntu/WSL composite action's own env.
+      WSL_UTF8: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       # WSL2's virtualization overhead can make a TUI frame that renders well
       # inside the 30s default on native hardware miss it here. Raise the wait
@@ -755,7 +760,11 @@ jobs:
           # Best-effort: the pool already unregisters distros between jobs by
           # design (confirmed by its maintainer), but a stale registration
           # left by an image bake or a future policy change should not block
-          # a fresh install.
+          # a fresh install. `--shutdown` first, matching the ubuntu/WSL
+          # composite action: unregistering without it can hit wsl.exe's
+          # "the file cannot be accessed by the system" against a VM that is
+          # still mid-startup (observed on run 34829015535).
+          wsl --shutdown
           wsl --unregister Ubuntu-24.04 2>$null | Out-Null
           wsl --install Ubuntu-24.04 --web-download --no-launch
           if ($LASTEXITCODE -ne 0) {
