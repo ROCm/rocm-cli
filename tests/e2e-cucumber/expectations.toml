@@ -347,4 +347,3 @@ when = { os = "windows", therock_family = "gfx*", has_amd_gpu = true }
 bug = "EAI-8031"
 reason = "Managed lemonade serve of a Hugging Face `owner/repo:variant` checkpoint exits 0 but the endpoint never becomes ready on Windows."
 serve_timeout_secs = 240
-
