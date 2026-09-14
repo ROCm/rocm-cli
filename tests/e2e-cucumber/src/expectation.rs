@@ -884,13 +884,13 @@ serve_timeout_secs = 90
         ]);
         // MI300X has eight devices → the premise holds → the scenario runs.
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(&d, &cap("mi300x"), &m, Included::default()),
             Expectation::ExpectPass
         );
         // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
         // is why the scenario used to run and fail on its premise.
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
             Expectation::Skip { .. }
         ));
         // No GPU at all, and a host whose count could not be probed (WSL), skip
@@ -898,7 +898,7 @@ serve_timeout_secs = 90
         for host in ["mock", "wsl2"] {
             assert!(
                 matches!(
-                    resolve(&d, &cap(host), &m, false, false, false),
+                    resolve(&d, &cap(host), &m, Included::default()),
                     Expectation::Skip { .. }
                 ),
                 "{host} must not run a multi-GPU scenario"
@@ -944,11 +944,11 @@ serve_timeout_secs = 90
         ));
         assert!(rocr.requires_multi_gpu, "serve-20 must carry the gate");
         assert!(matches!(
-            resolve(&rocr, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(&rocr, &cap("strix-ubuntu"), &m, Included::default()),
             Expectation::Skip { .. }
         ));
         assert_eq!(
-            resolve(&rocr, &cap("mi300x"), &m, false, false, false),
+            resolve(&rocr, &cap("mi300x"), &m, Included::default()),
             Expectation::ExpectPass
         );
 
@@ -960,7 +960,7 @@ serve_timeout_secs = 90
         );
         for host in ["strix-ubuntu", "mi300x"] {
             assert_eq!(
-                resolve(&masked, &cap(host), &m, false, false, false),
+                resolve(&masked, &cap(host), &m, Included::default()),
                 Expectation::ExpectPass,
                 "{host} must still run serve-19"
             );
@@ -975,7 +975,7 @@ serve_timeout_secs = 90
         let m = Expectations::default();
         let d = decl(&["id:x", "requires-gpu", "requires-multi-gpu"]);
         let Expectation::Skip { reason } =
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false)
+            resolve(&d, &cap("strix-ubuntu"), &m, Included::default())
         else {
             panic!("a single-GPU host must skip a multi-GPU scenario");
         };
