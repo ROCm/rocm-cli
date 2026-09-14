@@ -9,7 +9,7 @@
 //! from — exists only in what the terminal renders, so a piped run cannot see it.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cucumber::{given, then, when};
 
@@ -105,26 +105,26 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     // before bash has painted anything — so the single read that follows lands
     // in the gap between the two whenever the machine is busy, and reports a
     // shell that simply had not reached its prompt yet as one whose prompt is
-    // unmarked. Polling the real condition removes the gap without weakening
-    // it: the assertion below is unchanged, and a shell that never marks its
-    // prompt still fails, just at the timeout instead of instantly.
-    let deadline = Instant::now() + SCREEN_TIMEOUT;
-    let mut screen = session.screen_text();
-    loop {
-        let on_a_prompt_line = screen
-            .lines()
-            .filter(|line| line.contains(&marker))
-            .any(|line| line.contains('$'));
-        if on_a_prompt_line {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the marker never reached a prompt line within {SCREEN_TIMEOUT:?}:\n{screen}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        screen = session.screen_text();
-    }
+    // unmarked. Waiting on the real condition removes the gap without weakening
+    // it: a shell that never marks its prompt still fails, at the timeout.
+    //
+    // Through `wait_for_screen_where` rather than a local poll loop, so a shell
+    // that dies or a pty reader that panics is reported as THAT, instead of
+    // running out the full timeout and blaming the prompt marker for a failure
+    // that happened earlier and elsewhere.
+    session
+        .wait_for_screen_where(
+            &format!("{marker} on a prompt line"),
+            SCREEN_TIMEOUT,
+            |screen| {
+                screen
+                    .lines()
+                    .filter(|line| line.contains(&marker))
+                    .any(|line| line.contains('$'))
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the engine shell's prompt was never marked: {e}"));
 }
 
 #[then("the engine environment's interpreter is the one that runs")]

@@ -1263,6 +1263,16 @@ async fn user_serves_without_choosing_address(world: &mut E2eWorld) {
 #[then("the new server does not try to use the taken address")]
 async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
     let output = serve_output(world);
+    // The `port:` line read here is the one `serve` prints in its "serve plan"
+    // block (`apps/rocm/src/main.rs:5389`), which is what this scenario ran.
+    //
+    // Named because grepping the product for `port: {port}` finds a decoy first:
+    // `port_status` writes an identical line at `main.rs:13571` for a different
+    // command entirely. Two reviewers have now landed on that one while checking
+    // this step. `serve`'s is indented and `port_status`'s is not, which is why
+    // the `trim()` above is load-bearing rather than defensive — and also why
+    // matching on indentation instead would be the wrong way to tell them apart,
+    // since only one of the two can appear in this scenario's output at all.
     let planned = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("port:"))

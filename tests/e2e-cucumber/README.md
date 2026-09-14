@@ -101,10 +101,17 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 
 ## Tags and per-scenario expectations
 
-There is no tag-filter tiering. Each CI job runs the **whole** suite
-(`cargo xtask e2e`, no `-t` filter); the harness resolves every scenario to
-**pass / xfail / skip** at runtime from its capability tags plus the known-bug
-matrix, then reconciles the actual result against that expectation.
+Each CI job runs the suite as a whole (`cargo xtask e2e`, no `-t` filter); the
+harness resolves every scenario to **pass / xfail / skip** at runtime from its
+capability tags plus the known-bug matrix, then reconciles the actual result
+against that expectation.
+
+Three tags tier the suite at runtime rather than by a `-t` filter, so a scenario
+carrying one runs only where its env var is set: `@nightly`
+(`E2E_INCLUDE_NIGHTLY`), `@lifecycle` (`E2E_INCLUDE_LIFECYCLE`) and
+`@merge-queue` (`E2E_MERGE_QUEUE`, set on the merge-queue lanes). Note what that
+means for gating: a `@merge-queue` scenario does not run on ordinary per-PR CI
+at all, and the lanes that do run it are marked non-blocking in `ci.yml`.
 
 ### Naming
 
@@ -140,6 +147,8 @@ Scenarios carry stable-id and capability tags:
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
+| `@requires-no-gpu` | Premise is a host with no usable AMD GPU (e.g. a refusal that only happens without one). The inverse of `@requires-gpu`; resolves to **skip** on a GPU host. |
+| `@merge-queue` | Too expensive for per-PR CI (a real serve). Skipped unless `E2E_MERGE_QUEUE` is set, which the merge-queue lanes do. Those lanes are non-blocking, so such a scenario is telemetry rather than a gate. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 
