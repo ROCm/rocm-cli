@@ -4432,6 +4432,19 @@ mod tests {
     }
 
     #[test]
+    fn new_state_never_auto_opens_onboarding() {
+        // Regression guard: nothing on the startup path may read
+        // `setup.completed`/`onboarding_dismissed` to auto-open onboarding.
+        // It must only open via the explicit `n` key (KeyAction::OpenOnboarding)
+        // or an explicit `Focus::Setup` selection.
+        let s = AppState::new("t".into(), "default-dark".into());
+        assert!(
+            s.onboarding.is_none(),
+            "onboarding must not be open immediately after AppState::new"
+        );
+    }
+
+    #[test]
     fn opening_an_overlay_closes_the_others() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         apply_action(&mut s, KeyAction::OpenServices);

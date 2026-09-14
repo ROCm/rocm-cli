@@ -274,14 +274,15 @@ those.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
-to list the whole catalog. Each fix is marked AUTO
-(this command carries out the change) or PRINT-ONLY (it prints the steps for
-you to run yourself, typically because they need sudo or a reboot). Use
-`--dry-run` to see any fix's plan without changing anything, and `--yes` to
-skip the interactive confirmation once you've reviewed it. `--device-index`
-pins the discrete GPU index for `fix-9-igpu-dgpu`; without it, that fix only
-prints the `rocminfo` query needed to find the index and makes no change,
-despite being marked AUTO.
+to list the whole catalog. Each fix is marked AUTO (this command carries out
+the change) or PRINT-ONLY (it prints the steps for you to run yourself —
+usually because the right command depends on a choice only you can make,
+sometimes because it also needs sudo or a reboot). Use `--dry-run` to see any
+fix's plan without changing anything, and `--yes` to skip the interactive
+confirmation once you've reviewed it. `--device-index` pins the discrete GPU
+index for `fix-9-igpu-dgpu`; without it, that fix only prints the `rocminfo`
+(Linux) or `hipInfo.exe` (Windows) query needed to find the index and makes
+no change, despite being marked AUTO.
 
 ### ROCm installation
 
@@ -492,15 +493,15 @@ quality harnesses.
 `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
 plain host address without `/v1` also works); only `http://` is accepted —
 `https://` endpoints are rejected outright, since the load generator has no
-TLS backend compiled in. `--concurrency` sweeps a
-comma-separated list of levels (default `1,8,32,64`, each 1-128); `--auto-ramp`
-ignores `--concurrency` and instead ramps `1,2,4,8,16,32,64,128` automatically,
+TLS backend compiled in. `--concurrency` sweeps a comma-separated list of
+levels (default `1,8,32,64`, each 1-128); `--auto-ramp` ignores
+`--concurrency` and instead ramps `1,2,4,8,16,32,64,128` automatically,
 stopping early once generation throughput plateaus or the request queue backs
 up. `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
 1-32768, and `--requests` (default 128) accepts 1-10000. Results are written
-to `--out` (default `<data-dir>/bench/results.csv`,
-where `<data-dir>` is `~/.rocm` unless overridden), intended to match the path
-the daemon tails to feed the dashboard's **Observe** tab. The two are computed
+to `--out` (default `<data-dir>/bench/results.csv`, where `<data-dir>` is
+`~/.rocm` unless overridden), intended to match the path the daemon tails to
+feed the dashboard's **Observe** tab. The two are computed
 independently, so if either the CLI's data dir or the daemon's
 `bench_results_dir` config has been customized, confirm they still point at
 the same file.

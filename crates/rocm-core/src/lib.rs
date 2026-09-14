@@ -5599,6 +5599,10 @@ fn default_permissions_mode() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetupConfig {
+    /// Described in: `rocm setup status`/`reset` output, their `--help` doc
+    /// comments, README.md's Setup section, and docs/testing.md. Nothing
+    /// reads this to auto-open onboarding — grep this field, not a phrase,
+    /// before touching any of those surfaces.
     #[serde(default)]
     pub completed: bool,
     #[serde(default)]
@@ -5659,6 +5663,10 @@ pub struct RocmCliConfig {
     pub previous_runtime_key: Option<String>,
     #[serde(default)]
     pub planner_provider: Option<String>,
+    /// Described in: `rocm setup status`/`reset` output, their `--help` doc
+    /// comments, README.md's Setup section, and docs/testing.md. Nothing
+    /// reads this to auto-open onboarding — grep this field, not a phrase,
+    /// before touching any of those surfaces.
     #[serde(default)]
     pub onboarding_dismissed: bool,
     #[serde(default)]
