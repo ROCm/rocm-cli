@@ -218,10 +218,13 @@ form works depends on the engine your GPU selects.
 |---|---|
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
+| `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
+| `rocm fix <fix-id>` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm dash` | Open the full-screen telemetry dashboard |
+| `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
@@ -244,6 +247,35 @@ PyTorch, then falls back to llama.cpp; `pytorch` or `llama-cpp` probe only
 that framework; `skip` runs no framework probe at all, which is fastest and
 still enough to answer GPU and driver questions. `--framework` only affects
 the JSON report, not the human-readable one.
+
+### Diagnose and fix
+
+```
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
+```
+
+`diagnose` matches this machine against a fixed catalog of known
+ROCm/PyTorch/llama.cpp misconfigurations and ranks what it finds. It can only
+recognise failure modes that are in the catalog: no match means "not
+recognised", not "nothing is wrong" — in that case it points you at where to
+report the symptom. Each result prints an `id:` and an `apply with:` command;
+the leading `#1`, `#2` are ranking positions for reading order only — `rocm
+fix` takes the id, not the position. `--symptom` takes raw error text to
+sharpen keyword scoring; `--top` caps how many matches are shown (default 5);
+`--json` emits a machine-readable report; `--distro` diagnoses a WSL
+distribution from the Windows host instead of this machine (nothing needs to
+be installed inside the distribution — name it only when more than one is
+installed).
+
+`fix` applies a known fix by the `id:` that `diagnose` reported — not the
+`#1`/`#2` ranking position, which belongs to one report and isn't a stable
+name. Run it with no id to list the whole catalog. Each fix is marked AUTO
+(this command carries out the change) or PRINT-ONLY (it prints the steps for
+you to run yourself, typically because they need sudo or a reboot). Use
+`--dry-run` to see any fix's plan without changing anything, and `--yes` to
+skip the interactive confirmation once you've reviewed it. `--device-index`
+is only used by `fix-9-igpu-dgpu`, to pin the discrete GPU index.
 
 ### ROCm installation
 
@@ -437,6 +469,28 @@ and a chat tab backed by any configured provider. See
 - `--replay <file>` replays a recorded NDJSON session.
 - Live mode requires Unix domain sockets (Linux and WSL only).
 
+### Bench
+
+```
+rocm bench load --endpoint URL [--model NAME] [--concurrency N,N,...]
+                [--isl N] [--osl N] [--requests N] [--out FILE] [--auto-ramp]
+```
+
+Saturates a local OpenAI-compatible endpoint and reports rough client-side
+throughput — a local smoke test, **not** an official ROCm/AMD benchmark.
+`load` measures raw serving throughput with synthetic single-shot requests
+(the vLLM `benchmark_serving` shape); it does not reproduce agent-shaped,
+multi-turn, long-context tool traffic and isn't comparable to `*-agent-bench`
+quality harnesses.
+
+`--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
+plain host address without `/v1` also works). `--concurrency` sweeps a
+comma-separated list of levels (default `1,8,32,64`); `--auto-ramp` ignores
+`--concurrency` and instead ramps `1,2,4,8,16,32,64,128` automatically,
+stopping early once generation throughput plateaus or the request queue backs
+up. Results are written to `--out` (default `~/.rocm/bench/results.csv`), the
+same path the daemon tails to feed the dashboard's **Observe** tab.
+
 ### Chat
 
 ```
@@ -494,6 +548,17 @@ rocm config disable-provider <provider>
 rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
+
+### Setup
+
+```
+rocm setup status
+rocm setup reset
+```
+
+Manage first-time setup state. `status` shows whether first-time setup has
+completed; `reset` clears it so the next TUI launch shows first-time setup
+again — useful to redo onboarding after a big configuration change.
 
 ### Logs and cleanup
 
