@@ -227,6 +227,24 @@ pub struct Examination {
     pub in_container: bool,
     pub container_kind: String,
 
+    // Shared memory (Linux). A serving workload needs gigabytes of `/dev/shm`;
+    // a container gives it 64 MB by default. When it runs out the workload
+    // crashes without the message ever naming shared memory, so the user has no
+    // route from the error to the cause.
+    /// Size of the `/dev/shm` filesystem in bytes.
+    ///
+    /// The total, not the free space, is what decides: a 64 MB allowance cannot
+    /// hold an 8 GB workload even when completely empty, so judging on free
+    /// space would miss the case on an idle machine entirely.
+    ///
+    /// `None` when the path does not exist or cannot be queried, which is a
+    /// different answer from zero -- a machine we could not measure is not a
+    /// machine with a shortage.
+    pub shm_total_bytes: Option<u64>,
+    /// Free space on `/dev/shm` in bytes. Reported because "64 MB total" and
+    /// "64 MB total, 2 MB free" are different conversations.
+    pub shm_available_bytes: Option<u64>,
+
     // evidence
     pub dmesg_amdgpu_tail: Vec<String>,
     pub notes: Vec<String>,
@@ -288,6 +306,8 @@ impl Default for Examination {
             env: BTreeMap::new(),
             in_container: false,
             container_kind: String::new(),
+            shm_total_bytes: None,
+            shm_available_bytes: None,
             dmesg_amdgpu_tail: Vec::new(),
             notes: Vec::new(),
             probe_failures: Vec::new(),
@@ -339,6 +359,9 @@ impl Examination {
             probe_env(&mut e);
             probe_container(&mut e);
             probe_framework(&mut e, framework);
+            // WSL2 ships the same 64 MB default a container does, so this is one
+            // of the platforms where the shortage is most likely to be real.
+            probe_shared_memory(&mut e);
             e.status = e.compute_status();
             return e;
         }
@@ -355,6 +378,7 @@ impl Examination {
             probe_rocm_install(&mut e);
             probe_env(&mut e);
             probe_container(&mut e);
+            probe_shared_memory(&mut e);
             probe_dmesg_amdgpu(&mut e);
             probe_framework(&mut e, framework);
         } else if e.os_family == "windows" {
@@ -1635,6 +1659,76 @@ fn truncate_to_chars(value: String, max_chars: usize) -> String {
     }
 }
 
+/// The shared-memory filesystem a serving workload uses.
+const SHM_PATH: &str = "/dev/shm";
+
+/// Measure `/dev/shm`.
+///
+/// A direct `statvfs` rather than the shared disk-space helper, and that is not
+/// an oversight in the helper. `sysinfo` omits tmpfs, and `disk_space` guards
+/// against the consequence by comparing device ids -- so asking it about
+/// `/dev/shm` correctly returns "unknown" instead of confidently reporting the
+/// root filesystem's free space. The guard is right; this needs the number it
+/// declines to guess at.
+fn probe_shared_memory(e: &mut Examination) {
+    probe_shared_memory_at(e, SHM_PATH);
+}
+
+/// The body of [`probe_shared_memory`], with the path as a parameter so the
+/// unmeasurable branch is reachable from a test. A hard-coded `/dev/shm` cannot
+/// be made to fail on a host that has one.
+fn probe_shared_memory_at(e: &mut Examination, path: &str) {
+    let Some((total, available)) = filesystem_size(path) else {
+        // Recorded, not swallowed. The fields stay `None`, which the catalog
+        // reads as "not measured" rather than "no shortage" -- but without a
+        // trace here, an examination that could not measure is byte-identical
+        // to one that measured a healthy machine, and nothing tells a reader
+        // which they are looking at. `probe_failures` is the documented channel
+        // for exactly this (see `Examination::probe`), and a non-empty one also
+        // degrades `status` from `ok`, which is the signal a caller branches on.
+        e.probe_failures.push(format!(
+            "could not query {path}; shared-memory allowance unknown"
+        ));
+        return;
+    };
+    e.shm_total_bytes = Some(total);
+    e.shm_available_bytes = Some(available);
+}
+
+/// Total and available bytes for the filesystem mounted at `path`.
+///
+/// `None` when the path does not exist or the call fails, which callers must
+/// keep distinct from zero: a machine that could not be measured is not a
+/// machine with no space.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+fn filesystem_size(path: &str) -> Option<(u64, u64)> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call, and `stats` is a correctly sized, writable `statvfs` this thread
+    // owns. The call only reads the path and writes the struct.
+    let stats = unsafe {
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        if libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stats.assume_init()
+    };
+    // `f_frsize` is the fragment size the block counts are expressed in.
+    // `checked_mul` rather than a plain product: these are values the kernel
+    // hands back, and a probe has no business panicking on a surprising one.
+    let block = stats.f_frsize;
+    Some((
+        block.checked_mul(stats.f_blocks)?,
+        block.checked_mul(stats.f_bavail)?,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_size(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
 fn probe_container(e: &mut Examination) {
     for (marker, kind) in [("/.dockerenv", "docker"), ("/run/.containerenv", "podman")] {
         if Path::new(marker).exists() {
@@ -1843,6 +1937,41 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unmeasurable_shared_memory_allowance_leaves_a_trace() {
+        // The distinction the fields exist to preserve, tested at the layer that
+        // can erase it. The catalog already refuses to report a shortage it
+        // could not measure; this is the other half. Without a record here, an
+        // examination that failed to measure is indistinguishable from one that
+        // measured a healthy machine, and a reader cannot tell which.
+        // A machine the CLI supports and has found a GPU on, so `compute_status`
+        // reaches the probe-failure branch instead of short-circuiting on a
+        // platform or hardware verdict first.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        };
+        probe_shared_memory_at(&mut e, "/nonexistent-shm-for-this-test");
+
+        assert_eq!(
+            e.shm_total_bytes, None,
+            "an unreadable path must not invent a measurement"
+        );
+        assert!(
+            e.probe_failures.iter().any(|f| f.contains("shared-memory")),
+            "the failure has to be recorded, not swallowed: {:?}",
+            e.probe_failures
+        );
+        // `probe_failures` is what degrades the overall verdict, so the trace is
+        // load-bearing rather than decorative.
+        assert_eq!(
+            e.compute_status(),
+            "degraded",
+            "a probe that could not run must not leave the machine looking clean"
+        );
+    }
 
     /// Ported from the Python preflight this replaced, whose `wsl.exe` parser
     /// was covered by a self-test that CI ran on both lanes. That coverage has to
@@ -2196,6 +2325,11 @@ mod tests {
             "env",
             "in_container",
             "container_kind",
+            // CLI additions beyond examine.py, added deliberately: the shared
+            // memory allowance, which a serving workload exhausts without the
+            // crash ever naming it.
+            "shm_total_bytes",
+            "shm_available_bytes",
             "dmesg_amdgpu_tail",
             "notes",
             "probe_failures",

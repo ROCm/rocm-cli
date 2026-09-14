@@ -18,6 +18,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -628,6 +629,21 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
     world.register_mock_service_with(ServiceRecordOptions::default());
 }
 
+#[given("dashboard observation time is deterministic")]
+async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let path = root.join(DASH_CLOCK_OFFSET_FILE);
+    std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
+    world.command_env.push((
+        "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
+        path.into_os_string(),
+    ));
+}
+
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
 /// `gen_tps` is `Some(_)`. Wait for it to confirm a positive baseline was
 /// established through at least two successful Growing-mode scrapes.
@@ -670,17 +686,10 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     // snapshot is painted before the assertion reads the screen.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
-
-/// EAI-7960 principal regression assertion (must be RED with current code).
+/// EAI-7960 principal regression assertion.
 ///
-/// Contract: the Observe tab must still show "tok/s" immediately after the
-/// first failed scrape — the held value must persist for the validity window
-/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
-///
-/// **Current behaviour:** `runner.rs` lines 464-476 clear `gen_tps` on the
-/// very tick that the `/metrics` fetch fails — no holding logic exists. The
-/// TUI therefore renders "—" the moment the failure propagates, and this
-/// assertion **FAILS**, confirming EAI-7960 is reproduced at the PTY seam.
+/// The scenario's injected logical clock cannot cross the validity boundary
+/// because the host was descheduled; only an explicit scenario advance can.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
@@ -688,42 +697,41 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
         screen.contains("tok/s"),
         "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
          after the first failed scrape instead of being held for the validity \
-         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\
-         Root cause: runner.rs clears gen_tps on the same tick as the failure; \
-         no held-value / validity-window logic exists yet.\n\
-         This assertion must FAIL (RED) until the fix is applied.\n\n\
+         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\n\
          Last screen:\n{screen}"
     );
 }
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
 
-/// Production validity window: clamp(3 × instance_tick, 6 s, 30 s).
-///
-/// With the daemon's 2 s `instance_tick` the lower bound clamp(6 s, 6 s) = 6 s
-/// is always reached. An additional buffer of two instance-ticks (4 s) ensures
-/// the runner has had enough cycles to propagate the expiry to the TUI.
-const VALIDITY_WINDOW: Duration = Duration::from_secs(6);
-const VALIDITY_WINDOW_BUFFER: Duration = Duration::from_secs(5); // 2 × instance_tick + render
-
-/// Sleep for the full observation validity window so the caller can then assert
-/// that the held gen_tps has expired. Designed to follow
-/// "When the metrics endpoint fails transiently" — at that step's exit at least
-/// one 503 has been served, meaning the validity clock has started.
+/// Advance the test-only logical clock beyond the six-second validity window,
+/// then synchronize on the next failed scrape that publishes the expired value.
 #[when("the validity window has elapsed")]
-async fn validity_window_elapsed(_world: &mut E2eWorld) {
-    // Sleep the full window + buffer so the daemon has had enough cycles
-    // after expiry to deliver the snapshot change to the TUI.
-    tokio::time::sleep(VALIDITY_WINDOW + VALIDITY_WINDOW_BUFFER).await;
+async fn validity_window_elapsed(world: &mut E2eWorld) {
+    let mock = world.mock.as_ref().expect("no mock server running");
+    let prior_failures = mock.metrics_failure_count();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
+        .expect("failed to advance dashboard test clock");
+
+    let budget = default_timeout();
+    let deadline = Instant::now() + budget;
+    while mock.metrics_failure_count() == prior_failures {
+        assert!(
+            Instant::now() < deadline,
+            "no metrics scrape observed after advancing the dashboard clock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// Assert that gen_tps is no longer rendered on screen (BOUNDARY 2 of the
-/// EAI-7960 expiry contract). After the validity window the daemon must clear
-/// the held value and the TUI must show "—" in place of the "tok/s" unit.
-///
-/// With current code this step is unreachable because BOUNDARY 1 (the "remains
-/// visible" assertion) fails first. This step becomes GREEN once the hold/expiry
-/// logic is implemented.
+/// Assert that gen_tps is no longer rendered after the scenario advances the
+/// injected clock beyond the validity boundary and observes the next scrape.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
