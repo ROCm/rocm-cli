@@ -1926,7 +1926,9 @@ fn install_tarball_runtime(
         crate::cli_progress::AnimatedSpinner::start(format!("Extracting {}…", artifact.file_name));
     let extract_result = extract_tarball_and_discard_archive(&cache_path, &install_root);
     drop(extract_spinner);
-    extract_result?;
+    if let Some(cleanup_warning) = extract_result? {
+        progress_line(cleanup_warning);
+    }
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -3819,15 +3821,24 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
 ///
 /// Removing the archive is best-effort: the install has already succeeded by
 /// this point, so a cleanup failure is reported rather than raised.
-fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+/// Extracts `archive_path` into `target_dir` and deletes the archive.
+///
+/// Archive deletion failure is non-fatal but still worth reporting; the
+/// message is returned rather than printed directly so callers running a
+/// progress spinner over this call can drop it first and avoid interleaving
+/// spinner frames with the report.
+fn extract_tarball_and_discard_archive(
+    archive_path: &Path,
+    target_dir: &Path,
+) -> Result<Option<String>> {
     extract_tarball(archive_path, target_dir)?;
     if let Err(error) = fs::remove_file(archive_path) {
-        progress_line(format!(
+        return Ok(Some(format!(
             "Could not remove the downloaded archive {}: {error}",
             archive_path.display()
-        ));
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn ensure_uv_venv(
@@ -6737,7 +6748,11 @@ mod tests {
 
         let target = root.join("install");
         fs::create_dir_all(&target)?;
-        extract_tarball_and_discard_archive(&archive, &target)?;
+        let cleanup_warning = extract_tarball_and_discard_archive(&archive, &target)?;
+        assert!(
+            cleanup_warning.is_none(),
+            "archive cleanup should succeed: {cleanup_warning:?}"
+        );
 
         assert!(
             target.join("marker.txt").is_file(),

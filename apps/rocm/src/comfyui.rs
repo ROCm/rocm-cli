@@ -362,6 +362,7 @@ pub(crate) fn install(
             uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
             Some(&runtime_env),
             &mut log,
+            &log_path,
             "install ComfyUI dependencies",
             "Resolving and installing packages with uv…",
         )?;
@@ -1546,12 +1547,14 @@ fn write_torch_constraints(
     Ok(Some(path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_uv_logged_command(
     paths: &AppPaths,
     uv: &Path,
     args: Vec<String>,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
     log: &mut fs::File,
+    log_path: &Path,
     context_text: &str,
     spinner_label: &str,
 ) -> Result<()> {
@@ -1611,7 +1614,10 @@ fn run_uv_logged_command(
     if status.success() {
         return Ok(());
     }
-    bail!("{context_text}: uv exited with {status}; run `rocm comfyui logs` for details");
+    bail!(
+        "{context_text}: uv exited with {status}; see {} for details",
+        log_path.display()
+    );
 }
 
 fn stream_logged_output<R: Read>(mut reader: R, mut log: fs::File) -> io::Result<()> {
@@ -1877,6 +1883,45 @@ mod tests {
             !without_pin.iter().any(|arg| arg == "--constraint"),
             "no --constraint expected when nothing to pin: {without_pin:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_uv_logged_command_reports_concrete_log_path_on_failure() -> Result<()> {
+        // A failed install's manifest is never saved, so `rocm comfyui logs`
+        // (which discovers logs from the manifest) can't find this run's log.
+        // The error must name the log file directly instead.
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("comfyui-uv-failure");
+        fs::create_dir_all(&paths.cache_dir)?;
+        let uv_path = paths.cache_dir.join("fake-uv");
+        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
+
+        let log_path = paths.cache_dir.join("install.log");
+        let mut log = fs::File::create(&log_path)?;
+
+        let error = run_uv_logged_command(
+            &paths,
+            &uv_path,
+            vec!["pip".to_owned(), "install".to_owned()],
+            None,
+            &mut log,
+            &log_path,
+            "install ComfyUI dependencies",
+            "Resolving and installing packages with uv…",
+        )
+        .expect_err("uv exiting non-zero should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&log_path.display().to_string()),
+            "error should name the concrete log path so a failed install's log stays discoverable: {message}"
+        );
+
+        fs::remove_dir_all(&paths.cache_dir).ok();
+        Ok(())
     }
 
     #[test]
