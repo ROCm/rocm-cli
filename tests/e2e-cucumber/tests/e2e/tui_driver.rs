@@ -181,6 +181,11 @@ impl TuiSession {
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }
+        // Behavioural fixtures attached by Given steps apply to PTY commands too,
+        // just as they do to the piped `run_rocm_with_scenario_env` path.
+        for (key, value) in &world.command_env {
+            cmd.env(key, value);
+        }
         // Caller-supplied overrides win over the scenario's own isolation
         // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
         for (key, value) in extra_env {
