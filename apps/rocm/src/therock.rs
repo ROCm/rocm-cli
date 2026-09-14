@@ -20,6 +20,7 @@ use rocm_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -1115,7 +1116,7 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     for manifest in &manifests {
-        let plan = match runtime_update_plan(paths, manifest, &manifests) {
+        let plan = match runtime_update_plan(paths, manifest, &manifests, None) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -1173,6 +1174,73 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     }
 
     Ok(output)
+}
+
+/// Structured counterpart to [`render_update_report`], for `rocm update --json`.
+/// Consumed by the dash TUI's background update-check job (parsed off a
+/// single compact JSON line captured from the job's stdout), so field names
+/// are a stable-ish contract — extend, don't rename, without checking callers.
+///
+/// Three outcomes a consumer must handle: `runtimes: []` (nothing managed),
+/// one row per manifest with `status: "error"` for any that failed to
+/// resolve (this struct still returns `Ok`), or no JSON at all with a
+/// non-zero exit — [`load_runtime_manifests`] failing is not caught per-row
+/// and fails the whole call.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJson {
+    pub runtimes: Vec<UpdateJsonRuntime>,
+}
+
+/// `format`, `install_root`, and `source` are deliberately omitted: this
+/// contract only needs to answer "is an update available," and every consumer
+/// so far (the dash TUI's Updates tile) only reads `status`/`latest_version`.
+/// Add a field when a real consumer needs it, not preemptively.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJsonRuntime {
+    pub runtime_key: String,
+    pub channel: String,
+    pub family: String,
+    pub installed_version: String,
+    pub latest_version: Option<String>,
+    /// `"update_available"` | `"repair_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
+    pub status: String,
+    pub message: Option<String>,
+}
+
+pub(crate) fn render_update_json(
+    paths: &AppPaths,
+    download_timeout_secs: Option<u64>,
+) -> Result<UpdateJson> {
+    // Resolving a wheel-format manifest's latest version can fall through to
+    // Python resolution/bootstrap, which otherwise prints progress lines (and
+    // an installer's raw stdout) ahead of the JSON below, breaking the
+    // documented single-line contract on `UpdateJson`.
+    let _quiet = SuppressProgressOutput::new();
+    let manifests = load_runtime_manifests(paths)?;
+    let mut runtimes = Vec::with_capacity(manifests.len());
+    for manifest in &manifests {
+        match runtime_update_plan(paths, manifest, &manifests, download_timeout_secs) {
+            Ok(plan) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: Some(plan.latest_version),
+                status: plan.status,
+                message: None,
+            }),
+            Err(error) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: None,
+                status: "error".to_owned(),
+                message: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(UpdateJson { runtimes })
 }
 
 /// Whether the composition-keyed replacement for `source` is already installed.
@@ -1261,8 +1329,9 @@ pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     manifests: &[InstalledRuntimeManifest],
+    download_timeout_secs: Option<u64>,
 ) -> Result<RuntimeUpdatePlan> {
-    let latest = resolve_latest_for_manifest(paths, manifest, None)?;
+    let latest = resolve_latest_for_manifest(paths, manifest, download_timeout_secs)?;
     let freshness = runtime_freshness_with_manifests(
         manifests,
         manifest,
@@ -4886,9 +4955,64 @@ except Exception as exc:
 print(json.dumps(out))
 "#;
 
+thread_local! {
+    /// Set while rendering `--json` output, whose "single compact JSON line"
+    /// contract [`progress_line`] and the managed-Python installer would
+    /// otherwise break by writing extra lines to stdout ahead of the JSON.
+    static SUPPRESS_PROGRESS_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that silences [`progress_line`] and redirects managed-Python
+/// installer output away from stdout for its lifetime, restoring the prior
+/// state on drop (so nested callers compose correctly).
+struct SuppressProgressOutput {
+    previous: bool,
+}
+
+impl SuppressProgressOutput {
+    fn new() -> Self {
+        let previous = SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for SuppressProgressOutput {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.set(previous));
+    }
+}
+
+fn progress_output_suppressed() -> bool {
+    SUPPRESS_PROGRESS_OUTPUT.with(Cell::get)
+}
+
 fn progress_line(message: impl AsRef<str>) {
-    println!("{}", message.as_ref());
+    if progress_output_suppressed() {
+        return;
+    }
+    emit_progress_line(message.as_ref());
+}
+
+#[cfg(not(test))]
+fn emit_progress_line(message: &str) {
+    println!("{message}");
     let _ = std::io::stdout().flush();
+}
+
+// In tests, write through a thread-local buffer instead of stdout so a test can
+// assert on `progress_line`'s actual output (in particular, that a
+// `SuppressProgressOutput` guard held around a call really does silence it),
+// rather than only on the suppression flag's own bookkeeping.
+#[cfg(test)]
+thread_local! {
+    static PROGRESS_LINE_SINK: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn emit_progress_line(message: &str) {
+    PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().push(message.to_owned()));
 }
 
 fn capture_command_output(program: &Path, args: &[&str]) -> Result<Output> {
@@ -5221,16 +5345,29 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     progress_line(format!("Installing Python {version} via uv..."));
-    let status = Command::new(&uv)
+    let install_stdio = || {
+        if progress_output_suppressed() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let install_output = Command::new(&uv)
         .args(["python", "install", &version])
         .envs(uv_command_env(paths))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(install_stdio())
+        .stderr(install_stdio())
+        .output()
         .context("failed to launch uv python install")?;
-    if !status.success() {
-        bail!("uv python install {version} failed with {status}");
+    if !install_output.status.success() {
+        let status = install_output.status;
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("uv python install {version} failed with {status}");
+        }
+        bail!("uv python install {version} failed with {status}: {stderr}");
     }
 
     progress_line(format!("Finding Python {version}..."));
@@ -6268,6 +6405,180 @@ mod tests {
         manifest.source_layout_generation = Some("some-future-generation".to_owned());
         let error = manifest_source_layout(&manifest).unwrap_err().to_string();
         assert!(error.contains("unsupported TheRock source layout generation"));
+    }
+
+    #[test]
+    fn suppress_progress_output_contract() {
+        // `SUPPRESS_PROGRESS_OUTPUT` is thread-local, so this doesn't race with
+        // other tests' threads.
+        assert!(!progress_output_suppressed());
+        {
+            let _outer = SuppressProgressOutput::new();
+            assert!(progress_output_suppressed());
+            {
+                let _inner = SuppressProgressOutput::new();
+                assert!(
+                    progress_output_suppressed(),
+                    "a nested guard must still suppress"
+                );
+            }
+            assert!(
+                progress_output_suppressed(),
+                "dropping the inner guard must not lift the outer guard's suppression"
+            );
+        }
+        assert!(
+            !progress_output_suppressed(),
+            "dropping the outer guard must restore the pre-guard state"
+        );
+    }
+
+    #[test]
+    fn progress_line_is_suppressed_while_guard_is_held() {
+        // Unlike `suppress_progress_output_contract` (which only checks the
+        // flag `SuppressProgressOutput` flips), this asserts on `progress_line`'s
+        // actual output via the `#[cfg(test)]` sink, so it fails if the guard
+        // is ever wired up but `progress_line` stops consulting it.
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        progress_line("before guard");
+        {
+            let _guard = SuppressProgressOutput::new();
+            progress_line("during guard");
+        }
+        progress_line("after guard");
+        let captured = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+        assert_eq!(
+            captured,
+            vec!["before guard".to_owned(), "after guard".to_owned()]
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn render_update_json_installs_the_suppression_guard_around_resolution() -> Result<()> {
+        // Unlike the two tests above (which only exercise the guard's own
+        // bookkeeping in isolation), this proves `render_update_json` itself
+        // installs the guard around a code path that *actually reaches* a
+        // live `progress_line` call: a wheel-format manifest whose only PATH
+        // python is a non-executable stub fails
+        // `python_launcher_install_ready`, so `resolve_python_launcher_in`
+        // falls back to the managed-Python path and calls
+        // `progress_line("Python from PATH cannot create a virtual
+        // environment; using ROCm CLI's managed Python.")` before bailing out
+        // (managed bootstrap is disabled here, so the whole thing stays
+        // network-free). If `render_update_json` stopped installing the
+        // guard, that call would land in `PROGRESS_LINE_SINK` instead of
+        // being swallowed, and the assertion below would fail.
+        let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("render-update-json-installs-guard");
+
+        let manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        fs::write(bin_dir.join("python3"), "not an interpreter")?;
+
+        let old_path = std::env::var_os("PATH");
+        let old_python_override = std::env::var_os("ROCM_CLI_PYTHON");
+        let old_bootstrap_disabled = std::env::var_os("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP");
+        unsafe {
+            std::env::set_var("PATH", &bin_dir);
+            std::env::remove_var("ROCM_CLI_PYTHON");
+            std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1");
+        }
+
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&paths, Some(1));
+
+        unsafe {
+            match old_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match old_python_override {
+                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
+                None => std::env::remove_var("ROCM_CLI_PYTHON"),
+            }
+            match old_bootstrap_disabled {
+                Some(value) => {
+                    std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", value);
+                }
+                None => std::env::remove_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"),
+            }
+        }
+
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped once render_update_json returns"
+        );
+        let captured = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+        assert!(
+            captured.is_empty(),
+            "a progress_line call reachable during resolution must be suppressed by \
+             render_update_json's guard, not delivered to the sink: {captured:?}"
+        );
+
+        let document = result?;
+        assert_eq!(document.runtimes.len(), 1);
+        assert_eq!(
+            document.runtimes[0].status, "error",
+            "PATH python cannot create a venv and managed bootstrap is disabled, \
+             so resolution must fail"
+        );
+        let message = document.runtimes[0]
+            .message
+            .as_deref()
+            .expect("a failed resolution should carry an error message");
+        assert!(
+            message.contains("managed Python bootstrap is disabled"),
+            "expected the deterministic bootstrap-disabled failure, got: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn progress_suppression_guard_releases_on_ok_and_err_exit_paths() {
+        // This only proves the guard's own release semantics on both of
+        // `render_update_json`'s exit paths (both fixtures below exit before
+        // ever reaching resolution, so `progress_line` is never called here).
+        // It does NOT prove `render_update_json` installs the guard around a
+        // live `progress_line` call — see
+        // `render_update_json_installs_the_suppression_guard_around_resolution`
+        // for that.
+        //
+        // Ok path: no `runtimes` directory at all, so `load_runtime_manifests`
+        // returns `Ok(vec![])` and `render_update_json` succeeds trivially.
+        let (ok_root, ok_paths) = test_paths("render-update-json-ok");
+        fs::create_dir_all(&ok_root).unwrap();
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&ok_paths, Some(1));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Ok path"
+        );
+        fs::remove_dir_all(&ok_root).ok();
+
+        // Err path: `broken.json` is a directory, not a file, so the loader's
+        // `fs::read` on it fails and the error bubbles through
+        // `render_update_json`'s `?` before ever constructing an `UpdateJson`.
+        let (err_root, err_paths) = test_paths("render-update-json-err");
+        let registry_dir = err_root.join("data").join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json")).unwrap();
+        let result = render_update_json(&err_paths, Some(1));
+        assert!(
+            result.is_err(),
+            "a directory named *.json must fail to be read as manifest bytes"
+        );
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Err path too"
+        );
+        fs::remove_dir_all(&err_root).ok();
     }
 
     #[test]
@@ -8259,6 +8570,97 @@ echo Python 3.12.10
 
         server.join().expect("localhost server thread panicked")?;
         let _ = fs::remove_dir_all(&temp);
+        Ok(())
+    }
+
+    #[test]
+    fn http_get_respects_max_time_secs() {
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        // Regression test for `http_get`'s `max_time_secs` bound, pre-existing
+        // and unchanged by this PR, which `download_timeout_secs` relies on
+        // once threaded through `resolve_latest_for_manifest`: `http_get` must
+        // actually bound the request to `max_time_secs`, not just accept the
+        // argument and fall back to the 10-minute default. A listener that
+        // accepts the connection but never writes a response simulates a
+        // stalled server past the connect phase, so this exercises the
+        // overall `timeout` (what `max_time_secs` controls), not just
+        // `connect_timeout` (fixed at `THEROCK_HEAD_PROBE_TIMEOUT_SECS`).
+        //
+        // This does not exercise `resolve_latest_for_manifest` itself: its
+        // wheel/tarball index URLs come from `canonical_source`, a `const
+        // fn` over fixed real hostnames with no test-time override, so a
+        // hermetic test can't reach that exact call site without either
+        // hitting the real network or adding a production-code test seam.
+        // `max_time_secs`/`download_timeout_secs` is a single value passed
+        // unchanged through plain pass-through parameters down to here (no
+        // branching on it in between), so a regression in its plumbing would
+        // either fail to compile (type mismatch) or show up as this test
+        // hanging instead of returning quickly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stalled");
+        let started = Instant::now();
+        let result = http_get(&url, &[], Some(1));
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a stalled server must not be treated as a successful response"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "max_time_secs=Some(1) must bound the request; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
+        let (root, paths) = test_paths("update-json-empty");
+
+        let document = render_update_json(&paths, None)?;
+
+        assert!(document.runtimes.is_empty());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_per_manifest_error_without_failing_whole_report() -> Result<()> {
+        let (root, paths) = test_paths("update-json-error");
+        // An unsupported channel fails `TheRockChannel::parse` synchronously,
+        // so this error path is deterministic and never depends on real
+        // network reachability (unlike the manifest's placeholder index URL,
+        // which `resolve_pip_runtime_with_timeout` doesn't even consult).
+        //
+        // Deliberate gap: this only covers the all-error case. Asserting a
+        // successful row survives alongside a failing one would need a second
+        // manifest that resolves for real, and no fixture here stands up a
+        // resolvable wheel index — only a raw-body local HTTP server exists,
+        // for `native_http_download_and_get_round_trip_without_powershell`'s
+        // lower-level use. Not worth building just for this one assertion.
+        let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        manifest.channel = "unsupported-channel".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let document = render_update_json(&paths, None)?;
+
+        assert_eq!(document.runtimes.len(), 1);
+        let row = &document.runtimes[0];
+        assert_eq!(row.runtime_key, "active");
+        assert_eq!(row.status, "error");
+        assert!(row.latest_version.is_none());
+        assert!(row.message.is_some());
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

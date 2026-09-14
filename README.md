@@ -202,8 +202,10 @@ show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sd
 creates a separate managed runtime alongside it. Running the command when a
 managed runtime is already the active default asks first, because the new
 install takes over as the active default — that includes installing a different
-GPU family or channel, which takes it over just the same. Add `--yes` to approve
-that non-interactively, such as from a script.
+GPU family or channel, which takes it over just the same. Add
+`--approve-replacing-active-default` to approve that non-interactively, such as
+from a script; `--yes` also approves it but additionally approves installing
+required system packages, which needs `sudo`.
 
 Then serve a model:
 
@@ -260,6 +262,7 @@ rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
+                    [--json] [--timeout-secs SECS]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
@@ -279,7 +282,10 @@ root and manifest are keyed by version, an upgrade or downgrade keeps the
 previous install on disk — only a same-version reinstall reuses the same install
 root. `install driver` installs the AMD kernel driver on Linux
 (DKMS or native package). `update` checks for a newer ROCm package; pass
-`--apply` to install it. `rocm update --apply` has no `--yes` flag and needs
+`--apply` to install it. `--json` prints the check result as a single line of
+JSON instead of text; `--timeout-secs` bounds its network calls
+(`--timeout-secs` requires `--json`; both conflict with `--apply`).
+`rocm update --apply` has no `--yes` flag and needs
 none: selecting a runtime to update is itself the approval, and it leaves the
 active default alone unless you add `--activate`.
 
