@@ -15583,6 +15583,14 @@ fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
 /// On a platform without `/proc` no start-time exists to record or compare, so
 /// this degrades to the same best-effort match the managed-service kills already
 /// use there rather than making uninstall unusable whenever the daemon is up.
+///
+/// One residual gap, stated here because the outcomes above are otherwise
+/// exhaustive: a *missing* `runtime-state.json` is taken at face value as "no
+/// daemon". Deleting that file by hand while `rocmd` is live therefore skips the
+/// daemon stop silently. This is deliberate — a missing file is the ordinary
+/// never-started case, and there is no pid to verify or signal without it — but
+/// it does mean the gate is only as good as the state file. An unreadable one is
+/// the case that aborts; an absent one is the case that proceeds.
 fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -30996,10 +31004,19 @@ ID_LIKE="suse opensuse"
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn uninstall_stops_a_background_helper_whose_identity_it_can_verify() {
-        // The daemon restarts a managed service whose endpoint stops answering,
-        // which is exactly the state the stop pass creates before writing the
-        // record back — so it goes first. This is the path that must still kill.
+    fn uninstall_stops_a_live_background_helper() {
+        // This pins that the daemon stop still happens at all — the
+        // feature-removal guard. It does NOT pin identity verification: an
+        // unrecorded start-time also classifies as `Matches`, so this passes
+        // against the pre-fix `ProcessIdentity::new(pid, None)` too. The
+        // verification itself is pinned by
+        // `uninstall_never_kills_a_daemon_pid_that_was_recycled` and
+        // `uninstall_never_kills_a_daemon_pid_from_a_state_file_that_predates_start_ticks`,
+        // both of which fail if the identity check is dropped.
+        //
+        // Why the daemon goes first: it restarts a managed service whose
+        // endpoint stops answering, which is exactly the state the stop pass
+        // creates before writing the record back.
         let child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()

@@ -7895,10 +7895,17 @@ mod tests {
     }
 
     #[test]
-    fn a_service_record_is_published_atomically() {
-        // Companion to the reader-safety test above: the services directory must
-        // not accumulate scratch siblings, because `unreadable_service_manifests`
-        // treats stray files there as records it cannot parse.
+    fn a_service_record_write_leaves_no_scratch_sibling() {
+        // This pins scratch-file hygiene, NOT atomic publishing: a plain
+        // `fs::write` creates no scratch file at all and would pass too. The
+        // atomicity property is pinned next door, by
+        // `a_service_record_write_never_shows_a_reader_a_truncated_manifest`,
+        // which fails against an in-place write.
+        //
+        // It still earns its place: the services directory must not accumulate
+        // scratch siblings, because `unreadable_service_manifests` treats stray
+        // files there as records it cannot parse — a leaked one would abort
+        // uninstall.
         let root = atomic_write_root("service-record-publish");
         let paths = AppPaths {
             config_dir: root.join("config"),
