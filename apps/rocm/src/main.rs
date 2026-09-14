@@ -15637,10 +15637,19 @@ fn stop_background_helper_before_uninstall(
     // this fall back to the best-effort match the managed-service kills already
     // use there — otherwise uninstall could never stop a live daemon on those
     // platforms. That residual gap is documented on `daemon_start_ticks`.
+    //
+    // One reading of the PID's start-time serves both questions below — whether
+    // this platform could have verified the record, and whether the live process
+    // is still the recorded one. Reading twice let the two answers come from
+    // different observations: a PID whose `/proc` entry was momentarily
+    // unreadable could clear the pre-upgrade check on one read and then take the
+    // legacy best-effort `Matches` arm on the other, force-killing a tree on the
+    // strength of a reading that never agreed with itself.
     let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
-    let unverifiable_pre_upgrade_record = state.daemon_start_ticks.is_none()
-        && rocm_core::process_start_ticks(state.daemon_pid).is_some();
-    match rocm_core::identity_state(&identity) {
+    let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
+    let unverifiable_pre_upgrade_record =
+        state.daemon_start_ticks.is_none() && observed_start_ticks.is_some();
+    match rocm_core::identity_state_with_observed(&identity, observed_start_ticks) {
         rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled => {
             // Nothing of ours is running: either the PID is free or it now
             // belongs to someone else. Both mean this daemon cannot resurrect a

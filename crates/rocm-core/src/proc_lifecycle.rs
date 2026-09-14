@@ -83,12 +83,32 @@ pub enum IdentityState {
 /// [`IdentityState::Indeterminate`], never a risky match. When no identity was
 /// recorded (legacy state files), it degrades to best-effort
 /// [`IdentityState::Matches`].
+///
+/// Reads the PID's current start-time itself. A caller that has already read it
+/// — because it also needs the raw observation — should pass that one reading to
+/// [`identity_state_with_observed`] rather than calling this and reading again,
+/// so a process that exits between the two reads cannot produce two verdicts
+/// derived from disagreeing observations.
 #[must_use]
 pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
+    identity_state_with_observed(id, process_start_ticks(id.pid))
+}
+
+/// [`identity_state`] against a start-time the caller has already observed.
+///
+/// `observed_start_ticks` is what [`process_start_ticks`] returned for `id.pid`:
+/// `None` both where the platform has no `/proc` and where that one PID's
+/// start-time could not be read. Liveness is still checked here, so an exit
+/// after the caller's reading still yields [`IdentityState::Gone`].
+#[must_use]
+pub fn identity_state_with_observed(
+    id: &ProcessIdentity,
+    observed_start_ticks: Option<u64>,
+) -> IdentityState {
     if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
         return IdentityState::Gone;
     }
-    match (id.start_ticks, process_start_ticks(id.pid)) {
+    match (id.start_ticks, observed_start_ticks) {
         (Some(expected), Some(actual)) => {
             if expected == actual {
                 IdentityState::Matches
@@ -524,6 +544,51 @@ mod tests {
         assert!(!hard.graceful());
         assert_eq!(identity_state(&id), IdentityState::Gone);
         reap(child);
+    }
+
+    /// The observation the caller passes must be the one classified, not a fresh
+    /// read of the same PID. A caller that needs the raw start-time *and* the
+    /// verdict reads once and passes it down precisely so the two cannot
+    /// disagree; an implementation that quietly re-read `/proc` would restore
+    /// that hazard while every existing test still passed. Here the live child's
+    /// real start-time matches its recorded identity, so a re-reading
+    /// implementation returns `Matches` — only one that honours the argument
+    /// returns `Recycled`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_state_with_observed_classifies_the_reading_it_was_given() {
+        let (child, _) = spawn_ready("echo ready; while true; do sleep 1; done");
+        let id = ProcessIdentity::capture(child.id());
+        let real_ticks = id.start_ticks.expect("linux records a start-time");
+
+        // Collect every verdict first, then kill and reap, and only then assert.
+        // The child holds the harness's stdout pipe open, so an assertion that
+        // panics ahead of the kill does not merely fail this test — it leaks a
+        // looping process and hangs the whole suite on the pipe. Ask the
+        // questions, clean up unconditionally, then judge.
+        let agreeing = identity_state_with_observed(&id, Some(real_ticks));
+        let disagreeing = identity_state_with_observed(&id, Some(real_ticks.wrapping_add(1)));
+        let unreadable = identity_state_with_observed(&id, None);
+
+        let hard = terminate_verified(&id, KillScope::Single, Duration::from_secs(5), true);
+        reap(child);
+
+        assert!(hard.stopped(), "the child must not outlive the test");
+        assert_eq!(
+            agreeing,
+            IdentityState::Matches,
+            "the reading that agrees with the record is a match"
+        );
+        assert_eq!(
+            disagreeing,
+            IdentityState::Recycled,
+            "a disagreeing reading must be classified, not discarded for a re-read"
+        );
+        assert_eq!(
+            unreadable,
+            IdentityState::Indeterminate,
+            "an unreadable start-time against a recorded one is unconfirmable"
+        );
     }
 
     /// A terminated child that has not been reaped yet is a zombie: it still has

@@ -47,7 +47,7 @@ pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_fa
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    identity_state_with_observed, process_start_ticks, terminate_verified,
 };
 use runtime::env_path_override;
 pub use runtime::{
