@@ -72,13 +72,15 @@ Feature: Interactive dashboard
 
   @id:dash-gen-tps-held-after-scrape-failure @requires-os:linux
   Scenario: dash-08 - Gen throughput stays visible for the validity window after a scrape failure
-    # EAI-7960 principal regression: after establishing a positive gen_tps
-    # baseline through the scripted mock, a single /metrics transport failure
-    # must NOT immediately clear the displayed "tok/s" value.  The contract
-    # requires the held value to remain visible for the validity window
-    # clamp(3 x instance_tick, 6 s, 30 s).  Current code has no such window
-    # (runner.rs clears gen_tps on the same tick as the failure), so the
-    # "generation throughput remains visible" step is the RED assertion.
+    # EAI-7960 principal contract: after a positive gen_tps baseline is
+    # established, a single /metrics transport failure must NOT clear the
+    # displayed "tok/s" value.  The daemon holds the last observation for
+    # clamp(3 x instance_tick, 6 s, 30 s) and only drops it on expiry.
+    #
+    # The boundary arithmetic itself is covered deterministically by the
+    # injected-time unit tests in rocm-dash-core's observation module.  What
+    # this scenario adds is the wiring those cannot reach: tracker -> daemon
+    # snapshot -> rendered screen.
     Given a managed model exposes scripted serving metrics
     When the user opens the dashboard
     And the user opens the Observe view
@@ -90,23 +92,21 @@ Feature: Interactive dashboard
 
   @id:dash-gen-tps-expiry-boundary @requires-os:linux
   Scenario: dash-09 - Gen throughput expires after the validity window following sustained failure
-    # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
+    # EAI-7960 expiry half of the contract: once the validity window lapses with
+    # no successful scrape, the held gen_tps must be dropped and the screen must
+    # fall back to the unavailable placeholder.
     #
-    # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,
-    # gen_tps must still be visible (Held).  With current code this FAILS (RED)
-    # because runner.rs clears gen_tps immediately.
-    #
-    # BOUNDARY 2 (expired assertion) — after the validity window elapses
-    # (clamp(3 × instance_tick, 6 s, 30 s) = 6 s for the production 2 s tick),
-    # gen_tps must be gone from the screen.  This step is unreachable today
-    # because BOUNDARY 1 fails first; it becomes GREEN once the fix is applied.
+    # The scenario still tells the whole story — throughput visible, then the
+    # endpoint fails, then the window lapses, then it is gone.  It deliberately
+    # does NOT re-assert that the value is held immediately after the failure:
+    # that is dash-08's contract, and asserting it here only duplicated dash-08
+    # while making this scenario race the same deadline (#379).
     Given a managed model exposes scripted serving metrics
     When the user opens the dashboard
     And the user opens the Observe view
     Then positive generation throughput is displayed for the managed model
     When the metrics endpoint fails transiently
-    Then generation throughput remains visible within the validity window
-    When the validity window has elapsed
+    And the validity window has elapsed
     Then generation throughput is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully

@@ -616,8 +616,43 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 
 // ── EAI-7960: scripted metrics / validity-window regression ────────────────
 
+/// Scrape cadence these scenarios run the daemon at, in seconds.
+///
+/// The held-value contract derives its window from the cadence:
+/// `observation_validity = clamp(3 × instance_tick, 6 s, 30 s)`. At the
+/// production 2 s cadence that clamps to the 6 s floor, which left barely 4 s
+/// between the failed scrape and the assertion — not enough under CI runner
+/// contention, which is what made these scenarios flaky (#379).
+///
+/// 10 s saturates the 30 s ceiling, so the held value stays visible for ~20 s
+/// after the failure instead of ~4 s. This is the ordinary
+/// `dashboard.daemon.instance_tick_secs` config field, not a test-only seam.
+const SCENARIO_INSTANCE_TICK_SECS: u64 = 10;
+
+/// Mirrors `rocm_dash_core::observation_validity`: `clamp(3 × tick, 6 s, 30 s)`.
+///
+/// Derived from [`SCENARIO_INSTANCE_TICK_SECS`] rather than written as a literal
+/// so retuning the cadence cannot silently leave this behind. `Ord::clamp` is
+/// not const, hence the explicit bounds.
+const fn validity_window_secs(tick_secs: u64) -> u64 {
+    let window = 3 * tick_secs;
+    if window < 6 {
+        6
+    } else if window > 30 {
+        30
+    } else {
+        window
+    }
+}
+
+const VALIDITY_WINDOW: Duration =
+    Duration::from_secs(validity_window_secs(SCENARIO_INSTANCE_TICK_SECS));
+
 /// Start the mock in Growing mode so the daemon builds a positive gen_tps
 /// baseline before the scenario injects the Failure transition.
+///
+/// Also pins the daemon's scrape cadence for this scenario — see
+/// [`SCENARIO_INSTANCE_TICK_SECS`] for why.
 #[given("a managed model exposes scripted serving metrics")]
 async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
     let model = "TestModel/E2E-1B";
@@ -626,7 +661,39 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
     world.model_name = Some(model.to_string());
     world.mock = Some(mock);
     world.register_mock_service_with(ServiceRecordOptions::default());
+    write_scenario_instance_tick(world);
 }
+
+/// Write the scenario's `config.json` so the embedded daemon scrapes at
+/// [`SCENARIO_INSTANCE_TICK_SECS`] rather than the 2 s default.
+///
+/// Every other key is omitted deliberately: the whole config tree defaults, so
+/// this pins the cadence without freezing any unrelated default into the
+/// scenario. Must run before the dashboard is opened — the daemon reads the
+/// config once at startup.
+fn write_scenario_instance_tick(world: &E2eWorld) {
+    let config_dir = world
+        .isolate_env()
+        .into_iter()
+        .find(|(key, _)| *key == "ROCM_CLI_CONFIG_DIR")
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .expect("isolate_env did not set ROCM_CLI_CONFIG_DIR");
+    std::fs::create_dir_all(&config_dir)
+        .unwrap_or_else(|e| panic!("creating {}: {e}", config_dir.display()));
+    let config = config_dir.join("config.json");
+    let body = format!(
+        "{{\"dashboard\":{{\"daemon\":{{\"instance_tick_secs\":{SCENARIO_INSTANCE_TICK_SECS}}}}}}}"
+    );
+    std::fs::write(&config, body).unwrap_or_else(|e| panic!("writing {}: {e}", config.display()));
+}
+
+/// Budget for the baseline to appear.
+///
+/// A counter-differenced rate needs two successful scrapes, so at the
+/// scenario's cadence the baseline cannot appear before ~2 × tick. The shared
+/// `default_timeout()` (30 s) would leave almost no headroom on a loaded
+/// runner, so this step gets its own, cadence-derived budget.
+const BASELINE_TIMEOUT: Duration = Duration::from_secs(6 * SCENARIO_INSTANCE_TICK_SECS);
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
 /// `gen_tps` is `Some(_)`. Wait for it to confirm a positive baseline was
@@ -634,7 +701,7 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
 #[then("positive generation throughput is displayed for the managed model")]
 async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("tok/s", default_timeout())
+        .wait_for_screen("tok/s", BASELINE_TIMEOUT)
         .await
         .unwrap_or_else(|e| {
             panic!("positive gen_tps (\"tok/s\") never appeared after Growing-mode scrapes: {e}")
@@ -651,8 +718,8 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     mock.set_metrics_mode(MetricsMode::Failure);
 
     // Poll until the daemon delivers at least one 503 to the mock endpoint.
-    // The production instance_tick is 2 s, so this converges in 2–3 s.
-    let budget = default_timeout();
+    // The next scrape is at most one cadence away, so allow several of them.
+    let budget = Duration::from_secs(3 * SCENARIO_INSTANCE_TICK_SECS);
     let deadline = Instant::now() + budget;
     loop {
         if mock.metrics_failure_count() >= 1 {
@@ -671,68 +738,76 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// EAI-7960 principal regression assertion (must be RED with current code).
+/// EAI-7960 principal contract: a single failed scrape must not clear the
+/// displayed throughput.
 ///
-/// Contract: the Observe tab must still show "tok/s" immediately after the
-/// first failed scrape — the held value must persist for the validity window
-/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
+/// The daemon holds the last observation for `clamp(3 × instance_tick, 6 s,
+/// 30 s)` (`runner.rs` keeps `gen_trackers` across scrape failures), so the
+/// Observe tab must still show "tok/s" right after the first failure. What this
+/// covers that the `rocm-dash-core` unit tests cannot is the wiring: tracker →
+/// daemon snapshot → rendered screen.
 ///
-/// **Current behaviour:** `runner.rs` lines 464-476 clear `gen_tps` on the
-/// very tick that the `/metrics` fetch fails — no holding logic exists. The
-/// TUI therefore renders "—" the moment the failure propagates, and this
-/// assertion **FAILS**, confirming EAI-7960 is reproduced at the PTY seam.
+/// The assertion reads the screen immediately, so the value's age here is at
+/// most one cadence — well inside the window the scenario configures.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
     assert!(
         screen.contains("tok/s"),
-        "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
-         after the first failed scrape instead of being held for the validity \
-         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\
-         Root cause: runner.rs clears gen_tps on the same tick as the failure; \
-         no held-value / validity-window logic exists yet.\n\
-         This assertion must FAIL (RED) until the fix is applied.\n\n\
+        "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared right after \
+         the first failed scrape instead of being held for the validity window \
+         ({VALIDITY_WINDOW:?} at this scenario's cadence).\n\
+         Expected the daemon to keep serving the held observation until it \
+         expires, and the TUI to keep rendering it.\n\n\
          Last screen:\n{screen}"
     );
 }
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
 
-/// Production validity window: clamp(3 × instance_tick, 6 s, 30 s).
-///
-/// With the daemon's 2 s `instance_tick` the lower bound clamp(6 s, 6 s) = 6 s
-/// is always reached. An additional buffer of two instance-ticks (4 s) ensures
-/// the runner has had enough cycles to propagate the expiry to the TUI.
-const VALIDITY_WINDOW: Duration = Duration::from_secs(6);
-const VALIDITY_WINDOW_BUFFER: Duration = Duration::from_secs(5); // 2 × instance_tick + render
+/// Headroom past the window for the daemon to notice the expiry and for the
+/// resulting snapshot to reach the TUI: a couple of cadences plus render time.
+const EXPIRY_GRACE: Duration = Duration::from_secs(2 * SCENARIO_INSTANCE_TICK_SECS + 5);
 
-/// Sleep for the full observation validity window so the caller can then assert
-/// that the held gen_tps has expired. Designed to follow
-/// "When the metrics endpoint fails transiently" — at that step's exit at least
-/// one 503 has been served, meaning the validity clock has started.
+/// Wait until the held gen_tps has expired off the screen.
+///
+/// Follows "When the metrics endpoint fails transiently", at whose exit at
+/// least one 503 has been served — so the validity clock is already running.
+///
+/// Polls rather than sleeping a fixed span: it returns as soon as the value
+/// actually clears (usually sooner than the worst case) and tolerates a loaded
+/// runner taking longer. Unlike the held assertion this direction cannot race —
+/// extra delay only makes the value more expired — so a generous budget is free.
 #[when("the validity window has elapsed")]
-async fn validity_window_elapsed(_world: &mut E2eWorld) {
-    // Sleep the full window + buffer so the daemon has had enough cycles
-    // after expiry to deliver the snapshot change to the TUI.
-    tokio::time::sleep(VALIDITY_WINDOW + VALIDITY_WINDOW_BUFFER).await;
+async fn validity_window_elapsed(world: &mut E2eWorld) {
+    let budget = VALIDITY_WINDOW + EXPIRY_GRACE;
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if !session(world).screen_text().contains("tok/s") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Fall through without asserting: the following Then step owns the
+    // assertion and renders the screen, so a failure reports there rather than
+    // producing two messages about the same thing.
 }
 
-/// Assert that gen_tps is no longer rendered on screen (BOUNDARY 2 of the
-/// EAI-7960 expiry contract). After the validity window the daemon must clear
-/// the held value and the TUI must show "—" in place of the "tok/s" unit.
-///
-/// With current code this step is unreachable because BOUNDARY 1 (the "remains
-/// visible" assertion) fails first. This step becomes GREEN once the hold/expiry
-/// logic is implemented.
+/// Assert that gen_tps is no longer rendered (the expiry half of the EAI-7960
+/// contract). Once the validity window lapses with no successful scrape, the
+/// daemon must drop the held value and the TUI must show the unavailable
+/// placeholder in place of the "tok/s" unit.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
     assert!(
         !screen.contains("tok/s"),
-        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
-         validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
+        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible more than \
+         {:?} after the last successful scrape, with a validity window of \
+         {VALIDITY_WINDOW:?}.\n\
          Expected the daemon to have cleared the held value and the TUI to \
          show the unavailable placeholder.\n\n\
-         Last screen:\n{screen}"
+         Last screen:\n{screen}",
+        VALIDITY_WINDOW + EXPIRY_GRACE
     );
 }
