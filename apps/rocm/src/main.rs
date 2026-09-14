@@ -309,10 +309,10 @@ rocm update --json")]
         #[arg(long)]
         apply: bool,
         /// Runtime key to update.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         runtime: Option<String>,
         /// Use the updated ROCm install as the default after installing it.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         activate: bool,
         /// Show what would happen without changing files.
         #[arg(long)]
@@ -6805,14 +6805,16 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             dry_run,
         } => {
             let plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
-            print_runtime_uninstall_plan(&plan);
+            print!("{}", render_runtime_uninstall_plan(&plan));
 
             if dry_run {
                 println!("dry run: no changes made");
                 return Ok(());
             }
 
-            if !yes {
+            let plan = if yes {
+                plan
+            } else {
                 if !interactive_terminal() {
                     bail!("runtimes uninstall requires --yes outside an interactive terminal");
                 }
@@ -6827,7 +6829,8 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                          `rocm runtimes uninstall {runtime}` to review the updated plan"
                     );
                 }
-            }
+                reconfirmed_plan
+            };
 
             let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
             println!("runtime removed");
@@ -7239,26 +7242,32 @@ impl RuntimeUninstallPlan {
     }
 }
 
-fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
-    println!("runtime uninstall plan");
-    println!("  runtime_id: {}", plan.manifest.runtime_id);
-    println!("  runtime_key: {}", plan.manifest.runtime_key);
-    println!("  registry_entry: {}", plan.registry_path.display());
+fn render_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "runtime uninstall plan");
+    let _ = writeln!(output, "  runtime_id: {}", plan.manifest.runtime_id);
+    let _ = writeln!(output, "  runtime_key: {}", plan.manifest.runtime_key);
+    let _ = writeln!(output, "  registry_entry: {}", plan.registry_path.display());
     if plan.will_remove_install_root() {
-        println!(
+        let _ = writeln!(
+            output,
             "  install_folder: {} (would be removed)",
             plan.manifest.install_root.display()
         );
     } else {
         match plan.install_root_decision {
             InstallRootDecision::Remove => {
-                println!("  install_folder: not present, nothing to remove");
+                let _ = writeln!(output, "  install_folder: not present, nothing to remove");
             }
             InstallRootDecision::ReadOnly => {
-                println!("  install_folder: left in place (ROCm CLI did not create this folder)");
+                let _ = writeln!(
+                    output,
+                    "  install_folder: left in place (ROCm CLI did not create this folder)"
+                );
             }
             InstallRootDecision::ManifestMismatch => {
-                println!(
+                let _ = writeln!(
+                    output,
                     "  install_folder: left in place (local runtime manifest did not match \
                      the registry)"
                 );
@@ -7266,8 +7275,9 @@ fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
         }
     }
     if plan.was_active {
-        println!("  default_runtime: would be cleared");
+        let _ = writeln!(output, "  default_runtime: would be cleared");
     }
+    output
 }
 
 fn plan_runtime_uninstall(
@@ -25215,6 +25225,10 @@ install therock";
             .expect("update --dry-run should preview without --apply");
         Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
             .expect("update --apply --dry-run should still parse");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
+            .expect("update --dry-run --runtime should preview without --apply");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
+            .expect("update --dry-run --activate should preview without --apply");
     }
 
     #[test]

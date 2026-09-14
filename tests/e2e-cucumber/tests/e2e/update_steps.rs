@@ -52,6 +52,30 @@ async fn no_runtimes_to_update(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews an update")]
+async fn preview_update(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because no managed runtimes are registered")]
+async fn refuses_no_managed_runtimes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("no managed runtimes are registered"),
+        "expected the real 'no managed runtimes are registered' bail (not a \
+         clap usage error), got:\n{combined}"
+    );
+}
+
 #[then("it reports each update feed's status, marking unpublished feeds as not configured")]
 async fn reports_feed_status(world: &mut E2eWorld) {
     let out = ok_output(world);

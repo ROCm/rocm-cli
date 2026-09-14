@@ -24,3 +24,14 @@ Feature: Update report
     Given a machine with no managed runtimes
     When the user checks for updates as machine-readable JSON with a 5 second timeout
     Then the machine-readable check reports no runtimes to update
+
+  # `--dry-run` used to `requires = "apply"` in clap, so `rocm update --dry-run`
+  # alone failed with a bare usage error instead of previewing. It no longer
+  # requires `--apply`, so this asserts the command reaches real business logic
+  # (the "no managed runtimes" bail, worded nothing like a clap usage error)
+  # rather than being rejected before `rocm` even looks at the registry.
+  @id:update-dry-run-reaches-preview-path-without-apply
+  Scenario: update-04 - Previewing an update with --dry-run does not require --apply
+    Given a machine with no managed runtimes
+    When the user previews an update
+    Then the CLI refuses because no managed runtimes are registered
