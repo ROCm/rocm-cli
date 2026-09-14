@@ -38,6 +38,25 @@ Feature: Runtime lifecycle state machine
     Then its registry entry is removed
     And its folder is left in place because the local manifest did not match
 
+  # `runtimes uninstall` deletes state, so a non-interactive caller (CI, a script,
+  # a piped shell) that forgets `--yes` must be refused loudly instead of the
+  # command silently deleting anything or silently no-op'ing.
+  @id:runtime-lifecycle-uninstall-without-yes-requires-confirmation
+  Scenario: runtime-lifecycle-03c - Uninstalling without --yes outside a terminal is refused and changes nothing
+    Given a registered read-only runtime
+    When the user uninstalls that runtime without confirming
+    Then the CLI refuses because confirmation is required
+    And its registry entry is left in place
+    And its install folder still exists on disk
+
+  @id:runtime-lifecycle-uninstall-dry-run-changes-nothing
+  Scenario: runtime-lifecycle-03d - Uninstalling with --dry-run previews the plan and changes nothing
+    Given a registered read-only runtime
+    When the user previews uninstalling that runtime
+    Then the CLI prints the uninstall plan without applying it
+    And its registry entry is left in place
+    And its install folder still exists on disk
+
   @id:runtime-lifecycle-import-rejects-duplicate-unless-replacing
   Scenario: runtime-lifecycle-04 - Importing a runtime, then rejecting a duplicate unless replacing
     Given a runtime manifest to import

@@ -293,12 +293,14 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         #[command(subcommand)]
         target: InstallTarget,
     },
-    /// Check for a newer ROCm package and optionally install it.
+    /// Check for a newer ROCm package and optionally install or preview it.
     ///
-    /// Without --apply, only reports whether an update is available. Pass --apply to
-    /// install it, and add --activate to make the new install the default afterward.
+    /// Without --apply or --dry-run, only reports whether an update is available. Pass
+    /// --dry-run to preview what --apply would do without changing files, --apply to
+    /// install it, and --activate to make the new install the default afterward.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
+rocm update --dry-run\n  \
 rocm update --apply --activate\n  \
 rocm update --apply --dry-run\n  \
 rocm update --json")]
@@ -1941,7 +1943,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
-            if apply {
+            if update_should_preview_or_apply(apply, dry_run) {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
                     &paths,
@@ -6818,6 +6820,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                     println!("runtime uninstall cancelled");
                     return Ok(());
                 }
+                let reconfirmed_plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
+                if !runtime_uninstall_plan_matches(&plan, &reconfirmed_plan) {
+                    bail!(
+                        "runtime state changed while waiting for confirmation; re-run \
+                         `rocm runtimes uninstall {runtime}` to review the updated plan"
+                    );
+                }
             }
 
             let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
@@ -7246,9 +7255,7 @@ fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
                 println!("  install_folder: not present, nothing to remove");
             }
             InstallRootDecision::ReadOnly => {
-                println!(
-                    "  install_folder: left in place (ROCm CLI did not create this folder)"
-                );
+                println!("  install_folder: left in place (ROCm CLI did not create this folder)");
             }
             InstallRootDecision::ManifestMismatch => {
                 println!(
@@ -7281,6 +7288,24 @@ fn plan_runtime_uninstall(
         was_active,
         install_root_decision,
     })
+}
+
+/// Whether `current` still describes the same removal as `original`.
+///
+/// Used to catch the window between an interactive confirmation prompt and
+/// applying the plan: the registry or the install folder can change while a
+/// human is staring at the prompt, and applying a stale plan would delete (or
+/// fail to delete) the wrong thing.
+fn runtime_uninstall_plan_matches(
+    original: &RuntimeUninstallPlan,
+    current: &RuntimeUninstallPlan,
+) -> bool {
+    original.manifest.runtime_key == current.manifest.runtime_key
+        && original.manifest.runtime_id == current.manifest.runtime_id
+        && original.manifest.install_root == current.manifest.install_root
+        && original.registry_path == current.registry_path
+        && original.was_active == current.was_active
+        && original.install_root_decision == current.install_root_decision
 }
 
 fn uninstall_runtime(
@@ -12083,13 +12108,17 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("runtimes")
-            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove")
                 && args.iter().any(|arg| arg == "--dry-run") =>
         {
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("runtimes")
-            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove") =>
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove") =>
         {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
@@ -16267,6 +16296,16 @@ fn append_update_surfaces(output: &mut String) {
         output,
         "  note: `rocm update --apply` applies runtime updates only; CLI, engine, and recipe update feeds require published metadata before they can mutate state"
     );
+}
+
+/// Whether `rocm update` should route into the runtime update path
+/// (`apply_runtime_update`) instead of the read-only status report.
+///
+/// `--dry-run` alone must take this path too, since `apply_runtime_update`
+/// only mutates anything when `dry_run` is false — a plain status report
+/// would silently ignore `--dry-run` and never show what `--apply` would do.
+const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
+    apply || dry_run
 }
 
 fn apply_runtime_update(
@@ -25176,6 +25215,21 @@ install therock";
             .expect("update --dry-run should preview without --apply");
         Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
             .expect("update --apply --dry-run should still parse");
+    }
+
+    #[test]
+    fn update_dry_run_routes_into_the_preview_path_without_apply() {
+        assert!(
+            !update_should_preview_or_apply(false, false),
+            "plain `rocm update` should stay on the read-only status report"
+        );
+        assert!(
+            update_should_preview_or_apply(false, true),
+            "`rocm update --dry-run` must route into apply_runtime_update, or --dry-run \
+             is silently ignored"
+        );
+        assert!(update_should_preview_or_apply(true, false));
+        assert!(update_should_preview_or_apply(true, true));
     }
 
     #[test]

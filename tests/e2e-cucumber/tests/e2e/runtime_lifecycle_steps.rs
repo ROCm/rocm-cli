@@ -178,6 +178,21 @@ async fn uninstall(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+// `run_rocm` never inherits a real terminal for stdin (`Command::output` closes
+// it), so this exercises the same non-interactive path a CI job or script hits.
+#[when("the user uninstalls that runtime without confirming")]
+async fn uninstall_without_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user previews uninstalling that runtime")]
+async fn uninstall_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--dry-run"]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user imports the runtime")]
 async fn import(world: &mut E2eWorld) {
     let path = world.model_name.clone().expect("no import manifest path");
@@ -302,6 +317,58 @@ async fn folder_left_manifest_mismatch(world: &mut E2eWorld) {
     assert!(
         Path::new(install_root).is_dir(),
         "runtime folder was removed: {install_root}"
+    );
+}
+
+#[then("the CLI refuses because confirmation is required")]
+async fn refuses_without_confirmation(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    assert!(
+        combined(world).contains("requires --yes outside an interactive terminal"),
+        "expected a --yes-required error, got:\n{}",
+        combined(world)
+    );
+}
+
+#[then("the CLI prints the uninstall plan without applying it")]
+async fn prints_plan_without_applying(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
+        "expected a dry-run plan preview, got:\n{out}"
+    );
+    assert!(
+        !out.contains("runtime removed"),
+        "dry-run must not apply the uninstall, got:\n{out}"
+    );
+}
+
+#[then("its registry entry is left in place")]
+async fn registry_left_in_place(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let entry = root
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{FIRST_KEY}.json"));
+    assert!(
+        entry.exists(),
+        "registry entry was unexpectedly removed: {}",
+        entry.display()
+    );
+}
+
+#[then("its install folder still exists on disk")]
+async fn install_folder_still_exists(world: &mut E2eWorld) {
+    let install_root = world
+        .model_name
+        .as_deref()
+        .expect("no install root recorded");
+    assert!(
+        Path::new(install_root).is_dir(),
+        "install folder was unexpectedly removed: {install_root}"
     );
 }
 

@@ -1279,9 +1279,8 @@ mod tests {
         assert_eq!(removed, vec!["old"]);
         assert!(plan.remove[0].size_bytes >= 2048);
         assert!(
-            plan.skipped.iter().any(|line| line.starts_with(
-                "unowned: local runtime manifest did not match the registry"
-            )),
+            plan.skipped.iter().any(|line| line
+                .starts_with("unowned: local runtime manifest did not match the registry")),
             "unowned install must be reported as left alone: {:?}",
             plan.skipped
         );
@@ -1323,9 +1322,8 @@ mod tests {
             plan.skipped
         );
         assert!(
-            plan.skipped.iter().any(|line| line.starts_with(
-                "unowned: local runtime manifest did not match the registry"
-            )),
+            plan.skipped.iter().any(|line| line
+                .starts_with("unowned: local runtime manifest did not match the registry")),
             "manifest-mismatched install must be reported with its own reason, distinct \
              from the read-only case: {:?}",
             plan.skipped
