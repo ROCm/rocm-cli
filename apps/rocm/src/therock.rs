@@ -3773,7 +3773,7 @@ fn emit_progress_line(message: &str) {
 #[cfg(test)]
 thread_local! {
     static PROGRESS_LINE_SINK: std::cell::RefCell<Vec<String>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]

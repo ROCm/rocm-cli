@@ -37,8 +37,7 @@ async fn check_updates_json(world: &mut E2eWorld) {
 
 #[when("the user checks for updates as machine-readable JSON with a 5 second timeout")]
 async fn check_updates_json_with_timeout(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) =
-        crate::run_rocm(world, &["update", "--json", "--timeout-secs", "5"]);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--json", "--timeout-secs", "5"]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
