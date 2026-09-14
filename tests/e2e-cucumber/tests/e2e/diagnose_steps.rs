@@ -7,14 +7,15 @@ use cucumber::{given, then, when};
 use crate::E2eWorld;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
-/// A symptom string that scores a catalog match on both Linux and Windows. It
-/// keys off `check_1_arch_not_in_wheel` (a `LINUX_AND_WINDOWS` checker), which
-/// scores 50 on the `HSA_STATUS_ERROR_INVALID_ISA` keyword regardless of host
-/// state — the covered-arch penalty only applies when a framework arch list is
-/// present, so with none installed the match always renders. (The earlier
-/// "/dev/kfd" symptom keyed only off the Linux-only render-group checker and so
-/// produced no match on Windows.) The specific fix-id is environment-dependent,
-/// so scenarios assert the shape of a match, not the id.
+/// A symptom string that scores a catalog match on every platform these
+/// scenarios run on. It keys off `check_1_arch_not_in_wheel`, registered for
+/// `["linux", "windows", "wsl"]` (`crates/rocm-core/src/diagnose.rs:1964`),
+/// which scores 50 on the `HSA_STATUS_ERROR_INVALID_ISA` keyword regardless of
+/// host state — the covered-arch penalty only applies when a framework arch
+/// list is present, so with none installed the match always renders. (The
+/// earlier "/dev/kfd" symptom keyed only off the Linux-only render-group
+/// checker and so produced no match on Windows.) The specific fix-id is
+/// environment-dependent, so scenarios assert the shape of a match, not the id.
 const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 
 /// The error text a vLLM engine-startup import failure leaves behind, as a user
