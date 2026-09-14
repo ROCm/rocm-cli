@@ -1921,7 +1921,12 @@ fn install_tarball_runtime(
     });
     drop(spinner);
     download_result?;
-    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
+
+    let extract_spinner =
+        crate::cli_progress::AnimatedSpinner::start(format!("Extracting {}…", artifact.file_name));
+    let extract_result = extract_tarball_and_discard_archive(&cache_path, &install_root);
+    drop(extract_spinner);
+    extract_result?;
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
