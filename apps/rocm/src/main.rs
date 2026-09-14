@@ -15670,8 +15670,7 @@ fn stop_background_helper_before_uninstall(
     // so a PID that flickered could clear one check and fail the other.
     let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
     let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
-    let platform_reads_start_ticks =
-        rocm_core::process_start_ticks(std::process::id()).is_some();
+    let platform_reads_start_ticks = rocm_core::process_start_ticks(std::process::id()).is_some();
     let unverifiable_pre_upgrade_record =
         state.daemon_start_ticks.is_none() && platform_reads_start_ticks;
     match rocm_core::identity_state_with_observed(&identity, observed_start_ticks) {
@@ -31802,7 +31801,9 @@ ID_LIKE="suse opensuse"
             .iter()
             .find(|failure| failure.service_id == "svc-guarded-engine")
             .unwrap_or_else(|| {
-                panic!("an authenticated survivor must fail the gate, not be waved through: {report:?}")
+                panic!(
+                    "an authenticated survivor must fail the gate, not be waved through: {report:?}"
+                )
             });
         assert_eq!(
             failure.remedy,
