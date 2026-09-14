@@ -72,15 +72,15 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
 
-  @id:dash-gen-tps-held-after-scrape-failure @requires-os:linux
+  @id:dash-gen-tps-held-after-scrape-failure @requires-os:linux @serial
   Scenario: dash-08 - Gen throughput stays visible for the validity window after a scrape failure
-    # EAI-7960 principal regression: after establishing a positive gen_tps
-    # baseline through the scripted mock, a single /metrics transport failure
-    # must NOT immediately clear the displayed "tok/s" value.  The contract
-    # requires the held value to remain visible for the validity window
-    # clamp(3 x instance_tick, 6 s, 30 s).  Current code has no such window
-    # (runner.rs clears gen_tps on the same tick as the failure), so the
-    # "generation throughput remains visible" step is the RED assertion.
+    # EAI-7960: after establishing a positive gen_tps baseline through the
+    # scripted mock, a single /metrics transport failure must NOT immediately
+    # clear the displayed "tok/s" value — the held value must remain visible
+    # for the validity window clamp(3 x instance_tick, 6 s, 30 s) (6 s for the
+    # production 2 s tick). @serial keeps this scenario off the no-GPU job's
+    # 64-way concurrent lane so CPU contention from other scenarios can't eat
+    # into its tight wall-clock budget and cause a spurious expiry.
     Given a managed model exposes scripted serving metrics
     When the user opens the dashboard
     And the user opens the Observe view
@@ -90,18 +90,21 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  @id:dash-gen-tps-expiry-boundary @requires-os:linux
+  @id:dash-gen-tps-expiry-boundary @requires-os:linux @serial
   Scenario: dash-09 - Gen throughput expires after the validity window following sustained failure
     # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
     #
     # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,
-    # gen_tps must still be visible (Held).  With current code this FAILS (RED)
-    # because runner.rs clears gen_tps immediately.
+    # gen_tps must still be visible (Held).
     #
     # BOUNDARY 2 (expired assertion) — after the validity window elapses
     # (clamp(3 × instance_tick, 6 s, 30 s) = 6 s for the production 2 s tick),
-    # gen_tps must be gone from the screen.  This step is unreachable today
-    # because BOUNDARY 1 fails first; it becomes GREEN once the fix is applied.
+    # gen_tps must be gone from the screen.
+    #
+    # @serial keeps this scenario off the no-GPU job's 64-way concurrent lane:
+    # its two boundaries are pinned to real wall-clock timing, and CPU
+    # contention from ~62 other concurrently-running scenarios can delay it
+    # past the 6 s window even though nothing is functionally broken.
     Given a managed model exposes scripted serving metrics
     When the user opens the dashboard
     And the user opens the Observe view

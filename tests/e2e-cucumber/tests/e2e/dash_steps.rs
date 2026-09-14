@@ -741,16 +741,13 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// EAI-7960 principal regression assertion (must be RED with current code).
+/// EAI-7960 principal regression assertion.
 ///
 /// Contract: the Observe tab must still show "tok/s" immediately after the
 /// first failed scrape — the held value must persist for the validity window
-/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing.
-///
-/// **Current behaviour:** `runner.rs` lines 464-476 clear `gen_tps` on the
-/// very tick that the `/metrics` fetch fails — no holding logic exists. The
-/// TUI therefore renders "—" the moment the failure propagates, and this
-/// assertion **FAILS**, confirming EAI-7960 is reproduced at the PTY seam.
+/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing. Tagged `@serial` in
+/// `dash.feature` so CPU contention from the no-GPU job's other ~62
+/// concurrently-running scenarios can't delay this step past the window.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
@@ -758,10 +755,7 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
         screen.contains("tok/s"),
         "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
          after the first failed scrape instead of being held for the validity \
-         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\
-         Root cause: runner.rs clears gen_tps on the same tick as the failure; \
-         no held-value / validity-window logic exists yet.\n\
-         This assertion must FAIL (RED) until the fix is applied.\n\n\
+         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\n\
          Last screen:\n{screen}"
     );
 }
@@ -790,10 +784,6 @@ async fn validity_window_elapsed(_world: &mut E2eWorld) {
 /// Assert that gen_tps is no longer rendered on screen (BOUNDARY 2 of the
 /// EAI-7960 expiry contract). After the validity window the daemon must clear
 /// the held value and the TUI must show "—" in place of the "tok/s" unit.
-///
-/// With current code this step is unreachable because BOUNDARY 1 (the "remains
-/// visible" assertion) fails first. This step becomes GREEN once the hold/expiry
-/// logic is implemented.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
