@@ -9488,10 +9488,10 @@ fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
 
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
-    fs::create_dir_all(
-        path.parent()
-            .context("active runtime marker path has no parent directory")?,
-    )?;
+    // No `create_dir_all` here: `write_file_atomically` creates the parent
+    // itself, and it has to — it stages a scratch sibling in that directory
+    // before publishing.
+    //
     // The shared helper, not a local delete-then-rename. Removing the target
     // first opens a window in which the marker simply does not exist — a reader
     // in it concludes no runtime is active — and the old scratch name carried
@@ -32045,40 +32045,62 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The platform conjunct in `record_predates_start_ticks`, pinned on the one
+    /// lane where it is falsifiable.
+    ///
+    /// On Linux `process_start_ticks` always answers for a live process, so the
+    /// conjunct is unconditionally true there and *no* Linux assertion can
+    /// distinguish the predicate from a bare `is_none()`. Deleting it leaves
+    /// every Linux test green — which is exactly what happened to this test's
+    /// previous version. Off Linux the same call is a compile-time stub that
+    /// always answers `None`, so the conjunct decides the result, and this
+    /// assertion fails the moment it is dropped. It is the only assertion
+    /// anywhere that does.
+    ///
+    /// The behaviour it protects: with no start-time readable on this platform,
+    /// a record carrying none is NOT evidence of a pre-upgrade record — it is
+    /// just what every record looks like here. Treating it as pre-upgrade would
+    /// abort every uninstall that finds a live daemon on Windows and macOS.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn without_readable_start_times_a_bare_record_is_not_a_legacy_record() {
+        assert!(
+            !record_predates_start_ticks(None),
+            "where no start-time can be read, an absent one says nothing about the record's age"
+        );
+        assert!(
+            !record_predates_start_ticks(Some(1)),
+            "a record that carries a start-time is never a pre-upgrade record"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_legacy_record_is_recognised_even_when_the_recorded_pid_cannot_be_read() {
-        // The branch whose failure mode is "force-kill an unverified process
-        // tree", pinned at the decision instead of at its premise. The previous
-        // version of this test asserted only that this process can read its own
-        // start-time — true of stock Linux, untouched by this PR, and green
-        // against a full revert. It certified nothing while reading as coverage.
+    fn a_record_without_a_start_time_is_a_legacy_record_where_start_times_are_readable() {
+        // The Linux half of the predicate's contract, and no more than that.
         //
-        // `record_predates_start_ticks` has to answer "can this platform report
-        // a start-time?" independently of the PID under inspection. Reading the
-        // target instead cannot tell "no `/proc` on this OS" from "that read
-        // just failed", and a legacy record hitting the second case would look
-        // like Windows, take the best-effort `Matches` arm, and be killed.
+        // What actually prevents the conflation this predicate exists for —
+        // answering "can this platform report a start-time?" by reading the PID
+        // under inspection, which cannot tell "no `/proc` on this OS" from "that
+        // read just failed" — is the signature: `record_predates_start_ticks`
+        // takes no PID, so passing one is a compile error. It is prevented by
+        // construction, not caught by an assertion, and no assertion here should
+        // claim otherwise.
         //
-        // A reaped PID is the one reading that is genuinely unreadable on Linux
-        // while the platform plainly can report start-times, so it stages that
-        // conflation directly. The premise is asserted rather than assumed: if
-        // the number were recycled before we looked, this would be checking
-        // nothing, and it says so loudly instead of passing quietly.
-        let mut reaped = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn a process to reap");
-        let reaped_pid = reaped.id();
-        reaped.wait().expect("reap it");
-        assert!(
-            rocm_core::process_start_ticks(reaped_pid).is_none(),
-            "a reaped pid must be unreadable for this test to stage anything"
-        );
-
+        // The platform conjunct itself is unfalsifiable on this lane: on Linux
+        // `process_start_ticks` always answers for a live process, so the
+        // conjunct is constantly true and this test cannot tell the predicate
+        // from a bare `is_none()`. `without_readable_start_times_a_bare_record_\
+        // is_not_a_legacy_record` is what pins it, and only the non-Linux lanes
+        // run that.
+        //
+        // The guard's end-to-end behaviour is pinned separately, by
+        // `uninstall_never_kills_a_daemon_pid_from_a_state_file_that_predates_\
+        // start_ticks`, which stages a live unrelated process against a legacy
+        // record and fails if the guard is removed.
         assert!(
             record_predates_start_ticks(None),
-            "a record with no start-time is a legacy record on a platform that can read them, \
-             whatever an unreadable target pid would have answered"
+            "where start-times are readable, a record carrying none predates the field"
         );
         assert!(
             !record_predates_start_ticks(Some(1)),
