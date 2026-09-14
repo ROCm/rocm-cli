@@ -6795,6 +6795,19 @@ mod tests {
             return Ok(());
         }
 
+        // Root can unlink a file regardless of its parent directory's write
+        // permission bit, so the `chmod 0o555` below would not actually block
+        // the removal and `cleanup_warning` would come back `None`, failing
+        // the `.expect(...)` below on a mismatched assumption rather than the
+        // behavior under test.
+        #[allow(unsafe_code)] // libc FFI
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipping: test requires a non-root user to enforce permissions");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
         let target = root.join("install");
         fs::create_dir_all(&target)?;
 

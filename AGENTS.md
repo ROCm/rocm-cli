@@ -151,6 +151,10 @@ Current workspace members:
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
 - engine crates: `engines/lemonade`, `engines/vllm`
 
+Shared UI components: reuse `apps/rocm/src/cli_progress.rs`'s `AnimatedSpinner`
+for long-running CLI progress and `crates/rocm-dash-tui/src/ui/approval.rs` for
+approval-state prompts, rather than hand-rolling new ones.
+
 Guardrails:
 
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
@@ -161,7 +165,6 @@ Guardrails:
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
   - add a comment documenting why the test is skipped (e.g., `#[cfg_attr(not(target_os = "linux"), ignore)]`)
-- reuse the shared UI components — `apps/rocm/src/cli_progress.rs`'s `Spinner` for long-running CLI progress, `crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts — rather than hand-rolling new ones
 
 ## 7) Local Assistant And Tool-Use Policy Consistency
 
