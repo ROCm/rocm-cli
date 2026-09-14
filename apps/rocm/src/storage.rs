@@ -621,8 +621,8 @@ pub(crate) fn build_prune_plan(
         // It refuses read-only and imported records and requires a matching
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(decision) if decision.should_remove() => {}
+            Ok(_) => {
                 plan.skipped.push(format!(
                     "{runtime_key}: ROCm CLI did not create this folder, so it is left in place"
                 ));
