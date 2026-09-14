@@ -151,6 +151,14 @@ Current workspace members:
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
 - engine crates: `engines/lemonade`, `engines/vllm`
 
+Shared UI components — reuse rather than hand-rolling new ones:
+`apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that
+only advances when the caller's own loop ticks it (e.g. `serve`'s
+HTTP-polling wait loop); that same file's `AnimatedSpinner` for progress that
+must keep animating between caller updates, which can go quiet for long
+stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
+`crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts.
+
 Guardrails:
 
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes

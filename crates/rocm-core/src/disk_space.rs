@@ -241,10 +241,17 @@ pub fn available_space_for_path(path: &Path) -> Option<u64> {
     mount_for_path(path).map(|(_, available)| available)
 }
 
-/// Whether two paths live on the same filesystem.
+/// Whether two paths live under the same mount point.
 ///
-/// `None` when either path's filesystem cannot be determined.
-pub fn on_same_filesystem(left: &Path, right: &Path) -> Option<bool> {
+/// Named for the mount deliberately: two paths can share a filesystem and still
+/// sit on different mounts (a bind mount or a `subPath` volume is enough), and
+/// the mount is what the kernel enforces — `link(2)` returns `EXDEV` across two
+/// mounts of one filesystem. Callers reasoning about hardlinks want this. A
+/// caller reasoning about shared free space does not: those two mounts draw on
+/// one pool, and this returns `false` for them.
+///
+/// `None` when either path's mount cannot be determined.
+pub fn on_same_mount(left: &Path, right: &Path) -> Option<bool> {
     let left_mount = mount_for_path(left)?.0;
     let right_mount = mount_for_path(right)?.0;
     Some(left_mount == right_mount)

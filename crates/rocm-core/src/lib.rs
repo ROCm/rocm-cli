@@ -42,7 +42,7 @@ pub use diagnose::{
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
-    mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
+    mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 use examine::extract_rocm_version;
 pub use examine::{
