@@ -143,6 +143,17 @@ Understand existing patterns first:
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
+**Behavior claims are restated redundantly and drift independently.** The same
+claim about CLI/TUI behavior (e.g. "does X automatically") often appears in
+`README.md`, `--help`/doc comments on Clap commands, strings the CLI prints at
+runtime, and `docs/*.md` — and each copy can go stale on its own. When fixing
+or verifying such a claim, grep for its wording across all of these surfaces,
+not just the one under review, and confirm each copy against the actual code
+path rather than trusting that an existing doc or test already got it right.
+A unit test asserting exact string content only proves the string is
+unchanged, not that the claim it makes is true — a stale claim can stay
+"pinned" as passing indefinitely.
+
 ## 6) rocm-cli Architecture Guardrails
 
 Current workspace members:
