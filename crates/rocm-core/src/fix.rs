@@ -83,9 +83,6 @@ const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
 const WSL_ONLY: &[&str] = &["wsl"];
-/// Both Linux families. For a problem that is neither about the `amdgpu` module
-/// nor about the Windows host driver, and so is real on either.
-const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 
 /// The recipe registry. Mirrors the diagnosis catalog; only the four small,
 /// safe fixes carry a `runner` and are auto-applicable.
