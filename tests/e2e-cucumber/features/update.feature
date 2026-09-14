@@ -17,4 +17,4 @@ Feature: Update report
   Scenario: update-02 - The machine-readable update check reports an empty runtimes array
     Given a machine with no managed runtimes
     When the user checks for updates as machine-readable JSON
-    Then stdout is a single line of JSON with an empty runtimes array
+    Then the machine-readable check reports no runtimes to update

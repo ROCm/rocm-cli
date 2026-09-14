@@ -72,7 +72,13 @@ async fn reports_feed_status(world: &mut E2eWorld) {
     }
 }
 
-#[then("stdout is a single line of JSON with an empty runtimes array")]
+// Covers the JSON envelope shape only (single line, `runtimes: []`).
+// Suppressing wheel-resolution progress output ahead of the JSON contract is
+// a separate concern with no managed runtimes here to trigger it — that's
+// covered by `render_update_json_installs_the_suppression_guard_around_resolution`
+// in `apps/rocm/src/therock.rs`, which exercises a real progress_line call
+// reachable during resolution.
+#[then("the machine-readable check reports no runtimes to update")]
 async fn json_reports_empty_runtimes(world: &mut E2eWorld) {
     let out = ok_output(world);
     let mut lines = out.lines();
