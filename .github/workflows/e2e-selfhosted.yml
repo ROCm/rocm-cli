@@ -272,13 +272,21 @@ jobs:
           # having a quota of its own. What keeps it from starving them — and from
           # starving `.runner`, whose credentials live on the same volume and need a
           # repo-Administration token to re-register — is the runner pod's
-          # `uv-cache-gc` initContainer, which sweeps abandoned `.tmp*` extractions
-          # and drops `archive-v0` below a 60GiB floor on the way up.
+          # `uv-cache-gc` initContainer. On the way up it sweeps abandoned `.tmp*`
+          # extractions, then deletes `archive-v0` outright if FREE space on the
+          # volume is under 60GiB. It is a free-space floor, not a size cap: the
+          # floor covers two full ~25GB fills, because a ROCm generation transition
+          # installs the new runtime beside the old one and both are resident until
+          # the next pod start. The work volume is ~295G, so the floor has room to
+          # mean something.
           #
           # That GC bounds ONE directory: the `uv-cache` subPath of the work PVC,
           # which surfaces in this container as <runner-root>/uv-cache. Pointing the
           # cache anywhere else on the volume keeps the hardlinks but escapes the
-          # floor, which is how the MI300X lane previously stranded at 49G/49G.
+          # floor. The 49G/49G strand that motivated all of this was a *different*
+          # volume — the dedicated 50Gi cache PVC, since deleted — where no floor
+          # existed at all; escaping this one puts the same failure back on a volume
+          # that also holds the runner credentials.
           # $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so derive the root.
           runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
           export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"

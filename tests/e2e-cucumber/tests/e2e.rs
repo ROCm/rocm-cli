@@ -155,8 +155,8 @@ fn shared_cache_dir() -> Option<PathBuf> {
 /// own env var (not derived from `E2E_SHARED_CACHE_DIR`) because it has a
 /// placement constraint the weights cache does not: uv can only hardlink out of
 /// it into a managed environment when the two are reachable without crossing a
-/// mount point, so CI must put it on the same volume as the runtimes it
-/// populates. Unset locally → no sharing.
+/// mount point, so CI must put it under the same mount as the runtimes it
+/// populates — the same volume is not enough. Unset locally → no sharing.
 fn shared_uv_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
@@ -275,8 +275,8 @@ impl E2eWorld {
         }
         // Share uv's content-addressed download/build cache (the wheels `rocm
         // install sdk` fetches) so only the first scenario pays the cold download.
-        // Independent of the weights cache above because it has to sit on the
-        // same volume as the runtimes it populates or uv copies instead of
+        // Independent of the weights cache above because it has to sit under the
+        // same mount as the runtimes it populates or uv copies instead of
         // hardlinking; the runtimes registry the suite asserts on stays isolated.
         if let Some(uv_cache) = shared_uv_cache_dir() {
             env.push(("UV_CACHE_DIR", uv_cache.into_os_string()));

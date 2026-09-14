@@ -674,11 +674,10 @@ environments `uv` populates without crossing a mount point and packages can be
 hardlinked into them instead of copied. Note it is the mount, not the
 filesystem: a bind mount or `subPath` volume is enough to make Linux refuse the
 hardlink, and `uv` then silently copies. This cache holds every wheel `uv`
-downloads — the ROCm SDK and the
-torch stack included — so it is typically the largest directory rocm-cli
-manages, on the order of several GB per SDK version installed. It is removed by
-`rocm uninstall` unless `--keep-data` is passed, and its location can be
-overridden with `ROCM_CLI_UV_CACHE_DIR`.
+downloads — the ROCm SDK and the torch stack included — so it is typically the
+largest directory rocm-cli manages, on the order of several GB per SDK version
+installed. It is removed by `rocm uninstall` unless `--keep-data` is passed, and
+its location can be overridden with `ROCM_CLI_UV_CACHE_DIR`.
 
 ### Lemonade Embeddable Runtime
 

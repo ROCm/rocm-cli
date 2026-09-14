@@ -3541,10 +3541,12 @@ fn preflight_tarball_space(
         disk_space::with_margin(download_bytes),
     )?;
 
-    // When the cache and the install root share a filesystem, the archive and
-    // the extracted tree must both fit at the same time.
+    // When the cache and the install root share a mount, the archive and the
+    // extracted tree must both fit at the same time. Conservative in the other
+    // direction: two mounts backed by one filesystem also share a pool, and this
+    // treats them as separate, so the estimate can come in under the true need.
     let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
-    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+    if disk_space::on_same_mount(cache_path, install_root) == Some(true) {
         extract_estimate = extract_estimate.saturating_add(download_bytes);
     }
     Ok(disk_space::warn_if_low_space(
