@@ -1463,7 +1463,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup will show"
+        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -25437,7 +25437,7 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
-        assert!(rendered.contains("status: first-time setup will show"));
+        assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
