@@ -227,6 +227,15 @@ async fn open_command_palette(world: &mut E2eWorld) {
 #[when("the user opens the theme picker")]
 async fn open_theme_picker(world: &mut E2eWorld) {
     let tui = session(world);
+    // `t` toggles `Modal::ThemePicker` open/closed, so it is NOT safe to resend
+    // via `send_until` (its own doc comment restricts that to idempotent
+    // keys) — a resend after the picker is already open would immediately
+    // close it. Nothing before this step proves the event loop is reading
+    // input yet, so wait for the Home tab's readiness marker before the
+    // (non-retryable) `t`, same rationale as `open_instance_detail`.
+    tui.wait_for_screen("Updates", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("dashboard home view did not become ready: {e}"));
     tui.send("t")
         .unwrap_or_else(|e| panic!("failed to open the theme picker: {e}"));
     tui.wait_for_screen(

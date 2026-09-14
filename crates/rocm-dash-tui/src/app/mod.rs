@@ -3559,7 +3559,7 @@ pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction 
         MouseEventKind::ScrollUp => -1,
         _ => return KeyAction::Nothing,
     };
-    if *modal == Modal::Detail {
+    if matches!(*modal, Modal::Detail | Modal::Help | Modal::GlobalHelp) {
         KeyAction::ScrollModal(delta)
     } else if *modal == Modal::ThemePicker || (*modal == Modal::None && tab == ActiveTab::Observe) {
         KeyAction::Move(delta as isize)
@@ -4646,6 +4646,16 @@ mod tests {
         // Detail modal → ScrollModal by one line
         assert_eq!(
             handle_mouse(scroll_down, &Modal::Detail, ActiveTab::Observe),
+            KeyAction::ScrollModal(1)
+        );
+        // Help / GlobalHelp modals render a scrollbar and support keyboard
+        // scrolling identically to Detail — the wheel must reach them too.
+        assert_eq!(
+            handle_mouse(scroll_down, &Modal::Help, ActiveTab::Home),
+            KeyAction::ScrollModal(1)
+        );
+        assert_eq!(
+            handle_mouse(scroll_down, &Modal::GlobalHelp, ActiveTab::Home),
             KeyAction::ScrollModal(1)
         );
         // ThemePicker → Move (drives picker cursor)
