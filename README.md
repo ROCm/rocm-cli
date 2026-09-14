@@ -255,7 +255,7 @@ rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
-                    [--json] [--timeout-secs SECS]
+                    [--json] [--timeout-secs SECS] [--yes]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
@@ -263,7 +263,9 @@ by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
 native package). `update` checks for a newer ROCm package; pass `--apply` to
 install it. `--json` prints the check result as a single line of JSON instead
 of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
-`--json`; both conflict with `--apply`).
+`--json`; both conflict with `--apply`). `update --apply` never prompts;
+`--yes` is accepted for consistency with other mutating commands but has no
+effect on it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
@@ -458,13 +460,17 @@ use the provider's default.
 Install and manage ComfyUI for image generation (alias: `rocm comfy`):
 
 ```
-rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run]
-rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser]
-rocm comfyui stop
+rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run] [--yes]
+rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser] [--yes]
+rocm comfyui stop       [--yes]
 rocm comfyui status
 rocm comfyui logs       [--lines N]
 rocm comfyui models-path
 ```
+
+None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
+accepted on each for consistency with other mutating commands but currently
+has no effect.
 
 ### Automations
 

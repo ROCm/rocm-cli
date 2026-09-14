@@ -7498,6 +7498,19 @@ fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
             path.display()
         );
     }
+    // Belt and braces: a hand-edited or corrupted registry entry could point
+    // `install_root` at a protected system location while still carrying a
+    // matching in-tree `.rocm-cli-runtime.json`, slipping past
+    // `local_runtime_manifest_matches`. `prune` already refuses these before
+    // ever calling this function (see storage.rs); check it here too so the
+    // single source of truth for "may ROCm CLI delete this folder?" refuses
+    // it for every caller, including a direct `runtimes uninstall <key>`.
+    if runtime_install_root_is_protected(path) {
+        bail!(
+            "refusing to remove runtime folder {} in a protected system location",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -28451,6 +28464,28 @@ ID_LIKE="suse opensuse"
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn ensure_runtime_install_root_rejects_protected_system_path() {
+        // `prune` (storage.rs) refuses a runtime whose folder sits in a
+        // protected system location before it ever calls
+        // `should_remove_runtime_install_root`. A hand-edited or corrupted
+        // registry entry could point a direct `runtimes uninstall <key>`
+        // manifest's `install_root` at the same kind of path while still
+        // carrying a matching in-tree `.rocm-cli-runtime.json`, slipping past
+        // `local_runtime_manifest_matches`. The single source of truth for
+        // "may ROCm CLI delete this folder?" must refuse it too, regardless
+        // of caller.
+        let protected = if cfg!(windows) {
+            PathBuf::from("C:/Windows/rocm-cli-test-runtime")
+        } else {
+            PathBuf::from("/etc/rocm-cli-test-runtime")
+        };
+
+        let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
+            .expect_err("protected system path must be refused");
+        assert!(err.to_string().contains("protected system location"));
     }
 
     #[test]
