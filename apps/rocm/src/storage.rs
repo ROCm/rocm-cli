@@ -27,7 +27,7 @@ use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_r
 use serde::Serialize;
 
 use crate::{
-    ActiveRuntimeMarker, StorageCommand, UninstallPlan, UninstallPlanEntry,
+    ActiveRuntimeMarker, InstallRootDecision, StorageCommand, UninstallPlan, UninstallPlanEntry,
     active_runtime_marker_path, confirm_uninstall, format_bytes, remove_path,
     should_remove_runtime_install_root, therock,
 };
@@ -622,12 +622,19 @@ pub(crate) fn build_prune_plan(
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
             Ok(decision) if decision.should_remove() => {}
-            Ok(_) => {
+            Ok(InstallRootDecision::ReadOnly) => {
                 plan.skipped.push(format!(
                     "{runtime_key}: ROCm CLI did not create this folder, so it is left in place"
                 ));
                 continue;
             }
+            Ok(InstallRootDecision::ManifestMismatch) => {
+                plan.skipped.push(format!(
+                    "{runtime_key}: local runtime manifest did not match the registry, so it is left in place"
+                ));
+                continue;
+            }
+            Ok(InstallRootDecision::Remove) => unreachable!("handled by the guard above"),
             Err(error) => {
                 plan.skipped
                     .push(format!("{runtime_key}: cannot be removed safely ({error})"));
@@ -1272,9 +1279,9 @@ mod tests {
         assert_eq!(removed, vec!["old"]);
         assert!(plan.remove[0].size_bytes >= 2048);
         assert!(
-            plan.skipped
-                .iter()
-                .any(|line| line.starts_with("unowned: ROCm CLI did not create this folder")),
+            plan.skipped.iter().any(|line| line.starts_with(
+                "unowned: local runtime manifest did not match the registry"
+            )),
             "unowned install must be reported as left alone: {:?}",
             plan.skipped
         );
@@ -1288,6 +1295,41 @@ mod tests {
         assert!(rendered.contains("1 install(s) would be removed"));
         assert!(rendered.contains("Left alone:"));
         assert!(rendered.contains("Nothing was changed."));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_plan_reports_read_only_and_manifest_mismatch_with_distinct_messages() -> Result<()> {
+        let (root, paths) = test_paths("prune-plan-read-only");
+        install_fixture(&paths, manifest("old", "gfx110X-all", "7.10.0", 10), 2048)?;
+        let mut external = manifest("external", "gfx110X-all", "7.9.0", 5);
+        external.read_only = true;
+        install_fixture(&paths, external, 512)?;
+        let unowned = install_fixture(&paths, manifest("unowned", "gfx110X-all", "7.8.0", 1), 256)?;
+        std::fs::remove_file(unowned.install_root.join(".rocm-cli-runtime.json"))?;
+
+        let plan = build_prune_plan(&paths, &RocmCliConfig::default(), 1)?;
+
+        // Retention selection already refuses read-only/imported installs before
+        // `should_remove_runtime_install_root` is ever consulted, so a read-only
+        // install is reported via `HoldReason::NotOwned`, not the ReadOnly arm.
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|line| line.starts_with("external: added with adopt or import")),
+            "read-only install must be reported as not owned: {:?}",
+            plan.skipped
+        );
+        assert!(
+            plan.skipped.iter().any(|line| line.starts_with(
+                "unowned: local runtime manifest did not match the registry"
+            )),
+            "manifest-mismatched install must be reported with its own reason, distinct \
+             from the read-only case: {:?}",
+            plan.skipped
+        );
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

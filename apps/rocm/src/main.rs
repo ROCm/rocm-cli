@@ -6829,13 +6829,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 Some(path) => println!("  folder_removed: {}", path.display()),
                 None if result.read_only => {
                     println!("  folder_removed: no");
-                    println!("  note: existing external runtime folder was left untouched");
+                    println!("  note: ROCm CLI did not create this folder, so it is left in place");
                 }
                 None if result.manifest_mismatch => {
                     println!("  folder_removed: no");
                     println!(
-                        "  note: local runtime manifest did not match the registry; the \
-                         folder was left in place to avoid deleting the wrong install"
+                        "  note: local runtime manifest did not match the registry, so it is \
+                         left in place to avoid deleting the wrong install"
                     );
                 }
                 None => println!("  folder_removed: no"),
@@ -7246,11 +7246,13 @@ fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
                 println!("  install_folder: not present, nothing to remove");
             }
             InstallRootDecision::ReadOnly => {
-                println!("  install_folder: left untouched (external/read-only runtime)");
+                println!(
+                    "  install_folder: left in place (ROCm CLI did not create this folder)"
+                );
             }
             InstallRootDecision::ManifestMismatch => {
                 println!(
-                    "  install_folder: left untouched (local runtime manifest did not match \
+                    "  install_folder: left in place (local runtime manifest did not match \
                      the registry)"
                 );
             }

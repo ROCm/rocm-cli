@@ -31,6 +31,13 @@ Feature: Runtime lifecycle state machine
     Then its registry entry is removed
     And its external folder is left in place
 
+  @id:runtime-lifecycle-uninstall-keeps-mismatched-folder
+  Scenario: runtime-lifecycle-03b - Uninstalling a runtime whose local manifest doesn't match keeps its folder
+    Given a registered runtime with a local manifest mismatch
+    When the user uninstalls that runtime
+    Then its registry entry is removed
+    And its folder is left in place because the local manifest did not match
+
   @id:runtime-lifecycle-import-rejects-duplicate-unless-replacing
   Scenario: runtime-lifecycle-04 - Importing a runtime, then rejecting a duplicate unless replacing
     Given a runtime manifest to import

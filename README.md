@@ -296,7 +296,7 @@ Manage multiple side-by-side ROCm installs:
 rocm runtimes list
 rocm runtimes activate <runtime-key>
 rocm runtimes rollback
-rocm runtimes uninstall <runtime-key>
+rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
