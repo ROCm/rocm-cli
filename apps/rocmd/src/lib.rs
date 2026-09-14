@@ -6302,6 +6302,35 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fresh_runtime_state_records_this_daemons_start_time() {
+        // The capture the whole PID-recycling safety net hangs on. `rocm
+        // uninstall` refuses to signal a daemon pid it cannot prove is rocmd,
+        // and the proof is this field — so if `build_runtime_state` ever wrote
+        // `None` here, every record would look like a pre-upgrade one and the
+        // uninstall guard would degrade to best-effort without anything failing.
+        // The other tests in this file supply `daemon_start_ticks: None` to
+        // fixtures, which pins nothing about the real capture.
+        //
+        // Linux-gated because that is where a start-time is readable at all; on
+        // Windows and macOS `None` here is correct and expected.
+        let state = build_runtime_state(&RocmCliConfig::default(), true);
+        assert_eq!(
+            state.daemon_pid,
+            std::process::id(),
+            "the state must name the process that wrote it"
+        );
+        let recorded = state
+            .daemon_start_ticks
+            .expect("a live daemon must record its own start-time on Linux");
+        assert_eq!(
+            Some(recorded),
+            rocm_core::process_start_ticks(std::process::id()),
+            "the recorded start-time must be this process's own, not a placeholder"
+        );
+    }
+
     #[test]
     fn event_collector_emits_schedule_tick_for_due_update() -> Result<()> {
         let (root, paths) = temp_app_paths("event-bus-schedule");

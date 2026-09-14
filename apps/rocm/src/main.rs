@@ -15580,17 +15580,32 @@ fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
 /// aborts the uninstall with the tooling intact. Being told to kill a pid is
 /// recoverable; having an unrelated process tree killed is not.
 ///
+/// A record whose `running` is false is not signalled at all. Only rocmd's clean
+/// shutdown writes that flag, on its way out, so the pid in such a record names
+/// a process that has already exited and anything live under that number
+/// inherited it. This is the same inactive contract `background_helper_already_running`
+/// spawns on, and off Linux it is the only one that applies.
+///
 /// On a platform without `/proc` no start-time exists to record or compare, so
 /// this degrades to the same best-effort match the managed-service kills already
 /// use there rather than making uninstall unusable whenever the daemon is up.
+/// Read that as the *permanent* state on Windows and macOS, not an occasional
+/// one: there, every identity check takes the best-effort arm, so `running` and
+/// a live-pid check are the whole of the protection. Whether this platform can
+/// read a start-time at all is asked of a process known to be alive — this one —
+/// so a failed reading of the daemon's pid is never mistaken for a platform that
+/// cannot read them.
 ///
-/// One residual gap, stated here because the outcomes above are otherwise
-/// exhaustive: a *missing* `runtime-state.json` is taken at face value as "no
+/// Two residual gaps, and the list above is otherwise the complete set of
+/// inputs. First, a *missing* `runtime-state.json` is taken at face value as "no
 /// daemon". Deleting that file by hand while `rocmd` is live therefore skips the
 /// daemon stop silently. This is deliberate — a missing file is the ordinary
 /// never-started case, and there is no pid to verify or signal without it — but
 /// it does mean the gate is only as good as the state file. An unreadable one is
-/// the case that aborts; an absent one is the case that proceeds.
+/// the case that aborts; an absent one is the case that proceeds. Second, on
+/// Windows and macOS a pid recycled while `running` was still true (a crash, not
+/// a clean exit) cannot be told from the daemon itself; `GetProcessTimes` is the
+/// fix for the Windows half and is not attempted here.
 fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
