@@ -1209,9 +1209,21 @@ flaky = true
             }
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-            for tag in text.split_whitespace() {
-                if let Some(id) = tag.strip_prefix("@id:") {
-                    scenario_ids.insert(id.to_owned());
+            // Read tags off TAG LINES only, the way `scenarios_of` in
+            // tests/feature_naming.rs does. Scanning the whole file would also
+            // pick up an `@id:` written inside a `#` comment — and since this
+            // set is what decides whether a row is an orphan, a commented-out
+            // id would vouch for a row that measures nothing, which is the one
+            // thing this test exists to catch.
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.starts_with('@') {
+                    continue;
+                }
+                for tag in line.split_whitespace() {
+                    if let Some(id) = tag.strip_prefix("@id:") {
+                        scenario_ids.insert(id.to_owned());
+                    }
                 }
             }
         }

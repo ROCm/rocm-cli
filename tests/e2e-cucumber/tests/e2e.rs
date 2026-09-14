@@ -657,8 +657,9 @@ impl Drop for E2eWorld {
         // failure is ignored rather than panicking (which would abort the run) —
         // hence the returned status is discarded here. The serve retry, where a
         // failed stop changes the next attempt's meaning, does read it.
+        let env = self.isolate_env();
         if let Some(root) = &self.isolated_root {
-            stop_managed_services(root.path());
+            stop_managed_services(root.path(), &env);
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -675,7 +676,10 @@ impl Drop for E2eWorld {
 /// record existed yet, or the stop failed, the next attempt runs against a device
 /// the previous one still owns, and the run must say so rather than let it look
 /// like a genuinely broken serve.
-fn stop_managed_services(root: &std::path::Path) -> String {
+fn stop_managed_services(
+    root: &std::path::Path,
+    env: &[(&'static str, std::ffi::OsString)],
+) -> String {
     let services_dir = root.join("data").join("services");
     let entries = match std::fs::read_dir(&services_dir) {
         Ok(entries) => entries,
@@ -707,9 +711,14 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         }
         let mut cmd = std::process::Command::new(rocm_binary());
         cmd.args(["services", "stop", service_id, "--yes"]);
-        cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
-        cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
-        cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+        // The scenario's own environment, not a hand-rolled subset of it. The
+        // three directory variables were previously rebuilt here, which quietly
+        // dropped everything else `isolate_env` sets — including the shared
+        // cache redirection a CI lane exports — so this teardown was talking to
+        // a slightly different machine than the scenario it is cleaning up after.
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         outcomes.push(match cmd.output() {
             Ok(out) if out.status.success() => format!("{service_id}: stopped"),
             Ok(out) => format!(
@@ -917,12 +926,19 @@ pub fn stat_shim_path(
         .into_iter()
         .find(|candidate| std::path::Path::new(candidate).is_file())
         .expect("no real `stat` binary to delegate to");
-    // `-c %A|%U|%G` is the only form the CLI asks for, and the shim answers only
-    // when the target path is the one under test; anything else is the real
+    // Answers only the one call this scenario is substituting: the CLI's
+    // `stat -c %A|%U|%G <device>` (crates/rocm-core/src/examine.rs:1303).
+    // Both the format AND the path must match — keying on the path alone would
+    // hand this `mode|owner|group` line to any other `stat` of the same device
+    // added later, in whatever format it asked for, and the caller would parse
+    // the wrong shape without anything saying so. Anything else is the real
     // binary's business.
     let script = format!(
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"{device}\" ]; then\n    \
-         printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n    exit 0\n  fi\ndone\nexec {real} \"$@\"\n"
+        "#!/bin/sh\nfmt=\nwant=\nfor arg in \"$@\"; do\n  \
+         if [ \"$arg\" = '%A|%U|%G' ]; then fmt=1; fi\n  \
+         if [ \"$arg\" = \"{device}\" ]; then want=1; fi\ndone\n\
+         if [ -n \"$fmt\" ] && [ -n \"$want\" ]; then\n  \
+         printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n  exit 0\nfi\nexec {real} \"$@\"\n"
     );
     let shim = bin.join("stat");
     std::fs::write(&shim, script).expect("failed to write the stat shim");

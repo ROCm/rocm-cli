@@ -449,7 +449,7 @@ fn default_engine_serve_target() -> &'static str {
 fn stop_scenario_services(world: &E2eWorld) -> String {
     world.isolated_root.as_ref().map_or_else(
         || "not attempted: scenario has no isolated root".to_owned(),
-        |root| crate::stop_managed_services(root.path()),
+        |root| crate::stop_managed_services(root.path(), &world.isolate_env()),
     )
 }
 
