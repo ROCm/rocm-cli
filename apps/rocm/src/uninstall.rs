@@ -240,6 +240,44 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Assert `child` exits within `grace`, and say so if it does not.
+    ///
+    /// NOT `wait()`. The stand-in these tests spawn exits on its own after a
+    /// minute, so an unbounded `wait()` blocks until that happens and then finds
+    /// the process gone — passing whether or not uninstall killed anything. It
+    /// measures "did it eventually die", which the stand-in guarantees. Polling
+    /// against a deadline measures "did it die *now*", which is the claim.
+    ///
+    /// The kill-and-reap on the failure path keeps a failing assertion from
+    /// leaking the child for the life of the test binary.
+    #[cfg(target_os = "linux")]
+    fn assert_exits_within(
+        child: &mut std::process::Child,
+        grace: std::time::Duration,
+        message: &str,
+    ) {
+        let deadline = std::time::Instant::now() + grace;
+        let exited = loop {
+            match child.try_wait().expect("failed to poll the managed server") {
+                Some(_) => break true,
+                None if std::time::Instant::now() >= deadline => break false,
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(exited, "{message}");
+    }
+
+    /// How long the assertion above allows. Uninstall waits out its own bounded
+    /// stop grace per recorded process, so this has to exceed that — but stay
+    /// far below the stand-in's own lifetime, or the test goes back to measuring
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    const STOP_ASSERTION_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
     #[test]
     fn removal_proceeds_once_every_managed_server_is_confirmed_stopped() {
         let (root, plan) = plan_removing_one_file("stop-confirmed");
@@ -305,9 +343,15 @@ mod tests {
         })
         .expect("a server that stops must not block uninstall");
 
-        // Reap our own child so the liveness check does not observe a zombie.
+        // The stand-in is our own child, so its exit is observable directly —
+        // and bounded, so this pins that uninstall killed it rather than that it
+        // outlived the test.
         let mut child = child;
-        let _ = child.wait();
+        assert_exits_within(
+            &mut child,
+            STOP_ASSERTION_GRACE,
+            "the managed server must be stopped by uninstall",
+        );
         assert!(
             !rocm_core::process_is_running(pid),
             "the managed server must be stopped by uninstall"
@@ -325,9 +369,15 @@ mod tests {
     #[test]
     fn the_uninstall_command_itself_stops_a_managed_server_before_removing_anything() {
         // Drives the real command end to end — plan, confirm gate, stop pass,
-        // removal — rather than the pieces separately. Inlining the old
-        // remove-first loop back into `uninstall_with_paths` fails here even
-        // though every narrower test still passes.
+        // removal — rather than the pieces separately.
+        //
+        // Two distinct claims, and it is worth being exact about which is which,
+        // because an earlier version of this comment claimed both and only
+        // delivered one. ORDERING: inlining the old remove-first loop back into
+        // `uninstall_with_paths` fails here even though every narrower test
+        // still passes. STOPPING: the assertion below is bounded, so skipping
+        // the stop pass fails it instead of merely making the suite take as long
+        // as the stand-in lives.
         let root = std::env::temp_dir().join(format!(
             "rocm-cli-uninstall-cmd-test-{}-{}",
             std::process::id(),
@@ -384,7 +434,11 @@ mod tests {
         .expect("uninstall should succeed once the server is stopped");
 
         let mut server = server;
-        let _ = server.wait();
+        assert_exits_within(
+            &mut server,
+            STOP_ASSERTION_GRACE,
+            "`rocm uninstall` must stop the server it manages",
+        );
         assert!(
             !rocm_core::process_is_running(pid),
             "`rocm uninstall` must stop the server it manages"

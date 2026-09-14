@@ -15750,7 +15750,32 @@ fn stop_background_helper_before_uninstall(
 /// [`unreadable_service_manifests`].
 fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedServiceStopReport> {
     let mut report = ManagedServiceStopReport::default();
+    // Everything that can doom the run is decided BEFORE anything is stopped.
+    //
+    // Stopping is not free and not undoable: each confirmed stop drops that
+    // service's endpoint key, and this command's own abort text says a publicly
+    // bound service has to be served again with an explicit flag to come back.
+    // Once the gate is going to abort — the tooling stays, nothing is removed —
+    // every stop performed on the way there is pure cost to the operator, paid
+    // for a removal that will not happen. So a helper stop that recorded a
+    // failure returns here, and an unparseable manifest (which can perfectly
+    // well describe a live, GPU-holding server) is collected up front rather
+    // than after every other service is already down.
     stop_background_helper_before_uninstall(paths, &mut report);
+    for manifest in unreadable_service_manifests(paths)? {
+        report.failed.push(FailedManagedServiceStop {
+            // The full path, not the file name: the only remedy is to act on the
+            // file, so the message has to say which file.
+            service_id: manifest.display().to_string(),
+            reason:
+                "service record could not be parsed, so its server cannot be located or stopped"
+                    .to_owned(),
+            remedy: StopFailureRemedy::RepairTheRecord,
+        });
+    }
+    if !report.failed.is_empty() {
+        return Ok(report);
+    }
     let records = load_managed_services(paths)?;
     let mut attempted: Vec<&ManagedServiceRecord> = Vec::new();
     for record in &records {
@@ -15841,16 +15866,39 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             let mut probe_record = record.clone();
             probe_record.endpoint_url =
                 rocm_core::format_http_base_url(&reachable_host, record.port);
-            match rocm_core::managed_service_endpoint_model_ready(
+            match rocm_core::managed_service_endpoint_identity(
                 &probe_record,
                 endpoint_api_key.as_deref(),
                 ENDPOINT_IDENTITY_PROBE_TIMEOUT,
             ) {
                 // Serving this record's own model: the engine outlived the
                 // supervisor whose death marked the record stopped.
-                Ok(true) => {}
-                // Someone else's listener on a recycled port.
-                Ok(false) => continue,
+                Ok(rocm_core::EndpointIdentity::ServesExpectedModel) => {}
+                // Someone else's listener on a recycled port: it named its
+                // models and ours was not among them. This is the only "not
+                // ours" that is actually evidence of anything, so it is the only
+                // one that stays silent.
+                Ok(rocm_core::EndpointIdentity::ServesOtherModels) => continue,
+                // Answered, but named nothing. That is not evidence of a
+                // stranger — an engine that is up but has not populated its
+                // model list, or is mid-unload, lists nothing while holding the
+                // port and the GPU. Treating it as somebody else's and removing
+                // the tooling in silence is the original defect, reached through
+                // the gate meant to prevent it. It shares the fail-open with the
+                // unidentifiable case next door, and must share the warning too:
+                // proceeding quietly is what makes it a defect rather than a
+                // tradeoff.
+                Ok(rocm_core::EndpointIdentity::ListsNoModels) => {
+                    eprintln!(
+                        "warning: {}:{} still accepts connections and answered the identity \
+                         probe with an empty model list, so it cannot be told from an unrelated \
+                         service; {} is already recorded stopped — proceeding. An engine still \
+                         loading or unloading looks like this. If that is a server of yours, \
+                         stop whatever holds that port first.",
+                        record.host, record.port, record.service_id
+                    );
+                    continue;
+                }
                 Err(_) => {
                     // `/v1/models` did not yield a model list. That is either a
                     // refusal from a live HTTP server or no usable answer at
@@ -15919,17 +15967,6 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             // `rocm services stop` has nothing left to kill and every retry
             // would abort identically.
             remedy: StopFailureRemedy::StopWhatHoldsThePort,
-        });
-    }
-    for manifest in unreadable_service_manifests(paths)? {
-        report.failed.push(FailedManagedServiceStop {
-            // The full path, not the file name: the only remedy is to act on the
-            // file, so the message has to say which file.
-            service_id: manifest.display().to_string(),
-            reason:
-                "service record could not be parsed, so its server cannot be located or stopped"
-                    .to_owned(),
-            remedy: StopFailureRemedy::RepairTheRecord,
         });
     }
     Ok(report)
@@ -30905,6 +30942,33 @@ ID_LIKE="suse opensuse"
     }
 
     #[cfg(unix)]
+    /// Assert `child` exits within a bounded grace, and reap it either way.
+    ///
+    /// NOT `wait()`. These tests spawn a stand-in that exits on its own after a
+    /// minute, so an unbounded `wait()` blocks until that happens and then finds
+    /// the process gone — passing whether or not anything killed it. The only
+    /// symptom of a total regression would be the suite taking a minute. Polling
+    /// against a deadline asserts it died *now*, which is the actual claim.
+    ///
+    /// The grace exceeds the stop path's own per-process wait but stays far
+    /// below the stand-in's lifetime, or this goes back to measuring nothing.
+    #[cfg(unix)]
+    fn assert_stopped_within_grace(child: &mut std::process::Child, message: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let exited = loop {
+            match child.try_wait().expect("poll the stand-in") {
+                Some(_) => break true,
+                None if std::time::Instant::now() >= deadline => break false,
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(exited, "{message}");
+    }
+
     fn managed_record_for_pid(
         paths: &AppPaths,
         pid: u32,
@@ -31010,10 +31074,10 @@ ID_LIKE="suse opensuse"
 
         assert_eq!(signaled, vec![pid]);
         assert!(all_stopped);
-        // Reap our own child (a detached managed process would be reaped by init)
-        // so the liveness check does not observe a not-yet-reaped zombie.
+        // Bounded, and our own child, so this pins that the terminate killed it
+        // rather than that it outlived the test.
         let mut child = child;
-        let _ = child.wait();
+        assert_stopped_within_grace(&mut child, "the verified process must be terminated");
         assert!(
             !rocm_core::process_is_running(pid),
             "the verified process must be terminated"
@@ -31044,9 +31108,11 @@ ID_LIKE="suse opensuse"
 
         assert!(report.failed.is_empty(), "nothing should fail: {report:?}");
         assert_eq!(report.stopped, vec![record.service_id]);
-        // Reap our own child so the liveness check does not observe a zombie.
         let mut child = child;
-        let _ = child.wait();
+        assert_stopped_within_grace(
+            &mut child,
+            "the managed server must be stopped before uninstall proceeds",
+        );
         assert!(
             !rocm_core::process_is_running(pid),
             "the managed server must be stopped before uninstall proceeds"
@@ -31147,7 +31213,10 @@ ID_LIKE="suse opensuse"
             "a verified daemon is stopped and reported: {report:?}"
         );
         let mut child = child;
-        let _ = child.wait();
+        assert_stopped_within_grace(
+            &mut child,
+            "the background helper must be stopped before uninstall proceeds",
+        );
         assert!(
             !rocm_core::process_is_running(pid),
             "the background helper must be stopped before uninstall proceeds"
@@ -31835,6 +31904,99 @@ ID_LIKE="suse opensuse"
             "the gate must refuse to remove anything"
         );
         drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_doomed_run_stops_nothing_on_its_way_to_the_abort() {
+        // Stopping is not free and not undoable: each confirmed stop drops that
+        // service's endpoint key, and a publicly bound service has to be served
+        // again with an explicit flag to get one back. Once the gate is certain
+        // to abort — nothing removed, tooling intact — every stop performed
+        // first is pure cost for a removal that will not happen.
+        //
+        // The daemon failure used here is the unreadable-state one, which this
+        // file already documents at length as the reason to leave the helper
+        // alone. That same reasoning has to cover the services: it made no sense
+        // to spare the daemon and then stop everything else for no gain.
+        let server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn managed server");
+        let pid = server.id();
+        let (root, paths) = test_paths("uninstall-doomed-run-stops-nothing");
+        paths.ensure().expect("create the app directories");
+        fs::write(paths.automation_state_path(), b"{ not json")
+            .expect("seed a corrupt runtime state");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = managed_record_for_pid(&paths, pid, Some(real));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.stopped.is_empty(),
+            "a run that is already going to abort must stop nothing: {report:?}"
+        );
+        let mut server = server;
+        assert!(
+            server.try_wait().expect("poll the server").is_none(),
+            "the managed server must be left running by a run that aborts anyway"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the unreadable runtime state must still abort the uninstall"
+        );
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unparseable_manifest_aborts_before_any_service_is_stopped() {
+        // Same shape as the daemon case and worse: a manifest that cannot be
+        // parsed may itself describe a live, GPU-holding server, so collecting
+        // it last meant every other service was already down — and its key
+        // already dropped — before the run turned out to be doomed.
+        let server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn managed server");
+        let pid = server.id();
+        let (root, paths) = test_paths("uninstall-bad-manifest-ordering");
+        paths.ensure().expect("create the app directories");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = managed_record_for_pid(&paths, pid, Some(real));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+        fs::write(paths.services_dir().join("svc-corrupt.json"), b"{ not json")
+            .expect("seed an unparseable manifest");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.stopped.is_empty(),
+            "an unparseable manifest must abort before anything is stopped: {report:?}"
+        );
+        let mut server = server;
+        assert!(
+            server.try_wait().expect("poll the server").is_none(),
+            "the healthy service must be untouched when the run aborts on another record"
+        );
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.remedy == StopFailureRemedy::RepairTheRecord),
+            "the unparseable manifest must be the recorded failure: {report:?}"
+        );
+        let _ = server.kill();
+        let _ = server.wait();
         let _ = fs::remove_dir_all(root);
     }
 

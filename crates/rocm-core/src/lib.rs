@@ -882,19 +882,59 @@ pub fn openai_models_endpoint_has_model(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
+    Ok(
+        openai_models_endpoint_identity(endpoint_url, expected_model, endpoint_api_key, timeout)?
+            == EndpointIdentity::ServesExpectedModel,
+    )
+}
+
+/// What a listener said when asked which models it serves.
+///
+/// The distinction [`openai_models_endpoint_has_model`] cannot draw: it answers
+/// `false` both for "this is someone else's service" and for "this endpoint
+/// answered, but listed nothing". For a readiness poll those are the same — not
+/// ready either way — but for a caller deciding whether something still holds a
+/// port they are opposites. An engine that is up but has not populated its model
+/// list yet, or is mid-unload, lists nothing while very much holding the GPU.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointIdentity {
+    /// Listed a model matching the one asked about (or listed models when no
+    /// particular one was asked for).
+    ServesExpectedModel,
+    /// Listed models, none of which match — a different service on this port.
+    ServesOtherModels,
+    /// Answered `/v1/models` with an empty list. Says nothing either way about
+    /// whose service this is.
+    ListsNoModels,
+}
+
+/// Ask a listener which models it serves, keeping "listed nothing" distinct.
+pub fn openai_models_endpoint_identity(
+    endpoint_url: &str,
+    expected_model: Option<&str>,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
     let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
     let value = serde_json::from_str::<serde_json::Value>(body.trim())
         .context("failed to parse /v1/models JSON")?;
     let loaded_models = openai_loaded_model_ids(&value);
     if loaded_models.is_empty() {
-        return Ok(false);
+        return Ok(EndpointIdentity::ListsNoModels);
     }
     let Some(expected_model) = expected_model.filter(|value| !value.trim().is_empty()) else {
-        return Ok(true);
+        return Ok(EndpointIdentity::ServesExpectedModel);
     };
-    Ok(loaded_models
-        .iter()
-        .any(|loaded| model_refs_match(loaded, expected_model)))
+    Ok(
+        if loaded_models
+            .iter()
+            .any(|loaded| model_refs_match(loaded, expected_model))
+        {
+            EndpointIdentity::ServesExpectedModel
+        } else {
+            EndpointIdentity::ServesOtherModels
+        },
+    )
 }
 
 pub fn managed_service_endpoint_model_ready(
@@ -913,6 +953,29 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// [`managed_service_endpoint_model_ready`] without collapsing "listed nothing"
+/// into "not ours".
+///
+/// An empty `endpoint_url` is the one case with no listener to ask about at all,
+/// so it stays an error rather than being reported as an identity.
+pub fn managed_service_endpoint_identity(
+    record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
+    if record.endpoint_url.trim().is_empty() {
+        bail!("service record has no endpoint URL to identify");
+    }
+    let expected = if !record.canonical_model_id.trim().is_empty() {
+        Some(record.canonical_model_id.as_str())
+    } else if !record.model_ref.trim().is_empty() {
+        Some(record.model_ref.as_str())
+    } else {
+        None
+    };
+    openai_models_endpoint_identity(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
 /// How far along a managed service's endpoint is.
@@ -8263,6 +8326,61 @@ mod tests {
             Some("test-key"),
             Duration::from_secs(2)
         )?);
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_model_list_is_not_reported_as_somebody_elses_service() -> Result<()> {
+        // `openai_models_endpoint_has_model` answers `false` both for "these are
+        // someone else's models" and for "this endpoint listed nothing". For a
+        // readiness poll that is fine — not ready either way. For a caller
+        // deciding whether something still holds a port they are opposites: an
+        // engine that is up but has not populated its list yet, or is
+        // mid-unload, lists nothing while holding the port and the GPU, and
+        // reading that as "not ours" removes the tooling out from under it.
+        //
+        // Two connections: an empty list, then a list naming a different model.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for body in [r#"{"data":[]}"#, r#"{"data":[{"id":"someone/else"}]}"#] {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ListsNoModels,
+            "an empty list says nothing about whose service this is"
+        );
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ServesOtherModels,
+            "a list that names other models is the only real evidence of a stranger"
+        );
 
         server.join().expect("server thread should not panic")?;
         Ok(())
