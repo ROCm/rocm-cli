@@ -1888,9 +1888,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_uv_logged_command_reports_concrete_log_path_on_failure() -> Result<()> {
-        // A failed install's manifest is never saved, so `rocm comfyui logs`
-        // (which discovers logs from the manifest) can't find this run's log.
-        // The error must name the log file directly instead.
+        // `rocm comfyui logs` can still find this run's log via a directory
+        // scan even without a saved manifest, but naming the path directly
+        // in the error is more precise and needs no second command.
         use std::os::unix::fs::PermissionsExt;
 
         let paths = test_paths("comfyui-uv-failure");

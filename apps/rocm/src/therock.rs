@@ -3820,13 +3820,10 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
 /// `ensure_uv_binary` already performs after unpacking its own download.
 ///
 /// Removing the archive is best-effort: the install has already succeeded by
-/// this point, so a cleanup failure is reported rather than raised.
-/// Extracts `archive_path` into `target_dir` and deletes the archive.
-///
-/// Archive deletion failure is non-fatal but still worth reporting; the
-/// message is returned rather than printed directly so callers running a
-/// progress spinner over this call can drop it first and avoid interleaving
-/// spinner frames with the report.
+/// this point, so a cleanup failure is non-fatal. The message is returned
+/// rather than printed directly, so callers running a progress spinner over
+/// this call can drop it first and avoid interleaving spinner frames with
+/// the report.
 fn extract_tarball_and_discard_archive(
     archive_path: &Path,
     target_dir: &Path,
@@ -6762,6 +6759,65 @@ mod tests {
             !archive.exists(),
             "the archive should be removed once unpacked, found {}",
             archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// If the archive can't be removed after a successful extraction, the
+    /// extraction result still succeeds and callers receive a warning message
+    /// describing the cleanup failure instead of a raised error.
+    #[cfg(unix)]
+    #[test]
+    fn extracting_the_sdk_archive_reports_cleanup_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, _paths) = test_paths("discard-archive-cleanup-failure");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+
+        // Removing the archive requires write access to its parent directory;
+        // strip that so `fs::remove_file` fails after a successful extraction.
+        let cache_perms = fs::metadata(&cache)?.permissions();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o555))?;
+        let result = extract_tarball_and_discard_archive(&archive, &target);
+        fs::set_permissions(&cache, cache_perms)?;
+
+        let cleanup_warning = result?;
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should still be extracted"
+        );
+        assert!(
+            archive.is_file(),
+            "archive removal should have failed, leaving it in place"
+        );
+        let message = cleanup_warning.expect("a cleanup failure should produce a warning message");
+        assert!(
+            message.contains("Could not remove the downloaded archive"),
+            "{message}"
         );
 
         let _ = fs::remove_dir_all(&root);
