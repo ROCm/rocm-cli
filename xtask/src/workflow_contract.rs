@@ -1107,6 +1107,57 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_shared_uv_cache_sits_inside_the_gc_bounded_directory() {
+        // Two independent properties ride on this one path, and both fail
+        // silently.
+        //
+        // Hardlinking: uv can only link out of its cache into a managed
+        // environment when the two are reachable without crossing a mount point.
+        // Otherwise it copies, exits 0, and two of the three install paths
+        // discard its warning — invisible unless you compare inodes.
+        //
+        // Eviction: the runner pod's `uv-cache-gc` initContainer bounds exactly
+        // one directory — the `uv-cache` subPath of the work PVC, which surfaces
+        // in the job as <runner-root>/uv-cache. It sweeps abandoned `.tmp*`
+        // extractions and drops `archive-v0` below a 60GiB floor. A cache placed
+        // elsewhere on the same volume still hardlinks, so every signal stays
+        // green while nothing enforces the floor — and the volume also holds
+        // `.runner`, whose credentials need a repo-Administration token to
+        // re-register. That is how the MI300X lane stranded at 49G/49G.
+        //
+        // $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so a lane that derives
+        // the cache from it directly lands one level too deep and escapes the GC.
+        // Asserting the derivation rather than a literal keeps this honest if the
+        // runner root ever moves.
+        for (workflow, text) in self_hosted_workflows() {
+            for block in multiline_run_blocks(&text) {
+                let Some(line) = block
+                    .lines()
+                    .find(|line| line.starts_with("export E2E_SHARED_UV_CACHE_DIR="))
+                else {
+                    continue;
+                };
+                assert!(
+                    line.contains("$runner_root/uv-cache"),
+                    "{workflow} sets the shared uv cache to `{line}`. It must be \
+                     <runner-root>/uv-cache — the only directory the runner's \
+                     uv-cache-gc initContainer bounds. Derive it with \
+                     `runner_root=\"$(dirname \"$(dirname \"$RUNNER_WORKSPACE\")\")\"`; \
+                     $RUNNER_WORKSPACE itself is one level too deep, which keeps the \
+                     hardlinks but silently drops the 60GiB floor"
+                );
+                assert!(
+                    block.contains(
+                        "runner_root=\"$(dirname \"$(dirname \"$RUNNER_WORKSPACE\")\")\""
+                    ),
+                    "{workflow} exports E2E_SHARED_UV_CACHE_DIR from `$runner_root` \
+                     without defining it in the same run block"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn self_hosted_prebuilt_e2e_lanes_export_rocmd() {
         let workflow = read_workflow("e2e-selfhosted.yml");
         assert_prebuilt_e2e_lanes_export_rocmd("e2e-selfhosted.yml", &workflow);

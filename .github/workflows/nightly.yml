@@ -415,10 +415,13 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Share uv's wheel cache on the same volume as the runtimes it populates,
+          # Share uv's wheel cache on the same mount as the runtimes it populates,
           # so uv hardlinks into them instead of copying (see e2e-selfhosted.yml
-          # e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
-          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
+          # e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s. It must also be
+          # the directory the runner's uv-cache-gc initContainer bounds, or the
+          # cache grows without a floor on the volume holding `.runner`.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Share ONE installed managed runtime across serve/chat scenarios so
           # install sdk runs once per runner, not per scenario (see e2e-selfhosted.yml e2e-gpu).
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
@@ -523,9 +526,11 @@ jobs:
           # being scaled away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same volume as the runtimes it populates, so uv hardlinks into them
-          # instead of copying (see e2e-selfhosted.yml e2e-gpu).
-          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 

@@ -269,9 +269,19 @@ jobs:
           #
           # ~23GB per ROCm generation, and uv never evicts, so this shares the work
           # volume's budget with e2e-target/e2e-shared/e2e-prewarm rather than
-          # having a quota of its own. The runner image reclaims it when the volume
-          # runs low; nothing here does.
-          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
+          # having a quota of its own. What keeps it from starving them — and from
+          # starving `.runner`, whose credentials live on the same volume and need a
+          # repo-Administration token to re-register — is the runner pod's
+          # `uv-cache-gc` initContainer, which sweeps abandoned `.tmp*` extractions
+          # and drops `archive-v0` below a 60GiB floor on the way up.
+          #
+          # That GC bounds ONE directory: the `uv-cache` subPath of the work PVC,
+          # which surfaces in this container as <runner-root>/uv-cache. Pointing the
+          # cache anywhere else on the volume keeps the hardlinks but escapes the
+          # floor, which is how the MI300X lane previously stranded at 49G/49G.
+          # $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so derive the root.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Share ONE installed managed runtime across the serve/chat scenarios so
           # `rocm install sdk` runs once per runner, not once per scenario (the
           # per-scenario install count — each a multi-GiB TheRock SDK whose probe
@@ -926,10 +936,12 @@ jobs:
           # still warm on the next job even though the container is not.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Same volume as the runtimes it populates, so uv hardlinks into them
-          # instead of copying — see the e2e-gpu lane for why the distinction is
-          # invisible in the logs.
-          export E2E_SHARED_UV_CACHE_DIR="$RUNNER_WORKSPACE/uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the directory the runner's uv-cache-gc
+          # initContainer bounds — see the e2e-gpu lane for why the distinction is
+          # invisible in the logs and why the GC's path is load-bearing.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Pre-warm one shared runtime in place before the suite. Not an
           # optimization — `install sdk` bakes absolute paths into the runtime
           # manifest, so installing anywhere temporary breaks every later serve.
