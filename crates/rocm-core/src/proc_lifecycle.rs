@@ -91,6 +91,19 @@ pub enum IdentityState {
 /// derived from disagreeing observations.
 #[must_use]
 pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
+    // Liveness BEFORE the reading, and the early return is what enforces it.
+    // Folding this into the call below would leave the reading in argument
+    // position, which Rust evaluates first — and that inverts the safe side of
+    // the race. A PID read while it was still the recorded process, which then
+    // exits and is recycled before the liveness check, would be compared as
+    // `expected == actual` and come back `Matches`: the one verdict that
+    // authorises a kill, handed out for a PID that is now somebody else.
+    // Reading only after liveness means the reading always describes whatever
+    // holds the PID *now*, so a recycled one disagrees and comes back
+    // `Recycled`.
+    if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
+        return IdentityState::Gone;
+    }
     identity_state_with_observed(id, process_start_ticks(id.pid))
 }
 
@@ -98,8 +111,16 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
 ///
 /// `observed_start_ticks` is what [`process_start_ticks`] returned for `id.pid`:
 /// `None` both where the platform has no `/proc` and where that one PID's
-/// start-time could not be read. Liveness is still checked here, so an exit
-/// after the caller's reading still yields [`IdentityState::Gone`].
+/// start-time could not be read.
+///
+/// Liveness is checked here too, so a PID that simply exits after the caller's
+/// reading still yields [`IdentityState::Gone`]. What that check cannot catch is
+/// exit *and recycle* between the reading and this call: the PID is live again,
+/// and a reading taken while it was still the recorded process matches the
+/// record, so the verdict is [`IdentityState::Matches`] for a process that is no
+/// longer ours. Callers holding a reading across anything slow should re-read
+/// rather than pass a stale one; [`identity_state`] avoids the window entirely
+/// by reading only after its own liveness check.
 #[must_use]
 pub fn identity_state_with_observed(
     id: &ProcessIdentity,

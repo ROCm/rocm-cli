@@ -15867,92 +15867,64 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             let mut probe_record = record.clone();
             probe_record.endpoint_url =
                 rocm_core::format_http_base_url(&reachable_host, record.port);
-            match rocm_core::managed_service_endpoint_identity(
+            let probe = rocm_core::managed_service_endpoint_identity(
                 &probe_record,
                 endpoint_api_key.as_deref(),
                 ENDPOINT_IDENTITY_PROBE_TIMEOUT,
-            ) {
-                // Serving this record's own model: the engine outlived the
-                // supervisor whose death marked the record stopped.
-                Ok(rocm_core::EndpointIdentity::ServesExpectedModel) => {}
-                // Someone else's listener on a recycled port: it named its
-                // models and ours was not among them. This is the only "not
-                // ours" that is actually evidence of anything, so it is the only
-                // one that stays silent.
-                Ok(rocm_core::EndpointIdentity::ServesOtherModels) => continue,
-                // Answered, but named nothing. That is not evidence of a
-                // stranger — an engine that is up but has not populated its
-                // model list, or is mid-unload, lists nothing while holding the
-                // port and the GPU. Treating it as somebody else's and removing
-                // the tooling in silence is the original defect, reached through
-                // the gate meant to prevent it. It shares the fail-open with the
-                // unidentifiable case next door, and must share the warning too:
-                // proceeding quietly is what makes it a defect rather than a
-                // tradeoff.
-                Ok(rocm_core::EndpointIdentity::ListsNoModels) => {
-                    eprintln!(
+            );
+            // Short-circuits: the extra round trip only happens when the probe
+            // produced no usable listing, which is the only case its answer can
+            // change.
+            let auth_refused = probe.is_err()
+                && endpoint_refused_authorization(
+                    &probe_record.endpoint_url,
+                    endpoint_api_key.as_deref(),
+                );
+            let verdict = stopped_record_verdict(probe.ok(), auth_refused);
+            if !verdict.blocks() {
+                // The two fail-open outcomes say so on stderr, not stdout: this
+                // is the last fail-open left on a destructive path, so it has to
+                // survive the operator piping uninstall's output somewhere.
+                // Only `ProceedUnrelated` is silent, because a listener that
+                // named its models and did not name ours is the one case that is
+                // actually evidence of a stranger.
+                match verdict {
+                    StoppedRecordVerdict::ProceedListingNothing => eprintln!(
                         "warning: {}:{} still accepts connections and answered the identity \
                          probe with an empty model list, so it cannot be told from an unrelated \
                          service; {} is already recorded stopped — proceeding. An engine still \
                          loading or unloading looks like this. If that is a server of yours, \
                          stop whatever holds that port first.",
                         record.host, record.port, record.service_id
-                    );
-                    continue;
+                    ),
+                    StoppedRecordVerdict::ProceedUnidentified => eprintln!(
+                        "warning: {}:{} still accepts connections but did not answer the \
+                         identity probe with a usable model list, and service {} is already \
+                         recorded stopped — proceeding. That can be a wedged engine, an \
+                         unrelated server on the port, or a stale endpoint key. If it is a \
+                         server of yours, stop whatever holds that port first.",
+                        record.host, record.port, record.service_id
+                    ),
+                    StoppedRecordVerdict::ProceedUnrelated => {}
+                    StoppedRecordVerdict::BlockServingOurModel
+                    | StoppedRecordVerdict::BlockAuthRefused => unreachable!("guarded by blocks()"),
                 }
-                Err(_) => {
-                    // `/v1/models` did not yield a model list. That is either a
-                    // refusal from a live HTTP server or no usable answer at
-                    // all, and the two must not be treated alike: a public
-                    // service's key is cleared once its processes are gone, so
-                    // on the retry run this very probe goes out unauthenticated
-                    // against a still-serving endpoint and is answered 401. Fail
-                    // open on that and uninstall deletes the tooling while the
-                    // public endpoint keeps serving — the original defect,
-                    // reached through the retry.
-                    if !endpoint_refused_authorization(
-                        &probe_record.endpoint_url,
-                        endpoint_api_key.as_deref(),
-                    ) {
-                        // Listening but unidentifiable, and the causes are not
-                        // all dramatic: a wedged engine, something that is not
-                        // an OpenAI endpoint at all, a reply this cannot parse,
-                        // or a server erroring out on a key that has since been
-                        // rotated. (An outright refusal is not in this set — a
-                        // 401/403 is handled above and blocks.) Aborting on the
-                        // rest would put back the dead end that has no override
-                        // and no recovery, so the removal proceeds; the message
-                        // therefore has to describe what was actually seen
-                        // rather than assert a cause, because the operator is
-                        // the one who has to tell these apart.
-                        //
-                        // stderr, not stdout: this is the one fail-open left on
-                        // a destructive path, so it must survive the operator
-                        // piping uninstall's output somewhere.
-                        eprintln!(
-                            "warning: {}:{} still accepts connections but did not answer the \
-                             identity probe with a usable model list, and service {} is already \
-                             recorded stopped — proceeding. That can be a wedged engine, an \
-                             unrelated server on the port, or a stale endpoint key. If it is a \
-                             server of yours, stop whatever holds that port first.",
-                            record.host, record.port, record.service_id
-                        );
-                        continue;
-                    }
-                    report
-                        .stopped
-                        .retain(|stopped| stopped != &record.service_id);
-                    report.failed.push(FailedManagedServiceStop {
-                        service_id: record.service_id.clone(),
-                        reason: format!(
-                            "{}:{} refused the identity probe's credentials, so an \
-                             authenticated server is still serving there",
-                            record.host, record.port
-                        ),
-                        remedy: StopFailureRemedy::StopWhatHoldsThePort,
-                    });
-                    continue;
-                }
+                continue;
+            }
+            if verdict == StoppedRecordVerdict::BlockAuthRefused {
+                report
+                    .stopped
+                    .retain(|stopped| stopped != &record.service_id);
+                report.failed.push(FailedManagedServiceStop {
+                    service_id: record.service_id.clone(),
+                    reason: format!(
+                        "{}:{} refused the identity probe's credentials, so an authenticated \
+                         server is still serving there",
+                        record.host, record.port
+                    ),
+                    remedy: StopFailureRemedy::StopWhatHoldsThePort,
+                });
+                continue;
             }
         }
         report
@@ -16002,6 +15974,64 @@ fn probe_hosts(host: &str) -> Vec<String> {
             vec!["127.0.0.1".to_owned(), "::1".to_owned()]
         }
         _ => vec![normalized],
+    }
+}
+
+/// What the gate does about a listener answering on an already-stopped record's
+/// recorded port.
+///
+/// Lifted out of the stop pass so each outcome can be asserted directly. Inside
+/// the loop these arms are reachable only by standing up a server that answers
+/// in a particular way and then reading stderr, which is why two of them went
+/// untested: mutating either "proceed" arm into a block, or deleting the
+/// warning, left every test green while changing what a destructive command
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoppedRecordVerdict {
+    /// Serving this record's own model: the engine outlived the supervisor whose
+    /// death marked the record stopped.
+    BlockServingOurModel,
+    /// Refused our credentials — a live server stating it guards this path.
+    BlockAuthRefused,
+    /// Named its models and ours was not among them. The only "not ours" that is
+    /// evidence of anything, so the only one that proceeds silently.
+    ProceedUnrelated,
+    /// Answered, but listed nothing. Not evidence of a stranger: an engine still
+    /// loading or mid-unload looks exactly like this while holding the port.
+    ProceedListingNothing,
+    /// Listening but unidentifiable — not an OpenAI endpoint, an unparseable
+    /// reply, or a server erroring on a rotated key.
+    ProceedUnidentified,
+}
+
+impl StoppedRecordVerdict {
+    /// Whether this outcome stops the uninstall.
+    const fn blocks(self) -> bool {
+        matches!(self, Self::BlockServingOurModel | Self::BlockAuthRefused)
+    }
+}
+
+/// Decide [`StoppedRecordVerdict`] from what the identity probe answered.
+///
+/// `identity` is `None` when the probe produced no usable model list at all;
+/// `auth_refused` then says whether that was a 401/403 from a live server, which
+/// is stronger evidence the port is held than a listing would be.
+const fn stopped_record_verdict(
+    identity: Option<rocm_core::EndpointIdentity>,
+    auth_refused: bool,
+) -> StoppedRecordVerdict {
+    match identity {
+        Some(rocm_core::EndpointIdentity::ServesExpectedModel) => {
+            StoppedRecordVerdict::BlockServingOurModel
+        }
+        Some(rocm_core::EndpointIdentity::ServesOtherModels) => {
+            StoppedRecordVerdict::ProceedUnrelated
+        }
+        Some(rocm_core::EndpointIdentity::ListsNoModels) => {
+            StoppedRecordVerdict::ProceedListingNothing
+        }
+        None if auth_refused => StoppedRecordVerdict::BlockAuthRefused,
+        None => StoppedRecordVerdict::ProceedUnidentified,
     }
 }
 
@@ -30967,9 +30997,17 @@ ID_LIKE="suse opensuse"
     ///
     /// The grace exceeds the stop path's own per-process wait but stays far
     /// below the stand-in's lifetime, or this goes back to measuring nothing.
+    ///
+    /// Shared with `crate::uninstall`'s tests rather than duplicated there: two
+    /// near-identical copies of this, with near-identical comments, is what made
+    /// it easy to believe both process-based tests were bounded when only one
+    /// of them was.
     #[cfg(unix)]
-    fn assert_stopped_within_grace(child: &mut std::process::Child, message: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    pub(crate) const STOP_ASSERTION_GRACE: Duration = Duration::from_secs(30);
+
+    #[cfg(unix)]
+    pub(crate) fn assert_stopped_within_grace(child: &mut std::process::Child, message: &str) {
+        let deadline = std::time::Instant::now() + STOP_ASSERTION_GRACE;
         let exited = loop {
             match child.try_wait().expect("poll the stand-in") {
                 Some(_) => break true,
@@ -31632,6 +31670,12 @@ ID_LIKE="suse opensuse"
             Self::bind(model_id, "127.0.0.1", true).expect("bind the authenticated engine")
         }
 
+        /// Answer `/v1/models` with an empty list — an engine that is up and
+        /// holding the port but has not populated its models, or is mid-unload.
+        fn listing_nothing() -> Self {
+            Self::bind("", "127.0.0.1", false).expect("bind the empty-listing engine")
+        }
+
         /// Serve `model_id` on `bind_host`, or `None` when the host's address
         /// family is unavailable (IPv6 is absent in some containers, and a test
         /// that needs it has to skip rather than fail).
@@ -31642,7 +31686,14 @@ ID_LIKE="suse opensuse"
             let port = listener.local_addr().ok()?.port();
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = std::sync::Arc::clone(&shutdown);
-            let body = format!(r#"{{"data":[{{"id":"{model_id}"}}]}}"#);
+            // An empty `model_id` means "list nothing at all", not "list a model
+            // whose id is the empty string" — the two are different answers and
+            // only the first is the engine-still-loading case.
+            let body = if model_id.is_empty() {
+                r#"{"data":[]}"#.to_owned()
+            } else {
+                format!(r#"{{"data":[{{"id":"{model_id}"}}]}}"#)
+            };
             let thread = thread::spawn(move || {
                 use std::io::{Read, Write};
                 while let Ok((mut stream, _)) = listener.accept() {
@@ -31862,6 +31913,97 @@ ID_LIKE="suse opensuse"
         assert!(
             uninstall_removal_gate(&report).is_err(),
             "the gate must refuse to remove anything"
+        );
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_identity_answer_maps_to_exactly_one_gate_outcome() {
+        // The five arms, asserted directly. Reached through the stop loop each
+        // one needs a server that answers a particular way plus a reading of
+        // stderr, which is why two of them were previously pinned by nothing:
+        // mutating either "proceed" arm into a block, or a block into a proceed,
+        // left the whole suite green while changing what a destructive command
+        // does to a live endpoint.
+        use rocm_core::EndpointIdentity::{ListsNoModels, ServesExpectedModel, ServesOtherModels};
+
+        assert_eq!(
+            stopped_record_verdict(Some(ServesExpectedModel), false),
+            StoppedRecordVerdict::BlockServingOurModel,
+            "an engine serving this record's own model outlived its supervisor"
+        );
+        // Only this one is allowed to be silent: naming models and not naming
+        // ours is the single answer that is real evidence of a stranger.
+        assert_eq!(
+            stopped_record_verdict(Some(ServesOtherModels), false),
+            StoppedRecordVerdict::ProceedUnrelated,
+            "a listener naming other models is somebody else on a recycled port"
+        );
+        // Blocking here would turn any JSON listener that lists nothing into an
+        // unescapable abort; proceeding silently would remove the tooling from
+        // under an engine that is merely still loading. Hence a third outcome.
+        assert_eq!(
+            stopped_record_verdict(Some(ListsNoModels), false),
+            StoppedRecordVerdict::ProceedListingNothing,
+            "an empty listing is not evidence of a stranger, and not silent"
+        );
+        assert_eq!(
+            stopped_record_verdict(None, true),
+            StoppedRecordVerdict::BlockAuthRefused,
+            "a refusal is a live server stating it guards the path"
+        );
+        assert_eq!(
+            stopped_record_verdict(None, false),
+            StoppedRecordVerdict::ProceedUnidentified,
+            "no usable answer is the documented fail-open"
+        );
+
+        assert!(stopped_record_verdict(Some(ServesExpectedModel), false).blocks());
+        assert!(stopped_record_verdict(None, true).blocks());
+        assert!(!stopped_record_verdict(Some(ServesOtherModels), false).blocks());
+        assert!(!stopped_record_verdict(Some(ListsNoModels), false).blocks());
+        assert!(!stopped_record_verdict(None, false).blocks());
+    }
+
+    #[test]
+    fn an_endpoint_listing_nothing_does_not_block_uninstall() {
+        // The end-to-end half of the `ListsNoModels` arm: it must not abort.
+        // Blocking would make any listener that answers `/v1/models` with an
+        // empty list — including something unrelated on a recycled port — an
+        // abort with no override, which is the dead end this gate must not
+        // create. The warning is what keeps it a tradeoff rather than a silent
+        // removal, and is asserted by `every_identity_answer_maps_to_exactly_\
+        // one_gate_outcome` via the distinct verdict.
+        let endpoint = ServingEndpoint::listing_nothing();
+        let (root, paths) = test_paths("uninstall-endpoint-listing-nothing");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-empty-listing",
+            "vllm",
+            "amd/loading-model",
+            "amd/loading-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.failed.is_empty(),
+            "an empty model list must not abort uninstall: {report:?}"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_ok(),
+            "the gate must let the removal proceed"
         );
         drop(endpoint);
         let _ = fs::remove_dir_all(root);

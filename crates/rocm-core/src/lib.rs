@@ -7816,12 +7816,18 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> 
 ///   publish, so a crash cannot leave a half-written or zero-length file. The
 ///   containing *directory* is never fsynced, so the rename itself can still be
 ///   lost by a power failure — the guarantee is that readers only ever see one
-///   complete version, not that the newest one survives a crash.
+///   complete version, not that the newest one survives a crash. That flush is
+///   held by construction, not by test: deleting it leaves every test green,
+///   because reproducing what it prevents needs a real crash between the write
+///   and the rename. Do not read a green suite as evidence it is still there.
 /// * **Permissions are not carried over.** This replaces the target inode with
 ///   a freshly created file, so an existing file's mode does not survive (a
-///   difference from the `fs::write` it usually replaces). Every current caller
-///   writes non-sensitive state into a directory `AppPaths` already restricts;
-///   a permission-sensitive caller would need this to set the mode explicitly.
+///   difference from the `fs::write` it usually replaces), and the new file gets
+///   whatever the umask allows. What makes that acceptable today is only that
+///   every current caller writes non-sensitive state — *not* the containing
+///   directory, which `AppPaths::ensure` creates with plain `create_dir_all` and
+///   no mode of its own. A caller with something sensitive to write must set the
+///   mode explicitly here; it cannot lean on the directory.
 /// * **A symlink at `path` is replaced, not written through.** The publish is a
 ///   rename onto `path` itself, so a symlink there is what gets replaced — where
 ///   `fs::write` would have followed it and overwritten the target. That is the
@@ -8069,6 +8075,48 @@ mod tests {
             leftover_scratch_files(&root).is_empty(),
             "a successful publish must leave no scratch file: {:?}",
             leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Unix: needs a real symlink.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_replaces_a_symlink_instead_of_writing_through_it() {
+        // Documented behaviour, and a change from the `fs::write` this replaced:
+        // that followed a symlink and overwrote whatever it pointed at, while
+        // the publish here renames onto the path itself. Security-relevant in
+        // the safe direction — planting a link next to a state file can no
+        // longer redirect the write somewhere else — but a change, so it is
+        // pinned rather than left as prose.
+        let root = atomic_write_root("symlink-target");
+        let elsewhere = root.join("elsewhere");
+        fs::write(&elsewhere, b"must not be touched").expect("seed the link target");
+        let target = root.join("state.json");
+        std::os::unix::fs::symlink(&elsewhere, &target).expect("plant a symlink at the target");
+
+        write_file_atomically(&target, b"published").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&elsewhere).expect("read the link target"),
+            b"must not be touched",
+            "the write must not follow the symlink to its target"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read the published file"),
+            b"published",
+            "the published bytes must land at the path itself"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .expect("stat the published path")
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a regular file"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "no scratch file may survive a successful publish"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -8347,11 +8395,17 @@ mod tests {
         // mid-unload, lists nothing while holding the port and the GPU, and
         // reading that as "not ours" removes the tooling out from under it.
         //
-        // Two connections: an empty list, then a list naming a different model.
+        // Four connections: an empty list and a stranger's list, asked twice —
+        // once through the enum, once through the bool wrapper. The wrapper is
+        // where the three-way answer collapses back to the readiness contract
+        // every existing caller depends on, and that single comparison is not
+        // pinned by asserting on the enum alone.
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         let server = std::thread::spawn(move || -> Result<()> {
-            for body in [r#"{"data":[]}"#, r#"{"data":[{"id":"someone/else"}]}"#] {
+            let empty = r#"{"data":[]}"#;
+            let stranger = r#"{"data":[{"id":"someone/else"}]}"#;
+            for body in [empty, stranger, empty, stranger] {
                 let (mut stream, _) = listener.accept()?;
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut buffer = [0_u8; 512];
@@ -8386,6 +8440,29 @@ mod tests {
             )?,
             EndpointIdentity::ServesOtherModels,
             "a list that names other models is the only real evidence of a stranger"
+        );
+
+        // Across the wrapper. Only `ServesExpectedModel` may read as ready:
+        // mapping either of the other two arms to `true` would tell every
+        // readiness caller that an endpoint listing nothing, or listing a
+        // stranger's model, is serving theirs.
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint listing nothing is not serving our model"
+        );
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint serving a stranger's model is not serving ours"
         );
 
         server.join().expect("server thread should not panic")?;

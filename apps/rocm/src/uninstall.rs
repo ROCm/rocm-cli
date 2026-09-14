@@ -201,13 +201,23 @@ mod tests {
         .expect_err("an unstopped background helper must abort uninstall");
 
         let message = format!("{error:#}");
+        // Assert on text the GATE owns, not on the strings this test handed it.
+        // The service id and reason above are folded into the detail whatever
+        // the remedy is, so asserting they appear only proves the input reached
+        // the output — it passes with the remedy swapped to the service variant,
+        // which would leave this remedy branch unexercised while reading as its
+        // coverage. The daemon remedy's own sentence is what distinguishes it.
         assert!(
-            message.contains("rocmd (pid 4321)"),
-            "the abort names the pid the operator has to kill: {message}"
+            message.contains("restarts managed services on its own"),
+            "the abort must carry the daemon remedy, not a generic one: {message}"
         );
         assert!(
-            message.contains("background helper"),
-            "the abort explains it is the helper, not a service: {message}"
+            !message.contains("rocm services stop <id> --yes"),
+            "the daemon is not a service, so the service remedy must not be offered: {message}"
+        );
+        assert!(
+            message.contains("rocmd (pid 4321)"),
+            "the abort still names which helper: {message}"
         );
         assert!(
             doomed.is_file(),
@@ -240,43 +250,89 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Assert `child` exits within `grace`, and say so if it does not.
-    ///
-    /// NOT `wait()`. The stand-in these tests spawn exits on its own after a
-    /// minute, so an unbounded `wait()` blocks until that happens and then finds
-    /// the process gone — passing whether or not uninstall killed anything. It
-    /// measures "did it eventually die", which the stand-in guarantees. Polling
-    /// against a deadline measures "did it die *now*", which is the claim.
-    ///
-    /// The kill-and-reap on the failure path keeps a failing assertion from
-    /// leaking the child for the life of the test binary.
+    // The bounded-exit assertion and its budget are shared with the crate root's
+    // test module rather than copied here. Two near-identical copies, carrying
+    // near-identical comments, is exactly what made it easy to believe both
+    // process-based tests were bounded when only one of them actually was.
     #[cfg(target_os = "linux")]
-    fn assert_exits_within(
-        child: &mut std::process::Child,
-        grace: std::time::Duration,
-        message: &str,
-    ) {
-        let deadline = std::time::Instant::now() + grace;
-        let exited = loop {
-            match child.try_wait().expect("failed to poll the managed server") {
-                Some(_) => break true,
-                None if std::time::Instant::now() >= deadline => break false,
-                None => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        };
-        if !exited {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        assert!(exited, "{message}");
-    }
+    use crate::tests::assert_stopped_within_grace;
 
-    /// How long the assertion above allows. Uninstall waits out its own bounded
-    /// stop grace per recorded process, so this has to exceed that — but stay
-    /// far below the stand-in's own lifetime, or the test goes back to measuring
-    /// nothing.
+    /// Linux-only: needs a real spawned stand-in and `process_start_ticks`.
     #[cfg(target_os = "linux")]
-    const STOP_ASSERTION_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+    #[test]
+    fn a_cache_only_uninstall_leaves_a_live_server_running() {
+        // The other direction of the recovery-tooling predicate, pinned through
+        // the command rather than on the predicate alone. `--keep-binaries
+        // --keep-data` leaves `rocm services stop` and every service record in
+        // place, so there is nothing to protect by force-stopping a live server
+        // — and doing it anyway would kill a user's running model for a run that
+        // only clears a cache.
+        //
+        // Unit tests already assert `plan_removes_recovery_tooling` is false for
+        // a cache-only plan, but nothing checked the wiring: forcing that
+        // predicate true left every other test green, because they all uninstall
+        // something that *does* remove the tooling.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-cache-only-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        fs::write(paths.cache_dir.join("blob"), b"cached").expect("seed a cache file");
+
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn the managed server");
+        let pid = server.id();
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-cache-only",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            UNSERVABLE_PORT,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("failed to write the service record");
+
+        super::uninstall_with_paths(
+            &paths,
+            &crate::UninstallOptions {
+                yes: true,
+                keep_binaries: true,
+                keep_data: true,
+                ..crate::UninstallOptions::default()
+            },
+        )
+        .expect("a cache-only uninstall must succeed");
+
+        assert!(
+            server.try_wait().expect("poll the server").is_none(),
+            "a cache-only uninstall must not stop a live managed server"
+        );
+        assert!(
+            record.manifest_path.is_file(),
+            "a cache-only uninstall keeps the service records"
+        );
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn removal_proceeds_once_every_managed_server_is_confirmed_stopped() {
@@ -306,13 +362,26 @@ mod tests {
         // The whole ordering, driven through the real stop pass rather than an
         // injected report: a live server dies first, and only then do the files
         // go.
-        let (root, plan) = plan_removing_one_file("live-server");
+        //
+        // The mutation this is sensitive to is the ordering inversion — running
+        // the removal loop before the stop pass. That only bites because the
+        // plan below also removes the *services directory*: remove-first deletes
+        // the record, so the stop pass then finds nothing to stop, the stand-in
+        // survives its deadline and the assertion fails. With the plan removing
+        // only an unrelated file (as it did originally) the record survived the
+        // inversion, the stop still ran, and this test passed under exactly the
+        // defect it claims to guard.
+        let (root, mut plan) = plan_removing_one_file("live-server");
         let doomed = plan.actions[0].path.clone();
         let paths = rocm_core::AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
             cache_dir: root.join("cache"),
         };
+        plan.actions.push(crate::UninstallPlanEntry {
+            kind: "data",
+            path: paths.data_dir.join("services"),
+        });
         let child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -347,9 +416,8 @@ mod tests {
         // and bounded, so this pins that uninstall killed it rather than that it
         // outlived the test.
         let mut child = child;
-        assert_exits_within(
+        assert_stopped_within_grace(
             &mut child,
-            STOP_ASSERTION_GRACE,
             "the managed server must be stopped by uninstall",
         );
         assert!(
@@ -434,9 +502,8 @@ mod tests {
         .expect("uninstall should succeed once the server is stopped");
 
         let mut server = server;
-        assert_exits_within(
+        assert_stopped_within_grace(
             &mut server,
-            STOP_ASSERTION_GRACE,
             "`rocm uninstall` must stop the server it manages",
         );
         assert!(
