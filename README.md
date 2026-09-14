@@ -293,11 +293,15 @@ Manage multiple side-by-side ROCm installs:
 rocm runtimes list
 rocm runtimes activate <runtime-key>
 rocm runtimes rollback
-rocm runtimes uninstall <runtime-key>
+rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`uninstall` prompts for confirmation unless `--yes` is passed; outside an
+interactive terminal `--yes` is required. `--dry-run` prints the plan and
+exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,

@@ -6779,6 +6779,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
+            let waited_on_confirmation = !yes;
             if !yes {
                 if !interactive_terminal() {
                     bail!("runtimes uninstall requires --yes outside an interactive terminal");
@@ -6789,6 +6790,11 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 }
             }
 
+            let plan = if waited_on_confirmation {
+                revalidate_runtime_uninstall_plan(&paths, &config, plan)?
+            } else {
+                plan
+            };
             let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
             println!("runtime removed");
             println!("  runtime_id: {}", result.runtime_id);
@@ -7248,6 +7254,32 @@ fn plan_runtime_uninstall(
         was_active,
         install_root_decision,
     })
+}
+
+/// Re-derives the uninstall plan from disk and refuses to proceed if it no
+/// longer matches what the user approved. The interactive confirmation this
+/// guards can wait indefinitely; if another process activates a different
+/// runtime or replaces the install folder while the prompt is open, applying
+/// the stale plan could clear the wrong `active_runtime_key` or recursively
+/// delete a folder that is no longer the one that was vetted as safe to
+/// remove.
+fn revalidate_runtime_uninstall_plan(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallPlan> {
+    let fresh = plan_runtime_uninstall(paths, config, &plan.manifest.runtime_key)?;
+    if fresh.manifest.runtime_id != plan.manifest.runtime_id
+        || fresh.was_active != plan.was_active
+        || fresh.install_root_decision != plan.install_root_decision
+    {
+        bail!(
+            "runtime state for {} changed while waiting for confirmation; re-run `rocm runtimes uninstall {}` to review the current plan before approving it",
+            plan.manifest.runtime_key,
+            plan.manifest.runtime_key
+        );
+    }
+    Ok(fresh)
 }
 
 fn uninstall_runtime(
@@ -11992,13 +12024,17 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("runtimes")
-            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove")
                 && args.iter().any(|arg| arg == "--dry-run") =>
         {
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("runtimes")
-            if second.as_deref().is_some_and(|value| value == "uninstall" || value == "remove") =>
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove") =>
         {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
