@@ -760,6 +760,12 @@ jobs:
             Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
+          # GitHub's own PowerShell step wrapper fails the step on ANY non-zero
+          # $LASTEXITCODE left over at script end, regardless of whether our
+          # own `if` above already decided to tolerate it (observed on run
+          # 34831206409: the already-installed code above was correctly
+          # skipped, and the step still failed). Force it back to zero.
+          exit 0
 
       - name: Install Ubuntu-24.04 distro
         shell: powershell
