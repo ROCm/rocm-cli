@@ -884,12 +884,15 @@ jobs:
       # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
       # of these steps — this job mirrors it exactly, minus the scoped
       # name_filter dispatch input this workflow doesn't have.
+      # See e2e-wsl's own comment: winget returns
+      # APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (0x8A15002B) rather than
+      # success when the package is already installed and up to date.
       - name: Install WSL (pinned Microsoft.WSL)
         shell: powershell
         run: |
           winget install --id Microsoft.WSL --exact --silent `
             --accept-package-agreements --accept-source-agreements
-          if ($LASTEXITCODE -ne 0) {
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
             Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
@@ -1072,6 +1075,8 @@ jobs:
             cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
           fi
           "@ | wsl -d Ubuntu-24.04 -u root -- bash
+          # Best-effort per the step name: see e2e-wsl in e2e-selfhosted.yml.
+          exit 0
 
       - name: Upload E2E report
         if: always()
