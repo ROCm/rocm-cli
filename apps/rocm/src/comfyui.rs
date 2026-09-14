@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, Read, Write as IoWrite};
+use std::io::{self, IsTerminal, Read, Write as IoWrite};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -362,7 +362,9 @@ pub(crate) fn install(
             uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
             Some(&runtime_env),
             &mut log,
+            &log_path,
             "install ComfyUI dependencies",
+            "Resolving and installing packages with uv…",
         )?;
     }
 
@@ -1545,13 +1547,16 @@ fn write_torch_constraints(
     Ok(Some(path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_uv_logged_command(
     paths: &AppPaths,
     uv: &Path,
     args: Vec<String>,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
     log: &mut fs::File,
+    log_path: &Path,
     context_text: &str,
+    spinner_label: &str,
 ) -> Result<()> {
     writeln!(
         log,
@@ -1591,6 +1596,13 @@ fn run_uv_logged_command(
     let stderr_log = log
         .try_clone()
         .context("failed to clone ComfyUI install log for stderr")?;
+    // `AnimatedSpinner` (see cli_progress.rs) is TTY-gated and a hard no-op off
+    // a terminal, so on its own a piped/CI install would print nothing for the
+    // entire uv resolve, indistinguishable from a hang. `stream_logged_output`
+    // below is the off-TTY fallback: it tees the child's stdout/stderr through
+    // to our real stdout/stderr whenever stderr isn't a terminal, so a
+    // non-interactive install still shows live progress.
+    let spinner = AnimatedSpinner::start(spinner_label);
     let stdout_thread =
         thread::spawn(move || stream_logged_output(stdout, stdout_log, OutputTarget::Stdout));
     let stderr_thread =
@@ -1606,12 +1618,18 @@ fn run_uv_logged_command(
         .join()
         .map_err(|_| anyhow::anyhow!("{context_text}: stderr reader failed"))?
         .context("failed to stream command stderr")?;
+    drop(spinner);
     if status.success() {
         return Ok(());
     }
-    bail!("{context_text}: uv exited with {status}");
+    bail!(
+        "{context_text}: uv exited with {status}; see {} for details",
+        log_path.display()
+    );
 }
 
+/// Which real stream a `stream_logged_output` reader mirrors to when not
+/// attached to a terminal.
 enum OutputTarget {
     Stdout,
     Stderr,
@@ -1622,6 +1640,10 @@ fn stream_logged_output<R: Read>(
     mut log: fs::File,
     target: OutputTarget,
 ) -> io::Result<()> {
+    // When stderr is a terminal, the `AnimatedSpinner` is the progress signal
+    // and raw uv output would visually clash with it, so only tee through
+    // when we're not attached to one (piped output, CI, etc).
+    let tee = !io::stderr().is_terminal();
     let mut buffer = [0_u8; 8192];
     loop {
         let len = reader.read(&mut buffer)?;
@@ -1629,16 +1651,18 @@ fn stream_logged_output<R: Read>(
             break;
         }
         log.write_all(&buffer[..len])?;
-        match target {
-            OutputTarget::Stdout => {
-                let mut stdout = io::stdout().lock();
-                stdout.write_all(&buffer[..len])?;
-                stdout.flush()?;
-            }
-            OutputTarget::Stderr => {
-                let mut stderr = io::stderr().lock();
-                stderr.write_all(&buffer[..len])?;
-                stderr.flush()?;
+        if tee {
+            match target {
+                OutputTarget::Stdout => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(&buffer[..len])?;
+                    stdout.flush()?;
+                }
+                OutputTarget::Stderr => {
+                    let mut stderr = io::stderr().lock();
+                    stderr.write_all(&buffer[..len])?;
+                    stderr.flush()?;
+                }
             }
         }
     }
@@ -1896,6 +1920,45 @@ mod tests {
             !without_pin.iter().any(|arg| arg == "--constraint"),
             "no --constraint expected when nothing to pin: {without_pin:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_uv_logged_command_reports_concrete_log_path_on_failure() -> Result<()> {
+        // `rocm comfyui logs` can still find this run's log via a directory
+        // scan even without a saved manifest, but naming the path directly
+        // in the error is more precise and needs no second command.
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("comfyui-uv-failure");
+        fs::create_dir_all(&paths.cache_dir)?;
+        let uv_path = paths.cache_dir.join("fake-uv");
+        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
+
+        let log_path = paths.cache_dir.join("install.log");
+        let mut log = fs::File::create(&log_path)?;
+
+        let error = run_uv_logged_command(
+            &paths,
+            &uv_path,
+            vec!["pip".to_owned(), "install".to_owned()],
+            None,
+            &mut log,
+            &log_path,
+            "install ComfyUI dependencies",
+            "Resolving and installing packages with uv…",
+        )
+        .expect_err("uv exiting non-zero should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&log_path.display().to_string()),
+            "error should name the concrete log path so a failed install's log stays discoverable: {message}"
+        );
+
+        fs::remove_dir_all(&paths.cache_dir).ok();
+        Ok(())
     }
 
     #[test]
