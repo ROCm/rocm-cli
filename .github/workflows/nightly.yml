@@ -867,6 +867,10 @@ jobs:
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
     env:
+      # wsl.exe emits UTF-16 by default; without this its own error/status text
+      # comes back mangled when captured through PowerShell. Matches the
+      # ubuntu/WSL composite action's own env.
+      WSL_UTF8: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       # The Strix lanes share one physical machine, so a TUI frame that renders
@@ -893,6 +897,10 @@ jobs:
       - name: Install Ubuntu-24.04 distro
         shell: powershell
         run: |
+          # See e2e-wsl in e2e-selfhosted.yml: --shutdown first avoids
+          # wsl.exe's "the file cannot be accessed by the system" against a
+          # VM that is still mid-startup.
+          wsl --shutdown
           wsl --unregister Ubuntu-24.04 2>$null | Out-Null
           wsl --install Ubuntu-24.04 --web-download --no-launch
           if ($LASTEXITCODE -ne 0) {
