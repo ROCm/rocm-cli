@@ -3837,6 +3837,17 @@ fn managed_therock_python_executable(record: &TheRockFamilyManifest) -> Option<P
         .find(|candidate| candidate.is_file())
 }
 
+/// Version (e.g. `"10.0.0"`) of the active managed TheRock runtime.
+///
+/// Reflects the version recorded at install time. Returns `None` when there is no managed
+/// runtime (system or legacy ROCm) or the registry record predates version recording.
+pub fn active_managed_therock_version(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.version))
+}
+
 /// Pick the active managed TheRock runtime record: the one matching
 /// `config.active_runtime_key`, falling back to the most recently installed.
 fn select_active_managed_therock_record(
@@ -4098,6 +4109,8 @@ struct TheRockFamilyManifest {
     therock_family: Option<String>,
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
@@ -10562,6 +10575,98 @@ Class Name:                Display
                 "runtime_id": format!("therock-{channel}:{name}"),
                 "family": "gfx120X-all",
                 "channel": channel,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_reads_recorded_version() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "version": "10.0.0",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_is_none_without_runtime() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-none");
+        let config = RocmCliConfig::default();
+        assert_eq!(active_managed_therock_version(&paths, &config)?, None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_falls_back_to_most_recent() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // No active_runtime_key set: the most recently installed runtime wins.
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_prefers_active_runtime_key() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-active-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // The active key points at the older runtime, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("therock-release:older".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("7.13.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_therock_version_record(
+        registry: &Path,
+        name: &str,
+        version: &str,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": format!("therock-release:{name}"),
+                "family": "gfx120X-all",
+                "version": version,
                 "installed_at_unix_ms": installed_at_unix_ms,
                 "rocm_sdk": { "import_ok": true }
             }))?,
