@@ -1943,6 +1943,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
+            if !apply && !dry_run && (runtime.is_some() || activate) {
+                bail!(
+                    "--runtime and --activate require --apply or --dry-run; \
+                     run `rocm update --dry-run` to preview or add --apply to update"
+                );
+            }
             if update_should_preview_or_apply(apply, dry_run) {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
@@ -6822,6 +6828,10 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                     println!("runtime uninstall cancelled");
                     return Ok(());
                 }
+                // Reload from disk: the registry or config can change while a
+                // human is staring at the confirmation prompt, and re-planning
+                // against the stale in-memory config would miss it.
+                config = RocmCliConfig::load(&paths)?;
                 let reconfirmed_plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
                 if !runtime_uninstall_plan_matches(&plan, &reconfirmed_plan) {
                     bail!(
