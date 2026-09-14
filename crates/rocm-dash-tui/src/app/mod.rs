@@ -1678,18 +1678,21 @@ fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
     if runtimes.is_empty() {
         return UpdateStatus::NoManagedRuntimes;
     }
-    if let Some(latest_version) = runtimes.iter().find_map(|row| {
+    if let Some(row) = runtimes.iter().find(|row| {
         matches!(
             status_of(row),
             Some("update_available" | "repair_available")
         )
-        .then(|| {
-            row.get("latest_version")
-                .and_then(serde_json::Value::as_str)
-        })
-        .flatten()
-        .map(str::to_owned)
     }) {
+        // A missing/null `latest_version` must not silently fall through to
+        // the up-to-date/error checks below — that would misreport a real,
+        // actionable update as "check failed". Fall back to a placeholder
+        // instead of losing the actionable status.
+        let latest_version = row
+            .get("latest_version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
         return UpdateStatus::UpdateAvailable { latest_version };
     }
     if runtimes
@@ -1710,7 +1713,11 @@ fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
 fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::SideEffect> {
     if state.update_status_pending {
         let Some(job) = state.jobs.job(HOME_UPDATE_CHECK_JOB_ID) else {
+            // Re-arm the same as the terminal-job path below: without this,
+            // a vanished job would leave `update_check_due_at` in the past,
+            // so every subsequent tick would spawn a new check immediately.
             state.update_status_pending = false;
+            state.update_check_due_at = std::time::Instant::now() + UPDATE_CHECK_INTERVAL;
             return Vec::new();
         };
         if !job.is_terminal() {
@@ -6988,6 +6995,28 @@ mod tests {
     }
 
     #[test]
+    fn refresh_update_status_rearms_due_at_when_pending_job_vanishes() {
+        let _guard = UPDATE_CHECK_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = st();
+        let _ = refresh_update_status(&mut s);
+        assert!(s.update_status_pending);
+
+        // Not reachable today (jobs are never removed), but if it ever is,
+        // `update_check_due_at` must still be pushed out — otherwise every
+        // subsequent tick would spawn a new check immediately.
+        s.jobs.jobs.remove(HOME_UPDATE_CHECK_JOB_ID);
+        let fx = refresh_update_status(&mut s);
+        assert!(fx.is_empty());
+        assert!(!s.update_status_pending);
+        assert!(
+            s.update_check_due_at > std::time::Instant::now(),
+            "due_at must be re-armed, not left in the past"
+        );
+    }
+
+    #[test]
     fn refresh_update_status_resolves_from_terminal_success_json() {
         let _guard = UPDATE_CHECK_ENV_TEST_LOCK
             .lock()
@@ -7162,6 +7191,22 @@ mod tests {
             reduce_update_json(&doc),
             UpdateStatus::UpdateAvailable {
                 latest_version: "6.4.0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn reduce_update_json_missing_latest_version_is_still_update_available() {
+        // A row with an actionable status but no `latest_version` must not be
+        // silently skipped in favor of the up-to-date/error checks below it —
+        // that would misreport a real update as "check failed".
+        let doc = serde_json::json!({
+            "runtimes": [{"status": "update_available"}]
+        });
+        assert_eq!(
+            reduce_update_json(&doc),
+            UpdateStatus::UpdateAvailable {
+                latest_version: "unknown".to_owned()
             }
         );
     }
