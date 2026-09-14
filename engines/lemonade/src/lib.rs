@@ -1223,8 +1223,7 @@ fn prepare_llamacpp_backend_for_active_rocm(
     };
 
     let backend_versions_path = manifest.runtime_dir.join(BACKEND_VERSIONS_RESOURCE);
-    let Some(pinned_version) = read_backend_versions_therock_version(&backend_versions_path)
-    else {
+    let Some(pinned_version) = read_backend_versions_therock_version(&backend_versions_path) else {
         install_best_llamacpp_backend(manifest, false)?;
         return Ok(None);
     };
@@ -1244,8 +1243,12 @@ fn prepare_llamacpp_backend_for_active_rocm(
     // Tier 1: keep Lemonade's own pinned llama.cpp build, just point it at the active
     // ROCm version. Works when that specific build's release actually shipped a
     // matching ROCm-version asset.
-    if try_llamacpp_backend_alignment(manifest, &target_version, false, "its pinned llama.cpp build")
-    {
+    if try_llamacpp_backend_alignment(
+        manifest,
+        &target_version,
+        false,
+        "its pinned llama.cpp build",
+    ) {
         return Ok(Some(target_version));
     }
 
@@ -1273,14 +1276,17 @@ fn prepare_llamacpp_backend_for_active_rocm(
         // The pinned tag already is the latest — Tier 1 already tried it.
         Ok(_) => false,
         Err(error) => {
-            eprintln!(
-                "Warning: could not determine Lemonade's latest llama.cpp build: {error:#}"
-            );
+            eprintln!("Warning: could not determine Lemonade's latest llama.cpp build: {error:#}");
             false
         }
     };
     if latest_tag_applied
-        && try_llamacpp_backend_alignment(manifest, &target_version, true, "the latest llama.cpp build")
+        && try_llamacpp_backend_alignment(
+            manifest,
+            &target_version,
+            true,
+            "the latest llama.cpp build",
+        )
     {
         return Ok(Some(target_version));
     }
@@ -1315,7 +1321,8 @@ fn try_llamacpp_backend_alignment(
 ) -> bool {
     let install_result = install_best_llamacpp_backend(manifest, force_reinstall);
     let has_usable_binary = lemonade_process_environment().is_ok_and(|process_env| {
-        find_llama_server_binary(manifest).is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
+        find_llama_server_binary(manifest)
+            .is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
     });
     if !has_usable_binary {
         match install_result {
@@ -4922,7 +4929,11 @@ mod tests {
     fn backend_versions_therock_version_missing_object_is_an_error() {
         let dir = scratch_dir("backend-versions-missing-therock");
         let path = dir.join("backend_versions.json");
-        fs::write(&path, serde_json::to_vec_pretty(&json!({"llamacpp": {}})).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({"llamacpp": {}})).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(read_backend_versions_therock_version(&path), None);
         assert!(write_backend_versions_therock_version(&path, "10.0.0").is_err());
@@ -4968,7 +4979,11 @@ mod tests {
     fn backend_versions_llamacpp_tag_missing_object_is_an_error() {
         let dir = scratch_dir("backend-versions-missing-llamacpp");
         let path = dir.join("backend_versions.json");
-        fs::write(&path, serde_json::to_vec_pretty(&json!({"therock": {}})).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({"therock": {}})).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(read_backend_versions_llamacpp_tag(&path), None);
         assert!(write_backend_versions_llamacpp_tag(&path, "b10952").is_err());
@@ -4984,7 +4999,10 @@ mod tests {
 \tlibrocblas.so.5 => /opt/rocm/lib/librocblas.so.5 (0x00007f2)\n\
 \tlibamdhip64.so.7 => /opt/rocm/lib/libamdhip64.so.7 (0x00007f3)\n\
 \tlibhsa-runtime64.so.1 => /opt/rocm/lib/libhsa-runtime64.so.1 (0x00007f4)\n";
-        assert!(ldd_output_resolves_all(resolved, &ROCM_BACKEND_REQUIRED_SONAMES));
+        assert!(ldd_output_resolves_all(
+            resolved,
+            &ROCM_BACKEND_REQUIRED_SONAMES
+        ));
 
         let missing_one = "\
 \tlibhipblas.so.3 => not found\n\
