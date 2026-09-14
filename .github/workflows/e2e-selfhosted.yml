@@ -799,6 +799,12 @@ jobs:
       - name: Verify the host really is WSL2
         shell: powershell
         run: |
+          # Windows PowerShell prepends a UTF-8 BOM when piping a string to a
+          # native process's stdin by default, which lands as the first bytes
+          # bash reads — breaking `proc_version=...`'s assignment syntax and
+          # making bash treat the whole line as a (nonexistent) command
+          # (observed on run 34832369689's re-run). BOM-less UTF8 fixes it.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           @'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
@@ -819,6 +825,8 @@ jobs:
       - name: Ensure native build deps
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           @'
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -833,6 +841,8 @@ jobs:
       - name: Clone checkout into the WSL guest's native filesystem
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
           $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
           $script = @"
@@ -856,6 +866,8 @@ jobs:
       - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           @'
           set -eo pipefail
           cd /root/work/rocm-cli
@@ -880,6 +892,8 @@ jobs:
       - name: GPU preflight (advisory bounded wait)
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           @'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
@@ -924,6 +938,8 @@ jobs:
       - name: Ensure Rust toolchain
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           @'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
@@ -935,6 +951,8 @@ jobs:
       - name: Run E2E tests on Strix Halo WSL2
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
@@ -992,6 +1010,8 @@ jobs:
         if: always()
         shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
           @"
           mkdir -p '$winPath/tests/e2e-cucumber/results'
