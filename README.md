@@ -262,8 +262,9 @@ recognised", not "nothing is wrong" — in that case it points you at where to
 report the symptom. Each result prints an `id:` and an `apply with:` command;
 the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position. `--symptom` takes raw error text to
-sharpen keyword scoring; `--top` caps how many matches are shown (default 5);
-`--json` emits a machine-readable report; `--distro` diagnoses a WSL
+sharpen keyword scoring; `--top` caps how many matches are shown in the
+human-readable output (default 5) — `--json` always emits the full,
+untruncated report; `--distro` diagnoses a WSL
 distribution from the Windows host instead of this machine (nothing needs to
 be installed inside the distribution — name it only when more than one is
 installed).
@@ -275,7 +276,9 @@ name. Run it with no id to list the whole catalog. Each fix is marked AUTO
 you to run yourself, typically because they need sudo or a reboot). Use
 `--dry-run` to see any fix's plan without changing anything, and `--yes` to
 skip the interactive confirmation once you've reviewed it. `--device-index`
-is only used by `fix-9-igpu-dgpu`, to pin the discrete GPU index.
+pins the discrete GPU index for `fix-9-igpu-dgpu`; without it, that fix only
+prints the `rocminfo` query needed to find the index and makes no change,
+despite being marked AUTO.
 
 ### ROCm installation
 
@@ -488,8 +491,12 @@ plain host address without `/v1` also works). `--concurrency` sweeps a
 comma-separated list of levels (default `1,8,32,64`); `--auto-ramp` ignores
 `--concurrency` and instead ramps `1,2,4,8,16,32,64,128` automatically,
 stopping early once generation throughput plateaus or the request queue backs
-up. Results are written to `--out` (default `~/.rocm/bench/results.csv`), the
-same path the daemon tails to feed the dashboard's **Observe** tab.
+up. Results are written to `--out` (default `<data-dir>/bench/results.csv`,
+where `<data-dir>` is `~/.rocm` unless overridden), intended to match the path
+the daemon tails to feed the dashboard's **Observe** tab. The two are computed
+independently, so if either the CLI's data dir or the daemon's
+`bench_results_dir` config has been customized, confirm they still point at
+the same file.
 
 ### Chat
 
@@ -557,8 +564,10 @@ rocm setup reset
 ```
 
 Manage first-time setup state. `status` shows whether first-time setup has
-completed; `reset` clears it so the next TUI launch shows first-time setup
-again — useful to redo onboarding after a big configuration change.
+completed; `reset` clears the recorded completed/dismissed state (the launcher
+does not currently re-trigger onboarding from this alone — open it manually
+with the launcher's `n` key or `rocm setup status` to check where things
+stand). ROCm installs, API keys, and provider settings are left untouched.
 
 ### Logs and cleanup
 
