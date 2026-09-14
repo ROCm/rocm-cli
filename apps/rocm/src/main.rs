@@ -938,7 +938,9 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Reset setup so the next TUI launch shows first-time setup again.
+    /// Clear recorded setup completion/dismissal state (does not by itself
+    /// re-trigger onboarding in the TUI; open it manually from `rocm dash`'s
+    /// Observe tab with `n`).
     Reset,
 }
 
