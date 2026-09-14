@@ -1073,10 +1073,12 @@ jobs:
           # the next job even though the container is not.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # A SEPARATE volume is mounted at exactly this path by the runner's
-          # deployment. Keeping the ~23GB uv cache off the work volume is
-          # deliberate; if you change this path, change that deployment too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the directory the runner's uv-cache-gc
+          # initContainer bounds — see the e2e-gpu lane for both mechanisms and
+          # why a cache one level deeper keeps the links but loses the floor.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Pre-warm one shared runtime in place before the suite. Not an
           # optimization — `install sdk` bakes absolute paths into the runtime
           # manifest, so installing anywhere temporary breaks every later serve.

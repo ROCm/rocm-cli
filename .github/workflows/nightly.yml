@@ -617,9 +617,11 @@ jobs:
           # away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Separate volume mounted at exactly this path by the runner's
-          # deployment; if you change this path, change that deployment too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
