@@ -9492,23 +9492,17 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
         path.parent()
             .context("active runtime marker path has no parent directory")?,
     )?;
-    let tmp_path = path.with_extension(format!("json.tmp-{}", rocm_core::unix_time_millis()));
-    fs::write(
-        &tmp_path,
-        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
-    )
-    .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
-    fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "failed to move active runtime marker {} into {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    // The shared helper, not a local delete-then-rename. Removing the target
+    // first opens a window in which the marker simply does not exist — a reader
+    // in it concludes no runtime is active — and the old scratch name carried
+    // only a millisecond stamp, so two writers in the same millisecond picked
+    // the same file. `write_file_atomically` reserves its scratch name with
+    // `create_new` and publishes over the target in one step (`ReplaceFileW` on
+    // Windows), so neither window exists.
+    let bytes =
+        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
+    rocm_core::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn config(command: ConfigCommand) -> Result<()> {
@@ -15685,9 +15679,7 @@ fn stop_background_helper_before_uninstall(
     // so a PID that flickered could clear one check and fail the other.
     let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
     let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
-    let platform_reads_start_ticks = rocm_core::process_start_ticks(std::process::id()).is_some();
-    let unverifiable_pre_upgrade_record =
-        state.daemon_start_ticks.is_none() && platform_reads_start_ticks;
+    let unverifiable_pre_upgrade_record = record_predates_start_ticks(state.daemon_start_ticks);
     match rocm_core::identity_state_with_observed(&identity, observed_start_ticks) {
         rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled => {
             // Nothing of ours is running: either the PID is free or it now
@@ -15761,7 +15753,12 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
     // failure returns here, and an unparseable manifest (which can perfectly
     // well describe a live, GPU-holding server) is collected up front rather
     // than after every other service is already down.
-    stop_background_helper_before_uninstall(paths, &mut report);
+    //
+    // The manifest scan goes first because it is the only one of the two that
+    // costs nothing: it reads the services directory and signals nothing. The
+    // helper stop is itself destructive — it force-kills a process tree — so
+    // running it ahead of a read that can doom the run would terminate a live,
+    // perfectly verifiable `rocmd` for an uninstall that then removes nothing.
     for manifest in unreadable_service_manifests(paths)? {
         report.failed.push(FailedManagedServiceStop {
             // The full path, not the file name: the only remedy is to act on the
@@ -15773,6 +15770,10 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             remedy: StopFailureRemedy::RepairTheRecord,
         });
     }
+    if !report.failed.is_empty() {
+        return Ok(report);
+    }
+    stop_background_helper_before_uninstall(paths, &mut report);
     if !report.failed.is_empty() {
         return Ok(report);
     }
@@ -16002,6 +16003,21 @@ fn probe_hosts(host: &str) -> Vec<String> {
         }
         _ => vec![normalized],
     }
+}
+
+/// Whether a record carrying no start-time predates the field, as opposed to
+/// coming from a platform that cannot report one.
+///
+/// Deliberately takes no PID, and that is the whole point of it being a function
+/// rather than two lines at the call site. The question is about the *platform*,
+/// and asking it of the process under inspection cannot tell "this OS has no
+/// `/proc`" from "that one read just failed" — a conflation that sends a legacy
+/// record down the best-effort `Matches` arm and force-kills a tree it never
+/// verified. Answering from our own PID has no such window: the process asking
+/// is, by construction, running. Keeping the target PID out of the signature
+/// makes that conflation unrepresentable here rather than merely avoided.
+fn record_predates_start_ticks(recorded_start_ticks: Option<u64>) -> bool {
+    recorded_start_ticks.is_none() && rocm_core::process_start_ticks(std::process::id()).is_some()
 }
 
 /// Whether `endpoint_url` answered the identity probe with an auth refusal.
@@ -31796,7 +31812,16 @@ ID_LIKE="suse opensuse"
         // that live, port-holding engine as gone and removes the tooling anyway,
         // which is EAI-8014 reached through the address family.
         let Some(endpoint) = ServingEndpoint::bind("amd/v6-model", "::1", false) else {
-            // No IPv6 on this host: the thing under test cannot be staged.
+            // No IPv6 on this host: the thing under test cannot be staged. Say
+            // so on stderr rather than returning green and silent — a skip that
+            // looks identical to a pass is how a lane stops covering something
+            // without anyone noticing. `every_wildcard_bind_spelling_is_probed_\
+            // on_both_loopback_families` still pins both families here, with no
+            // socket required.
+            eprintln!(
+                "SKIPPED an_ipv6_only_wildcard_engine_is_not_waved_through: no IPv6 loopback \
+                 on this host"
+            );
             return;
         };
         let (root, paths) = test_paths("uninstall-ipv6-wildcard-engine");
@@ -31962,13 +31987,26 @@ ID_LIKE="suse opensuse"
         // parsed may itself describe a live, GPU-holding server, so collecting
         // it last meant every other service was already down — and its key
         // already dropped — before the run turned out to be doomed.
+        //
+        // The daemon is staged live and fully verifiable here on purpose. It is
+        // the one thing the gate would otherwise still destroy on a doomed run:
+        // the manifest scan only reads, so putting the force-kill ahead of it
+        // terminates a healthy `rocmd` for an uninstall that removes nothing.
         let server = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .expect("spawn managed server");
         let pid = server.id();
+        let daemon = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn background helper");
+        let daemon_pid = daemon.id();
         let (root, paths) = test_paths("uninstall-bad-manifest-ordering");
         paths.ensure().expect("create the app directories");
+        let mut state = runtime_state(true, daemon_pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(daemon_pid);
+        state.write(&paths).expect("write runtime state");
         let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
         let mut record = managed_record_for_pid(&paths, pid, Some(real));
         record.status = "ready".to_owned();
@@ -31984,9 +32022,14 @@ ID_LIKE="suse opensuse"
             "an unparseable manifest must abort before anything is stopped: {report:?}"
         );
         let mut server = server;
+        let mut daemon = daemon;
         assert!(
             server.try_wait().expect("poll the server").is_none(),
             "the healthy service must be untouched when the run aborts on another record"
+        );
+        assert!(
+            daemon.try_wait().expect("poll the helper").is_none(),
+            "a live, verifiable rocmd must not be force-killed for a run that removes nothing"
         );
         assert!(
             report
@@ -31997,26 +32040,49 @@ ID_LIKE="suse opensuse"
         );
         let _ = server.kill();
         let _ = server.wait();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
         let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_platforms_start_tick_support_is_read_from_a_process_known_to_be_alive() {
-        // The discriminator the pre-upgrade guard rests on. "Can this OS report
-        // a start-time?" must not be answered by whether the *daemon's* reading
-        // succeeded: a `None` from that PID means either "no `/proc` here" or
-        // "that read failed", and taking the first for the second sends a legacy
-        // record down the best-effort `Matches` arm and force-kills a tree that
-        // was never verified.
+    fn a_legacy_record_is_recognised_even_when_the_recorded_pid_cannot_be_read() {
+        // The branch whose failure mode is "force-kill an unverified process
+        // tree", pinned at the decision instead of at its premise. The previous
+        // version of this test asserted only that this process can read its own
+        // start-time — true of stock Linux, untouched by this PR, and green
+        // against a full revert. It certified nothing while reading as coverage.
         //
-        // Our own PID has no such ambiguity — the process asking is running — so
-        // on a platform with `/proc` it always reports a start-time, and that is
-        // what makes it a sound answer to the platform question.
+        // `record_predates_start_ticks` has to answer "can this platform report
+        // a start-time?" independently of the PID under inspection. Reading the
+        // target instead cannot tell "no `/proc` on this OS" from "that read
+        // just failed", and a legacy record hitting the second case would look
+        // like Windows, take the best-effort `Matches` arm, and be killed.
+        //
+        // A reaped PID is the one reading that is genuinely unreadable on Linux
+        // while the platform plainly can report start-times, so it stages that
+        // conflation directly. The premise is asserted rather than assumed: if
+        // the number were recycled before we looked, this would be checking
+        // nothing, and it says so loudly instead of passing quietly.
+        let mut reaped = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a process to reap");
+        let reaped_pid = reaped.id();
+        reaped.wait().expect("reap it");
         assert!(
-            rocm_core::process_start_ticks(std::process::id()).is_some(),
-            "a live process must be able to read its own start-time on Linux, or the \
-             pre-upgrade guard's platform check is answering the wrong question"
+            rocm_core::process_start_ticks(reaped_pid).is_none(),
+            "a reaped pid must be unreadable for this test to stage anything"
+        );
+
+        assert!(
+            record_predates_start_ticks(None),
+            "a record with no start-time is a legacy record on a platform that can read them, \
+             whatever an unreadable target pid would have answered"
+        );
+        assert!(
+            !record_predates_start_ticks(Some(1)),
+            "a record that carries a start-time is never a pre-upgrade record"
         );
     }
 

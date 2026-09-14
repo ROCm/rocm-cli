@@ -7822,6 +7822,12 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> 
 ///   difference from the `fs::write` it usually replaces). Every current caller
 ///   writes non-sensitive state into a directory `AppPaths` already restricts;
 ///   a permission-sensitive caller would need this to set the mode explicitly.
+/// * **A symlink at `path` is replaced, not written through.** The publish is a
+///   rename onto `path` itself, so a symlink there is what gets replaced — where
+///   `fs::write` would have followed it and overwritten the target. That is the
+///   safer direction for state files (it cannot be aimed somewhere else by
+///   planting a link) but it is a behaviour change, so a caller that means to
+///   write through a link must resolve it first.
 pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
