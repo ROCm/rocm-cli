@@ -294,7 +294,8 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
 rocm update --apply --activate\n  \
-rocm update --apply --dry-run")]
+rocm update --apply --dry-run\n  \
+rocm update --json")]
     Update {
         /// Install the selected update instead of only checking.
         #[arg(long)]
@@ -1816,6 +1817,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             activate,
             dry_run,
             json,
+            timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
             if apply {
@@ -1871,7 +1873,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             if json {
-                match therock::render_update_json(&paths) {
+                match therock::render_update_json(&paths, timeout_secs) {
                     Ok(document) => {
                         println!("{}", serde_json::to_string(&document)?);
                         record_cli_audit_event(
@@ -15911,7 +15913,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);

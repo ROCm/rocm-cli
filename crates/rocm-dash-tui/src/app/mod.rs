@@ -1741,12 +1741,21 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
         return Vec::new();
     }
 
+    if std::env::var_os("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK").is_some() {
+        return Vec::new();
+    }
+
     let fx = state
         .jobs
         .apply(rocm_dash_core::state::StateEvent::StartJob {
             id: HOME_UPDATE_CHECK_JOB_ID.to_owned(),
             cmd: crate::ui::exec::resolve_exe(),
-            args: vec!["update".to_owned(), "--json".to_owned()],
+            args: vec![
+                "update".to_owned(),
+                "--json".to_owned(),
+                "--timeout-secs".to_owned(),
+                HOME_UPDATE_CHECK_TIMEOUT_SECS.to_string(),
+            ],
         });
     if !fx.is_empty() {
         state.update_status_pending = true;
