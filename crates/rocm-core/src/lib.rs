@@ -7925,10 +7925,15 @@ mod tests {
         // `a_service_record_write_never_shows_a_reader_a_truncated_manifest`,
         // which fails against an in-place write.
         //
-        // It still earns its place: the services directory must not accumulate
-        // scratch siblings, because `unreadable_service_manifests` treats stray
-        // files there as records it cannot parse — a leaked one would abort
-        // uninstall.
+        // It still earns its place, but for a smaller reason than uninstall:
+        // scratch siblings are named `<record>.json.tmp-<pid>-<millis>-<attempt>`,
+        // whose extension is `tmp-…`, and both `unreadable_service_manifests`
+        // and the record loader filter on `extension == "json"` — so a leaked
+        // one is skipped, not mistaken for a corrupt record, and cannot abort
+        // uninstall. What this guards is directory hygiene: a publish that
+        // aborts between staging and rename leaves litter that accumulates
+        // silently, one file per failed write, in a directory an operator reads
+        // by hand.
         let root = atomic_write_root("service-record-publish");
         let paths = AppPaths {
             config_dir: root.join("config"),

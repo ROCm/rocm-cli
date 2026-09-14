@@ -15655,17 +15655,25 @@ fn stop_background_helper_before_uninstall(
     // use there — otherwise uninstall could never stop a live daemon on those
     // platforms. That residual gap is documented on `daemon_start_ticks`.
     //
-    // One reading of the PID's start-time serves both questions below — whether
-    // this platform could have verified the record, and whether the live process
-    // is still the recorded one. Reading twice let the two answers come from
-    // different observations: a PID whose `/proc` entry was momentarily
-    // unreadable could clear the pre-upgrade check on one read and then take the
-    // legacy best-effort `Matches` arm on the other, force-killing a tree on the
-    // strength of a reading that never agreed with itself.
+    // Which platform this is gets answered by a process that is definitely
+    // alive — this one — rather than by whether the daemon's own reading
+    // happened to succeed. Asking the daemon's PID cannot tell "no `/proc` on
+    // this OS" from "that one read just failed", and those must not be
+    // conflated: on Linux a legacy record whose PID was momentarily unreadable
+    // would otherwise answer `None` to both, land in the best-effort `Matches`
+    // arm meant for Windows, and force-kill a tree on a record it never
+    // verified. Reading our own PID has no such window — if the platform can
+    // report a start-time at all, it reports ours.
+    //
+    // One reading of the *daemon's* start-time then serves the identity question
+    // below. Reading it twice let two answers come from different observations,
+    // so a PID that flickered could clear one check and fail the other.
     let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
     let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
+    let platform_reads_start_ticks =
+        rocm_core::process_start_ticks(std::process::id()).is_some();
     let unverifiable_pre_upgrade_record =
-        state.daemon_start_ticks.is_none() && observed_start_ticks.is_some();
+        state.daemon_start_ticks.is_none() && platform_reads_start_ticks;
     match rocm_core::identity_state_with_observed(&identity, observed_start_ticks) {
         rocm_core::IdentityState::Gone | rocm_core::IdentityState::Recycled => {
             // Nothing of ours is running: either the PID is free or it now
@@ -15843,19 +15851,27 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                         &probe_record.endpoint_url,
                         endpoint_api_key.as_deref(),
                     ) {
-                        // Listening but unidentifiable — a wedged engine, or
-                        // something that is not an OpenAI endpoint at all.
-                        // Aborting on this would put back the dead end that has
-                        // no override and no recovery, so the removal proceeds;
-                        // say so rather than deciding silently.
+                        // Listening but unidentifiable, and the causes are not
+                        // all dramatic: a wedged engine, something that is not
+                        // an OpenAI endpoint at all, a reply this cannot parse,
+                        // or a server erroring out on a key that has since been
+                        // rotated. (An outright refusal is not in this set — a
+                        // 401/403 is handled above and blocks.) Aborting on the
+                        // rest would put back the dead end that has no override
+                        // and no recovery, so the removal proceeds; the message
+                        // therefore has to describe what was actually seen
+                        // rather than assert a cause, because the operator is
+                        // the one who has to tell these apart.
                         //
                         // stderr, not stdout: this is the one fail-open left on
                         // a destructive path, so it must survive the operator
                         // piping uninstall's output somewhere.
                         eprintln!(
-                            "warning: {}:{} still accepts connections but did not identify \
-                             itself, and service {} is already recorded stopped — proceeding. \
-                             If that is a server of yours, stop whatever holds that port first.",
+                            "warning: {}:{} still accepts connections but did not answer the \
+                             identity probe with a usable model list, and service {} is already \
+                             recorded stopped — proceeding. That can be a wedged engine, an \
+                             unrelated server on the port, or a stale endpoint key. If it is a \
+                             server of yours, stop whatever holds that port first.",
                             record.host, record.port, record.service_id
                         );
                         continue;
@@ -31447,6 +31463,14 @@ ID_LIKE="suse opensuse"
         // bound it would fail uninstall deterministically, with no override and
         // no recovery — `rocm services stop` cannot help an already-stopped
         // record, so every retry would fail identically.
+        //
+        // Unlike its neighbours this one does NOT fail if the port probe is
+        // deleted, and that is deliberate rather than an oversight: it guards
+        // the opposite direction. The others pin that a live server blocks; this
+        // pins that a *stranger* does not, so it fails against a naive "any
+        // listener blocks" gate — the over-strict implementation the rest of
+        // this file's pressure pushes toward — and passes against no gate at
+        // all. It is a false-positive guard, so read it as one.
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("bind an unrelated process on a recycled port");
         let port = listener.local_addr().expect("socket address").port();
@@ -31796,6 +31820,26 @@ ID_LIKE="suse opensuse"
         );
         drop(endpoint);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_platforms_start_tick_support_is_read_from_a_process_known_to_be_alive() {
+        // The discriminator the pre-upgrade guard rests on. "Can this OS report
+        // a start-time?" must not be answered by whether the *daemon's* reading
+        // succeeded: a `None` from that PID means either "no `/proc` here" or
+        // "that read failed", and taking the first for the second sends a legacy
+        // record down the best-effort `Matches` arm and force-kills a tree that
+        // was never verified.
+        //
+        // Our own PID has no such ambiguity — the process asking is running — so
+        // on a platform with `/proc` it always reports a start-time, and that is
+        // what makes it a sound answer to the platform question.
+        assert!(
+            rocm_core::process_start_ticks(std::process::id()).is_some(),
+            "a live process must be able to read its own start-time on Linux, or the \
+             pre-upgrade guard's platform check is answering the wrong question"
+        );
     }
 
     // `sleep` as a stand-in for the process that inherited the pid.
