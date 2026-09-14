@@ -155,7 +155,10 @@ async fn cli_names_install_log(world: &mut E2eWorld) {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("install-") && name.ends_with(".log"))
+                .is_some_and(|name| name.starts_with("install-"))
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
         })
         .collect();
     assert!(
