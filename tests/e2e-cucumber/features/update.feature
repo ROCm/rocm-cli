@@ -18,3 +18,9 @@ Feature: Update report
     Given a machine with no managed runtimes
     When the user checks for updates as machine-readable JSON
     Then the machine-readable check reports no runtimes to update
+
+  @id:update-json-respects-timeout-secs
+  Scenario: update-03 - The machine-readable update check accepts a --timeout-secs bound
+    Given a machine with no managed runtimes
+    When the user checks for updates as machine-readable JSON with a 5 second timeout
+    Then the machine-readable check reports no runtimes to update

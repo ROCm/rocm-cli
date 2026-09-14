@@ -255,12 +255,15 @@ rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
+                    [--json] [--timeout-secs SECS]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
 native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it.
+install it. `--json` prints the check result as a single line of JSON instead
+of text; `--timeout-secs` bounds its network calls (both require `--json` and
+conflict with `--apply`).
 
 ### Runtime management
 
