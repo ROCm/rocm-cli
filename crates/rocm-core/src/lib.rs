@@ -603,6 +603,27 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let parts = http_get_with_auth(endpoint_url, path, endpoint_api_key, timeout)?;
+    if parts.status != 200 {
+        bail!("HTTP endpoint returned HTTP {}", parts.status);
+    }
+    Ok(parts.body)
+}
+
+/// GET `path` and return the response status alongside the body.
+///
+/// The GET sibling of [`http_post_json_with_auth`], and it exists for the same
+/// reason: a caller probing an endpoint has to tell "the server answered, with a
+/// refusal" apart from "the server never answered", and only the former proves
+/// something is alive on that port. [`http_get_text_with_auth`] collapses both
+/// into `Err` — correct for callers that only want a 200's body, wrong for
+/// anything deciding whether a port is still held.
+pub fn http_get_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
     let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
@@ -623,10 +644,12 @@ pub fn http_get_text_with_auth(
         .split_once("\r\n\r\n")
         .context("HTTP response was missing a body")?;
     let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("HTTP endpoint returned {status_line}");
-    }
-    Ok(body.to_owned())
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
 }
 
 /// POST a JSON body and return the response status line plus body.
@@ -8237,6 +8260,61 @@ mod tests {
         )?);
 
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_reports_a_refusal_as_an_answer_not_as_a_failure() -> Result<()> {
+        // The distinction `http_get_text_with_auth` cannot make. Its `Err` means
+        // "no 200", which lumps a 401 from a live server together with a dead
+        // port — and a caller deciding whether something still holds a port has
+        // to tell those apart: only the refusal proves the port is held.
+        //
+        // Two connections: the same 401 read both ways.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let parts = http_get_with_auth(&endpoint, "/models", None, Duration::from_secs(2))?;
+        assert_eq!(
+            parts.status, 401,
+            "a refusal is an answer, and its status has to survive"
+        );
+        assert!(
+            http_get_text_with_auth(&endpoint, "/models", None, Duration::from_secs(2)).is_err(),
+            "the text helper still collapses every non-200 into an error"
+        );
+
+        server.join().expect("server thread should not panic")?;
+
+        // And an unreachable port is an error either way — the two must not
+        // collapse in the other direction.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let dead_port = dead.local_addr()?.port();
+        drop(dead);
+        assert!(
+            http_get_with_auth(
+                &format!("http://127.0.0.1:{dead_port}/v1"),
+                "/models",
+                None,
+                Duration::from_millis(500),
+            )
+            .is_err(),
+            "nothing answered, so there is no status to report"
+        );
         Ok(())
     }
 

@@ -15621,7 +15621,16 @@ fn stop_background_helper_before_uninstall(
             return;
         }
     };
-    if state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
+    // `running` is the same inactive contract `background_helper_already_running`
+    // spawns on, and honoring it here is what keeps this path off an unrelated
+    // process. Only the clean-shutdown path writes `running: false` — a daemon
+    // started without `--automations-enabled` returns before its first state
+    // write — so a false flag means the recorded pid belongs to a daemon that
+    // already exited, and anything alive under it now inherited the number.
+    // Without this, Windows cannot catch that: `process_start_ticks` is always
+    // `None` there, so `identity_state_with_observed` falls back to the legacy
+    // `Matches` verdict and the force tree-kill below lands on a stranger.
+    if !state.running || state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
         return;
     }
     if !rocm_core::process_is_running(state.daemon_pid) {
@@ -15786,9 +15795,15 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
         {
             continue;
         }
-        if !loopback_tcp_port_is_reachable(&probe_host(&record.host), record.port) {
+        // A wildcard record yields both loopback families; whichever answers is
+        // the one the identity probe below has to talk to, so keep it rather
+        // than re-deriving a single host and guessing the family wrong.
+        let Some(reachable_host) = probe_hosts(&record.host)
+            .into_iter()
+            .find(|candidate| loopback_tcp_port_is_reachable(candidate, record.port))
+        else {
             continue;
-        }
+        };
         let stopped_by_this_pass = attempted
             .iter()
             .any(|candidate| candidate.service_id == record.service_id);
@@ -15803,7 +15818,7 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             // identity probe gets the normalized host too.
             let mut probe_record = record.clone();
             probe_record.endpoint_url =
-                rocm_core::format_http_base_url(&probe_host(&record.host), record.port);
+                rocm_core::format_http_base_url(&reachable_host, record.port);
             match rocm_core::managed_service_endpoint_model_ready(
                 &probe_record,
                 endpoint_api_key.as_deref(),
@@ -15814,20 +15829,49 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                 Ok(true) => {}
                 // Someone else's listener on a recycled port.
                 Ok(false) => continue,
-                // Listening but unidentifiable — a wedged engine, or something
-                // that is not an OpenAI endpoint at all. Aborting on this would
-                // put back the dead end that has no override and no recovery, so
-                // the removal proceeds; say so rather than deciding silently.
                 Err(_) => {
-                    // stderr, not stdout: this is the one fail-open left on a
-                    // destructive path, so it must survive the operator piping
-                    // uninstall's output somewhere.
-                    eprintln!(
-                        "warning: {}:{} still accepts connections but did not identify itself, \
-                         and service {} is already recorded stopped — proceeding. If that is a \
-                         server of yours, stop whatever holds that port first.",
-                        record.host, record.port, record.service_id
-                    );
+                    // `/v1/models` did not yield a model list. That is either a
+                    // refusal from a live HTTP server or no usable answer at
+                    // all, and the two must not be treated alike: a public
+                    // service's key is cleared once its processes are gone, so
+                    // on the retry run this very probe goes out unauthenticated
+                    // against a still-serving endpoint and is answered 401. Fail
+                    // open on that and uninstall deletes the tooling while the
+                    // public endpoint keeps serving — the original defect,
+                    // reached through the retry.
+                    if !endpoint_refused_authorization(
+                        &probe_record.endpoint_url,
+                        endpoint_api_key.as_deref(),
+                    ) {
+                        // Listening but unidentifiable — a wedged engine, or
+                        // something that is not an OpenAI endpoint at all.
+                        // Aborting on this would put back the dead end that has
+                        // no override and no recovery, so the removal proceeds;
+                        // say so rather than deciding silently.
+                        //
+                        // stderr, not stdout: this is the one fail-open left on
+                        // a destructive path, so it must survive the operator
+                        // piping uninstall's output somewhere.
+                        eprintln!(
+                            "warning: {}:{} still accepts connections but did not identify \
+                             itself, and service {} is already recorded stopped — proceeding. \
+                             If that is a server of yours, stop whatever holds that port first.",
+                            record.host, record.port, record.service_id
+                        );
+                        continue;
+                    }
+                    report
+                        .stopped
+                        .retain(|stopped| stopped != &record.service_id);
+                    report.failed.push(FailedManagedServiceStop {
+                        service_id: record.service_id.clone(),
+                        reason: format!(
+                            "{}:{} refused the identity probe's credentials, so an \
+                             authenticated server is still serving there",
+                            record.host, record.port
+                        ),
+                        remedy: StopFailureRemedy::StopWhatHoldsThePort,
+                    });
                     continue;
                 }
             }
@@ -15861,10 +15905,16 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
     Ok(report)
 }
 
-/// The address to probe for a service recorded on `host`.
+/// The addresses to probe for a service recorded on `host`, in order.
 ///
 /// A service bound to a wildcard address is reachable on loopback; connecting to
-/// the wildcard itself is not portable.
+/// the wildcard itself is not portable. Which loopback, though, depends on what
+/// the listener actually bound: `::` with the usual `IPV6_V6ONLY=1` (the default
+/// on Windows) answers on `::1` and *refuses* `127.0.0.1`, while an `0.0.0.0`
+/// bind is the mirror image. Probing one family only would read a live,
+/// port-holding engine as "nothing is serving" and wave the removal through —
+/// the exact defect this gate exists to close — so a wildcard yields both and
+/// the caller blocks if either answers.
 ///
 /// The normalized form is what gets probed, not just what gets classified.
 /// `loopback_tcp_port_is_reachable` resolves with `(host, port)`, which rejects
@@ -15873,16 +15923,42 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
 /// direction for a check whose whole job is to catch a surviving engine
 /// grandchild. Records do carry bracketed spellings (`loopback_host_key`
 /// normalizes them too) because `--host` is free-form.
-fn probe_host(host: &str) -> String {
+fn probe_hosts(host: &str) -> Vec<String> {
     // Trimmed and case-folded so the spellings a record can carry — `0.0.0.0`,
     // `::`, `[::]`, `0:0:0:0:0:0:0:0`, `*`, or empty — all resolve to loopback
     // rather than being probed literally (a literal wildcard connect is not
     // portable, and would silently read as "nothing is serving").
     let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
     match normalized.as_str() {
-        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0" | "*" | "" => "127.0.0.1".to_owned(),
-        _ => normalized,
+        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0" | "*" | "" => {
+            vec!["127.0.0.1".to_owned(), "::1".to_owned()]
+        }
+        _ => vec![normalized],
     }
+}
+
+/// Whether `endpoint_url` answered the identity probe with an auth refusal.
+///
+/// A 401/403 is not a failure to reach the endpoint — it is a live HTTP server
+/// stating that it guards this path, which is stronger evidence that the port is
+/// still held than a model listing would be. It is also the shape the retry run
+/// takes for a public service: stopping the recorded processes clears the stored
+/// key, so the next `rocm uninstall` probes an authenticated survivor with no
+/// credentials and gets exactly this.
+///
+/// Anything else — unreachable, a timeout, a non-HTTP listener, a 200 whose body
+/// did not parse — is not an answer this can act on, and stays with the caller's
+/// fail-open.
+fn endpoint_refused_authorization(endpoint_url: &str, endpoint_api_key: Option<&str>) -> bool {
+    matches!(
+        rocm_core::http_get_with_auth(
+            endpoint_url,
+            "/v1/models",
+            endpoint_api_key,
+            ENDPOINT_IDENTITY_PROBE_TIMEOUT,
+        ),
+        Ok(parts) if parts.status == 401 || parts.status == 403
+    )
 }
 
 /// Service manifests that exist but cannot be parsed back into a record.
@@ -31415,19 +31491,32 @@ ID_LIKE="suse opensuse"
     /// shutdown in `Drop` means the port is released even when the test fails,
     /// which is when it matters.
     struct ServingEndpoint {
+        bind_host: &'static str,
         port: u16,
         shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<thread::JoinHandle<()>>,
     }
 
     impl ServingEndpoint {
-        /// Serve `model_id` from `/v1/models` until dropped.
+        /// Serve `model_id` from `/v1/models` on IPv4 loopback until dropped.
         fn serving(model_id: &str) -> Self {
+            Self::bind(model_id, "127.0.0.1", false).expect("bind the surviving engine on IPv4")
+        }
+
+        /// Serve `model_id` only to a request carrying an `Authorization` header,
+        /// answering 401 otherwise — a public service as the retry run meets it.
+        fn serving_with_authorization(model_id: &str) -> Self {
+            Self::bind(model_id, "127.0.0.1", true).expect("bind the authenticated engine")
+        }
+
+        /// Serve `model_id` on `bind_host`, or `None` when the host's address
+        /// family is unavailable (IPv6 is absent in some containers, and a test
+        /// that needs it has to skip rather than fail).
+        fn bind(model_id: &str, bind_host: &'static str, require_auth: bool) -> Option<Self> {
             use std::sync::atomic::Ordering;
 
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").expect("bind the surviving engine");
-            let port = listener.local_addr().expect("socket address").port();
+            let listener = std::net::TcpListener::bind((bind_host, 0)).ok()?;
+            let port = listener.local_addr().ok()?.port();
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = std::sync::Arc::clone(&shutdown);
             let body = format!(r#"{{"data":[{{"id":"{model_id}"}}]}}"#);
@@ -31439,21 +31528,33 @@ ID_LIKE="suse opensuse"
                     }
                     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                     let mut buffer = [0_u8; 1024];
-                    if stream.read(&mut buffer).is_err() {
+                    let Ok(read) = stream.read(&mut buffer) else {
                         continue;
+                    };
+                    let authorized = !require_auth
+                        || String::from_utf8_lossy(&buffer[..read])
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer ");
+                    if authorized {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    } else {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        );
                     }
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
                 }
             });
-            Self {
+            Some(Self {
+                bind_host,
                 port,
                 shutdown,
                 thread: Some(thread),
-            }
+            })
         }
     }
 
@@ -31462,7 +31563,7 @@ ID_LIKE="suse opensuse"
             self.shutdown
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             // Unblock the parked `accept()` so the thread observes the flag.
-            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            let _ = std::net::TcpStream::connect((self.bind_host, self.port));
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -31581,9 +31682,185 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn every_wildcard_bind_spelling_is_probed_on_loopback() {
+    fn an_ipv6_only_wildcard_engine_is_not_waved_through() {
+        // The IPv6 half of the wildcard case. `::` with `IPV6_V6ONLY` — the
+        // default on Windows, and what `TcpListener::bind("::1", 0)` gives here
+        // — answers on `::1` and refuses `127.0.0.1`. Probing IPv4 alone reads
+        // that live, port-holding engine as gone and removes the tooling anyway,
+        // which is EAI-8014 reached through the address family.
+        let Some(endpoint) = ServingEndpoint::bind("amd/v6-model", "::1", false) else {
+            // No IPv6 on this host: the thing under test cannot be staged.
+            return;
+        };
+        let (root, paths) = test_paths("uninstall-ipv6-wildcard-engine");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-v6-engine",
+            "vllm",
+            "amd/v6-model",
+            "amd/v6-model",
+            // Recorded as the wildcard it was launched on, which is all the
+            // record ever says — not which family the listener chose.
+            "::",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-v6-engine")
+            .unwrap_or_else(|| {
+                panic!("an IPv6-only engine still serving must fail the gate: {report:?}")
+            });
+        assert_eq!(
+            failure.remedy,
+            StopFailureRemedy::StopWhatHoldsThePort,
+            "its recorded processes are gone, so the port holder is the remedy"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the gate must refuse to remove anything"
+        );
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_authenticated_survivor_blocks_the_retry_instead_of_failing_open() {
+        // The retry run is where a public service loses its own evidence:
+        // stopping the recorded processes clears the stored endpoint key, so run
+        // 2 probes the still-serving endpoint with no credentials and is
+        // answered 401. `managed_service_endpoint_model_ready` turns any non-200
+        // into `Err`, which used to take the fail-open branch — deleting the
+        // tooling while a publicly reachable, GPU-holding server kept answering.
+        //
+        // A refusal is not a failure to reach: it is a live HTTP server saying
+        // it guards this path, and that has to block.
+        let endpoint = ServingEndpoint::serving_with_authorization("amd/guarded-model");
+        let (root, paths) = test_paths("uninstall-authenticated-survivor");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-guarded-engine",
+            "vllm",
+            "amd/guarded-model",
+            "amd/guarded-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        // Exactly run 2's state: recorded stopped, and no key on disk for it.
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+        assert!(
+            endpoint_keys::endpoint_api_key(&paths, "svc-guarded-engine").is_none(),
+            "the retry has no credentials left — that is the whole scenario"
+        );
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-guarded-engine")
+            .unwrap_or_else(|| {
+                panic!("an authenticated survivor must fail the gate, not be waved through: {report:?}")
+            });
+        assert_eq!(
+            failure.remedy,
+            StopFailureRemedy::StopWhatHoldsThePort,
+            "its recorded processes are gone, so the port holder is the remedy"
+        );
+        assert!(
+            failure.reason.contains("refused"),
+            "the abort has to say the endpoint refused the probe, not that it was silent: {}",
+            failure.reason
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the gate must refuse to remove anything"
+        );
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // `sleep` as a stand-in for the process that inherited the pid.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_never_signals_a_daemon_pid_recorded_as_already_stopped() {
+        // `running: false` is written by exactly one place — rocmd's clean
+        // shutdown, on its way out. (A daemon started without
+        // `--automations-enabled` returns before its first state write, so it
+        // never persists a false flag while alive.) The pid in such a record
+        // therefore belongs to a process that has already exited, and anything
+        // live under that number today inherited it.
+        //
+        // Windows is where this is the only defence: `process_start_ticks` is
+        // always `None` there, so the identity check falls back to its legacy
+        // `Matches` verdict and the force tree-kill lands on a stranger. That
+        // shape cannot be staged on Linux — identity genuinely works here — so
+        // this stages the same *decision*: a live pid that the identity check
+        // will confirm, which must still be left alone because the record says
+        // the daemon is stopped.
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn unrelated process");
+        let pid = stranger.id();
+        let (root, paths) = test_paths("uninstall-daemon-recorded-stopped");
+        let mut state = runtime_state(false, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        state.write(&paths).expect("write runtime state");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        // `try_wait`, not `process_is_running`: a signalled child we have not
+        // reaped is a zombie, and a zombie still reads as running — so the
+        // liveness check would pass over the very kill this test exists to
+        // catch. An exit status here means it was signalled.
+        assert!(
+            stranger.try_wait().expect("poll the stranger").is_none(),
+            "a pid recorded as already stopped must never be signalled: uninstall killed an \
+             unrelated process"
+        );
+        assert!(
+            report.stopped.is_empty(),
+            "the daemon was already stopped, so nothing was stopped here: {report:?}"
+        );
+        assert!(
+            report.failed.is_empty(),
+            "an already-stopped daemon is not an obstacle to uninstall: {report:?}"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_wildcard_bind_spelling_is_probed_on_both_loopback_families() {
         // A wildcard probed literally is not portable and would read as "nothing
         // is serving" — the gate's failure-open direction, so it matters.
+        //
+        // Both families, not one: a wildcard record does not say which protocol
+        // the listener bound, and the two loopbacks are not interchangeable. A
+        // `::` bind with the usual `IPV6_V6ONLY=1` — the default on Windows —
+        // answers on `::1` and refuses `127.0.0.1`, so probing IPv4 alone reads
+        // a live engine as gone and waves the removal through.
         for wildcard in [
             "0.0.0.0",
             "::",
@@ -31594,16 +31871,16 @@ ID_LIKE="suse opensuse"
             "  0.0.0.0  ",
         ] {
             assert_eq!(
-                probe_host(wildcard),
-                "127.0.0.1",
-                "wildcard {wildcard:?} must be probed on loopback"
+                probe_hosts(wildcard),
+                vec!["127.0.0.1".to_owned(), "::1".to_owned()],
+                "wildcard {wildcard:?} must be probed on both loopback families"
             );
         }
         for literal in ["127.0.0.1", "192.168.1.10", "example.internal"] {
             assert_eq!(
-                probe_host(literal),
-                literal,
-                "a concrete host must be probed as recorded"
+                probe_hosts(literal),
+                vec![literal.to_owned()],
+                "a concrete host must be probed as recorded, and only there"
             );
         }
         // A concrete host still has to come back in a form that resolves.
@@ -31617,16 +31894,23 @@ ID_LIKE="suse opensuse"
             ("[FE80::1]", "fe80::1"),
         ] {
             assert_eq!(
-                probe_host(recorded),
-                probed,
+                probe_hosts(recorded),
+                vec![probed.to_owned()],
                 "a concrete host must be probed in a resolvable form"
             );
-            assert!(
-                (probe_host(recorded).as_str(), 1u16)
-                    .to_socket_addrs()
-                    .is_ok(),
-                "the probed form of {recorded:?} must resolve"
-            );
+        }
+        // Every probed form, wildcard expansions included, has to resolve:
+        // `(host, port).to_socket_addrs()` rejects a bracketed literal and
+        // anything padded, and the caller reads a resolution failure as "nothing
+        // is serving" — so handing a raw spelling through would delete the
+        // recovery tooling while the endpoint is live.
+        for recorded in ["[::1]", "  127.0.0.1  ", "[FE80::1]", "::", "0.0.0.0", "*"] {
+            for probed in probe_hosts(recorded) {
+                assert!(
+                    (probed.as_str(), 1u16).to_socket_addrs().is_ok(),
+                    "the probed form {probed:?} of {recorded:?} must resolve"
+                );
+            }
         }
     }
 
