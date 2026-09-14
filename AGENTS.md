@@ -157,6 +157,7 @@ Guardrails:
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
+- before hand-rolling CLI output (completion reports, progress/spinner indicators, confirmation/approval prompts), check for and reuse the existing shared components (e.g. `apps/rocm/src/cli_report.rs::ActionReport`) instead of duplicating the pattern inline; extend the shared component if it doesn't yet cover the needed case
 - supported host platforms are Windows and Linux only (including WSL where documented)
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
@@ -227,6 +228,8 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
+- automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
+- to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
 **Stacked and dependent PRs:**
 
