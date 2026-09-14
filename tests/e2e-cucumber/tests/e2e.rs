@@ -1413,36 +1413,21 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
-    // The mock lane's ceiling is bounded by the machine rather than left at
-    // cucumber's flat 64. Its scenarios are safe to run together, but they are
-    // not free: each spawns `rocm` subprocesses, and several drive a TUI under a
-    // pseudo-terminal and assert on WALL-CLOCK behaviour. At 64-way on a 2-4
-    // vCPU runner those steps are descheduled for seconds — measured at 4.7 s
-    // against a 6 s window — so they miss the moment they are timing and report
-    // a starved reading as a product verdict. Bounding to the core count keeps
-    // the lane parallel where parallelism is free and stops it oversubscribing
-    // where it is not; it is also no slower, because starvation costs more than
-    // the extra concurrency buys.
     //
-    // `E2E_MAX_CONCURRENT` overrides the MOCK lane's ceiling, for bisecting a
-    // lane whose failures look like contention rather than behaviour. It cannot
-    // raise a serialized lane: the `1` above is a correctness requirement, not
-    // a tuning choice, so it is applied AFTER the override rather than inside
-    // the fallback. Two multi-GiB installs racing one shared runtimes tree, or
-    // two serves racing one port and one GPU's VRAM, is what that `1` prevents.
-    let serialize =
-        cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some();
-    let max_concurrent = if serialize {
-        1
-    } else {
-        std::env::var("E2E_MAX_CONCURRENT")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 6))
-            })
-    };
+    // The mock lane's 64 is deliberately left as main has it. Bounding it to the
+    // core count was tried on this branch and reverted: dash-08/dash-09 measure a
+    // validity window whose elapsed time advances with DAEMON CYCLES (the logical
+    // clock added in #380), so a less-loaded lane burns that window faster and
+    // clears the held value before the assertion looks. Both scenarios pass on
+    // main at 64-way and failed here at 2..=6 — a suite-wide scheduling knob
+    // changing two unrelated scenarios' verdicts is reason enough for a
+    // contract-pinning change not to touch it.
+    let max_concurrent =
+        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
+            1
+        } else {
+            64
+        };
     let summary = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every

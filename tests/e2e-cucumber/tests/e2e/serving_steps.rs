@@ -1230,9 +1230,9 @@ async fn given_default_serve_address_taken(world: &mut E2eWorld) {
     // port with `fuser -k`/`kill -9`, and from the moment this listener exists
     // the process holding that port is the cucumber binary itself — so a
     // concurrent scenario calling it would kill the whole suite mid-run. The
-    // serialization is enforced in `e2e.rs` and cannot be lifted by
-    // `E2E_MAX_CONCURRENT`; if that ever changes, this needs an ephemeral port
-    // rather than the shared default.
+    // serialization is enforced in `e2e.rs`, which pins a GPU lane to one
+    // scenario regardless of the mock lane's ceiling; if that ever changes, this
+    // needs an ephemeral port rather than the shared default.
     world.occupied_address = Some(listener);
 }
 
