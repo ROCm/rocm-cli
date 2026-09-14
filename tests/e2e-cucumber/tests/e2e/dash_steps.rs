@@ -18,6 +18,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -436,6 +437,131 @@ async fn managed_chat_request_carried_prompt(world: &mut E2eWorld) {
     );
 }
 
+/// The recorded chat request's message contents, in order.
+///
+/// The grounding steps look across every role rather than only `system`: what
+/// matters is that the model was told, not which envelope carried it (the
+/// built-in local provider folds system text into the user turn).
+///
+/// Waits for the request carrying `MANAGED_MODEL_PROMPT` specifically. Accepting
+/// any chat request instead picks up the local-endpoint detection probe, which
+/// is sent before the user types and carries no system prompt at all — the
+/// grounding then looks absent when it was simply asserted against the wrong
+/// request. Unlike `chat-03`, these steps have no screen wait ahead of them to
+/// order the two.
+async fn recorded_chat_messages(world: &mut E2eWorld) -> Vec<String> {
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .wait_for_chat_request_where(default_timeout(), |body| {
+            body.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                            && message_text(m.get("content").unwrap_or(&serde_json::Value::Null))
+                                .contains(MANAGED_MODEL_PROMPT)
+                    })
+                })
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the mock never received the user's chat turn: {e}"));
+    body.get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"))
+        .iter()
+        .filter_map(|m| m.get("content"))
+        .map(message_text)
+        .collect()
+}
+
+/// The text of one OpenAI-format message. `content` is a bare string on the
+/// turns the TUI builds, but an array of typed parts on the system message the
+/// chat client emits — read both, or the grounding looks absent when it is
+/// simply wrapped.
+fn message_text(content: &serde_json::Value) -> String {
+    content.as_str().map_or_else(
+        || {
+            content
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        },
+        str::to_owned,
+    )
+}
+
+/// The single line of the sent prompt that opens with `label`, or a failure
+/// naming what was actually sent. Asserting on the request — never on the
+/// canned reply — is the point: the mock answers identically whatever it is
+/// told, so only the request can show the assistant was grounded.
+fn sent_fact_line(messages: &[String], label: &str) -> String {
+    messages
+        .iter()
+        .flat_map(|m| m.lines())
+        .map(str::trim)
+        .find(|line| line.starts_with(label))
+        .unwrap_or_else(|| {
+            panic!(
+                "the assistant was never told `{label}`; the request carried:\n{}",
+                messages.join("\n---\n")
+            )
+        })
+        .to_owned()
+}
+
+#[then("the assistant is told which operating system this machine runs")]
+async fn assistant_told_the_operating_system(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- Operating system:");
+    let host = e2e_cucumber::capability::host_capability();
+    let expected = if host.os_family.eq_ignore_ascii_case("windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+    assert!(
+        line.contains(expected),
+        "this machine runs {}, but the assistant was told: {line}",
+        host.os_family
+    );
+    // WSL is the case the old prompt got wrong — it told WSL users vLLM was
+    // unavailable — so a WSL host must be named as one, not flattened to Linux.
+    assert_eq!(
+        line.contains("WSL"),
+        host.is_wsl,
+        "WSL must be stated exactly when this machine is WSL (is_wsl={}): {line}",
+        host.is_wsl
+    );
+}
+
+#[then("the assistant is told which GPU this machine has")]
+async fn assistant_told_the_gpu(world: &mut E2eWorld) {
+    let messages = recorded_chat_messages(world).await;
+    let line = sent_fact_line(&messages, "- AMD GPU:");
+    let host = e2e_cucumber::capability::host_capability();
+    match host.gfx_target.as_deref() {
+        // A host with a real GPU must see that GPU named, not a placeholder.
+        Some(target) => assert!(
+            line.contains(target),
+            "this machine's GPU is {target}, but the assistant was told: {line}"
+        ),
+        // A host without one must be told so explicitly, rather than left to
+        // fill the silence from pretraining.
+        None => assert!(
+            line.contains("no AMD GPU detected"),
+            "no GPU is detectable here, so the assistant must be told that: {line}"
+        ),
+    }
+}
+
 #[then("the managed model is shown as loading rather than ready")]
 async fn managed_model_shown_loading(world: &mut E2eWorld) {
     let model = world.model_name.clone().expect("no model name set");
@@ -698,6 +824,21 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
     world.register_mock_service_with(ServiceRecordOptions::default());
 }
 
+#[given("dashboard observation time is deterministic")]
+async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let path = root.join(DASH_CLOCK_OFFSET_FILE);
+    std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
+    world.command_env.push((
+        "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
+        path.into_os_string(),
+    ));
+}
+
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
 /// `gen_tps` is `Some(_)`. Wait for it to confirm a positive baseline was
 /// established through at least two successful Growing-mode scrapes.
@@ -740,14 +881,10 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     // snapshot is painted before the assertion reads the screen.
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
-
 /// EAI-7960 principal regression assertion.
 ///
-/// Contract: the Observe tab must still show "tok/s" immediately after the
-/// first failed scrape — the held value must persist for the validity window
-/// `clamp(3 × instance_tick, 6 s, 30 s)` before clearing. Tagged `@serial` in
-/// `dash.feature` so CPU contention from the no-GPU job's other ~62
-/// concurrently-running scenarios can't delay this step past the window.
+/// The scenario's injected logical clock cannot cross the validity boundary
+/// because the host was descheduled; only an explicit scenario advance can.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
@@ -762,28 +899,34 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
 
-/// Production validity window: clamp(3 × instance_tick, 6 s, 30 s).
-///
-/// With the daemon's 2 s `instance_tick` the lower bound clamp(6 s, 6 s) = 6 s
-/// is always reached. An additional buffer of two instance-ticks (4 s) ensures
-/// the runner has had enough cycles to propagate the expiry to the TUI.
-const VALIDITY_WINDOW: Duration = Duration::from_secs(6);
-const VALIDITY_WINDOW_BUFFER: Duration = Duration::from_secs(5); // 2 × instance_tick + render
-
-/// Sleep for the full observation validity window so the caller can then assert
-/// that the held gen_tps has expired. Designed to follow
-/// "When the metrics endpoint fails transiently" — at that step's exit at least
-/// one 503 has been served, meaning the validity clock has started.
+/// Advance the test-only logical clock beyond the six-second validity window,
+/// then synchronize on the next failed scrape that publishes the expired value.
 #[when("the validity window has elapsed")]
-async fn validity_window_elapsed(_world: &mut E2eWorld) {
-    // Sleep the full window + buffer so the daemon has had enough cycles
-    // after expiry to deliver the snapshot change to the TUI.
-    tokio::time::sleep(VALIDITY_WINDOW + VALIDITY_WINDOW_BUFFER).await;
+async fn validity_window_elapsed(world: &mut E2eWorld) {
+    let mock = world.mock.as_ref().expect("no mock server running");
+    let prior_failures = mock.metrics_failure_count();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
+        .expect("failed to advance dashboard test clock");
+
+    let budget = default_timeout();
+    let deadline = Instant::now() + budget;
+    while mock.metrics_failure_count() == prior_failures {
+        assert!(
+            Instant::now() < deadline,
+            "no metrics scrape observed after advancing the dashboard clock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// Assert that gen_tps is no longer rendered on screen (BOUNDARY 2 of the
-/// EAI-7960 expiry contract). After the validity window the daemon must clear
-/// the held value and the TUI must show "—" in place of the "tok/s" unit.
+/// Assert that gen_tps is no longer rendered after the scenario advances the
+/// injected clock beyond the validity boundary and observes the next scrape.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
     let screen = session(world).screen_text();

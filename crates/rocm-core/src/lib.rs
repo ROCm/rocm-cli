@@ -45,7 +45,9 @@ pub use disk_space::{
     mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
 };
 use examine::extract_rocm_version;
-pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
+pub use examine::{
+    Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
+};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
@@ -242,6 +244,32 @@ pub struct DownloadOutcome {
 /// matching length proves nothing about the bytes — do not read a successful
 /// return as "the artifact is genuine" unless a digest was supplied.
 pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<DownloadOutcome> {
+    download_file_streaming_with_progress(request, &mut |_written, _total| {})
+}
+
+/// As [`download_file_streaming`], but reports progress via `on_progress`.
+///
+/// `on_progress` is called with the cumulative bytes written and, when
+/// known, the total size — once before the transfer starts and once after
+/// every chunk is written to disk. The byte count is monotonically
+/// non-decreasing across the whole call, including across retries: an
+/// attempt that restarts from scratch (the server ignored `Range`, or
+/// resumed at the wrong offset and had its partial file discarded) counts
+/// its own bytes from 0 internally, but the byte count `on_progress` sees
+/// never drops below the highest value already reported by an earlier
+/// attempt. The total is not clamped the same way and is passed through as
+/// reported by the current attempt, so it can go from `None` to `Some` (or
+/// back) mid-transfer if a retry's response differs on `Content-Length`.
+/// Note also that for the whole duration of a from-scratch restart, the
+/// byte count holds flat at the prior high-water mark until the new attempt
+/// catches back up — a caller driving a static progress line should pair
+/// this with an animated indicator (as the `rocm` CLI's spinner does) so a
+/// long restart doesn't look hung. Callers that don't need progress should
+/// use [`download_file_streaming`] instead.
+pub fn download_file_streaming_with_progress(
+    request: &DownloadRequest<'_>,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<DownloadOutcome> {
     if let Some(parent) = request.destination.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -256,8 +284,18 @@ pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<Download
     let _ = fs::remove_file(&partial_path);
     let mut backoff = Backoff::default();
     let mut attempt = 1;
+    // `download_attempt` reports whatever it has on disk for *this* attempt,
+    // which resets to 0 on a from-scratch restart even though earlier
+    // attempts already progressed further. Clamp to a high-water mark here
+    // so every caller — not just ones that happen to add their own UI-side
+    // clamp — sees a byte count that never goes backwards.
+    let mut high_water = 0_u64;
+    let mut monotonic_progress = move |written: u64, total: Option<u64>| {
+        high_water = high_water.max(written);
+        on_progress(high_water, total);
+    };
     let outcome = loop {
-        match download_attempt(request, &partial_path) {
+        match download_attempt(request, &partial_path, &mut monotonic_progress) {
             Ok(outcome) => break outcome,
             Err(error) => {
                 let retryable = error.retryable && attempt < DOWNLOAD_MAX_ATTEMPTS;
@@ -315,9 +353,19 @@ const fn status_is_retryable(status: u16) -> bool {
     status == 408 || status == 429 || status >= 500
 }
 
+/// A single attempt at the transfer. `written` — and so what this reports
+/// through `on_progress` — reflects only what this attempt itself has put on
+/// disk: a confirmed `206` continuation starts counting from the resumed
+/// offset, but a restart (the server ignored `Range`, or resumed at the
+/// wrong offset and had its partial file discarded) truncates the file and
+/// starts counting from 0 again, even if a previous attempt already reported
+/// further along. That's fine — [`download_file_streaming_with_progress`]
+/// wraps `on_progress` with a high-water mark so callers never observe the
+/// drop; this function does not need to care.
 fn download_attempt(
     request: &DownloadRequest<'_>,
     partial_path: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<DownloadOutcome, DownloadAttemptError> {
     // Resume from whatever a previous attempt already wrote. A missing file is
     // simply a fresh start.
@@ -373,7 +421,11 @@ fn download_attempt(
     let remaining_len = header_u64(&response, "Content-Length");
     let total_len =
         remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
-    if let Some(total) = total_len.or(request.expected_len) {
+    // Fall back to the caller-supplied expected length when the server omits
+    // `Content-Length`, so progress reporting doesn't lose a total that's
+    // already known and already used for the preflight checks below.
+    let reported_total = total_len.or(request.expected_len);
+    if let Some(total) = reported_total {
         if let Some(max_bytes) = request.max_bytes
             && total > max_bytes
         {
@@ -417,6 +469,8 @@ fn download_attempt(
         })?
     };
 
+    on_progress(written, reported_total);
+
     let mut reader = response.into_reader();
     let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
     loop {
@@ -429,7 +483,7 @@ fn download_attempt(
             // the user, so report the shortfall either way rather than a bare
             // transport error.
             Err(error) => {
-                let reason = total_len.or(request.expected_len).map_or_else(
+                let reason = reported_total.map_or_else(
                     || format!("failed while downloading {}", request.url),
                     |expected| {
                         format!(
@@ -454,6 +508,7 @@ fn download_attempt(
         if let Err(error) = file.write_all(&buffer[..read]) {
             return Err(permanent(disk_space::map_write_error(error, partial_path)));
         }
+        on_progress(written, reported_total);
     }
     if let Err(error) = file.sync_all() {
         return Err(permanent(disk_space::map_write_error(error, partial_path)));
@@ -519,6 +574,21 @@ fn content_range_start(response: &ureq::Response) -> Option<u64> {
 
 pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
     download_file_streaming(&DownloadRequest::new(url, destination, timeout))?;
+    Ok(())
+}
+
+/// As [`download_file_to_path`], but reports progress via `on_progress`. See
+/// [`download_file_streaming_with_progress`] for callback semantics.
+pub fn download_file_to_path_with_progress(
+    url: &str,
+    destination: &Path,
+    timeout: Duration,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_streaming_with_progress(
+        &DownloadRequest::new(url, destination, timeout),
+        on_progress,
+    )?;
     Ok(())
 }
 
@@ -1009,14 +1079,6 @@ pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> 
         .context("failed to write to TCP stream")
 }
 
-pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read TCP stream")?;
-    Ok(response)
-}
-
 /// Read one HTTP response, bounded by a wall-clock deadline.
 ///
 /// Two problems with reading to end-of-stream instead. A response is only
@@ -1028,7 +1090,7 @@ pub fn read_tcp_stream_to_string(stream: &mut TcpStream) -> Result<String> {
 /// slow-drip responder could stretch the total wait to an arbitrary multiple of
 /// what the caller asked for. This returns as soon as the response is complete by
 /// its own framing, and never runs past `deadline` in total.
-fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
+pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
     let mut response = Vec::new();
     let mut chunk = [0_u8; 4096];
     while !http_response_is_complete(&response) {
@@ -1069,10 +1131,17 @@ fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Resu
 /// those are delimited by the connection closing, so the caller must keep reading
 /// until EOF.
 fn http_response_is_complete(response: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(response);
-    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+    // Headers are ASCII by the HTTP spec, so it is safe to lossy-decode just
+    // that slice to parse them. The body length check below stays on raw
+    // bytes: lossy-decoding a body that ends mid multi-byte UTF-8 sequence
+    // replaces the truncated tail with a 3-byte U+FFFD, which can inflate a
+    // partial body's *decoded* length past the declared Content-Length and
+    // report completeness one read early.
+    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
     };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let body = &response[header_end + 4..];
     let header_value = |name: &str| {
         headers.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -1089,7 +1158,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
     if header_value("Transfer-Encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
     {
-        return body.ends_with("0\r\n\r\n");
+        return body.ends_with(b"0\r\n\r\n");
     }
     false
 }
@@ -2351,23 +2420,101 @@ fn normalize_cpu_model(value: &str) -> String {
 /// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
 /// matrix by reading one of them.
 ///
-/// This is the union of every signal any of them used: a false positive costs a
-/// route-out note, a false negative runs bare-metal driver checks against a
-/// platform that has no amdgpu module and reports nonsense.
+/// `/dev/dxg` is trusted on its own, and so is the kernel's own build string in
+/// `/proc/version` — nothing else stamps a kernel `-microsoft-standard-WSL2` or
+/// `-Microsoft`. `$WSL_DISTRO_NAME` is not trusted at all: it is an ordinary
+/// environment variable that can survive into a shell that merely inherited it
+/// (over `ssh`, in a `systemd` unit, under `sudo` without `-E`, under `env -i` or
+/// cron) without corroborating anything. See [`wsl_signals_indicate_wsl`] for why
+/// a false positive is no longer cheap.
 #[must_use]
-pub(crate) fn is_wsl_host() -> bool {
+pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
-            std::env::var_os("WSL_DISTRO_NAME").is_some(),
             &fs::read_to_string("/proc/version").unwrap_or_default(),
         )
 }
 
+/// Whether the host runs WSL 1 rather than WSL 2.
+///
+/// WSL 1 translates syscalls instead of running a real kernel, so it has no
+/// `/dev/dxg` and no GPU path at all. Without this the catalog would tell a WSL 1
+/// user to update a Windows driver that could never help them.
+///
+/// WSL 1 reports a kernel ending in `-Microsoft`, as in `4.4.0-19041-Microsoft`.
+/// WSL 2 builds all carry `microsoft-standard`, with the `-WSL2` suffix added
+/// later — `4.19.104-microsoft-standard` was the original and has no `WSL2` in
+/// it at all.
+///
+/// So the test is the `standard` marker and the trailing position, not the
+/// absence of `WSL2`. Keying on `WSL2` alone called every early WSL 2 kernel
+/// "WSL 1", which is the asymmetric error [`crate::examine::WslFacts::version`]
+/// documents as the one to avoid: it tells the user to convert a distribution
+/// that is already converted, at high confidence, while suppressing every other
+/// check. Anything unrecognised is read as WSL 2 for the same reason.
+#[must_use]
+pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
+    let kernel = kernel_release.trim().to_ascii_lowercase();
+    kernel.ends_with("-microsoft") && !kernel.contains("standard")
+}
+
+/// The dynamic linker cache, or `None` when `ldconfig` could not be run.
+///
+/// `ldconfig` lives in `/sbin`, which is not on a non-root user's `PATH` on
+/// Debian and derivatives. Looking it up by bare name there yields nothing, and
+/// an empty cache is indistinguishable from a cache that does not list the
+/// library — so a correctly installed ROCDXG read as "not registered with the
+/// linker" and the catalog told the user to run `ldconfig` on a working install.
+///
+/// Search the conventional locations, and report "could not ask" as `None`
+/// rather than as an empty answer.
+fn ldconfig_cache() -> Option<String> {
+    for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
+        if let Some(text) = capture_optional_command(program, &["-p"]) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether the linker cache lists ROCDXG, or `None` if it could not be read.
+pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
+    ldconfig_cache().map(|text| text.contains("librocdxg.so"))
+}
+
+/// Whether `relative` exists under any ROCm install on this host.
+///
+/// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
+/// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
+/// package that was in fact installed. Ask the same resolver the rest of the CLI
+/// uses, and keep the conventional root as a fallback for the case where
+/// discovery finds nothing.
+fn rocm_relative_file_exists(relative: &str) -> bool {
+    if Path::new("/opt/rocm").join(relative).exists() {
+        return true;
+    }
+    discover_rocm_installs()
+        .iter()
+        .any(|install| install.path.join(relative).exists())
+}
+
 /// The predicate itself, separated from reading the machine so the union can be
 /// tested — including the two cases that used to split the old implementations.
-fn wsl_signals_indicate_wsl(dxg_device: bool, distro_name_set: bool, proc_version: &str) -> bool {
-    if dxg_device || distro_name_set {
+///
+/// `/dev/dxg` alone is trusted outright — nothing but WSLg's GPU passthrough
+/// creates that device node. The kernel's own build string in `/proc/version` is
+/// also trusted alone: only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+/// `-Microsoft`, and that string cannot be inherited, forwarded, or left behind
+/// by an unrelated shell the way `$WSL_DISTRO_NAME` can. `$WSL_DISTRO_NAME` plays
+/// no part here at all — an ordinary bare-metal host that merely inherited it
+/// (over `ssh`, from a parent shell, under `sudo` without `-E`) has no
+/// `/proc/version` match to go with it, so it still reads as Linux. A false
+/// positive the other way no longer costs only a route-out note — this catalog
+/// now runs the WSL diagnosis and fix set directly, so a bare-metal host
+/// misread as WSL would have its entire bare-metal catalog silently disabled.
+fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
+    if dxg_device {
         return true;
     }
     let proc_version = proc_version.to_ascii_lowercase();
@@ -2383,10 +2530,12 @@ fn detect_wsl_summary() -> Option<WslSummary> {
     let is_wsl = true;
 
     let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
-    let librocdxg = Path::new("/opt/rocm/lib/librocdxg.so").exists();
-    let rocdxg_dids = Path::new("/opt/rocm/share/rocdxg/dids.conf").exists();
-    let ldconfig_text = capture_optional_command("ldconfig", &["-p"]).unwrap_or_default();
-    let ldconfig_librocdxg = ldconfig_text.contains("librocdxg.so");
+    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let ldconfig_text = ldconfig_cache();
+    let ldconfig_librocdxg = ldconfig_text
+        .as_deref()
+        .is_some_and(|text| text.contains("librocdxg.so"));
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
     let mut missing = Vec::new();
@@ -2397,7 +2546,9 @@ fn detect_wsl_summary() -> Option<WslSummary> {
         missing.push("/usr/lib/wsl/lib/libdxcore.so");
     }
     if !librocdxg {
-        missing.push("/opt/rocm/lib/librocdxg.so");
+        // Named without a directory: the file is looked up across every ROCm
+        // install, so quoting one root would misreport where it was not found.
+        missing.push("librocdxg.so");
     }
     if !ldconfig_librocdxg {
         missing.push("ldconfig:librocdxg.so");
@@ -3075,7 +3226,7 @@ pub fn detect_host_gpu_diagnostics() -> String {
                 .as_deref()
                 .unwrap_or("<not found>")
         );
-        if is_wsl_environment_fast() {
+        if is_wsl_host() {
             let wsl_probe = detect_wsl_windows_display_probe_text().unwrap_or_default();
             let _ = writeln!(
                 output,
@@ -3360,10 +3511,6 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
         bail!("{field_name} must not be empty");
     }
     Ok(())
-}
-
-pub fn detect_host_therock_family() -> Option<String> {
-    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
 }
 
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
@@ -3950,6 +4097,7 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx1152") => Some("gfx1152".to_owned()),
         value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
         "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
+        value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
         value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
         value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
@@ -3996,6 +4144,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx1152",
         "gfx1153",
         "gfx120X-all",
+        "gfx125X-dcgpu",
     ]
 }
 
@@ -4267,8 +4416,81 @@ fn detect_wsl_windows_display_name_fast() -> Option<String> {
         .and_then(parse_windows_display_name)
 }
 
+/// What the guest was able to learn about the Windows host's AMD display driver.
+///
+/// Three states, not two. Reaching the host requires WSL interop, which the user
+/// can switch off and which is absent entirely inside a container running on WSL.
+/// Collapsing "could not ask" into "no driver found" would make the catalog blame
+/// a Windows driver on every locked-down or containerised host, so the two stay
+/// distinct and the check abstains on [`Unreachable`](Self::Unreachable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WslHostDriverProbe {
+    /// WSL interop is unavailable, so the host was never asked.
+    Unreachable,
+    /// The host answered but reported no AMD display adapter.
+    NoAmdDisplay,
+    /// The host's AMD display driver version.
+    Version(String),
+}
+
+/// The AMD display driver of the machine this is running on.
+///
+/// The host-side counterpart to [`detect_wsl_host_driver`]: when `rocm` runs on
+/// Windows and inspects a WSL distribution, the driver is a local question and
+/// needs no interop to answer.
+///
+/// Returns the same tri-state, and for the same reason. An earlier version
+/// collapsed it to `Option<String>` and defaulted the `None`, so "this is not
+/// Windows" and "the inventory query failed" both arrived as an empty version --
+/// which the catalog reads as "the host has no AMD adapter" and reports as a
+/// missing driver on a machine it never managed to look at.
+pub(crate) fn detect_local_windows_host_driver() -> WslHostDriverProbe {
+    if !runtime_is_windows() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(inventory) = detect_windows_examine_inventory() else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    inventory
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
+/// Ask the Windows host, from inside the distro, which AMD display driver it runs.
+pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
+    if !is_wsl_host() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(output) = capture_optional_command_with_timeout(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    ) else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    parse_windows_examine_inventory(&output)
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
 fn detect_wsl_windows_display_probe_text() -> Option<String> {
-    if !is_wsl_environment_fast() {
+    if !is_wsl_host() {
         return None;
     }
 
@@ -4290,15 +4512,6 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
             .to_owned()
     })
     .filter(|output| !output.is_empty())
-}
-
-fn is_wsl_environment_fast() -> bool {
-    if !runtime_is_linux() {
-        return false;
-    }
-    Path::new("/dev/dxg").exists()
-        || fs::read_to_string("/proc/version")
-            .is_ok_and(|text| text.to_ascii_lowercase().contains("microsoft"))
 }
 
 #[cfg(target_os = "linux")]
@@ -8084,6 +8297,162 @@ mod tests {
     }
 
     #[test]
+    fn download_with_progress_reports_cumulative_bytes_across_chunks() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
+        let dir = download_scratch("progress");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert_eq!(
+            calls.first(),
+            Some(&(0, total)),
+            "the first call must fire before any bytes are read, already knowing the total: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "cumulative bytes must never go backwards: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total must stay constant across an attempt: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    // This guards the resume path re-seeding `written` from the partial file
+    // already on disk (see `written = std::io::copy(...)` above), not the
+    // high-water-mark clamp itself — it would pass unchanged with the clamp
+    // removed entirely. `download_with_progress_stays_monotonic_after_a_discarded_restart`
+    // below is the one that actually exercises the clamp.
+    fn download_with_progress_reports_the_resumed_offset_before_reading_more() -> Result<()> {
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::Resume,
+            ],
+        )?;
+        let dir = download_scratch("progress-resume");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress across a retried attempt, e.g. reset to 0: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(written, _)| written == 5000),
+            "the resumed attempt must report the byte count already on disk before reading more: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the total size must stay stable across the retry: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn download_with_progress_stays_monotonic_after_a_discarded_restart() -> Result<()> {
+        // The second reply resumes at the wrong offset, so its partial file is
+        // discarded and the third attempt restarts from scratch — internally
+        // reporting 0 bytes written again even though the first attempt had
+        // already reached 5000. The caller must never see that drop.
+        let body = download_body();
+        let (port, server) = spawn_download_server(
+            body.clone(),
+            vec![
+                DownloadReply::Truncated { sent: 5000 },
+                DownloadReply::ResumeAtWrongOffset { start: 8000 },
+                DownloadReply::Complete,
+            ],
+        )?;
+        let dir = download_scratch("progress-wrong-offset");
+        let destination = dir.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        let outcome = download_file_streaming_with_progress(
+            &DownloadRequest::new(
+                &format!("http://127.0.0.1:{port}/artifact.bin"),
+                &destination,
+                Duration::from_secs(10),
+            ),
+            &mut |written, total| calls.push((written, total)),
+        )?;
+
+        let requests = server.join().expect("server thread")?;
+        fs::remove_dir_all(&dir).ok();
+
+        let total = Some(body.len() as u64);
+        assert_eq!(
+            requests.len(),
+            3,
+            "the wrong-offset reply must be discarded and retried, not accepted"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "cumulative bytes must never go backwards, even across a discarded \
+             partial file and a from-scratch restart: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(written, _)| written == 5000),
+            "the truncated first attempt's progress must not be lost once the \
+             restart reports 0 internally: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last call must report the complete byte count: {calls:?}"
+        );
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        Ok(())
+    }
+
+    #[test]
     fn download_interrupted_beyond_recovery_leaves_no_destination_file() -> Result<()> {
         // Every attempt ends early, so the download never completes and the
         // user is left with the truncation as the reported reason.
@@ -8503,6 +8872,25 @@ mod tests {
 
         let _ = server.join();
         Ok(())
+    }
+
+    #[test]
+    fn http_response_is_complete_does_not_miscount_a_split_multibyte_char() {
+        // A body ending in a multi-byte UTF-8 character can arrive one byte
+        // short of the declared Content-Length. Lossy-decoding the whole
+        // buffer to check completeness turns that dangling partial sequence
+        // into a 3-byte U+FFFD replacement, inflating the decoded length past
+        // the declared one and reporting completeness a read early.
+        let body = "hi \u{2603}"; // snowman is a 3-byte UTF-8 character
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let truncated = &full[..full.len() - 1];
+
+        assert!(!http_response_is_complete(truncated));
+        assert!(http_response_is_complete(&full));
     }
 
     /// A signal arriving mid-response must not fail the request.
@@ -9057,6 +9445,16 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx94X-dcgpu"),
             Some("gfx94X-dcgpu".to_owned())
+        );
+    }
+
+    /// ROCm 10's next layout publishes a `gfx125X-dcgpu` family; the raw
+    /// `gfx1250` arch a host reports has to land on it.
+    #[test]
+    fn normalize_therock_family_maps_gfx1250_to_gfx125x_dcgpu() {
+        assert_eq!(
+            normalize_therock_family("gfx1250"),
+            Some("gfx125X-dcgpu".to_owned())
         );
     }
 
@@ -11683,56 +12081,103 @@ last_installed_runtime_id = "therock-release"
     }
 
     #[test]
-    fn every_wsl_signal_is_believed_by_the_one_predicate() {
-        // The union. Each of these was decisive to at least one of the three
-        // implementations this replaces.
-        assert!(wsl_signals_indicate_wsl(true, false, ""), "/dev/dxg");
+    fn dev_dxg_is_believed_on_its_own() {
+        // Nothing but WSLg's GPU passthrough creates this device node, so it is
+        // trusted without corroboration.
+        assert!(wsl_signals_indicate_wsl(true, ""), "/dev/dxg");
         assert!(
-            wsl_signals_indicate_wsl(false, true, ""),
-            "$WSL_DISTRO_NAME"
-        );
-        assert!(
-            wsl_signals_indicate_wsl(
-                false,
-                false,
-                "Linux version 6.6.87.2-microsoft-standard-WSL2"
-            ),
-            "microsoft in /proc/version"
-        );
-        assert!(
-            wsl_signals_indicate_wsl(false, false, "Linux version 5.15.0 wsl2"),
-            "wsl in /proc/version"
-        );
-        assert!(
-            !wsl_signals_indicate_wsl(false, false, "Linux version 6.8.0-51-generic"),
-            "an ordinary kernel is not WSL"
+            wsl_signals_indicate_wsl(true, "Linux version 6.8.0-51-generic"),
+            "/dev/dxg overrides an otherwise ordinary kernel string"
         );
     }
 
     #[test]
-    fn the_two_old_predicates_disagreed_and_this_one_does_not() {
-        // The install summary asked for /dev/dxg or "microsoft"; the JSON probe
-        // asked for "microsoft"/"wsl" or $WSL_DISTRO_NAME. These are the two
-        // shapes that split them, and the reason `examine` could contradict
-        // `examine --json` about the platform it was describing.
-        let only_the_summary_saw_it = (true, false, "Linux version 6.8.0-generic");
-        let only_the_probe_saw_it = (false, true, "Linux version 6.8.0-generic");
-        for (dxg, distro, version) in [only_the_summary_saw_it, only_the_probe_saw_it] {
+    fn proc_version_alone_is_believed() {
+        // Only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+        // `-Microsoft` -- unlike $WSL_DISTRO_NAME, that string cannot be
+        // inherited or forwarded into an unrelated shell, so it needs no
+        // corroboration. This is also what makes a WSL2 container correctly
+        // read as WSL even when it was not started with /dev/dxg passed in:
+        // it shares the host kernel, so /proc/version still carries the
+        // marker even though the container has no $WSL_DISTRO_NAME of its own.
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 6.6.87.2-microsoft-standard-WSL2"),
+            "microsoft in /proc/version is enough on its own"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version is enough on its own"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_kernel_with_no_signals_is_not_wsl() {
+        assert!(
+            !wsl_signals_indicate_wsl(false, "Linux version 6.8.0-51-generic"),
+            "an ordinary kernel is not WSL"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, ""),
+            "no device and no /proc/version to read is not WSL"
+        );
+    }
+
+    #[test]
+    fn real_wsl2_and_wsl1_hosts_are_recognised_by_proc_version_alone() {
+        // Its own doc comment above records that WSL 1 kernels always end in
+        // "-microsoft" and WSL 2 kernels always carry "microsoft-standard" --
+        // so every real WSL host is recognised without needing $WSL_DISTRO_NAME
+        // or /dev/dxg at all.
+        let wsl2 = "Linux version 5.15.167.4-microsoft-standard-WSL2";
+        let wsl2_early = "Linux version 4.19.104-microsoft-standard";
+        let wsl1 = "Linux version 4.4.0-19041-Microsoft";
+        for proc_version in [wsl2, wsl2_early, wsl1] {
             assert!(
-                wsl_signals_indicate_wsl(dxg, distro, version),
-                "one predicate already believed this host was WSL: \
-                 dxg={dxg} distro_name={distro} {version:?}"
+                wsl_signals_indicate_wsl(false, proc_version),
+                "a real WSL host was not recognised: {proc_version:?}"
             );
         }
+        // WSL 2 with GPU passthrough enabled also has /dev/dxg, which is
+        // believed regardless of /proc/version.
+        assert!(wsl_signals_indicate_wsl(true, wsl2));
     }
 
     #[test]
     fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
-        assert!(wsl_signals_indicate_wsl(
-            false,
-            false,
-            "MICROSOFT-STANDARD-WSL2"
-        ));
+        assert!(wsl_signals_indicate_wsl(false, "MICROSOFT-STANDARD-WSL2"));
+    }
+
+    #[test]
+    fn wsl1_is_told_apart_from_wsl2_by_the_kernel_release() {
+        // The two are the same string family, distinguished only by the WSL2
+        // marker. Getting this backwards would send a WSL 1 user chasing a
+        // Windows driver update that can never give them a GPU, or hide the
+        // conversion advice from the one platform that needs it.
+        for wsl1 in [
+            "4.4.0-19041-Microsoft",
+            "4.4.0-18362-MICROSOFT",
+            "4.4.0-17763-microsoft",
+        ] {
+            assert!(is_wsl1_kernel(wsl1), "{wsl1} is a WSL 1 kernel");
+        }
+        for wsl2 in [
+            "6.6.87.2-microsoft-standard-WSL2",
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.18.33.2-MICROSOFT-STANDARD-WSL2",
+            // The `-WSL2` suffix is not the marker. These are the earlier WSL 2
+            // kernels, which carry `microsoft-standard` and no `WSL2` at all --
+            // testing for the absence of `WSL2` called every one of them WSL 1.
+            "4.19.104-microsoft-standard",
+            "4.19.128-microsoft-standard",
+            "5.10.16.3-microsoft-standard",
+        ] {
+            assert!(!is_wsl1_kernel(wsl2), "{wsl2} is a WSL 2 kernel");
+        }
+        // A bare-metal kernel is neither, and must not read as WSL 1 -- the
+        // caller only asks on a host already known to be WSL, but answering
+        // "yes" here would be wrong if that ever changed.
+        assert!(!is_wsl1_kernel("6.8.0-51-generic"));
+        assert!(!is_wsl1_kernel(""));
     }
 
     #[test]
