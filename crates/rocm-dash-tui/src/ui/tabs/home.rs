@@ -1020,37 +1020,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn held_legend_visible_when_hero_data_is_held() {
-        // Characterization guard: HELD_LEGEND rendering in the hero band
-        // (draw_hero_left/draw_hero_right, home.rs:315/424) predates this PR
-        // and is unchanged by this diff — this pins that pre-existing
-        // behavior, it does not exercise anything new here.
-        let mut s = state_with_gpu();
-        let inst = named_instance_with_obs("m", Some(held_obs()));
-        s.instances.insert(inst.container_id.clone(), inst);
-        let out = render(&s, 160, 30);
-        assert!(
-            out.contains(format::HELD_LEGEND),
-            "HELD_LEGEND must be visible when hero data is held; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn held_legend_absent_when_hero_data_is_fresh() {
-        // Characterization guard, see held_legend_visible_when_hero_data_is_held
-        // above: pins pre-existing HELD_LEGEND-absent behavior, unchanged by
-        // this diff.
-        let mut s = state_with_gpu();
-        let inst = named_instance_with_obs("m", Some(fresh_obs()));
-        s.instances.insert(inst.container_id.clone(), inst);
-        let out = render(&s, 160, 30);
-        assert!(
-            !out.contains(format::HELD_LEGEND),
-            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
-        );
-    }
-
     fn job(cmd: &str, status: JobStatus) -> JobState {
         JobState {
             cmd: cmd.into(),

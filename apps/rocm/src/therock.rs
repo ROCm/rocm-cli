@@ -6735,8 +6735,9 @@ echo Python 3.12.10
         use std::thread;
         use std::time::Instant;
 
-        // Regression test for the `download_timeout_secs` parameter threaded
-        // through `resolve_latest_for_manifest` in this PR: `http_get` must
+        // Regression test for `http_get`'s `max_time_secs` bound, pre-existing
+        // and unchanged by this PR, which `download_timeout_secs` relies on
+        // once threaded through `resolve_latest_for_manifest`: `http_get` must
         // actually bound the request to `max_time_secs`, not just accept the
         // argument and fall back to the 10-minute default. A listener that
         // accepts the connection but never writes a response simulates a

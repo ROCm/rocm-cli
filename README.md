@@ -262,8 +262,8 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
 native package). `update` checks for a newer ROCm package; pass `--apply` to
 install it. `--json` prints the check result as a single line of JSON instead
-of text; `--timeout-secs` bounds its network calls (both require `--json` and
-conflict with `--apply`).
+of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
+`--json`; both conflict with `--apply`).
 
 ### Runtime management
 

@@ -1691,7 +1691,7 @@ fn reduce_update_json(document: &serde_json::Value) -> UpdateStatus {
         let latest_version = row
             .get("latest_version")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
+            .unwrap_or("(version unknown)")
             .to_owned();
         return UpdateStatus::UpdateAvailable { latest_version };
     }
@@ -7215,7 +7215,7 @@ mod tests {
         assert_eq!(
             reduce_update_json(&doc),
             UpdateStatus::UpdateAvailable {
-                latest_version: "unknown".to_owned()
+                latest_version: "(version unknown)".to_owned()
             }
         );
     }
