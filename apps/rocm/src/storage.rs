@@ -623,6 +623,11 @@ pub(crate) fn build_prune_plan(
         match should_remove_runtime_install_root(manifest) {
             Ok(decision) if decision.should_remove() => {}
             Ok(InstallRootDecision::ReadOnly) => {
+                // Unreachable in practice: `removable` already excludes read-only/imported
+                // runtimes via `unconditional_hold`, using the same condition
+                // `should_remove_runtime_install_root` checks here. Kept for match
+                // exhaustiveness against the shared `InstallRootDecision` enum, whose
+                // other variant (`ManifestMismatch`) *is* reachable from this call site.
                 plan.skipped.push(format!(
                     "{runtime_key}: ROCm CLI did not create this folder, so it is left in place"
                 ));

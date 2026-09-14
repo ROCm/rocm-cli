@@ -6849,9 +6849,13 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             println!("  registry_removed: {}", result.registry_path.display());
             match result.removed_install_root.as_ref() {
                 Some(path) => println!("  folder_removed: {}", path.display()),
-                None if result.read_only => {
+                None if result.read_only && result.install_root_existed => {
                     println!("  folder_removed: no");
                     println!("  note: ROCm CLI did not create this folder, so it is left in place");
+                }
+                None if result.read_only => {
+                    println!("  folder_removed: no");
+                    println!("  note: ROCm CLI did not create this folder; it was already gone");
                 }
                 None if result.manifest_mismatch && result.install_root_existed => {
                     println!("  folder_removed: no");
@@ -28559,7 +28563,7 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn runtime_uninstall_plan_dry_run_makes_no_changes() -> Result<()> {
+    fn runtime_uninstall_plan_computes_without_mutating() -> Result<()> {
         let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
         let manifest = write_test_pip_runtime(
             &paths,

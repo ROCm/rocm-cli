@@ -37,10 +37,21 @@ Feature: Update report
     Then the CLI refuses because no managed runtimes are registered
 
   # `--runtime`/`--activate` are apply-only flags: without `--apply` or
-  # `--dry-run` alongside them, the old code silently fell through to the plain
-  # report and ignored both. This pins the refusal instead of the silent no-op.
+  # `--dry-run` alongside them, the old code rejected them with a bare clap
+  # usage error (both were declared `requires = "apply"`) instead of a message
+  # naming the actual constraint. This pins the intentional refusal message.
   @id:update-runtime-or-activate-without-apply-or-dry-run-is-refused
   Scenario: update-05 - --runtime or --activate without --apply or --dry-run is refused
     Given a machine with no managed runtimes
     When the user requests updating a specific runtime without --apply or --dry-run
     Then the CLI refuses because --apply or --dry-run is required with --runtime or --activate
+
+  # --dry-run and --json are mutually exclusive: --json emits a single line of
+  # machine-readable JSON, and --dry-run would print human-readable preview text
+  # on top of it, corrupting the JSON contract. Pins the clap conflict instead of
+  # one flag silently winning.
+  @id:update-dry-run-conflicts-with-json
+  Scenario: update-06 - --dry-run and --json cannot be combined
+    Given a machine with no managed runtimes
+    When the user checks for updates as JSON with --dry-run
+    Then the CLI refuses because --dry-run and --json cannot be combined
