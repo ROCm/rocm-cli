@@ -69,7 +69,18 @@ pub fn runner_options(
         // Production always runs the real `/dev/kfd` pre-flight; only daemon
         // integration tests with a fake binary skip it.
         amd_smi_skip_kfd_preflight: false,
+        test_clock_offset_path: dash_test_clock_offset_path(),
     }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH").map(Into::into)
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
