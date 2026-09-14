@@ -1031,6 +1031,9 @@ mod tests {
             approval: None,
             active_provider: crate::app::ChatProvider::default(),
             provider_switch: None,
+            update_status: crate::app::UpdateStatus::Unknown,
+            update_status_pending: false,
+            update_check_due_at: std::time::Instant::now(),
         }
     }
 
