@@ -7210,8 +7210,8 @@ enum InstallRootDecision {
 }
 
 impl InstallRootDecision {
-    fn should_remove(self) -> bool {
-        matches!(self, InstallRootDecision::Remove)
+    const fn should_remove(self) -> bool {
+        matches!(self, Self::Remove)
     }
 }
 
@@ -23334,7 +23334,9 @@ model recipes
                         "{args:?} should have --yes injected for the approval path"
                     );
                 }
-                other => panic!("{args:?} should require approval, got {other:?}"),
+                ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("{args:?} should require approval, got ReadOnly")
+                }
             }
         }
     }

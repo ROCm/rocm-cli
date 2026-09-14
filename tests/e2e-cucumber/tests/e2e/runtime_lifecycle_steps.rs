@@ -148,7 +148,8 @@ async fn list_runtimes(world: &mut E2eWorld) {
 
 #[when("the user uninstalls that runtime")]
 async fn uninstall(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--yes"]);
     record(world, stdout, stderr, rc);
 }
 
