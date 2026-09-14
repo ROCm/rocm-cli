@@ -624,9 +624,11 @@ jobs:
           E2E_ONLY_LIFECYCLE: "1"
         run: |
           # Derive from CARGO_TARGET_DIR when it is set, falling back to the
-          # default target dir — the same form the PowerShell prebuilt lanes in
-          # nightly.yml and e2e-selfhosted.yml use, so a future job-level
-          # CARGO_TARGET_DIR cannot leave this lane pointing at a stale path.
+          # default target dir, so a future job-level CARGO_TARGET_DIR cannot
+          # leave this lane pointing at a stale path. The expression is
+          # byte-identical to the prebuilt lanes in nightly.yml and
+          # e2e-selfhosted.yml — which keeps the shared pin string meaningful —
+          # though those steps run under `shell: powershell` rather than pwsh.
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
           $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
