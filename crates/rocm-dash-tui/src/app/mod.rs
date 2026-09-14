@@ -1620,8 +1620,7 @@ fn focused_close_key_blocked(state: &AppState, focus: Option<Focus>, code: KeyCo
     }
     let running = state
         .active_job_id()
-        .and_then(|id| state.jobs.job(id))
-        .is_some_and(|j| !j.is_terminal());
+        .is_some_and(|id| ui::job_console::console_esc_closes(state.jobs.job(id)));
     running && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
 }
 
@@ -5509,9 +5508,11 @@ mod tests {
     fn slash_help_resets_stale_scroll_offset() {
         let mut s = st();
         s.help_scroll = 42;
+        s.help_max_scroll = 42;
         assert_eq!(s.handle_slash_command("/help"), SlashOutcome::Handled);
         assert_eq!(s.modal, Modal::Help);
         assert_eq!(s.help_scroll, 0);
+        assert_eq!(s.help_max_scroll, 0);
     }
 
     #[test]
@@ -5525,9 +5526,11 @@ mod tests {
     fn slash_question_mark_resets_stale_scroll_offset() {
         let mut s = st();
         s.help_scroll = 17;
+        s.help_max_scroll = 17;
         assert_eq!(s.handle_slash_command("/?"), SlashOutcome::Handled);
         assert_eq!(s.modal, Modal::Help);
         assert_eq!(s.help_scroll, 0);
+        assert_eq!(s.help_max_scroll, 0);
     }
 
     #[test]

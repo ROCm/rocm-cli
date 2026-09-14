@@ -438,11 +438,26 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
+    } else if state.has_open_overlay()
+        && state
+            .active_job_id()
+            .is_some_and(|id| crate::ui::job_console::console_esc_closes(state.jobs.job(id)))
+    {
+        // A manager's job console is showing a still-running job — Esc fully
+        // closes the overlay there (the job keeps running in the background),
+        // matching the console's own footer hint ("Esc close (keeps
+        // running)"), not the generic sub-popup "cancel" below. Once the job
+        // finishes, `on_console_key` only dismisses the console back to the
+        // screen body (the overlay stays open), so that case falls through to
+        // the "cancel" arm below, which already describes it correctly. Shares
+        // `console_esc_closes` with `on_console_key` so the two can't drift.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" close  "));
     } else if state.has_open_overlay() {
-        // A manager is open but not at its root layer (sub-popup, picker,
-        // approval, or job console) — Esc is handled by that layer's own
-        // event-loop arm, not by `should_pane_back_out`/`OpenMenu`. `None`
-        // keeps the chip non-clickable so it can't dispatch the wrong action.
+        // A manager is open but not at its root layer (sub-popup, picker, or
+        // approval) — Esc is handled by that layer's own event-loop arm, not
+        // by `should_pane_back_out`/`OpenMenu`. `None` keeps the chip
+        // non-clickable so it can't dispatch the wrong action.
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" cancel  "));
     } else if state.modal != Modal::None {
@@ -613,11 +628,13 @@ mod tests {
     #[test]
     fn footer_esc_chip_is_not_clickable_menu_when_overlay_has_a_sub_popup_open() {
         // Regression: with a manager open but not at its root layer (here, a
-        // running job console), `has_open_overlay()` is true but
+        // folder browser sub-popup), `has_open_overlay()` is true but
         // `active_overlay_at_root()` is false. The chip must not fall through
         // to the generic `OpenMenu` arm — that key is actually consumed by the
         // manager's own event-loop arm, which cancels the sub-layer, not the
-        // menu. Any chip shown here must be non-clickable (`action == None`).
+        // menu. Any chip shown here must be non-clickable (`action == None`)
+        // and labeled "cancel" (this sub-popup has no "close means job keeps
+        // running" nuance, unlike a job console — see the "close" test below).
         use crate::ui::theme::Theme;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -625,7 +642,10 @@ mod tests {
         let theme = Theme::from_name("default-dark");
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
-            active_job: Some("job".into()),
+            browser: Some(crate::ui::folder_browser::FolderBrowser::new(
+                "t",
+                std::env::temp_dir(),
+            )),
             ..Default::default()
         });
         assert!(state.has_open_overlay());
@@ -644,5 +664,114 @@ mod tests {
                 "no chip may dispatch OpenMenu while a sub-popup owns Esc"
             );
         }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("cancel"),
+            "sub-popup Esc chip should say cancel: {row:?}"
+        );
+        assert!(
+            !row.contains("close"),
+            "sub-popup Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_close_when_job_console_is_open() {
+        // A manager's job console is showing a still-running job — Esc fully
+        // closes the overlay there (matching the console's own "Esc close
+        // (keeps running)" footer hint), so the dashboard footer chip must say
+        // "close", not the generic sub-popup "cancel".
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("close"),
+            "job console Esc chip should say close: {row:?}"
+        );
+        assert!(
+            !row.contains("cancel"),
+            "job console Esc chip should not say cancel: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_cancel_when_job_console_shows_a_finished_job() {
+        // Once the job console's job has finished, Esc only dismisses the
+        // console back to the screen body (the overlay itself stays open) —
+        // `on_console_key` never returns `Closed` for a terminal job. The
+        // footer chip must not claim "close" here; it falls through to the
+        // generic sub-popup "cancel" label, which already describes this
+        // case correctly.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.jobs.apply(StateEvent::JobDone {
+            id: "job".into(),
+            code: 0,
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("cancel"),
+            "finished-job console Esc chip should say cancel: {row:?}"
+        );
+        assert!(
+            !row.contains("close"),
+            "finished-job console Esc chip should not say close: {row:?}"
+        );
     }
 }

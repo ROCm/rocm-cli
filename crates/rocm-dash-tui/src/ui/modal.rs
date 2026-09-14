@@ -70,6 +70,14 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 /// computed last-page offset so callers can write it back into app state
 /// (see `AppState::help_max_scroll`) and clamp future scroll deltas against
 /// the real content length instead of just this frame's render clamp.
+///
+/// Draws a scrollbar thumb on the right edge when content overflows — a
+/// widely recognized affordance for "there's more below" that a footer hint
+/// alone doesn't convey. The overflow check (and thus `max_scroll`) is
+/// wrapped at the *full* inner width first, before the scrollbar reserves its
+/// column: narrowing the width can only ever add more wrapped rows, never
+/// remove the overflow that triggered the bar, so this ordering keeps the
+/// decision to draw a bar and the final wrap consistent.
 pub fn draw_scrollable_lines(
     f: &mut Frame,
     area: Rect,
@@ -83,11 +91,20 @@ pub fn draw_scrollable_lines(
         return 0;
     }
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let max_scroll = u16::try_from(p.line_count(inner.width))
+    let full_count = u16::try_from(p.line_count(inner.width)).unwrap_or(u16::MAX);
+    let content_area = panel::vertical_scrollbar(
+        f,
+        inner,
+        full_count as usize,
+        inner.height as usize,
+        scroll as usize,
+        theme,
+    );
+    let max_scroll = u16::try_from(p.line_count(content_area.width))
         .unwrap_or(u16::MAX)
-        .saturating_sub(inner.height);
+        .saturating_sub(content_area.height);
     let p = p.scroll((scroll.min(max_scroll), 0));
-    f.render_widget(p, inner);
+    f.render_widget(p, content_area);
     max_scroll
 }
 
@@ -926,6 +943,32 @@ mod ported_chrome_tests {
             out.contains("REPLAY") && out.contains("60s"),
             "overscrolling wrapped help should still reach the last REPLAY \
              entry, not clamp short of it: {out:?}"
+        );
+    }
+
+    #[test]
+    fn help_overflow_shows_scrollbar_thumb_and_reports_positive_max_scroll() {
+        // A short viewport guarantees Chat's (longest) help content overflows,
+        // which should both report a positive max_scroll and render a
+        // scrollbar thumb — the "there's more below" affordance.
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 10);
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut max_scroll = 0;
+        term.draw(|f| {
+            max_scroll = super::draw_help(f, area, ActiveTab::Chat, &theme, 0);
+        })
+        .unwrap();
+        assert!(
+            max_scroll > 0,
+            "a short viewport should report overflow via a positive max_scroll"
+        );
+        let out = flat(&term);
+        assert!(
+            out.contains('█'),
+            "overflowing help should render a scrollbar thumb: {out:?}"
         );
     }
 }

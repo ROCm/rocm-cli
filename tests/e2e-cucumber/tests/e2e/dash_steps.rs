@@ -530,6 +530,10 @@ async fn services_manager_closed(world: &mut E2eWorld) {
         screen.contains("● Observe"),
         "Escape left the Observe tab entirely, not just the manager:\n{screen}"
     );
+    // Belt-and-suspenders: `wait_until_gone` above is the primary regression
+    // check (the manager itself closed). This additionally guards against
+    // Esc falling through to open the main menu instead — "Options"/"Quit"
+    // are unique to `Modal::Menu`.
     assert!(
         !screen.contains("Options") && !screen.contains("Quit"),
         "the main menu is open on top of the closed manager:\n{screen}"
