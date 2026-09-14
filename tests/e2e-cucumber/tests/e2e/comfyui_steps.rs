@@ -8,8 +8,10 @@
 //! with a satisfying `rocm_sdk` probe, a pre-existing source checkout (so the
 //! CLI never attempts the real network download of ComfyUI's source archive)
 //! and a fake Python interpreter that answers the torch-stack version probe
-//! with valid, empty JSON. The only thing under test is what happens when the
-//! `uv` dependency install that follows all of that fails.
+//! with valid, empty JSON. `comfyui-01` covers what happens when the `uv`
+//! dependency install that follows all of that fails; `comfyui-02` covers a
+//! `uv` install that succeeds, which runs on into the post-install GPU check
+//! and needs the fake Python to also answer that second probe.
 
 use std::path::{Path, PathBuf};
 
@@ -125,6 +127,42 @@ async fn uv_install_fails(world: &mut E2eWorld) {
         .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
 }
 
+#[given("the ComfyUI dependency install with uv prints progress and succeeds")]
+async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
+    let uv = root(world)
+        .join("comfyui-fixture")
+        .join("uv-bin")
+        .join("uv");
+    write_shim(&uv, "#!/bin/sh\necho 'Resolved 3 packages'\nexit 0\n");
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+
+    // The success path runs past `uv` into `probe_comfyui`'s post-install GPU
+    // check, which shells out to the runtime's Python a second time with two
+    // path arguments (a generated probe script, then where to write its JSON
+    // result) rather than `-c <script>` like the pre-install torch-stack probe.
+    // The fixture Python from the `Given` above only answers the `-c` form, so
+    // it must be replaced here with one that answers both: unlike
+    // `comfyui-01`, this scenario runs `install()` far enough to reach that
+    // second call.
+    let python = root(world)
+        .join("comfyui-fixture")
+        .join("python")
+        .join("rocm-python");
+    write_shim(
+        &python,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-c\" ]; then\n\
+         \tprintf '{}'\n\
+         \texit 0\n\
+         fi\n\
+         cat > \"$2\" <<'JSON'\n\
+         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
+         JSON\n",
+    );
+}
+
 #[when("the user installs ComfyUI")]
 async fn install_comfyui(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
@@ -175,5 +213,24 @@ async fn cli_names_install_log(world: &mut E2eWorld) {
     assert!(
         stderr.contains(&log_path),
         "expected stderr to name the install log {log_path}, got:\n{stderr}"
+    );
+}
+
+#[then("the CLI succeeds and shows the install progress")]
+async fn cli_succeeds_and_shows_progress(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let rc = world.cli_rc.unwrap_or(-1);
+    assert!(
+        rc == 0,
+        "expected `rocm comfyui install` to succeed, got rc={rc}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // This is the non-TTY fallback under test: the `AnimatedSpinner` is a
+    // no-op off a terminal, so `uv`'s own stdout must be the thing that
+    // proves the install wasn't silent for its whole run.
+    assert!(
+        stdout.contains("Resolved 3 packages"),
+        "expected uv's progress output to be streamed through to stdout, got:\n{stdout}"
     );
 }

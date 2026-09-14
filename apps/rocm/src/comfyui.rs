@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, Read, Write as IoWrite};
+use std::io::{self, IsTerminal, Read, Write as IoWrite};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -1596,9 +1596,17 @@ fn run_uv_logged_command(
     let stderr_log = log
         .try_clone()
         .context("failed to clone ComfyUI install log for stderr")?;
+    // `AnimatedSpinner` (see cli_progress.rs) is TTY-gated and a hard no-op off
+    // a terminal, so on its own a piped/CI install would print nothing for the
+    // entire uv resolve, indistinguishable from a hang. `stream_logged_output`
+    // below is the off-TTY fallback: it tees the child's stdout/stderr through
+    // to our real stdout/stderr whenever stderr isn't a terminal, so a
+    // non-interactive install still shows live progress.
     let spinner = AnimatedSpinner::start(spinner_label);
-    let stdout_thread = thread::spawn(move || stream_logged_output(stdout, stdout_log));
-    let stderr_thread = thread::spawn(move || stream_logged_output(stderr, stderr_log));
+    let stdout_thread =
+        thread::spawn(move || stream_logged_output(stdout, stdout_log, OutputTarget::Stdout));
+    let stderr_thread =
+        thread::spawn(move || stream_logged_output(stderr, stderr_log, OutputTarget::Stderr));
     let status = child
         .wait()
         .with_context(|| format!("{context_text}: failed waiting for {}", uv.display()))?;
@@ -1620,7 +1628,22 @@ fn run_uv_logged_command(
     );
 }
 
-fn stream_logged_output<R: Read>(mut reader: R, mut log: fs::File) -> io::Result<()> {
+/// Which real stream a `stream_logged_output` reader mirrors to when not
+/// attached to a terminal.
+enum OutputTarget {
+    Stdout,
+    Stderr,
+}
+
+fn stream_logged_output<R: Read>(
+    mut reader: R,
+    mut log: fs::File,
+    target: OutputTarget,
+) -> io::Result<()> {
+    // When stderr is a terminal, the `AnimatedSpinner` is the progress signal
+    // and raw uv output would visually clash with it, so only tee through
+    // when we're not attached to one (piped output, CI, etc).
+    let tee = !io::stderr().is_terminal();
     let mut buffer = [0_u8; 8192];
     loop {
         let len = reader.read(&mut buffer)?;
@@ -1628,6 +1651,20 @@ fn stream_logged_output<R: Read>(mut reader: R, mut log: fs::File) -> io::Result
             break;
         }
         log.write_all(&buffer[..len])?;
+        if tee {
+            match target {
+                OutputTarget::Stdout => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(&buffer[..len])?;
+                    stdout.flush()?;
+                }
+                OutputTarget::Stderr => {
+                    let mut stderr = io::stderr().lock();
+                    stderr.write_all(&buffer[..len])?;
+                    stderr.flush()?;
+                }
+            }
+        }
     }
     Ok(())
 }
