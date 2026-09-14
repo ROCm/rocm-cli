@@ -882,8 +882,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let dispatch_timeout = job_scalar(job_block(&self_hosted, "e2e-wsl"), "timeout-minutes");
         let nightly_timeout = job_scalar(job_block(&nightly, "e2e-wsl-nightly"), "timeout-minutes");
         assert_eq!(
-            dispatch_timeout, "90",
-            "the 2400s large-model readiness budget needs the established 90-minute job cap for setup and the remaining suite"
+            dispatch_timeout, "120",
+            "the 2400s large-model readiness budget plus the ephemeral pool's per-job WSL install/build/prewarm \
+             overhead needs the established 120-minute job cap for setup and the remaining suite"
         );
         assert_eq!(
             dispatch_timeout, nightly_timeout,

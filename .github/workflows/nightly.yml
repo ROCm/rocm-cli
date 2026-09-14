@@ -851,18 +851,20 @@ jobs:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
 
-  # WSL2 counterpart to e2e-gpu-nightly-strix: the same Strix Halo box again, but
-  # reached through an Ubuntu distro under WSL2, so this lane exercises the WSL
-  # host boundary AND whatever GPU access WSL exposes. Mirrors the per-PR
-  # `e2e-wsl` lane in e2e-selfhosted.yml, opting into the same @nightly
-  # large-model scenario as the other nightly lanes. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner; the native lane's
-  # /home/ubuntu/actions-runner paths deliberately are NOT reused, since they do
-  # not exist in the WSL distro.
+  # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
+  # fresh inside WSL2 on a DevLab Dispatch pool Windows host — the same pool
+  # e2e-gpu-nightly-strix-windows already uses, not a separate `wsl`-labeled
+  # runner. Mirrors the per-PR `e2e-wsl` lane in e2e-selfhosted.yml step for
+  # step (see that job's header comment for the pool maintainer's sign-off),
+  # opting into the same @nightly large-model scenario as the other nightly
+  # lanes.
   e2e-wsl-nightly:
     name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, strix-halo, wsl]
+    # See e2e-wsl in e2e-selfhosted.yml: every job here is cold (fresh distro,
+    # fresh build, fresh prewarm) plus the ~5min/job distro-install overhead;
+    # conservative starting budget, tune down after a measured run.
+    timeout-minutes: 120
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
     env:
       E2E_INCLUDE_NIGHTLY: "1"
@@ -875,10 +877,40 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
+      # of these steps — this job mirrors it exactly, minus the scoped
+      # name_filter dispatch input this workflow doesn't have.
+      - name: Install WSL (pinned Microsoft.WSL)
+        shell: powershell
+        run: |
+          winget install --id Microsoft.WSL --exact --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      - name: Install Ubuntu-24.04 distro
+        shell: powershell
+        run: |
+          wsl --unregister Ubuntu-24.04 2>$null | Out-Null
+          wsl --install Ubuntu-24.04 --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::wsl --install Ubuntu-24.04 failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          wsl -d Ubuntu-24.04 -u root -- echo ok
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::distro did not come up after install"
+            exit $LASTEXITCODE
+          }
+
       # Fail fast and loudly if this job ever lands on a native Linux runner:
       # every WSL-tagged scenario would silently resolve to skip instead.
       - name: Verify the host really is WSL2
+        shell: powershell
         run: |
+          @'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
             && [ -z "${WSL_DISTRO_NAME+x}" ] \
@@ -887,37 +919,48 @@ jobs:
             exit 1
           fi
           printf 'WSL kernel: %s\n' "$(uname -r)"
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The native Strix runners come pre-provisioned; a WSL distro often does
-      # not. Install the native build deps only when something is missing, and
-      # only if passwordless sudo is available — otherwise say what is missing
-      # instead of hanging on a password prompt.
       - name: Ensure native build deps
+        shell: powershell
         run: |
-          missing=""
-          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
-          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
-          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
-          if [ -z "$missing" ]; then
-            echo "native build deps present"
-          elif sudo -n true 2>/dev/null; then
-            echo "installing:$missing"
-            sudo -n apt-get update
-            # shellcheck disable=SC2086
-            sudo -n apt-get install -y $missing
-          else
-            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
-            exit 1
-          fi
+          @'
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config build-essential libcap-dev git ca-certificates curl sudo
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Reclaim GPU from stray E2E processes
+      - name: Clone checkout into the WSL guest's native filesystem
+        shell: powershell
         run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+          $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          $script = @"
+          set -eo pipefail
+          rm -rf /root/work
+          mkdir -p /root/work
+          git clone --local '$winPath' /root/work/rocm-cli
+          cd /root/work/rocm-cli
+          git checkout --quiet '$sha'
+          "@
+          $script | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
+        shell: powershell
+        run: |
+          @'
+          set -eo pipefail
+          cd /root/work/rocm-cli
+          if bash scripts/wsl_setup_rocdxg.sh; then
+            echo "librocdxg installed"
+          else
+            echo "::warning::librocdxg install failed or was skipped -- @requires-gpu scenarios will resolve to skip"
+          fi
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
@@ -926,7 +969,9 @@ jobs:
       # GPU that IS present but stays held by a leftover serve still fails, since
       # that would corrupt the serve scenarios' results.
       - name: GPU preflight (advisory bounded wait)
+        shell: powershell
         run: |
+          @'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
@@ -958,28 +1003,39 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
       # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
       # the exact toolchain, installed on first cargo use. Idempotent.
       - name: Ensure Rust toolchain
+        shell: powershell
         run: |
+          @'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)
+        shell: powershell
         run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE'
+          @'
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd /root/work/rocm-cli
+
+          export CARGO_TARGET_DIR="/root/work/e2e-target"
+          export E2E_SHARED_CACHE_DIR="/root/work/e2e-shared"
           # Share ONE installed managed runtime across serve/chat scenarios and
           # PRE-WARM it in place (mirrors e2e-gpu-nightly-strix). Required for
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="/root/work/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -994,6 +1050,20 @@ jobs:
             cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 
           cargo xtask e2e
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Copy E2E results out of the WSL guest
+        if: always()
+        shell: powershell
+        run: |
+          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          @"
+          mkdir -p '$winPath/tests/e2e-cucumber/results'
+          if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then
+            cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
+          fi
+          "@ | wsl -d Ubuntu-24.04 -u root -- bash
 
       - name: Upload E2E report
         if: always()
