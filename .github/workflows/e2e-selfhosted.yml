@@ -743,13 +743,20 @@ jobs:
       # `ubuntu/WSL` composite action's own install step uses (with its own
       # `continue-on-error: true`) — that combination is exactly the "green
       # over a failing step" the pool maintainer flagged. No
-      # continue-on-error here: a real install failure must fail this step.
+      # continue-on-error here: a real install failure must fail this step —
+      # except winget's own well-known quirk where `install` on an
+      # already-installed-and-up-to-date package auto-retries as an upgrade
+      # and returns APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
+      # (0x8A15002B) instead of success (observed on run 34829625888, where
+      # the pool image already carries Microsoft.WSL). That specific code
+      # means "already present," which is exactly what this step wants; any
+      # other non-zero code still fails it.
       - name: Install WSL (pinned Microsoft.WSL)
         shell: powershell
         run: |
           winget install --id Microsoft.WSL --exact --silent `
             --accept-package-agreements --accept-source-agreements
-          if ($LASTEXITCODE -ne 0) {
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
             Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
@@ -986,6 +993,11 @@ jobs:
             cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
           fi
           "@ | wsl -d Ubuntu-24.04 -u root -- bash
+          # Best-effort per the step name: an earlier failure (e.g. the distro
+          # itself never came up) already failed the job through its own step,
+          # so this one must not also report red on the resulting "no such
+          # distribution" from the commands above.
+          exit 0
 
       - name: Upload E2E report
         if: always()
