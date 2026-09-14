@@ -736,6 +736,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
 
+      - name: Published Doctor catalog is current
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask catalog --check
+
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
       # is gated on sccache being present rather than on the remote backend being

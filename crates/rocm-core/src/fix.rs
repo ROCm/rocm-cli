@@ -10,8 +10,9 @@
 //! print the exact change, honor `--dry-run`, refuse on a non-interactive shell
 //! without `--yes`, and otherwise confirm before mutating anything.
 //!
-//! Exit codes match `apply_fix.py`: `0` ok/dry-run/print-only, `2` unknown id,
-//! `3` environment/OS not right, `4` a command failed, `5` user declined.
+//! Exit codes are named in [`exit`] and published in the catalog manifest, so
+//! the number, its meaning, and what a reader is told it means all come from one
+//! place.
 
 use crate::examine::{run, which};
 use crate::{runtime_is_linux, runtime_is_windows};
@@ -22,6 +23,30 @@ use std::time::Duration;
 
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The exit codes `apply` returns, named so the published manifest and the code
+/// that produces them cannot come to disagree.
+///
+/// These were written down only in the module comment above. A consumer reading
+/// the manifest is being told what a number means, so the number and its meaning
+/// have to come from one place -- a manifest that restated them by hand would be
+/// the same defect this whole contract exists to remove, one level up.
+pub mod exit {
+    /// Applied, previewed with `--dry-run`, printed, or listed. Nothing failed.
+    pub const OK: i32 = 0;
+    /// The CLI is inconsistent with itself -- a recipe it says it can carry out,
+    /// with nothing to carry it out with. Never a fault of the machine.
+    pub const INTERNAL: i32 = 1;
+    /// No such fix-id.
+    pub const UNKNOWN_ID: i32 = 2;
+    /// Real, but not for this machine: wrong platform, or a precondition the
+    /// host does not meet. Distinct from [`FAILED`], which means it was tried.
+    pub const NOT_APPLICABLE: i32 = 3;
+    /// Attempted, and a command it ran failed.
+    pub const FAILED: i32 = 4;
+    /// The user was asked and said no.
+    pub const DECLINED: i32 = 5;
+}
 
 /// Print a failure explanation to stderr, ignoring write failures (closed
 /// stderr, full disk) so an I/O error while explaining a failure can't itself
@@ -192,6 +217,10 @@ struct FixRecipe {
     needs_relogin: bool,
     verify: &'static str,
     notes: &'static [&'static str],
+    /// Where to read more about this failure. `None` for most entries today --
+    /// an empty answer beats a guessed one, which would send a user somewhere
+    /// wrong with an air of authority.
+    doc_url: Option<&'static str>,
     /// Every operating system this applies on, and what it does on each.
     applies_on: &'static [Platform],
     runner: Option<fn(&FixOptions) -> i32>,
@@ -242,6 +271,9 @@ const RECIPES: &[FixRecipe] = &[
             "TheRock per-gfx wheels are the recommended fallback when the official pytorch index does not yet cover your gfx (and the only first-party option on Windows AMD).",
             "HSA_OVERRIDE_GFX_VERSION is NOT the right fix here -- it papers over the mismatch and risks page faults at runtime.",
         ],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+        ),
         applies_on: PRINT_ON_LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
@@ -262,6 +294,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
         notes: &[],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS,
         runner: Some(run_unset_override),
     },
@@ -279,6 +312,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5",
         notes: &[],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+        ),
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -292,6 +328,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && rocminfo | head -n 5",
         notes: &[],
+        doc_url: None,
         applies_on: AUTO_ON_LINUX,
         runner: Some(run_render_group),
     },
@@ -313,6 +350,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If Secure Boot is enabled and amdgpu still won't load, the DKMS module isn't signed. Either sign it with mokutil or disable Secure Boot in firmware.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -331,6 +369,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "rocminfo | head -n 5 && hipcc --version",
         notes: &[],
+        doc_url: None,
         applies_on: AUTO_ON_LINUX_WINDOWS_AND_WSL,
         runner: Some(run_path_export),
     },
@@ -349,6 +388,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "sudo apt update 2>&1 | tail -n 20",
         notes: &[],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -369,6 +409,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())\"",
         notes: &[],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+        ),
         applies_on: PRINT_ON_LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
@@ -391,6 +434,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Pass --device-index N to persist the env var; without it, this fix only prints the rocminfo / hipInfo query so you can identify N.",
         ],
+        doc_url: None,
         applies_on: NEEDS_DEVICE_INDEX,
         runner: Some(run_hip_visible_devices),
     },
@@ -414,6 +458,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Rootless podman additionally needs `--userns=keep-id` and a host user that is in the render group; podman maps it through.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -433,6 +478,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'",
         notes: &[],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -453,6 +499,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If `apt autoremove --purge` warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -472,6 +519,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.",
         ],
+        doc_url: Some("https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
@@ -491,6 +539,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"",
         notes: &[],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-windows/en/latest/install/install.html",
+        ),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
@@ -510,6 +561,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.",
         ],
+        doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
@@ -556,6 +608,7 @@ const RECIPES: &[FixRecipe] = &[
             "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
             "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_LINUX,
         runner: None,
     },
@@ -581,6 +634,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "A container running on WSL2 reports itself as WSL but sees /dev/dxg only when it was started with the device. Check that before touching the Windows driver.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -601,6 +655,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore",
         notes: &["apt cannot repair /usr/lib/wsl: it is a mount supplied by WSL, not a package."],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -620,6 +675,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. rocm-cli does not run that for you, and the script does not bake in a production checksum -- set ROCDXG_SHA256 to one you trust.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -635,6 +691,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -653,6 +710,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -672,6 +730,7 @@ const RECIPES: &[FixRecipe] = &[
             "Nothing inside the distro can carry this out, which is why it prints rather than runs.",
             "The ROCm release and the Adrenalin release are paired; check the WSL install guide for the version that matches your ROCm.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -691,6 +750,7 @@ const RECIPES: &[FixRecipe] = &[
         notes: &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
+        doc_url: None,
         applies_on: PRINT_ON_WSL,
         runner: None,
     },
@@ -720,6 +780,7 @@ const RECIPES: &[FixRecipe] = &[
             "This is reported below 1 GiB. Silence is not proof of enough: a container given 2 GiB clears that bar and can still be too small for a large model.",
             "8g matches what fix-10-container already tells you to pass, so the two stay consistent.",
         ],
+        doc_url: None,
         // Not `PRINT_ON_LINUX`: the size of a tmpfs has nothing to do with the
         // amdgpu module, and WSL2 ships the same 64 MB default a container does.
         // Print-only on both because every remedy above needs sudo.
@@ -861,6 +922,108 @@ fn looks_like_a_diagnosis_position(value: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// The version of the agreement between this binary and the tools that read its
+/// catalog.
+///
+/// Rules, following `ENGINE_RECIPE_CONTRACT_VERSION` in the engine protocol: an
+/// **addition** keeps the version — a new entry, a new field, a doc URL filled
+/// in. A **removal or a type change** raises it. A reader declares the minimum
+/// it understands and stops below it rather than guessing.
+pub const CATALOG_CONTRACT_VERSION: u32 = 1;
+
+/// What the CLI does with one entry on one platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestPlatform {
+    pub os: String,
+    pub class: FixClass,
+    /// The argument [`FixClass::NeedsArgument`] is waiting for; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
+}
+
+/// One catalog entry, as published.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestEntry {
+    pub id: String,
+    pub title: String,
+    /// Every platform this applies on, and what it does there.
+    ///
+    /// A list rather than one class for the entry: an entry can apply on Linux
+    /// as print-only and on Windows as auto, and flattening that is precisely
+    /// the defect the class model was introduced to remove.
+    pub platforms: Vec<ManifestPlatform>,
+    pub needs_sudo: bool,
+    pub needs_reboot: bool,
+    pub needs_relogin: bool,
+    /// Where to read more. Absent for most entries today; filling one in later
+    /// is an addition and does not raise the contract version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_url: Option<String>,
+}
+
+/// The published description of the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogManifest {
+    pub contract_version: u32,
+    pub entries: Vec<ManifestEntry>,
+    /// What each exit code from `rocm fix` means.
+    pub exit_codes: std::collections::BTreeMap<String, i32>,
+}
+
+/// Describe the catalog for a machine to read.
+///
+/// Derived from `RECIPES` on every call, never stored alongside it. The whole
+/// point is that there is one catalog and one description of it; a second copy
+/// maintained by hand is the drift this is meant to end.
+#[must_use]
+pub fn catalog_manifest() -> CatalogManifest {
+    CatalogManifest {
+        contract_version: CATALOG_CONTRACT_VERSION,
+        entries: RECIPES
+            .iter()
+            .map(|r| ManifestEntry {
+                id: r.fix_id.to_owned(),
+                title: r.title.to_owned(),
+                platforms: r
+                    .applies_on
+                    .iter()
+                    .map(|p| ManifestPlatform {
+                        os: p.os.to_owned(),
+                        class: p.class,
+                        needs: p.needs.map(ToOwned::to_owned),
+                    })
+                    .collect(),
+                needs_sudo: r.needs_sudo,
+                needs_reboot: r.needs_reboot,
+                needs_relogin: r.needs_relogin,
+                doc_url: r.doc_url.map(ToOwned::to_owned),
+            })
+            .collect(),
+        exit_codes: [
+            ("ok", exit::OK),
+            ("internal", exit::INTERNAL),
+            ("unknown_id", exit::UNKNOWN_ID),
+            ("not_applicable", exit::NOT_APPLICABLE),
+            ("failed", exit::FAILED),
+            ("declined", exit::DECLINED),
+        ]
+        .into_iter()
+        .map(|(name, code)| (name.to_owned(), code))
+        .collect(),
+    }
+}
+
+/// The manifest as the published file holds it: pretty-printed, newline
+/// terminated, so a catalog change reads as a reviewable diff rather than one
+/// very long line.
+///
+/// # Errors
+/// When the manifest cannot be serialized, which would mean a type in it stopped
+/// being serializable.
+pub fn catalog_manifest_json() -> Result<String, serde_json::Error> {
+    Ok(serde_json::to_string_pretty(&catalog_manifest())? + "\n")
+}
+
 /// List every fix-id (id, class on this machine, OS scope, title).
 ///
 /// The marker is what the entry does **here**, not everywhere: `fix-2` reports
@@ -953,7 +1116,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
         } else {
             fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
-        return 2;
+        return exit::UNKNOWN_ID;
     };
     act_on(recipe, opts)
 }
@@ -1023,26 +1186,27 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
                 recipe.os_scope().join(", "),
                 current_os()
             );
-            3
+            exit::NOT_APPLICABLE
         }
         Plan::Unfixable => {
             // Not an error, so not a nonzero code: the command did everything it
-            // could, which is name the problem. Exit 3 would say "not applicable
-            // *here*", a different claim that would send a caller looking for
+            // could, which is name the problem. NOT_APPLICABLE would say "not
+            // applicable *here*", a claim that would send a caller looking for
             // another machine to run it on.
             println!("This problem has no reliable fix, so this command changes nothing.");
             println!("The explanation above is the whole of what is known about it.");
-            0
+            exit::OK
         }
         Plan::Run => recipe
             .runner
             .expect("plan_of returns Run only when a runner is present")(opts),
         Plan::MissingRunner => {
             // A recipe the catalog says the CLI carries out, with nothing to
-            // carry it out with -> 1, not 4 (4 is reserved for "attempted but
-            // the command failed"). Held by `a_recipe_that_acts_has_a_runner`.
+            // carry it out with -> INTERNAL, not FAILED (which is reserved for
+            // "attempted, and the command failed"). Held by
+            // `a_recipe_that_acts_has_a_runner`.
             fail!("Internal error: a recipe the catalog says is applied here has no runner.");
-            1
+            exit::INTERNAL
         }
         Plan::PrintSteps => {
             println!("This fix is print-only (manual change required).");
@@ -1050,7 +1214,7 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
             if !recipe.verify.is_empty() {
                 println!("  $ {}", recipe.verify);
             }
-            0
+            exit::OK
         }
     }
 }
@@ -1678,6 +1842,7 @@ mod tests {
             needs_relogin: false,
             verify: "",
             notes: &[],
+            doc_url: None,
             applies_on: Box::leak(Box::new([on(current_os(), class)])),
             runner: None,
         }
@@ -1840,6 +2005,97 @@ mod tests {
     /// changing machines that callers were told it only ever advised on, and
     /// the two corrections below were both silent precisely because a flat
     /// `bool` could not record the platform the claim was true on.
+    #[test]
+    fn the_manifest_describes_every_entry_exactly_once() {
+        let manifest = catalog_manifest();
+        let published: Vec<&str> = manifest.entries.iter().map(|e| e.id.as_str()).collect();
+        let catalog: Vec<&str> = RECIPES.iter().map(|r| r.fix_id).collect();
+        // Order too, not just membership: the published file is read as a diff,
+        // and a reordering that changed nothing would still churn review.
+        assert_eq!(
+            published, catalog,
+            "the manifest and the catalog must list the same entries in the same order"
+        );
+    }
+
+    #[test]
+    fn the_manifest_repeats_the_catalog_rather_than_reinterpreting_it() {
+        // The manifest exists so a reader does not have to parse prose. If it
+        // said anything the catalog does not, it would be a third copy to keep
+        // correct -- which is the defect, not the fix.
+        for entry in catalog_manifest().entries {
+            let recipe = find_recipe(&entry.id).expect("every published entry is in the catalog");
+            let published: Vec<(&str, FixClass)> = entry
+                .platforms
+                .iter()
+                .map(|p| (p.os.as_str(), p.class))
+                .collect();
+            let actual: Vec<(&str, FixClass)> =
+                recipe.applies_on.iter().map(|p| (p.os, p.class)).collect();
+            assert_eq!(published, actual, "{}: platform classes drifted", entry.id);
+            assert_eq!(entry.needs_sudo, recipe.needs_sudo, "{}", entry.id);
+            assert_eq!(entry.needs_reboot, recipe.needs_reboot, "{}", entry.id);
+            assert_eq!(entry.needs_relogin, recipe.needs_relogin, "{}", entry.id);
+        }
+    }
+
+    #[test]
+    fn the_published_exit_codes_are_the_ones_apply_returns() {
+        // Reachable without a machine in a particular state, so they are worth
+        // pinning here: an unknown id and a recipe for another platform.
+        let manifest = catalog_manifest();
+        assert_eq!(
+            apply("fix-does-not-exist", &FixOptions::default()),
+            manifest.exit_codes["unknown_id"],
+            "an unknown id must exit with the code the manifest publishes for it"
+        );
+        assert_eq!(
+            apply(fix_id_for_another_platform(), &FixOptions::default()),
+            manifest.exit_codes["not_applicable"],
+            "a recipe for another platform must exit with the published code"
+        );
+        // The map is a contract in itself: dropping a name would leave a reader
+        // unable to interpret a code it still receives.
+        for name in [
+            "ok",
+            "internal",
+            "unknown_id",
+            "not_applicable",
+            "failed",
+            "declined",
+        ] {
+            assert!(
+                manifest.exit_codes.contains_key(name),
+                "the published exit-code map is missing `{name}`"
+            );
+        }
+    }
+
+    /// A catalog entry that cannot apply on the platform running the test.
+    fn fix_id_for_another_platform() -> &'static str {
+        RECIPES
+            .iter()
+            .find(|r| r.platform(current_os()).is_none())
+            .map(|r| r.fix_id)
+            .expect("every platform has an entry belonging to a different one")
+    }
+
+    #[test]
+    fn a_published_doc_url_is_a_url() {
+        // Most entries carry none, which is the honest answer until someone
+        // sources one. What must not happen is a value that looks like a link
+        // and is not, since that is what sends a reader somewhere wrong.
+        for entry in catalog_manifest().entries {
+            if let Some(url) = entry.doc_url {
+                assert!(
+                    url.starts_with("https://"),
+                    "{}: doc_url is not a URL: {url}",
+                    entry.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn only_these_entries_act_on_the_machine_and_only_on_these_platforms() {
         let acts: Vec<(&str, &str, FixClass)> = classes()

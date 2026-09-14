@@ -158,6 +158,18 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
+      - id: cargo-catalog
+        name: Published Doctor catalog is current
+        # The catalog the CLI ships and the file tools read have to be the same
+        # thing. Write form, like cargo-manifest: prek fails the commit when a
+        # hook rewrites a file, so a stale catalog is refreshed and re-staged
+        # rather than merely reported.
+        entry: cargo xtask catalog
+        language: system
+        files: '^(crates/rocm-core/src/fix\.rs|xtask/.*|doctor-catalog\.json)$'
+        pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
       - id: cargo-tpn
         name: THIRD_PARTY_NOTICES.txt is current
         # `--if-available` skips cleanly when cargo-about is absent or not the
