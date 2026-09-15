@@ -31987,6 +31987,23 @@ ID_LIKE="suse opensuse"
             StopFailureRemedy::StopWhatHoldsThePort,
             "the recorded processes are gone, so `rocm services stop` is not the remedy"
         );
+        // This record was already marked stopped before the run, so this pass
+        // never attempted a stop on it. The reason must not say the endpoint
+        // survived one — that describes something that did not happen, on the
+        // one output its operator has to reason from. Collapsing the two arms
+        // back into the old single sentence fails here.
+        assert!(
+            failure
+                .reason
+                .contains("is recorded stopped, but something there is still serving"),
+            "a record nothing was attempted on must not be reported as surviving a stop: {}",
+            failure.reason
+        );
+        assert!(
+            !failure.reason.contains("after the stop"),
+            "no stop ran for this record, so the reason must not claim one did: {}",
+            failure.reason
+        );
         let error = uninstall_removal_gate(&report)
             .expect_err("a still-serving engine must abort uninstall")
             .to_string();

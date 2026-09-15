@@ -15,10 +15,13 @@
 //!
 //! **The recycling defence is Linux-only in practice.** [`process_start_ticks`]
 //! reads the start-time from `/proc` and is a compile-time `None` everywhere
-//! else, so on Windows and macOS every record looks like one carrying no
-//! recorded identity, and [`identity_state`] degrades to best-effort
+//! else, so on Windows and macOS every record *captured there* carries no
+//! identity, and [`identity_state`] degrades to best-effort
 //! [`IdentityState::Matches`] — the paragraph above describes what this module
-//! enforces *where the platform can answer*. The degradation is deliberate: a
+//! enforces *where the platform can answer*. (A record reconstructed with a
+//! start-time recorded elsewhere is the other case: unconfirmable rather than
+//! absent, so it lands on [`IdentityState::Indeterminate`] and is not signalled
+//! either.) The degradation is deliberate: a
 //! host that cannot tell two processes apart must not therefore refuse to stop
 //! anything, since that would make every service unstoppable rather than making
 //! any of them safer. What holds on those hosts is the rest of the caller's
