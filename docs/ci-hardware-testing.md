@@ -52,13 +52,17 @@ installing ROCm's WSL driver bridge (`librocdxg`, via
 `scripts/wsl_setup_rocdxg.sh`) and cloning the checkout into the guest's
 native filesystem to avoid building against the slow DrvFs mount.
 
-This migration is scoped to the per-PR lanes in this table only.
-`nightly.yml`'s Ubuntu and Windows Strix lanes (`e2e-gpu-nightly-strix`,
-`e2e-gpu-nightly-strix-windows`) still pin the `native` label and run on the
-same static, always-on host these per-PR lanes moved off of — that label still
-means what it always did there (two Linux runners share `strix-halo`, a native
-host and a WSL host, and `native` disambiguates the former). Moving nightly
-onto the pool is a separate, not-yet-made decision.
+This migration is scoped to the per-PR lanes in this table, plus the nightly
+WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
+Strix lanes (`e2e-gpu-nightly-strix`, `e2e-gpu-nightly-strix-windows`) still
+pin the `native` label and run on the same static, always-on host these per-PR
+lanes moved off of — that label still means what it always did there (two
+Linux runners share `strix-halo`, a native host and a WSL host, and `native`
+disambiguates the former). `nightly.yml`'s `e2e-wsl-nightly`, however, already
+moved onto the same DevLab Dispatch pool as the per-PR `e2e-wsl` lane above,
+for the same reason: WSL2 needs no dedicated `wsl`-labeled runner, so there is
+nothing pool-incompatible about it. Moving the two `native` nightly lanes onto
+the pool as well is a separate, not-yet-made decision.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
