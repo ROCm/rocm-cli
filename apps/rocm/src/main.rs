@@ -321,7 +321,7 @@ rocm update --json")]
         #[arg(long, conflicts_with_all = ["apply", "dry_run"])]
         json: bool,
         /// Bound the version-check network calls to this many seconds each.
-        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, requires = "json", value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
@@ -25278,17 +25278,19 @@ install therock";
         );
     }
 
+    /// Truth table for `update_should_preview_or_apply` itself. This only
+    /// pins the helper's own `apply || dry_run` expression — it can't catch
+    /// a regression at its call site (e.g. reverting `main.rs`'s dispatch
+    /// back to `if apply`), since the helper would still compute the same
+    /// values. That end-to-end routing is what
+    /// `@id:update-dry-run-reaches-preview-path-without-apply`
+    /// (`tests/e2e-cucumber/features/update.feature`) actually proves, by
+    /// running the real binary and asserting on `apply_runtime_update`'s
+    /// output.
     #[test]
-    fn update_dry_run_routes_into_the_preview_path_without_apply() {
-        assert!(
-            !update_should_preview_or_apply(false, false),
-            "plain `rocm update` should stay on the read-only status report"
-        );
-        assert!(
-            update_should_preview_or_apply(false, true),
-            "`rocm update --dry-run` must route into apply_runtime_update, or --dry-run \
-             is silently ignored"
-        );
+    fn update_should_preview_or_apply_truth_table() {
+        assert!(!update_should_preview_or_apply(false, false));
+        assert!(update_should_preview_or_apply(false, true));
         assert!(update_should_preview_or_apply(true, false));
         assert!(update_should_preview_or_apply(true, true));
     }

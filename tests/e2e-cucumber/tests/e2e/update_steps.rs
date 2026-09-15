@@ -174,7 +174,9 @@ async fn refuses_dry_run_json_conflict(world: &mut E2eWorld) {
     );
     assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
     assert!(
-        combined.contains("cannot be used with"),
+        combined.contains("--dry-run")
+            && combined.contains("--json")
+            && combined.contains("cannot be used with"),
         "expected a clap conflict error naming --dry-run/--json, got:\n{combined}"
     );
 }
