@@ -10,8 +10,11 @@ name: E2E self-hosted
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
-# because of `continue-on-error`, which is `false` below so a real hardware
-# regression shows red instead of always green. PRs #334, #335 and #343 all
+# because of `continue-on-error`, which is `false` on every lane below except
+# `e2e-gpu-mi350p`, so a real hardware regression shows red instead of always
+# green. (mi350p alone sets it `true`; that lane reports green regardless, which
+# is a property of that lane and not the reason any of them is non-blocking.)
+# PRs #334, #335 and #343 all
 # landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
 # merge_group ref, which a required check under ALLGREEN would have blocked;
 # renaming a lane is therefore safe.

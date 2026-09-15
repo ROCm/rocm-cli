@@ -62,9 +62,14 @@ fn feature_files() -> Vec<String> {
 
 /// The scan itself, split out so the subdirectory refusal can be exercised
 /// against a temporary tree — against the real `features/` it could only fire
-/// by someone breaking the repository. Mirrors `feature_files_in` in
-/// `src/expectation.rs`, which is split for the same reason: the two guards
-/// should match in coverage, not only in wording.
+/// by someone breaking the repository.
+///
+/// Deliberately the same shape as `feature_files_in` in `src/expectation.rs`:
+/// same refusal, the same `Path::extension()` test rather than a `.feature`
+/// string suffix, and the same non-empty assertion. The extension test is not
+/// interchangeable with the suffix one — a file named exactly `.feature` has no
+/// extension and would have been taken by one scan and skipped by the other,
+/// which is the divergence this pair exists to prevent.
 fn feature_files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir).expect("features dir") {
@@ -76,21 +81,34 @@ fn feature_files_in(dir: &Path) -> Vec<String> {
              .feature file into one",
             path.display()
         );
-        let name = path.file_name().expect("dir entry name").to_string_lossy();
-        if name.ends_with(".feature") {
+        if path.extension().is_some_and(|ext| ext == "feature") {
+            let name = path.file_name().expect("dir entry name").to_string_lossy();
             names.push(name.into_owned());
         }
     }
+    assert!(
+        !names.is_empty(),
+        "found no .feature files in {}",
+        dir.display()
+    );
     names.sort();
     names
 }
 
 #[test]
 fn the_feature_scan_takes_the_flat_files_it_finds() {
+    // Pins FILTERING and MEMBERSHIP, not sort order. `read_dir` order is
+    // unspecified and happens to come back alphabetical here, so removing
+    // `names.sort()` leaves this green — verified. Nothing can force a real
+    // directory to yield entries out of order, so the ordering is asserted for
+    // a stable comparison rather than because this test proves it.
     let dir = tempfile::tempdir().expect("no temp dir");
     std::fs::write(dir.path().join("b.feature"), "Feature: b\n").unwrap();
     std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
     std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    // A file named exactly `.feature` has no extension, so neither this scan nor
+    // its sibling takes it. Present here so the two stay agreed on that.
+    std::fs::write(dir.path().join(".feature"), "not a feature file\n").unwrap();
     assert_eq!(feature_files_in(dir.path()), ["a.feature", "b.feature"]);
 }
 

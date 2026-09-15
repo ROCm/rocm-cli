@@ -179,10 +179,15 @@ flaky = true
 # independently. Argument handling only, so platform-independent.
 #
 # NOT ONLY `--dry-run`. `--runtime` and `--activate` carry the same
-# `requires = "apply"`, and that one synopsis line brackets all four as if
-# independent — so three of its four options are documented as usable on their
-# own and none of them is. This scenario exercises `--dry-run` because it is the
-# one a README reader reaches for first, not because it is the only case.
+# `requires = "apply"`, and the synopsis brackets all three alongside `[--apply]`
+# as if independent — so three options are documented as usable on their own and
+# none of them is. This scenario exercises `--dry-run` because it is the one a
+# README reader reaches for first, not because it is the only case.
+#
+# Scoped to those three on purpose. The synopsis spans two lines and six
+# options; the other two, `--json` and `--timeout-secs`, are NOT part of this:
+# the README prose under it spells their relationship out ("`--timeout-secs`
+# requires `--json`; both conflict with `--apply`"), and the code agrees.
 #
 # WHICH SIDE IS WRONG IS A MAINTAINER CALL, and this row does not presume it.
 # The defensible alternative reading is that bare `rocm update` is already the

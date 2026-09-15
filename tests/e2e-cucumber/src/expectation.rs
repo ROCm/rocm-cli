@@ -1426,6 +1426,11 @@ flaky = true
         let dir = tempfile::tempdir().expect("no temp dir");
         std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
         std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+        // A file named exactly `.feature` has no extension, so this scan skips
+        // it. Pinned on both sides — `tests/feature_naming.rs` once matched on a
+        // `.feature` string suffix instead, which would have taken this one and
+        // left the two scans covering different sets.
+        std::fs::write(dir.path().join(".feature"), "not a feature file\n").unwrap();
         let found = feature_files_in(dir.path());
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].ends_with("a.feature"), "{found:?}");
