@@ -190,7 +190,10 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     if runtimes.is_empty() {
         writeln!(output)?;
         writeln!(output, "ROCm")?;
-        writeln!(output, "  Install ROCm first from Set Up ROCm.")?;
+        writeln!(
+            output,
+            "  Install ROCm first: run `rocm` and pick \"Set up this system\"."
+        )?;
     } else if let Some(active) = config.active_runtime_key.as_deref() {
         writeln!(output)?;
         writeln!(output, "Default ROCm runtime")?;
@@ -1021,7 +1024,9 @@ fn select_runtime(
 ) -> Result<SelectedRuntime> {
     let manifests = therock::load_runtime_manifests(paths)?;
     if manifests.is_empty() {
-        bail!("Install ROCm first from Set Up ROCm, then install ComfyUI.");
+        bail!(
+            "Install ROCm first: run `rocm` and pick \"Set up this system\", then install ComfyUI."
+        );
     }
     let manifest = match selector.map(str::trim).filter(|value| !value.is_empty()) {
         Some(selector) => select_runtime_by_selector(&manifests, selector)?.clone(),
@@ -1152,7 +1157,7 @@ fn select_single_ready_runtime(
         [] => {
             let statuses = format_runtime_statuses(manifests);
             bail!(
-                "No ROCm runtime is ready. Fix one or install another from Set Up ROCm (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
+                "No ROCm runtime is ready. Fix one or install another: run `rocm` and pick \"Set up this system\" (or run `rocm install sdk`), then install ComfyUI. Runtimes found: {statuses}. See `rocm runtimes list`."
             )
         }
         _ => {
@@ -2452,29 +2457,29 @@ mod tests {
             message.contains("rocm runtimes list"),
             "error should point to `rocm runtimes list`, got: {message}"
         );
-        // The setup pointer names the `Set Up ROCm` screen once, as a label. It
-        // must not also use "set up" as the sentence verb. The quoted string
-        // below is not a hypothetical: it is the superseded pre-reword wording
-        // this branch actually emitted before `31957ed`, where the label read
-        // like a repetition of the verb.
+        // The setup pointer must name a destination that actually exists. The
+        // only ROCm-setup entry point a user can see is the bare-`rocm`
+        // launcher row labelled "Set up this system"
+        // (`crates/rocm-dash-tui/src/ui/launcher.rs`, rendered verbatim from
+        // `ROWS`); there has never been a screen called "Set Up ROCm".
         //
-        // The negative assertion is therefore not vacuous — it is the *only*
-        // thing that catches a revert of that reword. Measured, not assumed:
-        // restoring the old wording with this assertion deleted leaves all 28
-        // `comfyui` tests green; restoring it with the assertion present fails
-        // here. The positive assertion below cannot catch it, because
-        // "Set up ROCm first from Set Up ROCm" also contains "from Set Up ROCm".
-        // Nor can `assert_actionable` — this branch is deliberately not covered
-        // by it, since the none-ready message carries only one of its four
-        // needles (`rocm runtimes list`); the other three are remedies for
-        // choosing between runtimes, which do not apply when none is usable.
+        // The negative assertion is not vacuous, and it is strictly stronger
+        // than the "don't repeat the verb" guard it replaces: both the invented
+        // label this branch emitted until now and the superseded pre-`31957ed`
+        // wording ("Set up ROCm first from Set Up ROCm") contain "Set Up ROCm",
+        // so either revert fails here. The positive assertion alone cannot
+        // catch them, since both would simply stop matching a needle they never
+        // contained. Nor can `assert_actionable` — this branch is deliberately
+        // not covered by it, since the none-ready message carries only one of
+        // its four needles (`rocm runtimes list`); the other three are remedies
+        // for choosing between runtimes, which do not apply when none is usable.
         assert!(
-            message.contains("from Set Up ROCm"),
-            "error should still point at the `Set Up ROCm` screen, got: {message}"
+            message.contains("pick \"Set up this system\""),
+            "error should still point at the launcher's \"Set up this system\" row, got: {message}"
         );
         assert!(
-            !message.contains("Set up ROCm first from Set Up ROCm"),
-            "the setup pointer must not repeat the verb and the screen label, got: {message}"
+            !message.contains("Set Up ROCm"),
+            "the setup pointer must not name the nonexistent `Set Up ROCm` screen, got: {message}"
         );
         Ok(())
     }
