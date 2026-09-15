@@ -1763,6 +1763,21 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
     fx
 }
 
+/// The dashboard's entire startup gate: an overlay opens only when an
+/// explicit `Focus` was resolved from the command line. `event_loop` calls
+/// this directly (rather than inlining the `match`) so a regression test can
+/// exercise the actual gate instead of `AppState::new`, which takes no focus
+/// argument and can't observe it either way.
+fn apply_startup_focus(
+    state: &mut AppState,
+    focus: Option<Focus>,
+) -> Vec<rocm_dash_core::state::SideEffect> {
+    match focus {
+        Some(focus) => open_overlay_for_focus(state, focus),
+        None => Vec::new(),
+    }
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1835,10 +1850,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
-    if let Some(focus) = args.focus {
-        let fx = open_overlay_for_focus(&mut state, focus);
-        crate::jobs::run_effects(fx, &job_tx);
-    }
+    let fx = apply_startup_focus(&mut state, args.focus);
+    crate::jobs::run_effects(fx, &job_tx);
     state.replay = replay_controller.map(ReplayState::new);
     // Both `--demo` (a generated session replayed) and `--replay <file>` present
     // non-live data, so mark the session simulated for the honesty chrome.
@@ -4432,15 +4445,23 @@ mod tests {
     }
 
     #[test]
-    fn new_state_never_auto_opens_onboarding() {
-        // Regression guard: nothing on the startup path may read
-        // `setup.completed`/`onboarding_dismissed` to auto-open onboarding.
-        // It must only open via the explicit `n` key (KeyAction::OpenOnboarding)
-        // or an explicit `Focus::Setup` selection.
-        let s = AppState::new("t".into(), "default-dark".into());
+    fn startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus() {
+        // Regression guard: this calls `apply_startup_focus`, the same gate
+        // `event_loop` uses, not just `AppState::new` — which takes no focus
+        // argument and hardcodes `onboarding: None` regardless, so it cannot
+        // exhibit an auto-open regression either way.
+        let mut s = st();
+        assert!(apply_startup_focus(&mut s, None).is_empty());
         assert!(
             s.onboarding.is_none(),
-            "onboarding must not be open immediately after AppState::new"
+            "no --focus flag must not open onboarding"
+        );
+
+        let mut s = st();
+        assert!(apply_startup_focus(&mut s, Some(Focus::Setup)).is_empty());
+        assert!(
+            s.onboarding.is_some(),
+            "an explicit Focus::Setup must open onboarding"
         );
     }
 
