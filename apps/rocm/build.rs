@@ -115,8 +115,22 @@ fn git_watch_paths(cwd: &Path) -> Vec<PathBuf> {
     if let Some(reference) = run_git_at(&cwd, &["symbolic-ref", "-q", "HEAD"]) {
         paths.push(common_dir.join(reference));
     }
-    paths.push(common_dir.join("packed-refs"));
-    paths.push(common_dir.join("refs").join("tags"));
+    // Cargo treats a missing `rerun-if-changed` path as permanently dirty (it
+    // has nothing to compare a missing file's mtime against), so a path that
+    // doesn't exist in *this* checkout must be skipped rather than watched —
+    // packed-refs in particular does not exist in every checkout shape. The
+    // trade-off: if one of these is created later from nothing (this
+    // specific checkout's first-ever tag, or its first `git gc`), that one
+    // transition can be missed until some other rebuild trigger fires: a far
+    // smaller gap than recompiling on every single build, forever.
+    for watched in [
+        common_dir.join("packed-refs"),
+        common_dir.join("refs").join("tags"),
+    ] {
+        if watched.exists() {
+            paths.push(watched);
+        }
+    }
     paths
 }
 
@@ -152,23 +166,24 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn git_watch_paths_include_head_branch_tags_and_packed_refs() {
+    /// A fresh, empty git repository under `CARGO_MANIFEST_DIR/target`, with
+    /// `HEAD` pointed at `refs/heads/main`. Under `CARGO_MANIFEST_DIR`, not
+    /// `std::env::temp_dir()`: `cargo test` runs this integration test with
+    /// the crate root as its process cwd, so a path relative to
+    /// `CARGO_MANIFEST_DIR` is also relative to the real cwd — which is what
+    /// lets tests call `git_watch_paths` with a *relative* path, mirroring
+    /// the real `Path::new(".")` call site in `main()`. A test that only
+    /// ever passes an absolute cwd cannot catch a relative one leaking
+    /// through into a real build's `rerun-if-changed`.
+    fn init_test_repo(tag: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before Unix epoch")
             .as_nanos();
-        // Under CARGO_MANIFEST_DIR/target, not std::env::temp_dir(): `cargo test`
-        // runs this integration test with the crate root as its process cwd, so
-        // a path relative to CARGO_MANIFEST_DIR is also relative to the real
-        // cwd — which is what lets this test call `git_watch_paths` with a
-        // *relative* path, mirroring the real `Path::new(".")` call site in
-        // `main()`. A test that only ever passes an absolute cwd cannot catch a
-        // relative one leaking through into a real build's `rerun-if-changed`.
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let repo = manifest_dir
             .join("target")
-            .join(format!("build-metadata-test-{nonce}"));
+            .join(format!("build-metadata-test-{tag}-{nonce}"));
         fs::create_dir_all(&repo).expect("create temporary repository directory");
         let status = Command::new("git")
             .env_remove("GIT_DIR")
@@ -186,7 +201,49 @@ mod tests {
             .status()
             .expect("set initial branch");
         assert!(status.success(), "setting initial branch failed");
+        repo
+    }
 
+    #[test]
+    fn git_watch_paths_skips_packed_refs_when_it_does_not_exist_yet() {
+        // Regression test: Cargo treats a missing `rerun-if-changed` path as
+        // permanently dirty, and a fresh `git init` never creates
+        // packed-refs (only a later `git gc`/`git repack`/some clone shapes
+        // do), so watching it unconditionally would recompile on every
+        // build, forever, in exactly this common a checkout shape.
+        // `refs/tags` is a different case: `git init` always creates it
+        // (empty), so it is not exercised by this test.
+        let repo = init_test_repo("no-packed-refs");
+        assert!(!repo.join(".git").join("packed-refs").exists());
+        assert!(repo.join(".git").join("refs").join("tags").exists());
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let relative_repo = repo
+            .strip_prefix(manifest_dir)
+            .expect("repo is under the manifest dir");
+        let paths = git_watch_paths(relative_repo);
+        fs::remove_dir_all(&repo).expect("remove temporary repository");
+
+        assert_eq!(
+            paths.len(),
+            3,
+            "HEAD, its branch ref, and refs/tags, but not the absent packed-refs: {paths:?}"
+        );
+        assert!(paths[0].ends_with(Path::new("HEAD")));
+        assert!(paths[1].ends_with(Path::new("refs").join("heads").join("main")));
+        assert!(paths[2].ends_with(Path::new("refs").join("tags")));
+    }
+
+    #[test]
+    fn git_watch_paths_include_head_branch_tags_and_packed_refs() {
+        let repo = init_test_repo("with-packed-refs");
+        // An empty file is a valid (trivial) packed-refs; anything else needs
+        // real header/ref-line syntax or git rejects *every* command in this
+        // repo with "unexpected line in .git/packed-refs" — including the
+        // `symbolic-ref` this same function relies on to find the branch ref.
+        fs::write(repo.join(".git").join("packed-refs"), "").expect("create packed-refs");
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let relative_repo = repo
             .strip_prefix(manifest_dir)
             .expect("repo is under the manifest dir");
