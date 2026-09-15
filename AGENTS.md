@@ -110,7 +110,7 @@ Before each stateful decision or public status update:
 - verify review context against current PR head commit
 
 Do not rely on stale memory, partial CI views, or prior snapshots.
-Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan.
+Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan. A passing unit test asserting exact string content only proves the string is unchanged, not that the claim is true — re-derive the claim against the actual code path rather than accepting the test as proof.
 
 After rebase/cherry-pick/merge, grep for conflict markers:
 
@@ -143,17 +143,17 @@ Understand existing patterns first:
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
+Keep docs and behavior claims in sync while editing:
+
 - when a command's flags, defaults, arguments, or observable behavior
-  change, update README.md, its --help/doc comment, and docs/testing.md
-  in the same change — do not leave user-facing docs for a follow-up
+  change, update README.md, its --help/doc comment, docs/testing.md, and
+  docs/manual-testing.md in the same change — do not leave user-facing docs
+  for a follow-up
 - the same behavior claim (e.g. "does X automatically") often repeats across
   README.md, --help doc comments, printed CLI output, and docs/*.md; each
   drifts independently, so grep for the claim's wording across all of them,
   not just the surface you're editing, and check each against the actual
   code path
-- a passing unit test asserting exact string content only proves the string
-  is unchanged, not that the claim is true — it can keep a stale claim
-  green indefinitely
 
 ## 6) rocm-cli Architecture Guardrails
 

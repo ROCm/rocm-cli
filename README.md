@@ -501,10 +501,10 @@ up. `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
 1-32768, and `--requests` (default 128) accepts 1-10000. Results are written
 to `--out` (default `<data-dir>/bench/results.csv`, where `<data-dir>` is
 `~/.rocm` unless overridden), intended to match the path the daemon tails to
-feed the dashboard's **Observe** tab. The two are computed
-independently, so if either the CLI's data dir or the daemon's
-`bench_results_dir` config has been customized, confirm they still point at
-the same file.
+feed the dashboard's **Observe** tab. The CLI's default output path and the
+daemon's tailed path are computed independently, so if either the CLI's data
+dir or the daemon's `bench_results_dir` config has been customized, confirm
+they still point at the same file.
 
 ### Chat
 

@@ -938,9 +938,10 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Clear recorded setup completion/dismissal state (does not by itself
-    /// re-trigger onboarding in the TUI; open it manually from `rocm dash`'s
-    /// Observe tab with `n`).
+    /// Clear recorded setup completion/dismissal state.
+    ///
+    /// Does not by itself re-trigger onboarding in the TUI; open it manually
+    /// from `rocm dash`'s Observe tab with `n`.
     Reset,
 }
 
@@ -25366,6 +25367,12 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
+        // The claim itself (onboarding only opens via an explicit `n` on the
+        // Observe tab, never automatically) is proven by
+        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
+        // test and the `onboarding.rs` module doc — this assertion only
+        // guards the string, not the behavior.
         assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
@@ -25437,6 +25444,9 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
+        // See the pointer comment in
+        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
+        // above: this only guards the string, not the underlying behavior.
         assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
