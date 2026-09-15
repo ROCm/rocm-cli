@@ -313,7 +313,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun with --no-dkms and accept the risk.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`.",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -497,20 +497,26 @@ const RECIPES: &[FixRecipe] = &[
     },
     FixRecipe {
         fix_id: "fix-12-installer",
-        title: "Reset amdgpu-install state and reinstall",
-        rationale: "amdgpu-install left a half-configured DKMS / repo state. Run the documented uninstall, clean up, and reinstall without the flag that broke things (commonly --accept-eula on newer installers).",
+        title: "Reset repo-native install state and reinstall",
+        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
-            "sudo amdgpu-install --uninstall",
-            "sudo apt autoremove --purge -y",
-            "sudo apt update",
-            "sudo amdgpu-install --usecase=rocm,hip",
+            "# Run only the block matching your package manager:",
+            "sudo dpkg --configure -a && sudo apt-get install -f && sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
+            "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
+            "rocm install driver --dkms --yes",
         ],
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5",
+        verify: "rocm examine --json | grep -q '\"rocm_install_method\": \"repo-native\"' && rocminfo | head -n 5",
         notes: &[
-            "If `apt autoremove --purge` warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
+            "If the package-manager update/refresh warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -3175,5 +3181,31 @@ mod tests {
             "the catalog knows which argument fix-9-igpu-dgpu waits for, so the flags line \
              has to say it: {named:?}"
         );
+    }
+
+    #[test]
+    fn fix_12_recipe_clears_state_before_reinstall_and_keeps_mv_commented() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let commands = recipe.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
+        );
+        assert!(recipe.verify.contains("repo-native"));
     }
 }
