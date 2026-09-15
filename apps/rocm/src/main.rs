@@ -22700,13 +22700,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_install_sdk_strips_a_model_supplied_yes_with_an_attached_value() {
-        // `--yes=true` is a model-supplied argv that reaches the chat arm intact:
-        // neither `canonicalize_chat_rocm_command` nor
-        // `validate_chat_rocm_command_safety` splits or rejects it. If the strip
-        // only matched `--yes` exactly, the flag would survive into a null-stdin
-        // spawn and re-grant the system-package/sudo consent `76c6aa3c` removed,
-        // on a spawn with no terminal to answer the password prompt.
+    fn chat_install_sdk_strips_a_model_supplied_yes_in_both_its_bare_and_attached_forms() {
+        // `--yes` and `--yes=true` are both model-supplied argv that reach the
+        // chat arm intact: neither `canonicalize_chat_rocm_command` nor
+        // `validate_chat_rocm_command_safety` splits or rejects either. Whichever
+        // form survives re-grants into a null-stdin spawn the system-package/sudo
+        // consent `76c6aa3c` removed, with no terminal to answer the password
+        // prompt, so the strip has to catch both.
         let classify = |args: &[&str]| -> Vec<String> {
             let action = chat_rocm_command_action_from_args(
                 args.iter().copied().map(str::to_owned).collect(),
@@ -22718,11 +22718,15 @@ mod tests {
             args
         };
 
-        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
-            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", attached]);
+        // Both terms of `arg != "--yes" && !arg.starts_with("--yes=")` are driven
+        // here, and each alone: the bare form is caught only by the first, the
+        // `=` forms only by the second, so dropping either term reddens this test
+        // on its own rather than leaving one half to a sibling.
+        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
+            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", supplied]);
             assert!(
                 !args.iter().any(|arg| arg.starts_with("--yes")),
-                "`{attached}` must not survive the chat strip, got {args:?}"
+                "`{supplied}` must not survive the chat strip, got {args:?}"
             );
             assert_eq!(
                 args,
@@ -22733,16 +22737,28 @@ mod tests {
                     "/tmp/therock".to_owned(),
                     "--approve-replacing-active-default".to_owned(),
                 ],
-                "stripping `{attached}` must leave the rest of the argv and the narrow consent alone"
+                "stripping `{supplied}` must leave the rest of the argv and the narrow consent alone"
             );
         }
 
-        // A prefix match must not reach flags that merely start the same way, or
-        // the strip would silently drop arguments the model legitimately sent.
-        let args = classify(&["install", "sdk", "--prefix", "/tmp/--yes-not-a-flag"]);
+        // Future-proofing, not a guard on the `--yes=` term this test's other
+        // assertions pin: `--yes-not-a-flag` survives both the exact-match strip
+        // that preceded that term and the two-term strip that replaced it, so it
+        // would pass on either. What it does catch is the next edit — widening
+        // the second term to `starts_with("--yes")` to "simplify" it would start
+        // eating every argv token that merely begins the same way, silently
+        // dropping arguments the model legitimately sent.
+        let args = classify(&[
+            "install",
+            "sdk",
+            "--prefix",
+            "/tmp/therock",
+            "--yes-not-a-flag",
+        ]);
         assert!(
-            args.iter().any(|arg| arg == "/tmp/--yes-not-a-flag"),
-            "the strip must only match the flag itself, got {args:?}"
+            args.iter().any(|arg| arg == "--yes-not-a-flag"),
+            "the strip must match `--yes` and `--yes=…`, not every token starting with \
+             `--yes`, got {args:?}"
         );
 
         // Second layer, and only the second: clap also refuses an attached value

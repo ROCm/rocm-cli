@@ -256,3 +256,34 @@ Feature: Runtime configuration
   Scenario: runtime-14 - Stating that the non-interactive consent flag does not approve sudo in --help
     When the user asks for SDK install help
     Then the help offers a consent flag that does not approve system-package installs
+
+  # `rocm --yes <request>` prints the planned command twice — once under `request
+  # plan`, once under `execution` — and the two deliberately disagree: the plan
+  # render is shared with the no-`--yes` review path, which must never hand a
+  # human a pre-approved command, so the replacement consent is injected only
+  # after it. What the operator sees, though, is a consent flag appearing on the
+  # command that runs and nowhere on the command they were shown, which reads as
+  # something approved behind their back. The `note:` under the execution
+  # `tool_call:` is the only place that difference is explained, and it is
+  # command output, so a unit test on the renderer does not discharge it.
+  #
+  # The three Thens are one claim only if the note can be trusted on its own. It
+  # cannot: a note saying "this differs from the plan above" is a lie if the two
+  # lines actually agree, and a plan line that already carried the flag would
+  # make the note false without changing its text. So the first two Thens pin the
+  # difference the third one describes.
+  #
+  # The install itself must not run — on the GPU lanes this request resolves to a
+  # real multi-GiB SDK pull — and these assertions are about output the CLI
+  # prints *before* it dispatches. The Given makes the first step of `install
+  # sdk` (finding a Python) fail, which is deterministic, offline, writes
+  # nothing, and happens after the header is on stdout. That is also why the When
+  # tolerates a non-zero exit. No runtime state needed, so this runs on the mock
+  # lane and every other lane identically.
+  @id:runtime-freeform-yes-discloses-injected-consent
+  Scenario: runtime-15 - Disclosing the consent added to a natural-language install approved with --yes
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install with --yes
+    Then the request plan shows an install command carrying no replacement consent
+    And the executed command carries the replacement consent
+    And the execution section says the consent came from the user's --yes

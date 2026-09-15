@@ -984,3 +984,108 @@ async fn install_sdk_help_separates_consents(world: &mut E2eWorld) {
         "expected `rocm install sdk --help` to say the narrow flag excludes system-package installs, got:\n{out}"
     );
 }
+
+/// Point the CLI at an interpreter that does not exist, so `install sdk` fails
+/// on its very first step.
+///
+/// A behavioural precondition, not a mechanism the feature file names — the same
+/// idiom as the torch-alignment opt-out above. Scenario runtime-15 asserts on the
+/// two sections `rocm --yes <request>` prints *before* it dispatches, and on the
+/// GPU lanes the request it sends resolves to a real multi-GiB SDK install. This
+/// makes `resolve_python_launcher` bail: offline, instantly, writing nothing, and
+/// after the header is already on stdout.
+#[given("the CLI cannot reach a usable Python")]
+async fn setup_unusable_python(world: &mut E2eWorld) {
+    let missing = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("no-such-python");
+    world
+        .command_env
+        .push(("ROCM_CLI_PYTHON", missing.into_os_string()));
+}
+
+#[when("the user approves a natural-language SDK install with --yes")]
+async fn user_approves_freeform_sdk_install(world: &mut E2eWorld) {
+    // A prefix inside the scenario's own temp root, so the words that make this a
+    // high-confidence `install sdk` plan cannot name a folder outside it even if
+    // the Given ever stops stopping the install.
+    let prefix = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("freeform-therock")
+        .to_string_lossy()
+        .into_owned();
+    let request = format!("install the latest TheRock nightly for this GPU into {prefix}");
+    // `run_rocm`, not `run_rocm_ok`: the Given guarantees the dispatched install
+    // fails, and the exit code is not what this scenario is about.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["--yes", &request]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The `request plan` and `execution` halves of `rocm --yes <request>` output.
+///
+/// Split rather than searched whole because both sections print a `note:` line
+/// and a `tool_call:` line; asserting against the full text would let a match in
+/// the wrong section satisfy the wrong claim.
+fn freeform_plan_and_execution(world: &E2eWorld) -> (String, String) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    let (plan, execution) = out
+        .split_once("\nexecution\n")
+        .unwrap_or_else(|| panic!("no `execution` section in the freeform output:\n{out}"));
+    (plan.to_owned(), execution.to_owned())
+}
+
+#[then("the request plan shows an install command carrying no replacement consent")]
+async fn assert_freeform_plan_is_unapproved(world: &mut E2eWorld) {
+    let (plan, _) = freeform_plan_and_execution(world);
+    assert!(
+        plan.contains("tool_call: rocm install sdk"),
+        "expected the request plan to propose an SDK install, got:\n{plan}"
+    );
+    // The reviewable command a plain `rocm <request>` prints is this same render,
+    // so a consent flag reaching it would hand a human a pre-approved command.
+    assert!(
+        !plan.contains("--approve-replacing-active-default"),
+        "the request plan must stay unapproved, got:\n{plan}"
+    );
+}
+
+#[then("the executed command carries the replacement consent")]
+async fn assert_freeform_execution_is_approved(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    // The `tool_call:` line alone, not the whole section: the disclosure note
+    // below it quotes `--yes`, so a section-wide search could not tell a consent
+    // flag on the command from a mention of one in prose.
+    let executed = execution
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("tool_call: "))
+        .unwrap_or_else(|| panic!("no executed tool_call in:\n{execution}"));
+    assert!(
+        executed.starts_with("rocm install sdk")
+            && executed.contains("--approve-replacing-active-default"),
+        "expected the executed command to carry the narrow consent, got `{executed}`"
+    );
+    // Never `--yes`: this surface spawns with no terminal on which to answer the
+    // sudo password prompt a system-package install can raise.
+    assert!(
+        !executed.split_whitespace().any(|arg| arg == "--yes"),
+        "the executed command must not carry `--yes`, got `{executed}`"
+    );
+}
+
+#[then("the execution section says the consent came from the user's --yes")]
+async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    assert!(
+        execution.contains("was added here from your --yes"),
+        "the operator is shown a consent flag the plan above did not carry, with \
+         nothing saying where it came from:\n{execution}"
+    );
+}

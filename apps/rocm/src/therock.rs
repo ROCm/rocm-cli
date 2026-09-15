@@ -9737,18 +9737,9 @@ echo Python 3.12.10
             10,
         );
         write_test_runtime_manifest(&paths, &manifest)?;
-        let manifest_path = runtime_manifest_path(&paths, &manifest.runtime_key);
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        value
-            .as_object_mut()
-            .expect("manifest is a JSON object")
-            .remove("family_source")
-            .expect("manifest carries family_source");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&value)?)?;
-        assert!(
-            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&manifest_path)?).is_err(),
-            "the test fixture must be unparsable, or this asserts nothing"
-        );
+        // The helper carries the preconditions that make this the parse path and
+        // not the I/O path: the file still reads, and it no longer deserializes.
+        let _ = make_test_runtime_manifest_unparsable(&paths, &manifest.runtime_key)?;
 
         let config = RocmCliConfig::load(&paths)?;
         assert!(config.active_runtime_key.is_none());
