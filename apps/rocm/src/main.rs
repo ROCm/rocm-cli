@@ -938,7 +938,10 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Reset setup so the next TUI launch shows first-time setup again.
+    /// Clear recorded setup completion/dismissal state.
+    ///
+    /// Does not by itself re-trigger onboarding in the TUI; open it manually
+    /// from `rocm dash`'s Observe tab with `n`.
     Reset,
 }
 
@@ -1461,7 +1464,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup will show"
+        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1495,7 +1498,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Setup will show again the next time you run `rocm`.",
+        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -25364,7 +25367,13 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
-        assert!(rendered.contains("Setup will show again"));
+        // The claim itself (onboarding only opens via an explicit `n` on the
+        // Observe tab, never automatically) is proven by
+        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
+        // test and the `onboarding.rs` module doc — this assertion only
+        // guards the string, not the behavior.
+        assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
         assert!(!rendered.contains("request plan"));
@@ -25435,7 +25444,10 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
-        assert!(rendered.contains("status: first-time setup will show"));
+        // See the pointer comment in
+        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
+        // above: this only guards the string, not the underlying behavior.
+        assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
