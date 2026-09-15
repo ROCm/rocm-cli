@@ -1,7 +1,3 @@
-# Copyright © Advanced Micro Devices, Inc., or its affiliates.
-#
-# SPDX-License-Identifier: MIT
-
 Feature: ComfyUI install reports progress and makes failures actionable
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
@@ -18,7 +14,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # scripts.
   @id:comfyui-uv-install-failure-names-log @requires-os:linux
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
-    Given a ready ROCm install with a ComfyUI checkout pending dependencies
+    Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv fails
     When the user installs ComfyUI
     Then the CLI fails and names the install log it wrote
@@ -31,7 +27,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # directly, on the success path (the failure path is `comfyui-01` above).
   @id:comfyui-uv-install-progress-streamed @requires-os:linux
   Scenario: comfyui-02 - A dependency install streams progress output
-    Given a ready ROCm install with a ComfyUI checkout pending dependencies
+    Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv prints progress and succeeds
     When the user installs ComfyUI
     Then the CLI succeeds and shows the install progress
@@ -57,7 +53,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # remediation and lists both keys. Linux-only because the planted rocm_sdk stub
   # uses `.so` library names; the selection logic it exercises is platform-agnostic.
   @id:comfyui-ambiguous-runtime-actionable @requires-os:linux
-  Scenario: comfyui-03 - ComfyUI install refuses ambiguously and names every remediation
+  Scenario: comfyui-03 - ComfyUI install refuses an ambiguous runtime choice and names every remediation
     Given two ready ROCm runtimes and no active default
     When the user installs ComfyUI without choosing a runtime
     Then ComfyUI install is refused as ambiguous

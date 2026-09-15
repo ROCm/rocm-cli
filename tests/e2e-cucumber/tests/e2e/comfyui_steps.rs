@@ -156,7 +156,7 @@ fn refusal_text(world: &E2eWorld) -> String {
     format!("{stdout}\n{stderr}")
 }
 
-#[given("a ready ROCm install with a ComfyUI checkout pending dependencies")]
+#[given("a ready ROCm runtime with a ComfyUI checkout pending dependencies")]
 async fn ready_install_pending_dependencies(world: &mut E2eWorld) {
     let install_root = install_root(world);
 

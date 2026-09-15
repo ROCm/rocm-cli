@@ -2456,9 +2456,18 @@ mod tests {
         // must not also use "set up" as the sentence verb. The quoted string
         // below is not a hypothetical: it is the superseded pre-reword wording
         // this branch actually emitted before `31957ed`, where the label read
-        // like a repetition of the verb. So the negative assertion is not
-        // vacuous — it is the only thing that catches a revert of that reword,
-        // because the positive assertion above it passes under both wordings.
+        // like a repetition of the verb.
+        //
+        // The negative assertion is therefore not vacuous — it is the *only*
+        // thing that catches a revert of that reword. Measured, not assumed:
+        // restoring the old wording with this assertion deleted leaves all 28
+        // `comfyui` tests green; restoring it with the assertion present fails
+        // here. The positive assertion below cannot catch it, because
+        // "Set up ROCm first from Set Up ROCm" also contains "from Set Up ROCm".
+        // Nor can `assert_actionable` — this branch is deliberately not covered
+        // by it, since the none-ready message carries only one of its four
+        // needles (`rocm runtimes list`); the other three are remedies for
+        // choosing between runtimes, which do not apply when none is usable.
         assert!(
             message.contains("from Set Up ROCm"),
             "error should still point at the `Set Up ROCm` screen, got: {message}"

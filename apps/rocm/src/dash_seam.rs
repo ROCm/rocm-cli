@@ -199,26 +199,33 @@ mod tests {
     /// `runtimes` invocation as `Approval`, and against the hermetic
     /// [`temp_paths`] registry below (which has no manifests at all) the child
     /// refuses deterministically with no network, no GPU and no real state.
-    /// The asserted stderr is that refusal verbatim, so the test cannot pass
-    /// off some other non-zero exit as the captured one.
+    /// The asserted argv, exit code and stderr together pin *that* refusal, so
+    /// the test cannot pass off some other non-zero exit as the captured one.
     #[test]
     fn seam_execute_approved_captures_a_failing_command_as_a_result() {
         // `run_rocm_capture_for_paths` spawns `daemon_binary_path()`, which from
         // a unit test means "the `rocm` next to the test harness". If the binary
         // has not been built it silently falls back to the harness itself, which
-        // would re-enter libtest instead of running a command — so refuse to
-        // proceed rather than measure the wrong process.
-        // The binary is only there because `apps/rocm/tests/` exists and makes
-        // cargo build it; delete those and this guard fires for that reason.
+        // would re-enter libtest instead of running a command — so skip rather
+        // than measure the wrong process.
+        //
+        // This *skips* instead of failing on purpose. The binary is present for
+        // every gate that matters (unfiltered `cargo test -p rocm` builds it,
+        // as do the nextest and `--all-targets` lanes), but `docs/testing.md`
+        // teaches the filtered `cargo test -p rocm --bin rocm <filter>` form,
+        // which builds only the unit-test harness. Failing there would hand a
+        // contributor a red test unrelated to their change.
         let binary = rocm_core::daemon_binary_path().expect("resolve the rocm binary");
-        assert_eq!(
-            binary.file_stem().and_then(std::ffi::OsStr::to_str),
-            Some("rocm"),
-            "this test replays through a real `rocm` subprocess but resolved `{}`; \
-             build the binary first (`cargo build -p rocm`) — `cargo test -p rocm \
-             --bin rocm` on its own only builds the unit-test harness",
-            binary.display()
-        );
+        if binary.file_stem().and_then(std::ffi::OsStr::to_str) != Some("rocm") {
+            eprintln!(
+                "skipping `seam_execute_approved_captures_a_failing_command_as_a_result`: \
+                 it replays through a real `rocm` subprocess but resolved `{}`. \
+                 Build the binary first (`cargo build -p rocm`) — `cargo test -p rocm \
+                 --bin rocm <filter>` on its own only builds the unit-test harness.",
+                binary.display()
+            );
+            return;
+        }
 
         let exec = BinToolExecutor::new(temp_paths());
         let outcome = exec.execute_approved(
@@ -233,6 +240,17 @@ mod tests {
                  the `Error` arm is for calls that never ran"
             );
         };
+        // `argv[0]` is the resolved binary path, which is machine-dependent; the
+        // arguments after it are what this test pins.
+        assert_eq!(
+            v["structuredContent"]["argv"].as_array().map(|argv| argv
+                .iter()
+                .skip(1)
+                .filter_map(serde_json::Value::as_str)
+                .collect()),
+            Some(vec!["runtimes", "activate", "no-such-runtime-key"]),
+            "the envelope must carry the argv actually spawned: {v}"
+        );
         assert_eq!(
             v["structuredContent"]["exit_status"],
             serde_json::json!(1),
@@ -246,10 +264,17 @@ mod tests {
         // The refusal text is buried in the envelope rather than surfaced —
         // exactly the shape `approved_command_failure_stays_a_collapsed_envelope`
         // (`crates/rocm-dash-tui/src/app/mod.rs`) then collapses out of the chat.
+        //
+        // Anchored on the rejected selector rather than on `select_runtime_manifest`'s
+        // current "installed runtime not found" wording: that message is on this
+        // PR's Deferred list to be reworked into the "refuse and list keys" shape,
+        // and any such refusal still names the key it would not resolve. This
+        // keeps the test proving "the child really refused, and said why" without
+        // pinning a sentence already scheduled for rewrite.
         assert!(
             v["structuredContent"]["stderr"]
                 .as_str()
-                .is_some_and(|stderr| stderr.contains("installed runtime not found")),
+                .is_some_and(|stderr| stderr.contains("no-such-runtime-key")),
             "the CLI's own refusal is carried as captured stderr: {v}"
         );
     }
