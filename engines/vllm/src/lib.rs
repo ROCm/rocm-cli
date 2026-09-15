@@ -2216,6 +2216,15 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 
 /// Builds a human-readable summary of the tail of the startup log, if available.
 /// Returns an empty string when no log is present or it cannot be read.
+///
+/// The tail is sanitized before it is embedded. It is untrusted subprocess
+/// output and this whole string is `bail!`-ed to the user's terminal, so
+/// stripping control bytes out of the one echoed line further down while
+/// printing the raw tail a few lines above would have left the escapes a clear
+/// path to the terminal inside the same message. Stripping is per line so the
+/// tail keeps its shape; `oom_utilization_hint` still reads the *raw* tail,
+/// because what it selects from it is quoted into a command and has its own,
+/// stricter admissibility test.
 fn startup_log_context(log_path: Option<&Path>) -> String {
     let summary = log_path
         .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
@@ -2224,6 +2233,11 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
         return String::new();
     }
     let hint = oom_utilization_hint(&summary);
+    let summary = summary
+        .lines()
+        .map(rocm_core::strip_terminal_control_sequences)
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}{hint}")
 }
 
@@ -2757,40 +2771,114 @@ mod tests {
     }
 
     #[test]
-    fn every_emitted_oom_symptom_is_diagnosable() {
+    fn every_emitted_oom_symptom_is_diagnosable_and_names_the_branch_that_produced_it() {
         // Closes the loop between the two layers: the engine prints
         // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
-        // actually score for the diagnose checker. Since the detector now
-        // classifies each line with the *same* rule the checker uses, an accepted
-        // line is diagnosable by construction -- this guards that invariant.
+        // actually score for the diagnose checker. The detector now classifies
+        // each line with the *same* rule the checker uses, so an accepted line
+        // is diagnosable by construction -- this guards that invariant.
+        //
+        // Each case pins the *exact* symptom, not just that one is diagnosable.
+        // Diagnosability alone cannot fail for the defect this test is named
+        // for: the canonical symptom is diagnosable by construction, so a
+        // mutant that deletes the "route the user's real failing line" feature
+        // entirely and always returns VLLM_OOM_CANONICAL_SYMPTOM satisfies
+        // every such assertion. Naming the expected symptom per line is what
+        // makes the routing branch and the fallback branch separately
+        // falsifiable -- and it is why the table below deliberately mixes the
+        // two.
+        //
+        // Since the detector was reconciled with the checker, the fallback is no
+        // longer reached by sub-threshold scoring (those lines now produce no
+        // hint at all -- see `sub_threshold_lines_carry_no_hint_at_all`); it is
+        // reached by a line that scores but cannot be rendered as one intact
+        // single-quoted argument. So the fallback rows here are the
+        // *unquotable* ones, which is also what keeps the admissibility guard
+        // falsifiable through the surface that actually prints the command.
         let accepted_lines = [
-            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
-            "RuntimeError: hipErrorOutOfMemory",
-            "torch.cuda.OutOfMemoryError: CUDA out of memory",
-            "CUDA out of memory",
+            // Score and are quotable: the user's own line must be quoted verbatim.
+            (
+                "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+                "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            ),
+            (
+                "RuntimeError: hipErrorOutOfMemory",
+                "vllm: RuntimeError: hipErrorOutOfMemory",
+            ),
+            (
+                "torch.cuda.OutOfMemoryError: CUDA out of memory",
+                "vllm: torch.cuda.OutOfMemoryError: CUDA out of memory",
+            ),
+            ("CUDA out of memory", "vllm: CUDA out of memory"),
+            // Score but are inadmissible in a single-quoted word, so they must
+            // reach the canonical fallback: an apostrophe (which would close the
+            // quote), a colourised line (control bytes), and a bidi override
+            // (a `Cf` format character, which `char::is_control` does not catch
+            // and which reorders how the printed command renders).
+            (
+                "torch.OutOfMemoryError: HIP out of memory. GPU 0 can't allocate the model's weights.",
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            ),
+            (
+                "\u{1b}[31mtorch.OutOfMemoryError: HIP out of memory\u{1b}[0m",
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            ),
+            (
+                "torch.OutOfMemoryError: \u{202e}HIP out of memory. Tried to allocate 7.21 GiB.",
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            ),
         ];
-        for line in accepted_lines {
+        let mut routed_verbatim = 0;
+        let mut fell_back = 0;
+        for (line, expected) in accepted_lines {
             assert!(
                 rocm_core::vllm_log_shows_oom(line),
-                "detector must accept: {line}"
+                "detector must accept: {line:?}"
             );
             let hint = oom_utilization_hint(line);
-            let symptom = hint
-                .split("--symptom '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .expect("hint must carry a --symptom value");
+            let symptom = quoted_symptom_argument(&hint);
+            assert_eq!(
+                symptom, expected,
+                "wrong branch for {line:?}: the engine must quote the user's own line when \
+                 it can be rendered as one intact single-quoted argument and fall back to \
+                 the canonical symptom only when it cannot"
+            );
             assert!(
                 rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
                 "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
             );
+            if symptom == rocm_core::VLLM_OOM_CANONICAL_SYMPTOM {
+                fell_back += 1;
+            } else {
+                routed_verbatim += 1;
+            }
         }
+        // Both counters, not just the verbatim one: a table that drifted until
+        // every row took the same branch would still satisfy every per-row
+        // assertion above, which is the vacuity this test was written to close.
+        assert_eq!(
+            (routed_verbatim, fell_back),
+            (4, 3),
+            "the table must keep exercising both branches; if a scoring or admissibility \
+             change moved a line across a boundary, re-pick the fixture rather than relaxing \
+             the expectation"
+        );
+    }
 
+    #[test]
+    fn sub_threshold_lines_carry_no_hint_at_all() {
         // The reconciled detector rejects sub-threshold lines the loose scan used
         // to accept -- exactly the false positives the diagnose checker's
         // threshold guards against. Rejecting them here keeps the two layers from
         // disagreeing (the engine must not print a `--symptom` the checker would
         // then score as "no known cause").
+        //
+        // This is a different property from the one above: there the question is
+        // *which* symptom an emitted hint carries, here it is whether a hint is
+        // emitted at all. Before the detector was reconciled these lines reached
+        // the canonical fallback instead; now they produce nothing, and printing
+        // a memory hint for them would be a regression the symptom table cannot
+        // see.
         let rejected_lines = [
             // The bare exception class every PyTorch OOM raises, uncorroborated.
             "torch.cuda.OutOfMemoryError",
@@ -2898,6 +2986,44 @@ mod tests {
             ),
             "the echoed line must render exactly, with the whole escape sequence gone"
         );
+    }
+
+    #[test]
+    fn the_printed_log_tail_is_sanitized_not_just_the_echoed_line() -> Result<()> {
+        // The stripper's contract is that nothing in this message can repaint
+        // the user's terminal. The log tail is printed a few lines above the
+        // echoed line in the same `bail!`-ed string, and it used to go out raw,
+        // so the escapes removed from one had a clear path to the terminal via
+        // the other.
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-sanitize-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(
+            &path,
+            "\u{1b}[31mINFO starting\u{1b}[0m\n\u{1b}]0;pwned\u{7}RuntimeError: HIP out of memory\n",
+        )?;
+        let context = startup_log_context(Some(path.as_path()));
+        fs::remove_file(&path).ok();
+
+        assert!(
+            !context.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte may survive into the printed failure message: {context:?}"
+        );
+        assert!(
+            !context.contains("pwned"),
+            "an OSC body in the tail must not be emitted as text: {context:?}"
+        );
+        assert_eq!(
+            context
+                .split("startup log:\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n\nDetected").next()),
+            Some("INFO starting\nRuntimeError: HIP out of memory"),
+            "the tail must keep its text and its line structure, minus the escapes: {context:?}"
+        );
+        Ok(())
     }
 
     #[test]

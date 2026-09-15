@@ -5357,8 +5357,21 @@ fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn is_amdgpu_device(device_dir: &Path) -> bool {
+/// Whether a DRM `device` directory belongs to an AMD GPU: the PCI `vendor` id
+/// (`0x1002`), or, when that is unreadable, an `amdgpu` `uevent` `DRIVER=` line.
+///
+/// Both signals are needed. A vendor-only test under-counts on hosts where
+/// `vendor` is absent or unreadable, and the callers are counting *cards* — the
+/// KFD/DRM count authority here and the `rocm` CLI's sysfs fallback probe — so
+/// an under-count silently narrows the multi-card ordinal guard.
+///
+/// `pub` and not `#[cfg(target_os = "linux")]` precisely so there is one copy:
+/// the CLI's fallback probe used to carry its own, with a doc comment asserting
+/// the two were "the same two-signal test" and nothing holding them to it. It
+/// reads files, so there is nothing platform-specific to gate, and gating it
+/// would put it out of reach of a dependent crate's `cfg(test)` build.
+#[must_use]
+pub fn is_amdgpu_device(device_dir: &Path) -> bool {
     if let Ok(vendor) = fs::read_to_string(device_dir.join("vendor"))
         && vendor.trim().eq_ignore_ascii_case("0x1002")
     {
@@ -7821,6 +7834,17 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// a caller that did both would evaluate it twice and carry a branch that can
 /// never be taken.
 ///
+/// Scanning with `.rev()` is deliberate, not incidental: when several lines of
+/// the tail mention running out of memory, the *last* one is the proximate
+/// failure — the point where the process actually gave up — and the earlier ones
+/// are usually the allocator's own retry chatter leading up to it. The cost is
+/// real and worth stating: on a tail like "torch.OutOfMemoryError: ... Tried to
+/// allocate 7.21 GiB. GPU 0 has a total capacity of 24.00 GiB." followed by a
+/// bare "RuntimeError: ... killed: out of memory", the vaguer line wins even
+/// though the first carries the allocation size and the capacity. Both are
+/// diagnosable, so this picks which line is quoted, never whether one is. The
+/// user still sees every line: callers print the whole log tail beside the hint.
+///
 /// The return value is *log text*, not a shell-safe token: some callers only
 /// display it. A caller that renders it inside a quoted command must gate it on
 /// [`quotable_in_single_quotes`] first and fall back to
@@ -7860,44 +7884,170 @@ pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
 /// from the same untrusted text — the vLLM engine's startup-failure hint and the
 /// `rocm serve` summary's OOM note — and a guard that protects only one of them
 /// is the bug it was written to prevent.
+///
+/// The character test is [`is_control_or_format`], not `char::is_control`: the
+/// latter is Unicode `Cc` only, so a bidi override in the failing line survived
+/// into the printed command and reordered how it renders.
 #[must_use]
 pub fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'') && !symptom.chars().any(char::is_control)
+    !symptom.contains('\'') && !symptom.chars().any(is_control_or_format)
 }
 
-/// Removes ANSI escape sequences and any remaining control characters, so a
-/// colourised or bell-bearing log line cannot repaint the user's terminal from
-/// inside rocm-cli's own error message.
+/// Removes ANSI escape sequences and any remaining control or format characters.
+///
+/// A colourised or bell-bearing log line must not be able to repaint the user's
+/// terminal, or reorder how the message renders, from inside rocm-cli's own
+/// error message.
 ///
 /// This is for text rocm-cli *echoes*; text rocm-cli renders into a command the
 /// user is told to run is gated with [`quotable_in_single_quotes`] instead, so a
 /// control-bearing line is rejected rather than rewritten into a lookalike.
+///
+/// The sequence grammar is ECMA-48's, followed exactly, and the reason is that
+/// the input is a *killed* process's output: truncated and interleaved escapes
+/// are the normal case here, not an exotic one. A scan that just ran to the
+/// next byte in `0x40..=0x7E` mis-handled every one of them — it swallowed the
+/// following sequence's introducer (`ESC [ 1 ; 2 ESC [ 0 m Killed` lost
+/// `Killed`'s first six characters), ran straight past a multi-byte scalar
+/// (which can never be in that ASCII range) and ate everything up to the next
+/// byte that happened to land in it, emitted the body of an OSC title
+/// sequence as text, and left a stray `ESC ESC` unrecoverable.
+///
+/// Consuming only what the grammar allows and then *stopping without consuming*
+/// the offending byte bounds the damage to the malformed sequence itself: the
+/// text after it survives, and a following well-formed sequence is still
+/// recognised because its `ESC` is left for the main loop to re-read.
+///
+/// What this deliberately does not do is second-guess a well-formed sequence.
+/// `ESC [ SP K` is a valid CSI (`SP` is an intermediate, `K` the final byte), so
+/// it is consumed whole even though the `K` may have been the first letter of a
+/// truncated process's "Killed" — a real terminal consumes it too, and the
+/// contract here is "render what the terminal would have rendered", which is
+/// the only rule that stays decidable on a byte stream with no framing.
 #[must_use]
 pub fn strip_terminal_control_sequences(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                // CSI (what a colourised logger emits): skip the parameter and
-                // intermediate bytes up to and including the final byte.
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&next) {
-                        break;
-                    }
-                }
-            } else {
-                // Any other escape: drop the byte it introduces too.
-                chars.next();
+        if c != '\u{1b}' {
+            if !is_control_or_format(c) {
+                out.push(c);
             }
             continue;
         }
-        if !c.is_control() {
-            out.push(c);
+        match chars.peek() {
+            // CSI — what a colourised logger emits.
+            Some('[') => {
+                chars.next();
+                skip_csi_body(&mut chars);
+            }
+            // The string-argument sequences: OSC, DCS, SOS, PM, APC. Their
+            // bodies are arbitrary text (a window title, say) and must not be
+            // emitted as if the process had printed it.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                chars.next();
+                skip_string_sequence_body(&mut chars);
+            }
+            // `ESC` with nothing after it, or `ESC ESC`: drop just this one and
+            // let the loop re-read the next as a fresh introducer.
+            None | Some('\u{1b}') => {}
+            // Any other escape: optional intermediates, then one final byte.
+            Some(_) => skip_simple_escape_body(&mut chars),
         }
     }
     out
+}
+
+/// Consumes a CSI body — parameter bytes, then intermediate bytes, then one
+/// final byte — from just after the `ESC [`. Stops without consuming anything
+/// that does not belong, leaving it to be treated as text.
+fn skip_csi_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{30}'..='\u{3f}').contains(c))
+        .is_some()
+    {}
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+}
+
+/// Consumes a string-argument sequence's body and terminator (`BEL`, or `ST` =
+/// `ESC \`) from just after the introducer. A body truncated by anything else —
+/// including a bare `ESC` starting the next sequence — ends the scan with that
+/// byte left in place.
+fn skip_string_sequence_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(&c) = chars.peek() {
+        if c == '\u{7}' {
+            chars.next();
+            return;
+        }
+        if c == '\u{1b}' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'\\') {
+                chars.next();
+                chars.next();
+            }
+            return;
+        }
+        chars.next();
+    }
+}
+
+/// Consumes a non-CSI escape's body — optional intermediates, then one final
+/// byte — from just after the `ESC`.
+fn skip_simple_escape_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+}
+
+/// Whether `c` is a character that carries no glyph of its own but changes how
+/// the text around it renders.
+///
+/// `char::is_control` is Unicode category `Cc` only, so it misses the `Cf`
+/// format characters — and `U+202E RIGHT-TO-LEFT OVERRIDE` in a log line
+/// reverses how the rest of the printed `rocm diagnose --symptom '...'` command
+/// renders in the user's terminal. That cannot escape the single quotes (no
+/// ASCII `'` is involved), so it is display spoofing rather than shell
+/// injection, but it is the same "untrusted subprocess output must not control
+/// what the terminal shows" concern the escape stripping above exists for, and
+/// the answer has to be the same.
+///
+/// The ranges are the `Cf` category, enumerated rather than pulled from a
+/// Unicode-tables dependency: the set is small, stable, and a new dependency for
+/// one predicate is a worse trade. Over-inclusion is safe here — the only cost
+/// of rejecting a character is falling back to the canonical symptom, which is
+/// guaranteed to report a cause.
+#[must_use]
+pub fn is_control_or_format(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}')
 }
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
@@ -12710,6 +12860,18 @@ last_installed_runtime_id = "therock-release"
         assert!(quotable_in_single_quotes(
             "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
         ));
+        // Cf characters must also be inadmissible in the quoted command, not
+        // merely stripped from the echoed sentence: the two guards are separate
+        // because they are separate call sites and only one of them used
+        // `char::is_control`.
+        assert!(
+            !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
+            "a bidi override must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            quotable_in_single_quotes("vllm: HIP out of memory"),
+            "the rejection must not be so broad that ordinary lines stop qualifying"
+        );
     }
 
     #[test]
@@ -12731,6 +12893,95 @@ last_installed_runtime_id = "therock-release"
             strip_terminal_control_sequences(VLLM_OOM_CANONICAL_SYMPTOM),
             VLLM_OOM_CANONICAL_SYMPTOM
         );
+    }
+
+    #[test]
+    fn the_stripper_follows_the_escape_grammar_not_just_the_colour_case() {
+        // The `'m'`-terminated SGR case above is the *easy* one, and on its own
+        // it pins almost nothing: narrowing the CSI final-byte range from
+        // `0x40..=0x7E` to just `'m'` leaves it green. These cases pin the
+        // range, the parameter/intermediate classes, and the introducers.
+        //
+        // They are not academic. This input is a *killed* process's output, so
+        // truncated and interleaved sequences are the normal case on this code
+        // path, and every one of them used to corrupt the message the user
+        // reads -- the failures are quoted per case below.
+        for (raw, expected, defect) in [
+            // Non-`m` CSI finals: `K` (erase-in-line) and `A` (cursor-up) are
+            // ordinary logger output, and narrowing the final-byte range to
+            // `'m'` leaves them in the message verbatim.
+            (
+                "\u{1b}[2KRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            (
+                "\u{1b}[1ARuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            // Truncated CSI immediately followed by a well-formed one: the old
+            // scan consumed the second sequence's `ESC [` as the first one's
+            // parameters and stopped at `0`, yielding "0mKilled: out of memory".
+            (
+                "\u{1b}[1;2\u{1b}[0mKilled: out of memory",
+                "Killed: out of memory",
+                "a truncated CSI must not swallow the next sequence's introducer",
+            ),
+            // A multi-byte scalar can never be in `0x40..=0x7E`, so the old scan
+            // ran past it and ate to the next byte that happened to land in
+            // range -- this yielded "ut of memory", losing the `o`.
+            (
+                "\u{1b}[12\u{e9} out of memory",
+                "\u{e9} out of memory",
+                "an invalid CSI byte must end the sequence, not be scanned past",
+            ),
+            // `ESC ESC`: the old code dropped the second `ESC` as the first
+            // one's argument, then emitted `[0m` as literal text.
+            (
+                "\u{1b}\u{1b}[0mRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a stray ESC must not consume the next sequence's introducer",
+            ),
+            // OSC: the old code took the `else` branch on `]`, so the window
+            // title leaked into the message as "0;titleRuntimeError: ...".
+            (
+                "\u{1b}]0;title\u{7}RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC body must not be emitted as text",
+            ),
+            // ...and with the ST terminator (`ESC \`) rather than BEL.
+            (
+                "\u{1b}]0;title\u{1b}\\RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC terminated by ST must be consumed whole",
+            ),
+            // A two-character escape with no CSI at all.
+            (
+                "\u{1b}7RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a simple escape must consume exactly its final byte",
+            ),
+            // Cf format characters: `char::is_control` is category Cc only, so
+            // U+202E survived and reversed how the rest of the line renders.
+            (
+                "RuntimeError: \u{202e}HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a bidi override must not survive into the message",
+            ),
+            // The text-only control: nothing is removed from a clean line.
+            (
+                "RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a clean line must pass through untouched",
+            ),
+        ] {
+            assert_eq!(
+                strip_terminal_control_sequences(raw),
+                expected,
+                "{defect}: {raw:?}"
+            );
+        }
     }
 
     #[test]

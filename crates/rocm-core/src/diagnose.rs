@@ -1502,12 +1502,23 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// line with no OOM token contributes nothing, so the score is 0 and the checker
 /// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
 /// anchor and the error on one line by construction.
+///
+/// The split is on `\r` as well as `\n`, not `str::lines()`. `lines()` treats a
+/// lone `\r` as ordinary text, and a bare CR is what every progress bar in this
+/// ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw terminal
+/// capture pasted into `rocm diagnose --symptom '...'` therefore collapses into
+/// one giant "line", the anchor matches anywhere in it, and every keyword in the
+/// paste scores -- which is exactly the whole-paste scoring this function exists
+/// to prevent, reinstated by one byte
+/// (`a_bare_carriage_return_is_a_line_boundary_not_scoreable_text`). Splitting on
+/// both makes the line boundary the one the terminal actually renders. `\r\n`
+/// yields an empty segment, which carries no anchor and is dropped.
 fn vllm_anchored_lines(symptom: &str) -> String {
     let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
         return String::new();
     };
     symptom
-        .lines()
+        .split(['\n', '\r'])
         .filter(|line| anchor.is_match(&line.to_lowercase()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -1562,13 +1573,16 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
     );
     let fix = Fix {
         summary,
+        // Byte-identical to the `fix-16-vllm-oom` catalog recipe's block, and
+        // pinned there by `the_oom_plan_matches_the_catalog_copy`. The two are
+        // one plan in two modules and a user may meet either copy.
         commands: vec![
-            "# If the GPU is shared/busy (tenancy collision), lower vLLM's reservation:".to_owned(),
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,".to_owned(),
+            "# or steer vLLM onto a less-busy device:".to_owned(),
             "rocm serve <model> --gpu-memory-utilization 0.5".to_owned(),
-            "# ...or steer the server onto a less-busy device:".to_owned(),
             "rocm serve <model> --gpu <index>".to_owned(),
-            "# If the model genuinely does not fit, the reservation is not the problem:".to_owned(),
-            "#   pick a smaller or quantized model (single-GPU serving only).".to_owned(),
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the".to_owned(),
+            "# problem; pick a smaller or quantized model (single-GPU serving only).".to_owned(),
         ],
         fix_id: "fix-16-vllm-oom".to_owned(),
         auto_applicable: false,
@@ -2906,6 +2920,28 @@ mod tests {
     }
 
     #[test]
+    fn the_oom_plan_matches_the_catalog_copy() {
+        // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
+        // already opened: the executable lines agreed, so the cross-check that
+        // runs over every matched finding
+        // (`the_reported_fix_agrees_with_the_catalog_recipe`) saw nothing --
+        // it filters `#` lines by construction -- while the comments explaining
+        // *which of the two faults each step addresses* had drifted apart. That
+        // prose is the whole point of this entry: the two faults need opposite
+        // responses, so a user meeting the `diagnose` copy and a user meeting
+        // the `rocm fix` copy must be told the same thing.
+        let report = diagnose(&linux_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
     fn the_extension_name_alone_does_not_establish_the_variant_failure() {
         // The extension appearing in a traceback says it is involved, not that
         // it loaded the CUDA variant. Holding this under the threshold is what
@@ -4114,6 +4150,56 @@ mod tests {
             .find(|d| d.id == "fix-16-vllm-oom")
             .expect("an anchored OOM line must still match");
         assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn a_bare_carriage_return_is_a_line_boundary_not_scoreable_text() {
+        // Regression: the anchored-lines filter used `str::lines()`, which
+        // splits only on `\n` and `\r\n` -- a lone `\r` is ordinary text to it.
+        // Every progress bar in this ecosystem (tqdm, pip, huggingface)
+        // repaints with a bare CR, and a pasted terminal capture is the
+        // expected way to use `--symptom`, so the whole capture collapsed into
+        // one "line": the vLLM anchor matched somewhere in it and another
+        // framework's OOM elsewhere in it scored at full weight. That is
+        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
+        // one byte, and neither existing guard saw it because both use
+        // `\n`-only fixtures.
+        let capture = "Downloading shards:  10%\rvllm serve starting up\r\
+                       Downloading shards:  90%\r\
+                       llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+                       Tried to allocate 7.21 GiB.\n";
+        let report = diagnose(&linux_base(), capture);
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "a CR-separated llama.cpp OOM must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The same content with `\n` in place of `\r` is the already-covered
+        // shape; pinning both together is what makes the CR case a boundary
+        // question rather than a scoring question.
+        let newline_form = capture.replace('\r', "\n");
+        assert!(
+            diagnose(&linux_base(), &newline_form)
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-16-vllm-oom"),
+            "the `\\n` form of the same capture must not match either"
+        );
+
+        // The control: a CR-separated capture whose *anchored* segment carries
+        // the OOM must still match, so splitting on CR did not simply blind the
+        // checker to carriage-returned input.
+        let anchored = diagnose(
+            &linux_base(),
+            "Downloading shards:  90%\rvllm: torch.OutOfMemoryError: HIP out of memory\r",
+        );
+        let oom = anchored
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM segment must still match across CRs");
+        assert!(oom.score >= MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
     }
 
     #[test]
