@@ -167,9 +167,23 @@ mod tests {
         })
         .expect_err("an unconfirmed stop must abort uninstall");
 
+        let message = format!("{error:#}");
+        // Assert on text the GATE owns first. `svc-stuck` alone would be this
+        // test reading back its own input — the id is folded into the detail
+        // whatever the remedy is, so that assertion survives swapping the
+        // remedy to the daemon variant and would leave this branch of the
+        // remedy selection unexercised while reading as its coverage.
         assert!(
-            error.to_string().contains("svc-stuck"),
-            "the abort names the service: {error:#}"
+            message.contains("rocm services stop <id> --yes"),
+            "the abort must carry the service remedy, not a generic one: {message}"
+        );
+        assert!(
+            !message.contains("restarts managed services on its own"),
+            "a service is not the background helper, so its remedy must not be offered: {message}"
+        );
+        assert!(
+            message.contains("svc-stuck"),
+            "the abort still names which service: {message}"
         );
         assert!(
             doomed.is_file(),
@@ -239,9 +253,17 @@ mod tests {
         })
         .expect_err("a stop pass that cannot run must abort uninstall");
 
+        // Unlike the two remedy tests above, there is no gate-owned text to
+        // assert on here: a discovery failure never reaches the gate, it is
+        // propagated by the `?` on the stop pass. So this substring is
+        // deliberately the test's own input, and it pins exactly one thing —
+        // that the cause is carried through rather than swallowed or replaced
+        // by a generic "uninstall aborted", which is the `.ok()` defect an
+        // earlier round found on this path. The survival assertion below is
+        // what pins the abort itself.
         assert!(
             error.to_string().contains("services directory"),
-            "the abort carries the discovery failure: {error:#}"
+            "the abort carries the discovery failure verbatim: {error:#}"
         );
         assert!(
             doomed.is_file(),

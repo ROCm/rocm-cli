@@ -15880,6 +15880,13 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                     &probe_record.endpoint_url,
                     endpoint_api_key.as_deref(),
                 );
+            // Every arm below is decided in `stopped_record_verdict` and pinned
+            // there by `every_identity_answer_maps_to_exactly_one_gate_outcome`,
+            // with `an_endpoint_listing_nothing_does_not_block_uninstall` and
+            // `a_listener_naming_another_model_does_not_block_uninstall` driving
+            // the two proceed-on-a-live-socket arms through this call site. The
+            // tests live at the bottom of this file, far from here; change an
+            // arm and expect them, not this match, to be what goes red.
             let verdict = stopped_record_verdict(probe.ok(), auth_refused);
             if !verdict.blocks() {
                 // The two fail-open outcomes say so on stderr, not stdout: this
@@ -31972,9 +31979,15 @@ ID_LIKE="suse opensuse"
         // Blocking would make any listener that answers `/v1/models` with an
         // empty list — including something unrelated on a recycled port — an
         // abort with no override, which is the dead end this gate must not
-        // create. The warning is what keeps it a tradeoff rather than a silent
-        // removal, and is asserted by `every_identity_answer_maps_to_exactly_\
-        // one_gate_outcome` via the distinct verdict.
+        // create. Sensitive to exactly one mutation: turning that arm into a
+        // block.
+        //
+        // What keeps this a tradeoff rather than a silent removal is the
+        // warning on stderr, and that warning is pinned by nothing — no test
+        // here reads stderr, so emptying its body while leaving the `continue`
+        // would stay green. What is pinned is only that `ListsNoModels` reaches
+        // a verdict distinct from the silent one, which is the precondition for
+        // the warning rather than the warning itself.
         let endpoint = ServingEndpoint::listing_nothing();
         let (root, paths) = test_paths("uninstall-endpoint-listing-nothing");
         let mut record = ManagedServiceRecord::new(
@@ -32000,6 +32013,50 @@ ID_LIKE="suse opensuse"
         assert!(
             report.failed.is_empty(),
             "an empty model list must not abort uninstall: {report:?}"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_ok(),
+            "the gate must let the removal proceed"
+        );
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_listener_naming_another_model_does_not_block_uninstall() {
+        // The end-to-end half of the `ServesOtherModels` arm, and the only test
+        // that drives it through the real call site rather than through the
+        // pure helper. A listener that names its models and does not name ours
+        // is the one answer that is positive evidence of a stranger on a
+        // recycled port, so it must proceed — blocking here would let any
+        // unrelated OpenAI-shaped server on a reused port wedge uninstall with
+        // no override. Sensitive to exactly one mutation: turning that arm into
+        // a block.
+        let endpoint = ServingEndpoint::serving("amd/somebody-elses-model");
+        let (root, paths) = test_paths("uninstall-endpoint-other-model");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-recycled-port",
+            "vllm",
+            "amd/our-model",
+            "amd/our-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.failed.is_empty(),
+            "a listener naming only other models must not abort uninstall: {report:?}"
         );
         assert!(
             uninstall_removal_gate(&report).is_ok(),

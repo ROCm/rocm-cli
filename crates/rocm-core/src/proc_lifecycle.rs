@@ -101,6 +101,13 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
     // Reading only after liveness means the reading always describes whatever
     // holds the PID *now*, so a recycled one disagrees and comes back
     // `Recycled`.
+    //
+    // Held by construction, not by test: staging the inversion needs a process
+    // to exit and its PID to be reissued inside a window of microseconds, which
+    // means injectable seams around `process_is_running` and
+    // `process_start_ticks` — indirection in the primitive whose whole job is
+    // to be simple enough to audit by reading. The statement below is the
+    // guarantee; keep it a statement.
     if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
         return IdentityState::Gone;
     }
