@@ -1502,12 +1502,23 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// line with no OOM token contributes nothing, so the score is 0 and the checker
 /// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
 /// anchor and the error on one line by construction.
+///
+/// The split is on `\r` as well as `\n`, not `str::lines()`. `lines()` treats a
+/// lone `\r` as ordinary text, and a bare CR is what every progress bar in this
+/// ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw terminal
+/// capture pasted into `rocm diagnose --symptom '...'` therefore collapses into
+/// one giant "line", the anchor matches anywhere in it, and every keyword in the
+/// paste scores -- which is exactly the whole-paste scoring this function exists
+/// to prevent, reinstated by one byte
+/// (`a_bare_carriage_return_is_a_line_boundary_not_scoreable_text`). Splitting on
+/// both makes the line boundary the one the terminal actually renders. `\r\n`
+/// yields an empty segment, which carries no anchor and is dropped.
 fn vllm_anchored_lines(symptom: &str) -> String {
     let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
         return String::new();
     };
     symptom
-        .lines()
+        .split(['\n', '\r'])
         .filter(|line| anchor.is_match(&line.to_lowercase()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -4114,6 +4125,56 @@ mod tests {
             .find(|d| d.id == "fix-16-vllm-oom")
             .expect("an anchored OOM line must still match");
         assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn a_bare_carriage_return_is_a_line_boundary_not_scoreable_text() {
+        // Regression: the anchored-lines filter used `str::lines()`, which
+        // splits only on `\n` and `\r\n` -- a lone `\r` is ordinary text to it.
+        // Every progress bar in this ecosystem (tqdm, pip, huggingface)
+        // repaints with a bare CR, and a pasted terminal capture is the
+        // expected way to use `--symptom`, so the whole capture collapsed into
+        // one "line": the vLLM anchor matched somewhere in it and another
+        // framework's OOM elsewhere in it scored at full weight. That is
+        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
+        // one byte, and neither existing guard saw it because both use
+        // `\n`-only fixtures.
+        let capture = "Downloading shards:  10%\rvllm serve starting up\r\
+                       Downloading shards:  90%\r\
+                       llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+                       Tried to allocate 7.21 GiB.\n";
+        let report = diagnose(&linux_base(), capture);
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "a CR-separated llama.cpp OOM must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The same content with `\n` in place of `\r` is the already-covered
+        // shape; pinning both together is what makes the CR case a boundary
+        // question rather than a scoring question.
+        let newline_form = capture.replace('\r', "\n");
+        assert!(
+            diagnose(&linux_base(), &newline_form)
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-16-vllm-oom"),
+            "the `\\n` form of the same capture must not match either"
+        );
+
+        // The control: a CR-separated capture whose *anchored* segment carries
+        // the OOM must still match, so splitting on CR did not simply blind the
+        // checker to carriage-returned input.
+        let anchored = diagnose(
+            &linux_base(),
+            "Downloading shards:  90%\rvllm: torch.OutOfMemoryError: HIP out of memory\r",
+        );
+        let oom = anchored
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM segment must still match across CRs");
+        assert!(oom.score >= MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
     }
 
     #[test]
