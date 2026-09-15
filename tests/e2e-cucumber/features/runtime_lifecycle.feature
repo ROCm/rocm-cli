@@ -31,34 +31,8 @@ Feature: Runtime lifecycle state machine
     Then its registry entry is removed
     And its external folder is left in place
 
-  @id:runtime-lifecycle-uninstall-keeps-mismatched-folder
-  Scenario: runtime-lifecycle-04 - Uninstalling a runtime whose local manifest doesn't match keeps its folder
-    Given a registered runtime with a local manifest mismatch
-    When the user uninstalls that runtime
-    Then its registry entry is removed
-    And its folder is left in place because the local manifest did not match
-
-  # `runtimes uninstall` deletes state, so a non-interactive caller (CI, a script,
-  # a piped shell) that forgets `--yes` must be refused loudly instead of the
-  # command silently deleting anything or silently no-op'ing.
-  @id:runtime-lifecycle-uninstall-without-yes-requires-confirmation
-  Scenario: runtime-lifecycle-05 - Uninstalling without --yes outside a terminal is refused and changes nothing
-    Given a registered read-only runtime
-    When the user uninstalls that runtime without confirming
-    Then the CLI refuses because confirmation is required
-    And its registry entry is left in place
-    And its install folder still exists on disk
-
-  @id:runtime-lifecycle-uninstall-dry-run-changes-nothing
-  Scenario: runtime-lifecycle-06 - Uninstalling with --dry-run previews the plan and changes nothing
-    Given a registered read-only runtime
-    When the user previews uninstalling that runtime
-    Then the CLI prints the uninstall plan without applying it
-    And its registry entry is left in place
-    And its install folder still exists on disk
-
   @id:runtime-lifecycle-import-rejects-duplicate-unless-replacing
-  Scenario: runtime-lifecycle-07 - Importing a runtime, then rejecting a duplicate unless replacing
+  Scenario: runtime-lifecycle-04 - Importing a runtime, then rejecting a duplicate unless replacing
     Given a runtime manifest to import
     When the user imports the runtime
     Then the runtime is registered as read-only
@@ -72,7 +46,7 @@ Feature: Runtime lifecycle state machine
   # they mean. This asserts the printed legend actually names both glyphs, so the
   # rendered marker and its explanation can't drift apart silently.
   @id:runtime-lifecycle-list-shows-marker-legend
-  Scenario: runtime-lifecycle-08 - Listing runtimes explains the active and rollback markers
+  Scenario: runtime-lifecycle-05 - Listing runtimes explains the active and rollback markers
     Given two registered runtimes with the second active after the first
     When the user rolls back
     And the user lists the registered runtimes

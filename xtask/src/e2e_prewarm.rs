@@ -661,7 +661,7 @@ fn repair_poisoned_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
         // Drops the registry entry, the active marker, and the config pointers.
         // Tolerates the recorded folder being absent, which it is.
         rocm_command(rocm, prewarm_dir)
-            .args(["runtimes", "uninstall", &runtime.runtime_key, "--yes"])
+            .args(["runtimes", "uninstall", &runtime.runtime_key])
             .status_ok("rocm runtimes uninstall")?;
 
         // The physical tree the CLI could not reach: it removed what the manifest

@@ -296,7 +296,7 @@ Manage multiple side-by-side ROCm installs:
 rocm runtimes list
 rocm runtimes activate <runtime-key>
 rocm runtimes rollback
-rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
+rocm runtimes uninstall <runtime-key>
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
@@ -305,13 +305,6 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,
 `/opt/rocm`); use `rocm install sdk` instead.
-
-`uninstall` always removes the runtime's registry entry, but only deletes its
-install folder when rocm-cli created it and the local manifest still matches
-the registry. It leaves the folder in place — and prints why — when the
-runtime is externally sourced or read-only (nothing to delete on rocm-cli's
-side) or when the local manifest no longer matches the registry (deleting the
-wrong install would be worse than leaving a stale folder behind).
 
 ### Disk space
 

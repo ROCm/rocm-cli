@@ -271,7 +271,6 @@ pub fn on_key(
                     "runtimes".to_string(),
                     "uninstall".to_string(),
                     rt.key.clone(),
-                    "--yes".to_string(),
                 ];
                 stage_approval(r, RuntimeAction::Uninstall, args);
             } else {
@@ -624,7 +623,7 @@ mod tests {
         assert_eq!(pending.action, RuntimeAction::Uninstall);
         assert_eq!(
             pending.args,
-            vec!["runtimes", "uninstall", "therock-nightly-gfx94", "--yes"]
+            vec!["runtimes", "uninstall", "therock-nightly-gfx94"]
         );
     }
 

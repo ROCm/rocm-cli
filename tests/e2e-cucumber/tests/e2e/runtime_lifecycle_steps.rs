@@ -32,24 +32,6 @@ const IMPORT_KEY: &str = "release-tarball-gfx1151";
 /// create its `install_root` (a dir with a payload file) so it validates as usable.
 /// Returns the install_root so a scenario can assert the folder's fate.
 fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
-    plant_runtime_with_read_only(world, key, family, true)
-}
-
-/// Write a *non*-read-only `tarball` runtime manifest whose `install_root` lacks
-/// the local `.rocm-cli-runtime.json` marker the CLI writes at install time — the
-/// same "local manifest doesn't match" condition
-/// `runtime_uninstall_leaves_folder_on_local_manifest_mismatch` exercises at the
-/// unit level, reached here through the real CLI binary instead.
-fn plant_runtime_with_manifest_mismatch(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
-    plant_runtime_with_read_only(world, key, family, false)
-}
-
-fn plant_runtime_with_read_only(
-    world: &E2eWorld,
-    key: &str,
-    family: &str,
-    read_only: bool,
-) -> PathBuf {
     assert!(
         key.chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
@@ -63,15 +45,15 @@ fn plant_runtime_with_read_only(
 
     let registry = root.path().join("data").join("runtimes").join("registry");
     std::fs::create_dir_all(&registry).expect("failed to create registry dir");
-    let manifest = runtime_manifest_json(key, family, &install_root, read_only);
+    let manifest = runtime_manifest_json(key, family, &install_root);
     std::fs::write(registry.join(format!("{key}.json")), manifest)
         .expect("failed to write runtime manifest");
     install_root
 }
 
-/// A minimal valid tarball runtime manifest (matches the CLI's on-disk schema).
-/// Written as plain JSON — black-box, not a typed import from the crates.
-fn runtime_manifest_json(key: &str, family: &str, install_root: &Path, read_only: bool) -> String {
+/// A minimal valid read-only tarball runtime manifest (matches the CLI's on-disk
+/// schema). Written as plain JSON — black-box, not a typed import from the crates.
+fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "runtime_key": key,
         // The human-facing identifier keeps the `therock-release:<family>` form (the
@@ -84,7 +66,7 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path, read_only
         "version": "1.0.0",
         "install_root": install_root,
         "selected_artifact_url": format!("https://example.invalid/{key}.tar.gz"),
-        "read_only": read_only,
+        "read_only": true,
         "installed_at_unix_ms": 1_700_000_000_000u64,
     }))
     .expect("failed to serialize runtime manifest")
@@ -101,7 +83,7 @@ fn write_import_manifest(world: &E2eWorld) -> PathBuf {
     let manifest_path = root.path().join("import-manifest.json");
     std::fs::write(
         &manifest_path,
-        runtime_manifest_json(IMPORT_KEY, "gfx1151", &install_root, true),
+        runtime_manifest_json(IMPORT_KEY, "gfx1151", &install_root),
     )
     .expect("failed to write import manifest");
     manifest_path
@@ -128,13 +110,6 @@ async fn two_runtimes_second_active(world: &mut E2eWorld) {
 #[given("a registered read-only runtime")]
 async fn one_readonly_runtime(world: &mut E2eWorld) {
     let install_root = plant_runtime(world, FIRST_KEY, "gfx942");
-    // Stash the install_root path so the uninstall scenario can assert it survives.
-    world.model_name = Some(install_root.to_string_lossy().into_owned());
-}
-
-#[given("a registered runtime with a local manifest mismatch")]
-async fn one_manifest_mismatch_runtime(world: &mut E2eWorld) {
-    let install_root = plant_runtime_with_manifest_mismatch(world, FIRST_KEY, "gfx942");
     // Stash the install_root path so the uninstall scenario can assert it survives.
     world.model_name = Some(install_root.to_string_lossy().into_owned());
 }
@@ -173,23 +148,7 @@ async fn list_runtimes(world: &mut E2eWorld) {
 
 #[when("the user uninstalls that runtime")]
 async fn uninstall(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) =
-        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--yes"]);
-    record(world, stdout, stderr, rc);
-}
-
-// `run_rocm` never inherits a real terminal for stdin (`Command::output` closes
-// it), so this exercises the same non-interactive path a CI job or script hits.
-#[when("the user uninstalls that runtime without confirming")]
-async fn uninstall_without_yes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
-    record(world, stdout, stderr, rc);
-}
-
-#[when("the user previews uninstalling that runtime")]
-async fn uninstall_dry_run(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) =
-        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--dry-run"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -287,7 +246,7 @@ async fn folder_left(world: &mut E2eWorld) {
     let out = world.cli_output.clone().unwrap_or_default();
     assert!(
         out.contains("folder_removed: no")
-            && out.contains("ROCm CLI did not create this folder, so it is left in place"),
+            && out.contains("existing external runtime folder was left untouched"),
         "expected the external folder to be left, got:\n{out}"
     );
     let install_root = world
@@ -297,78 +256,6 @@ async fn folder_left(world: &mut E2eWorld) {
     assert!(
         Path::new(install_root).is_dir(),
         "external runtime folder was removed: {install_root}"
-    );
-}
-
-#[then("its folder is left in place because the local manifest did not match")]
-async fn folder_left_manifest_mismatch(world: &mut E2eWorld) {
-    let out = world.cli_output.clone().unwrap_or_default();
-    assert!(
-        out.contains("folder_removed: no")
-            && out.contains(
-                "local runtime manifest did not match the registry, so it is left in place"
-            ),
-        "expected the folder to be left in place with a mismatch note, got:\n{out}"
-    );
-    let install_root = world
-        .model_name
-        .as_deref()
-        .expect("no install root recorded");
-    assert!(
-        Path::new(install_root).is_dir(),
-        "runtime folder was removed: {install_root}"
-    );
-}
-
-#[then("the CLI refuses because confirmation is required")]
-async fn refuses_without_confirmation(world: &mut E2eWorld) {
-    let rc = world.cli_rc.expect("no command rc recorded");
-    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
-    assert!(
-        combined(world).contains("requires --yes outside an interactive terminal"),
-        "expected a --yes-required error, got:\n{}",
-        combined(world)
-    );
-}
-
-#[then("the CLI prints the uninstall plan without applying it")]
-async fn prints_plan_without_applying(world: &mut E2eWorld) {
-    let out = ok_output(world);
-    assert!(
-        out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
-        "expected a dry-run plan preview, got:\n{out}"
-    );
-    assert!(
-        !out.contains("runtime removed"),
-        "dry-run must not apply the uninstall, got:\n{out}"
-    );
-}
-
-#[then("its registry entry is left in place")]
-async fn registry_left_in_place(world: &mut E2eWorld) {
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
-    assert!(
-        entry.exists(),
-        "registry entry was unexpectedly removed: {}",
-        entry.display()
-    );
-}
-
-#[then("its install folder still exists on disk")]
-async fn install_folder_still_exists(world: &mut E2eWorld) {
-    let install_root = world
-        .model_name
-        .as_deref()
-        .expect("no install root recorded");
-    assert!(
-        Path::new(install_root).is_dir(),
-        "install folder was unexpectedly removed: {install_root}"
     );
 }
 

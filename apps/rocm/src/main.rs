@@ -293,14 +293,12 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         #[command(subcommand)]
         target: InstallTarget,
     },
-    /// Check for a newer ROCm package and optionally install or preview it.
+    /// Check for a newer ROCm package and optionally install it.
     ///
-    /// Without --apply or --dry-run, only reports whether an update is available. Pass
-    /// --dry-run to preview what --apply would do without changing files, --apply to
-    /// install it, and --activate to make the new install the default afterward.
+    /// Without --apply, only reports whether an update is available. Pass --apply to
+    /// install it, and add --activate to make the new install the default afterward.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
-rocm update --dry-run\n  \
 rocm update --apply --activate\n  \
 rocm update --apply --dry-run\n  \
 rocm update --json")]
@@ -309,19 +307,19 @@ rocm update --json")]
         #[arg(long)]
         apply: bool,
         /// Runtime key to update.
-        #[arg(long)]
+        #[arg(long, requires = "apply")]
         runtime: Option<String>,
         /// Use the updated ROCm install as the default after installing it.
-        #[arg(long)]
+        #[arg(long, requires = "apply")]
         activate: bool,
         /// Show what would happen without changing files.
-        #[arg(long)]
+        #[arg(long, requires = "apply")]
         dry_run: bool,
         /// Print the check result as a single line of JSON instead of text.
-        #[arg(long, conflicts_with_all = ["apply", "dry_run"])]
+        #[arg(long, conflicts_with = "apply")]
         json: bool,
         /// Bound the version-check network calls to this many seconds each.
-        #[arg(long, requires = "json", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
     /// List, choose, add, or remove ROCm installs (runtimes).
@@ -702,12 +700,6 @@ left, so it cannot undo more than one activation."
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
-        /// Do not ask for interactive confirmation.
-        #[arg(long)]
-        yes: bool,
-        /// Show what would be removed without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Add a ROCm install from a saved manifest file.
     Import {
@@ -1943,13 +1935,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
-            if !apply && !dry_run && (runtime.is_some() || activate) {
-                bail!(
-                    "--runtime and --activate require --apply or --dry-run; \
-                     run `rocm update --dry-run` to preview or add --apply to update"
-                );
-            }
-            if update_should_preview_or_apply(apply, dry_run) {
+            if apply {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
                     &paths,
@@ -6805,71 +6791,17 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall {
-            runtime,
-            yes,
-            dry_run,
-        } => {
-            let plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
-            print!("{}", render_runtime_uninstall_plan(&plan));
-
-            if dry_run {
-                println!("dry run: no changes made");
-                return Ok(());
-            }
-
-            let plan = if yes {
-                plan
-            } else {
-                if !interactive_terminal() {
-                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
-                }
-                if !confirm_uninstall()? {
-                    println!("runtime uninstall cancelled");
-                    return Ok(());
-                }
-                // Reload from disk: the registry or config can change while a
-                // human is staring at the confirmation prompt, and re-planning
-                // against the stale in-memory config would miss it.
-                config = RocmCliConfig::load(&paths)?;
-                let reconfirmed_plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
-                if !runtime_uninstall_plan_matches(&plan, &reconfirmed_plan) {
-                    bail!(
-                        "runtime state changed while waiting for confirmation; re-run \
-                         `rocm runtimes uninstall {runtime}` to review the updated plan"
-                    );
-                }
-                reconfirmed_plan
-            };
-
-            let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
+        RuntimesCommand::Uninstall { runtime } => {
+            let result = uninstall_runtime(&paths, &mut config, &runtime)?;
             println!("runtime removed");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
             println!("  registry_removed: {}", result.registry_path.display());
             match result.removed_install_root.as_ref() {
                 Some(path) => println!("  folder_removed: {}", path.display()),
-                None if result.read_only && result.install_root_existed => {
-                    println!("  folder_removed: no");
-                    println!("  note: ROCm CLI did not create this folder, so it is left in place");
-                }
                 None if result.read_only => {
                     println!("  folder_removed: no");
-                    println!("  note: ROCm CLI did not create this folder; it was already gone");
-                }
-                None if result.manifest_mismatch && result.install_root_existed => {
-                    println!("  folder_removed: no");
-                    println!(
-                        "  note: local runtime manifest did not match the registry, so it is \
-                         left in place to avoid deleting the wrong install"
-                    );
-                }
-                None if result.manifest_mismatch => {
-                    println!("  folder_removed: no");
-                    println!(
-                        "  note: local runtime manifest did not match the registry, but the \
-                         folder was already gone; nothing to leave in place"
-                    );
+                    println!("  note: existing external runtime folder was left untouched");
                 }
                 None => println!("  folder_removed: no"),
             }
@@ -7004,8 +6936,6 @@ struct RuntimeUninstallResult {
     registry_path: PathBuf,
     removed_install_root: Option<PathBuf>,
     read_only: bool,
-    manifest_mismatch: bool,
-    install_root_existed: bool,
     was_active: bool,
 }
 
@@ -7232,157 +7162,23 @@ fn rollback_runtime(
     })
 }
 
-/// A runtime's install folder is only ever removed when ROCm CLI is confident
-/// it owns that folder; `ReadOnly` and `ManifestMismatch` are distinct reasons
-/// for leaving it alone, surfaced separately so a real problem (a stale or
-/// corrupt local manifest) doesn't look identical to an intentional no-op.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallRootDecision {
-    Remove,
-    ReadOnly,
-    ManifestMismatch,
-}
-
-impl InstallRootDecision {
-    const fn should_remove(self) -> bool {
-        matches!(self, Self::Remove)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeUninstallPlan {
-    manifest: therock::InstalledRuntimeManifest,
-    all_manifests: Vec<therock::InstalledRuntimeManifest>,
-    registry_path: PathBuf,
-    was_active: bool,
-    install_root_decision: InstallRootDecision,
-}
-
-impl RuntimeUninstallPlan {
-    fn will_remove_install_root(&self) -> bool {
-        self.install_root_decision.should_remove() && self.manifest.install_root.exists()
-    }
-}
-
-fn render_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "runtime uninstall plan");
-    let _ = writeln!(output, "  runtime_id: {}", plan.manifest.runtime_id);
-    let _ = writeln!(output, "  runtime_key: {}", plan.manifest.runtime_key);
-    let _ = writeln!(output, "  registry_entry: {}", plan.registry_path.display());
-    if plan.will_remove_install_root() {
-        let _ = writeln!(
-            output,
-            "  install_folder: {} (would be removed)",
-            plan.manifest.install_root.display()
-        );
-    } else {
-        match plan.install_root_decision {
-            InstallRootDecision::Remove => {
-                let _ = writeln!(output, "  install_folder: not present, nothing to remove");
-            }
-            InstallRootDecision::ReadOnly if plan.manifest.install_root.exists() => {
-                let _ = writeln!(
-                    output,
-                    "  install_folder: left in place (ROCm CLI did not create this folder)"
-                );
-            }
-            InstallRootDecision::ReadOnly => {
-                let _ = writeln!(
-                    output,
-                    "  install_folder: not present, nothing to leave in place"
-                );
-            }
-            InstallRootDecision::ManifestMismatch if plan.manifest.install_root.exists() => {
-                let _ = writeln!(
-                    output,
-                    "  install_folder: left in place (local runtime manifest did not match \
-                     the registry)"
-                );
-            }
-            InstallRootDecision::ManifestMismatch => {
-                let _ = writeln!(
-                    output,
-                    "  install_folder: not present, nothing to leave in place"
-                );
-            }
-        }
-    }
-    if plan.was_active {
-        let _ = writeln!(output, "  default_runtime: would be cleared");
-    }
-    output
-}
-
-fn plan_runtime_uninstall(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-    selector: &str,
-) -> Result<RuntimeUninstallPlan> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let manifest = select_runtime_manifest(&manifests, selector)?.clone();
-    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
-    let was_active = current_runtime_manifest(config, &manifests)
-        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let install_root_decision = should_remove_runtime_install_root(&manifest)?;
-    Ok(RuntimeUninstallPlan {
-        manifest,
-        all_manifests: manifests,
-        registry_path,
-        was_active,
-        install_root_decision,
-    })
-}
-
-/// Whether `current` still describes the same removal as `original`.
-///
-/// Used to catch the window between an interactive confirmation prompt and
-/// applying the plan: the registry or the install folder can change while a
-/// human is staring at the prompt, and applying a stale plan would delete (or
-/// fail to delete) the wrong thing.
-fn runtime_uninstall_plan_matches(
-    original: &RuntimeUninstallPlan,
-    current: &RuntimeUninstallPlan,
-) -> bool {
-    original.manifest.runtime_key == current.manifest.runtime_key
-        && original.manifest.runtime_id == current.manifest.runtime_id
-        && original.manifest.install_root == current.manifest.install_root
-        && original.registry_path == current.registry_path
-        && original.was_active == current.was_active
-        && original.install_root_decision == current.install_root_decision
-}
-
 fn uninstall_runtime(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
     selector: &str,
 ) -> Result<RuntimeUninstallResult> {
-    let plan = plan_runtime_uninstall(paths, config, selector)?;
-    apply_runtime_uninstall(paths, config, plan)
-}
+    let manifests = therock::load_runtime_manifests(paths)?;
+    let manifest = select_runtime_manifest(&manifests, selector)?.clone();
+    let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
+    let was_active = current_runtime_manifest(config, &manifests)
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
+    let remove_install_root = should_remove_runtime_install_root(&manifest)?;
 
-fn apply_runtime_uninstall(
-    paths: &AppPaths,
-    config: &mut RocmCliConfig,
-    plan: RuntimeUninstallPlan,
-) -> Result<RuntimeUninstallResult> {
-    let RuntimeUninstallPlan {
-        manifest,
-        all_manifests: manifests,
-        registry_path,
-        was_active,
-        install_root_decision,
-    } = plan;
-
-    let install_root_existed = manifest.install_root.exists();
     let mut removed_install_root = None;
-    if install_root_decision.should_remove() && install_root_existed {
+    if remove_install_root && manifest.install_root.exists() {
         fs::remove_dir_all(&manifest.install_root).with_context(|| {
             format!(
-                "failed to remove runtime folder {} — the runtime registry entry has not \
-                 been removed yet, so `rocm runtimes list` will still show this runtime as \
-                 installed and pointing at this (now possibly partially deleted) folder \
-                 until the removal succeeds",
+                "failed to remove runtime folder {}",
                 manifest.install_root.display()
             )
         })?;
@@ -7461,23 +7257,21 @@ fn apply_runtime_uninstall(
         registry_path,
         removed_install_root,
         read_only: manifest.read_only,
-        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
-        install_root_existed,
         was_active,
     })
 }
 
 fn should_remove_runtime_install_root(
     manifest: &therock::InstalledRuntimeManifest,
-) -> Result<InstallRootDecision> {
+) -> Result<bool> {
     if manifest.read_only || manifest.imported_from.is_some() {
-        return Ok(InstallRootDecision::ReadOnly);
+        return Ok(false);
     }
     if !local_runtime_manifest_matches(manifest)? {
-        return Ok(InstallRootDecision::ManifestMismatch);
+        return Ok(false);
     }
     ensure_runtime_install_root_is_safe_to_remove(&manifest.install_root)?;
-    Ok(InstallRootDecision::Remove)
+    Ok(true)
 }
 
 fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) -> Result<bool> {
@@ -7487,12 +7281,8 @@ fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) 
     }
     let bytes = fs::read(&local_path)
         .with_context(|| format!("failed to read {}", local_path.display()))?;
-    let Ok(local) = serde_json::from_slice::<therock::InstalledRuntimeManifest>(&bytes) else {
-        // A marker file that fails to parse is just as untrustworthy as one whose
-        // fields don't match — treat it as a mismatch instead of aborting the
-        // whole uninstall, so a corrupt local marker doesn't block cleanup.
-        return Ok(false);
-    };
+    let local: therock::InstalledRuntimeManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", local_path.display()))?;
     Ok(local.runtime_key == manifest.runtime_key
         && local.runtime_id == manifest.runtime_id
         && paths_equivalent(&local.install_root, &manifest.install_root))
@@ -12157,26 +11947,6 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Update".to_owned(),
             })
         }
-        Some("runtimes")
-            if second
-                .as_deref()
-                .is_some_and(|value| value == "uninstall" || value == "remove")
-                && args.iter().any(|arg| arg == "--dry-run") =>
-        {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("runtimes")
-            if second
-                .as_deref()
-                .is_some_and(|value| value == "uninstall" || value == "remove") =>
-        {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Remove ROCm install".to_owned(),
-                command_title: "Runtimes".to_owned(),
-            })
-        }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
             args,
             pending_title: "Change ROCm install".to_owned(),
@@ -16346,16 +16116,6 @@ fn append_update_surfaces(output: &mut String) {
         output,
         "  note: `rocm update --apply` applies runtime updates only; CLI, engine, and recipe update feeds require published metadata before they can mutate state"
     );
-}
-
-/// Whether `rocm update` should route into the runtime update path
-/// (`apply_runtime_update`) instead of the read-only status report.
-///
-/// `--dry-run` alone must take this path too, since `apply_runtime_update`
-/// only mutates anything when `dry_run` is false — a plain status report
-/// would silently ignore `--dry-run` and never show what `--apply` would do.
-const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
-    apply || dry_run
 }
 
 fn apply_runtime_update(
@@ -23353,18 +23113,6 @@ model recipes
             vec!["comfyui".to_owned(), "logs".to_owned()],
             vec!["uninstall".to_owned(), "--dry-run".to_owned()],
             vec!["setup".to_owned(), "status".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-                "--dry-run".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-                "--dry-run".to_owned(),
-            ],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -23382,16 +23130,6 @@ model recipes
             vec!["comfyui".to_owned(), "stop".to_owned()],
             vec!["uninstall".to_owned()],
             vec!["setup".to_owned(), "reset".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-            ],
         ];
         for args in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -23400,35 +23138,6 @@ model recipes
                 matches!(action, ChatRocmCommandAction::Approval { .. }),
                 "{args:?} should require approval, got {action:?}"
             );
-        }
-
-        let mutating_requiring_yes_injection = [
-            vec!["uninstall".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-            ],
-        ];
-        for args in mutating_requiring_yes_injection {
-            let action = chat_rocm_command_action_from_args(args.clone())
-                .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            match &action {
-                ChatRocmCommandAction::Approval { args, .. } => {
-                    assert!(
-                        args.iter().any(|arg| arg == "--yes"),
-                        "{args:?} should have --yes injected for the approval path"
-                    );
-                }
-                ChatRocmCommandAction::ReadOnly(_) => {
-                    panic!("{args:?} should require approval, got ReadOnly")
-                }
-            }
         }
     }
 
@@ -25257,42 +24966,6 @@ install therock";
             .expect("services stop should accept --yes");
         Cli::try_parse_from(["rocm", "services", "restart", "svc-qwen", "--yes"])
             .expect("services restart should accept --yes");
-    }
-
-    #[test]
-    fn update_dry_run_does_not_require_apply() {
-        Cli::try_parse_from(["rocm", "update", "--dry-run"])
-            .expect("update --dry-run should preview without --apply");
-        Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
-            .expect("update --apply --dry-run should still parse");
-        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
-            .expect("update --dry-run --runtime should preview without --apply");
-        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
-            .expect("update --dry-run --activate should preview without --apply");
-    }
-
-    #[test]
-    fn update_dry_run_conflicts_with_json() {
-        Cli::try_parse_from(["rocm", "update", "--dry-run", "--json"]).expect_err(
-            "update --dry-run --json should be rejected instead of silently dropping --json",
-        );
-    }
-
-    /// Truth table for `update_should_preview_or_apply` itself. This only
-    /// pins the helper's own `apply || dry_run` expression — it can't catch
-    /// a regression at its call site (e.g. reverting `main.rs`'s dispatch
-    /// back to `if apply`), since the helper would still compute the same
-    /// values. That end-to-end routing is what
-    /// `@id:update-dry-run-reaches-preview-path-without-apply`
-    /// (`tests/e2e-cucumber/features/update.feature`) actually proves, by
-    /// running the real binary and asserting on `apply_runtime_update`'s
-    /// output.
-    #[test]
-    fn update_should_preview_or_apply_truth_table() {
-        assert!(!update_should_preview_or_apply(false, false));
-        assert!(update_should_preview_or_apply(false, true));
-        assert!(update_should_preview_or_apply(true, false));
-        assert!(update_should_preview_or_apply(true, true));
     }
 
     #[test]
@@ -28481,106 +28154,6 @@ ID_LIKE="suse opensuse"
         );
         assert!(!prefix_root.exists());
         assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_leaves_folder_on_local_manifest_mismatch() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert!(removed.manifest_mismatch);
-        assert!(!removed.read_only);
-        assert_eq!(removed.removed_install_root, None);
-        assert!(manifest.install_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_reports_absent_folder_distinctly_from_mismatched_folder() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch-folder-gone");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        fs::remove_dir_all(&manifest.install_root)?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert!(removed.manifest_mismatch);
-        assert!(!removed.install_root_existed);
-        assert_eq!(removed.removed_install_root, None);
-        assert!(!manifest.install_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_treats_corrupt_local_manifest_as_mismatch_not_error() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-corrupt-local-manifest");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        fs::write(
-            manifest.install_root.join(".rocm-cli-runtime.json"),
-            b"not valid json",
-        )?;
-        let mut config = RocmCliConfig::default();
-
-        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
-
-        assert!(removed.manifest_mismatch);
-        assert!(!removed.read_only);
-        assert_eq!(removed.removed_install_root, None);
-        assert!(manifest.install_root.exists());
-        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn runtime_uninstall_plan_computes_without_mutating() -> Result<()> {
-        let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-7-13-0",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            20,
-        )?;
-        let config = RocmCliConfig::default();
-
-        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
-
-        assert!(plan.will_remove_install_root());
-        assert!(manifest.install_root.exists());
-        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
 
         let _ = fs::remove_dir_all(root);
         Ok(())
