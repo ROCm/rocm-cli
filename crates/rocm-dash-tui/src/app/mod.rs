@@ -4102,6 +4102,10 @@ mod tests {
     /// microseconds; this only exists so a broken registration fails the test
     /// instead of parking the `.await` forever and burning the lane's job
     /// timeout. A hanging test is worse than a failing one — it reports nothing.
+    ///
+    /// Gated because its only callers are: ungated, it is dead code on Windows
+    /// and `-D warnings` fails that lane.
+    #[cfg(unix)]
     const SIGNAL_AWAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// A current-thread runtime with the signal driver enabled, which
