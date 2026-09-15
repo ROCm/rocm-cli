@@ -13350,6 +13350,18 @@ fn run_chat_port_status_tool(
     }))
 }
 
+/// Whether `host` resolves to any address at all.
+///
+/// Split out from [`loopback_tcp_port_is_reachable`], which answers `false` both
+/// for "resolved, nothing listening" and for "did not resolve". Those mean
+/// opposite things to the uninstall gate, and only the caller that has to
+/// distinguish them pays for the second lookup.
+fn host_port_resolves(host: &str, port: u16) -> bool {
+    (host, port)
+        .to_socket_addrs()
+        .is_ok_and(|mut addresses| addresses.next().is_some())
+}
+
 fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
     let Ok(addresses) = (host, port).to_socket_addrs() else {
         return false;
@@ -15537,6 +15549,17 @@ struct ManagedServiceStopReport {
     /// an unverifiable process, or a record too corrupt to locate one. Uninstall
     /// must abort rather than remove the tooling that stops them.
     failed: Vec<FailedManagedServiceStop>,
+    /// Every place this pass decided to proceed without proving the port was
+    /// free, for the caller to put on stderr.
+    ///
+    /// These are values rather than `eprintln!`s so a test can assert on them.
+    /// While they were printed in place, the disclosure that keeps each
+    /// fail-open a tradeoff rather than a silent removal was pinned by nothing:
+    /// emptying a warning body left every test green while changing what a
+    /// destructive command tells its operator. Returning them makes the
+    /// disclosure part of this function's answer, and `stderr` the caller's
+    /// business.
+    warnings: Vec<String>,
 }
 
 /// The failure recorded when the background helper is live but cannot be proven
@@ -15846,10 +15869,34 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
         // A wildcard record yields both loopback families; whichever answers is
         // the one the identity probe below has to talk to, so keep it rather
         // than re-deriving a single host and guessing the family wrong.
-        let Some(reachable_host) = probe_hosts(&record.host)
-            .into_iter()
+        let candidates = probe_hosts(&record.host);
+        let Some(reachable_host) = candidates
+            .iter()
             .find(|candidate| loopback_tcp_port_is_reachable(candidate, record.port))
+            .cloned()
         else {
+            // Not reaching the port is the normal, silent case: nothing is
+            // listening, which is what a stopped service looks like. But
+            // `loopback_tcp_port_is_reachable` returns the same `false` when the
+            // address does not resolve at all, and those are opposite
+            // situations. A refused connect is evidence the port is free; a name
+            // that no longer resolves is evidence of nothing, and skipping on it
+            // means proceeding to delete the tooling without ever having asked
+            // whether a server is up. That is a fail-open, and unlike its two
+            // siblings below it used to pass in silence.
+            if !candidates
+                .iter()
+                .any(|candidate| host_port_resolves(candidate, record.port))
+            {
+                report.warnings.push(format!(
+                    "{} is recorded for service {}, but that name does not resolve here, so \
+                     whether anything is still serving on port {} could not be checked at all — \
+                     proceeding. A record written on another machine, or under a hostname since \
+                     removed, looks like this. If that service may still be running, stop it \
+                     before re-running uninstall.",
+                    record.host, record.service_id, record.port
+                ));
+            }
             continue;
         };
         let stopped_by_this_pass = attempted
@@ -15889,29 +15936,29 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             // arm and expect them, not this match, to be what goes red.
             let verdict = stopped_record_verdict(probe.ok(), auth_refused);
             if !verdict.blocks() {
-                // The two fail-open outcomes say so on stderr, not stdout: this
-                // is the last fail-open left on a destructive path, so it has to
-                // survive the operator piping uninstall's output somewhere.
-                // Only `ProceedUnrelated` is silent, because a listener that
-                // named its models and did not name ours is the one case that is
-                // actually evidence of a stranger.
+                // The two fail-open outcomes disclose themselves; only
+                // `ProceedUnrelated` is silent, because a listener that named
+                // its models and did not name ours is the one case that is
+                // actually evidence of a stranger. They go into the report
+                // rather than straight to stderr so the disclosure is a value a
+                // test can assert on — see the field's own comment.
                 match verdict {
-                    StoppedRecordVerdict::ProceedListingNothing => eprintln!(
-                        "warning: {}:{} still accepts connections and answered the identity \
-                         probe with an empty model list, so it cannot be told from an unrelated \
-                         service; {} is already recorded stopped — proceeding. An engine still \
-                         loading or unloading looks like this. If that is a server of yours, \
-                         stop whatever holds that port first.",
+                    StoppedRecordVerdict::ProceedListingNothing => report.warnings.push(format!(
+                        "{}:{} still accepts connections and answered the identity probe with an \
+                         empty model list, so it cannot be told from an unrelated service; {} is \
+                         already recorded stopped — proceeding. An engine still loading or \
+                         unloading looks like this. If that is a server of yours, stop whatever \
+                         holds that port first.",
                         record.host, record.port, record.service_id
-                    ),
-                    StoppedRecordVerdict::ProceedUnidentified => eprintln!(
-                        "warning: {}:{} still accepts connections but did not answer the \
-                         identity probe with a usable model list, and service {} is already \
-                         recorded stopped — proceeding. That can be a wedged engine, an \
-                         unrelated server on the port, or a stale endpoint key. If it is a \
-                         server of yours, stop whatever holds that port first.",
+                    )),
+                    StoppedRecordVerdict::ProceedUnidentified => report.warnings.push(format!(
+                        "{}:{} still accepts connections but did not answer the identity probe \
+                         with a usable model list, and service {} is already recorded stopped — \
+                         proceeding. That can be a wedged engine, an unrelated server on the \
+                         port, or a stale endpoint key. If it is a server of yours, stop whatever \
+                         holds that port first.",
                         record.host, record.port, record.service_id
-                    ),
+                    )),
                     StoppedRecordVerdict::ProceedUnrelated => {}
                     StoppedRecordVerdict::BlockServingOurModel
                     | StoppedRecordVerdict::BlockAuthRefused => unreachable!("guarded by blocks()"),
@@ -16013,8 +16060,21 @@ enum StoppedRecordVerdict {
 
 impl StoppedRecordVerdict {
     /// Whether this outcome stops the uninstall.
+    ///
+    /// Exhaustive on purpose, rather than `matches!` over the blocking pair.
+    /// The wildcard that `matches!` implies would default a newly added variant
+    /// to "proceed" — the direction that removes the tooling — and it would
+    /// compile, leaving the mistake to be caught by a test that can only
+    /// enumerate the variants that existed when it was written. Spelled out,
+    /// the compiler stops the next variant until somebody decides which side of
+    /// a destructive command it belongs on.
     const fn blocks(self) -> bool {
-        matches!(self, Self::BlockServingOurModel | Self::BlockAuthRefused)
+        match self {
+            Self::BlockServingOurModel | Self::BlockAuthRefused => true,
+            Self::ProceedUnrelated | Self::ProceedListingNothing | Self::ProceedUnidentified => {
+                false
+            }
+        }
     }
 }
 
@@ -31483,6 +31543,7 @@ ID_LIKE="suse opensuse"
                 reason: "still \"ready\" after the stop attempt".to_owned(),
                 remedy: StopFailureRemedy::StopTheService,
             }],
+            warnings: Vec::new(),
         };
         let error = uninstall_removal_gate(&report)
             .expect_err("a non-empty `failed` must abort uninstall")
@@ -31517,6 +31578,7 @@ ID_LIKE="suse opensuse"
                 reason: "still \"ready\" after the stop attempt".to_owned(),
                 remedy: StopFailureRemedy::StopTheService,
             }],
+            warnings: Vec::new(),
         };
         let error = uninstall_removal_gate(&report)
             .expect_err("a non-empty `failed` must abort uninstall")
@@ -32018,7 +32080,68 @@ ID_LIKE="suse opensuse"
             uninstall_removal_gate(&report).is_ok(),
             "the gate must let the removal proceed"
         );
+        // The disclosure, not just the decision. Proceeding here is only
+        // defensible because the operator is told the port was never proven
+        // free, so emptying that message is as much a regression as flipping
+        // the verdict — and until the warnings became values on the report,
+        // nothing could say so.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("empty model list")
+                    && warning.contains("svc-empty-listing")),
+            "proceeding past an empty listing must disclose itself: {:?}",
+            report.warnings
+        );
         drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_record_whose_host_no_longer_resolves_says_so_before_proceeding() {
+        // The third fail-open, and the one that used to pass in silence. A
+        // refused connect and an unresolvable name both come back `false` from
+        // `loopback_tcp_port_is_reachable`, but they are opposite evidence: the
+        // first says the port is free, the second says the question was never
+        // asked. Proceeding on the second is still the right call — a record
+        // written on another machine must not brick uninstall — but it has to
+        // be disclosed, and `.invalid` is reserved by RFC 2606 precisely so it
+        // never resolves anywhere.
+        let (root, paths) = test_paths("uninstall-host-unresolvable");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-foreign-host",
+            "vllm",
+            "amd/our-model",
+            "amd/our-model",
+            "no-such-host.invalid",
+            8123,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.failed.is_empty(),
+            "an unresolvable host must not abort uninstall: {report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("does not resolve here")
+                    && warning.contains("svc-foreign-host")),
+            "skipping a record whose host does not resolve must disclose itself: {:?}",
+            report.warnings
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -32061,6 +32184,15 @@ ID_LIKE="suse opensuse"
         assert!(
             uninstall_removal_gate(&report).is_ok(),
             "the gate must let the removal proceed"
+        );
+        // The one proceed-arm that is allowed to be silent, and the assertion
+        // that keeps it distinguishable from the two that are not: a listener
+        // that named its models and did not name ours is positive evidence of a
+        // stranger, so there is nothing to disclose.
+        assert!(
+            report.warnings.is_empty(),
+            "a named stranger is evidence, not a fail-open, so it warns about nothing: {:?}",
+            report.warnings
         );
         drop(endpoint);
         let _ = fs::remove_dir_all(root);
@@ -32540,6 +32672,7 @@ ID_LIKE="suse opensuse"
         let report = ManagedServiceStopReport {
             stopped: vec!["a".to_owned(), "b".to_owned()],
             failed: Vec::new(),
+            warnings: Vec::new(),
         };
         let line = uninstall_removal_gate(&report).expect("all stopped must proceed");
         assert_eq!(

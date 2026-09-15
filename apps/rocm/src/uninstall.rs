@@ -78,6 +78,13 @@ fn stop_managed_services_then_remove(
     stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
 ) -> Result<()> {
     let stop_report = stop_managed_services()?;
+    // Every fail-open the stop pass took, on stderr rather than stdout: these
+    // are the places uninstall proceeded without proving the port was free, so
+    // they have to survive the operator piping its output somewhere. Printed
+    // before the gate, so they are on screen whether or not it aborts.
+    for warning in &stop_report.warnings {
+        eprintln!("warning: {warning}");
+    }
     if let Some(line) = uninstall_removal_gate(&stop_report)? {
         println!("{line}");
     }
@@ -163,6 +170,7 @@ mod tests {
                     reason: "still \"ready\" after the stop attempt".to_owned(),
                     remedy: StopFailureRemedy::StopTheService,
                 }],
+                warnings: Vec::new(),
             })
         })
         .expect_err("an unconfirmed stop must abort uninstall");
@@ -210,6 +218,7 @@ mod tests {
                     reason: "the background helper's identity could not be verified".to_owned(),
                     remedy: StopFailureRemedy::StopTheDaemon,
                 }],
+                warnings: Vec::new(),
             })
         })
         .expect_err("an unstopped background helper must abort uninstall");
@@ -365,6 +374,7 @@ mod tests {
             Ok(ManagedServiceStopReport {
                 stopped: vec!["svc-stopped".to_owned()],
                 failed: Vec::new(),
+                warnings: Vec::new(),
             })
         })
         .expect("a confirmed stop must let uninstall proceed");
