@@ -415,6 +415,75 @@ mod tests {
             .collect()
     }
 
+    /// Every `confirmed <YYYY-MM-DD>` date in `text`, in order.
+    ///
+    /// Line structure is thrown away first: both carriers wrap the sentence, so
+    /// the word and its date routinely land on different lines (and in the YAML
+    /// each of those lines starts with a `#`). Matching per line would find
+    /// nothing and the guard would pass by never looking. `re-confirmed` is
+    /// matched too — it ends with the same word.
+    fn confirmed_dates(text: &str) -> Vec<String> {
+        let flat = text
+            .lines()
+            .map(|line| line.trim().trim_start_matches('#').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        flat.match_indices("confirmed ")
+            .filter_map(|(at, word)| {
+                let date: String = flat[at + word.len()..].chars().take(10).collect();
+                let shaped = date.len() == 10
+                    && date.chars().enumerate().all(|(i, c)| {
+                        if i == 4 || i == 7 {
+                            c == '-'
+                        } else {
+                            c.is_ascii_digit()
+                        }
+                    });
+                shaped.then_some(date)
+            })
+            .collect()
+    }
+
+    /// The two carriers of the required-check observation must name the same day.
+    ///
+    /// That observation is of a GitHub repository setting with no in-tree source
+    /// of truth, so it is a dated reading rather than something a checkout can
+    /// verify — which is exactly why it is written down twice, in the workflow
+    /// header and in the docs, and why the header tells the next person to
+    /// re-date BOTH when they re-read the setting. That instruction was a
+    /// comment, and a comment does not fail: re-dating one carrier and leaving
+    /// the other would have left two dates disagreeing about one reading, with
+    /// nothing to say which was current.
+    ///
+    /// This does not check the claim itself, which nothing in a checkout can.
+    #[test]
+    fn the_required_check_observation_is_dated_the_same_in_both_places() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        let docs = std::fs::read_to_string(repo_root().join("docs/ci-hardware-testing.md"))
+            .expect("read hardware testing docs");
+
+        let in_workflow = confirmed_dates(&workflow);
+        let in_docs = confirmed_dates(&docs);
+        assert_eq!(
+            in_workflow.len(),
+            1,
+            "e2e-selfhosted.yml's header must carry exactly one `confirmed <date>` for the \
+             required-check observation, so there is one thing to re-date: {in_workflow:?}"
+        );
+        assert_eq!(
+            in_docs.len(),
+            1,
+            "docs/ci-hardware-testing.md must carry exactly one `confirmed <date>` for the \
+             same observation: {in_docs:?}"
+        );
+        assert_eq!(
+            in_workflow[0], in_docs[0],
+            "the required-check observation is one reading of one setting, so its date must \
+             match in e2e-selfhosted.yml's header and in docs/ci-hardware-testing.md — \
+             re-date both, or neither is trustworthy"
+        );
+    }
+
     /// Every backtick-delimited span in `text`, in order.
     fn backticked_items(text: &str) -> Vec<String> {
         text.split('`')
