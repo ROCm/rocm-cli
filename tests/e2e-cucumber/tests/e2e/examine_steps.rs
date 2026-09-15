@@ -451,9 +451,11 @@ fn parsed_json(world: &E2eWorld) -> serde_json::Value {
 async fn user_inspects_both_ways(world: &mut E2eWorld) {
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
-    // Both are needed by the comparison step; the human form goes in the stderr
-    // slot rather than adding a World field for one scenario.
-    world.cli_stderr = Some(human);
+    // Both are needed by the comparison step. The human form is a second
+    // command's STDOUT, so it goes in `cli_other_output` — the field that did
+    // not exist when this step was written, which is why it used to borrow the
+    // stderr slot.
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -527,7 +529,7 @@ fn human_states(human: &str, label: &str) -> Option<String> {
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -553,7 +555,7 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
 #[then("both reports agree on whether this machine has an AMD GPU")]
 async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -576,7 +578,7 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);

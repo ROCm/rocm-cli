@@ -56,10 +56,14 @@ pub struct E2eWorld {
     pub cli_stderr: Option<String>,
     /// STDOUT of a SECOND command, for a scenario whose whole point is that two
     /// commands agree — a diagnosis against a fix preview, help examples against
-    /// the model listing. Its own slot rather than a spare one: `cli_stderr`
-    /// holds real stderr at three dozen other call sites, and borrowing it to
-    /// mean "the other stdout" reads, at every one of them, as a claim about
-    /// stderr that is not being made.
+    /// the model listing, the human `examine` report against its `--json` form.
+    ///
+    /// Put a second stdout HERE rather than in `cli_stderr`. The rule that slot
+    /// keeps is "this is what the command wrote to stderr", and a reader checks
+    /// it with `grep 'cli_stderr = '` — every hit should be storing a stderr
+    /// capture. Borrowing it for a second stdout breaks that at a distance: the
+    /// step that reads it back looks like it is making a claim about stderr.
+    /// This field exists so nothing has to.
     pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
