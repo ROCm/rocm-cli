@@ -254,9 +254,12 @@ reason = "The diagnosis proposes adding the user to the device's own group while
 # group membership and never credits access that demonstrably works, so a device
 # the user can already read and write is still diagnosed as a permission problem.
 # The scenario substitutes a world-writable device answer and asserts the
-# inspection agrees before relying on it. Where the runner's user already belongs
-# to the conventional groups the finding scores zero anyway and this XPASSes —
-# which is what the first GPU run is for. ---
+# inspection agrees before relying on it. It shims BOTH `stat` (device
+# `crw-rw-rw- root root`) and `id` (groups `users` — none of the conventional
+# ones), so the runner's own group membership cannot reach the result: the
+# outcome is the same on every bare-metal Linux GPU host. If this XPASSes, the
+# product changed; it is not a host difference, and NOT a reason to add
+# `flaky = true`. ---
 [["diagnose-credits-a-usable-device"]]
 when = {}
 bug = "EAI-8021"

@@ -37,9 +37,14 @@ const PREVIEW_FIX_ID: &str = "fix-1-arch";
 /// A recipe that would really change the machine, used to prove the CLI asks
 /// first. Of the four AUTO recipes this is the only one that reaches the
 /// confirmation gate on a host with nothing installed: `fix-2-unset-override`
-/// never calls it on Linux, `fix-4-render-group` exits early once the user is
-/// already in the groups, and `fix-6-path` exits early with "no ROCm install
-/// found". This one needs only `--device-index`, which the scenario supplies.
+/// never calls it on Linux (`run_unset_override_linux` only prints), `fix-6-path`
+/// exits 3 with "No ROCm install found; nothing to add to PATH", and
+/// `fix-4-render-group` exits 3 unless `usermod` — and `sudo`, when not root —
+/// are both on `$PATH`, which is why the command-failure scenario below has to
+/// shim them in. (`run_render_group` has no group-membership check at all; an
+/// earlier version of this comment said it exited early "once the user is
+/// already in the groups", which was never true.) This one needs only
+/// `--device-index`, which the scenario supplies.
 const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 
 /// The recipe used to prove a failed helper command is explained on stderr with
@@ -1044,11 +1049,17 @@ const DIAGNOSE_VERIFY_PREFIX: &str = "verify after fix:";
 const FIX_VERIFY_PREFIX: &str = "Verify:";
 
 /// The value after `label` on the first line that carries it.
+///
+/// A bare label with nothing after it is `None`, not `Some("")`. The callers
+/// compare two of these for equality, and two empty strings compare equal — so
+/// returning `Some("")` would let a diagnosis and a fix preview that BOTH said
+/// nothing pass as agreeing. `None` sends the caller to its own "gave no way to
+/// verify this" panic, which is what an empty label actually means.
 fn labelled(text: &str, label: &str) -> Option<String> {
     text.lines()
         .filter_map(|line| line.trim().strip_prefix(label))
         .map(|value| value.trim().to_owned())
-        .next()
+        .find(|value| !value.is_empty())
 }
 
 /// The part of a diagnosis that belongs to one cause.
@@ -1137,7 +1148,7 @@ fn compare_diagnosis_with_fix(world: &mut E2eWorld, path_override: Option<&str>)
     let (preview, preview_err, _) =
         crate::run_rocm(world, &["fix", DEVICE_PERMISSION_FIX_ID, "--dry-run"]);
     world.cli_output = Some(diagnosis);
-    world.cli_stderr = Some(format!("{preview}{preview_err}"));
+    world.cli_other_output = Some(format!("{preview}{preview_err}"));
 }
 
 #[given("a user who hit a device-permission failure")]
@@ -1164,7 +1175,10 @@ async fn user_compares_diagnosis_with_fix(world: &mut E2eWorld) {
 #[then("both give the same way to verify that the fix worked")]
 async fn assert_verification_agrees(world: &mut E2eWorld) {
     let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
-    let preview = world.cli_stderr.as_ref().expect("no fix preview output");
+    let preview = world
+        .cli_other_output
+        .as_ref()
+        .expect("no fix preview output");
     let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
         panic!(
             "the symptom did not produce the device-permission cause, so there is nothing to \
@@ -1185,7 +1199,10 @@ async fn assert_verification_agrees(world: &mut E2eWorld) {
 #[then("both give the same command for applying the remedy")]
 async fn assert_remedy_command_agrees(world: &mut E2eWorld) {
     let diagnosis = world.cli_output.as_ref().expect("no diagnosis output");
-    let preview = world.cli_stderr.as_ref().expect("no fix preview output");
+    let preview = world
+        .cli_other_output
+        .as_ref()
+        .expect("no fix preview output");
     let cause = section_for(diagnosis, DEVICE_PERMISSION_FIX_ID).unwrap_or_else(|| {
         panic!(
             "the symptom did not produce the device-permission cause, so there is nothing to \

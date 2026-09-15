@@ -15,6 +15,14 @@ name: E2E self-hosted
 # landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
 # merge_group ref, which a required check under ALLGREEN would have blocked;
 # renaming a lane is therefore safe.
+#
+# THIS HEADER IS THE ONLY PLACE THE REPO RECORDS THAT FACT. Branch protection is
+# a GitHub repository setting with no in-tree source of truth, so nothing in a
+# checkout can verify the claim — it is a dated observation, and re-confirming it
+# means reading the setting (`gh api repos/:owner/:repo/branches/main/protection`)
+# or watching what a red lane actually blocks. ci.yml and
+# tests/e2e-cucumber/README.md point here rather than asserting it again, so
+# there is one line to re-date rather than four to notice.
 
 on:
   push:

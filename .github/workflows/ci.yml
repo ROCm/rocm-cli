@@ -982,15 +982,12 @@ jobs:
         run: cargo xtask verify-commits --base "$BASE" --require-verified
 
   # Hardware (real AMD GPU) smoke tests run on dedicated self-hosted runners in a
-  # SEPARATE workflow, e2e-selfhosted.yml — see that file for the current lanes,
-  # deliberately not restated here. They live there — not here — so a job queued on an
-  # offline self-hosted runner (which GitHub cannot cancel) can never hold this
-  # workflow's concurrency group and stall its merge-required checks (EAI-7548).
-  # They are non-blocking because none of their check names are in branch
-  # protection's required-status-check list — NOT because of `continue-on-error`,
-  # which is `false` on all but one of them so a real hardware regression shows
-  # red (see that file's own header). They are also fork-safe (self-hosted
-  # runners do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
+  # SEPARATE workflow, e2e-selfhosted.yml — see that file for the current lanes
+  # and for why they are non-blocking, neither restated here. They live there —
+  # not here — so a job queued on an offline self-hosted runner (which GitHub
+  # cannot cancel) can never hold this workflow's concurrency group and stall its
+  # merge-required checks (EAI-7548). They are also fork-safe (self-hosted runners
+  # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
   #
@@ -998,8 +995,7 @@ jobs:
   # job per platform: the harness resolves every scenario to pass / xfail / skip
   # per host from its @id + @requires-* tags, a capability probe, and
   # expectations.toml (no tier flag, no tag filter). The mock job (GitHub-hosted,
-  # no GPU) gates the PR; the self-hosted GPU jobs do not, because their check
-  # names are not in branch protection's required list (see the note above).
+  # no GPU) gates the PR; the self-hosted GPU jobs do not (see the note above).
   # Each job writes a platform.json sidecar the consolidated report joins by
   # scenario id to render the (scenario × platform) expectation grid.
 

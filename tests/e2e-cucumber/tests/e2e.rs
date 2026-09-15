@@ -54,6 +54,13 @@ pub struct E2eWorld {
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
+    /// STDOUT of a SECOND command, for a scenario whose whole point is that two
+    /// commands agree — a diagnosis against a fix preview, help examples against
+    /// the model listing. Its own slot rather than a spare one: `cli_stderr`
+    /// holds real stderr at three dozen other call sites, and borrowing it to
+    /// mean "the other stdout" reads, at every one of them, as a claim about
+    /// stderr that is not being made.
+    pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
@@ -292,6 +299,7 @@ impl Default for E2eWorld {
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
+            cli_other_output: None,
             cli_rc: None,
             current_scenario: None,
             isolated_root: Some(root),

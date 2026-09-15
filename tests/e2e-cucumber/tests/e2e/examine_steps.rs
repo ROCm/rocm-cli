@@ -107,13 +107,13 @@ async fn user_reads_serve_examples(world: &mut E2eWorld) {
     let (serve, _, _) = crate::run_rocm(world, &["serve", "--help"]);
     let (listing, _, _) = crate::run_rocm(world, &["model", "--verbose"]);
     world.cli_output = Some(format!("{general}\n{serve}"));
-    world.cli_stderr = Some(listing);
+    world.cli_other_output = Some(listing);
 }
 
 #[then("every model named there is one the CLI can resolve")]
 async fn assert_example_models_resolve(world: &mut E2eWorld) {
     let help = world.cli_output.as_ref().expect("no help output");
-    let listing = world.cli_stderr.as_ref().expect("no model listing");
+    let listing = world.cli_other_output.as_ref().expect("no model listing");
     let examples = serve_example_models(help);
     assert!(
         !examples.is_empty(),

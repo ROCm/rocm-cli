@@ -1007,9 +1007,12 @@ async fn assert_no_policy_refused(world: &mut E2eWorld) {
     // a silent narrowing. If either moves, this guard quietly falls back to the
     // clap branch alone — still a real check, but no longer the one described
     // above — so treat a miss here as needing the strings re-sourced, not as
-    // evidence the command stopped refusing:
-    //   "CPU mode is not a fallback path"  apps/rocm/src/main.rs:18688
-    //   "unsupported device policy"        apps/rocm/src/main.rs:18690
+    // evidence the command stopped refusing. Both are emitted by
+    // `parse_device_policy` in `apps/rocm/src/main.rs`:
+    //   "CPU mode is not a fallback path"
+    //   "unsupported device policy"
+    // Cited by symbol rather than line: an earlier draft gave line numbers, and
+    // they had drifted by ~170 lines before this PR was through review.
     // Matched lowercased, which is why the literals below differ in case from
     // the source.
     let rejected: Vec<&String> = transcript

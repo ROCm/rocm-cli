@@ -1345,14 +1345,8 @@ flaky = true
     /// caught here instead.
     #[test]
     fn every_expectation_row_names_a_scenario_that_exists() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut scenario_ids = std::collections::BTreeSet::new();
-        let features = std::fs::read_dir(root.join("features")).expect("no features directory");
-        for entry in features {
-            let path = entry.expect("unreadable features directory entry").path();
-            if path.extension().is_none_or(|ext| ext != "feature") {
-                continue;
-            }
+        for path in feature_files() {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
             // Read tags off TAG LINES only, the way `scenarios_of` in
@@ -1390,6 +1384,146 @@ flaky = true
         );
     }
 
+    /// Every `.feature` file the suite runs.
+    ///
+    /// `features/` is flat, as `scenarios_of` in tests/feature_naming.rs also
+    /// assumes, so this does not recurse. It refuses to run rather than quietly
+    /// covering less if that ever stops being true: a subdirectory would simply
+    /// vanish from the checks below, and a check that silently stops looking at
+    /// something is worse than no check at all.
+    fn feature_files() -> Vec<std::path::PathBuf> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("features");
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("no features directory") {
+            let path = entry.expect("unreadable features directory entry").path();
+            assert!(
+                !path.is_dir(),
+                "features/ has grown a subdirectory ({}), which this scan does not descend \
+                 into — make it recursive, here and in tests/feature_naming.rs, before moving \
+                 any .feature file into one",
+                path.display()
+            );
+            if path.extension().is_some_and(|ext| ext == "feature") {
+                paths.push(path);
+            }
+        }
+        assert!(
+            !paths.is_empty(),
+            "found no .feature files in {}",
+            dir.display()
+        );
+        paths
+    }
+
+    /// What one feature file claims about expected failures.
+    struct FailureClaims {
+        /// Scenario ids introduced by a comment block claiming "Expected to
+        /// FAIL".
+        ids: Vec<String>,
+        /// 1-indexed lines whose claim reached no scenario id.
+        unbound: Vec<usize>,
+    }
+
+    /// Scan one feature file for "Expected to FAIL" claims.
+    ///
+    /// A scenario is written comment block → tag line(s) → `Scenario:`, and the
+    /// block is contiguous with the tags it introduces, so a blank line ends a
+    /// claim's reach: a file header or a note left in a previous scenario's
+    /// body describes something other than whatever comes next.
+    ///
+    /// A claim that reaches nothing is REPORTED, not dropped. Dropping it is
+    /// how a scenario leaves this check's coverage without anyone noticing —
+    /// one blank line between a comment and its tag line would be enough, and
+    /// a blank line is the same character the file already uses to separate
+    /// scenarios. Reporting it also keeps the failure honest about where the
+    /// problem is: the comment, not the scenario that happens to follow it.
+    fn claimed_failure_ids(text: &str) -> FailureClaims {
+        let (mut ids, mut unbound) = (Vec::new(), Vec::new());
+        let (mut claim_lines, mut pending_ids): (Vec<usize>, Vec<String>) =
+            (Vec::new(), Vec::new());
+        for (index, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                // Clearing `pending_ids` here means a blank line between a tag
+                // line and its `Scenario:` would drop the ids too. Deliberate,
+                // and no longer silent: the claim above them then reaches
+                // nothing and is reported as unbound.
+                unbound.append(&mut claim_lines);
+                pending_ids.clear();
+            } else if line.starts_with('#') {
+                if line.contains("Expected to FAIL") {
+                    claim_lines.push(index + 1);
+                }
+            } else if line.starts_with('@') {
+                for tag in line.split_whitespace() {
+                    if let Some(id) = tag.strip_prefix("@id:") {
+                        pending_ids.push(id.to_owned());
+                    }
+                }
+            } else if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") {
+                if !claim_lines.is_empty() {
+                    if pending_ids.is_empty() {
+                        unbound.append(&mut claim_lines);
+                    } else {
+                        ids.extend(pending_ids.iter().cloned());
+                    }
+                }
+                claim_lines.clear();
+                pending_ids.clear();
+            }
+        }
+        unbound.append(&mut claim_lines);
+        FailureClaims { ids, unbound }
+    }
+
+    #[test]
+    fn a_contiguous_comment_block_binds_to_its_scenario() {
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 @id:thing-is-broken\n\
+             \x20 Scenario: f-01 - The thing works\n\
+             \x20   Given a thing\n",
+        );
+        assert_eq!(claims.ids, ["thing-is-broken"]);
+        assert!(claims.unbound.is_empty(), "{:?}", claims.unbound);
+    }
+
+    #[test]
+    fn a_file_header_mentioning_the_phrase_condemns_no_scenario() {
+        let claims = claimed_failure_ids(
+            "# Historical note: f-01 was once Expected to FAIL.\n\
+             \n\
+             Feature: f\n\
+             \n\
+             \x20 @id:thing-works\n\
+             \x20 Scenario: f-01 - The thing works\n\
+             \x20   Given a thing\n",
+        );
+        // Not attributed to `thing-works` — that was the round-9 false positive.
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        // But not swallowed either: it is reported against its own line.
+        assert_eq!(claims.unbound, [1]);
+    }
+
+    #[test]
+    fn a_comment_a_blank_line_from_its_tag_is_reported_not_dropped() {
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \n\
+             \x20 @id:thing-is-broken\n\
+             \x20 Scenario: f-01 - The thing works\n\
+             \x20   Given a thing\n",
+        );
+        // The scenario has silently left the guard's coverage in every earlier
+        // version of this scan. It must not do so silently.
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [3]);
+    }
+
     /// The inverse orphan: a scenario whose comment still says "Expected to
     /// FAIL" after its row has been deleted.
     ///
@@ -1401,49 +1535,33 @@ flaky = true
     /// hypothetical.
     #[test]
     fn every_expected_to_fail_comment_still_has_a_row() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut claimed = Vec::new();
-        let features = std::fs::read_dir(root.join("features")).expect("no features directory");
-        for entry in features {
-            let path = entry.expect("unreadable features directory entry").path();
-            if path.extension().is_none_or(|ext| ext != "feature") {
-                continue;
-            }
+        let mut unbound = Vec::new();
+        for path in feature_files() {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-            // A scenario is written comment block → tag line(s) → `Scenario:`, so
-            // carry the claim forward from the comments and bind it to the ids on
-            // the tag lines, clearing at the `Scenario:` that ends the block.
-            //
-            // A blank line resets it. A comment block is contiguous with the tags
-            // it introduces, so anything separated by a blank line — a file
-            // header, a note in a previous scenario's body — belongs to something
-            // else. Without this, a header merely MENTIONING the phrase condemns
-            // whichever scenario happens to come first, and the failure names an
-            // innocent id: loud, but pointing at the wrong place.
-            let (mut expects_failure, mut pending_ids) = (false, Vec::new());
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    expects_failure = false;
-                    pending_ids.clear();
-                } else if line.starts_with('#') {
-                    expects_failure |= line.contains("Expected to FAIL");
-                } else if line.starts_with('@') {
-                    for tag in line.split_whitespace() {
-                        if let Some(id) = tag.strip_prefix("@id:") {
-                            pending_ids.push(id.to_owned());
-                        }
-                    }
-                } else if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") {
-                    if expects_failure {
-                        claimed.append(&mut pending_ids.clone());
-                    }
-                    expects_failure = false;
-                    pending_ids.clear();
-                }
-            }
+            let scan = claimed_failure_ids(&text);
+            claimed.extend(scan.ids);
+            unbound.extend(
+                scan.unbound
+                    .into_iter()
+                    .map(|number| format!("{}:{number}", path.display())),
+            );
         }
+        // Before asking whether the claims still have rows, insist that every
+        // claim reached a scenario at all. A claim that reaches none is not
+        // harmless: it means that scenario is no longer covered by this check,
+        // and the whole point of the check is that nothing drops out of it
+        // quietly. Naming the file and line sends the reader to the comment
+        // itself rather than to whichever scenario happened to follow it.
+        assert!(
+            unbound.is_empty(),
+            "these lines say 'Expected to FAIL' but bind to no scenario id, so the scenario they \
+             describe is not covered by this check: {unbound:?}\n\
+             A claim reaches only the tag line directly beneath it — no blank line in between. \
+             Move the comment against its tag line, or reword it if it is not a claim about a \
+             specific scenario."
+        );
         assert!(
             !claimed.is_empty(),
             "found no scenario claiming 'Expected to FAIL', so this check would pass vacuously"
