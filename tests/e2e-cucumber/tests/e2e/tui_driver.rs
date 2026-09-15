@@ -271,6 +271,42 @@ impl TuiSession {
         self.screen_snapshot().0
     }
 
+    /// Whether the top-left cell carries the dimmed-backdrop wash a popup
+    /// overlay paints behind itself (`grey_overlay`'s fixed RGB(0x1c, 0x1e,
+    /// 0x22)). Popups drawn via `centered_rect` always leave a pad outside
+    /// the frame, and the top-left corner falls in that pad, so this is a
+    /// reliable proxy for "the screen behind the popup was dimmed" without
+    /// importing the product crate's own color constant. Unlike
+    /// `screen_text`, this deliberately inspects style, not just text content.
+    ///
+    /// This check is only as good as its two hardcoded assumptions: the
+    /// `(0, 0)` corner and the literal wash RGB. If a future popup's geometry
+    /// ever grows to cover the corner, or `grey_overlay`'s color constant
+    /// changes, this silently stops discriminating (always false) instead of
+    /// failing loudly — keep both in sync with `grey_overlay` and
+    /// `centered_rect` if either changes.
+    ///
+    /// HARD INVARIANT this relies on: `WASH` must never equal any theme's
+    /// plain `bg` (see the `bg:` fields in
+    /// `crates/rocm-dash-tui/src/ui/theme.rs`) — if it ever did, an
+    /// undimmed screen would misreport as dimmed and this assertion would
+    /// pass for the wrong reason. This is intentionally *not* enforced here
+    /// with a second hardcoded RGB (that would just trade one magic-number
+    /// coupling for two); if you touch either `WASH` or a theme's `bg`,
+    /// diff them against each other by hand.
+    pub fn corner_backdrop_is_dimmed(&self) -> bool {
+        const WASH: vt100::Color = vt100::Color::Rgb(0x1c, 0x1e, 0x22);
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cell = p
+            .screen()
+            .cell(0, 0)
+            .expect("screen (0, 0) must exist once a screen has been rendered");
+        cell.bgcolor() == WASH
+    }
+
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
         // Recover a poisoned lock rather than defaulting to a blank screen: the
         // parser's data is still valid even if some other thread panicked while
@@ -476,16 +512,106 @@ impl TuiSession {
         }
     }
 
+    /// Wait until `marker` no longer appears on screen — the inverse of
+    /// [`wait_for_screen`](Self::wait_for_screen). Use this after a keystroke
+    /// that should dismiss an overlay whose absence is the only signal of
+    /// success (there is no positive marker for "menu didn't open").
+    pub async fn wait_until_gone(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.screen_text().contains(marker) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).
+    ///
+    /// A bare send has no read-back, so if the quit gesture is written before
+    /// the app has finished acting on whatever came just before it (e.g. right
+    /// after an unsynchronized `send` like the Escape key), it can be consumed
+    /// by that transient state and never reach the quit handler — the process
+    /// then never exits and this hangs until `timeout`. Re-sending the gesture
+    /// on a short cadence closes that gap the same way [`send_until`] does for
+    /// screen markers: if the first attempt landed (the common case), the
+    /// process has already exited by the first check and nothing is resent.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
-        if self.is_chat {
-            self.send("/quit\r")?;
-        } else {
-            self.send("q")?;
+        let gesture = if self.is_chat { "/quit\r" } else { "q" };
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send(gesture)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt = KEY_RESEND_INTERVAL.min(remaining);
+            match self.wait_for_exit_code_within(attempt).await {
+                Some(code) => {
+                    return if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "TUI exited unsuccessfully (code {code}).\n{}",
+                            self.framed_screen()
+                        ))
+                    };
+                }
+                None => {
+                    if let Some(panic_message) = self.take_reader_panic() {
+                        return Err(format!(
+                            "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
+                            self.framed_screen()
+                        ));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+                    self.framed_screen()
+                ));
+            }
         }
-        self.wait_for_exit(timeout).await
+    }
+
+    /// Poll for up to `budget` for the child to exit, returning its exit code
+    /// if it did within that window or `None` (not a timeout error) if it
+    /// didn't — used by [`quit_and_wait`](Self::quit_and_wait) to bound each
+    /// resend attempt without treating "still running" as a hard failure.
+    async fn wait_for_exit_code_within(&mut self, budget: Duration) -> Option<i32> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                self.finished = true;
+                self.record_once(code);
+                return Some(code);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Poll until the child exits, asserting a successful (zero) exit code.

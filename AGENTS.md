@@ -112,6 +112,8 @@ Before each stateful decision or public status update:
 Do not rely on stale memory, partial CI views, or prior snapshots.
 Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan.
 
+A dismissed `CHANGES_REQUESTED` review (`review_dismissed` event) is not an approval — the reviewer withdrew their objection, but `reviewDecision` can still read `REVIEW_REQUIRED` afterward. Re-check `reviewDecision` directly rather than treating a dismissal as clearing the merge gate.
+
 After rebase/cherry-pick/merge, grep for conflict markers:
 
 ```bash
@@ -252,6 +254,7 @@ Watch checks to completion and drive to all-green.
 - fix real regressions from your change
 - handle infrastructure flakes by rerun or maintainer escalation with evidence
 - ensure flakes are not hiding real code failures in other checks
+- `gh run rerun --job <id>` is rejected until the *entire* parent run reaches `completed`, even if the target job already failed; if sibling jobs are still `queued`/`in_progress`, wait for the whole run to finish (or use `gh run rerun --failed <run-id>` once it has) instead of retrying the per-job command
 
 A red check means "not ready" until resolved.
 

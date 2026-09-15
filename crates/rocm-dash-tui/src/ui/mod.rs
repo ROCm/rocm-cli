@@ -42,7 +42,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
+use crate::app::{
+    ActiveTab, AppState, ChatConsent, ConnState, FooterChip, KeyAction, Modal, PaneFocus,
+};
 use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -123,12 +125,16 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Modal overlay (rendered last so it sits on top of the body).
     match state.modal {
         Modal::None => {}
-        Modal::Help => modal::draw_help(f, body, state.active_tab, &theme),
+        Modal::Help => {
+            state.help_max_scroll =
+                modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll);
+        }
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
         Modal::Detail => {
             if state.active_tab == ActiveTab::Observe {
-                tabs::instances::draw_detail(f, body, state, &theme);
+                let max_scroll = tabs::instances::draw_detail(f, body, state, &theme);
+                state.instance_detail_max_scroll = max_scroll;
             }
         }
         Modal::ThemePicker => {
@@ -137,7 +143,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
-        Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::GlobalHelp => {
+            state.help_max_scroll = modal::draw_global_help(f, body, &theme, state.help_scroll);
+        }
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -168,10 +176,17 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// A single hint line sits below it — no header, tab shell, dock, or footer
 /// legend. Used by the bare-`rocm` launcher's in-place flows (Set up / Serve /
 /// Diagnose), where the full dashboard chrome would be misleading. The overlay
-/// is drawn through the same [`draw_active_manager`] path the dashboard uses (so
-/// the approval / job-console layering is identical). Falls back to a centered
-/// "closing…" note when no overlay is open — defensive; the event loop breaks at
-/// that point and hands control back to the launcher.
+/// (and any job console nested inside it) is drawn through the same
+/// [`draw_active_manager`] path [`draw`] uses, and the same dimmed-backdrop
+/// wash is applied behind it. It is NOT identical to [`draw`] in two ways:
+/// there is no approval layer here (a focused-host session has no chat, so no
+/// tool call can ever be pending), and the "Esc back to menu" hint below is
+/// rendered with a foreground-only `Style` (no `bg`) — `ratatui::Style::patch`
+/// leaves an unset field untouched rather than clearing it, so the hint
+/// inherits the wash's background from the cells underneath it rather than
+/// reverting to plain theme bg, exactly like `draw`'s footer. Falls back to a
+/// centered "closing…" note when no overlay is open — defensive; the event
+/// loop breaks at that point and hands control back to the launcher.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
     state.scrollbars.borrow_mut().clear();
@@ -187,6 +202,11 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let footer_area = outer[1];
 
     if state.has_open_overlay() {
+        // Dim the periphery behind the modal, matching `draw()`'s treatment so
+        // the overlay reads as the foreground here too (previously this path
+        // skipped the wash entirely, leaving the area outside the manager card
+        // at plain theme background instead of dimmed).
+        modal::grey_overlay(f);
         let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
         draw_active_manager(f, manager_rect, state, &theme);
     } else {
@@ -419,23 +439,80 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    // On a domain tab with a manager open inline, the pane keys route to the
-    // manager — advertise the back-out instead of the (now wrong) select/open.
-    if is_action_tab && state.has_open_overlay() {
+    // Exactly one Esc chip is shown at all times, and it must match what Esc
+    // actually does — the real routing priority (highest first) is: a pending
+    // chat approval owns every key; then an open manager overlay backs itself
+    // out; then a `Modal::*` overlay closes; then a focused/gating Chat tab
+    // absorbs Esc; only once none of those apply does Esc fall through to the
+    // uniform "menu" fallback (item #35). Mirror that order here so the chip
+    // never advertises `menu` while a click on it would actually do something
+    // else.
+    if state.approval.is_some() {
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
-    } else if matches!(
-        state.active_tab,
-        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-    ) {
-        segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
-        segs.push(Seg::Sep(" select  "));
-        segs.push(Seg::Key("Enter", Some(enter_action)));
-        segs.push(Seg::Sep(if is_action_tab {
-            " open  "
+    } else if state.has_open_overlay()
+        && state
+            .active_job_id()
+            .is_some_and(|id| crate::ui::job_console::console_esc_closes(state.jobs.job(id)))
+    {
+        // A manager's job console is showing a still-running job — Esc fully
+        // closes the overlay there (the job keeps running in the background),
+        // matching the console's own footer hint ("Esc close (keeps
+        // running)"), not the generic sub-popup "cancel" below. Once the job
+        // finishes, `on_console_key` only dismisses the console back to the
+        // screen body (the overlay stays open), so that case falls through to
+        // the "cancel" arm below, which already describes it correctly. Shares
+        // `console_esc_closes` with `on_console_key` so the two can't drift.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" close  "));
+    } else if state.has_open_overlay() {
+        // A manager is open but not at its root layer (sub-popup, picker, or
+        // approval) — Esc is handled by that layer's own event-loop arm, not
+        // by `should_pane_back_out`/`OpenMenu`. `None` keeps the chip
+        // non-clickable so it can't dispatch the wrong action.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.modal != Modal::None {
+        segs.push(Seg::Key("Esc", Some(KeyAction::CloseModal)));
+        segs.push(Seg::Sep(" close  "));
+    } else if state.active_tab == ActiveTab::Chat
+        && state.chat_detect_offer.is_some()
+        && state.chat_consent != ChatConsent::Accepted
+    {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatDetectDismiss)));
+        segs.push(Seg::Sep(" dismiss  "));
+    } else if state.active_tab == ActiveTab::Chat && state.chat_focused {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatBlur)));
+        segs.push(Seg::Sep(" unfocus  "));
+    } else {
+        // Dispatch `PaneEscape`, not a hardcoded `OpenMenu` — `apply_action`
+        // resolves `PaneEscape` against `pane_focus` exactly as a real
+        // keypress does (Details → Actions on Rocm/Serving, else the menu),
+        // so the chip can't promise "menu" when the key would actually just
+        // step the pane back out.
+        let steps_out_of_detail = is_action_tab && state.pane_focus == PaneFocus::Detail;
+        segs.push(Seg::Key("Esc", Some(KeyAction::PaneEscape)));
+        segs.push(Seg::Sep(if steps_out_of_detail {
+            " back  "
         } else {
-            " detail  "
+            " menu  "
         }));
+        if matches!(
+            state.active_tab,
+            ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+        ) {
+            segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
+            segs.push(Seg::Sep(" select  "));
+            segs.push(Seg::Key("Enter", Some(enter_action)));
+            segs.push(Seg::Sep(if is_action_tab {
+                " open  "
+            } else {
+                " detail  "
+            }));
+        }
     }
     // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
     // ROCm/Serving the Actions list is the single path, so no letter chips.
@@ -467,8 +544,20 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     segs.push(Seg::Sep(" theme  "));
     segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
     segs.push(Seg::Sep(" help  "));
-    segs.push(Seg::Key("q", Some(KeyAction::Quit)));
-    segs.push(Seg::Sep(" quit"));
+    if state.has_open_overlay() {
+        // While a manager overlay is open it owns every key (the event loop
+        // routes each keypress to its `on_key`, never falling through to
+        // `apply_action`), so a real `q` press can't reach `KeyAction::Quit`
+        // there — it cancels the approval, closes the job console, or backs
+        // the manager out instead, but it never tears down the app or kills
+        // a job the way `Quit` does. `None` keeps the chip non-clickable so a
+        // click can't do something the key never would.
+        segs.push(Seg::Key("q", None));
+        segs.push(Seg::Sep(" close"));
+    } else {
+        segs.push(Seg::Key("q", Some(KeyAction::Quit)));
+        segs.push(Seg::Sep(" quit"));
+    }
 
     // Lay out left-to-right, rendering each segment in its own cell span so the
     // recorded chip geometry matches the painted columns exactly.
@@ -551,5 +640,351 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+
+    #[test]
+    fn footer_shows_esc_menu_chip_when_no_overlay_open() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let state = AppState::new("t".into(), "default-dark".into());
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        // The chip dispatches `PaneEscape`, matching what a real Esc keypress
+        // resolves to via `handle_key`'s catch-all — not a hardcoded
+        // `OpenMenu` that would diverge from `apply_action`'s `pane_focus`
+        // handling on Rocm/Serving.
+        let _ = chips
+            .iter()
+            .find(|c| c.action == KeyAction::PaneEscape)
+            .expect("a fallback Esc chip stepping the pane back out must always be present");
+    }
+
+    #[test]
+    fn footer_esc_chip_dispatches_pane_escape_when_detail_focused() {
+        // Regression: on Rocm/Serving with `pane_focus == Detail`, the real
+        // Esc key steps Details → Actions first (`PaneEscape` in
+        // `apply_action`); it does not open the menu. The chip must dispatch
+        // the same `PaneEscape` action (not `OpenMenu`) so a click matches
+        // the keypress, and its label must say so.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Rocm;
+        state.pane_focus = PaneFocus::Detail;
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        assert!(
+            chips.iter().any(|c| c.action == KeyAction::PaneEscape),
+            "Esc chip must dispatch PaneEscape, matching the real key, while Detail is focused"
+        );
+        assert!(
+            !chips.iter().any(|c| c.action == KeyAction::OpenMenu),
+            "no chip may claim OpenMenu while Esc would actually step Detail back to Actions"
+        );
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("back"),
+            "chip label should say the Esc key steps back out of Detail: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_is_not_clickable_menu_when_overlay_has_a_sub_popup_open() {
+        // Regression: with a manager open but not at its root layer (here, a
+        // folder browser sub-popup), `has_open_overlay()` is true but
+        // `active_overlay_at_root()` is false. The chip must not fall through
+        // to the generic `OpenMenu` arm — that key is actually consumed by the
+        // manager's own event-loop arm, which cancels the sub-layer, not the
+        // menu. Any chip shown here must be non-clickable (`action == None`)
+        // and labeled "cancel" (this sub-popup has no "close means job keeps
+        // running" nuance, unlike a job console — see the "close" test below).
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            browser: Some(crate::ui::folder_browser::FolderBrowser::new(
+                "t",
+                std::env::temp_dir(),
+            )),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenMenu,
+                "no chip may dispatch OpenMenu while a sub-popup owns Esc"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  cancel"),
+            "sub-popup Esc chip should say cancel: {row:?}"
+        );
+        // Note: "close" legitimately appears elsewhere in this row (the `q`
+        // chip always says "close" while any overlay is open, root or not —
+        // see `footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open`),
+        // so the Esc chip's own label must be checked specifically rather
+        // than scanning the whole row for the substring.
+        assert!(
+            !row.contains("Esc  close"),
+            "sub-popup Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_close_when_job_console_is_open() {
+        // A manager's job console is showing a still-running job — Esc fully
+        // closes the overlay there (matching the console's own "Esc close
+        // (keeps running)" footer hint), so the dashboard footer chip must say
+        // "close", not the generic sub-popup "cancel".
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("close"),
+            "job console Esc chip should say close: {row:?}"
+        );
+        assert!(
+            !row.contains("cancel"),
+            "job console Esc chip should not say cancel: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_cancel_when_job_console_shows_a_finished_job() {
+        // Once the job console's job has finished, Esc only dismisses the
+        // console back to the screen body (the overlay itself stays open) —
+        // `on_console_key` never returns `Closed` for a terminal job. The
+        // footer chip must not claim "close" here; it falls through to the
+        // generic sub-popup "cancel" label, which already describes this
+        // case correctly.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.jobs.apply(StateEvent::JobDone {
+            id: "job".into(),
+            code: 0,
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  cancel"),
+            "finished-job console Esc chip should say cancel: {row:?}"
+        );
+        // Note: "close" legitimately appears elsewhere in this row (the `q`
+        // chip always says "close" while any overlay is open — see
+        // `footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open`),
+        // so the Esc chip's own label must be checked specifically rather
+        // than scanning the whole row for the substring.
+        assert!(
+            !row.contains("Esc  close"),
+            "finished-job console Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open() {
+        // Regression: while any manager overlay is open it owns every key
+        // (the event loop routes each keypress to the manager's own `on_key`,
+        // never falling through to `apply_action`), so a real `q` press can
+        // never reach `KeyAction::Quit` there — it only cancels/closes the
+        // overlay. A click on the footer chip must not diverge from that and
+        // tear down the app (killing a still-running job via `kill_on_drop`)
+        // when the key itself never would.
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::Quit,
+                "no chip may dispatch Quit while a manager overlay owns `q`"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("close"),
+            "q chip should say close while an overlay is open: {row:?}"
+        );
+        assert!(
+            !row.contains("quit"),
+            "q chip should not say quit while an overlay is open: {row:?}"
+        );
+    }
+
+    /// The wash `grey_overlay` paints behind an open overlay (see
+    /// `modal::grey_overlay`'s own `grey_overlay_dims_every_cell` test for the
+    /// exact color); these tests only check that `draw`/`draw_focused` actually
+    /// invoke it at their three call sites, not the wash's own correctness.
+    const OVERLAY_WASH: ratatui::style::Color = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+
+    #[test]
+    fn draw_dims_periphery_with_grey_overlay_behind_manager_overlay() {
+        // Covers `draw`'s manager-overlay `grey_overlay(f)` call (the
+        // `has_open_overlay()` branch, not the approval one).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg while a manager overlay is open"
+        );
+    }
+
+    #[test]
+    fn draw_dims_periphery_with_grey_overlay_behind_approval_modal() {
+        // Covers `draw`'s approval-modal `grey_overlay(f)` call, distinct from
+        // the manager-overlay one above (`state.approval` is `Some` with no
+        // manager open).
+        use crate::app::PendingApproval;
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.approval = Some(PendingApproval {
+            req: ApprovalRequest::new("run it", vec!["echo hi".into()]),
+            choice: ApprovalChoice::default(),
+            name: "tool".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg while the approval modal is open"
+        );
+    }
+
+    #[test]
+    fn draw_focused_dims_periphery_with_grey_overlay_behind_manager_overlay() {
+        // Covers `draw_focused`'s own `grey_overlay(f)` call — a separate
+        // renderer from `draw`, previously skipping the wash entirely for the
+        // bare-launcher focused-host path.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_focused(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg in the focused-host renderer too"
+        );
     }
 }
