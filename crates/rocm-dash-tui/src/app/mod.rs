@@ -5531,6 +5531,17 @@ mod tests {
             out.contains("Esc"),
             "focused hint carries an Esc affordance"
         );
+        // Periphery must carry the same grey_overlay wash `draw()` uses behind
+        // every dashboard modal — text-only assertions above would still pass
+        // if the `grey_overlay` call in `draw_focused` were dropped, since the
+        // corner is plain theme bg either way in terms of glyphs (it's blank).
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "corner cell must carry grey_overlay's wash bg, not plain theme bg"
+        );
     }
 
     #[test]

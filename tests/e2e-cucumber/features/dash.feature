@@ -166,7 +166,8 @@ Feature: Interactive dashboard
     When the user presses Escape
     Then the dashboard menu is displayed
     When the user presses Escape
-    And the user quits the dashboard
+    Then the dashboard menu is closed
+    When the user quits the dashboard
     Then the dashboard exits successfully
 
   @id:dash-theme-picker-dims-backdrop @requires-os:linux

@@ -769,6 +769,20 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
 
+#[then("the dashboard menu is closed")]
+async fn dashboard_menu_is_closed(world: &mut E2eWorld) {
+    // A bare Escape send is not guaranteed to have been acted on yet by the
+    // time the next step runs — confirm `Modal::Menu` actually closed before
+    // quitting, the same way `services_manager_closed` does. Without this,
+    // an unlanded close leaves the menu open and swallows the subsequent
+    // quit keystroke (`Modal::Menu` has no `q` arm), hanging until the
+    // quit step's timeout.
+    session(world)
+        .wait_until_gone("Options", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard menu is still open after Escape: {e}"));
+}
+
 #[then("Serving actions are displayed")]
 async fn serving_actions_displayed(world: &mut E2eWorld) {
     session(world)
