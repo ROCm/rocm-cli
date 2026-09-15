@@ -16051,10 +16051,24 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
             .retain(|stopped| stopped != &record.service_id);
         report.failed.push(FailedManagedServiceStop {
             service_id: record.service_id.clone(),
-            reason: format!(
-                "{}:{} still accepts connections after the stop",
-                record.host, record.port
-            ),
+            // Two different situations reach here and they need different
+            // sentences. Only one of them involved a stop: the other is a
+            // record that was already marked stopped before this run, which
+            // this pass never attempted to stop, and telling its operator the
+            // endpoint survived "the stop" describes something that did not
+            // happen — on the one output they have to reason from.
+            reason: if stopped_by_this_pass {
+                format!(
+                    "{}:{} still accepts connections after the stop",
+                    record.host, record.port
+                )
+            } else {
+                format!(
+                    "{}:{} is recorded stopped, but something there is still serving this \
+                     record's own model",
+                    record.host, record.port
+                )
+            },
             // Not `StopTheService`: the recorded processes are gone, so
             // `rocm services stop` has nothing left to kill and every retry
             // would abort identically.
@@ -31628,23 +31642,19 @@ ID_LIKE="suse opensuse"
         // place in the order — but the compiler cannot check that the text is
         // the *right* text, or that the three id-carrying classes still name
         // their ids. That is what this asserts, across all five at once.
+        // Listed in REVERSE `advice_rank` order, and that is load-bearing
+        // rather than arbitrary. Listing them in rank order makes insertion
+        // order and rank order coincide, so the ordering assertion below holds
+        // whether or not the code sorts at all — deleting the sort left the
+        // whole suite green. Reversed, the assertion can only pass because
+        // `advice_rank` put them back.
         let report = ManagedServiceStopReport {
             stopped: Vec::new(),
             failed: vec![
                 FailedManagedServiceStop {
-                    service_id: "svc-wedged".to_owned(),
-                    reason: "still ready".to_owned(),
-                    remedy: StopFailureRemedy::StopTheService,
-                },
-                FailedManagedServiceStop {
-                    service_id: "svc-orphaned".to_owned(),
-                    reason: "endpoint still answers".to_owned(),
-                    remedy: StopFailureRemedy::StopWhatHoldsThePort,
-                },
-                FailedManagedServiceStop {
-                    service_id: "rocmd (pid 4321)".to_owned(),
-                    reason: "identity unverified".to_owned(),
-                    remedy: StopFailureRemedy::StopTheDaemon,
+                    service_id: "svc-corrupt.json".to_owned(),
+                    reason: "does not parse".to_owned(),
+                    remedy: StopFailureRemedy::RepairTheRecord,
                 },
                 FailedManagedServiceStop {
                     service_id: "runtime.json".to_owned(),
@@ -31652,9 +31662,19 @@ ID_LIKE="suse opensuse"
                     remedy: StopFailureRemedy::RepairTheDaemonState,
                 },
                 FailedManagedServiceStop {
-                    service_id: "svc-corrupt.json".to_owned(),
-                    reason: "does not parse".to_owned(),
-                    remedy: StopFailureRemedy::RepairTheRecord,
+                    service_id: "rocmd (pid 4321)".to_owned(),
+                    reason: "identity unverified".to_owned(),
+                    remedy: StopFailureRemedy::StopTheDaemon,
+                },
+                FailedManagedServiceStop {
+                    service_id: "svc-orphaned".to_owned(),
+                    reason: "endpoint still answers".to_owned(),
+                    remedy: StopFailureRemedy::StopWhatHoldsThePort,
+                },
+                FailedManagedServiceStop {
+                    service_id: "svc-wedged".to_owned(),
+                    reason: "still ready".to_owned(),
+                    remedy: StopFailureRemedy::StopTheService,
                 },
             ],
             warnings: Vec::new(),

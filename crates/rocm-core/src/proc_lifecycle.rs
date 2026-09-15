@@ -12,6 +12,18 @@
 //! truthfully: a stop is only "graceful" once the recorded process is observed to
 //! have actually exited within a bounded grace period, escalating to `SIGKILL`
 //! only when the caller opts into a forced stop.
+//!
+//! **The recycling defence is Linux-only in practice.** [`process_start_ticks`]
+//! reads the start-time from `/proc` and is a compile-time `None` everywhere
+//! else, so on Windows and macOS every record looks like one carrying no
+//! recorded identity, and [`identity_state`] degrades to best-effort
+//! [`IdentityState::Matches`] — the paragraph above describes what this module
+//! enforces *where the platform can answer*. The degradation is deliberate: a
+//! host that cannot tell two processes apart must not therefore refuse to stop
+//! anything, since that would make every service unstoppable rather than making
+//! any of them safer. What holds on those hosts is the rest of the caller's
+//! gate — the port reality-check, the endpoint identity probe, and aborting
+//! with the recovery tooling intact on any unconfirmed stop.
 
 use std::time::{Duration, Instant};
 
@@ -489,11 +501,14 @@ mod tests {
         // the reading — not the record — that decides. A recycled PID reads
         // differently and must come back `Recycled`.
         //
-        // The PID is made up on purpose. Reaching the comparison with a PID that
-        // is provably not running is the assertion that this path consults the
-        // liveness it was handed and nothing else — while the comparison went
-        // back through `identity_state_with_observed`, the same call returned
-        // `Gone` from that function's own second liveness check.
+        // The PID is arbitrary, and nothing here establishes whether it is
+        // running — it does not need to. Both probes are stubbed, so this path
+        // never consults the real process table at all, and that is the point:
+        // reaching the comparison at all proves the verdict came from the
+        // liveness this function was handed rather than from a second check of
+        // its own. While the comparison went back through
+        // `identity_state_with_observed`, this same call returned `Gone` from
+        // that function's own liveness check, whatever the stub said.
         let id = ProcessIdentity {
             pid: 4321,
             start_ticks: Some(99),
