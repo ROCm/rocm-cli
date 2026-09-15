@@ -2248,9 +2248,10 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
     // The line is subprocess output, so it is echoed only after the terminal
     // control bytes vLLM's colourised logger emits are removed.
-    let symptom_line =
-        strip_terminal_control_sequences(symptom.strip_prefix("vllm: ").unwrap_or(&symptom));
-    let symptom = if quotable_in_single_quotes(&symptom) {
+    let symptom_line = rocm_core::strip_terminal_control_sequences(
+        symptom.strip_prefix("vllm: ").unwrap_or(&symptom),
+    );
+    let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
         symptom
     } else {
         rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
@@ -2260,57 +2261,6 @@ fn oom_utilization_hint(log_tail: &str) -> String {
          For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
         rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
     )
-}
-
-/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
-///
-/// The value is untrusted subprocess output (the vLLM startup log tail) and the
-/// message it lands in invites the user to paste the command into a shell, so a
-/// bare `'` would close the quote and let text nobody vetted become shell
-/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
-/// `model 'foo'`), and a line only has to mention running out of memory to be
-/// selected, so this is an ordinary case rather than an exotic one.
-///
-/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
-/// the exact bytes but yields a command a reader cannot check by eye, and a
-/// wrong escape is *runnable* and misleading rather than obviously broken;
-/// control bytes would still reach the terminal. The canonical fallback is the
-/// branch that already exists for "this line cannot be used", and it is
-/// guaranteed to report a cause. The user's own line stays visible in the
-/// human-readable sentence above the command (and in the log tail printed with
-/// it), so nothing is lost but the copy-paste convenience.
-fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'') && !symptom.chars().any(char::is_control)
-}
-
-/// Removes ANSI escape sequences and any remaining control characters, so a
-/// colourised or bell-bearing log line cannot repaint the user's terminal from
-/// inside rocm-cli's own error message.
-fn strip_terminal_control_sequences(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                // CSI (what a colourised logger emits): skip the parameter and
-                // intermediate bytes up to and including the final byte.
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&next) {
-                        break;
-                    }
-                }
-            } else {
-                // Any other escape: drop the byte it introduces too.
-                chars.next();
-            }
-            continue;
-        }
-        if !c.is_control() {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
@@ -2928,7 +2878,7 @@ mod tests {
         // leaves `31m`/`0m` behind, which contains neither `[31m` nor `[0m` and
         // carries no control byte, so every absence check still passes.
         assert_eq!(
-            strip_terminal_control_sequences(log_tail),
+            rocm_core::strip_terminal_control_sequences(log_tail),
             "RuntimeError: HIP out of memory",
             "the ANSI sequence must be removed whole, not just its escape byte"
         );

@@ -7657,6 +7657,14 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// cause. Shared by the vLLM engine's post-failure hint and the `rocm` CLI serve
 /// summary so both surfaces route to `diagnose` identically instead of
 /// hand-rolling the line selection twice.
+///
+/// The return value is *log text*, not a shell-safe token: some callers only
+/// display it. A caller that renders it inside a quoted command must gate it on
+/// [`quotable_in_single_quotes`] first and fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`] otherwise. Guaranteeing quotability here
+/// instead would impose the command-builder's constraint on the display-only
+/// callers, silently withholding the user's real error from text that is never
+/// pasted anywhere.
 pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> String {
     log_tail
         .lines()
@@ -7667,6 +7675,68 @@ pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> String {
             || VLLM_OOM_CANONICAL_SYMPTOM.to_owned(),
             |line| format!("vllm: {line}"),
         )
+}
+
+/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
+///
+/// The value is untrusted subprocess output (the vLLM startup log tail) and the
+/// messages it lands in invite the user to paste the command into a shell, so a
+/// bare `'` would close the quote and let text nobody vetted become shell
+/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
+/// `model 'foo'`), and a line only has to look like an allocation failure to be
+/// selected, so this is an ordinary case rather than an exotic one.
+///
+/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
+/// the exact bytes but yields a command a reader cannot check by eye, and a
+/// wrong escape is *runnable* and misleading rather than obviously broken;
+/// control bytes would still reach the terminal. The canonical fallback is the
+/// branch that already exists for "this line cannot be used", and it is
+/// guaranteed to report a cause. The user's own line stays visible in the
+/// human-readable sentence beside the command (and in the log tail printed with
+/// it), so nothing is lost but the copy-paste convenience.
+///
+/// Lives here rather than in one engine because two surfaces build that command
+/// from the same untrusted text — the vLLM engine's startup-failure hint and the
+/// `rocm serve` summary's OOM note — and a guard that protects only one of them
+/// is the bug it was written to prevent.
+#[must_use]
+pub fn quotable_in_single_quotes(symptom: &str) -> bool {
+    !symptom.contains('\'') && !symptom.chars().any(char::is_control)
+}
+
+/// Removes ANSI escape sequences and any remaining control characters, so a
+/// colourised or bell-bearing log line cannot repaint the user's terminal from
+/// inside rocm-cli's own error message.
+///
+/// This is for text rocm-cli *echoes*; text rocm-cli renders into a command the
+/// user is told to run is gated with [`quotable_in_single_quotes`] instead, so a
+/// control-bearing line is rejected rather than rewritten into a lookalike.
+#[must_use]
+pub fn strip_terminal_control_sequences(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                // CSI (what a colourised logger emits): skip the parameter and
+                // intermediate bytes up to and including the final byte.
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            } else {
+                // Any other escape: drop the byte it introduces too.
+                chars.next();
+            }
+            continue;
+        }
+        if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
@@ -12335,6 +12405,51 @@ last_installed_runtime_id = "therock-release"
         ));
         assert!(!vllm_log_shows_oom("OSError: model weights not found"));
         assert!(!vllm_log_shows_oom(""));
+    }
+
+    #[test]
+    fn quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms() {
+        // The ordinary case the guard exists for: Python error text with an
+        // apostrophe, which would close the shell quote in the printed command.
+        assert!(!quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: GPU 0 can't allocate the model's weights"
+        ));
+        assert!(!quotable_in_single_quotes(
+            "vllm: failed to load model 'foo/bar'"
+        ));
+        // Terminal control bytes from vLLM's colourised logger.
+        assert!(!quotable_in_single_quotes(
+            "vllm: \u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m"
+        ));
+        assert!(!quotable_in_single_quotes("vllm: out of memory\u{7}"));
+        assert!(!quotable_in_single_quotes("vllm: out of\nmemory"));
+        // The canonical fallback must always be usable, or the rejection branch
+        // would have nowhere to go.
+        assert!(quotable_in_single_quotes(VLLM_OOM_CANONICAL_SYMPTOM));
+        assert!(quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+    }
+
+    #[test]
+    fn strip_terminal_control_sequences_removes_whole_escape_sequences() {
+        // Pin the exact rendering, not the absence of fragments: a stripper that
+        // dropped only the escape byte and the `[` it introduces would leave
+        // `31m`/`0m` behind, which carries no control byte and contains neither
+        // `[31m` nor `[0m`, so every absence check would still pass.
+        assert_eq!(
+            strip_terminal_control_sequences(
+                "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}"
+            ),
+            "RuntimeError: HIP out of memory"
+        );
+        // A non-CSI escape takes the byte it introduces with it.
+        assert_eq!(strip_terminal_control_sequences("a\u{1b}Bc"), "ac");
+        // Text with nothing to strip is returned unchanged.
+        assert_eq!(
+            strip_terminal_control_sequences(VLLM_OOM_CANONICAL_SYMPTOM),
+            VLLM_OOM_CANONICAL_SYMPTOM
+        );
     }
 
     #[test]

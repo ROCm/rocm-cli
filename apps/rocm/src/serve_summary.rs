@@ -214,7 +214,19 @@ pub(crate) fn oom_memory_note(status: &str, log_tail: &str) -> Option<String> {
     if !serve_failed_to_become_ready(status) || !rocm_core::vllm_log_shows_oom(log_tail) {
         return None;
     }
+    // The symptom is vLLM's own subprocess output and it lands inside a
+    // single-quoted shell word in a sentence that invites the user to paste the
+    // command, so it is only routed through verbatim when it can be rendered as
+    // one intact quoted argument; otherwise the canonical symptom stands in. See
+    // [`rocm_core::quotable_in_single_quotes`] for why this rejects rather than
+    // escapes. The engine's startup-failure hint guards the same text the same
+    // way.
     let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
+    let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
+        symptom
+    } else {
+        rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
+    };
     Some(format!(
         "the serve attempt ran out of GPU memory. {} If the model simply does not fit in this \
          GPU's VRAM, lowering the reservation will not help — serve a smaller or quantized model \
@@ -526,6 +538,103 @@ mod tests {
         assert_eq!(
             oom_memory_note("starting", "OSError: model weights not found"),
             None
+        );
+    }
+
+    /// The `--symptom` value the note actually hands the user, read back out of
+    /// the rendered text exactly the way a shell would: the note's prose carries
+    /// its own apostrophes (`GPU's VRAM`), so the command is extracted from
+    /// between its backticks first, then the first `'...'` word inside it.
+    fn quoted_symptom_argument(note: &str) -> &str {
+        note.split("run `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("the note must print a runnable command")
+            .split("--symptom '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("the command must carry a --symptom value")
+    }
+
+    #[test]
+    fn an_apostrophe_in_the_failing_line_cannot_break_out_of_the_printed_command() {
+        // A realistic vLLM traceback tail: apostrophes are routine in Python
+        // error text, and this line scores well above MIN_SCORE_FOR_MATCH
+        // (torch.OutOfMemoryError + HIP out of memory), so the "route the user's
+        // real line" branch selects it.
+        let log_tail = concat!(
+            "  File \"/opt/vllm/worker.py\", line 212, in load_model\n",
+            "ERROR 09-14 12:00:01 engine.py:389] torch.OutOfMemoryError: HIP out of memory. ",
+            "Tried to allocate 7.21 GiB. GPU 0 can't allocate the model's weights.\n"
+        );
+        let note = oom_memory_note("starting", log_tail).expect("an OOM failure must carry a note");
+
+        // The rendered command must be one intact single-quoted argument: no
+        // byte the vLLM subprocess printed may close the quote and land outside
+        // it in a command the note invites the user to paste.
+        let command = note
+            .split("run `")
+            .nth(1)
+            .and_then(|rest| rest.split('`').next())
+            .expect("the note must print a runnable command");
+        assert_eq!(
+            command.matches('\'').count(),
+            2,
+            "the --symptom argument must stay a single balanced quoted word: {command}"
+        );
+        // Pin which branch ran, not just that no apostrophe survived: "contains
+        // no `'`" also holds if the apostrophes were silently deleted from the
+        // user's line, which is the escaping-style behaviour the fallback exists
+        // to avoid. Rejection means the canonical symptom, exactly.
+        let symptom = quoted_symptom_argument(&note);
+        assert_eq!(
+            symptom,
+            rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            "a quote-bearing line must be rejected in favour of the canonical symptom, \
+             not silently rewritten: {symptom:?}"
+        );
+        // ...and the command it does print must still report a cause.
+        assert!(
+            rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
+            "the fallback symptom must still be diagnosable: {symptom:?}"
+        );
+    }
+
+    #[test]
+    fn control_bytes_from_the_log_never_reach_the_printed_command() {
+        // vLLM's logger colourises; an ANSI-coloured OOM line must not repaint
+        // the user's terminal from inside rocm-cli's own serve summary.
+        let log_tail = "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}";
+        let note = oom_memory_note("starting", log_tail).expect("an OOM failure must carry a note");
+        assert!(
+            !note.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte may survive into the printed note: {note:?}"
+        );
+        // Pin the exact value rather than the absence of a few fragments: an
+        // absence check cannot fail for the defect it names, since a stripper
+        // that drops only the escape byte and the `[` leaves `31m`/`0m` behind,
+        // which contains neither `[31m` nor `[0m` and carries no control byte.
+        let symptom = quoted_symptom_argument(&note);
+        assert_eq!(
+            symptom,
+            rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            "a control-byte-bearing line must be rejected in favour of the canonical \
+             symptom, not stripped into a lookalike: {symptom:?}"
+        );
+    }
+
+    #[test]
+    fn oom_note_quotes_a_clean_failing_line_verbatim() {
+        // The guard must not cost the common case its own error text: a line
+        // with no quote and no control byte is still routed into the command.
+        let note = oom_memory_note(
+            "starting",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        )
+        .expect("an OOM failure must carry a note");
+        assert_eq!(
+            quoted_symptom_argument(&note),
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
         );
     }
 
