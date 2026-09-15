@@ -199,17 +199,17 @@ Feature: Model serving
 
   # A guard, not a finding. Stopping a running server was reported as having
   # stopped nothing on the pod this set came from, but neither fixture tried here
-  # reproduces that: a plain process registered as a managed service is counted
-  # correctly (measured on the no-GPU lane), and so is a real vLLM serve
-  # (measured on MI300X, run 188). It therefore holds the contract the pod
-  # violated and goes red if CI ever meets it — unconditionally, EXCEPT on the
-  # lemonade-default Linux GPU lane, where a separate serve bug (EAI-7423) stops
-  # the service coming up at all and a `flaky` row covers the precondition
-  # failing; see the note at that row in `expectations.toml`.
-  # @merge-queue: this serves a real model, and the Strix Halo lanes already run
-  # at 32 of their 35 allotted minutes on main alone. Three new real serves would
-  # put them over, so they follow serve-06/07/08 onto the merge-queue path,
-  # where the budget for heavy serves lives.
+  # reproduces that. Why it ships as a guard rather than an expected failure, and
+  # what was measured on which lane, is recorded once at the EAI-8007 note in
+  # `expectations.toml` — not restated here, so the two cannot drift.
+  #
+  # It holds that contract unconditionally EXCEPT on the lemonade-default Linux
+  # GPU lane, where a separate serve bug (EAI-7423) stops the service coming up
+  # at all and a `flaky` row covers the precondition failing; see that row.
+  #
+  # @merge-queue because it serves a real model and the Strix Halo lanes have
+  # little headroom left on main alone, so three more real serves follow
+  # serve-06/07/08 onto the merge-queue path where the budget for them lives.
   @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
   Scenario: serve-20 - Stopping a running server reports that it stopped it
     Given a managed runtime is active

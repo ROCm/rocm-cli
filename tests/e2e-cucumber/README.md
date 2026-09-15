@@ -111,7 +111,10 @@ carrying one runs only where its env var is set: `@nightly`
 (`E2E_INCLUDE_NIGHTLY`), `@lifecycle` (`E2E_INCLUDE_LIFECYCLE`) and
 `@merge-queue` (`E2E_MERGE_QUEUE`, set on the merge-queue lanes). Note what that
 means for gating: a `@merge-queue` scenario does not run on ordinary per-PR CI
-at all, and the lanes that do run it are marked non-blocking in `ci.yml`.
+at all, and the lanes that do run it — the self-hosted ones in
+`.github/workflows/e2e-selfhosted.yml`, not `ci.yml` — are non-blocking because
+none of their check names are in branch protection's required-status-check list.
+Not because of `continue-on-error`, which is `false` on all but one of them.
 
 ### Naming
 
@@ -148,7 +151,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@requires-no-gpu` | Premise is a host with no usable AMD GPU (e.g. a refusal that only happens without one). The inverse of `@requires-gpu`; resolves to **skip** on a GPU host. |
-| `@merge-queue` | Too expensive for per-PR CI (a real serve). Skipped unless `E2E_MERGE_QUEUE` is set, which the merge-queue lanes do. Those lanes are non-blocking, so such a scenario is telemetry rather than a gate. |
+| `@merge-queue` | Too expensive for per-PR CI (a real serve). Skipped unless `E2E_MERGE_QUEUE` is set, which the self-hosted lanes in `e2e-selfhosted.yml` do on a `merge_group` event. Those check names are not in branch protection's required list, so such a scenario is telemetry rather than a gate. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 

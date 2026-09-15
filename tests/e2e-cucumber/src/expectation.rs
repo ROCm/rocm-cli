@@ -1219,6 +1219,70 @@ flaky = true
         );
     }
 
+    /// The inverse orphan: a scenario whose comment still says "Expected to
+    /// FAIL" after its row has been deleted.
+    ///
+    /// `expectations.toml` owns that state, but the feature files restate it in
+    /// prose for the reader, and prose does not move when a row does. When a bug
+    /// is fixed the harness flips correctly and silently — leaving a comment that
+    /// tells the next reader the opposite of what the suite now enforces. Four
+    /// rows were deleted while this file was being written, so the drift is not
+    /// hypothetical.
+    #[test]
+    fn every_expected_to_fail_comment_still_has_a_row() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut claimed = Vec::new();
+        let features = std::fs::read_dir(root.join("features")).expect("no features directory");
+        for entry in features {
+            let path = entry.expect("unreadable features directory entry").path();
+            if path.extension().is_none_or(|ext| ext != "feature") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+            // A scenario is written comment block → tag line(s) → `Scenario:`, so
+            // carry the claim forward from the comments and bind it to the ids on
+            // the tag lines, clearing at the `Scenario:` that ends the block.
+            let (mut expects_failure, mut pending_ids) = (false, Vec::new());
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    expects_failure |= line.contains("Expected to FAIL");
+                } else if line.starts_with('@') {
+                    for tag in line.split_whitespace() {
+                        if let Some(id) = tag.strip_prefix("@id:") {
+                            pending_ids.push(id.to_owned());
+                        }
+                    }
+                } else if line.starts_with("Scenario:") || line.starts_with("Scenario Outline:") {
+                    if expects_failure {
+                        claimed.append(&mut pending_ids.clone());
+                    }
+                    expects_failure = false;
+                    pending_ids.clear();
+                }
+            }
+        }
+        assert!(
+            !claimed.is_empty(),
+            "found no scenario claiming 'Expected to FAIL', so this check would pass vacuously"
+        );
+
+        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
+        let declared: std::collections::BTreeSet<&str> = m.declared_ids().collect();
+        let lying: Vec<&String> = claimed
+            .iter()
+            .filter(|id| !declared.contains(id.as_str()))
+            .collect();
+        assert!(
+            lying.is_empty(),
+            "these scenarios still say 'Expected to FAIL' but have no expectations row, so the \
+             comment asserts the opposite of what the suite enforces: {lying:?}\n\
+             Delete the comment along with the row — the bug it described is fixed, and the \
+             scenario now guards the fix."
+        );
+    }
+
     #[test]
     fn glob_matches_family() {
         assert!(glob_match("gfx94*", "gfx942"));
