@@ -484,6 +484,36 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
+/// `--reinstall` re-extracts the packaged embeddable, which resets
+/// `backend_versions.json` to its pinned defaults -- so this fires the
+/// alignment's Tier 1/Tier 2/revert state machine deterministically every time,
+/// even against a shared runtime tree where an earlier scenario already left
+/// Lemonade's backend aligned (in which case a plain, non-forcing install would
+/// find nothing left to do and print no alignment line at all).
+#[when("the user reinstalls the lemonade engine")]
+async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["engines", "install", "lemonade", "--reinstall"]);
+    world.cli_output = Some(stdout);
+}
+
+/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
+/// install's version does not match Lemonade's packaged pin, Tier 1's install
+/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
+/// build succeeds -- producing exactly this line. This is the one part of the
+/// alignment path with no other e2e coverage: the unit tests exercise the
+/// Tier 1/Tier 2/revert state machine directly (against injected install/align
+/// steps), but nothing else asserts that `rocm engines install lemonade`
+/// actually surfaces the outcome to the user.
+#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
+async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output
+            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
+        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+    );
+}
+
 /// The engine inventory reports a usable engine runtime.
 ///
 /// A precondition only. It deliberately has no Then counterpart: `engines list`
