@@ -6860,30 +6860,39 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 plan
             };
             let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
-            println!("runtime removed");
-            println!("  runtime_id: {}", result.runtime_id);
-            println!("  runtime_key: {}", result.runtime_key);
-            println!("  registry_removed: {}", result.registry_path.display());
+
+            let mut report = cli_report::ActionReport::new("runtime removed")
+                .detail("runtime_id", &result.runtime_id)
+                .detail("runtime_key", &result.runtime_key)
+                .detail("registry_removed", result.registry_path.display());
             match result.removed_install_root.as_ref() {
-                Some(path) => println!("  folder_removed: {}", path.display()),
-                None if result.read_only => {
-                    println!("  folder_removed: no");
-                    println!("  note: existing external runtime folder was left untouched");
+                Some(path) => {
+                    report = report.detail("folder_removed", path.display());
                 }
-                None if result.manifest_mismatch => {
-                    println!("  folder_removed: no");
-                    println!(
-                        "  note: local runtime manifest did not match the registry; the \
-                         folder was left in place to avoid deleting the wrong install"
+                None if result.read_only => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "existing external runtime folder was left untouched",
                     );
                 }
-                None => println!("  folder_removed: no"),
+                None if result.manifest_mismatch => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "local runtime manifest did not match the registry; the folder was \
+                         left in place to avoid deleting the wrong install",
+                    );
+                }
+                None => {
+                    report = report.detail("folder_removed", "no");
+                }
             }
             if result.default_runtime_cleared {
-                println!("  default_runtime: cleared");
-                println!("  next step: rocm runtimes activate <runtime_key>");
+                report = report
+                    .detail("default_runtime", "cleared")
+                    .detail("next step", "rocm runtimes activate <runtime_key>");
             }
-            println!("  config: {}", paths.config_path().display());
+            report = report.detail("config", paths.config_path().display());
+            print!("{}", report.render());
             record_cli_audit_event(
                 &paths,
                 "runtime",
@@ -7280,34 +7289,32 @@ impl RuntimeUninstallPlan {
 }
 
 fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
-    println!("runtime uninstall plan");
-    println!("  runtime_id: {}", plan.manifest.runtime_id);
-    println!("  runtime_key: {}", plan.manifest.runtime_key);
-    println!("  registry_entry: {}", plan.registry_path.display());
-    if plan.will_remove_install_root() {
-        println!(
-            "  install_folder: {} (would be removed)",
+    let install_folder = if plan.will_remove_install_root() {
+        format!(
+            "{} (would be removed)",
             plan.manifest.install_root.display()
-        );
+        )
     } else {
         match plan.install_root_decision {
-            InstallRootDecision::Remove => {
-                println!("  install_folder: not present, nothing to remove");
-            }
+            InstallRootDecision::Remove => "not present, nothing to remove".to_owned(),
             InstallRootDecision::ReadOnly => {
-                println!("  install_folder: left untouched (external/read-only runtime)");
+                "left untouched (external/read-only runtime)".to_owned()
             }
             InstallRootDecision::ManifestMismatch => {
-                println!(
-                    "  install_folder: left untouched (local runtime manifest did not match \
-                     the registry)"
-                );
+                "left untouched (local runtime manifest did not match the registry)".to_owned()
             }
         }
-    }
+    };
+
+    let mut report = cli_report::ActionReport::new("runtime uninstall plan")
+        .detail("runtime_id", &plan.manifest.runtime_id)
+        .detail("runtime_key", &plan.manifest.runtime_key)
+        .detail("registry_entry", plan.registry_path.display())
+        .detail("install_folder", install_folder);
     if plan.clears_default_runtime {
-        println!("  default_runtime: would be cleared");
+        report = report.detail("default_runtime", "would be cleared");
     }
+    print!("{}", report.render());
 }
 
 fn plan_runtime_uninstall(
@@ -28533,7 +28540,7 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn runtime_uninstall_plan_dry_run_makes_no_changes() -> Result<()> {
+    fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
         let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
         let manifest = write_test_pip_runtime(
             &paths,
