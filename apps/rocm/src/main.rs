@@ -1398,6 +1398,46 @@ fn cli_version_string() -> String {
     )
 }
 
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
+}
+
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
 /// data directory. Kept relative so the check works on every platform's home dir.
 const LEGACY_UV_CACHE_RELATIVE: [&str; 2] = [".cache", "uv"];
@@ -1995,10 +2035,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm-cli {}", cli_version_string());
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
