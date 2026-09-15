@@ -384,7 +384,8 @@ jobs:
   # CARGO_HOME override (pool hosts have room under the default paths, unlike
   # the full-partition static host this replaced), though CARGO_TARGET_DIR
   # still points at RUNNER_WORKSPACE to dodge checkout's `git clean -ffdx`
-  # mid-job. Non-blocking while this hardware is proven out.
+  # mid-job. Non-blocking for the reason in this file's header, not because
+  # this hardware is still being proven out.
   e2e-gpu-strix-ubuntu:
     name: E2E tests (Strix Halo, Ubuntu)
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
@@ -700,8 +701,9 @@ jobs:
   # boundary AND whatever GPU access WSL exposes. Same suite as every other
   # platform — scenarios the host cannot satisfy resolve to skip from the
   # capability probe, so nothing is filtered out here. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner. Non-blocking while
-  # GPU-on-WSL is proven out.
+  # disambiguates it from the `native` Strix Linux runner. Non-blocking for the
+  # reason in this file's header, not because GPU-on-WSL is still being proven
+  # out.
   e2e-wsl:
     name: E2E tests (Strix Halo, WSL2)
     # A manual include_nightly dispatch runs the 2400s large-model readiness
@@ -887,7 +889,8 @@ jobs:
   # Third AMD GPU target: the rad3 cluster's Radeon AI PRO R9700S (gfx1201, 32GB),
   # targeted by the `r9700` label. This runner is a KEDA-scaled pod (0<->1 off the
   # job queue), so the card is only reserved while a job exists (dev-tooling EAI-8065).
-  # Non-blocking while this hardware is proven out.
+  # Non-blocking for the reason in this file's header, not because this hardware
+  # is still being proven out.
   e2e-gpu-rad3:
     name: E2E tests (rad3 R9700)
     # 90min: matches e2e-gpu — same collapsed suite, and the card is smaller, so

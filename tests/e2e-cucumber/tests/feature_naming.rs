@@ -49,12 +49,29 @@ fn features_dir() -> PathBuf {
 }
 
 /// Every `.feature` file actually present, by file name.
+///
+/// Flat, not recursive — and it refuses to run rather than quietly covering
+/// less if that stops being true. `feature_files` in `src/expectation.rs` makes
+/// the same assumption and its refusal message names THIS scan as the other
+/// place to fix, so the two guards belong together: a subdirectory that made
+/// one of them fail loudly while the other silently skipped it would be the
+/// worst of both.
 fn feature_files() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(features_dir())
-        .expect("features dir")
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into())
-        .filter(|n: &String| n.ends_with(".feature"))
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(features_dir()).expect("features dir") {
+        let path = entry.expect("dir entry").path();
+        assert!(
+            !path.is_dir(),
+            "features/ has grown a subdirectory ({}), which this scan does not descend \
+             into — make it recursive, here and in src/expectation.rs, before moving any \
+             .feature file into one",
+            path.display()
+        );
+        let name = path.file_name().expect("dir entry name").to_string_lossy();
+        if name.ends_with(".feature") {
+            names.push(name.into_owned());
+        }
+    }
     names.sort();
     names
 }

@@ -32,9 +32,14 @@ Feature: Update report
   #
   # Expected to FAIL. Asking to see what an update would do, without asking for
   # it to be done, is refused as a misuse — even though checking is what this
-  # command does when left alone. The two choices are documented as independent
-  # of each other, so a user who wants a preview before committing to anything
-  # is turned away from the one command that would give them it.
+  # command does when left alone. README.md's synopsis for `rocm update` brackets
+  # `[--apply]` and `[--dry-run]` as independent options, so a user who wants a
+  # preview before committing to anything is turned away from the one command
+  # the documentation told them would give it.
+  #
+  # The row in expectations.toml records why this does not presume which side is
+  # wrong: closing the gap by correcting the synopsis would satisfy it just as
+  # well as accepting the flag.
   @id:update-preview-without-applying
   Scenario: update-04 - Previewing an update without asking to install it is accepted
     When the user asks to see what updating would do without asking for it to be done

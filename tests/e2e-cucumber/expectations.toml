@@ -174,9 +174,17 @@ flaky = true
 # deletes itself.
 
 # --- EAI-8010: `--dry-run` is declared as requiring `--apply`, so previewing an
-# update without asking for one is rejected as a usage error, though the README
-# documents the two as independent. Argument handling only, so platform-
-# independent. Remove when `rocm update --dry-run` is accepted. ---
+# update without asking for one is rejected as a usage error, though README.md's
+# synopsis line for `rocm update` brackets `[--apply]` and `[--dry-run]`
+# independently. Argument handling only, so platform-independent.
+#
+# WHICH SIDE IS WRONG IS A MAINTAINER CALL, and this row does not presume it.
+# The defensible alternative reading is that bare `rocm update` is already the
+# preview, making `--dry-run` meaningful only alongside `--apply` — in which case
+# the synopsis is what misleads. This row asserts only that the documented
+# contract and the shipped behaviour disagree, which is true either way.
+# Remove it when they agree: either `rocm update --dry-run` is accepted, or the
+# README stops offering it as a standalone flag. ---
 [["update-preview-without-applying"]]
 when = {}
 bug = "EAI-8010"
