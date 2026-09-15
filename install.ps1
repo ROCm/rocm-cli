@@ -21,7 +21,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$script:NoColor = -not [string]::IsNullOrEmpty($env:NO_COLOR)
+# [Console]::IsOutputRedirected is checked alongside NO_COLOR because
+# Write-Host -ForegroundColor (and the [Console]::OutputEncoding assignment in
+# Write-CompletionBanner, guarded separately below) can throw a terminating
+# HostException when no real console is attached to the process — WinRM
+# remoting, a non-interactive scheduled task, or similar service-style
+# invocation. $ErrorActionPreference = "Stop" above means that would abort the
+# install outright, a regression from the pre-color script, which never
+# touched -ForegroundColor and worked in exactly those contexts.
+$script:NoColor = (-not [string]::IsNullOrEmpty($env:NO_COLOR)) -or [Console]::IsOutputRedirected
 
 function Write-Step {
     param([string] $Message)
