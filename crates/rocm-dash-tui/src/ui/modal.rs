@@ -36,7 +36,7 @@ fn scale_pct(extent: u16, pct: u16) -> u16 {
 /// Centered rectangle taking `pct_x`% width and `pct_y`% height of `area`,
 /// clamped to a maximum so it doesn't drown the screen on big terminals.
 pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect) -> Rect {
-    let h_pct = scale_pct(area.height, pct_y).min(max_h).max(5);
+    let h_pct = centered_height(pct_y, max_h, area);
     let v_pad = (area.height.saturating_sub(h_pct)) / 2;
     let w_pct = centered_width(pct_x, max_w, area);
     let vert = Layout::default()
@@ -81,6 +81,27 @@ const MIN_POPUP_WIDTH: u16 = 20;
 pub fn centered_width(pct_x: u16, max_w: u16, area: Rect) -> u16 {
     let floor = MIN_POPUP_WIDTH.min(area.width);
     scale_pct(area.width, pct_x).min(max_w).max(floor)
+}
+
+/// Shortest a popup is allowed to be shrunk to by the percentage: a border pair
+/// plus enough body rows to be worth opening.
+const MIN_POPUP_HEIGHT: u16 = 5;
+
+/// Height [`centered_rect`] will give a popup — the exact counterpart of
+/// [`centered_width`], and split out for the same reason: the number this
+/// computes has to be the number the popup gets.
+///
+/// The [`MIN_POPUP_HEIGHT`] floor is clamped to `area.height` for the reason
+/// spelled out on [`centered_width`]. An unclamped floor asks for 5 rows on an
+/// area shorter than 5, which the `Layout::split` below then truncates, so the
+/// requested geometry and the rendered geometry disagree. Nothing measures
+/// against the height *today* — the callers measure their content and pass the
+/// answer in as `max_h` — so this is a latent form of the defect that had gone
+/// live on the width. Keeping the two sides identical is what stops it going
+/// live here the first time a caller needs the height before the popup exists.
+fn centered_height(pct_y: u16, max_h: u16, area: Rect) -> u16 {
+    let floor = MIN_POPUP_HEIGHT.min(area.height);
+    scale_pct(area.height, pct_y).min(max_h).max(floor)
 }
 
 /// Render a bordered block with `title` over `area` after clearing it,
@@ -1189,10 +1210,18 @@ mod ported_chrome_tests {
             let painted = rows(w, h, |f| super::draw_global_help(f, area, &theme));
             let bottom = bottom_border_row(&painted);
             let last = painted[bottom - 1].trim_end();
+            // Two separate properties, in order. The first is *not* a
+            // no-filler check: a blank row inside a bordered popup paints as
+            // `│      │` and ends with '│' too, so `ends_with` can never tell
+            // filler from content. What it does establish is that the row above
+            // the bottom border is an interior row — a body row between the two
+            // side borders, rather than the popup's own top border (`╭───╮`,
+            // which ends with '╮') as it would be on a two-row popup. The
+            // second assertion is the one that rules out filler.
             assert!(
                 last.ends_with('│'),
-                "{w}x{h}: the modal's last row must be content, not filler, but \
-                 row {} is {last:?}:\n{}",
+                "{w}x{h}: the row above the bottom border must be a body row \
+                 between the side borders, but row {} is {last:?}:\n{}",
                 bottom - 1,
                 painted.join("\n")
             );
@@ -1252,6 +1281,42 @@ mod ported_chrome_tests {
                     measured,
                     "the popup's rendered width must equal the width its \
                      content was measured against ({w}-column area)"
+                );
+            }
+        }
+    }
+
+    /// The height counterpart of the sweep above, pinned for the same reason.
+    ///
+    /// Unlike the width, nothing measures its content against this number yet,
+    /// so the defect is latent rather than live: `centered_rect` returns a rect
+    /// `Layout::split` has already truncated to the area, and *that* is why this
+    /// test asserts on `centered_height` rather than on `centered_rect(..).
+    /// height`. A test written against the returned rect could not fail — it
+    /// would be re-asserting ratatui's own invariant, which is precisely the
+    /// mistake `help_modal_is_clamped_when_the_content_cannot_fit` made before
+    /// it was deleted. The property this crate owns is that the height it *asks*
+    /// for is the height it gets.
+    ///
+    /// Both live `(pct_y, max_h)` shapes are swept: the content-sized help
+    /// modals' `pct_y = 100`, and a fixed-height overlay's 80/30.
+    #[test]
+    fn popup_height_is_never_taller_than_a_short_area() {
+        for h in 0..=8u16 {
+            let area = Rect::new(0, 0, 80, h);
+            for (pct_y, max_h) in [(100u16, 12u16), (80, 30)] {
+                let asked = super::centered_height(pct_y, max_h, area);
+                assert!(
+                    asked <= h,
+                    "centered_height({pct_y}, {max_h}) returned {asked} on a \
+                     {h}-row area: the popup would be laid out to a height it \
+                     cannot have"
+                );
+                assert_eq!(
+                    super::centered_rect(100, pct_y, 80, max_h, area).height,
+                    asked,
+                    "the popup's rendered height must equal the height it was \
+                     laid out to ({h}-row area)"
                 );
             }
         }
