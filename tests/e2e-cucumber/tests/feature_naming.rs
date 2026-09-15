@@ -113,6 +113,19 @@ fn the_feature_scan_takes_the_flat_files_it_finds() {
 }
 
 #[test]
+#[should_panic(expected = "found no .feature files")]
+fn the_feature_scan_refuses_an_empty_directory_rather_than_passing_vacuously() {
+    // Without this, every check in this file is a loop over nothing: a
+    // `features/` that stopped yielding files would pass the whole guard rather
+    // than fail it. Unreachable against the real directory, so pinned here —
+    // and pinned identically in `src/expectation.rs`, whose scan makes the same
+    // assertion for the same reason.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    let _ = feature_files_in(dir.path());
+}
+
+#[test]
 #[should_panic(expected = "has grown a subdirectory")]
 fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
     // The branch that stops this scan quietly covering less than it claims.
