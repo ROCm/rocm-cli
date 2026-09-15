@@ -9,7 +9,7 @@ name: E2E self-hosted
 # THIS workflow's supersession, never the required checks in ci.yml.
 #
 # These lanes are non-blocking because none of their check names are in
-# branch protection's required-status-check list (confirmed 2026-09-11) — not
+# branch protection's required-status-check list (confirmed 2026-09-15) — not
 # because of `continue-on-error`, which is `false` on every lane below except
 # `e2e-gpu-mi350p`, so a real hardware regression shows red instead of always
 # green. (mi350p alone sets it `true`; that lane reports green regardless, which
