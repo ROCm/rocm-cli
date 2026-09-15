@@ -1606,6 +1606,21 @@ fn prepare_freeform_execution(
 /// rendering path is deliberately untouched: `rocm <request>` without `--yes`
 /// prints a command for a human to review, and it must not hand them a
 /// pre-approved one.
+///
+/// That leaves `rocm --yes <request>` printing two `tool_call:` lines that
+/// differ — `run_freeform` renders the plan section before calling
+/// `execute_freeform_next_action`, and the flag is injected between them — and
+/// that is also deliberate. The two sections report different things: "request
+/// plan" is what the planner derived from the request, and "execution" is the
+/// argv handed to clap, so the added consent showing up only under the
+/// `execution` header is how this surface discloses that it granted it. Nothing
+/// is being solicited in between; under `--yes` the operator already approved
+/// on the outer command line, and under no `--yes` the execution section is
+/// never reached, so neither line is an approval prompt whose subject could
+/// drift from what runs. Injecting into the plan render instead would have to
+/// reach `render_structured_request_plan`, which the no-`--yes` review path
+/// shares, and would print a pre-approved command to a human being asked to
+/// review it — the case the paragraph above rules out.
 fn apply_freeform_execution_consent(args: &mut Vec<String>) {
     let is_install_sdk = args.first().is_some_and(|arg| arg == "install")
         && args.get(1).is_some_and(|arg| arg == "sdk");
@@ -22609,6 +22624,43 @@ mod tests {
                 "--dry-run".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn install_sdk_yes_rejects_an_attached_value_so_the_chat_strip_cannot_be_evaded() {
+        // The chat arm strips a model-supplied `--yes` by exact string match, so
+        // that strip is only airtight because clap refuses the `=`-form: if
+        // `--yes=true` parsed, a model could smuggle the system-package/sudo
+        // consent past `args.retain(|arg| arg != "--yes")` and into a spawn with
+        // null stdin and no terminal to answer a password prompt. `--yes` on
+        // `install sdk` is a bare `bool` today, which is what produces the
+        // rejection; giving it `num_args` later would silently re-grant that
+        // consent, so pin the rejection here rather than leaving it implicit.
+        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
+            let error = match Cli::try_parse_from(["rocm", "install", "sdk", attached]) {
+                Ok(cli) => panic!(
+                    "`{attached}` must not parse; the chat `--yes` strip is an exact string match, got {cli:?}"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::TooManyValues,
+                "expected clap to reject the attached value on {attached}: {error}"
+            );
+        }
+
+        // Control: the bare form the strip is written against does parse, so the
+        // assertions above are about the `=`-form and not about `--yes` being
+        // rejected outright.
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--yes"])
+            .expect("the bare flag is the form the chat arm strips");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { yes, .. },
+            }) => assert!(yes),
+            other => panic!("expected `install sdk`, got {other:?}"),
+        }
     }
 
     #[test]

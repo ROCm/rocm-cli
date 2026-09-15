@@ -2174,6 +2174,20 @@ fn active_default_runtime_relation(
 /// function when resolution failed, so that count is 0 (dangling) or greater
 /// than 1 (ambiguous) — an exactly-one match is what
 /// `current_runtime_manifest` resolves successfully.
+///
+/// `unparsed` is reported two different ways on purpose. An entry is only the
+/// *cause* of an unresolved `active_runtime_key` when it is that key's own
+/// manifest; every other unreadable entry is a separate registry wart that
+/// happens to be visible at the same time, so it is appended as a suffix rather
+/// than named as the reason. Blaming an unrelated file — the ordinary
+/// older-binary manifest is exactly that — would point the operator at the
+/// wrong path while a deleted runtime went unmentioned.
+///
+/// Both config pointers are named when both are set. `current_runtime_manifest`
+/// tries `active_runtime_key` first and falls through to `default_runtime_id`,
+/// so arriving here means *both* failed, and the message is what the prompt,
+/// the preapproved progress line and the non-interactive refusal print: it has
+/// to name everything that could not be resolved, not just the first pointer.
 fn unresolved_active_default_relation_text(
     active_runtime_key: Option<&str>,
     default_runtime_id: Option<&str>,
@@ -2200,15 +2214,45 @@ fn unresolved_active_default_relation_text(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
+    // The registry stores each manifest at `<runtime_key>.json`
+    // (`runtime_manifest_path`), so the file stem is the key. Compared
+    // case-insensitively because that is how `current_runtime_manifest` matches
+    // `active_runtime_key` against `runtime_key`.
+    let key_manifest_is_unparsable = |key: &str| {
+        unparsed.iter().any(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(key))
+        })
+    };
+    // Reached only when `active_runtime_key` is also set and also unresolved, so
+    // this is always a continuation of the key clause, never a sentence by
+    // itself. The count is 0 or >1 for the reason given on the parameter.
+    let also_unresolved_id = |id: &str| {
+        if default_runtime_id_match_count > 1 {
+            format!(
+                "; the recorded default runtime_id `{id}` does not settle it either, because {default_runtime_id_match_count} installed runtime manifests match it"
+            )
+        } else {
+            format!(
+                "; the recorded default runtime_id `{id}` does not settle it either, because no installed runtime manifest matches it"
+            )
+        }
+    };
 
     match (non_empty(active_runtime_key), non_empty(default_runtime_id)) {
-        (Some(key), _) if unparsed.is_empty() => Some(format!(
-            "recorded as `{key}`, but no installed runtime manifest matches it, so what is currently active cannot be determined"
-        )),
-        (Some(key), _) => Some(format!(
-            "recorded as `{key}`, but its manifest could not be read; unreadable runtime manifests: {}",
-            unparsed_text()
-        )),
+        (Some(key), id) => {
+            let cause = if key_manifest_is_unparsable(&key) {
+                format!("recorded as `{key}`, but its manifest could not be read")
+            } else {
+                format!("recorded as `{key}`, but no installed runtime manifest matches it")
+            };
+            Some(format!(
+                "{cause}, so what is currently active cannot be determined{}{}",
+                id.as_deref().map(also_unresolved_id).unwrap_or_default(),
+                unparsed_suffix()
+            ))
+        }
         (None, Some(id)) if default_runtime_id_match_count > 1 => Some(format!(
             "recorded as runtime_id `{id}`, which {default_runtime_id_match_count} installed runtime manifests match, so which one is currently active cannot be determined{}",
             unparsed_suffix()
@@ -9428,6 +9472,164 @@ echo Python 3.12.10
     }
 
     #[test]
+    fn active_default_relation_blames_an_unparsable_manifest_only_when_it_is_the_active_one()
+    -> Result<()> {
+        // A dangling `active_runtime_key` and an unparsable manifest belonging to
+        // some *other* runtime are two independent faults that show up together
+        // routinely: an older binary's manifest fails `from_slice` against this
+        // one while the runtime the config calls active was removed outright.
+        // Naming the stranger's file as "its manifest" would send the operator to
+        // repair a path that has nothing to do with the problem and never mention
+        // the runtime that actually went missing.
+        let (root, paths) = test_paths("active-default-relation-unrelated-unparsable");
+
+        let stranger = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &stranger)?;
+        let stranger_path = make_test_runtime_manifest_unparsable(&paths, &stranger.runtime_key)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        // Nothing on disk is stored under this key, so the only unreadable entry
+        // in the registry is the stranger's.
+        config.active_runtime_key = Some("release-wheel-gfx120X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling active_runtime_key must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all`, but no installed runtime manifest matches it"
+            ),
+            "the missing runtime is the cause, not the stranger's manifest: {relation}"
+        );
+        assert!(
+            !relation.contains("its manifest could not be read"),
+            "an unrelated unparsable manifest must not be blamed as the active one's: {relation}"
+        );
+        assert!(
+            relation.contains(&format!(
+                "; unreadable runtime manifests: {}",
+                stranger_path.display()
+            )),
+            "the unrelated unparsable manifest is still reported, as a suffix: {relation}"
+        );
+
+        // The other direction, in the same registry: once the active key's *own*
+        // manifest is unparsable, "could not be read" is the right cause even
+        // though the stranger's file is unreadable too.
+        let active = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            20,
+        );
+        write_test_runtime_manifest(&paths, &active)?;
+        let active_path = make_test_runtime_manifest_unparsable(&paths, &active.runtime_key)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("an unparsable active manifest must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all`, but its manifest could not be read"
+            ),
+            "the active key's own unparsable manifest is the cause here: {relation}"
+        );
+        assert!(
+            relation.contains(&active_path.display().to_string())
+                && relation.contains(&stranger_path.display().to_string()),
+            "both unreadable entries are still listed: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_names_both_unresolved_config_pointers() -> Result<()> {
+        // `current_runtime_manifest` tries `active_runtime_key` and falls through
+        // to `default_runtime_id`, so arriving at the fail-closed path with both
+        // set means both failed. `rocm runtimes activate` writes the pair
+        // together, so removing that runtime while another version of the family
+        // remains strands them together too. Reporting only the key would have
+        // the operator repair half the config and hit the gate again.
+        let (root, paths) = test_paths("active-default-relation-both-pointers");
+        let runtime_id = "therock-release:gfx120X-all";
+        let mut older = test_runtime_manifest("release-wheel-gfx120X-all-7130", runtime_id, 10);
+        older.version = "7.13.0".to_owned();
+        let mut newer = test_runtime_manifest("release-wheel-gfx120X-all-7140", runtime_id, 20);
+        newer.version = "7.14.0".to_owned();
+        write_test_runtime_manifest(&paths, &older)?;
+        write_test_runtime_manifest(&paths, &newer)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.active_runtime_key = Some("release-wheel-gfx120X-all-7120".to_owned());
+        config.default_runtime_id = Some(runtime_id.to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("two unresolved pointers must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all-7120`, but no installed runtime manifest matches it"
+            ),
+            "the relation must name the unresolved key: {relation}"
+        );
+        assert!(
+            relation.contains(&format!(
+                "; the recorded default runtime_id `{runtime_id}` does not settle it either, because 2 installed runtime manifests match it"
+            )),
+            "the relation must also name the ambiguous fallback id: {relation}"
+        );
+
+        // The zero-match half of the same pairing: the fallback is dangling
+        // rather than ambiguous, and must still be named.
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some("therock-release:gfx110X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("two unresolved pointers must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "; the recorded default runtime_id `therock-release:gfx110X-all` does not settle it either, because no installed runtime manifest matches it"
+            ),
+            "the relation must also name the dangling fallback id: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn active_default_relation_fails_closed_on_an_ambiguous_default_runtime_id() -> Result<()> {
         // Same policy, but the *other* resolution path. `current_runtime_manifest`
         // falls back to `default_runtime_id` when `active_runtime_key` is unset,
@@ -9890,6 +10092,33 @@ echo Python 3.12.10
         fs::create_dir_all(path.parent().expect("manifest path should have parent"))?;
         fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
         Ok(())
+    }
+
+    /// Rewrite an already-written registry manifest so it still *reads* but no
+    /// longer deserializes, and return its path. Drops `family_source`, which
+    /// carries no `#[serde(default)]` — the real older-binary/newer-binary shape,
+    /// not an invented corruption.
+    fn make_test_runtime_manifest_unparsable(
+        paths: &AppPaths,
+        runtime_key: &str,
+    ) -> Result<PathBuf> {
+        let path = runtime_manifest_path(paths, runtime_key);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        value
+            .as_object_mut()
+            .expect("manifest is a JSON object")
+            .remove("family_source")
+            .expect("manifest carries family_source");
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+        assert!(
+            fs::read(&path).is_ok(),
+            "the fixture must still read, or this is the I/O path, not the parse path"
+        );
+        assert!(
+            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&path)?).is_err(),
+            "the test fixture must be unparsable, or this asserts nothing"
+        );
+        Ok(path)
     }
 
     #[test]
