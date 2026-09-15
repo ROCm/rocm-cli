@@ -1,3 +1,17 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
+# This file must stay BOM-less, so the "add a BOM" rule is suppressed for it.
+# The documented install path is `irm <url> | iex`, which hands the parser a
+# string rather than a file: a byte order mark survives into that string, the
+# parser glues it onto the first token, and the param() block below silently
+# stops being the script's first statement. All nine parameters then vanish,
+# with zero parse errors to show for it. The cost of staying BOM-less is that
+# Windows PowerShell 5.1 decodes this file as the ANSI codepage and renders the
+# © above as mojibake -- a cosmetic blemish in a comment, which is the cheaper
+# of the two failures. Do not "fix" this by adding a BOM.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseBOMForUnicodeEncodedFile', '')]
 param(
     [Parameter(Position = 0)]
     [string] $Channel = $env:ROCM_CLI_CHANNEL,
