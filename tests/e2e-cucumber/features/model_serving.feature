@@ -255,3 +255,69 @@ Feature: Model serving
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
+
+  # `serve` advertises a set of device policies, and the list the user is offered
+  # has to be the list the command accepts. Runs on the no-GPU lane, where a
+  # refusal that names the policy itself is cleanly distinguishable from the
+  # ordinary "this machine has no GPU" refusal every policy gets there.
+  @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
+  Scenario: serve-22 - Every device policy the serve command offers is one it accepts
+    When the user serves a model under each device policy the command offers
+    Then no policy is refused for being that policy
+
+  # A guard, not a finding. Stopping a running server was reported as having
+  # stopped nothing on the pod this set came from, but neither fixture tried here
+  # reproduces that. Why it ships as a guard rather than an expected failure, and
+  # what was measured on which lane, is recorded once at the EAI-8007 note in
+  # `expectations.toml` — not restated here, so the two cannot drift.
+  #
+  # It holds that contract unconditionally EXCEPT on the lemonade-default Linux
+  # GPU lane, where a separate serve bug (EAI-7423) stops the service coming up
+  # at all and a `flaky` row covers the precondition failing; see that row.
+  #
+  # @merge-queue because it serves a real model and the Strix Halo lanes have
+  # little headroom left on main alone, so three more real serves follow
+  # serve-06/07/08 onto the merge-queue path where the budget for them lives.
+  @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
+  Scenario: serve-23 - Stopping a running server reports that it stopped it
+    Given a managed runtime is active
+    And a model is being served on GPU
+    When the user stops the server that is running
+    Then the CLI reports that it stopped a process
+
+  # Expected to FAIL. Removing the CLI's managed files reports completion while
+  # the server it was managing is left running — and with the records gone, the
+  # supported way to stop it has been removed along with them. Nothing here
+  # touches the installed program: the removal is scoped to this scenario's own
+  # directories and keeps the binaries.
+  @id:serve-uninstall-stops-what-it-manages @requires-os:linux
+  Scenario: serve-24 - Removing the CLI's managed files stops the servers it manages
+    Given a local server this machine manages is running
+    When the user removes the CLI's managed files
+    Then the removal is reported as complete
+    And the server is no longer running
+
+  # Expected to FAIL on Windows. Asking the CLI to choose a GPU on a machine that
+  # has one must end with a device chosen: reporting that it selected none and
+  # carrying on leaves the user unable to tell which GPU their model will run on,
+  # or whether it will run on one at all. Both Linux lanes name the device, so
+  # this scenario also guards them.
+  # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
+  @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
+  Scenario: serve-25 - Letting the CLI choose the GPU names the device it chose
+    Given a managed runtime is active
+    And a machine with an AMD GPU
+    When the user serves a model letting the CLI choose the GPU
+    Then the plan names the device it chose
+
+  # Expected to FAIL on a GPU host. A second server started while the usual
+  # address is already taken is handed that same address anyway, so it collides
+  # with the server already there. Either outcome is fine — pick a free address,
+  # or say the usual one is busy — but silently reusing it is not.
+  # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
+  @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
+  Scenario: serve-26 - A second server does not take an address already in use
+    Given a managed runtime is active
+    And the address a new server would use is already taken
+    When the user serves a model without choosing an address
+    Then the new server does not try to use the taken address

@@ -152,3 +152,22 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection explains the default-engine marker
     And the host's default engine is marked in the inspection's engine inventory
+
+  # The help's own worked examples are the first thing a new user copies, so a
+  # model named there has to be one this CLI can actually serve. The check
+  # accepts either form the README documents — a name the model listing knows,
+  # or an explicit `owner/repo` reference — and so does not prescribe which
+  # model the examples should use.
+  @id:examine-help-serve-example-names-a-resolvable-model
+  Scenario: examine-15 - Every model the help offers as an example is one the CLI can resolve
+    When the user reads the serve examples the help offers
+    Then every model named there is one the CLI can resolve
+
+  # Running the CLI with no subcommand and running its dashboard command are two
+  # different things. When the help describes them as the same one, a reader has
+  # no way to learn what the plain command does or that there is anything else
+  # to reach.
+  @id:examine-help-describes-the-default-command
+  Scenario: examine-16 - The help tells the two ways of opening a screen apart
+    When the user asks for help
+    Then running the CLI with no subcommand is not described as the dashboard command

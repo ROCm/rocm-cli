@@ -98,20 +98,33 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     let marker = format!("(rocm:{ENGINE})");
     // The marker must be on the rendered prompt line, which is what the user
     // actually sees — not merely somewhere in the informational block above it.
+    //
+    // Waited for as ONE condition rather than two. Waiting for the marker alone
+    // and then reading the screen once is satisfied by the banner above the
+    // prompt ("your prompt is now prefixed (rocm:vllm)"), which the CLI prints
+    // before bash has painted anything — so the single read that follows lands
+    // in the gap between the two whenever the machine is busy, and reports a
+    // shell that simply had not reached its prompt yet as one whose prompt is
+    // unmarked. Waiting on the real condition removes the gap without weakening
+    // it: a shell that never marks its prompt still fails, at the timeout.
+    //
+    // Through `wait_for_screen_where` rather than a local poll loop, so a shell
+    // that dies or a pty reader that panics is reported as THAT, instead of
+    // running out the full timeout and blaming the prompt marker for a failure
+    // that happened earlier and elsewhere.
     session
-        .wait_for_screen(&marker, SCREEN_TIMEOUT)
+        .wait_for_screen_where(
+            &format!("{marker} on a prompt line"),
+            SCREEN_TIMEOUT,
+            |screen| {
+                screen
+                    .lines()
+                    .filter(|line| line.contains(&marker))
+                    .any(|line| line.contains('$'))
+            },
+        )
         .await
-        .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
-
-    let screen = session.screen_text();
-    let on_a_prompt_line = screen
-        .lines()
-        .filter(|line| line.contains(&marker))
-        .any(|line| line.contains('$'));
-    assert!(
-        on_a_prompt_line,
-        "the marker never reached a prompt line:\n{screen}"
-    );
+        .unwrap_or_else(|e| panic!("the engine shell's prompt was never marked: {e}"));
 }
 
 #[then("the engine environment's interpreter is the one that runs")]

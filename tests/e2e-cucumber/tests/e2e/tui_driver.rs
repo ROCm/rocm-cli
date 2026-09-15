@@ -408,14 +408,33 @@ impl TuiSession {
     /// deadline that includes the last screen for diagnosis. Also fails fast if
     /// the child exits before the marker appears.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let wanted = format!("{marker:?}");
+        self.wait_for_screen_where(&wanted, timeout, |screen| screen.contains(marker))
+            .await
+    }
+
+    /// The same wait as [`Self::wait_for_screen`], for a condition a substring
+    /// cannot express.
+    ///
+    /// Callers that hand-roll this loop lose what the waiting is really for: a
+    /// shell that dies, or a pty reader that panics, is reported as the real
+    /// cause here instead of running out the full timeout and blaming whatever
+    /// the caller happened to be looking for. `wanted` is quoted into those
+    /// messages, so it should read as the thing being waited for.
+    pub async fn wait_for_screen_where(
+        &mut self,
+        wanted: &str,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.screen_text().contains(marker) {
+            if matches(&self.screen_text()) {
                 return Ok(());
             }
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
-                    "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
+                    "pty reader thread panicked while waiting for {wanted}: {panic_message}\n{}",
                     self.framed_screen()
                 ));
             }
@@ -427,12 +446,12 @@ impl TuiSession {
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
                 let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
                 while Instant::now() < drain_deadline {
-                    if self.screen_text().contains(marker) {
+                    if matches(&self.screen_text()) {
                         return Ok(());
                     }
                     if let Some(panic_message) = self.take_reader_panic() {
                         return Err(format!(
-                            "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                            "pty reader thread panicked while draining the final frame for {wanted}: {panic_message}\n{}",
                             self.framed_screen()
                         ));
                     }
@@ -448,7 +467,7 @@ impl TuiSession {
                 // Final check after the drain window closes: the reader may have
                 // committed the last frame between the loop's screen check and the
                 // `is_finished`/deadline exit, so re-read before declaring failure.
-                if self.screen_text().contains(marker) {
+                if matches(&self.screen_text()) {
                     return Ok(());
                 }
                 // A reader panic landing exactly on the drain deadline would
@@ -457,18 +476,18 @@ impl TuiSession {
                 // unwind). Surface it here so the real cause wins.
                 if let Some(panic_message) = self.take_reader_panic() {
                     return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                        "pty reader thread panicked while draining the final frame for {wanted}: {panic_message}\n{}",
                         self.framed_screen()
                     ));
                 }
                 return Err(format!(
-                    "process exited ({status:?}) before {marker:?} appeared.\n{}",
+                    "process exited ({status:?}) before {wanted} appeared.\n{}",
                     self.framed_screen()
                 ));
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "timed out after {timeout:?} waiting for {marker:?}.\n{}",
+                    "timed out after {timeout:?} waiting for {wanted}.\n{}",
                     self.framed_screen()
                 ));
             }

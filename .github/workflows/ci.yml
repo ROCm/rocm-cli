@@ -982,11 +982,11 @@ jobs:
         run: cargo xtask verify-commits --base "$BASE" --require-verified
 
   # Hardware (real AMD GPU) smoke tests run on dedicated self-hosted runners in a
-  # SEPARATE workflow, e2e-selfhosted.yml (jobs e2e-gpu, e2e-gpu-strix-ubuntu,
-  # e2e-gpu-strix-windows). They live there — not here — so a job queued on an
-  # offline self-hosted runner (which GitHub cannot cancel) can never hold this
-  # workflow's concurrency group and stall its merge-required checks (EAI-7548).
-  # They are non-blocking (continue-on-error) and fork-safe (self-hosted runners
+  # SEPARATE workflow, e2e-selfhosted.yml — see that file for the current lanes
+  # and for why they are non-blocking, neither restated here. They live there —
+  # not here — so a job queued on an offline self-hosted runner (which GitHub
+  # cannot cancel) can never hold this workflow's concurrency group and stall its
+  # merge-required checks (EAI-7548). They are also fork-safe (self-hosted runners
   # do not execute untrusted fork PRs). See docs/ci-hardware-testing.md.
 
   # ── E2E tests (cucumber-rs) ───────────────────────────────────────────────
@@ -995,8 +995,8 @@ jobs:
   # job per platform: the harness resolves every scenario to pass / xfail / skip
   # per host from its @id + @requires-* tags, a capability probe, and
   # expectations.toml (no tier flag, no tag filter). The mock job (GitHub-hosted,
-  # no GPU) gates the PR; the self-hosted GPU jobs are non-blocking while proven
-  # out. Each job writes a platform.json sidecar the consolidated report joins by
+  # no GPU) gates the PR; the self-hosted GPU jobs do not (see the note above).
+  # Each job writes a platform.json sidecar the consolidated report joins by
   # scenario id to render the (scenario × platform) expectation grid.
 
   # Blocking mock job (GitHub-hosted, no GPU): must stay green. @requires-gpu
