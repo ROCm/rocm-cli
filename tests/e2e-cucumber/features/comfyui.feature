@@ -42,10 +42,15 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # is surfaced in `rocm comfyui install`'s command output, where `--runtime-id`
   # and `rocm runtimes activate` apply and the `/runtimes` pointer is for the same
   # text read from a terminal. This scenario asserts that CLI surface only: the
-  # refusal does not reach the TUI chat, which is machine-checked by
+  # refusal does not reach the TUI chat. Both halves of that are machine-checked
+  # — that a non-zero `rocm` exit arrives as a captured `isError: true` envelope
+  # rather than as an error, by
+  # `seam_execute_approved_captures_a_failing_command_as_a_result`
+  # (`apps/rocm/src/dash_seam.rs`, which replays a real refusing subprocess), and
+  # that such an envelope is then collapsed out of the chat, by
   # `approved_command_failure_stays_a_collapsed_envelope`
-  # (`crates/rocm-dash-tui/src/app/mod.rs`) and explained at the seam that decides
-  # it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
+  # (`crates/rocm-dash-tui/src/app/mod.rs`). The reasoning is written out at the
+  # seam that decides it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the
   # scenario plants two ready wheel runtimes and asserts the refusal names every

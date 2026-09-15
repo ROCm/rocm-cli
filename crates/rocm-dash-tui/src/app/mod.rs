@@ -6661,11 +6661,19 @@ mod tests {
     const AMBIGUOUS_RUNTIME_REFUSAL: &str = "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default \
          with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`.";
 
-    /// An executor whose approved replay reproduces what the real seam returns
+    /// An executor whose approved replay *replicates* what the real seam returns
     /// for a `rocm` subprocess that exited non-zero: `run_rocm_capture_for_paths`
     /// *captures* the failure, so `run_internal_mcp_call` returns `Ok` with an
     /// `isError: true` envelope and the stderr buried in `structuredContent` —
     /// it never returns `Err`, so the seam never builds `RocmToolOutcome::Error`.
+    ///
+    /// Replicates, not reaches: those producers live in the bin, which depends
+    /// on this crate, so this crate cannot call them. The envelope below is
+    /// hand-built to their shape and the test pins only what happens
+    /// *downstream* of it. That the producers really do hand the seam an `Ok`
+    /// envelope for a non-zero exit is pinned separately, against a real `rocm`
+    /// subprocess, by `seam_execute_approved_captures_a_failing_command_as_a_result`
+    /// in `apps/rocm/src/dash_seam.rs`.
     #[derive(Debug)]
     struct CapturedFailureExecutor;
     impl crate::tool_exec::RocmToolExecutor for CapturedFailureExecutor {
@@ -6704,13 +6712,15 @@ mod tests {
 
     #[test]
     fn approved_command_failure_stays_a_collapsed_envelope() {
-        // Pins the premise the ComfyUI e2e scenario's CLI-only scope rests on
-        // (`tests/e2e-cucumber/features/comfyui.feature`). A failing
-        // approval-gated `/comfyui install` is NOT an `Error` outcome: the exit
-        // code is captured into an envelope, so `run_approved` takes the
-        // `Result` arm and `summarize_json_value` collapses every field. The
-        // refusal text therefore stays out of the chat — reading the `Error` arm
-        // (`Approved · … failed: {e}`) as this path's renderer is wrong.
+        // Pins the second half of the premise the ComfyUI e2e scenario's
+        // CLI-only scope rests on (`tests/e2e-cucumber/features/comfyui.feature`):
+        // *given* the captured `isError: true` envelope, `run_approved` takes
+        // the `Result` arm and `summarize_json_value` collapses every field, so
+        // the refusal text stays out of the chat — reading the `Error` arm
+        // (`Approved · … failed: {e}`) as this path's renderer is wrong. The
+        // first half — that a non-zero `rocm` exit really does arrive as that
+        // envelope rather than as an `Err` — is pinned by the seam test named
+        // on `CapturedFailureExecutor` above.
         let shared: crate::tool_exec::SharedRocmToolExecutor =
             std::sync::Arc::new(CapturedFailureExecutor);
         let summary = run_approved(

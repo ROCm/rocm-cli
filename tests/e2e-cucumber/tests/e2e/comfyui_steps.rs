@@ -26,9 +26,13 @@
 //! `isError: true` envelope rather than raised, so the seam yields
 //! `RocmToolOutcome::Result` (never the `Error` arm that prints a message
 //! verbatim) and `summarize_json_value` collapses the envelope to
-//! `content: [1 items]`. Pinned by
-//! `approved_command_failure_stays_a_collapsed_envelope` in
-//! `crates/rocm-dash-tui/src/app/mod.rs`.
+//! `content: [1 items]`. Both links in that chain are pinned:
+//! `seam_execute_approved_captures_a_failing_command_as_a_result`
+//! (`apps/rocm/src/dash_seam.rs`) replays a real refusing `rocm` subprocess
+//! through the seam and asserts the `Result`/`isError: true` envelope, and
+//! `approved_command_failure_stays_a_collapsed_envelope`
+//! (`crates/rocm-dash-tui/src/app/mod.rs`) asserts that envelope is collapsed
+//! out of the chat.
 //!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
