@@ -25,8 +25,9 @@ name: E2E self-hosted
 # Re-date it here AND in docs/ci-hardware-testing.md — its "Blocking vs.
 # non-blocking" section and its "Required-check history" paragraph, which
 # carries the same date and the fuller story of why these names used to be
-# required. Those are the places known to carry it; ci.yml and
-# tests/e2e-cucumber/README.md point at them rather than asserting it
+# required. Those are the places known to carry it; ci.yml,
+# tests/e2e-cucumber/README.md and crates/e2e-report (which prints the reason
+# into the consolidated report) point at them rather than asserting it
 # themselves. Deliberately no count of how many places there are: naming them is
 # what helps, and a tally is what goes stale the moment someone adds another.
 

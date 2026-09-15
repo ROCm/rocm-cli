@@ -68,6 +68,11 @@ pub struct E2eWorld {
     /// be storing a stderr capture. Borrowing that slot for a second command's
     /// output breaks the rule at a distance: the step reading it back looks like
     /// it is making a claim about stderr. This field exists so nothing has to.
+    ///
+    /// Readability only — NOT a bug fix. Every assertion that moved here would
+    /// pass unchanged if the same strings went back into `cli_stderr`; what
+    /// changes is whether a reader of those steps is misled about which stream
+    /// they are asserting on.
     pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// Name of the scenario currently executing, set by the `before` hook. Used

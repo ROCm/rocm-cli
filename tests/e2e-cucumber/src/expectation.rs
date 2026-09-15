@@ -1392,9 +1392,15 @@ flaky = true
     /// vanish from the checks below, and a check that silently stops looking at
     /// something is worse than no check at all.
     fn feature_files() -> Vec<std::path::PathBuf> {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("features");
+        feature_files_in(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("features"))
+    }
+
+    /// The directory scan itself, split out so the subdirectory refusal can be
+    /// exercised against a temporary tree — against the real `features/` it
+    /// could only ever fire by someone breaking the repository.
+    fn feature_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&dir).expect("no features directory") {
+        for entry in std::fs::read_dir(dir).expect("no features directory") {
             let path = entry.expect("unreadable features directory entry").path();
             assert!(
                 !path.is_dir(),
@@ -1413,6 +1419,27 @@ flaky = true
             dir.display()
         );
         paths
+    }
+
+    #[test]
+    fn the_feature_scan_takes_the_flat_files_it_finds() {
+        let dir = tempfile::tempdir().expect("no temp dir");
+        std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+        let found = feature_files_in(dir.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("a.feature"), "{found:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "has grown a subdirectory")]
+    fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
+        // The branch that stops this scan quietly covering less than it claims.
+        // Unreachable against the real `features/`, so it is pinned here.
+        let dir = tempfile::tempdir().expect("no temp dir");
+        std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        let _ = feature_files_in(dir.path());
     }
 
     /// What one feature file claims about expected failures.
