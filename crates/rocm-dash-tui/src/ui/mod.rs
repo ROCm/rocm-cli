@@ -173,8 +173,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// A single hint line sits below it — no header, tab shell, dock, or footer
 /// legend. Used by the bare-`rocm` launcher's in-place flows (Set up / Serve /
 /// Diagnose), where the full dashboard chrome would be misleading. The overlay
-/// is drawn through the same [`draw_active_manager`] path the dashboard uses (so
-/// the approval / job-console layering is identical). Falls back to a centered
+/// is drawn through the same [`draw_active_manager`] path the dashboard uses,
+/// with the same dimmed-backdrop wash behind it, so the approval / job-console
+/// layering is identical to [`draw`]. Falls back to a centered
 /// "closing…" note when no overlay is open — defensive; the event loop breaks at
 /// that point and hands control back to the launcher.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
@@ -192,6 +193,11 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let footer_area = outer[1];
 
     if state.has_open_overlay() {
+        // Dim the periphery behind the modal, matching `draw()`'s treatment so
+        // the overlay reads as the foreground here too (previously this path
+        // skipped the wash entirely, leaving the area outside the manager card
+        // at plain theme background instead of dimmed).
+        modal::grey_overlay(f);
         let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
         draw_active_manager(f, manager_rect, state, &theme);
     } else {

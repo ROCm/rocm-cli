@@ -971,4 +971,38 @@ mod ported_chrome_tests {
             "overflowing help should render a scrollbar thumb: {out:?}"
         );
     }
+
+    #[test]
+    fn max_scroll_uses_post_scrollbar_width_not_pre_scrollbar_width() {
+        // Regression: `max_scroll` must be computed from `content_area.width`
+        // (one column narrower than `inner.width` once the scrollbar reserves
+        // its column), not `inner.width`. A line exactly as wide as
+        // `inner.width` fits on one row there, but wraps onto a second row
+        // once the scrollbar narrows the content area by one column — and
+        // that extra row must count toward `max_scroll`, or "scroll to end"
+        // permanently strands it just past the last reachable offset.
+        use ratatui::text::Line;
+        let theme = Theme::from_name("default-dark");
+        // area 80x10 -> inner 78x8 (1-cell border each side); once a
+        // scrollbar is drawn, content_area narrows to 77x8.
+        let area = Rect::new(0, 0, 80, 10);
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut lines: Vec<Line> = (0..10).map(|_| Line::from("x")).collect();
+        // Exactly `inner.width` (78) chars: one row at width 78, two rows at
+        // the post-scrollbar width of 77.
+        lines.push(Line::from("a".repeat(78)));
+        let mut max_scroll = 0;
+        term.draw(|f| {
+            max_scroll = super::draw_scrollable_lines(f, area, "Test", lines, 0, &theme);
+        })
+        .unwrap();
+        assert_eq!(
+            max_scroll, 4,
+            "max_scroll must reflect wrapping at the post-scrollbar width \
+             (77 -> 12 wrapped rows -> max_scroll 4), not the pre-scrollbar \
+             inner width (78 -> 11 wrapped rows -> max_scroll 3), or the \
+             wrapped second row of the long line becomes unreachable"
+        );
+    }
 }

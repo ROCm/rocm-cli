@@ -5603,6 +5603,34 @@ mod tests {
     }
 
     #[test]
+    fn scroll_modal_action_reaches_scroll_help_only_for_help_modals() {
+        // Regression: earlier coverage only exercised `scroll_help` directly,
+        // never through `apply_action`, so a broken/removed `ScrollModal`
+        // dispatch arm (e.g. a wrong `matches!` guard) would pass every
+        // existing test while the real `{`/`}` keys silently did nothing.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::Help;
+        s.help_max_scroll = 10;
+        apply_action(&mut s, KeyAction::ScrollModal(3));
+        assert_eq!(s.help_scroll, 3, "Help modal scrolls via apply_action");
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::GlobalHelp;
+        s.help_max_scroll = 10;
+        apply_action(&mut s, KeyAction::ScrollModal(3));
+        assert_eq!(
+            s.help_scroll, 3,
+            "GlobalHelp modal scrolls via apply_action"
+        );
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::None;
+        s.help_max_scroll = 10;
+        apply_action(&mut s, KeyAction::ScrollModal(3));
+        assert_eq!(s.help_scroll, 0, "no modal open: ScrollModal is a no-op");
+    }
+
+    #[test]
     fn slash_clear_empties_transcript() {
         let mut s = st();
         s.chat.push(ChatTurn::user("hi"));

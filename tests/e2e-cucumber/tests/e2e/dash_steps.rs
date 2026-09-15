@@ -633,15 +633,17 @@ async fn navigation_guidance_displayed(world: &mut E2eWorld) {
 #[then("replay controls guidance is displayed")]
 async fn replay_controls_guidance_displayed(world: &mut E2eWorld) {
     let tui = session(world);
-    // REPLAY is the last group in the flattened, scrollable help body — it
-    // sits past what an 80x24 terminal shows without scrolling, so this
-    // proves the scroll wiring actually reaches previously-clipped content.
-    tui.wait_for_screen("pause / resume", default_timeout())
+    // REPLAY is the last group in the flattened, scrollable help body, but
+    // most of it (including "pause / resume") already fits on an 80x24
+    // screen at scroll=0. Only "jump ±60s" — the group's last line — sits
+    // past the fold, so it's the one line that actually proves the scroll
+    // wiring reaches previously-clipped content.
+    tui.wait_for_screen("jump ±60s", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("replay controls guidance did not appear after scrolling: {e}"));
     let screen = tui.screen_text();
     assert!(
-        screen.contains("REPLAY") && screen.contains("pause / resume"),
+        screen.contains("REPLAY") && screen.contains("jump ±60s"),
         "replay controls guidance missing after scrolling to end of help:\n{screen}"
     );
 }
