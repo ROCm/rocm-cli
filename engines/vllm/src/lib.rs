@@ -2875,9 +2875,15 @@ mod tests {
             "the --symptom argument must stay a single balanced quoted word: {command}"
         );
         let symptom = quoted_symptom_argument(&hint);
-        assert!(
-            !symptom.contains('\''),
-            "no apostrophe may reach the single-quoted argument: {symptom:?}"
+        // Pin which branch ran, not just that no apostrophe survived: "contains
+        // no `'`" also holds if the apostrophes were silently deleted from the
+        // user's line, which is the escaping-style behaviour the fallback exists
+        // to avoid. Rejection means the canonical symptom, exactly.
+        assert_eq!(
+            symptom,
+            rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
+            "a quote-bearing line must be rejected in favour of the canonical symptom, \
+             not silently rewritten: {symptom:?}"
         );
         // ...and the command it does print must still report a cause.
         assert!(
@@ -2896,13 +2902,28 @@ mod tests {
             !hint.chars().any(|c| c.is_control() && c != '\n'),
             "no control byte may survive into the printed hint: {hint:?}"
         );
-        assert!(
-            !hint.contains("[31m") && !hint.contains("[0m"),
-            "the ANSI sequence must be removed whole, not just its escape byte: {hint:?}"
+        // Pin the exact rendering rather than the absence of a few fragments.
+        // Absence checks cannot fail for the defect they name: a stripper that
+        // drops the escape byte and the `[` it introduces and nothing further
+        // leaves `31m`/`0m` behind, which contains neither `[31m` nor `[0m` and
+        // carries no control byte, so every absence check still passes.
+        assert_eq!(
+            strip_terminal_control_sequences(log_tail),
+            "RuntimeError: HIP out of memory",
+            "the ANSI sequence must be removed whole, not just its escape byte"
         );
-        assert!(
-            hint.contains("RuntimeError: HIP out of memory"),
-            "the readable part of the failing line must survive: {hint:?}"
+        // The colourised line is not quotable (control bytes), so the command
+        // falls back to the canonical symptom while the echoed sentence keeps
+        // the user's own line, stripped.
+        assert_eq!(
+            hint,
+            format!(
+                "\n\nDetected an out-of-memory failure (RuntimeError: HIP out of memory). {}\n\
+                 For conditional remediation, run `rocm diagnose --symptom '{}'`.",
+                rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
+            ),
+            "the echoed line must render exactly, with the whole escape sequence gone"
         );
     }
 
