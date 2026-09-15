@@ -3589,7 +3589,6 @@ dependencies = [
  "unicode-width",
  "ureq",
  "windows-native-keyring-store",
- "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
 ]
 
@@ -3755,7 +3754,6 @@ dependencies = [
  "sha2",
  "tokio",
  "ureq",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
