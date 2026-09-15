@@ -261,28 +261,31 @@ recognise failure modes that are in the catalog: no match means "not
 recognised", not "nothing is wrong" — in that case it points you at where to
 report the symptom. Each result prints an `id:` and an `apply with:` command;
 the leading `#1`, `#2` are ranking positions for reading order only — `rocm
-fix` takes the id, not the position. `--symptom` takes raw error text to
-sharpen keyword scoring; `--top` caps how many matches are shown in the
-human-readable output (default 5) — `--json` always emits the full,
-untruncated report; `--distro` diagnoses a WSL
-distribution from the Windows host instead of this machine (nothing needs to
-be installed inside the distribution — name it only when more than one is
-installed). Inspecting remotely this way skips checks that need to read the
-distribution's own environment (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the
-framework/ROCm pairing) — run `rocm diagnose` inside the distribution for
-those.
+fix` takes the id, not the position.
+
+- `--symptom` takes raw error text to sharpen keyword scoring.
+- `--top` caps how many matches are shown in the human-readable output
+  (default 5) — `--json` always emits the full, untruncated report.
+- `--distro` diagnoses a WSL distribution from the Windows host instead of
+  this machine (nothing needs to be installed inside the distribution — name
+  it only when more than one is installed). Inspecting remotely this way
+  skips checks that need to read the distribution's own environment
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
+  `rocm diagnose` inside the distribution for those.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
 to list the whole catalog. Each fix is marked AUTO (this command carries out
 the change) or PRINT-ONLY (it prints the steps for you to run yourself —
 usually because the right command depends on a choice only you can make,
-sometimes because it also needs sudo or a reboot). Use `--dry-run` to see any
-fix's plan without changing anything, and `--yes` to skip the interactive
-confirmation once you've reviewed it. `--device-index` pins the discrete GPU
-index for `fix-9-igpu-dgpu`; without it, that fix only prints the `rocminfo`
-(Linux) or `hipInfo.exe` (Windows) query needed to find the index and makes
-no change, despite being marked AUTO.
+sometimes because it also needs sudo or a reboot).
+
+- `--dry-run` shows any fix's plan without changing anything.
+- `--yes` skips the interactive confirmation once you've reviewed it.
+- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`;
+  without it, that fix only prints the `rocminfo` (Linux) or `hipInfo.exe`
+  (Windows) query needed to find the index and makes no change, despite
+  being marked AUTO.
 
 ### ROCm installation
 
@@ -490,21 +493,23 @@ throughput — a local smoke test, **not** an official ROCm/AMD benchmark.
 multi-turn, long-context tool traffic and isn't comparable to `*-agent-bench`
 quality harnesses.
 
-`--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
-plain host address without `/v1` also works); only `http://` is accepted —
-`https://` endpoints are rejected outright, since the load generator has no
-TLS backend compiled in. `--concurrency` sweeps a comma-separated list of
-levels (default `1,8,32,64`, each 1-128); `--auto-ramp` ignores
-`--concurrency` and instead ramps `1,2,4,8,16,32,64,128` automatically,
-stopping early once generation throughput plateaus or the request queue backs
-up. `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
-1-32768, and `--requests` (default 128) accepts 1-10000. Results are written
-to `--out` (default `<data-dir>/bench/results.csv`, where `<data-dir>` is
-`~/.rocm` unless overridden), intended to match the path the daemon tails to
-feed the dashboard's **Observe** tab. The CLI's default output path and the
-daemon's tailed path are computed independently, so if either the CLI's data
-dir or the daemon's `bench_results_dir` config has been customized, confirm
-they still point at the same file.
+- `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
+  plain host address without `/v1` also works); only `http://` is accepted —
+  `https://` endpoints are rejected outright, since the load generator has no
+  TLS backend compiled in.
+- `--concurrency` sweeps a comma-separated list of levels (default
+  `1,8,32,64`, each 1-128); `--auto-ramp` ignores `--concurrency` and instead
+  ramps `1,2,4,8,16,32,64,128` automatically, stopping early once generation
+  throughput plateaus or the request queue backs up.
+- `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
+  1-32768, and `--requests` (default 128) accepts 1-10000.
+- Results are written to `--out` (default `<data-dir>/bench/results.csv`,
+  where `<data-dir>` is `~/.rocm` unless overridden), intended to match the
+  path the daemon tails to feed the dashboard's **Observe** tab. The CLI's
+  default output path and the daemon's tailed path are computed
+  independently, so if either the CLI's data dir or the daemon's
+  `bench_results_dir` config has been customized, confirm they still point
+  at the same file.
 
 ### Chat
 
