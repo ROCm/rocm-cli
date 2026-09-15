@@ -61,11 +61,26 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
     horiz[1]
 }
 
+/// Narrowest a popup is allowed to be shrunk to by the percentage, so a modal
+/// on a merely small terminal is still wide enough to read.
+const MIN_POPUP_WIDTH: u16 = 20;
+
 /// Width [`centered_rect`] will give a popup, split out so a caller that needs
 /// to lay its content out *before* the popup exists (to size the popup to that
 /// content) cannot drift from the real geometry.
+///
+/// The [`MIN_POPUP_WIDTH`] floor is itself clamped to `area.width`, which is the
+/// difference between a number the popup might get and the number it *will*
+/// get. An unclamped floor returns 20 on a terminal narrower than 20 — a width
+/// the popup can never have, because [`centered_rect`]'s `Layout::split`
+/// truncates the segment to the area. That is harmless for a caller that only
+/// renders, but both help modals now *measure* their wrapped content against
+/// this width before the popup exists: measuring the wrap at 20 columns and
+/// rendering it into 12 under-counts the rows the content needs and cuts the
+/// tail off — the precise silent truncation content-sizing was added to remove.
 pub fn centered_width(pct_x: u16, max_w: u16, area: Rect) -> u16 {
-    scale_pct(area.width, pct_x).min(max_w).max(20)
+    let floor = MIN_POPUP_WIDTH.min(area.width);
+    scale_pct(area.width, pct_x).min(max_w).max(floor)
 }
 
 /// Render a bordered block with `title` over `area` after clearing it,
@@ -109,6 +124,12 @@ pub fn draw_scrollable_lines(
 /// with no scrollbar or indicator to say so. Content-sizing keeps every hint on
 /// screen wherever the room exists, and adding a hint can no longer push an
 /// unrelated one off the bottom.
+///
+/// Where the room does *not* exist — a terminal too short for the hint list even
+/// at full height — the content is still cut, and the modal does not scroll.
+/// [`help_title`] marks the title in that case rather than leaving the user to
+/// guess, which is the whole of what is claimed here: an honest indicator, not a
+/// guarantee that everything is visible.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
@@ -191,9 +212,37 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let width = centered_width(70, 80, area);
     let needed = popup_height_for(p.line_count(width.saturating_sub(2)));
     let popup = centered_rect(70, 100, 80, needed, area);
-    let inner = draw_popup_frame(f, popup, "Help", theme);
+    let inner = draw_popup_frame(f, popup, &help_title("Help", needed, popup), theme);
 
     f.render_widget(p, inner);
+}
+
+/// Title for a content-sized help popup, marked when the content did not fit.
+///
+/// `needed` is the height the wrapped content asked for; `popup` is what the
+/// area could actually give it. When the popup is shorter, the tail of the
+/// content is off-screen — and these modals are *sized*, not scrolled, so there
+/// is no scrollbar, no scroll position, and nothing the user can press to see
+/// the rest. Saying so is the only honest option left; the alternative is the
+/// silent truncation this module's doc comments call the original defect.
+///
+/// The marker goes in the border title rather than the body because a body
+/// marker would cost a content row on precisely the terminal that has none to
+/// spare — it would evict a hint to announce that hints were evicted.
+///
+/// Residual, stated rather than papered over: [`panel::title_fits`] is false on
+/// a popup too narrow for the marked form, and a title that does not fit is
+/// dropped rather than overflowing the border. Rather than lose the plain
+/// "Help" as well, the bare title is used there and the truncation goes
+/// unmarked. That is a popup under ~30 columns, i.e. a terminal well below
+/// anything the dashboard lays out usefully.
+fn help_title(base: &str, needed: u16, popup: Rect) -> String {
+    let marked = format!("{base} (truncated — resize)");
+    if needed > popup.height && panel::title_fits(popup.width, &marked) {
+        marked
+    } else {
+        base.to_string()
+    }
 }
 
 /// Popup height that shows `content_rows` rows of wrapped content: the content
@@ -628,6 +677,10 @@ pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 /// the right-hand column landed on the last usable row and one more hint — or
 /// one more wrap, from a wording change — would have pushed it off. On a roomy
 /// terminal the same fixed shape drew ten blank rows below the content.
+///
+/// Shares [`help_title`] with [`draw_help`], so the residual case — a terminal
+/// too short even for the content-sized modal — is marked here the same way and
+/// under the same caveat.
 pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
     grey_overlay(f);
     let left: &[(&str, &[(&str, &str)])] = &[
@@ -683,7 +736,7 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
     );
 
     let modal = centered_rect(80, 100, 100, needed, area);
-    let inner = draw_popup_frame(f, modal, "Keyboard", theme);
+    let inner = draw_popup_frame(f, modal, &help_title("Keyboard", needed, modal), theme);
     if inner.height == 0 {
         return;
     }
@@ -1165,6 +1218,84 @@ mod ported_chrome_tests {
                     painted.join("\n")
                 );
             }
+        }
+    }
+
+    /// The width the content-sized modals *measure* their wrapped content
+    /// against must be the width the popup actually gets.
+    ///
+    /// `centered_width`'s minimum-width floor is what can break that. On a
+    /// terminal narrower than the floor, an unclamped floor hands back a number
+    /// `centered_rect` then truncates (`Layout::split` cannot emit a segment
+    /// wider than its input), so `draw_help` / `draw_global_help` count the rows
+    /// their content wraps to at one width and render it at a narrower one —
+    /// under-counting the rows needed and cutting the tail off. That is the
+    /// silent truncation content-sizing exists to remove, re-introduced at a
+    /// geometry nothing else in this module exercises.
+    ///
+    /// Both live `(pct_x, max_w)` pairs are checked: `draw_help`'s 70/80 and
+    /// `draw_global_help`'s 80/100.
+    #[test]
+    fn popup_width_is_never_wider_than_a_narrow_area() {
+        for w in 0..=24u16 {
+            let area = Rect::new(0, 0, w, 40);
+            for (pct_x, max_w) in [(70u16, 80u16), (80, 100)] {
+                let measured = super::centered_width(pct_x, max_w, area);
+                assert!(
+                    measured <= w,
+                    "centered_width({pct_x}, {max_w}) returned {measured} on a \
+                     {w}-column area: the modals would measure their content at \
+                     a width the popup cannot have"
+                );
+                assert_eq!(
+                    super::centered_rect(pct_x, 100, max_w, 10, area).width,
+                    measured,
+                    "the popup's rendered width must equal the width its \
+                     content was measured against ({w}-column area)"
+                );
+            }
+        }
+    }
+
+    /// When the content still cannot fit at full height, the modal says so.
+    ///
+    /// It is sized, not scrolled: there is no scrollbar and nothing to press, so
+    /// an unmarked short modal is indistinguishable from a complete one. The
+    /// marker lives in the border title, which costs no content row.
+    #[test]
+    fn help_modals_mark_the_title_when_the_content_still_cannot_fit() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let painted = |w: u16, h: u16, global: bool| -> String {
+            let area = Rect::new(0, 0, w, h);
+            rows(w, h, |f| {
+                if global {
+                    super::draw_global_help(f, area, &theme);
+                } else {
+                    super::draw_help(f, area, ActiveTab::Chat, &theme);
+                }
+            })
+            .join("\n")
+        };
+
+        // Ten rows holds neither hint list — the sibling test above pins that
+        // `draw_help` is clamp-bound here — so both must be marked.
+        for global in [false, true] {
+            let out = painted(80, 10, global);
+            assert!(
+                out.contains("truncated"),
+                "a modal that cut its content must say so (global={global}):\n{out}"
+            );
+        }
+        // Roomy: every hint fits, so the marker must NOT appear — it would be a
+        // false alarm on the geometry the product is normally used at.
+        for (w, h, global) in [(80u16, 44u16, false), (80, 20, true), (120, 30, true)] {
+            let out = painted(w, h, global);
+            assert!(
+                !out.contains("truncated"),
+                "{w}x{h}: a modal that fits must not claim it was truncated \
+                 (global={global}):\n{out}"
+            );
         }
     }
 

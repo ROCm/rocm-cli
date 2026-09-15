@@ -610,17 +610,34 @@ impl TuiSession {
     /// observed code for the scenario's `Then` steps.
     ///
     /// Sends the raw byte `0x03` — what a terminal actually transmits for the
-    /// keystroke — rather than a signal, and that distinction is the point.
-    /// While the TUI holds the terminal in raw mode, `ISIG` is off (and
-    /// `ENABLE_PROCESSED_INPUT` on Windows), so the driver does not turn the
-    /// keystroke into SIGINT: nothing in the process ever sees a signal, and the
-    /// byte arrives as an ordinary key event. Only sending it covers the gesture
-    /// a user performs; [`deliver_signal_and_wait`](Self::deliver_signal_and_wait)
-    /// covers the externally delivered signal, which is a genuinely different
-    /// path.
+    /// keystroke — rather than a signal. While the TUI holds the terminal in raw
+    /// mode, `ISIG` is off (and `ENABLE_PROCESSED_INPUT` on Windows), so the
+    /// driver does not translate the keystroke into SIGINT and the byte arrives
+    /// as an ordinary key event. That is the gesture a user performs;
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) covers the
+    /// externally delivered signal.
     ///
-    /// As there, only harness faults are `Err`; the exit *value* and terminal
-    /// restoration are asserted by the scenario's `Then` steps.
+    /// What the scenario's assertions do and do not distinguish, stated plainly
+    /// because the two paths converge:
+    ///
+    /// - The *outcome* assertions (exit code 130, terminal restored) are
+    ///   byte-identical to the SIGINT scenario's, and cannot tell the paths
+    ///   apart on their own.
+    /// - The discrimination comes from the input plus the fact that the process
+    ///   exits **at all**. Delete the key-event arm and no signal is ever
+    ///   raised, so nothing ends the process and this call fails on its timeout.
+    ///   That is the regression the step is here to catch, and it catches it.
+    /// - It does **not** independently prove no signal was involved. That rests
+    ///   on the product's own raw mode: a build that failed to enter raw mode
+    ///   would leave `ISIG` on, the tty would turn `0x03` into a SIGINT, and
+    ///   these same assertions would still pass via the signal handler. Probing
+    ///   the pty's termios from the master side would need `libc`/`nix` in the
+    ///   harness, which this module deliberately avoids (see
+    ///   [`deliver_signal_and_wait`](Self::deliver_signal_and_wait), which shells
+    ///   out to `kill(1)` for the same reason).
+    ///
+    /// As with the signal path, only harness faults are `Err`; the exit *value*
+    /// and terminal restoration are asserted by the scenario's `Then` steps.
     pub async fn press_ctrl_c_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         self.send("\u{3}")?;
         let code = self.wait_for_exit_code(timeout).await?;
@@ -686,6 +703,14 @@ impl TuiSession {
     /// terminal-restore sequences a signal handler emits arrive immediately
     /// before the process exits, so the parser must see them before restoration
     /// is asserted.
+    ///
+    /// That drain runs on *every* path through here, including callers that
+    /// predate the signal scenarios ([`wait_for_exit`](Self::wait_for_exit), and
+    /// through it [`quit_and_wait`](Self::quit_and_wait)). It is not gated on the
+    /// caller needing it, because the frame is just as buffered after a `q` as
+    /// after a signal. It ends the moment the reader thread sees EOF — the usual
+    /// case, costing about one [`POLL_INTERVAL`] — with [`DRAIN_TIMEOUT`] as the
+    /// ceiling a wedged PTY can impose.
     pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {

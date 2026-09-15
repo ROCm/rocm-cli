@@ -2556,6 +2556,27 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // (above every operational overlay and the general handler)
                     // so the operator's decision can't be pre-empted by a screen
                     // behind it. Only the Ctrl-C arm above outranks it.
+                    //
+                    // Spelling out the consequence, because it is the one that
+                    // surprises: a typed Ctrl-C while an approval is pending
+                    // QUITS the dashboard. It is not consumed by the modal and
+                    // it is not a decline. That is deliberate — Ctrl-C is the
+                    // gesture a user reaches for to get out of a program, and a
+                    // modal that swallowed it would recreate the wedge this PR
+                    // fixes (the pre-fix dashboard ignored Ctrl-C entirely and
+                    // left the user in a raw-mode terminal), which is worse here
+                    // than anywhere: the approval modal is exactly where someone
+                    // wants out in a hurry. Nothing is lost by quitting — the
+                    // pending action has NOT run (approval is what would run
+                    // it), so declining and quitting leave identical state on
+                    // disk; only the chat turn differs. The help surfaces say
+                    // "quit" for Ctrl-C without exception for this modal, which
+                    // is therefore accurate.
+                    //
+                    // To decline without quitting there are `n` (deny) and
+                    // `Esc` / `q` (cancel) — `ui::approval::approval_key`, which
+                    // ignores Ctrl-C, so without the arm above the gesture would
+                    // be a silent no-op on this screen.
                     // On Approve: replay the approved action off the
                     // event loop (spawn_blocking) and post ChatApprovalResult.
                     // On Deny/Cancel: a declined turn, no execution.
