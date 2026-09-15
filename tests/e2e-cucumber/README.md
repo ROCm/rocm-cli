@@ -112,10 +112,10 @@ carrying one runs only where its env var is set: `@nightly`
 `@merge-queue` (`E2E_MERGE_QUEUE`, set on the merge-queue lanes). Note what that
 means for gating: a `@merge-queue` scenario does not run on ordinary per-PR CI
 at all, and the lanes that do run it — the self-hosted ones in
-`.github/workflows/e2e-selfhosted.yml`, not `ci.yml` — are non-blocking. That
-file's header says why, and is the only place the repo records it; branch
-protection is a GitHub setting no checkout can verify, so it is not restated
-here.
+`.github/workflows/e2e-selfhosted.yml`, not `ci.yml` — are non-blocking. Branch
+protection is a GitHub setting no checkout can verify, so the reason is not
+restated here: that file's header gives it, and `docs/ci-hardware-testing.md`
+carries the fuller history.
 
 ### Naming
 

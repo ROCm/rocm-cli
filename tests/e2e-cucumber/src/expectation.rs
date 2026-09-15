@@ -1437,6 +1437,14 @@ flaky = true
     /// a blank line is the same character the file already uses to separate
     /// scenarios. Reporting it also keeps the failure honest about where the
     /// problem is: the comment, not the scenario that happens to follow it.
+    ///
+    /// This is line-shaped, not a Gherkin parse. It assumes the phrase appears
+    /// only in real `#` comments (not inside a docstring or table cell) and
+    /// that `Scenario:`/`Scenario Outline:` are the only block terminators —
+    /// `Background:` is not treated as one. Neither construct exists anywhere in
+    /// `features/` today, and both would fail loudly (an unbound claim) rather
+    /// than silently if one appeared, but a reader adding either should revisit
+    /// this scan first.
     fn claimed_failure_ids(text: &str) -> FailureClaims {
         let (mut ids, mut unbound) = (Vec::new(), Vec::new());
         let (mut claim_lines, mut pending_ids): (Vec<usize>, Vec<String>) =
@@ -1520,6 +1528,21 @@ flaky = true
         );
         // The scenario has silently left the guard's coverage in every earlier
         // version of this scan. It must not do so silently.
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [3]);
+    }
+
+    #[test]
+    fn a_claim_dangling_at_end_of_file_is_reported_not_dropped() {
+        // The `Scenario:` that would have bound this claim was deleted, leaving
+        // the comment as the last thing in the file. Covers the flush after the
+        // loop, which the blank-line and `Scenario:` cases never reach.
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 @id:thing-is-broken\n",
+        );
         assert!(claims.ids.is_empty(), "{:?}", claims.ids);
         assert_eq!(claims.unbound, [3]);
     }
