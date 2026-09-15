@@ -266,3 +266,21 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that machine
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of. When the copy that loads belongs to a different
+  # installation than the runtime, compilation fails with an error naming
+  # neither. Both remedies — remove one stack, or reorder the search path — can
+  # break a working Python environment, and which is right depends on which
+  # stack the user means to keep. So the CLI states them and changes nothing.
+  #
+  # The conflict itself cannot be provoked here: the suite cannot install a
+  # second ROCm stack, and the detection rule is proven by unit tests that build
+  # the machine state directly. What this pins is the half that matters if the
+  # entry ever stops being advisory — that asking for it changes nothing and
+  # recommends neither option.
+  @id:diagnose-fix-comgr-conflict-is-advisory-only
+  Scenario: diagnose-20 - The fix for a shadowed compilation library changes nothing and recommends nothing
+    Given a user who has chosen the fix for a shadowed compilation library
+    When the user asks the CLI to apply that fix
+    Then the CLI explains that it will not make the change itself
+    And the CLI offers both options without ranking them
