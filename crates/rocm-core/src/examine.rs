@@ -1557,18 +1557,26 @@ fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpre
         "Probed torch with the active managed runtime's interpreter: {}",
         interpreter.python.display()
     ));
-    let (_, out, err) = run_with_env(
+    let env = runtime_library_path_env(e, &interpreter.library_paths);
+    let (rc, out, err) = run_with_env(
         &interpreter.python.display().to_string(),
         &["-c", PYTORCH_PROBE],
-        &runtime_library_path_env(&interpreter.library_paths),
+        &env,
         Duration::from_secs(20),
     );
-    record_pytorch_probe(e, &out, &err);
+    record_pytorch_probe(e, rc, &out, &err);
 }
 
 /// Compose the loader path a runtime's torch needs, runtime entries ahead of
 /// whatever the host already has, so the runtime's own ROCm wins.
-fn runtime_library_path_env(library_paths: &[PathBuf]) -> Vec<(String, OsString)> {
+///
+/// A failure to compose it is recorded rather than swallowed: the import that
+/// follows would die on a missing ROCm library and read as a broken runtime,
+/// which is the misdiagnosis this whole path exists to avoid.
+fn runtime_library_path_env(
+    e: &mut Examination,
+    library_paths: &[PathBuf],
+) -> Vec<(String, OsString)> {
     if library_paths.is_empty() {
         return Vec::new();
     }
@@ -1576,9 +1584,16 @@ fn runtime_library_path_env(library_paths: &[PathBuf]) -> Vec<(String, OsString)
     if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
         entries.extend(std::env::split_paths(&existing));
     }
-    std::env::join_paths(entries)
-        .map(|joined| vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)])
-        .unwrap_or_default()
+    match std::env::join_paths(entries) {
+        Ok(joined) => vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)],
+        Err(err) => {
+            e.framework_notes.push(format!(
+                "Could not compose {RUNTIME_LIBRARY_PATH_ENV} for the runtime's interpreter ({err}); \
+                 its torch may fail to load the runtime's ROCm libraries."
+            ));
+            Vec::new()
+        }
+    }
 }
 
 fn probe_pytorch_on_path(e: &mut Examination) {
@@ -1593,25 +1608,36 @@ fn probe_pytorch_on_path(e: &mut Examination) {
     };
     e.framework_source = "path".to_owned();
     let (rc, out, err) = run(py, &["-c", PYTORCH_PROBE], Duration::from_secs(20));
-    let (out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3") {
-        let (_, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
+    let (rc, out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3")
+    {
+        let (rc2, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
         if out2.trim().is_empty() {
-            (out, err)
+            (rc, out, err)
         } else {
-            (out2, err2)
+            (rc2, out2, err2)
         }
     } else {
-        (out, err)
+        (rc, out, err)
     };
-    record_pytorch_probe(e, &out, &err);
+    record_pytorch_probe(e, rc, &out, &err);
 }
 
-fn record_pytorch_probe(e: &mut Examination, out: &str, err: &str) {
+fn record_pytorch_probe(e: &mut Examination, rc: i32, out: &str, err: &str) {
     if out.trim().is_empty() {
-        e.framework_notes.push(
-            "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
+        // `run` reports 127 when the program could not be spawned and 124 on
+        // timeout. Those are facts about the interpreter, not about torch, and
+        // the venv advice below is actively wrong for a managed runtime — its
+        // interpreter is the one that was asked.
+        e.framework_notes.push(match rc {
+            127 => "The torch probe interpreter could not be started.".to_owned(),
+            124 => "The torch probe timed out.".to_owned(),
+            _ if e.framework_source == "managed-runtime" => {
+                "The active managed runtime's interpreter returned nothing for the torch probe."
+                    .to_owned()
+            }
+            _ => "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
                 .to_owned(),
-        );
+        });
         if let Some(last) = err.trim().lines().last() {
             let snippet: String = last.chars().take(200).collect();
             e.framework_notes.push(format!("python stderr: {snippet}"));
@@ -1676,7 +1702,6 @@ fn probe_llama_cpp(e: &mut Examination) {
             .push("No llama.cpp binary (llama-cli/llama-server/main) on PATH.".to_owned());
         return;
     };
-    e.framework_source = "path".to_owned();
     let (rc, out, err) = run(binary, &["--version"], Duration::from_secs(10));
     let body = format!("{out}{err}");
     if rc != 0 && body.is_empty() {
@@ -1684,6 +1709,10 @@ fn probe_llama_cpp(e: &mut Examination) {
             .push(format!("{binary} --version exited rc={rc}"));
         return;
     }
+    // Set only now that this probe is the one answering. Setting it on finding
+    // the binary would, on the `Auto` fall-through from a failed runtime probe,
+    // relabel the runtime's answer as the ambient one.
+    e.framework_source = "path".to_owned();
     e.framework = "llama-cpp".to_owned();
     e.framework_version = body.trim().lines().next().map_or_else(
         || "unknown".to_owned(),

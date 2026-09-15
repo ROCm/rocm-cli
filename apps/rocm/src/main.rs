@@ -2419,9 +2419,14 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
     } else {
         // Same reasoning as `examine --json`: the catalog reasons over the torch
         // the engines will load, which is the active runtime's.
-        let paths = AppPaths::discover()?;
-        let config = RocmCliConfig::load(&paths).unwrap_or_default();
-        let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
+        //
+        // Best-effort, unlike `examine`'s copy: this command already promises to
+        // answer on a degraded host, so a path-discovery failure must cost only
+        // the managed-runtime lookup, never the diagnosis.
+        let interpreter = AppPaths::discover().ok().and_then(|paths| {
+            let config = RocmCliConfig::load(&paths).unwrap_or_default();
+            rocm_core::active_managed_framework_interpreter(&paths, &config)
+        });
         rocm_core::Examination::probe_with_interpreter(
             rocm_core::FrameworkProbe::Auto,
             interpreter.as_ref(),

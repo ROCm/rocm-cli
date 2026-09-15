@@ -466,9 +466,7 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         fix_id: "fix-1-arch".to_owned(),
         auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
-        notes: vec![
-            "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
-        ],
+        notes: notes_1_arch(e),
         ..Fix::default()
     };
     finalize(
@@ -478,6 +476,24 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// The arch-list evidence this checker reads can now come from a managed
+/// runtime's torch, which the bare `pip` commands above would not touch — they
+/// resolve against whatever interpreter is on `PATH`, a different environment.
+/// Say which one the evidence describes rather than letting the commands imply
+/// it.
+fn notes_1_arch(e: &Examination) -> Vec<String> {
+    let mut notes = vec![
+        "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
+    ];
+    if e.framework_source == "managed-runtime" {
+        notes.push(
+            "This host's torch was read from the active managed runtime, not from `PATH`. Run the commands above against that runtime's own interpreter -- `rocm examine --json` names it under framework_notes -- or a bare `pip` will change a different environment and leave this unfixed."
+                .to_owned(),
+        );
+    }
+    notes
 }
 
 fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
@@ -2288,6 +2304,33 @@ mod tests {
             finding.score >= MIN_SCORE_FOR_MATCH,
             "the version evidence alone has to establish it: {}",
             finding.score
+        );
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
+        // The Windows-shaped sibling of the check_8 gate, and the reason
+        // check_13's own note already gives: TheRock wheels bring their own HIP
+        // runtime, so a HIP-build torch on a host with no system HIP SDK says
+        // nothing when that torch came from a managed runtime.
+        let windows = |source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+
+        let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        let ambient = check_13_hip_sdk_missing(&windows("path"), "");
+        assert_eq!(
+            ambient.score - managed.score,
+            25,
+            "the HIP-build clause must apply to the ambient torch and only to it \
+             (managed {}, ambient {})",
+            managed.score,
+            ambient.score
         );
     }
 
