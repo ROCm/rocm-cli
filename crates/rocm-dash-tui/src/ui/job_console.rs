@@ -235,7 +235,7 @@ pub fn draw_job_console(
     let hints = if matches!(job.status, JobStatus::Running) {
         "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
     } else {
-        "Enter/Esc dismiss · wheel / PgUp·PgDn scroll"
+        "Enter/Esc cancel · wheel / PgUp·PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(

@@ -126,7 +126,10 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scrol
         ("Tab / Shift-Tab", "next / previous tab"),
         ("1 .. 5", "jump to tab"),
         ("t", "open theme picker"),
-        ("Esc", "open the main menu"),
+        (
+            "Esc",
+            "back out one step (see the active tab's own Esc below)",
+        ),
     ];
     let replay: &[(&str, &str)] = &[
         ("Space", "pause / resume"),
@@ -140,7 +143,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme, scrol
             ("j / k  ↑ / ↓", "select an action"),
             ("→ / Enter", "open it in Details (asks before mutating)"),
             ("←", "Details preview → Actions list"),
-            ("Esc", "close an open manager (back to Actions)"),
+            ("Esc", "in Details, back out to Actions first"),
         ],
         ActiveTab::Observe => &[
             ("j / Down", "select next instance"),

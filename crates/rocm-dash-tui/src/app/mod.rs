@@ -544,6 +544,13 @@ pub struct AppState {
     /// so a "jump to end" (`i16::MAX`) can't leave the offset far past the
     /// real content length.
     pub help_max_scroll: u16,
+    /// Scroll offset (in lines) inside the instance Detail modal's body
+    /// (launch args / env vars panes). Reset when the modal opens.
+    pub instance_detail_scroll: u16,
+    /// Last-measured upper bound for `instance_detail_scroll`, written back
+    /// by the renderer each frame (see `ui::tabs::instances::draw_detail`),
+    /// mirroring `help_max_scroll`.
+    pub instance_detail_max_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.
     /// Shared by whichever operational manager is showing its console; reset
     /// when an overlay opens (`close_overlays`).
@@ -752,6 +759,8 @@ impl AppState {
             bench_detail_scroll: 0,
             help_scroll: 0,
             help_max_scroll: 0,
+            instance_detail_scroll: 0,
+            instance_detail_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -1144,6 +1153,7 @@ impl AppState {
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
     pub fn open_theme_picker(&mut self) {
+        self.close_overlays();
         let names = crate::ui::theme::theme_names();
         self.theme_picker_sel = names
             .iter()
@@ -1204,6 +1214,27 @@ impl AppState {
         let max = i32::from(self.help_max_scroll);
         let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
         self.help_scroll = next;
+    }
+
+    /// Reset the instance Detail modal's scroll offset (called when opening
+    /// the modal, so a stale offset never carries over from a previous
+    /// instance's selection).
+    pub const fn reset_instance_detail_scroll(&mut self) {
+        self.instance_detail_scroll = 0;
+        self.instance_detail_max_scroll = 0;
+    }
+
+    /// Adjust the instance Detail modal's scroll. `delta` is in lines;
+    /// clamped against `[0, instance_detail_max_scroll]` (the latter is last
+    /// written back by the renderer, see `instance_detail_max_scroll`), so
+    /// `i16::MIN`/`i16::MAX` ("jump to start/end") land exactly on
+    /// `0`/`instance_detail_max_scroll` instead of overflowing into an offset
+    /// far past the real content length.
+    pub fn scroll_instance_detail(&mut self, delta: i16) {
+        let cur = i32::from(self.instance_detail_scroll);
+        let max = i32::from(self.instance_detail_max_scroll);
+        let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
+        self.instance_detail_scroll = next;
     }
 
     /// Install the resolved chat endpoint and set the initial consent state.
@@ -2757,12 +2788,14 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             }
             if state.selection_len() > 0 {
                 state.modal = Modal::Detail;
+                state.reset_instance_detail_scroll();
             }
         }
         KeyAction::ToggleHelp => {
             state.modal = if state.modal == Modal::Help {
                 Modal::None
             } else {
+                state.close_overlays();
                 state.reset_help_scroll();
                 Modal::Help
             };
@@ -2876,11 +2909,11 @@ fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
             }
             _ => {}
         },
-        // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
-        // is no longer reachable, so Detail itself has nothing to scroll. Help
-        // and GlobalHelp are the only modals that currently use this action.
         KeyAction::ScrollModal(delta) if matches!(state.modal, Modal::Help | Modal::GlobalHelp) => {
             state.scroll_help(delta);
+        }
+        KeyAction::ScrollModal(delta) if state.modal == Modal::Detail => {
+            state.scroll_instance_detail(delta);
         }
         KeyAction::ScrollModal(_) => {}
         KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
@@ -3570,6 +3603,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
     // Esc main menu: ↑↓ cycle Options/Help/Quit, Enter activates, Esc closes.
     if *modal == Modal::Menu {
         return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
             KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
@@ -3580,6 +3614,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
     // Command palette: ↑↓ choose destination, Enter goes, Esc closes.
     if *modal == Modal::Palette {
         return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
             KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
@@ -3590,6 +3625,7 @@ fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) 
     // Options panel: ←→ switch settings tab, Esc closes.
     if *modal == Modal::Options {
         return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
             KeyCode::Esc => KeyAction::CloseModal,
             KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => KeyAction::OptionsTab(-1),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => KeyAction::OptionsTab(1),
@@ -3767,6 +3803,48 @@ mod tests {
         assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
         // P4: Esc opens the main menu (it never quits).
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
+    }
+
+    #[test]
+    fn q_quits_menu_palette_and_options_too() {
+        // Menu/Palette/Options used to have no `q` arm at all, silently
+        // swallowing the key instead of quitting like every other modal.
+        let with_modal = |modal: &Modal| {
+            handle_key(
+                press(KeyCode::Char('q')),
+                ActiveTab::Home,
+                modal,
+                ChatKeyCtx::default(),
+            )
+        };
+        assert_eq!(with_modal(&Modal::Menu), KeyAction::Quit);
+        assert_eq!(with_modal(&Modal::Palette), KeyAction::Quit);
+        assert_eq!(with_modal(&Modal::Options), KeyAction::Quit);
+    }
+
+    #[test]
+    fn chat_esc_then_q_still_quits_via_the_menu() {
+        // A terminal that decodes "Alt+q" as a bare Esc followed by a plain
+        // `q` (rather than a single Alt-modified KeyEvent) used to quit
+        // immediately on Chat, because Esc was a no-op there and `q` fell
+        // through to the global `Quit` arm. This PR makes Esc open the main
+        // menu on Chat too, so the second event now needs Menu's own `q`
+        // arm (added above) to still reach `Quit` instead of being
+        // swallowed by the menu.
+        let ctx = ChatKeyCtx {
+            consent: ChatConsent::Accepted,
+            focused: false,
+            ..Default::default()
+        };
+        let after_esc = handle_key(press(KeyCode::Esc), ActiveTab::Chat, &Modal::None, ctx);
+        assert_eq!(after_esc, KeyAction::OpenMenu);
+        let after_q = handle_key(
+            press(KeyCode::Char('q')),
+            ActiveTab::Chat,
+            &Modal::Menu,
+            ctx,
+        );
+        assert_eq!(after_q, KeyAction::Quit);
     }
 
     #[test]
@@ -5542,6 +5620,25 @@ mod tests {
             Some(wash),
             "corner cell must carry grey_overlay's wash bg, not plain theme bg"
         );
+        // The "Esc back to menu" hint is rendered with a foreground-only
+        // style (no explicit bg), and `ratatui::Style::patch` leaves an
+        // unset field alone rather than clearing it — so the hint inherits
+        // grey_overlay's wash bg from the cells underneath it, exactly like
+        // `draw()`'s footer. Assert on the cell directly (not just its
+        // text), so this fails if the hint's style ever gains an explicit
+        // `bg` that would revert it to plain theme background.
+        let hint_row_y = term.backend().buffer().area().height - 1;
+        let hint_cell = term.backend().buffer().cell((0, hint_row_y)).unwrap();
+        assert_eq!(
+            hint_cell.symbol(),
+            "E",
+            "hint row should start with the Esc affordance"
+        );
+        assert_eq!(
+            hint_cell.style().bg,
+            Some(wash),
+            "the Esc hint inherits grey_overlay's wash bg, same as draw()'s footer"
+        );
     }
 
     #[test]
@@ -5796,6 +5893,24 @@ mod tests {
         s.help_max_scroll = 10;
         apply_action(&mut s, KeyAction::ScrollModal(3));
         assert_eq!(s.help_scroll, 0, "no modal open: ScrollModal is a no-op");
+    }
+
+    #[test]
+    fn scroll_modal_action_reaches_scroll_instance_detail_for_detail_modal() {
+        // Regression: `apply_action`'s ScrollModal dispatch only matched
+        // `Modal::Help | Modal::GlobalHelp`, silently dropping the action for
+        // `Modal::Detail` even though both `handle_key` and `handle_mouse`
+        // emit `ScrollModal` for it (see `detail_modal_j_k_emit_scroll` /
+        // `handle_mouse_routes_scroll_by_modal_and_tab`) and the instance
+        // Detail modal's body (launch_args/env_vars) can genuinely overflow.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::Detail;
+        s.instance_detail_max_scroll = 10;
+        apply_action(&mut s, KeyAction::ScrollModal(3));
+        assert_eq!(
+            s.instance_detail_scroll, 3,
+            "Detail modal scrolls via apply_action"
+        );
     }
 
     #[test]

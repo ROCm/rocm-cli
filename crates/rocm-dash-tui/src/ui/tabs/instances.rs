@@ -615,7 +615,10 @@ const fn point_in_rect(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
-pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+/// Draws the instance Detail modal and returns the max scroll offset for its
+/// body (see `render_body`), so the caller can write it back to
+/// `AppState::instance_detail_max_scroll`.
+pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> u16 {
     grey_overlay(f);
     let popup = centered_rect(85, 85, 120, 36, area);
 
@@ -626,7 +629,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
         f.render_widget(p, inner);
-        return;
+        return 0;
     }
 
     let instances = sorted_instances(&state.instances);
@@ -638,13 +641,13 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
         f.render_widget(p, inner);
-        return;
+        return 0;
     };
 
     let title = format!(" Instance · {} ", inst.container_name);
     let inner = draw_popup_frame(f, popup, &title, theme);
     if inner.height == 0 || inner.width == 0 {
-        return;
+        return 0;
     }
 
     // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness)
@@ -660,8 +663,9 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .split(inner);
 
     render_summary(f, chunks[0], inst, snap_ts, theme);
-    render_body(f, chunks[1], inst, theme);
+    let max_scroll = render_body(f, chunks[1], inst, theme, state.instance_detail_scroll);
     render_footer(f, chunks[2], inst, theme);
+    max_scroll
 }
 
 fn render_summary(
@@ -759,7 +763,10 @@ fn render_summary(
     f.render_widget(p, area);
 }
 
-fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
+/// Renders the launch_args/env_vars panes, applying `scroll` (in lines) to
+/// both, and returns the larger of the two panes' max scroll offsets so the
+/// caller can clamp future scroll input (see `AppState::scroll_instance_detail`).
+fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll: u16) -> u16 {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
@@ -786,10 +793,11 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
             .map(|a| Line::from(Span::styled(a.clone(), Style::default().fg(theme.fg))))
             .collect()
     };
-    f.render_widget(
-        Paragraph::new(args_lines).wrap(Wrap { trim: false }),
-        args_inner,
-    );
+    let args_p = Paragraph::new(args_lines).wrap(Wrap { trim: false });
+    let args_max = u16::try_from(args_p.line_count(args_inner.width))
+        .unwrap_or(u16::MAX)
+        .saturating_sub(args_inner.height);
+    f.render_widget(args_p.scroll((scroll.min(args_max), 0)), args_inner);
 
     // env_vars (right). BTreeMap iterates sorted by key.
     let env_inner = panel::bento(
@@ -818,10 +826,13 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
             })
             .collect()
     };
-    f.render_widget(
-        Paragraph::new(env_lines).wrap(Wrap { trim: false }),
-        env_inner,
-    );
+    let env_p = Paragraph::new(env_lines).wrap(Wrap { trim: false });
+    let env_max = u16::try_from(env_p.line_count(env_inner.width))
+        .unwrap_or(u16::MAX)
+        .saturating_sub(env_inner.height);
+    f.render_widget(env_p.scroll((scroll.min(env_max), 0)), env_inner);
+
+    args_max.max(env_max)
 }
 
 fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
@@ -981,6 +992,8 @@ mod tests {
             bench_detail_scroll: 0,
             help_scroll: 0,
             help_max_scroll: 0,
+            instance_detail_scroll: 0,
+            instance_detail_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -1245,8 +1258,10 @@ mod tests {
 
         // Detail modal: shows the quantization value and the VRAM pair.
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
         let detail = buffer_text(&term);
         assert!(
             detail.contains("fp8"),
@@ -1255,6 +1270,85 @@ mod tests {
         assert!(
             detail.contains(&vram),
             "detail modal must render the used / total MiB VRAM string; got:\n{detail}"
+        );
+    }
+
+    #[test]
+    fn draw_detail_dims_periphery_with_grey_overlay() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Empty instance map hits `draw_detail`'s early-return branch, right
+        // after its `grey_overlay(f)` call — the shortest path that still
+        // exercises it. Text-only assertions on the popup body would still
+        // pass if that call were silently dropped, since the corner is blank
+        // either way; assert on the corner cell's background directly so
+        // this fails if `grey_overlay(f)` is ever removed.
+        let state = mk_state(HashMap::new(), 0);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "corner cell must carry grey_overlay's wash bg, not plain theme bg"
+        );
+    }
+
+    #[test]
+    fn detail_modal_body_scrolls_launch_args_and_reports_nonzero_max_scroll() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Enough launch_args to overflow the body pane at a realistic
+        // terminal height, so `render_body` has real content to scroll.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let mut state = mk_state(m, 0);
+
+        // Render once at scroll=0 and capture the max_scroll draw_detail
+        // reports back — it must be non-zero given how much content
+        // overflows the pane.
+        let mut max_scroll = 0u16;
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| {
+            max_scroll = draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        assert!(
+            max_scroll > 0,
+            "60 launch_args must overflow the body pane, giving a nonzero max_scroll; got {max_scroll}"
+        );
+
+        let text_top = buffer_text(&term);
+        assert!(
+            text_top.contains("--flag-0=value0"),
+            "unscrolled body must show the first launch_args line; got:\n{text_top}"
+        );
+
+        // Scroll to the end and confirm the visible text actually shifts:
+        // the first line scrolls out of view while the last scrolls in.
+        state.instance_detail_scroll = max_scroll;
+        let mut term2 = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term2
+            .draw(|f| {
+                draw_detail(f, f.area(), &state, &state.theme);
+            })
+            .unwrap();
+        let text_scrolled = buffer_text(&term2);
+        assert!(
+            !text_scrolled.contains("--flag-0=value0"),
+            "fully scrolled body must no longer show the first launch_args line; got:\n{text_scrolled}"
+        );
+        assert!(
+            text_scrolled.contains("--flag-59=value59"),
+            "fully scrolled body must show the last launch_args line; got:\n{text_scrolled}"
         );
     }
 
@@ -1684,8 +1778,10 @@ mod tests {
         );
         let state = state_with_snap(inst);
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
         let out = buffer_text(&term);
         assert!(
             out.contains("held"),
@@ -1706,8 +1802,10 @@ mod tests {
         inst.tokens_per_watt = Some(1.5);
         let state = state_with_snap(inst);
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
         let out = buffer_text(&term);
         assert!(
             out.contains("1.50 tok/W*"),
@@ -1727,8 +1825,10 @@ mod tests {
         );
         let state = state_with_snap(inst);
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
         let out = buffer_text(&term);
         assert!(
             out.contains("fresh"),
@@ -1744,8 +1844,10 @@ mod tests {
         let inst = mk_inst_obs("legacy-detail", Some(100.0), None);
         let state = state_with_snap(inst);
         let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
-        term.draw(|f| draw_detail(f, f.area(), &state, &state.theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
         let out = buffer_text(&term);
         assert!(
             out.contains("unknown"),
