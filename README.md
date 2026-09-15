@@ -202,8 +202,8 @@ show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sd
 creates a separate managed runtime alongside it. Running the command when a
 managed runtime is already the active default asks first, because the new
 install takes over as the active default; see
-[ROCm installation](#rocm-installation) for that gate and the flags that approve
-it without a prompt.
+[ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
+for that gate and the flags that approve it without a prompt.
 
 Then serve a model:
 
