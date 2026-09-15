@@ -3777,7 +3777,7 @@ pub fn active_managed_therock_channel(
 /// Version (e.g. `"10.0.0"`) of the active managed TheRock runtime.
 ///
 /// Reflects the version recorded at install time. Returns `None` when there is no managed
-/// runtime (system or legacy ROCm) or the registry record predates version recording.
+/// runtime (system or legacy ROCm) or the registry record is malformed or hand-edited.
 pub fn active_managed_therock_version(
     paths: &AppPaths,
     config: &RocmCliConfig,
