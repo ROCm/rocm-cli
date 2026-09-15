@@ -3712,23 +3712,23 @@ mod tests {
             "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
         );
         assert!(fix.verify.contains("repo-native"));
+        assert!(
+            hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "positive control: the repo-native evidence line must appear when the method really is repo-native: {:?}",
+            hit.evidence
+        );
     }
 
     #[test]
-    fn repo_native_broken_does_not_fire_on_non_repo_native_installs_without_symptom() {
-        let mut e = linux_base();
-        e.rocm_install_method = "runfile-or-tarball".to_owned();
-        let report = diagnose(&e, "");
-        assert!(report.matched.iter().all(|d| d.id != "fix-12-installer"));
-    }
-
-    #[test]
-    fn repo_native_broken_fires_on_dpkg_symptom_regardless_of_install_method() {
-        // The keyword score alone (half-configured + generic dpkg error = 75)
-        // clears MIN_SCORE_FOR_MATCH without the +20 repo-native bonus, so
-        // fix-12 still fires even when rocm_install_method isn't
-        // "repo-native" -- the method only adds confidence, it doesn't gate
-        // whether the check fires at all.
+    fn repo_native_broken_does_not_claim_repo_native_evidence_for_other_install_methods() {
+        // Regression test: an empty symptom would short-circuit keyword_score to
+        // 0 before the install-method gate is ever reached, making this pass
+        // vacuously regardless of whether the gate works. Pass a real dpkg
+        // symptom instead, matching the positive-control test above, so fix-12
+        // still fires (kw_score alone clears MIN_SCORE_FOR_MATCH) but must not
+        // claim repo-native evidence for a non-repo-native install.
         let mut e = linux_base();
         e.rocm_install_method = "runfile-or-tarball".to_owned();
         let report = diagnose(
@@ -3741,9 +3741,31 @@ mod tests {
             .find(|d| d.id == "fix-12-installer")
             .expect("dpkg keyword evidence alone should still surface fix-12");
         assert!(
-            !hit.evidence.iter().any(|l| l.contains("repo-native")),
-            "the repo-native install-method evidence line must not appear for a non-repo-native install: {:?}",
+            !hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "must not claim repo-native evidence for a non-repo-native install: {:?}",
             hit.evidence
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_fires_on_dpkg_symptom_regardless_of_install_method() {
+        // The keyword score alone (half-configured + generic dpkg error = 75)
+        // clears MIN_SCORE_FOR_MATCH without the +20 repo-native bonus, so
+        // fix-12 still fires even when rocm_install_method isn't
+        // "repo-native" -- the method only adds confidence, it doesn't gate
+        // whether the check fires at all. See the sibling test above for the
+        // repo-native-evidence-line assertion this used to also make.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        assert!(
+            report.matched.iter().any(|d| d.id == "fix-12-installer"),
+            "dpkg keyword evidence alone should still surface fix-12"
         );
     }
 }
