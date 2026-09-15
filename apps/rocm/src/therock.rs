@@ -2102,9 +2102,11 @@ fn quote_display_arg(value: &str) -> String {
 /// fresh-install verdict on a read error would skip the confirmation gate
 /// precisely when we are least sure what is currently active.
 ///
-/// The same reasoning covers the two ways an active default can fail to
-/// resolve without any I/O error at all, and both of them used to reach the
-/// fresh-install verdict:
+/// The same reasoning covers the ways an active default can fail to resolve
+/// without any I/O error at all, and all of them used to reach the
+/// fresh-install verdict. `current_runtime_manifest` resolves through two
+/// pointers — `active_runtime_key` first, then `default_runtime_id` — and each
+/// has its own failure shapes:
 ///
 /// * a registry manifest that reads fine but does not deserialize —
 ///   `load_runtime_manifests` drops those silently, so a manifest written by an
@@ -2112,14 +2114,24 @@ fn quote_display_arg(value: &str) -> String {
 ///   `installed_at_unix_ms` carry no `#[serde(default)]`) vanishes from the
 ///   list and `current_runtime_manifest` misses;
 /// * `active_runtime_key` naming a runtime whose manifest is not in the
-///   registry at all.
+///   registry at all;
+/// * `default_runtime_id` matching no installed manifest — `runtime_id` is not
+///   version-scoped, and `rocm config set-default-runtime` stores whatever it
+///   is handed without validating it against the registry;
+/// * `default_runtime_id` matching more than one installed manifest, which is
+///   the ordinary state once two versions of the same family are installed,
+///   because they share the one `therock-<channel>:<family>` id.
+///   `current_runtime_manifest` resolves only an exactly-one match, so both the
+///   zero-match and the multi-match shapes arrive here.
 ///
-/// Either way `rocm runtimes list` already calls this out as
-/// `active_status: missing manifest for active_runtime_key=...`, so proceeding
-/// as a fresh install would have one CLI assert both that a runtime is active
-/// and that none is. These fail closed into the consent gate rather than into a
-/// hard error, so `--approve-replacing-active-default` (or `--yes`) still gets
-/// an operator through a stale manifest.
+/// Every one of these is something `rocm runtimes list` already calls out, as
+/// `active_status: missing manifest for active_runtime_key=...`,
+/// `active_status: missing manifest for active_runtime_id=...` or
+/// `active_status: ambiguous runtime_id=...`, so proceeding as a fresh install
+/// would have one CLI assert both that a runtime is active and that none is.
+/// These fail closed into the consent gate rather than into a hard error, so
+/// `--approve-replacing-active-default` (or `--yes`) still gets an operator
+/// through a stale or ambiguous config.
 fn active_default_runtime_relation(
     paths: &AppPaths,
     channel: TheRockChannel,
@@ -2131,6 +2143,8 @@ fn active_default_runtime_relation(
     let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
         return Ok(unresolved_active_default_relation_text(
             config.active_runtime_key.as_deref(),
+            config.default_runtime_id.as_deref(),
+            crate::default_runtime_id_matches(&config, &manifests).len(),
             &unparsed,
         ));
     };
@@ -2145,13 +2159,25 @@ fn active_default_runtime_relation(
 /// Wording for the fail-closed half of [`active_default_runtime_relation`]:
 /// nothing resolved, but the on-disk state says something should have.
 ///
-/// `None` here is the only genuinely fresh verdict — no configured active key
-/// and every registry manifest parsed. Anything else names what could not be
-/// resolved, because the relation string is what the prompt, the preapproved
-/// progress line and the non-interactive refusal all print, and "unknown" is
-/// the honest answer the operator needs to see.
+/// `None` here is the only genuinely fresh verdict, and it needs *neither*
+/// config pointer to claim an active default: with no `active_runtime_key` and
+/// no `default_runtime_id`, nothing on disk asserts that a runtime is active,
+/// so an unparsable manifest is a registry wart rather than a displacement
+/// risk and demanding a consent flag would be a false positive on a genuinely
+/// fresh install. Once a pointer does claim something, anything unresolved
+/// names what could not be resolved, because the relation string is what the
+/// prompt, the preapproved progress line and the non-interactive refusal all
+/// print, and "unknown" is the honest answer the operator needs to see.
+///
+/// `default_runtime_id_match_count` is the number of installed manifests whose
+/// `runtime_id` equals `default_runtime_id`. The caller only reaches this
+/// function when resolution failed, so that count is 0 (dangling) or greater
+/// than 1 (ambiguous) — an exactly-one match is what
+/// `current_runtime_manifest` resolves successfully.
 fn unresolved_active_default_relation_text(
     active_runtime_key: Option<&str>,
+    default_runtime_id: Option<&str>,
+    default_runtime_id_match_count: usize,
     unparsed: &[PathBuf],
 ) -> Option<String> {
     let unparsed_text = || {
@@ -2161,23 +2187,37 @@ fn unresolved_active_default_relation_text(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    match active_runtime_key
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    {
-        Some(key) if unparsed.is_empty() => Some(format!(
+    let unparsed_suffix = || {
+        if unparsed.is_empty() {
+            String::new()
+        } else {
+            format!("; unreadable runtime manifests: {}", unparsed_text())
+        }
+    };
+    let non_empty = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+
+    match (non_empty(active_runtime_key), non_empty(default_runtime_id)) {
+        (Some(key), _) if unparsed.is_empty() => Some(format!(
             "recorded as `{key}`, but no installed runtime manifest matches it, so what is currently active cannot be determined"
         )),
-        Some(key) => Some(format!(
+        (Some(key), _) => Some(format!(
             "recorded as `{key}`, but its manifest could not be read; unreadable runtime manifests: {}",
             unparsed_text()
         )),
-        None if unparsed.is_empty() => None,
-        None => Some(format!(
-            "unknown: {} of the installed runtime manifests could not be read, so an active default cannot be ruled out; unreadable runtime manifests: {}",
-            unparsed.len(),
-            unparsed_text()
+        (None, Some(id)) if default_runtime_id_match_count > 1 => Some(format!(
+            "recorded as runtime_id `{id}`, which {default_runtime_id_match_count} installed runtime manifests match, so which one is currently active cannot be determined{}",
+            unparsed_suffix()
         )),
+        (None, Some(id)) => Some(format!(
+            "recorded as runtime_id `{id}`, but no installed runtime manifest matches it, so what is currently active cannot be determined{}",
+            unparsed_suffix()
+        )),
+        (None, None) => None,
     }
 }
 
@@ -9381,6 +9421,148 @@ echo Python 3.12.10
         assert!(
             relation.contains("release-wheel-gfx120X-all"),
             "the relation must name the unresolved key: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_an_ambiguous_default_runtime_id() -> Result<()> {
+        // Same policy, but the *other* resolution path. `current_runtime_manifest`
+        // falls back to `default_runtime_id` when `active_runtime_key` is unset,
+        // and resolves only an exactly-one match. `runtime_id` is
+        // `therock-<channel>:<family>` with no version in it, so two installed
+        // versions of one family share it and the fallback returns `None` — while
+        // `rocm runtimes list` reports `active_status: ambiguous runtime_id=...`.
+        // `rocm config set-default-runtime` reaches this state directly: it stores
+        // the id unvalidated and clears `active_runtime_key`.
+        let (root, paths) = test_paths("active-default-relation-ambiguous-id");
+        let runtime_id = "therock-release:gfx120X-all";
+        let mut older = test_runtime_manifest("release-wheel-gfx120X-all-7130", runtime_id, 10);
+        older.version = "7.13.0".to_owned();
+        let mut newer = test_runtime_manifest("release-wheel-gfx120X-all-7140", runtime_id, 20);
+        newer.version = "7.14.0".to_owned();
+        write_test_runtime_manifest(&paths, &older)?;
+        write_test_runtime_manifest(&paths, &newer)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some(runtime_id.to_owned());
+        // Precondition: this is the `default_runtime_id` shape, not the
+        // `active_runtime_key` shape the sibling tests already cover.
+        config.active_runtime_key = None;
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("an ambiguous default_runtime_id must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(runtime_id),
+            "the relation must name the id that could not be resolved: {relation}"
+        );
+        assert!(
+            relation.contains("2 installed runtime manifests match"),
+            "the relation must say the id is ambiguous and how badly: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_a_dangling_default_runtime_id() -> Result<()> {
+        // The zero-match half of the same fallback path: `_ => None` in
+        // `current_runtime_manifest` swallows "no match" exactly as it swallows
+        // "many matches". `rocm config set-default-runtime` does not check the id
+        // against the registry, so a typo — or uninstalling the last runtime of a
+        // family — leaves the config asserting an active default that is not
+        // there, which `rocm runtimes list` reports as
+        // `active_status: missing manifest for active_runtime_id=...`.
+        let (root, paths) = test_paths("active-default-relation-dangling-id");
+        let other = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &other)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some("therock-release:gfx120X-all".to_owned());
+        config.active_runtime_key = None;
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling default_runtime_id must not yield a fresh-install verdict");
+        assert!(
+            relation.contains("therock-release:gfx120X-all"),
+            "the relation must name the id that could not be resolved: {relation}"
+        );
+        assert!(
+            relation.contains("no installed runtime manifest matches it"),
+            "the relation must say the id resolved to nothing: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_is_fresh_when_no_config_pointer_claims_an_active_default()
+    -> Result<()> {
+        // The limit of the fail-closed policy. An unparsable registry manifest is
+        // only evidence of a *displacement* risk if something claims an active
+        // default; with neither `active_runtime_key` nor `default_runtime_id` set,
+        // nothing does, and demanding a consent flag would block a genuinely fresh
+        // install over an unrelated registry wart.
+        let (root, paths) = test_paths("active-default-relation-fresh-unparsable");
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &manifest)?;
+        let manifest_path = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        value
+            .as_object_mut()
+            .expect("manifest is a JSON object")
+            .remove("family_source")
+            .expect("manifest carries family_source");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value)?)?;
+        assert!(
+            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&manifest_path)?).is_err(),
+            "the test fixture must be unparsable, or this asserts nothing"
+        );
+
+        let config = RocmCliConfig::load(&paths)?;
+        assert!(config.active_runtime_key.is_none());
+        assert!(config.default_runtime_id.is_none());
+
+        assert_eq!(
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0",
+            )?,
+            None,
+            "no config pointer claims an active default, so this is a fresh install"
         );
 
         let _ = fs::remove_dir_all(root);

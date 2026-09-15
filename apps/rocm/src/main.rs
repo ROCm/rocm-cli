@@ -22588,6 +22588,27 @@ mod tests {
                 "--dry-run".to_owned(),
             ]
         );
+
+        // Both together: the strip is unconditional, so `--yes` still does not
+        // survive into a preview spawn, and the dry run still gains no consent.
+        // A model that emits both must not end up with either flag.
+        assert_eq!(
+            classify(&[
+                "install",
+                "sdk",
+                "--prefix",
+                "/tmp/therock",
+                "--yes",
+                "--dry-run",
+            ]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--dry-run".to_owned(),
+            ]
+        );
     }
 
     #[test]
