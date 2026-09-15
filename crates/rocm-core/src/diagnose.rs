@@ -878,8 +878,14 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
 
     let fw_major = major_version(fw_rocm);
     let sys_major = major_version(sys_rocm);
+    // Only meaningful when the framework resolves its HIP from the system. A
+    // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
+    // inside the runtime, so its HIP major is free to differ from the system's
+    // on a completely healthy host — and "reinstall torch" would be wrong there.
+    let framework_uses_system_rocm = e.framework_source != "managed-runtime";
     if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
         && fw != sys
+        && framework_uses_system_rocm
     {
         score += 50;
         let runtime = if windows { "HIP SDK" } else { "ROCm" };
@@ -1200,7 +1206,14 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
         ));
     }
-    if e.has_amd_gpu && e.framework == "pytorch" && e.framework_rocm_version.starts_with("hip=") {
+    // Skipped for a managed runtime for the reason this checker's own note
+    // already gives: those wheels bring their own HIP runtime, so a missing
+    // system HIP SDK is not evidence against them.
+    if e.has_amd_gpu
+        && e.framework == "pytorch"
+        && e.framework_rocm_version.starts_with("hip=")
+        && e.framework_source != "managed-runtime"
+    {
         score += 25;
         evidence
             .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
@@ -2228,6 +2241,54 @@ mod tests {
             os_family: "linux".to_owned(),
             ..Examination::default()
         }
+    }
+
+    /// A host whose framework HIP major differs from its system ROCm: torch on
+    /// HIP 7, a system ROCm 6 beside it.
+    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+        Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: framework_source.to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        }
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
+        // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
+        // package inside the runtime, never from the system install, so the two
+        // majors are free to differ on a perfectly healthy host. Before
+        // `examine` probed the runtime this could not fire, because the field it
+        // reads was always empty; now that it is populated, the comparison has
+        // to be told when it is meaningless -- or fixing the probe would hand
+        // every such host a spurious "reinstall torch".
+        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        assert!(
+            !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
+            "a managed runtime must not be told to reinstall torch: {:?}",
+            managed
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // The same host, same versions, with torch coming from the ambient
+        // interpreter: there the comparison is exactly right, and the checker
+        // must keep its full strength.
+        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let finding = ambient
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-8-wheel-rocm")
+            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the version evidence alone has to establish it: {}",
+            finding.score
+        );
     }
 
     fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {

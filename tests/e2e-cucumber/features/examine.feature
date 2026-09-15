@@ -152,3 +152,20 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection explains the default-engine marker
     And the host's default engine is marked in the inspection's engine inventory
+
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # The assertion is conditional on the host actually having a managed runtime
+  # because both lanes have to pass it: the GPU lanes run with one active and
+  # pin the fix, while an unmanaged box legitimately has nothing but `PATH` to
+  # probe and must keep saying so. Either way `framework_source` has to name the
+  # interpreter that answered, which is what check_8 reads to decide whether
+  # comparing that torch against the system ROCm means anything.
+  @id:examine-framework-names-the-interpreter-that-answered
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the interpreter that answered

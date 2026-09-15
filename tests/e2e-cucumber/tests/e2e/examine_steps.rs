@@ -402,6 +402,37 @@ fn human_states(human: &str, label: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[then("the framework report names the interpreter that answered")]
+async fn assert_framework_names_the_interpreter(world: &mut E2eWorld) {
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    // Read the runtime from the human form: `examine --json` carries no runtime
+    // fields at all, so there is nowhere else in the JSON to learn this from.
+    let managed_runtime = human_states(human, "active_runtime_root");
+    let value = parsed_json(world);
+    let source = value
+        .get("framework_source")
+        .and_then(serde_json::Value::as_str)
+        .expect("`examine --json` must report which interpreter answered");
+
+    match managed_runtime {
+        Some(root) => assert_eq!(
+            source, "managed-runtime",
+            "this host's active runtime is {root}, and its torch -- not the ambient \
+             interpreter's -- is the one the engines will load"
+        ),
+        // An unmanaged host has nothing but `PATH` to probe and must keep
+        // saying so. Asserting only the negative here because a box with no
+        // managed runtime and no ambient python has no framework to name at all.
+        None => assert_ne!(
+            source, "managed-runtime",
+            "no managed runtime is active on this host, so none could have answered"
+        ),
+    }
+}
+
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
