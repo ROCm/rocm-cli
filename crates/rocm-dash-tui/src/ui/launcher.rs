@@ -355,6 +355,12 @@ pub fn run_launcher(
 /// is being restored, and this frame must not land after the restore and undo
 /// it. See the ordering note on `crate::app::restore_terminal`.
 ///
+/// As in the dashboard's gate, the latch read is done *under*
+/// `crate::app::lock_terminal_writer`, which is then held for the whole frame:
+/// the lock stops a restore splicing into (or being overtaken by) this frame, and
+/// the latch read under it stops a frame that a restore already beat to the lock.
+/// Neither half is sufficient alone.
+///
 /// Parameterised over the backend and the latch so the gate is testable against
 /// a `TestBackend` — inlined in the loop it was reachable only from a real
 /// terminal, and deleting it turned no test red.
@@ -365,6 +371,7 @@ fn draw_menu_unless_shutting_down<B: ratatui::backend::Backend>(
     theme: &Theme,
     latch: &std::sync::atomic::AtomicBool,
 ) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    let _writer = crate::app::lock_terminal_writer();
     if crate::app::shutdown_claimed_on(latch) {
         return Ok(());
     }
@@ -436,6 +443,67 @@ mod tests {
             "",
             "once the shutdown is claimed the launcher must stop painting — a \
              late frame lands after `restore_terminal()` and undoes it"
+        );
+    }
+
+    #[test]
+    fn a_menu_frame_cannot_paint_while_a_teardown_owns_the_terminal() {
+        // The launcher's half of the fix for the partial restore the WSL2 E2E
+        // lane caught (`alternate_screen=false, cursor_hidden=true`): reading the
+        // latch cannot stop a frame that already passed the gate, and that
+        // frame's trailing `Hide` undoes the restore's `Show`. The menu loop must
+        // therefore take `lock_terminal_writer()` first and read the latch under
+        // it. See the twin test in `app::tests`, which carries the full analysis.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+        let latch = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (drawing_tx, drawing_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            // `mpsc::Receiver` is `Send` but not `Sync`, so the halves the
+            // teardown thread uses are moved into it; the latch is shared as a
+            // plain reference (the whole point is that both threads see it).
+            let latch = &latch;
+            scope.spawn(move || {
+                // Stands in for `crate::app::restore_terminal()`, which takes this
+                // same lock around its escape bytes.
+                let guard = crate::app::lock_terminal_writer();
+                held_tx.send(()).expect("the drawing thread is alive");
+                drawing_rx.recv().expect("the drawing thread is alive");
+                // Only to make the unfixed code reliably red; the fixed path is
+                // correct for any duration, including zero.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                latch.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(guard);
+            });
+
+            held_rx.recv().expect("the teardown thread is alive");
+            drawing_tx.send(()).expect("the teardown thread is alive");
+            draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, latch)
+                .expect("the gate must not turn a suppressed frame into an error");
+        });
+
+        assert_eq!(
+            painted(&term),
+            "",
+            "a menu frame asked for while a teardown owned the terminal must not \
+             paint — its trailing `Hide` would land after the restore's `Show` and \
+             leave the user on the normal screen with an invisible cursor"
         );
     }
 

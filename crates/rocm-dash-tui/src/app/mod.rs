@@ -1854,60 +1854,86 @@ pub(crate) fn restore_after_session(latch: &AtomicBool, restore: impl FnOnce()) 
 ///
 /// # Ordering against the renderer
 ///
-/// Nothing here locks the terminal, and this writer is genuinely concurrent with
-/// the renderer: the watcher runs on a Tokio worker thread while frames are
-/// drawn on the thread that owns the loop (`block_on`'s thread for a dashboard
-/// session, the synchronous menu thread for the launcher hub).
+/// This writer is genuinely concurrent with the renderer: the watcher runs on a
+/// Tokio worker thread while frames are drawn on the thread that owns the loop
+/// (`block_on`'s thread for a dashboard session, the synchronous menu thread for
+/// the launcher hub). A frame that lands *after* this function's bytes cannot
+/// re-enter the alternate screen — `EnterAlternateScreen` is emitted exactly
+/// once at startup and `Terminal::draw` never re-emits it — but every frame ends
+/// by hiding the cursor (`Terminal::draw` emits `Hide` unconditionally when the
+/// frame sets no cursor position), so a late frame undoes the show-cursor half of
+/// this restore and leaves the user with an invisible cursor.
 ///
-/// The consequence is not merely cosmetic, so it is closed rather than accepted.
-/// A frame that *completes after* this function returns cannot re-enter the
-/// alternate screen — `EnterAlternateScreen` is emitted exactly once at startup
-/// and `Terminal::draw` never re-emits it — but every frame ends by hiding (or
-/// repositioning) the cursor and repainting, so a late frame would undo the
-/// show-cursor half of this restore and paint a stale dashboard over the
-/// restored screen. The narrow serialization that closes that window, in
-/// preference to a process-global lock on every terminal write: both render
-/// loops consult [`shutdown_claimed_on`] before drawing, and the latch is
-/// claimed *before* the restore begins, so no frame can start after the claim.
+/// Gating the loops on [`shutdown_claimed_on`] is necessary but *not* sufficient,
+/// and the gap is not cosmetic: the claim cannot stop a frame that already passed
+/// the gate, and that frame's tail is written after these bytes. Measured, rather
+/// than argued — SIGINT delivered to a real `rocm dash --demo` under a pty, 300
+/// runs on a loaded Linux box: 6 of them ended with this restore spliced into the
+/// middle of a frame (`…;48;` `ESC[?1049l … ESC[?25h` `2;19;20;22m qui…ESC[?25l`),
+/// leaving the alternate screen with the cursor still hidden. That is exactly
+/// what the E2E scenario `dash-sigint-restores-terminal` reported from the WSL2
+/// lane, and it reproduces identically on the commits before this PR, so it is
+/// the long-standing shape of the race and not a new one.
 ///
-/// What remains is a frame already in flight when the claim lands, which can
-/// still interleave *during* the restore. That one is cosmetic — out-of-order
-/// escapes on a terminal being reset in the same breath, with these restore
-/// bytes written last — and is accepted.
+/// So the window is closed rather than accepted: [`TERMINAL_WRITE_LOCK`] is held
+/// across one whole frame and across one whole restore, and both render loops
+/// re-check the latch *while holding it*. Every interleaving then ends with these
+/// bytes last — either the frame completes first and this restore follows it, or
+/// this restore goes first and the gate suppresses the frame behind it.
+///
+/// This adds no new hang: a renderer blocked mid-frame on a full terminal blocks
+/// this restore's own writes to that same terminal just as surely, so the lock
+/// can only make us wait where we were already waiting.
 ///
 /// # Ordering against another restore
 ///
-/// Separate hazard, separate mechanism. Two teardowns can run at once: a signal
-/// watcher resumed past its `.await` races [`run`]'s clean-quit teardown (which
-/// deliberately does not claim the exit latch — see [`restore_after_session`]),
-/// and two watchers on two runtimes both wake on one process-global signal.
-/// [`RESTORE_LOCK`] makes this function the single writer for the duration of
-/// one teardown, so two threads can never interleave `write_restore_sequences`
-/// on the same stdout. It is held only across a handful of escape bytes, so it
-/// adds no hang profile beyond the internal lock `io::stdout()` already takes on
-/// every write.
+/// The same lock covers the second hazard. Two teardowns can run at once: a
+/// signal watcher resumed past its `.await` races [`run`]'s clean-quit teardown
+/// (which deliberately does not claim the exit latch — see
+/// [`restore_after_session`]), and two watchers on two runtimes both wake on one
+/// process-global signal. Holding [`TERMINAL_WRITE_LOCK`] makes this function the
+/// single writer for the duration of one teardown, so two threads can never
+/// interleave `write_restore_sequences` on the same stdout.
 pub(crate) fn restore_terminal() {
     // Poisoning is irrelevant here: nothing inside can panic (every step is
     // best-effort), and a teardown skipped because some *other* thread panicked
     // mid-restore is strictly worse than running it again.
-    let _guard = RESTORE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = lock_terminal_writer();
     // `disable_raw_mode` mutates the real terminal (there is no in-memory
     // equivalent), so it stays outside the testable sequence writer below.
     let _ = disable_raw_mode();
     let _ = write_restore_sequences(&mut io::stdout());
 }
 
-/// Serialises [`restore_terminal`] so concurrent teardowns cannot interleave
-/// their escape sequences on one stdout.
+/// Serialises everything that writes to the process's one stdout while the TUI
+/// owns it: one whole frame from either render loop, and one whole teardown in
+/// [`restore_terminal`].
 ///
 /// Distinct from [`SHUTTING_DOWN`], and deliberately so: the latch answers "is
-/// the process exiting" (one-shot, never released, gates rendering), this
-/// answers "is someone writing the restore right now" (re-armable, held for the
-/// length of one teardown). Conflating them is what made a clean session exit
+/// the process exiting" (one-shot, never released), this answers "is someone
+/// writing the terminal right now" (re-armable, held for the length of one frame
+/// or one teardown). Conflating them is what made a clean session exit
 /// permanently wedge the launcher hub.
-static RESTORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// The two are used *together* in the render gates — the latch is re-read under
+/// this lock — because neither alone is enough: the lock without the latch would
+/// merely order a late frame after the restore, and the latch without the lock
+/// cannot stop a frame that has already passed the gate. See the ordering notes
+/// on [`restore_terminal`].
+static TERMINAL_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take exclusive ownership of the terminal for the length of one frame or one
+/// teardown. Poisoning is recovered from rather than propagated: a teardown or a
+/// frame skipped because some *other* thread panicked while holding the lock is
+/// strictly worse than doing it anyway.
+///
+/// `pub(crate)` so the launcher's menu loop — the crate's other render loop —
+/// can take the same lock around its own frame.
+pub(crate) fn lock_terminal_writer() -> std::sync::MutexGuard<'static, ()> {
+    TERMINAL_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Write the escape sequences that undo `run`'s terminal setup — leave the
 /// alternate screen, disable mouse capture, show the cursor — to `out`. Split
@@ -2219,6 +2245,12 @@ const EXIT_CODE_SIGTERM: i32 = 143;
 /// the frame must not land after the restore and undo it. See the ordering note
 /// on [`restore_terminal`].
 ///
+/// The gate is the latch read **plus** [`lock_terminal_writer`], and needs both.
+/// The lock is taken first and held across the whole frame, so the restore can
+/// neither splice its bytes into the middle of this frame nor be overtaken by its
+/// tail; the latch is then read *under* that lock, so a restore that got there
+/// first suppresses this frame entirely instead of merely preceding it.
+///
 /// Extracted from the event loop's body — and parameterised over the backend and
 /// the latch — purely so the gate is *testable*: a test can drive a
 /// `TestBackend`, claim a local latch, and assert no cells were painted. Inlined
@@ -2233,6 +2265,7 @@ fn draw_frame_unless_shutting_down<B: ratatui::backend::Backend>(
     focus: Option<Focus>,
     latch: &AtomicBool,
 ) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    let _writer = lock_terminal_writer();
     if shutdown_claimed_on(latch) {
         return Ok(());
     }
@@ -4353,6 +4386,20 @@ mod tests {
         );
     }
 
+    /// Every cell a `TestBackend` frame painted, trimmed — `""` for a frame the
+    /// render gate suppressed. Shared by the two gate tests below so they assert
+    /// on the same thing.
+    fn painted(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
     #[test]
     fn a_claimed_shutdown_stops_the_dashboard_painting_another_frame() {
         // The render gate itself, not just the latch predicate underneath it.
@@ -4367,17 +4414,6 @@ mod tests {
         // than on the predicate the gate happens to call.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-
-        let painted = |term: &Terminal<TestBackend>| -> String {
-            term.backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(ratatui::buffer::Cell::symbol)
-                .collect::<String>()
-                .trim()
-                .to_string()
-        };
 
         // Control: with nothing claimed the gate must let the frame through,
         // otherwise the assertion below would pass on a helper that never draws.
@@ -4404,6 +4440,77 @@ mod tests {
             "",
             "once the shutdown is claimed no further frame may be painted — a \
              late frame lands after `restore_terminal()` and undoes it"
+        );
+    }
+
+    #[test]
+    fn a_frame_cannot_paint_while_a_teardown_owns_the_terminal() {
+        // The half of the gate the latch cannot provide on its own, and the
+        // defect the WSL2 E2E lane caught as `dash-sigint-restores-terminal`:
+        // "alternate_screen=false, cursor_hidden=true" — the alt-screen left, but
+        // the cursor still invisible.
+        //
+        // Reading the latch before drawing stops a frame that *starts* after the
+        // claim. It cannot stop the frame already in flight when the claim lands,
+        // and that frame is the problem: `Terminal::draw` ends by emitting `Hide`
+        // unconditionally, so its tail undoes the restore's `Show` while the
+        // alt-screen stays left (`EnterAlternateScreen` is never re-emitted) —
+        // exactly the half-restored terminal the lane reported. Reproduced
+        // outside the harness by signalling a real `rocm dash --demo` under a
+        // pty: the restore landed *inside* a frame's bytes, with `ESC[?25l` last.
+        //
+        // So the gate must take `lock_terminal_writer()` FIRST and read the latch
+        // under it. Modelled with the teardown's half of that lock held by another
+        // thread: this thread asks to draw while the teardown owns the terminal,
+        // and must paint nothing, because the claim happens-before the unlock it
+        // is waiting on. Delete the lock from the gate and the frame paints
+        // immediately instead, which is the bug.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let latch = AtomicBool::new(false);
+        let mut s = st();
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (drawing_tx, drawing_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            // `mpsc::Receiver` is `Send` but not `Sync`, so the halves the
+            // teardown thread uses are moved into it; the latch is shared as a
+            // plain reference (the whole point is that both threads see it).
+            let latch = &latch;
+            scope.spawn(move || {
+                // Stands in for `restore_terminal()`. It writes nothing: the
+                // claim is what this test is about, not the escape bytes (those
+                // are covered by `write_restore_sequences_leaves_alt_screen_…`).
+                let guard = lock_terminal_writer();
+                held_tx.send(()).expect("the drawing thread is alive");
+                drawing_rx.recv().expect("the drawing thread is alive");
+                // Only to make the unfixed code reliably red: an ungated draw
+                // paints in microseconds, so it would certainly have painted
+                // within this window. The fixed path does not depend on the
+                // duration — the claim below happens-before the unlock either
+                // way, so the assertion holds even if this were zero.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(
+                    claim_shutdown(latch),
+                    "the teardown must win a latch nothing else can see"
+                );
+                drop(guard);
+            });
+
+            held_rx.recv().expect("the teardown thread is alive");
+            drawing_tx.send(()).expect("the teardown thread is alive");
+            draw_frame_unless_shutting_down(&mut term, &mut s, None, latch)
+                .expect("the gate must not turn a suppressed frame into an error");
+        });
+
+        assert_eq!(
+            painted(&term),
+            "",
+            "a frame asked for while a teardown owned the terminal must not paint \
+             — its trailing `Hide` would land after the restore's `Show` and leave \
+             the user on the normal screen with an invisible cursor"
         );
     }
 
