@@ -26832,6 +26832,30 @@ install therock";
     }
 
     #[test]
+    fn auto_selection_all_reported_busy_falls_back_to_a_reported_ordinal() {
+        // Same sparse-ordinal host as above ([2, 3] reported, nothing at 0 or 1)
+        // but now BOTH reported GPUs are pinned by a running service, so every
+        // pass falls through to the terminal "all busy, pick one anyway"
+        // fallback. That fallback used to hand back a hardcoded `0` — safe only
+        // while candidates were a dense `0..count`, and simply wrong once they
+        // come from the reported rows: index 0 is a device nothing reported, yet
+        // it would be exported verbatim as `HIP_VISIBLE_DEVICES`. It must return
+        // the lowest ordinal that was actually reported instead.
+        let usage = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[2, 3], Some(&usage)),
+            vec![2],
+            "the all-busy fallback must name a reported GPU, never a fabricated index 0"
+        );
+        // The same holds when the busy set is given in descending order — the
+        // fallback tracks the reported ordinals, not the order they arrive in.
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[3, 2], Some(&usage)),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
         let error = validate_pinned_gpu_index(4, Some(4), None, false)
