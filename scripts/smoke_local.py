@@ -98,7 +98,9 @@ def assert_version_string(text: str, label: str) -> None:
         fail(f"{label} did not match 'rocm-cli <version> (<ref>, <hash>)':\n{text}")
     ref = match.group(2)
     if ref == "unknown":
-        fail(f"{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}")
+        fail(
+            f"{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}"
+        )
 
 
 def assert_path_missing(path: Path, label: str) -> None:
@@ -185,14 +187,26 @@ def main() -> int:
     rocmd = str(paths["rocmd"])
     vllm = str(paths["vllm"])
 
-    versions = [
-        run("rocm version", [rocm, "version"], env=env),
+    version_flags = [
         run("rocm --version", [rocm, "--version"], env=env),
         run("rocm -V", [rocm, "-V"], env=env),
     ]
-    if len(set(versions)) != 1:
-        fail(f"version surfaces returned different output: {versions}")
-    assert_version_string(versions[0], "rocm version")
+    if len(set(version_flags)) != 1:
+        fail(f"version flag surfaces returned different output: {version_flags}")
+
+    # `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    # so only its first line -- the same traceable build string -- has to
+    # match `-V`/`--version`.
+    version_command = run("rocm version", [rocm, "version"], env=env)
+    version_command_lines = version_command.splitlines()
+    if not version_command_lines or version_command_lines[0] != version_flags[0]:
+        fail(
+            "`rocm version`'s build line does not match `-V`/`--version`: "
+            f"{version_command_lines[:1]!r} vs {version_flags[0]!r}"
+        )
+    assert_version_string(version_command_lines[0], "rocm version")
+    assert_contains(version_command, "ROCm SDK:", "rocm version")
+    assert_contains(version_command, "GPU driver:", "rocm version")
 
     examine = run("rocm examine", [rocm, "examine"], env=env)
     assert_contains(examine, "rocm examine", "rocm examine")
