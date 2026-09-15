@@ -126,11 +126,18 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
-    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
-    /// scenario's isolation environment — for a step whose `Given` planted
-    /// scenario-owned state (e.g. a shell rc file) that only the piped
-    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
-    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
+    ///
+    /// Two kinds of step need this. One sets a variable the CLI reads at startup
+    /// (e.g. the test-only `ROCM_E2E_SIMULATE_OOM_LAUNCH` fault-injection
+    /// switch). The other has a `Given` that planted scenario-owned state (e.g. a
+    /// shell rc file) which only the piped `run_rocm_with_env` path would
+    /// otherwise pick up, since [`pty_env`]'s `HOME`/lack of `SHELL` are the
+    /// PTY's own isolation rather than that state.
+    ///
+    /// The vars are applied per-child on the `CommandBuilder`, never via the
+    /// shared process environment, so concurrent scenarios on the no-GPU lane
+    /// cannot observe each other's overrides.
     pub fn spawn_with_env(
         world: &E2eWorld,
         args: &[&str],
@@ -152,6 +159,9 @@ impl TuiSession {
         Self::spawn_binary_with_env(world, binary, args, &[])
     }
 
+    /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
+    /// `binary <args>` under a PTY with the isolated environment, then overlay
+    /// `extra_env` on the child.
     fn spawn_binary_with_env(
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
@@ -187,7 +197,10 @@ impl TuiSession {
             cmd.env(key, value);
         }
         // Caller-supplied overrides win over the scenario's own isolation
-        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself), but
+        // deliberately stay *above* the provider-credential strip below, so no
+        // `extra_env` entry can reinstate a credential and select a cloud
+        // backend for a journey that is meant to be deterministic local chat.
         for (key, value) in extra_env {
             cmd.env(key, value);
         }

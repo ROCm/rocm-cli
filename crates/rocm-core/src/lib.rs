@@ -7781,9 +7781,274 @@ pub fn resolve_amd_smi_binary() -> OsString {
 /// weights of most models people actually serve, so it trades one startup
 /// failure for another. Pinned by
 /// `the_utilization_hint_example_matches_the_recipe_command`.
+///
+/// The stated bound must be the one `rocm serve` actually accepts:
+/// `parse_gpu_memory_utilization` rejects `<= 0` and accepts `1`, so the domain
+/// is `(0, 1]` and the older `<0-1>` wording wrongly advertised `0`. Pinned by
+/// `the_utilization_hint_states_the_bound_the_parser_accepts`, because this
+/// wording has already been reverted once by a merge that resolved the line from
+/// a pre-fix tree.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
+
+/// Whether a vLLM startup-log tail carries a genuine out-of-memory failure.
+///
+/// Classifies the tail with the *same* rule as the `rocm diagnose` vLLM-OOM
+/// checker (`check_16_vllm_oom`, reached through
+/// [`vllm_oom_symptom_is_diagnosable`]) so the pre-launch low-VRAM note, the
+/// post-failure serve summary, and `rocm diagnose` never disagree on what counts
+/// as a vLLM OOM. The tail is vLLM's own process output, so the checker's
+/// required vLLM anchor is supplied by context: each line is scored as
+/// `vllm: <line>`, and the tail is an OOM iff some line clears the checker's
+/// `MIN_SCORE_FOR_MATCH` threshold.
+///
+/// This deliberately rejects a bare `out of memory` with no allocator-shaped
+/// signature — a kernel OOM-killer line, a dependency's log, or an unrelated
+/// subprocess — the same false positive the checker's threshold guards against,
+/// rather than driving the user-facing memory note off any stray OOM substring
+/// in the tail. A real vLLM/HIP allocation failure (`HIP out of memory`,
+/// `CUDA out of memory`, `hipErrorOutOfMemory`, or `torch.OutOfMemoryError`
+/// corroborated by an allocator message) still clears it.
+pub fn vllm_log_shows_oom(log: &str) -> bool {
+    log.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {line}"))
+    })
+}
+
+/// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to, or
+/// `None` when the tail carries no OOM line to route.
+///
+/// Returns the user's actual failing line (so `diagnose` echoes their real
+/// error), selected with the *same* rule [`vllm_log_shows_oom`] classifies the
+/// tail with, so whatever comes back is diagnosable by construction. Shared by
+/// the vLLM engine's post-failure hint and the `rocm` CLI serve summary so both
+/// surfaces route to `diagnose` identically instead of hand-rolling the line
+/// selection twice.
+///
+/// `None` *is* the "this tail is not an OOM" answer, so callers use it as the
+/// OOM gate directly rather than testing [`vllm_log_shows_oom`] first and then
+/// asking for the line: the two are the same predicate over the same string, so
+/// a caller that did both would evaluate it twice and carry a branch that can
+/// never be taken.
+///
+/// Scanning with `.rev()` is deliberate, not incidental: when several lines of
+/// the tail mention running out of memory, the *last* one is the proximate
+/// failure — the point where the process actually gave up — and the earlier ones
+/// are usually the allocator's own retry chatter leading up to it. The cost is
+/// real and worth stating: on a tail like "torch.OutOfMemoryError: ... Tried to
+/// allocate 7.21 GiB. GPU 0 has a total capacity of 24.00 GiB." followed by a
+/// bare "RuntimeError: ... killed: out of memory", the vaguer line wins even
+/// though the first carries the allocation size and the capacity. Both are
+/// diagnosable, so this picks which line is quoted, never whether one is. The
+/// user still sees every line: callers print the whole log tail beside the hint.
+///
+/// The return value is *log text*, not a shell-safe token: some callers only
+/// display it. A caller that renders it inside a quoted command must gate it on
+/// [`quotable_in_single_quotes`] first and fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`] otherwise. Guaranteeing quotability here
+/// instead would impose the command-builder's constraint on the display-only
+/// callers, silently withholding the user's real error from text that is never
+/// pasted anywhere.
+#[must_use]
+pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
+    log_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && vllm_log_shows_oom(line))
+        .map(|line| format!("vllm: {line}"))
+}
+
+/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
+///
+/// The value is untrusted subprocess output (the vLLM startup log tail) and the
+/// messages it lands in invite the user to paste the command into a shell, so a
+/// bare `'` would close the quote and let text nobody vetted become shell
+/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
+/// `model 'foo'`), and a line only has to look like an allocation failure to be
+/// selected, so this is an ordinary case rather than an exotic one.
+///
+/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
+/// the exact bytes but yields a command a reader cannot check by eye, and a
+/// wrong escape is *runnable* and misleading rather than obviously broken;
+/// control bytes would still reach the terminal. The canonical fallback is the
+/// branch that already exists for "this line cannot be used", and it is
+/// guaranteed to report a cause. The user's own line stays visible in the
+/// human-readable sentence beside the command (and in the log tail printed with
+/// it), so nothing is lost but the copy-paste convenience.
+///
+/// Lives here rather than in one engine because two surfaces build that command
+/// from the same untrusted text — the vLLM engine's startup-failure hint and the
+/// `rocm serve` summary's OOM note — and a guard that protects only one of them
+/// is the bug it was written to prevent.
+///
+/// The character test is [`is_control_or_format`], not `char::is_control`: the
+/// latter is Unicode `Cc` only, so a bidi override in the failing line survived
+/// into the printed command and reordered how it renders.
+#[must_use]
+pub fn quotable_in_single_quotes(symptom: &str) -> bool {
+    !symptom.contains('\'') && !symptom.chars().any(is_control_or_format)
+}
+
+/// Removes ANSI escape sequences and any remaining control or format characters.
+///
+/// A colourised or bell-bearing log line must not be able to repaint the user's
+/// terminal, or reorder how the message renders, from inside rocm-cli's own
+/// error message.
+///
+/// This is for text rocm-cli *echoes*; text rocm-cli renders into a command the
+/// user is told to run is gated with [`quotable_in_single_quotes`] instead, so a
+/// control-bearing line is rejected rather than rewritten into a lookalike.
+///
+/// The sequence grammar is ECMA-48's, followed exactly, and the reason is that
+/// the input is a *killed* process's output: truncated and interleaved escapes
+/// are the normal case here, not an exotic one. A scan that just ran to the
+/// next byte in `0x40..=0x7E` mis-handled every one of them — it swallowed the
+/// following sequence's introducer (`ESC [ 1 ; 2 ESC [ 0 m Killed` lost
+/// `Killed`'s first six characters), ran straight past a multi-byte scalar
+/// (which can never be in that ASCII range) and ate everything up to the next
+/// byte that happened to land in it, emitted the body of an OSC title
+/// sequence as text, and left a stray `ESC ESC` unrecoverable.
+///
+/// Consuming only what the grammar allows and then *stopping without consuming*
+/// the offending byte bounds the damage to the malformed sequence itself: the
+/// text after it survives, and a following well-formed sequence is still
+/// recognised because its `ESC` is left for the main loop to re-read.
+///
+/// What this deliberately does not do is second-guess a well-formed sequence.
+/// `ESC [ SP K` is a valid CSI (`SP` is an intermediate, `K` the final byte), so
+/// it is consumed whole even though the `K` may have been the first letter of a
+/// truncated process's "Killed" — a real terminal consumes it too, and the
+/// contract here is "render what the terminal would have rendered", which is
+/// the only rule that stays decidable on a byte stream with no framing.
+#[must_use]
+pub fn strip_terminal_control_sequences(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            if !is_control_or_format(c) {
+                out.push(c);
+            }
+            continue;
+        }
+        match chars.peek() {
+            // CSI — what a colourised logger emits.
+            Some('[') => {
+                chars.next();
+                skip_csi_body(&mut chars);
+            }
+            // The string-argument sequences: OSC, DCS, SOS, PM, APC. Their
+            // bodies are arbitrary text (a window title, say) and must not be
+            // emitted as if the process had printed it.
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                chars.next();
+                skip_string_sequence_body(&mut chars);
+            }
+            // `ESC` with nothing after it, or `ESC ESC`: drop just this one and
+            // let the loop re-read the next as a fresh introducer.
+            None | Some('\u{1b}') => {}
+            // Any other escape: optional intermediates, then one final byte.
+            Some(_) => skip_simple_escape_body(&mut chars),
+        }
+    }
+    out
+}
+
+/// Consumes a CSI body — parameter bytes, then intermediate bytes, then one
+/// final byte — from just after the `ESC [`. Stops without consuming anything
+/// that does not belong, leaving it to be treated as text.
+fn skip_csi_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{30}'..='\u{3f}').contains(c))
+        .is_some()
+    {}
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+}
+
+/// Consumes a string-argument sequence's body and terminator (`BEL`, or `ST` =
+/// `ESC \`) from just after the introducer. A body truncated by anything else —
+/// including a bare `ESC` starting the next sequence — ends the scan with that
+/// byte left in place.
+fn skip_string_sequence_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(&c) = chars.peek() {
+        if c == '\u{7}' {
+            chars.next();
+            return;
+        }
+        if c == '\u{1b}' {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'\\') {
+                chars.next();
+                chars.next();
+            }
+            return;
+        }
+        chars.next();
+    }
+}
+
+/// Consumes a non-CSI escape's body — optional intermediates, then one final
+/// byte — from just after the `ESC`.
+fn skip_simple_escape_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars
+        .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+        .is_some()
+    {}
+    chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+}
+
+/// Whether `c` is a character that carries no glyph of its own but changes how
+/// the text around it renders.
+///
+/// `char::is_control` is Unicode category `Cc` only, so it misses the `Cf`
+/// format characters — and `U+202E RIGHT-TO-LEFT OVERRIDE` in a log line
+/// reverses how the rest of the printed `rocm diagnose --symptom '...'` command
+/// renders in the user's terminal. That cannot escape the single quotes (no
+/// ASCII `'` is involved), so it is display spoofing rather than shell
+/// injection, but it is the same "untrusted subprocess output must not control
+/// what the terminal shows" concern the escape stripping above exists for, and
+/// the answer has to be the same.
+///
+/// The ranges are the `Cf` category, enumerated rather than pulled from a
+/// Unicode-tables dependency: the set is small, stable, and a new dependency for
+/// one predicate is a worse trade. Over-inclusion is safe here — the only cost
+/// of rejecting a character is falling back to the canonical symptom, which is
+/// guaranteed to report a cause.
+#[must_use]
+pub fn is_control_or_format(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}')
+}
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
@@ -12493,6 +12758,230 @@ last_installed_runtime_id = "therock-release"
             usable_amd_gpu_indices_from(usize::from(true), hip_mask("")),
             Some(vec![])
         );
+    }
+
+    #[test]
+    fn vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures() {
+        // A real allocator message (the `MIN_SCORE_FOR_MATCH`-clearing shape the
+        // `rocm diagnose` vLLM-OOM checker recognises) is a genuine OOM, whichever
+        // module path the exception carries.
+        assert!(vllm_log_shows_oom(
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+        assert!(vllm_log_shows_oom(
+            "torch.cuda.OutOfMemoryError: CUDA out of memory"
+        ));
+        assert!(vllm_log_shows_oom("RuntimeError: hipErrorOutOfMemory"));
+        // Case-insensitive.
+        assert!(vllm_log_shows_oom("HIP OUT OF MEMORY"));
+
+        // Sub-threshold on their own — the same lines the diagnose checker keeps
+        // below `MIN_SCORE_FOR_MATCH` so a stray OOM phrase does not carry the
+        // verdict. Detecting these here would contradict that checker (they are
+        // the false positives the shared threshold exists to reject).
+        //
+        // The bare exception class every PyTorch OOM raises, with no allocator
+        // message to corroborate it.
+        assert!(!vllm_log_shows_oom("TORCH.OUTOFMEMORYERROR"));
+        // A spaced "out of memory" with no allocator anchor phrase.
+        assert!(!vllm_log_shows_oom("HIP error: out of memory"));
+        // A kernel OOM-killer line from an unrelated subprocess must NOT drive
+        // the vLLM memory note.
+        assert!(!vllm_log_shows_oom(
+            "Out of memory: Killed process 4242 (python)"
+        ));
+        // The generic EngineCore wrapper is NOT an OOM signature.
+        assert!(!vllm_log_shows_oom(
+            "EngineCore failed: engine core initialization failed"
+        ));
+        assert!(!vllm_log_shows_oom("OSError: model weights not found"));
+        assert!(!vllm_log_shows_oom(""));
+    }
+
+    #[test]
+    fn vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom() {
+        // The selector and the classifier are one predicate: a tail
+        // `vllm_log_shows_oom` accepts always yields a line, and a tail it
+        // rejects always yields `None` — which is what lets callers use this as
+        // the OOM gate instead of asking the same question twice.
+        let tail = concat!(
+            "  File \"/opt/vllm/worker.py\", line 212, in load_model\n",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+            "INFO shutting down worker\n"
+        );
+        assert_eq!(
+            vllm_oom_diagnose_symptom(tail).as_deref(),
+            Some("vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."),
+            "the user's own failing line must be routed into `rocm diagnose --symptom`"
+        );
+        // Whatever comes back must be diagnosable, or the printed command would
+        // report no known cause.
+        let symptom = vllm_oom_diagnose_symptom(tail).expect("an OOM tail selects a line");
+        assert!(diagnose::vllm_oom_symptom_is_diagnosable(&symptom));
+        // The *last* OOM line wins: a tail ends with the failure that killed the
+        // launch, and an earlier retry's line would misreport it.
+        assert_eq!(
+            vllm_oom_diagnose_symptom("RuntimeError: hipErrorOutOfMemory\nHIP OUT OF MEMORY\n")
+                .as_deref(),
+            Some("vllm: HIP OUT OF MEMORY")
+        );
+        // No OOM line, no symptom — including the sub-threshold shapes the
+        // shared classifier rejects, which must not be reported as a cause.
+        assert_eq!(
+            vllm_oom_diagnose_symptom("OSError: model weights not found"),
+            None
+        );
+        assert_eq!(
+            vllm_oom_diagnose_symptom("Out of memory: Killed process 4242 (python)"),
+            None
+        );
+        assert_eq!(vllm_oom_diagnose_symptom(""), None);
+    }
+
+    #[test]
+    fn quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms() {
+        // The ordinary case the guard exists for: Python error text with an
+        // apostrophe, which would close the shell quote in the printed command.
+        assert!(!quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: GPU 0 can't allocate the model's weights"
+        ));
+        assert!(!quotable_in_single_quotes(
+            "vllm: failed to load model 'foo/bar'"
+        ));
+        // Terminal control bytes from vLLM's colourised logger.
+        assert!(!quotable_in_single_quotes(
+            "vllm: \u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m"
+        ));
+        assert!(!quotable_in_single_quotes("vllm: out of memory\u{7}"));
+        assert!(!quotable_in_single_quotes("vllm: out of\nmemory"));
+        // The canonical fallback must always be usable, or the rejection branch
+        // would have nowhere to go.
+        assert!(quotable_in_single_quotes(VLLM_OOM_CANONICAL_SYMPTOM));
+        assert!(quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+        // Cf characters must also be inadmissible in the quoted command, not
+        // merely stripped from the echoed sentence: the two guards are separate
+        // because they are separate call sites and only one of them used
+        // `char::is_control`.
+        assert!(
+            !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
+            "a bidi override must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            quotable_in_single_quotes("vllm: HIP out of memory"),
+            "the rejection must not be so broad that ordinary lines stop qualifying"
+        );
+    }
+
+    #[test]
+    fn strip_terminal_control_sequences_removes_whole_escape_sequences() {
+        // Pin the exact rendering, not the absence of fragments: a stripper that
+        // dropped only the escape byte and the `[` it introduces would leave
+        // `31m`/`0m` behind, which carries no control byte and contains neither
+        // `[31m` nor `[0m`, so every absence check would still pass.
+        assert_eq!(
+            strip_terminal_control_sequences(
+                "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}"
+            ),
+            "RuntimeError: HIP out of memory"
+        );
+        // A non-CSI escape takes the byte it introduces with it.
+        assert_eq!(strip_terminal_control_sequences("a\u{1b}Bc"), "ac");
+        // Text with nothing to strip is returned unchanged.
+        assert_eq!(
+            strip_terminal_control_sequences(VLLM_OOM_CANONICAL_SYMPTOM),
+            VLLM_OOM_CANONICAL_SYMPTOM
+        );
+    }
+
+    #[test]
+    fn the_stripper_follows_the_escape_grammar_not_just_the_colour_case() {
+        // The `'m'`-terminated SGR case above is the *easy* one, and on its own
+        // it pins almost nothing: narrowing the CSI final-byte range from
+        // `0x40..=0x7E` to just `'m'` leaves it green. These cases pin the
+        // range, the parameter/intermediate classes, and the introducers.
+        //
+        // They are not academic. This input is a *killed* process's output, so
+        // truncated and interleaved sequences are the normal case on this code
+        // path, and every one of them used to corrupt the message the user
+        // reads -- the failures are quoted per case below.
+        for (raw, expected, defect) in [
+            // Non-`m` CSI finals: `K` (erase-in-line) and `A` (cursor-up) are
+            // ordinary logger output, and narrowing the final-byte range to
+            // `'m'` leaves them in the message verbatim.
+            (
+                "\u{1b}[2KRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            (
+                "\u{1b}[1ARuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            // Truncated CSI immediately followed by a well-formed one: the old
+            // scan consumed the second sequence's `ESC [` as the first one's
+            // parameters and stopped at `0`, yielding "0mKilled: out of memory".
+            (
+                "\u{1b}[1;2\u{1b}[0mKilled: out of memory",
+                "Killed: out of memory",
+                "a truncated CSI must not swallow the next sequence's introducer",
+            ),
+            // A multi-byte scalar can never be in `0x40..=0x7E`, so the old scan
+            // ran past it and ate to the next byte that happened to land in
+            // range -- this yielded "ut of memory", losing the `o`.
+            (
+                "\u{1b}[12\u{e9} out of memory",
+                "\u{e9} out of memory",
+                "an invalid CSI byte must end the sequence, not be scanned past",
+            ),
+            // `ESC ESC`: the old code dropped the second `ESC` as the first
+            // one's argument, then emitted `[0m` as literal text.
+            (
+                "\u{1b}\u{1b}[0mRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a stray ESC must not consume the next sequence's introducer",
+            ),
+            // OSC: the old code took the `else` branch on `]`, so the window
+            // title leaked into the message as "0;titleRuntimeError: ...".
+            (
+                "\u{1b}]0;title\u{7}RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC body must not be emitted as text",
+            ),
+            // ...and with the ST terminator (`ESC \`) rather than BEL.
+            (
+                "\u{1b}]0;title\u{1b}\\RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC terminated by ST must be consumed whole",
+            ),
+            // A two-character escape with no CSI at all.
+            (
+                "\u{1b}7RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a simple escape must consume exactly its final byte",
+            ),
+            // Cf format characters: `char::is_control` is category Cc only, so
+            // U+202E survived and reversed how the rest of the line renders.
+            (
+                "RuntimeError: \u{202e}HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a bidi override must not survive into the message",
+            ),
+            // The text-only control: nothing is removed from a clean line.
+            (
+                "RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a clean line must pass through untouched",
+            ),
+        ] {
+            assert_eq!(
+                strip_terminal_control_sequences(raw),
+                expected,
+                "{defect}: {raw:?}"
+            );
+        }
     }
 
     #[test]

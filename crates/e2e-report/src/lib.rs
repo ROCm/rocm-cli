@@ -15,6 +15,20 @@ use std::time::SystemTime;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde::Deserialize;
 
+/// Environment variable signalling the `e2e-oom-fault-injection` hook is present.
+///
+/// `cargo xtask e2e` sets it to `1` when it built the binary under test with the
+/// `rocm/e2e-oom-fault-injection` feature, so the `e2e-cucumber` harness can tell
+/// whether `@requires-oom-fault-injection` scenarios can run against it.
+///
+/// The single source of truth for this xtask ↔ harness contract. It lives in
+/// this lean crate — the one both `xtask` and `e2e-cucumber` already depend on —
+/// so the producer (`xtask::e2e`) and the consumer
+/// (`e2e_cucumber::capability`) reference the same literal and cannot drift: a
+/// typo previously would not fail to compile or fail a test, silently turning
+/// `@requires-oom-fault-injection` into a skip (green suite, zero coverage).
+pub const OOM_FAULT_INJECTION_ENV: &str = "ROCM_E2E_OOM_FAULT_INJECTION";
+
 #[derive(Deserialize)]
 struct Feature {
     name: String,
