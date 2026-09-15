@@ -88,12 +88,23 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
 async fn assert_version_returned(world: &mut E2eWorld) {
     let outputs = world.cli_outputs.as_ref().expect("no commands were run");
     assert_eq!(outputs.len(), 3, "expected all three version surfaces");
+    let (version_output, flag_outputs) = outputs.split_first().expect("three version surfaces");
     assert!(
-        outputs.windows(2).all(|pair| pair[0] == pair[1]),
-        "version surfaces returned different output: {outputs:?}"
+        flag_outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "-V/--version returned different output: {flag_outputs:?}"
     );
 
-    let output = outputs[0].trim();
+    // `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    // so only its first line -- the same traceable build string -- has to
+    // match `-V`/`--version`.
+    let version_first_line = version_output.lines().next().unwrap_or_default();
+    assert_eq!(
+        version_first_line,
+        flag_outputs[0].trim(),
+        "`rocm version`'s build line does not match `-V`/`--version`: {outputs:?}"
+    );
+
+    let output = version_first_line.trim();
     let parsed = output
         .strip_prefix("rocm-cli ")
         .and_then(|value| value.strip_suffix(')'))
