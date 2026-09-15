@@ -871,11 +871,12 @@ jobs:
 
   # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
   # fresh inside WSL2 on a DevLab Dispatch pool Windows host — the same pool
-  # e2e-gpu-nightly-strix-windows already uses, not a separate `wsl`-labeled
-  # runner. Mirrors the per-PR `e2e-wsl` lane in e2e-selfhosted.yml step for
-  # step (see that job's header comment for the pool maintainer's sign-off),
-  # opting into the same @nightly large-model scenario as the other nightly
-  # lanes.
+  # the per-PR `e2e-gpu-strix-windows`/`e2e-wsl` jobs use, not a separate
+  # `wsl`-labeled runner and not the `native` host e2e-gpu-nightly-strix-windows
+  # still runs on. Mirrors the per-PR `e2e-wsl` lane in e2e-selfhosted.yml step
+  # for step (see that job's header comment for the pool maintainer's
+  # sign-off), opting into the same @nightly large-model scenario as the other
+  # nightly lanes.
   e2e-wsl-nightly:
     name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
     # See e2e-wsl in e2e-selfhosted.yml: every job here is cold (fresh distro,
@@ -891,10 +892,11 @@ jobs:
       WSL_UTF8: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
-      # The Strix lanes share one physical machine, so a TUI frame that renders
-      # well inside the 30s default on an idle runner can miss it while a sibling
-      # lane loads a model. Raise the wait budget rather than let that read as a
-      # product failure; a genuine hang still fails, just later.
+      # A freshly-provisioned pool host installing WSL2, a distro, and native
+      # build deps from scratch this run can leave a TUI frame that renders
+      # well inside the 30s default arriving late. Raise the wait budget rather
+      # than let that read as a product failure; a genuine hang still fails,
+      # just later.
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1066,7 +1068,7 @@ jobs:
         shell: powershell
         run: |
           $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY'
           @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
