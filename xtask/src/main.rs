@@ -15,6 +15,7 @@ mod demos;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
+mod env_mutation_contract;
 mod manifest;
 mod package;
 mod paths;
