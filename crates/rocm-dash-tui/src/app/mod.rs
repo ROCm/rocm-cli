@@ -1785,6 +1785,14 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 
     // The session ended on its own — the signal watcher is no longer needed and
     // must not linger to fire (and re-restore/exit) after a clean return.
+    // What `abort()` buys is cancelling a watcher still parked on its `.await`:
+    // `spawn_termination_watcher`'s body runs straight from `await_termination`
+    // into `process::exit` with no await point in between, so once the signal
+    // has resolved there is nowhere for the cancellation to land. A signal
+    // arriving in the instant before this call therefore still ends the process
+    // with `128 + signo` instead of returning `res`. Narrow window, accepted:
+    // the process is exiting either way, and the terminal is restored on both
+    // paths.
     signal_task.abort();
 
     // Best-effort terminal restoration, reusing the exact teardown the signal
@@ -2471,10 +2479,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     Some(Ok(CtEvent::Key(k))) if ctrl_c_should_exit(&state, k) => {
                         exit_on_ctrl_c();
                     }
-                    // The approval modal, when open, owns ALL keys with the
-                    // highest priority (above every operational overlay and the
-                    // general handler) so the operator's decision can't be
-                    // pre-empted. On Approve: replay the approved action off the
+                    // The approval modal, when open, owns every remaining key
+                    // (above every operational overlay and the general handler)
+                    // so the operator's decision can't be pre-empted by a screen
+                    // behind it. Only the Ctrl-C arm above outranks it.
+                    // On Approve: replay the approved action off the
                     // event loop (spawn_blocking) and post ChatApprovalResult.
                     // On Deny/Cancel: a declined turn, no execution.
                     Some(Ok(CtEvent::Key(k))) if state.approval.is_some() => {
@@ -4437,18 +4446,33 @@ mod tests {
     // stdout handle, so the Windows path is exercised there, not by this sink.
     #[cfg(unix)]
     #[test]
-    fn write_restore_sequences_leaves_alt_screen_and_shows_cursor() {
-        // The restore path must leave the alternate screen and show the cursor.
-        // Driving an in-memory sink asserts the actual emitted bytes without
-        // touching the process's shared terminal state — the global
-        // `disable_raw_mode()` half is deliberately outside this function, so
-        // nothing here races other tests in the single-process `cargo test` lane.
+    fn write_restore_sequences_leaves_alt_screen_disables_mouse_and_shows_cursor() {
+        // The restore path must undo all three things `run` set up: leave the
+        // alternate screen, disable mouse capture, show the cursor. Driving an
+        // in-memory sink asserts the actual emitted bytes without touching the
+        // process's shared terminal state — the global `disable_raw_mode()` half
+        // is deliberately outside this function, so nothing here races other
+        // tests in the single-process `cargo test` lane.
         let mut sink: Vec<u8> = Vec::new();
         write_restore_sequences(&mut sink).expect("writing to a Vec cannot fail");
         let emitted = String::from_utf8(sink).expect("restore sequences are ASCII escapes");
         assert!(
             emitted.contains("\x1b[?1049l"),
             "expected the leave-alt-screen sequence in {emitted:?}"
+        );
+        // `DisableMouseCapture` is one command but five terminal modes:
+        // crossterm 0.28 expands it to SGR-encoding, urxvt-encoding, any-motion,
+        // button-event and normal tracking, turned off in that order. Assert
+        // the whole block rather than a single mode so dropping the command from
+        // `write_restore_sequences` cannot leave this test green — a terminal
+        // left reporting mouse events after `rocm dash` exits is exactly the
+        // broken-terminal state this restore path exists to prevent. If a
+        // crossterm bump changes the expansion, re-derive it from a sink run
+        // rather than weakening the assertion.
+        let disable_mouse = "\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+        assert!(
+            emitted.contains(disable_mouse),
+            "expected the disable-mouse-capture sequences {disable_mouse:?} in {emitted:?}"
         );
         assert!(
             emitted.contains("\x1b[?25h"),
