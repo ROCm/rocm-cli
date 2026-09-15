@@ -223,7 +223,7 @@ form works depends on the engine your GPU selects.
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the rocm-cli version |
+| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
