@@ -43,7 +43,7 @@ repos:
         args: [--fix=lf] # repo standardises on LF endings (see .gitattributes)
         exclude: '^THIRD_PARTY_NOTICES\.txt$'
 
-  # Python: lint + format the helper scripts and engine workers.
+  # Python: lint + format the helper scripts and the Sphinx docs config.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.4
     hooks:
