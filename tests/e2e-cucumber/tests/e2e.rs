@@ -153,7 +153,8 @@ impl OwnedProcess {
                 // than an error and there is no benign case left to absorb.
                 //
                 // Panicking is safe here specifically: nothing calls this from
-                // `Drop` (the only caller is the serve-21 step), so there is no
+                // `Drop` (the only caller is the step behind
+                // `@id:serve-uninstall-stops-what-it-manages`), so there is no
                 // unwind-during-drop abort to worry about, and cucumber catches
                 // a step panic per scenario — the failure is reported and this
                 // handle's `Drop` still runs its kill/wait cleanup.
