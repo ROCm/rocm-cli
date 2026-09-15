@@ -617,6 +617,13 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 
 // ── EAI-7960: scripted metrics / validity-window regression ────────────────
 
+/// Mirrors the daemon's production `instance_tick`
+/// (`crates/rocm-dash-daemon/src/runner.rs`). Sized so the held value's
+/// persistence window below is wide enough to distinguish "held correctly"
+/// (production clears it after `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s)
+/// from the regression (cleared within about one tick).
+const INSTANCE_TICK: Duration = Duration::from_secs(2);
+
 /// Start the mock in Growing mode so the daemon builds a positive gen_tps
 /// baseline before the scenario injects the Failure transition.
 #[given("a managed model exposes scripted serving metrics")]
@@ -686,13 +693,15 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 ///
 /// The scenario's injected logical clock cannot cross the validity boundary
 /// because the host was descheduled; only an explicit scenario advance can.
-/// The daemon's failed-scrape state is confirmed above, but the TUI repaints
-/// on its own real-time cadence, so poll for the redraw rather than trusting
-/// a fixed sleep to outrun host scheduling contention in CI.
+/// The daemon's failed-scrape state is confirmed above; this step asserts
+/// that "tok/s" *persists* on screen across an `INSTANCE_TICK` window rather
+/// than merely appearing, since it's already on screen from the pre-failure
+/// baseline and a "poll until true" check would pass even if the regression
+/// cleared it immediately after this step started polling.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen("tok/s", default_timeout())
+        .assert_screen_persists("tok/s", INSTANCE_TICK)
         .await
         .unwrap_or_else(|e| {
             panic!(
