@@ -2463,16 +2463,28 @@ mod tests {
         // (`crates/rocm-dash-tui/src/ui/launcher.rs`, rendered verbatim from
         // `ROWS`); there has never been a screen called "Set Up ROCm".
         //
-        // The negative assertion is not vacuous, and it is strictly stronger
-        // than the "don't repeat the verb" guard it replaces: both the invented
-        // label this branch emitted until now and the superseded pre-`31957ed`
-        // wording ("Set up ROCm first from Set Up ROCm") contain "Set Up ROCm",
-        // so either revert fails here. The positive assertion alone cannot
-        // catch them, since both would simply stop matching a needle they never
-        // contained. Nor can `assert_actionable` — this branch is deliberately
-        // not covered by it, since the none-ready message carries only one of
-        // its four needles (`rocm runtimes list`); the other three are remedies
-        // for choosing between runtimes, which do not apply when none is usable.
+        // The positive assertion already catches a plain revert to either wrong
+        // wording on its own: neither the invented label this branch emitted
+        // until now ("install another from Set Up ROCm") nor the superseded
+        // pre-`31957ed` wording ("Set up ROCm first from Set Up ROCm") contains
+        // `pick "Set up this system"`, so under either revert the positive
+        // needle stops matching and reddens. Measured, not assumed: reverting
+        // the production string to the invented label fails the positive
+        // assertion, and fails the negative one too once the positive is
+        // neutralized.
+        //
+        // The negative assertion is therefore not redundant, but its value is
+        // the case the positive one cannot see: a message carrying *both*
+        // labels. Re-adding "Set Up ROCm" alongside the real row still
+        // satisfies the positive needle, so only the negative one reddens —
+        // measured the same way. That is the drift worth guarding here, since
+        // the invented screen name is likelier to creep back as an "extra"
+        // pointer than as a wholesale revert.
+        //
+        // Nor can `assert_actionable` cover this branch — it is deliberately
+        // excluded, since the none-ready message carries only one of its four
+        // needles (`rocm runtimes list`); the other three are remedies for
+        // choosing between runtimes, which do not apply when none is usable.
         assert!(
             message.contains("pick \"Set up this system\""),
             "error should still point at the launcher's \"Set up this system\" row, got: {message}"
@@ -2480,6 +2492,48 @@ mod tests {
         assert!(
             !message.contains("Set Up ROCm"),
             "the setup pointer must not name the nonexistent `Set Up ROCm` screen, got: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_runtime_setup_pointers_name_the_real_launcher_row() -> Result<()> {
+        // The none-ready pointer above is one of three siblings that send a
+        // user off to install ROCm; the other two fire when the registry is
+        // empty rather than merely unusable. Until now only the none-ready one
+        // was pinned, so these two could drift back to the invented `Set Up
+        // ROCm` screen name without reddening anything. Same needles, same
+        // reasoning as `no_ready_runtime_lists_each_key_and_reason`: the
+        // positive one catches a wholesale revert, the negative one catches the
+        // invented label creeping back *alongside* the real row.
+        //
+        // `test_paths` never creates the runtime registry directory, so
+        // `load_runtime_manifests` returns empty and both zero-runtime branches
+        // are the ones under test.
+        let paths = test_paths("comfyui-zero-runtime-setup-pointers");
+
+        // `render_status`' "ROCm" note (the zero-runtime arm of `render_status`).
+        let status = render_status(&paths, &RocmCliConfig::default())?;
+        assert!(
+            status.contains("pick \"Set up this system\""),
+            "status should point at the launcher's \"Set up this system\" row, got: {status}"
+        );
+        assert!(
+            !status.contains("Set Up ROCm"),
+            "status must not name the nonexistent `Set Up ROCm` screen, got: {status}"
+        );
+
+        // `select_runtime`'s bail when nothing is registered at all.
+        let error = select_runtime(&paths, &RocmCliConfig::default(), None)
+            .expect_err("no registered runtime means no selection");
+        let message = error.to_string();
+        assert!(
+            message.contains("pick \"Set up this system\""),
+            "the zero-runtime refusal should point at the launcher's \"Set up this system\" row, got: {message}"
+        );
+        assert!(
+            !message.contains("Set Up ROCm"),
+            "the zero-runtime refusal must not name the nonexistent `Set Up ROCm` screen, got: {message}"
         );
         Ok(())
     }

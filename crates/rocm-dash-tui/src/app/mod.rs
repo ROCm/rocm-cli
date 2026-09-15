@@ -6656,8 +6656,14 @@ mod tests {
         );
     }
 
-    /// The exact CLI refusal `rocm comfyui install` prints when two managed ROCm
-    /// runtimes are ready and none is activated.
+    /// The leading sentences of the CLI refusal `rocm comfyui install` prints
+    /// when two managed ROCm runtimes are ready and none is activated. This is a
+    /// verbatim *prefix*, not the whole message: the real one continues with an
+    /// `Available: <key>, <key>.` list and a trailing pointer to
+    /// `rocm runtimes list`, both of which depend on the planted runtimes and
+    /// neither of which this test inspects — it only pins what the seam does
+    /// with the envelope it is handed, so the remedy-bearing prefix is the
+    /// relevant part.
     const AMBIGUOUS_RUNTIME_REFUSAL: &str = "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default \
          with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`.";
 
