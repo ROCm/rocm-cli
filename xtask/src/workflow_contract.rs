@@ -1114,6 +1114,74 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_shared_uv_cache_sits_inside_the_gc_bounded_directory() {
+        // Two independent properties ride on this one path, and both fail
+        // silently.
+        //
+        // Hardlinking: uv can only link out of its cache into a managed
+        // environment when the two are reachable without crossing a mount point.
+        // Otherwise it copies, exits 0, and two of the three install paths
+        // discard its warning — invisible unless you compare inodes.
+        //
+        // Eviction: the runner pod's `uv-cache-gc` initContainer bounds exactly
+        // one directory — the `uv-cache` subPath of the work PVC, which surfaces
+        // in the job as <runner-root>/uv-cache. It sweeps abandoned `.tmp*`
+        // extractions, then deletes `archive-v0` if FREE space on the volume is
+        // under 60GiB. A free-space floor, not a size cap. A cache placed
+        // elsewhere on the same volume still hardlinks, so every signal stays
+        // green while nothing enforces the floor — and the volume also holds
+        // `.runner`, whose credentials need a repo-Administration token to
+        // re-register. The 49G/49G strand that motivated this was the separate
+        // 50Gi cache PVC, since deleted, which had no floor at all.
+        //
+        // $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so a lane that derives
+        // the cache from it directly lands one level too deep and escapes the GC.
+        // Asserting the derivation rather than a literal keeps this honest if the
+        // runner root ever moves.
+        const DERIVATION: &str = "runner_root=\"$(dirname \"$(dirname \"$RUNNER_WORKSPACE\")\")\"";
+        const EXPORT: &str = "export E2E_SHARED_UV_CACHE_DIR=\"$runner_root/uv-cache\"";
+
+        for (workflow, text) in self_hosted_workflows() {
+            let mut setters = 0;
+            for block in multiline_run_blocks(&text) {
+                let Some(line) = block
+                    .lines()
+                    .find(|line| line.starts_with("export E2E_SHARED_UV_CACHE_DIR="))
+                else {
+                    continue;
+                };
+                setters += 1;
+                // Full-line equality, not `contains`: a substring match accepts
+                // `$runner_root/uv-cache-old`, which is outside the bounded
+                // directory and would fail exactly the way this test exists to
+                // prevent.
+                assert_eq!(
+                    line, EXPORT,
+                    "{workflow} sets the shared uv cache to `{line}`. It must be \
+                     exactly `{EXPORT}` — <runner-root>/uv-cache is the only directory \
+                     the runner's uv-cache-gc initContainer bounds. $RUNNER_WORKSPACE \
+                     itself is one level too deep, which keeps the hardlinks but \
+                     silently drops the 60GiB free-space floor"
+                );
+                assert!(
+                    block.contains(DERIVATION),
+                    "{workflow} exports E2E_SHARED_UV_CACHE_DIR from `$runner_root` \
+                     without defining it in the same run block; add `{DERIVATION}`"
+                );
+            }
+            // Without this, deleting every export is a silent pass — the loop
+            // above simply finds nothing to assert on. Same guard the sibling
+            // `assert_prebuilt_e2e_lanes_export_rocmd` uses.
+            assert!(
+                setters > 0,
+                "{workflow} sets E2E_SHARED_UV_CACHE_DIR nowhere. Its GPU lanes share a \
+                 pre-warmed runtime, so an unset cache sends uv to a per-job default \
+                 outside the GC-bounded directory"
+            );
+        }
+    }
+
+    #[test]
     fn self_hosted_prebuilt_e2e_lanes_export_rocmd() {
         let workflow = read_workflow("e2e-selfhosted.yml");
         assert_prebuilt_e2e_lanes_export_rocmd("e2e-selfhosted.yml", &workflow);

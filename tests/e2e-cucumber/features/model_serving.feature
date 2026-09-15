@@ -161,16 +161,12 @@ Feature: Model serving
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
   #
-  # This is the live coverage for `--gpu` validation under either authority: the
-  # amd-smi device count, or — when amd-smi cannot count — membership in the
-  # KFD/DRM usable set (EAI-8058). Which one answers depends on the lane, so the
-  # step accepts either rejection wording. The *masked* sub-case that motivated
-  # the membership rule (a visibility mask leaving a non-contiguous usable set,
-  # e.g. `HIP_VISIBLE_DEVICES=2` on a 4-GPU host, where `--gpu 2` must pass and
-  # `--gpu 0` must be refused) has no scenario of its own: it is reachable only
-  # where amd-smi is *absent*, and faking that absence would assert against the
-  # seam rather than the product. It is unit-covered by
-  # `validate_pinned_gpu_index_falls_back_to_usable_set_membership`.
+  # This is the live coverage for an index the host does not have. The *masked*
+  # sub-case — an index that exists but is hidden by an active visibility mask —
+  # is a different refusal and owns its own scenarios, serve-19 and serve-20.
+  # The step here accepts several refusal wordings only because which authority
+  # answers depends on the lane: the visible set when it could be enumerated,
+  # the raw amd-smi count when it could not.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
@@ -199,6 +195,74 @@ Feature: Model serving
     Then serving stops after one automatic retry
     And the user is told how to reinstall Lemonade and retry serving
 
+  # Visible-ordinal correctness (EAI-7194): a `--gpu` index that physically EXISTS
+  # on the host but is hidden by an active visibility mask
+  # (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES) must be validated against the
+  # VISIBLE set and refused — never silently remapped onto a visible device. This
+  # is distinct from scenario 13 (an index beyond the device count): here the index
+  # is in range yet masked out. On a multi-GPU host (e.g. MI300X) `--gpu 1` under
+  # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
+  # rejection directly. It holds on a single-GPU host too, so this stays ungated:
+  # the mask names device 0, which exists there, so the visible set still resolves
+  # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
+  # names a device a single-GPU host does not have — see the note there.) Either
+  # way an honest refusal rather than a remap, which is what this asserts. Runs on
+  # GPU hardware.
+  @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
+  Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
+    When the user serves a model pinned to a GPU hidden by the visibility mask
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable
+
+  # ROCR-vs-HIP ordinal space (EAI-7194): `ROCR_VISIBLE_DEVICES` masks at the ROCr
+  # level and HIP re-indexes the surviving devices as 0..N, whereas rocm-cli pins
+  # and exports its choice through `HIP_VISIBLE_DEVICES`. So a `--gpu` index must
+  # be validated in that re-indexed HIP space, not against the physical ROCR
+  # tokens. On a multi-GPU host `ROCR_VISIBLE_DEVICES=1` leaves one device that HIP
+  # sees as ordinal 0; `--gpu 1` is therefore out of the visible set and must be
+  # refused — before the fix it was read as the physical token 1, wrongly accepted,
+  # then exported as HIP ordinal 1 that no longer binds. The complementary
+  # accept-path (`--gpu 0` binding the surviving physical device) needs live
+  # multi-GPU hardware and is covered by the `usable_amd_gpu_indices_from` unit
+  # tests.
+  #
+  # KNOWN GAP — why this needs `@requires-multi-gpu` rather than just a GPU:
+  # a mask token `>= present` is not a device the host has, so
+  # `usable_amd_gpu_indices_from` cannot resolve the visible set and reports
+  # "unknown" (`None`) rather than an authoritative answer. On a SINGLE-GPU host
+  # `ROCR_VISIBLE_DEVICES=1` is exactly that shape, and `--gpu` validation then
+  # falls back to `detect_gpu_count()`'s best-effort `amd-smi list` count. That
+  # count does NOT honour the mask (amd-smi reads sysfs/KFD, not ROCr), so where
+  # amd-smi is installed it answers 1 and the ordinal is refused as "out of
+  # range"; where amd-smi is absent or unparseable it answers `None` and the serve
+  # is ALLOWED, not refused — which is what the single-GPU lane observed. So the
+  # outcome on one GPU turns on whether amd-smi happens to be present, and only a
+  # second device makes the refusal follow from the mask itself. The permissive
+  # unknown-mask fallback is deliberate (an unprobeable host must not be blocked
+  # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
+  # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
+  # set resolves on one GPU too and it stays ungated.
+  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
+  Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
+    When the user serves a model pinned past the ROCR-reindexed visible set
+    Then serving is refused before any engine starts
+    And the user is told the pinned GPU is unavailable
+
+  # Both visibility variables at once (EAI-7194): they compose, they are not
+  # alternatives. ROCr applies first and HIP only re-indexes and selects among the
+  # survivors, so `ROCR_VISIBLE_DEVICES=` (hide everything) leaves HIP nothing to
+  # see and `HIP_VISIBLE_DEVICES=0` cannot bring a device back. The GPU-required
+  # serve must therefore refuse, exactly as serve-15 does for a HIP-only empty
+  # mask. Before the fix the probe preferred the HIP mask and discarded the ROCR
+  # one entirely, resolved the visible set to [0], and let the serve proceed onto a
+  # device the runtime had already hidden. Runs on GPU hardware: on a no-GPU host
+  # the same refusal fires for having no device at all and would prove nothing.
+  @id:serve-rocr-empty-mask-beats-hip-mask @requires-gpu @requires-os:linux
+  Scenario: serve-21 - Serving is refused when ROCR hides every GPU a HIP mask names
+    When the user serves a model with ROCR hiding every GPU a HIP mask names
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+
   # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
   # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
   # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
@@ -212,7 +276,7 @@ Feature: Model serving
   # runtime is active — hence the same `a managed runtime is active` precondition
   # every other real-serve scenario on this lane opens with.
   @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
-  Scenario: serve-19 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+  Scenario: serve-22 - A vLLM serve plan on a nearly-full GPU points at the memory knob
     Given a managed runtime is active
     And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU
@@ -229,13 +293,13 @@ Feature: Model serving
   # pre-flight and reaches the reuse short-circuit even here. It therefore gates
   # every PR and allocates no GPU memory.
   @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
-  Scenario: serve-20 - Reusing an already-running serve never blames it for another process's OOM
+  Scenario: serve-23 - Reusing an already-running serve never blames it for another process's OOM
     Given a live managed vLLM serve has an OOM startup log
     When the user opens its interactive serve summary
     Then the summary reflects the reused already-running service
     And the deployment summary does not blame this invocation for GPU memory
 
-  # Positive counterpart of Scenario 20 (EAI-8059 review asked for both): when
+  # Positive counterpart of Scenario 23 (EAI-8059 review asked for both): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
   # ready, the summary MUST name the memory knobs. A real launch cannot run on a
   # GPU-less host, so the mock lane build compiles in a test-only fault-injection
@@ -247,7 +311,7 @@ Feature: Model serving
   # where xtask builds the binary with the feature. @requires-no-gpu because the
   # fabricated launch stands in for the GPU the mock lane does not have.
   @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-21 - A launch that runs out of GPU memory names the memory knobs
+  Scenario: serve-24 - A launch that runs out of GPU memory names the memory knobs
     Given a managed vLLM launch will run out of GPU memory
     When the user opens the interactive serve summary for that launch
     Then the deployment summary blames this launch for GPU memory

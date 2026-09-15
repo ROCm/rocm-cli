@@ -21,6 +21,7 @@ mod e2e {
     pub mod automations_steps;
     pub mod bench_steps;
     pub mod chat_steps;
+    pub mod comfyui_steps;
     pub mod config_steps;
     pub mod dash_steps;
     pub mod dependency_guard_steps;
@@ -152,8 +153,11 @@ fn shared_cache_dir() -> Option<PathBuf> {
 /// cold ~160s install into a ~34s warm one (measured on MI300X) without sharing
 /// any mutable state — the runtimes *registry* the suite asserts on still lives
 /// in each scenario's isolated `<data>/runtimes` (see `default()`). Kept as its
-/// own env var (not derived from `E2E_SHARED_CACHE_DIR`) so CI can place it on a
-/// larger overlay disk than the model-weights cache. Unset locally → no sharing.
+/// own env var (not derived from `E2E_SHARED_CACHE_DIR`) because it has a
+/// placement constraint the weights cache does not: uv can only hardlink out of
+/// it into a managed environment when the two are reachable without crossing a
+/// mount point, so CI must put it under the same mount as the runtimes it
+/// populates — the same volume is not enough. Unset locally → no sharing.
 fn shared_uv_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
@@ -272,8 +276,9 @@ impl E2eWorld {
         }
         // Share uv's content-addressed download/build cache (the wheels `rocm
         // install sdk` fetches) so only the first scenario pays the cold download.
-        // Independent of the weights cache above so CI can host it on a larger
-        // disk; the runtimes registry the suite asserts on stays isolated.
+        // Independent of the weights cache above because it has to sit under the
+        // same mount as the runtimes it populates or uv copies instead of
+        // hardlinking; the runtimes registry the suite asserts on stays isolated.
         if let Some(uv_cache) = shared_uv_cache_dir() {
             env.push(("UV_CACHE_DIR", uv_cache.into_os_string()));
         }
@@ -1122,8 +1127,8 @@ async fn main() {
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
-    // per-engine canary covers them on the PR fast path); set by ci.yml on the
-    // `merge_group` event.
+    // per-engine canary covers them on the PR fast path); set by
+    // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",

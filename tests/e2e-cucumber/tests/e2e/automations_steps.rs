@@ -47,6 +47,34 @@ pub(crate) fn suppress_daemon_spawn(world: &E2eWorld) {
     .expect("failed to write automation runtime state");
 }
 
+/// Plant an autostart *claim* — the harness's own (live) pid and a fresh spawn
+/// time — WITHOUT planting the daemon runtime-state. Unlike `suppress_daemon_spawn`
+/// (which marks the daemon already *running*, so the CLI's pre-check short-circuits
+/// before the claim is ever consulted), this reproduces the spawn→publish window
+/// the fix guards: no `running` state is published yet, so the "already running?"
+/// check reads false, but a spawn is genuinely in flight. A correct autostart
+/// holder that acquires the lock in this window must see the live, recent claim
+/// and defer instead of spawning a duplicate daemon. Written in the same
+/// `"<pid> <ms>"` shape the CLI's `write_autostart_claim` uses.
+fn plant_inflight_autostart_claim(world: &E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let dir = root.path().join("data").join("automations");
+    std::fs::create_dir_all(&dir).expect("failed to create automations dir");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    std::fs::write(
+        dir.join("autostart.claim"),
+        format!("{} {now_ms}", std::process::id()),
+    )
+    .expect("failed to write autostart claim");
+}
+
+#[given("a daemon spawn is already in flight")]
+async fn daemon_spawn_in_flight(world: &mut E2eWorld) {
+    plant_inflight_autostart_claim(world);
+}
+
 #[given("an enabled automation watcher")]
 async fn enabled_watcher(world: &mut E2eWorld) {
     suppress_daemon_spawn(world);
@@ -113,6 +141,28 @@ async fn confirm_enabled(world: &mut E2eWorld, mode: String) {
     assert!(
         out.contains(&format!("mode: {mode}")),
         "expected mode {mode}, got:\n{out}"
+    );
+}
+
+#[then("the CLI does not start a second background daemon")]
+async fn no_second_daemon(world: &mut E2eWorld) {
+    // The enable itself still succeeds and confirms the watcher: deferring to the
+    // in-flight spawn is invisible to the user's requested action.
+    let out = ok_output(world);
+    assert!(
+        out.contains("automation watcher enabled"),
+        "expected the enable to still succeed, got:\n{out}"
+    );
+    // But it must have DEFERRED to the in-flight claim: the autostart holder only
+    // prints a `helper:` daemon line ("started ..." on success, "could not start
+    // ..." on failure) once it actually reaches the spawn. Its absence is the
+    // observable proof that no second daemon was launched — the exact regression
+    // a duplicate spawn in the spawn→publish window would introduce.
+    let combined = combined(world);
+    assert!(
+        !combined.contains("background automation daemon"),
+        "expected the enable to defer to the in-flight spawn without launching a \
+         second daemon, but it reached the spawn:\n{combined}"
     );
 }
 
