@@ -6,9 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, RocmCliConfig, active_managed_therock_environment,
-    download_file_to_path, format_http_base_url, http_get_text_with_auth,
-    normalize_runtime_path_for_host, prepend_runtime_paths, require_nonempty, runtime_is_linux,
-    runtime_is_windows,
+    active_managed_therock_version, download_file_to_path, format_http_base_url,
+    http_get_text_with_auth, normalize_runtime_path_for_host, prepend_runtime_paths,
+    require_nonempty, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EndpointRequest,
@@ -40,6 +40,11 @@ const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GG
 const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 const LLAMACPP_RECIPE: &str = "llamacpp";
 const ROCM_BACKEND_NAME: &str = "rocm";
+/// Resource file inside the extracted Lemonade embeddable pinning which
+/// llama.cpp build (and paired ROCm version) `llamacpp:rocm` downloads. Its own
+/// header comment invites hand-editing: "You can modify these values to pin
+/// specific versions without rebuilding the application."
+const BACKEND_VERSIONS_RESOURCE: &str = "resources/backend_versions.json";
 /// Records the extracted embeddable version inside the runtime tree itself
 /// (not the CLI's own manifest) so the version check survives even when the
 /// manifest lives under a data dir that is not shared with the runtime tree
@@ -456,18 +461,21 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         .as_deref()
         .map(normalize_runtime_path_for_host);
     let mut manifest = prepare_embeddable(&paths, env_root.as_deref(), request.reinstall)?;
-    // Lemonade reuses the ROCm rocm-cli already installed via the injected process
-    // environment (ROCM_PATH / rocm-sdk on PATH); no channel translation is needed.
     eprintln!("Detecting best supported Lemonade llama.cpp backend...");
-    install_best_llamacpp_backend(&mut manifest)?;
+    let aligned_version = prepare_llamacpp_backend_for_active_rocm(&paths, &mut manifest)?;
     write_manifest(&paths, &manifest)?;
-    let warnings = vec![
+    let mut warnings = vec![
         "Lemonade is installed as a rocm-cli managed embeddable runtime".to_owned(),
         format!(
             "Selected the best supported llama.cpp backend for this GPU: {}:{}",
             manifest.backend_recipe, manifest.backend_name
         ),
     ];
+    if let Some(version) = aligned_version {
+        warnings.push(format!(
+            "Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK ({version})"
+        ));
+    }
     Ok(InstallResponse {
         env_id: manifest.env_id.clone(),
         env_path: manifest.runtime_dir.display().to_string(),
@@ -585,7 +593,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     // assumed device 0), and an explicit `--gpu` index is rejected when it is not
     // actually present. This runs before any server process is spawned.
     request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
-    let runtime = resolve_runtime()?;
+    let mut runtime = resolve_runtime()?;
     let mut process_env = lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
@@ -634,9 +642,14 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
-    let backend =
-        ensure_best_llamacpp_backend(&runtime.manifest, &request.host, request.port, &process_env)
-            .context("failed to select a supported Lemonade llama.cpp backend")?;
+    let backend = ensure_best_llamacpp_backend(
+        &mut runtime.manifest,
+        &request.host,
+        request.port,
+        &process_env,
+        false,
+    )
+    .context("failed to select a supported Lemonade llama.cpp backend")?;
     let load_result = run_lemonade_model_load(
         &runtime.manifest,
         &request.host,
@@ -1180,7 +1193,434 @@ where
     })
 }
 
-fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Result<()> {
+/// Point Lemonade's `llamacpp:rocm` backend at the ROCm version rocm-cli already has
+/// installed and active, instead of Lemonade's hardcoded pin (which does not track
+/// whatever the user separately installed via `rocm install sdk`).
+///
+/// Best-effort and defensive at every step: if there is no managed rocm-cli SDK, the
+/// pinned version already matches, or an aligned attempt cannot be verified to actually
+/// resolve its GPU library, this falls back to (or reverts to) today's unmodified
+/// pinned-version install — never a regression, and never a silent CPU fallback
+/// (AGENTS.md §6): an aligned backend is only kept once [`rocm_backend_resolves`]
+/// confirms it.
+///
+/// Returns the aligned version string when one was applied and verified, so the caller
+/// can surface it in the install response.
+fn prepare_llamacpp_backend_for_active_rocm(
+    paths: &AppPaths,
+    manifest: &mut LemonadeInstallManifest,
+) -> Result<Option<String>> {
+    // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
+    // reports unresolved elsewhere), so attempting it on Windows can only burn up to
+    // three multi-GB backend installs and a network round-trip for a guaranteed-futile
+    // outcome. Skip straight to the ordinary pinned-version install.
+    if !runtime_is_linux() {
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    }
+
+    let target_version = active_rocm_sdk_version_for_alignment(paths).unwrap_or_else(|error| {
+        eprintln!(
+            "Warning: could not determine the active ROCm SDK version to align Lemonade's \
+             backend with: {error:#}"
+        );
+        None
+    });
+    let Some(target_version) = target_version else {
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    };
+
+    let backend_versions_path = manifest.runtime_dir.join(BACKEND_VERSIONS_RESOURCE);
+    let Some(pinned_version) = read_backend_versions_therock_version(&backend_versions_path) else {
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    };
+    if pinned_version == target_version {
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    }
+
+    align_llamacpp_backend_to_version(
+        manifest,
+        &backend_versions_path,
+        &target_version,
+        &pinned_version,
+        try_llamacpp_backend_alignment,
+        install_best_llamacpp_backend,
+        latest_llamacpp_rocm_stable_tag,
+    )
+}
+
+/// The Tier 1 / Tier 2 / revert state machine, isolated from the config and active-SDK
+/// lookups above so it can be exercised in tests against a temp `backend_versions.json`
+/// with the install/align/latest-tag steps injected, instead of spawning a real
+/// `lemond` and reaching GitHub.
+fn align_llamacpp_backend_to_version(
+    manifest: &mut LemonadeInstallManifest,
+    backend_versions_path: &Path,
+    target_version: &str,
+    pinned_version: &str,
+    mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
+    mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
+    mut latest_tag: impl FnMut() -> Result<String>,
+) -> Result<Option<String>> {
+    if let Err(error) =
+        write_backend_versions_therock_version(backend_versions_path, target_version)
+    {
+        eprintln!("Warning: could not pin Lemonade's backend to ROCm {target_version}: {error:#}");
+        fallback_install(manifest, false)?;
+        return Ok(None);
+    }
+
+    // Tier 1: keep Lemonade's own pinned llama.cpp build, just point it at the active
+    // ROCm version. Works when that specific build's release actually shipped a
+    // matching ROCm-version asset.
+    if align(
+        manifest,
+        target_version,
+        false,
+        "its pinned llama.cpp build",
+    ) {
+        return Ok(Some(target_version.to_owned()));
+    }
+
+    // Tier 2: the pinned build may simply be too old to ever have shipped a
+    // matching ROCm-version asset — Lemonade only started publishing per-ROCm-
+    // version builds partway through its release history, and the embeddable's
+    // pin (frozen at whatever build was current when this Lemonade version was
+    // cut) does not track that. Point at the current newest build instead, still
+    // paired with the active ROCm version, forcing a real reinstall attempt
+    // regardless of whatever Tier 1 left on disk.
+    let pinned_tag = read_backend_versions_llamacpp_tag(backend_versions_path);
+    let latest_tag_applied = match latest_tag() {
+        Ok(latest_tag) if pinned_tag.as_deref() != Some(latest_tag.as_str()) => {
+            match write_backend_versions_llamacpp_tag(backend_versions_path, &latest_tag) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not pin Lemonade's backend to llama.cpp {latest_tag}: \
+                         {error:#}"
+                    );
+                    false
+                }
+            }
+        }
+        // The pinned tag already is the latest — Tier 1 already tried it.
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("Warning: could not determine Lemonade's latest llama.cpp build: {error:#}");
+            false
+        }
+    };
+    if latest_tag_applied && align(manifest, target_version, true, "the latest llama.cpp build") {
+        return Ok(Some(target_version.to_owned()));
+    }
+
+    // Neither tier produced a verified GPU backend. Revert everything — including
+    // the llama.cpp build tag, so the fallback install below isn't itself
+    // misdirected — and retry once more with Lemonade's original pinned defaults.
+    // Never a regression relative to today's behavior: every step below is
+    // best-effort, matching its sibling warnings, so a failure to restore the pin
+    // still lets the fallback install run rather than hard-failing the whole install.
+    eprintln!(
+        "Warning: could not align Lemonade's ROCm backend to {target_version}; reverting to the \
+         default pinned version."
+    );
+    if let Err(error) =
+        write_backend_versions_therock_version(backend_versions_path, pinned_version)
+    {
+        eprintln!(
+            "Warning: could not restore Lemonade's default pinned backend version \
+             ({pinned_version}): {error:#}"
+        );
+    }
+    if latest_tag_applied {
+        // Best-effort, matching the therock.version restore above: a failure here
+        // must not skip the fallback reinstall below. Restore the original tag when
+        // there was one; otherwise Tier 2 pinned a key that did not exist before, so
+        // removing it (not writing some placeholder) is what "reverted" means.
+        let restore_result = match pinned_tag.as_deref() {
+            Some(tag) => write_backend_versions_llamacpp_tag(backend_versions_path, tag),
+            None => remove_backend_versions_llamacpp_tag(backend_versions_path),
+        };
+        if let Err(error) = restore_result {
+            eprintln!(
+                "Warning: could not restore Lemonade's default pinned llama.cpp build tag: \
+                 {error:#}"
+            );
+        }
+    }
+    fallback_install(manifest, true)?;
+    Ok(None)
+}
+
+/// Attempt one llama.cpp backend install aligned to `target_version`'s ROCm pairing
+/// (already written into `resources/backend_versions.json`), then verify — never
+/// simply trust Lemonade's own reported success — that the resulting GPU backend
+/// actually resolves against rocm-cli's active ROCm SDK (AGENTS.md §6: no silent CPU
+/// fallback). Returns whether a verified backend is now in place; on success,
+/// `manifest.backend_name` is updated to match it.
+fn try_llamacpp_backend_alignment(
+    manifest: &mut LemonadeInstallManifest,
+    target_version: &str,
+    force_reinstall: bool,
+    attempt_label: &str,
+) -> bool {
+    let install_result = install_best_llamacpp_backend(manifest, force_reinstall);
+    // `ensure_best_llamacpp_backend` records the backend it attempted into
+    // `manifest.backend_name` before the fallible install step runs, so this is accurate
+    // even when `install_result` is `Err` below. Scoping to it — rather than scanning
+    // every backend directory — means a stale `rocm-*` directory left by an earlier
+    // attempt can never be mistaken for this round's verification, including when this
+    // round actually picked `vulkan`.
+    let backend_name = manifest.backend_name.clone();
+    let has_usable_binary = backend_name == ROCM_BACKEND_NAME
+        && lemonade_process_environment().is_ok_and(|process_env| {
+            find_llama_server_binary_for_backend(manifest, &backend_name)
+                .is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
+        });
+    if !has_usable_binary {
+        match install_result {
+            Ok(()) => eprintln!(
+                "Warning: {attempt_label} installed for ROCm {target_version}, but its GPU \
+                 backend does not resolve against rocm-cli's active ROCm SDK; not using it."
+            ),
+            Err(error) => eprintln!(
+                "Warning: could not install {attempt_label} for ROCm {target_version}: {error:#}"
+            ),
+        }
+        return false;
+    }
+    match install_result {
+        Ok(()) => {
+            eprintln!("Aligned Lemonade's ROCm backend to {target_version} using {attempt_label}.");
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: Lemonade reported an error installing {attempt_label} for ROCm \
+                 {target_version} ({error:#}), but the backend resolves against rocm-cli's \
+                 active ROCm SDK; continuing with it."
+            );
+            // `manifest.backend_name` is already correct: set by `ensure_best_llamacpp_backend`
+            // before the fallible install step ran, and verified against just above.
+        }
+    }
+    true
+}
+
+/// GitHub repo backing Lemonade's `llamacpp:rocm-stable` builds. Bumping
+/// `resources/backend_versions.json`'s `therock.version` alone doesn't get a
+/// ROCm-version-matched build if the pinned tag predates that ROCm version's
+/// support: Lemonade only started publishing per-ROCm-version assets partway
+/// through this repo's release history, and the embeddable's own pin can be
+/// (and, at the time of writing, is) older than that.
+const LLAMACPP_ROCM_STABLE_REPO: &str = "lemonade-sdk/llama.cpp";
+
+/// The newest published release tag for [`LLAMACPP_ROCM_STABLE_REPO`] (e.g.
+/// `b10952`), queried directly rather than assumed — the whole reason Tier 2
+/// exists is that the embeddable's own pinned tag cannot be trusted to have a
+/// matching-ROCm-version asset.
+fn latest_llamacpp_rocm_stable_tag() -> Result<String> {
+    let url = format!("https://api.github.com/repos/{LLAMACPP_ROCM_STABLE_REPO}/releases/latest");
+    let timeout = Duration::from_secs(15);
+    // `timeout_connect` takes precedence over `timeout` and defaults to 30s, so without
+    // it a host that blackholes rather than refuses would stall well past the intended
+    // ceiling.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout(timeout)
+        .build();
+    let response = agent
+        .get(&url)
+        .set("User-Agent", "rocm-cli")
+        .call()
+        .with_context(|| format!("failed to query {url}"))?;
+    let body: Value = response
+        .into_json()
+        .with_context(|| format!("failed to parse response from {url}"))?;
+    body.get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{url} response is missing 'tag_name'"))
+}
+
+/// Read `resources/backend_versions.json`'s pinned `llamacpp.rocm-stable` build tag.
+fn read_backend_versions_llamacpp_tag(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("llamacpp")?
+        .get("rocm-stable")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Overwrite `resources/backend_versions.json`'s `llamacpp.rocm-stable` build tag in
+/// place, preserving every other key.
+fn write_backend_versions_llamacpp_tag(path: &Path, tag: &str) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    value
+        .get_mut("llamacpp")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
+        .insert("rocm-stable".to_owned(), Value::String(tag.to_owned()));
+    fs::write(path, serde_json::to_vec_pretty(&value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Remove `resources/backend_versions.json`'s `llamacpp.rocm-stable` key entirely,
+/// restoring the "never pinned" state — the counterpart to
+/// [`write_backend_versions_llamacpp_tag`] for reverting Tier 2's pin when there was
+/// no prior tag to restore it to.
+fn remove_backend_versions_llamacpp_tag(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    value
+        .get_mut("llamacpp")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
+        .remove("rocm-stable");
+    fs::write(path, serde_json::to_vec_pretty(&value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// The active rocm-cli-managed ROCm SDK version to align Lemonade's backend to,
+/// restricted to plain `X.Y.Z` release versions. Nightly builds carry a date suffix
+/// (e.g. `7.14.0a20260601`) that does not correspond to any llama.cpp build tag
+/// Lemonade publishes, so those are left alone rather than guessed at.
+///
+/// Errors (rather than defaulting) when the config can't be loaded: an empty default
+/// config would discard the active runtime key and let version selection guess the
+/// most-recently-installed runtime, then mutate Lemonade based on that guess.
+fn active_rocm_sdk_version_for_alignment(paths: &AppPaths) -> Result<Option<String>> {
+    let config = RocmCliConfig::load(paths)?;
+    let Some(version) = active_managed_therock_version(paths, &config)? else {
+        return Ok(None);
+    };
+    Ok(looks_like_plain_semver(&version).then_some(version))
+}
+
+/// Whether `version` is a plain `major.minor.patch` string with no build/date suffix
+/// (e.g. `10.0.0`, not `7.14.0a20260601`).
+fn looks_like_plain_semver(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Read `resources/backend_versions.json`'s `therock.version` — Lemonade's pin for
+/// which private ROCm runtime its `llamacpp:rocm` backend downloads.
+fn read_backend_versions_therock_version(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("therock")?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Overwrite `resources/backend_versions.json`'s `therock.version` in place,
+/// preserving every other key. Lemonade's own comment in that file invites exactly
+/// this: "You can modify these values to pin specific versions without rebuilding the
+/// application."
+fn write_backend_versions_therock_version(path: &Path, version: &str) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    value
+        .get_mut("therock")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{} has no 'therock' object to patch", path.display()))?
+        .insert("version".to_owned(), Value::String(version.to_owned()));
+    fs::write(path, serde_json::to_vec_pretty(&value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// ROCm shared-library sonames the `llamacpp:rocm` backend's `libggml-hip.so` links
+/// against. If any fail to resolve, the backend would silently fall back to CPU
+/// inference at runtime instead of failing loudly — unacceptable under the
+/// GPU-required policy (AGENTS.md §6), so this must be verified, not assumed from
+/// version numbers matching.
+///
+/// Linux-only, like the `ldd`-based verification it exists for: the non-Linux
+/// `rocm_backend_resolves` stub below never references it, so leaving it
+/// ungated makes it dead code — and a build failure under `-D warnings` — on
+/// every other target.
+#[cfg(target_os = "linux")]
+const ROCM_BACKEND_REQUIRED_SONAMES: [&str; 4] = [
+    "libhipblas.so",
+    "librocblas.so",
+    "libamdhip64.so",
+    "libhsa-runtime64.so",
+];
+
+/// Whether the ROCm GPU backend beside `llama_server_binary` actually resolves its
+/// required ROCm libraries under `process_env` (rocm-cli's injected ROCm environment),
+/// checked with `ldd` rather than assumed. `false` on any I/O/parse failure.
+#[cfg(target_os = "linux")]
+fn rocm_backend_resolves(
+    llama_server_binary: &Path,
+    process_env: &LemonadeProcessEnvironment,
+) -> bool {
+    let Some(backend_dir) = llama_server_binary.parent() else {
+        return false;
+    };
+    let hip_backend = backend_dir.join("libggml-hip.so");
+    if !hip_backend.is_file() {
+        return false;
+    }
+    let mut command = ProcessCommand::new("ldd");
+    command
+        .arg(&hip_backend)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if apply_lemonade_process_environment(&mut command, process_env).is_err() {
+        return false;
+    }
+    let Ok(output) = command.output() else {
+        return false;
+    };
+    output.status.success()
+        && ldd_output_resolves_all(
+            &String::from_utf8_lossy(&output.stdout),
+            &ROCM_BACKEND_REQUIRED_SONAMES,
+        )
+}
+
+/// Off Linux, `ldd`-based verification is not exercised: a version-aligned backend is
+/// never accepted without it, so this always reports unresolved.
+#[cfg(not(target_os = "linux"))]
+const fn rocm_backend_resolves(
+    _llama_server_binary: &Path,
+    _process_env: &LemonadeProcessEnvironment,
+) -> bool {
+    false
+}
+
+/// Whether every `required` soname prefix appears in `ldd` output with a resolved
+/// path (i.e. not `=> not found`). Linux-only: see [`ROCM_BACKEND_REQUIRED_SONAMES`].
+#[cfg(target_os = "linux")]
+fn ldd_output_resolves_all(output: &str, required: &[&str]) -> bool {
+    required.iter().all(|soname| {
+        output.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with(soname) && !line.contains("not found")
+        })
+    })
+}
+
+fn install_best_llamacpp_backend(
+    manifest: &mut LemonadeInstallManifest,
+    force_reinstall: bool,
+) -> Result<()> {
     let port = free_local_port()?;
     let log_path_buf = manifest.runtime_dir.join("install-lemond.log");
     let log_path = Some(log_path_buf.as_path());
@@ -1195,7 +1635,7 @@ fn install_best_llamacpp_backend(manifest: &mut LemonadeInstallManifest) -> Resu
             log_path,
             &process_env,
         )?;
-        ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env)
+        ensure_best_llamacpp_backend(manifest, DEFAULT_HOST, port, &process_env, force_reinstall)
     })();
     let _ = terminate_pid(child.id(), true);
     let _ = child.wait();
@@ -1225,10 +1665,11 @@ fn install_llamacpp_backend_with_retry(mut install: impl FnMut() -> Result<()>) 
 }
 
 fn ensure_best_llamacpp_backend(
-    manifest: &LemonadeInstallManifest,
+    manifest: &mut LemonadeInstallManifest,
     host: &str,
     port: u16,
     process_env: &LemonadeProcessEnvironment,
+    force_reinstall: bool,
 ) -> Result<String> {
     let listing = run_lemonade_backends_list(manifest, process_env)?;
     let backends = parse_llamacpp_backend_statuses(&listing);
@@ -1241,7 +1682,11 @@ fn ensure_best_llamacpp_backend(
             describe_llamacpp_backends(&backends)
         );
     };
-    if already_installed {
+    // Record the attempted backend before the fallible install step below, so a caller
+    // verifying the result can scope its check to this backend even when the install
+    // itself errors out.
+    manifest.backend_name = backend.clone();
+    if already_installed && !force_reinstall {
         eprintln!("Using installed Lemonade {LLAMACPP_RECIPE}:{backend} backend.");
     } else {
         eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
@@ -3195,6 +3640,30 @@ fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Option<PathBu
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
+/// Like [`find_llama_server_binary`], but scoped to the single backend Lemonade
+/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
+/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
+/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
+/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
+/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
+/// does. This is what lets alignment verification reject a stale ROCm directory left
+/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
+fn find_llama_server_binary_for_backend(
+    manifest: &LemonadeInstallManifest,
+    backend_name: &str,
+) -> Option<PathBuf> {
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    let binary = platform_binary_name("llama-server");
+    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
+        &["rocm-stable", "rocm-nightly", "rocm"]
+    } else {
+        &["vulkan"]
+    };
+    family
+        .iter()
+        .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
+}
+
 /// Look for `binary` directly in `dir`, then one level down in each subdirectory.
 fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     let direct = dir.join(binary);
@@ -4524,6 +4993,431 @@ mod tests {
             backend_name: ROCM_BACKEND_NAME.to_owned(),
             installed_at_unix_ms: 0,
         }
+    }
+
+    #[test]
+    fn plain_semver_accepts_release_versions_only() {
+        assert!(looks_like_plain_semver("10.0.0"));
+        assert!(looks_like_plain_semver("7.13.0"));
+        assert!(!looks_like_plain_semver("7.14.0a20260601"));
+        assert!(!looks_like_plain_semver("10.0"));
+        assert!(!looks_like_plain_semver("10.0.0.1"));
+        assert!(!looks_like_plain_semver(""));
+    }
+
+    #[test]
+    fn backend_versions_therock_version_round_trips() {
+        let dir = scratch_dir("backend-versions-round-trip");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "llamacpp": { "rocm-stable": "b9752" },
+                "therock": { "version": "7.13.0", "architectures": ["gfx1151"] },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("7.13.0".to_owned())
+        );
+
+        write_backend_versions_therock_version(&path, "10.0.0").unwrap();
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("10.0.0".to_owned())
+        );
+
+        // Every other key, including sibling keys under `therock`, is preserved.
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
+        assert_eq!(value["therock"]["architectures"][0], "gfx1151");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backend_versions_therock_version_missing_object_is_an_error() {
+        let dir = scratch_dir("backend-versions-missing-therock");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({"llamacpp": {}})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_backend_versions_therock_version(&path), None);
+        assert!(write_backend_versions_therock_version(&path, "10.0.0").is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backend_versions_llamacpp_tag_round_trips() {
+        let dir = scratch_dir("backend-versions-tag-round-trip");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "llamacpp": { "rocm-stable": "b9752", "vulkan": "b9747" },
+                "therock": { "version": "7.13.0" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b9752".to_owned())
+        );
+
+        write_backend_versions_llamacpp_tag(&path, "b10952").unwrap();
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b10952".to_owned())
+        );
+
+        // Sibling keys, including the unrelated `llamacpp.vulkan` tag and the
+        // whole `therock` object, are preserved.
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["llamacpp"]["vulkan"], "b9747");
+        assert_eq!(value["therock"]["version"], "7.13.0");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backend_versions_llamacpp_tag_missing_object_is_an_error() {
+        let dir = scratch_dir("backend-versions-missing-llamacpp");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({"therock": {}})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_backend_versions_llamacpp_tag(&path), None);
+        assert!(write_backend_versions_llamacpp_tag(&path, "b10952").is_err());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn write_backend_versions_fixture(path: &Path, therock_version: &str, llamacpp_tag: &str) {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "llamacpp": { "rocm-stable": llamacpp_tag },
+                "therock": { "version": therock_version },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn find_llama_server_binary_for_backend_scopes_to_rocm_family() {
+        let dir = scratch_dir("find-server-scoped-rocm");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        // A stale vulkan install from an earlier attempt must never satisfy a "rocm"
+        // scoped lookup.
+        let vulkan_dir = llamacpp.join("vulkan");
+        fs::create_dir_all(&vulkan_dir).unwrap();
+        fs::write(vulkan_dir.join(&server), b"x").unwrap();
+        let manifest = test_manifest(runtime_dir);
+        assert_eq!(
+            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
+            None
+        );
+
+        // Any directory in the ROCm family satisfies it, matching the unscoped scan's
+        // priority order.
+        let nightly_dir = llamacpp.join("rocm-nightly");
+        fs::create_dir_all(&nightly_dir).unwrap();
+        fs::write(nightly_dir.join(&server), b"x").unwrap();
+        assert_eq!(
+            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
+            Some(nightly_dir.join(&server))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_llama_server_binary_for_backend_scopes_to_vulkan_only() {
+        let dir = scratch_dir("find-server-scoped-vulkan");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        // A stale rocm-stable install from an earlier attempt must never satisfy a
+        // "vulkan" scoped lookup, even though it would win the unscoped priority scan.
+        let rocm_dir = llamacpp.join("rocm-stable");
+        fs::create_dir_all(&rocm_dir).unwrap();
+        fs::write(rocm_dir.join(&server), b"x").unwrap();
+        let manifest = test_manifest(runtime_dir);
+        assert_eq!(
+            find_llama_server_binary_for_backend(&manifest, "vulkan"),
+            None
+        );
+
+        let vulkan_dir = llamacpp.join("vulkan");
+        fs::create_dir_all(&vulkan_dir).unwrap();
+        fs::write(vulkan_dir.join(&server), b"x").unwrap();
+        assert_eq!(
+            find_llama_server_binary_for_backend(&manifest, "vulkan"),
+            Some(vulkan_dir.join(&server))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_tier1_success_keeps_target_version_pinned() {
+        let dir = scratch_dir("align-tier1-success");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, force_reinstall, _label| {
+                assert!(!force_reinstall, "tier 1 never forces a reinstall");
+                true
+            },
+            |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
+            || panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+        );
+
+        assert_eq!(result.unwrap(), Some("10.0.0".to_owned()));
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_falls_through_to_tier2_and_succeeds() {
+        let dir = scratch_dir("align-tier2-success");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+        let mut align_calls = Vec::new();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, force_reinstall, _label| {
+                align_calls.push(force_reinstall);
+                // Tier 1 (force_reinstall=false) fails; Tier 2 (true) succeeds.
+                force_reinstall
+            },
+            |_manifest, _force_reinstall| panic!("tier 2 succeeded; no fallback install"),
+            || Ok("b10952".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), Some("10.0.0".to_owned()));
+        assert_eq!(align_calls, vec![false, true], "both tiers were attempted");
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("10.0.0".to_owned())
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b10952".to_owned()),
+            "tier 2 pins the newer llama.cpp tag"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_reverts_the_llamacpp_tag_when_tier2_pinned_a_newer_one_and_still_fails() {
+        // Regression test: the tag restore used to be silently skipped whenever
+        // deleted, and nothing caught it -- both tiers must fail here so the
+        // revert path actually runs, and the tag must come back to its original
+        // value rather than staying on Tier 2's newer pin.
+        let dir = scratch_dir("align-revert-restores-tag");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| false,
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall);
+                Ok(())
+            },
+            || Ok("b10952".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("7.13.0".to_owned())
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b9752".to_owned()),
+            "the llama.cpp tag must be restored to its original value, not left on Tier 2's pin"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_removes_the_llamacpp_tag_on_revert_when_none_was_pinned_before() {
+        // The resource file may have no `llamacpp.rocm-stable` key at all (an
+        // embeddable that never shipped a pin). Tier 2 still writes one; reverting
+        // must remove it again rather than leaving it in place with no original
+        // value to restore it to.
+        let dir = scratch_dir("align-revert-removes-tag");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "llamacpp": {},
+                "therock": { "version": "7.13.0" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| false,
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall);
+                Ok(())
+            },
+            || Ok("b10952".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            None,
+            "no tag was pinned before Tier 2; reverting must remove it, not invent a value"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_skips_tier2_reinstall_when_pinned_tag_is_already_latest() {
+        let dir = scratch_dir("align-tier2-tag-unchanged");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+        let mut align_calls = 0;
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| {
+                align_calls += 1;
+                false
+            },
+            |_manifest, force_reinstall| {
+                assert!(
+                    force_reinstall,
+                    "the revert fallback always forces a reinstall"
+                );
+                Ok(())
+            },
+            // Already the latest tag: Tier 2's own reinstall must not be attempted.
+            || Ok("b9752".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(align_calls, 1, "only tier 1 was attempted");
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("7.13.0".to_owned()),
+            "reverted to the original pinned version"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_reverts_and_still_runs_fallback_when_the_restore_write_fails() {
+        // Regression test: a failure while restoring the original pinned version must
+        // not abort the install — the fallback reinstall below it is the recovery
+        // path, and every sibling warning in this function is best-effort.
+        let dir = scratch_dir("align-revert-write-fails");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+        let mut fallback_called = false;
+
+        // Corrupt the file's `therock` object between tier attempts and the revert, so
+        // the revert's own write fails.
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| {
+                fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&json!({"llamacpp": {}})).unwrap(),
+                )
+                .unwrap();
+                false
+            },
+            |_manifest, force_reinstall| {
+                fallback_called = true;
+                assert!(force_reinstall);
+                Ok(())
+            },
+            || bail!("network unavailable"),
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "never propagates the restore-write failure"
+        );
+        assert!(fallback_called, "the fallback reinstall still ran");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ldd_output_resolves_all_requires_every_soname_resolved() {
+        let resolved = "\
+\tlibggml-base.so.0 => /opt/rocm/lib/libggml-base.so.0 (0x00007f0)\n\
+\tlibhipblas.so.3 => /opt/rocm/lib/libhipblas.so.3 (0x00007f1)\n\
+\tlibrocblas.so.5 => /opt/rocm/lib/librocblas.so.5 (0x00007f2)\n\
+\tlibamdhip64.so.7 => /opt/rocm/lib/libamdhip64.so.7 (0x00007f3)\n\
+\tlibhsa-runtime64.so.1 => /opt/rocm/lib/libhsa-runtime64.so.1 (0x00007f4)\n";
+        assert!(ldd_output_resolves_all(
+            resolved,
+            &ROCM_BACKEND_REQUIRED_SONAMES
+        ));
+
+        let missing_one = "\
+\tlibhipblas.so.3 => not found\n\
+\tlibrocblas.so.5 => /opt/rocm/lib/librocblas.so.5 (0x00007f2)\n\
+\tlibamdhip64.so.7 => /opt/rocm/lib/libamdhip64.so.7 (0x00007f3)\n\
+\tlibhsa-runtime64.so.1 => /opt/rocm/lib/libhsa-runtime64.so.1 (0x00007f4)\n";
+        assert!(!ldd_output_resolves_all(
+            missing_one,
+            &ROCM_BACKEND_REQUIRED_SONAMES
+        ));
     }
 
     #[test]
