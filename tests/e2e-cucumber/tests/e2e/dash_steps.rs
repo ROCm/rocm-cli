@@ -624,6 +624,17 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 /// from the regression (cleared within about one tick).
 const INSTANCE_TICK: Duration = Duration::from_secs(2);
 
+/// The daemon's observation-validity window, `clamp(3 × instance_tick, 6 s, 30 s)`
+/// (`crates/rocm-dash-daemon/src/runner.rs`), evaluated at `INSTANCE_TICK` above:
+/// `3 × 2 s = 6 s`, already inside the `[6 s, 30 s]` clamp bounds. Named so the
+/// clock-advance offset below is derived from it instead of a bare literal.
+const VALIDITY_WINDOW_SECS: u64 = 3 * INSTANCE_TICK.as_secs();
+
+/// One second past `VALIDITY_WINDOW_SECS`, guaranteeing the clock advance in
+/// `validity_window_elapsed` below is provably past the boundary rather than
+/// landing exactly on it.
+const CLOCK_ADVANCE_PAST_VALIDITY_SECS: u64 = VALIDITY_WINDOW_SECS + 1;
+
 /// Start the mock in Growing mode so the daemon builds a positive gen_tps
 /// baseline before the scenario injects the Failure transition.
 #[given("a managed model exposes scripted serving metrics")]
@@ -725,8 +736,11 @@ async fn validity_window_elapsed(world: &mut E2eWorld) {
         .as_ref()
         .expect("scenario has no isolated root")
         .path();
-    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
-        .expect("failed to advance dashboard test clock");
+    std::fs::write(
+        root.join(DASH_CLOCK_OFFSET_FILE),
+        CLOCK_ADVANCE_PAST_VALIDITY_SECS.to_string(),
+    )
+    .expect("failed to advance dashboard test clock");
 
     let budget = default_timeout();
     let deadline = Instant::now() + budget;

@@ -568,6 +568,24 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                // The process exiting is never a legitimate "persisted" outcome
+                // here; drain briefly so the error reflects the final buffered
+                // frame rather than a stale mid-drain snapshot.
+                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                while Instant::now() < drain_deadline
+                    && !self
+                        .reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                if let Some(panic_message) = self.take_reader_panic() {
+                    return Err(format!(
+                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                        self.framed_screen()
+                    ));
+                }
                 return Err(format!(
                     "process exited ({status:?}) while asserting {marker:?} persists.\n{}",
                     self.framed_screen()
