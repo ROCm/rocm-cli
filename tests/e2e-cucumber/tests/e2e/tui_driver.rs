@@ -156,6 +156,19 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
+    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
+    /// scenario's isolation environment — for a step whose `Given` planted
+    /// scenario-owned state (e.g. a shell rc file) that only the piped
+    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
+    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    pub fn spawn_with_env(
+        world: &E2eWorld,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+    }
+
     /// Spawn a specific `rocm` binary under a fresh PTY.
     ///
     /// Most scenarios use [`spawn`](Self::spawn) and exercise the harness-built
@@ -165,6 +178,15 @@ impl TuiSession {
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, binary, args, &[])
+    }
+
+    fn spawn_binary_with_env(
+        world: &E2eWorld,
+        binary: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -187,6 +209,16 @@ impl TuiSession {
             cmd.env(key, value);
         }
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
+            cmd.env(key, value);
+        }
+        // Behavioural fixtures attached by Given steps apply to PTY commands too,
+        // just as they do to the piped `run_rocm_with_scenario_env` path.
+        for (key, value) in &world.command_env {
+            cmd.env(key, value);
+        }
+        // Caller-supplied overrides win over the scenario's own isolation
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        for (key, value) in extra_env {
             cmd.env(key, value);
         }
         // Provider configuration changes product startup semantics: a host API
@@ -456,20 +488,29 @@ impl TuiSession {
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
+        match self.wait_for_exit_code(timeout).await? {
+            0 => Ok(()),
+            code => Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero. Used by journeys (e.g. a declined confirmation
+    /// prompt) whose success case is a specific *nonzero* code, where
+    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
+    /// would reject the very outcome under test.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.finished = true;
-                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                    return if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully ({status:?}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
+                    self.record_once(code);
+                    return Ok(code);
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),
@@ -491,6 +532,80 @@ impl TuiSession {
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
+    }
+
+    /// Whether the emulated terminal is currently in the alternate screen — the
+    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
+    /// refusal that never takes over the terminal this must stay `false`.
+    #[must_use]
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
+    /// fast refusal contract. Unlike [`wait_for_exit`](Self::wait_for_exit) (which
+    /// requires success), this fails if the child exits 0, and — crucially — if it
+    /// does not exit within `timeout`: the pre-fix `dash --replay <missing>`
+    /// enters the alt-screen and hangs under a real PTY, so a timeout here is the
+    /// regression, not an infrastructure flake.
+    pub async fn wait_for_refusal(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finished = true;
+                    self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                    return if status.success() {
+                        Err(format!(
+                            "expected `dash --replay <missing>` to be refused, but it exited 0.\n{}",
+                            self.framed_screen()
+                        ))
+                    } else {
+                        Ok(())
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for refusal: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for `dash --replay <missing>` to be \
+                     refused — it did not exit (pre-fix regression: the dashboard took over the \
+                     terminal and hung).\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// After the child has exited (e.g. via [`wait_for_refusal`](Self::wait_for_refusal)),
+    /// wait a bounded time for the reader thread to commit the final buffered
+    /// frame, then return the visible screen. Lets a sibling assertion read the
+    /// last error line without racing the reader draining the PTY after exit.
+    pub async fn drain_final_screen(&mut self) -> String {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        self.screen_text()
     }
 
     /// Record this invocation once for the command-coverage report (so `rocm

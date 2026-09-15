@@ -2,20 +2,21 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::cli_progress::AnimatedSpinner;
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::{
-    AppPaths, RocmCliConfig, download_file_to_path, ensure_uv_binary, format_http_base_url,
-    runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child, runtime_path_list_join,
-    runtime_path_list_split, runtime_paths_equivalent, unix_time_millis, uv_command_env,
-    uv_pip_install_base,
+    AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
+    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
+    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
+    uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{self, Read, Write as IoWrite};
+use std::io::{self, IsTerminal, Read, Write as IoWrite};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -361,7 +362,9 @@ pub(crate) fn install(
             uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
             Some(&runtime_env),
             &mut log,
+            &log_path,
             "install ComfyUI dependencies",
+            "Resolving and installing packages with uv…",
         )?;
     }
 
@@ -1296,7 +1299,17 @@ fn download_and_extract_source(
         )?;
     } else {
         writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
-        download_file(COMFYUI_SOURCE_ARCHIVE_URL, &archive_path)?;
+        let download_label = "Fetching ComfyUI source archive…";
+        let spinner = AnimatedSpinner::start(download_label);
+        let download_result = download_file(
+            COMFYUI_SOURCE_ARCHIVE_URL,
+            &archive_path,
+            &mut |bytes, total| {
+                spinner.set_progress(download_label, bytes, total);
+            },
+        );
+        drop(spinner);
+        download_result?;
     }
     let extract_root = app_root
         .join("extract")
@@ -1357,8 +1370,12 @@ fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    download_file_to_path(url, destination, Duration::from_mins(2))
+fn download_file(
+    url: &str,
+    destination: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
+    download_file_to_path_with_progress(url, destination, Duration::from_mins(2), on_progress)
 }
 
 fn filtered_requirement_specs(requirements_path: &Path) -> Result<Vec<String>> {
@@ -1530,13 +1547,16 @@ fn write_torch_constraints(
     Ok(Some(path))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_uv_logged_command(
     paths: &AppPaths,
     uv: &Path,
     args: Vec<String>,
     runtime_env: Option<&ComfyUiRuntimeEnvironment>,
     log: &mut fs::File,
+    log_path: &Path,
     context_text: &str,
+    spinner_label: &str,
 ) -> Result<()> {
     writeln!(
         log,
@@ -1576,6 +1596,13 @@ fn run_uv_logged_command(
     let stderr_log = log
         .try_clone()
         .context("failed to clone ComfyUI install log for stderr")?;
+    // `AnimatedSpinner` (see cli_progress.rs) is TTY-gated and a hard no-op off
+    // a terminal, so on its own a piped/CI install would print nothing for the
+    // entire uv resolve, indistinguishable from a hang. `stream_logged_output`
+    // below is the off-TTY fallback: it tees the child's stdout/stderr through
+    // to our real stdout/stderr whenever stderr isn't a terminal, so a
+    // non-interactive install still shows live progress.
+    let spinner = AnimatedSpinner::start(spinner_label);
     let stdout_thread =
         thread::spawn(move || stream_logged_output(stdout, stdout_log, OutputTarget::Stdout));
     let stderr_thread =
@@ -1591,12 +1618,18 @@ fn run_uv_logged_command(
         .join()
         .map_err(|_| anyhow::anyhow!("{context_text}: stderr reader failed"))?
         .context("failed to stream command stderr")?;
+    drop(spinner);
     if status.success() {
         return Ok(());
     }
-    bail!("{context_text}: uv exited with {status}");
+    bail!(
+        "{context_text}: uv exited with {status}; see {} for details",
+        log_path.display()
+    );
 }
 
+/// Which real stream a `stream_logged_output` reader mirrors to when not
+/// attached to a terminal.
 enum OutputTarget {
     Stdout,
     Stderr,
@@ -1607,6 +1640,10 @@ fn stream_logged_output<R: Read>(
     mut log: fs::File,
     target: OutputTarget,
 ) -> io::Result<()> {
+    // When stderr is a terminal, the `AnimatedSpinner` is the progress signal
+    // and raw uv output would visually clash with it, so only tee through
+    // when we're not attached to one (piped output, CI, etc).
+    let tee = !io::stderr().is_terminal();
     let mut buffer = [0_u8; 8192];
     loop {
         let len = reader.read(&mut buffer)?;
@@ -1614,16 +1651,18 @@ fn stream_logged_output<R: Read>(
             break;
         }
         log.write_all(&buffer[..len])?;
-        match target {
-            OutputTarget::Stdout => {
-                let mut stdout = io::stdout().lock();
-                stdout.write_all(&buffer[..len])?;
-                stdout.flush()?;
-            }
-            OutputTarget::Stderr => {
-                let mut stderr = io::stderr().lock();
-                stderr.write_all(&buffer[..len])?;
-                stderr.flush()?;
+        if tee {
+            match target {
+                OutputTarget::Stdout => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(&buffer[..len])?;
+                    stdout.flush()?;
+                }
+                OutputTarget::Stderr => {
+                    let mut stderr = io::stderr().lock();
+                    stderr.write_all(&buffer[..len])?;
+                    stderr.flush()?;
+                }
             }
         }
     }
@@ -1884,6 +1923,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn run_uv_logged_command_reports_concrete_log_path_on_failure() -> Result<()> {
+        // `rocm comfyui logs` can still find this run's log via a directory
+        // scan even without a saved manifest, but naming the path directly
+        // in the error is more precise and needs no second command.
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = test_paths("comfyui-uv-failure");
+        fs::create_dir_all(&paths.cache_dir)?;
+        let uv_path = paths.cache_dir.join("fake-uv");
+        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
+
+        let log_path = paths.cache_dir.join("install.log");
+        let mut log = fs::File::create(&log_path)?;
+
+        let error = run_uv_logged_command(
+            &paths,
+            &uv_path,
+            vec!["pip".to_owned(), "install".to_owned()],
+            None,
+            &mut log,
+            &log_path,
+            "install ComfyUI dependencies",
+            "Resolving and installing packages with uv…",
+        )
+        .expect_err("uv exiting non-zero should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains(&log_path.display().to_string()),
+            "error should name the concrete log path so a failed install's log stays discoverable: {message}"
+        );
+
+        fs::remove_dir_all(&paths.cache_dir).ok();
+        Ok(())
+    }
+
+    #[test]
     fn status_without_install_is_plain() -> Result<()> {
         let paths = test_paths("comfyui-status");
         let config = RocmCliConfig::default();
@@ -2090,6 +2168,7 @@ mod tests {
             version: "7.13.0a20260511".to_owned(),
             install_root: runtime_root,
             selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,
@@ -2112,6 +2191,7 @@ mod tests {
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2163,6 +2243,7 @@ mod tests {
             version: "7.13.0a20260511".to_owned(),
             install_root: runtime_root.clone(),
             selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,
@@ -2178,6 +2259,7 @@ mod tests {
                 ..Default::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2253,6 +2335,7 @@ mod tests {
             version: "7.13.0a20260511".to_owned(),
             install_root: runtime_root,
             selected_artifact_url: "https://example.invalid/simple".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,
@@ -2275,6 +2358,7 @@ mod tests {
                 ..therock::RocmSdkPythonProbe::default()
             }),
             sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 100,
@@ -2305,5 +2389,74 @@ mod tests {
             data_dir: root.join("data"),
             cache_dir: root.join("cache"),
         }
+    }
+
+    #[test]
+    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
+        // A multi-chunk body (the streaming downloader reads in 64 KiB
+        // chunks) so a single callback firing wouldn't already satisfy the
+        // "monotonically increasing" assertion below.
+        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let served = body.clone();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )?;
+            stream.write_all(&served)?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/archive.tar.gz");
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-comfyui-download-progress-{}",
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&root)?;
+        let destination = root.join("archive.tar.gz");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        download_file(&url, &destination, &mut |bytes, total| {
+            calls.push((bytes, total));
+        })?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&root);
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.len() >= 2,
+            "expected at least a pre-transfer and a final callback: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last callback must report the complete transfer: {calls:?}"
+        );
+        Ok(())
     }
 }

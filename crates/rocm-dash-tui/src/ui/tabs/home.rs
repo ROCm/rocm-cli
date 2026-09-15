@@ -7,7 +7,9 @@
 //! Composes the home layout against live `AppState` (read-only): a hero GPU
 //! gauge + spark, a stacked VRAM/TEMP/POWER mini-spark cluster, and Running /
 //! Health / Updates tiles. Empty/absent telemetry renders honest placeholders
-//! rather than synthetic numbers.
+//! rather than synthetic numbers — and pairs every "nothing to show" state
+//! with a hint at the tab/key that would produce something, so no tile is a
+//! dead end.
 //!
 //! ponytail: Home is added behind the existing default this phase (P2). It is
 //! reachable by Tab / digit `1` but is NOT the default tab yet — P3 repoints
@@ -19,7 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{AppState, ConnState};
+use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -191,12 +193,22 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Span::styled(format!("{port} serving"), Style::default().fg(theme.muted)),
         ]));
     }
-    // Then recent jobs (tools run), newest-relevant first.
-    for job in state.jobs.jobs.values().take(feed.height as usize) {
+    // Then recent jobs (tools run), newest-relevant first. The Home tab's own
+    // update-check job is plumbing, not user activity — never show it here.
+    for job in state
+        .jobs
+        .jobs
+        .iter()
+        .filter(|(id, _)| id.as_str() != crate::app::HOME_UPDATE_CHECK_JOB_ID)
+        .map(|(_, job)| job)
+        .take(feed.height as usize)
+    {
         let (glyph, color) = match job.status {
             rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("✓ ", theme.ok),
-            _ => ("⋯ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
+            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
+            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
+            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
         };
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::default().fg(color)),
@@ -209,6 +221,13 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
     }
+    // Glyph key, appended last: `truncate` below already drops it whenever
+    // there's no spare room, so it never displaces real activity on a
+    // squeezed card — no separate room check needed.
+    lines.push(Line::from(Span::styled(
+        "● live  ✓ done  ! warn  ✗ failed  ⋯ running  ○ cancelled",
+        Style::default().fg(theme.muted),
+    )));
     lines.truncate(feed.height as usize);
     f.render_widget(Paragraph::new(lines), feed);
 }
@@ -258,13 +277,18 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Tokens/watt: summed across running instances when available.
     // Mark held if any contributing instance has a held gen_tps observation
     // (tok/W derives from gen_tps; aggregate inherits held status).
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (and, for `any_tpw_held`, count as held without ever being displayed) —
+    // filtered out the same way `tokens_per_watt` is guarded per-instance
+    // elsewhere in this tab.
     let tpw: f64 = state
         .instances
         .values()
         .filter_map(|i| i.tokens_per_watt)
+        .filter(|v| v.is_finite())
         .sum();
     let any_tpw_held = state.instances.values().any(|i| {
-        i.tokens_per_watt.is_some()
+        i.tokens_per_watt.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -288,6 +312,19 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))),
         lh[4],
     );
+    // Show the shared HELD_LEGEND only when the tok/W aggregate is actually
+    // held AND rendered with a marker — `tpw > 0.0` mirrors the gate on
+    // `tpw_label` above so a zero-throughput aggregate (which prints
+    // "tokens / watt —" with no marker) never shows an unexplained legend.
+    if tpw > 0.0 && any_tpw_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            lh[5],
+        );
+    }
 }
 
 fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -362,9 +399,18 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         false,
         theme,
     );
-    let tps: f64 = state.instances.values().filter_map(|i| i.gen_tps).sum();
+    // A single NaN/Infinity instance would otherwise poison the whole sum
+    // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
+    // without ever contributing a displayed value — guarded the same way
+    // `gen_tps_cell` guards a single instance's value.
+    let tps: f64 = state
+        .instances
+        .values()
+        .filter_map(|i| i.gen_tps)
+        .filter(|v| v.is_finite())
+        .sum();
     let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some()
+        i.gen_tps.is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -375,6 +421,17 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         format!("{tps:.0}")
     };
     mini_spark(f, rh[4], "T/S  ", &tps_str, &[], true, theme);
+    // Show the shared HELD_LEGEND only when the tok/s aggregate is actually
+    // held — keeps the hero quiet when data is fully fresh.
+    if any_tps_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            rh[5],
+        );
+    }
 }
 
 fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -400,28 +457,35 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme,
     );
     if running.height > 0 {
-        let line = state
+        let lines = state
             .instances
             .values()
             .find(|i| i.status.is_serving())
             .map_or_else(
                 || {
-                    Line::from(Span::styled(
+                    let mut lines = vec![Line::from(Span::styled(
                         "Nothing running",
                         Style::default().fg(theme.muted),
-                    ))
+                    ))];
+                    if running.height > 1 {
+                        lines.push(Line::from(Span::styled(
+                            "Press 3 → Serving to launch a model",
+                            Style::default().fg(theme.muted),
+                        )));
+                    }
+                    lines
                 },
                 |i| {
-                    Line::from(vec![
+                    vec![Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
                         Span::styled(
                             i.model_name.clone(),
                             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                         ),
-                    ])
+                    ])]
                 },
             );
-        f.render_widget(Paragraph::new(line), running);
+        f.render_widget(Paragraph::new(lines), running);
     }
 
     // Health tile — derive from snapshot/system-info presence + conn state.
@@ -461,34 +525,80 @@ fn draw_tiles(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    // Updates tile — honest placeholder (no update feed wired this run).
+    // Updates tile — backed by the periodic `home-update-check` job
+    // (`refresh_update_status`, driven off the tick loop). `state.simulated`
+    // sessions never spawn that job, so they always render `Unknown` — same
+    // as before the check existed, keeping "SIMULATED DATA never looks live".
     let updates = card(f, mid[2], "Updates", BoxRole::Muted, theme);
     if updates.height > 0 {
-        let body = if state.simulated {
-            // No real update feed can be observed for simulated data.
-            Line::from(Span::styled("unknown", Style::default().fg(theme.muted)))
+        let hint = Line::from(Span::styled(
+            "Press 2 → ROCm → Check for updates",
+            Style::default().fg(theme.muted),
+        ));
+        let mut lines = if state.update_status_pending {
+            vec![Line::from(Span::styled(
+                "Checking…",
+                Style::default().fg(theme.muted),
+            ))]
         } else {
-            match state.conn {
-                ConnState::Connected { .. } => {
-                    Line::from(Span::styled("Up to date", Style::default().fg(theme.muted)))
+            match &state.update_status {
+                UpdateStatus::Unknown => {
+                    vec![Line::from(Span::styled(
+                        "unknown",
+                        Style::default().fg(theme.muted),
+                    ))]
                 }
-                _ => Line::from(Span::styled("Checking…", Style::default().fg(theme.muted))),
+                UpdateStatus::UpToDate => vec![Line::from(Span::styled(
+                    "Up to date",
+                    Style::default().fg(theme.fg),
+                ))],
+                UpdateStatus::UpdateAvailable { latest_version } => vec![
+                    Line::from(Span::styled(
+                        "Update available",
+                        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        latest_version.clone(),
+                        Style::default().fg(theme.warn),
+                    )),
+                ],
+                UpdateStatus::NoManagedRuntimes => vec![Line::from(Span::styled(
+                    "no managed runtimes",
+                    Style::default().fg(theme.muted),
+                ))],
+                UpdateStatus::Error => vec![Line::from(Span::styled(
+                    "check failed",
+                    Style::default().fg(theme.muted),
+                ))],
             }
         };
-        // No update-feed data source this run: simulated sessions show "unknown"
-        // (nothing observable), otherwise the tile is conn-derived rather than
-        // the mock's hardcoded "ROCm 6.3 ready".
-        f.render_widget(Paragraph::new(body), updates);
+        // No fabricated status, but never leave the tile a dead end — point at
+        // the one place that actually runs a real check on demand.
+        let wants_hint = !state.update_status_pending
+            && matches!(
+                state.update_status,
+                UpdateStatus::Unknown | UpdateStatus::Error
+            );
+        if wants_hint && updates.height > 1 {
+            lines.push(hint);
+        }
+        f.render_widget(Paragraph::new(lines), updates);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::ActiveTab;
+    use crate::app::{ActiveTab, ConnState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot, SystemMetrics};
+    use rocm_dash_core::metrics::{
+        GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationFreshness,
+        ObservationMetadata, Snapshot, SystemMetrics,
+    };
+    use rocm_dash_core::state::{JobState, JobStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn node_load_label_never_marks_simulated_live() {
@@ -583,5 +693,455 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8, 11] {
             let _ = render(&s, 80, h);
         }
+    }
+
+    fn instance_with_obs(gen_tps: f64, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(gen_tps),
+            tokens_per_watt: Some(gen_tps / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn held_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        }
+    }
+
+    fn fresh_obs() -> ObservationMetadata {
+        ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    fn state_with_instance(inst: Instance) -> AppState {
+        let mut s = state_with_gpu();
+        s.instances.insert(inst.container_id.clone(), inst);
+        s
+    }
+
+    #[test]
+    fn home_held_legend_visible_when_tpw_and_tps_held() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(held_obs()))),
+            160,
+            30,
+        );
+        // Assert the specific rendered cells, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregates stopped being marked.
+        assert!(
+            out.contains(&format!("{:.0}{}", 300.0, format::HELD_MARKER)),
+            "held tok/s aggregate must show the held marker; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{:.1} tokens / watt{}", 1.0, format::HELD_MARKER)),
+            "held tok/W aggregate must show the held marker; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when instance data is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_when_all_fresh() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when all fresh; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_held_legend_absent_for_legacy_none_metadata() {
+        let out = render(
+            &state_with_instance(instance_with_obs(300.0, None)),
+            160,
+            30,
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_legend_absent_when_aggregate_is_zero_even_if_held() {
+        // tokens_per_watt sums to 0.0 (the "tokens / watt —" branch, no marker
+        // rendered) while gen_tps is absent (so the tok/s side never fires
+        // either). Held metadata alone must not add an unexplained legend.
+        let inst = Instance {
+            container_id: "m".into(),
+            container_name: "m".into(),
+            status: InstanceStatus::Running,
+            model_name: "m".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.0),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let out = render(&state_with_instance(inst), 160, 30);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the tok/W aggregate is zero; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tps_aggregate_ignores_nonfinite_instance() {
+        // A NaN `gen_tps` on one instance must not poison the summed hero
+        // value for every other (finite) instance, nor suppress the held
+        // marker/legend a genuinely held finite instance still earns.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(150.0),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(f64::NAN),
+            tokens_per_watt: None,
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("NaN"),
+            "a non-finite instance must not poison the tok/s aggregate; got:\n{out}"
+        );
+        // Assert the specific rendered cell, not just `HELD_MARKER`'s bare
+        // `"*"` — `HELD_LEGEND` itself contains `"*"`, so a bare-marker check
+        // would pass even if the aggregate stopped being marked.
+        assert!(
+            out.contains(&format!("{:.0}{}", 150.0, format::HELD_MARKER)),
+            "the finite held instance must still mark the tok/s aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the held tok/s aggregate must still be explained by the legend; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn home_tpw_aggregate_ignores_nonfinite_instance() {
+        // Symmetric with the tok/s case above: an infinite `tokens_per_watt`
+        // on one instance must not poison the summed tok/W aggregate.
+        let mut s = state_with_gpu();
+        let held = Instance {
+            container_id: "held".into(),
+            container_name: "held".into(),
+            status: InstanceStatus::Running,
+            model_name: "held".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(0.5),
+            gen_tps_observation: Some(held_obs()),
+            ..Default::default()
+        };
+        let broken = Instance {
+            container_id: "broken".into(),
+            container_name: "broken".into(),
+            status: InstanceStatus::Running,
+            model_name: "broken".into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: None,
+            tokens_per_watt: Some(f64::INFINITY),
+            gen_tps_observation: Some(fresh_obs()),
+            ..Default::default()
+        };
+        s.instances.insert(held.container_id.clone(), held);
+        s.instances.insert(broken.container_id.clone(), broken);
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("0.5 tokens / watt"),
+            "a non-finite instance must not poison the tok/W aggregate; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "the finite held instance must still explain the aggregate; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_never_asserts_up_to_date_without_a_real_check() {
+        // `state.conn` must never be read as a proxy for "checked and
+        // current" — connectivity to the daemon says nothing about update
+        // status. Only a resolved `UpdateStatus::UpToDate` may render it.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("Up to date"),
+            "must not fabricate a version check from conn state: {out:?}"
+        );
+        assert!(
+            out.contains("unknown"),
+            "Updates tile should show unknown before any check resolves: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_shows_checking_while_pending() {
+        // Must be connected here — otherwise the reverted conn-derived tile
+        // would also render "Checking…" and this test couldn't discriminate.
+        let mut s = state_with_gpu();
+        s.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.0".into(),
+        };
+        s.update_status_pending = true;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Checking…"),
+            "Updates tile should show Checking… while a check is in flight: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_up_to_date_from_a_real_check() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpToDate;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Up to date"),
+            "a resolved UpToDate status should render: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_renders_update_available_with_version() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::UpdateAvailable {
+            latest_version: "7.1.0".into(),
+        };
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Update available"),
+            "should surface an available update: {out:?}"
+        );
+        assert!(out.contains("7.1.0"), "should show the version: {out:?}");
+    }
+
+    #[test]
+    fn updates_tile_renders_no_managed_runtimes() {
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::NoManagedRuntimes;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("no managed runtimes"),
+            "should report nothing to check: {out:?}"
+        );
+    }
+
+    #[test]
+    fn updates_tile_hints_where_to_run_a_real_check() {
+        // "unknown" alone is a dead end — the tile must point at the real
+        // "Check for updates" verb (ROCm tab, digit 2) rather than leaving
+        // the user with no next step. Same for a failed check.
+        let s = state_with_gpu();
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check when unknown: {out:?}"
+        );
+
+        let mut s = state_with_gpu();
+        s.update_status = UpdateStatus::Error;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("check failed"),
+            "should report the failure: {out:?}"
+        );
+        assert!(
+            out.contains("Check for updates"),
+            "Updates tile should hint at the real check when the check failed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn running_tile_hints_when_empty() {
+        // "Nothing running" alone is a dead end — hint at the Serving tab
+        // (digit 3) that would actually launch a model.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("Nothing running"),
+            "empty running tile: {out:?}"
+        );
+        assert!(
+            out.contains("Serving"),
+            "Running tile should hint where to launch a model: {out:?}"
+        );
+    }
+
+    fn named_instance_with_obs(name: &str, obs: Option<ObservationMetadata>) -> Instance {
+        Instance {
+            container_id: name.into(),
+            container_name: name.into(),
+            status: InstanceStatus::Running,
+            model_name: name.into(),
+            gpu_ids: vec!["0".into()],
+            gen_tps: Some(200.0),
+            tokens_per_watt: Some(200.0 / 300.0),
+            gen_tps_observation: obs,
+            ..Default::default()
+        }
+    }
+
+    fn job(cmd: &str, status: JobStatus) -> JobState {
+        JobState {
+            cmd: cmd.into(),
+            args: Vec::new(),
+            status,
+            output: std::collections::VecDeque::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn activity_glyph_key_present_with_room_to_spare() {
+        // Exercise the Gherkin precondition literally: a real serving instance
+        // plus a real job, not just the empty-feed placeholder line.
+        let mut s = state_with_gpu();
+        let inst = named_instance_with_obs("demo-model", None);
+        s.instances.insert(inst.container_id.clone(), inst);
+        s.jobs.jobs.insert(
+            "build".into(),
+            job("cargo build", JobStatus::Done { code: 0 }),
+        );
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("demo-model") && out.contains("cargo build"),
+            "expected real activity entries to render: {out:?}"
+        );
+        assert!(
+            out.contains("live") && out.contains("done") && out.contains("failed"),
+            "activity glyph key missing: {out:?}"
+        );
+        assert!(
+            out.contains("cancelled"),
+            "activity glyph key must document the cancelled glyph: {out:?}"
+        );
+        assert!(
+            out.contains("warn"),
+            "activity glyph key must document the nonzero-exit warn glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_job_renders_distinct_glyph_from_running() {
+        // Characterization guard for pre-existing base behavior (the
+        // `JobStatus::Cancelled` match arm predates this PR): it must not be
+        // silently folded into the `⋯ running` glyph in some future change.
+        // The glyph-key line documenting `○ cancelled`, which *is* new to this
+        // PR, is covered separately by `activity_glyph_key_present_with_room_to_spare`.
+        // Assert on the job's own rendered line (not just presence of '○'
+        // anywhere in the frame — the glyph key appended below the feed also
+        // contains '○', so that alone wouldn't catch a regression back to the
+        // shared wildcard arm).
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("cancel-me".into(), job("long task", JobStatus::Cancelled));
+        let out = render(&s, 160, 30);
+        assert!(
+            out.contains("○ long task"),
+            "cancelled job should render its own ○ glyph: {out:?}"
+        );
+        assert!(
+            !out.contains("⋯ long task"),
+            "cancelled job must not render the running glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn home_update_check_job_never_shown_in_activity_feed() {
+        // The Home tab's own background update-check job is plumbing, not
+        // user activity, even when there's ample spare room in the feed.
+        let mut s = state_with_gpu();
+        s.jobs.jobs.insert(
+            crate::app::HOME_UPDATE_CHECK_JOB_ID.to_owned(),
+            job("/path/to/rocm", JobStatus::Running),
+        );
+        let out = render(&s, 160, 30);
+        assert!(
+            !out.contains("/path/to/rocm"),
+            "the update-check job must never render in the activity feed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn activity_feed_glyphs_match_job_console_vocabulary() {
+        use rocm_dash_core::state::StateEvent;
+
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.jobs.apply(StateEvent::StartJob {
+            id: "a".into(),
+            cmd: "ok".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "a".into(),
+            code: 0,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "b".into(),
+            cmd: "bad".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "b".into(),
+            code: 1,
+        });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "c".into(),
+            cmd: "cancelled".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::CancelJob("c".into()));
+        s.jobs.apply(StateEvent::StartJob {
+            id: "d".into(),
+            cmd: "running".into(),
+            args: vec![],
+        });
+
+        let out = render(&s, 160, 30);
+        assert!(out.contains('✓'), "zero-exit glyph missing: {out:?}");
+        assert!(out.contains('!'), "nonzero-exit glyph missing: {out:?}");
+        assert!(out.contains('○'), "cancelled glyph missing: {out:?}");
+        assert!(out.contains('⋯'), "running glyph missing: {out:?}");
     }
 }

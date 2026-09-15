@@ -25,6 +25,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("automations.feature", "automations"),
     ("bench.feature", "bench"),
     ("chat.feature", "chat"),
+    ("comfyui.feature", "comfyui"),
     ("config.feature", "config"),
     ("dash.feature", "dash"),
     ("dependency_guard.feature", "deps-guard"),
@@ -39,6 +40,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
+    ("therock_next_generation.feature", "therock-next"),
     ("update.feature", "update"),
 ];
 

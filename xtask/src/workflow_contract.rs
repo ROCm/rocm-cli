@@ -37,7 +37,15 @@ mod tests {
     }
 
     /// The self-hosted runner labels that must not appear in a `runs-on`.
-    const SELF_HOSTED_LABELS: [&str; 3] = ["self-hosted", "amd-gpu", "strix-halo"];
+    const SELF_HOSTED_LABELS: [&str; 5] =
+        ["self-hosted", "amd-gpu", "strix-halo", "mi300x", "r9700"];
+
+    /// Labels that do NOT narrow a `runs-on` to one kind of hardware.
+    ///
+    /// `self-hosted`, `linux` and `windows` are self-evidently generic.
+    /// `amd-gpu` reads specific but is not: every AMD GPU runner registers it,
+    /// so a lane selecting on it alone draws from a mixed-silicon pool.
+    const GENERIC_LABELS: [&str; 4] = ["self-hosted", "linux", "windows", "amd-gpu"];
 
     /// Strip a trailing `# …` comment from a YAML line (best-effort: our
     /// workflows never put a literal `#` inside a runs-on/group value).
@@ -822,6 +830,33 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_self_hosted_lane_pins_a_hardware_label() {
+        // `e2e-gpu` and `e2e-gpu-nightly` shipped as `[self-hosted, linux,
+        // amd-gpu]`. The Strix Halo Linux hosts carry `amd-gpu` too, so the
+        // MI300X-named lanes were scheduled onto gfx1151 whenever a Strix
+        // runner won the race: red on the WSL host, and a PASS on the native
+        // Ubuntu one — published as `e2e-gpu-report`, which the consolidated
+        // grid labels MI300X. A green run on hardware the lane does not name is
+        // worse than a red one, because nothing prompts anyone to look.
+        //
+        // Derived like its siblings: a new lane is covered the day it lands,
+        // and only a lane whose labels are ALL generic fails, so pinning a new
+        // hardware label needs no change here.
+        for (workflow, text) in self_hosted_workflows() {
+            for (job, runs_on) in self_hosted_e2e_jobs(&text) {
+                let labels = flattened_list_items(&runs_on);
+                assert!(
+                    labels.iter().any(|l| !GENERIC_LABELS.contains(&l.as_str())),
+                    "{workflow} job `{job}` selects its runner with generic labels only \
+                     (`{runs_on}`), so it can land on any AMD GPU host. Pin a label that \
+                     identifies the hardware the lane is named for (e.g. `mi300x`, \
+                     `r9700`, `strix-halo`)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_self_hosted_lane_allows_for_a_cold_serve() {
         // The per-PR Strix Windows lane was the only lane without this, while its
         // own nightly twin set it. A first serve on shared hardware loads the
@@ -971,14 +1006,68 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             );
         }
 
+        // The README's own lane lists were the one hand-copied hole in this
+        // otherwise derived net: the nightly sentence was asserted by literal
+        // string match against a copy in this test source, so both could go
+        // stale together while the guard stayed green — which is exactly what
+        // happened when the R9700 lane landed. Derive both from the YAML.
+        //
+        // Whitespace is normalized first because these are prose sentences and
+        // a table, wrapped for readability; the lane lists must survive a
+        // reflow that does not change what the doc says.
         let readme = std::fs::read_to_string(repo_root().join("tests/e2e-cucumber/README.md"))
             .expect("read E2E README");
+        let readme_flat = normalized_whitespace(&readme);
+
+        let nightly = read_workflow("nightly.yml");
+        let nightly_lanes = self_hosted_e2e_jobs(&nightly);
         assert!(
-            normalized_whitespace(&readme).contains(
-                "The nightly workflow runs non-blocking jobs — MI300X, Radeon R9700, and Strix Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`"
-            ),
-            "E2E README must identify every nightly job platform"
+            !nightly_lanes.is_empty(),
+            "expected at least one self-hosted job in nightly.yml (extractor sanity check)"
         );
+        let nightly_ids: Vec<String> = nightly_lanes.iter().map(|(job, _)| job.clone()).collect();
+        assert_eq!(
+            backticked_list_between(&readme_flat, "as non-blocking lanes (", ") with"),
+            nightly_ids,
+            "the E2E README must name every nightly self-hosted lane, in workflow order"
+        );
+
+        // The README's CI job table is the per-PR view: the blocking mock job
+        // from ci.yml, then one row per self-hosted lane. Only the self-hosted
+        // rows are derivable, so the mock row is matched by workflow and the
+        // rest are compared against e2e-selfhosted.yml.
+        let readme_rows = markdown_table_rows(&readme, "| Job | Workflow | Platform | Blocking |");
+        let (mock_rows, self_hosted_rows): (Vec<_>, Vec<_>) = readme_rows
+            .into_iter()
+            .partition(|row| row.get(1).is_some_and(|workflow| workflow == "`ci.yml`"));
+        assert_eq!(
+            mock_rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            vec!["`e2e`".to_owned()],
+            "the README CI job table must carry exactly one blocking mock row"
+        );
+        assert_eq!(
+            self_hosted_rows
+                .iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            lanes
+                .iter()
+                .map(|(job, _)| format!("`{job}`"))
+                .collect::<Vec<_>>(),
+            "the README CI job table must have one row per self-hosted job in \
+             e2e-selfhosted.yml, in workflow order"
+        );
+        for row in &self_hosted_rows {
+            assert_eq!(
+                row[3], "no",
+                "self-hosted lane `{}` is continue-on-error, so the README must not \
+                 document it as blocking",
+                row[0]
+            );
+        }
     }
 
     #[test]
@@ -1018,6 +1107,74 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_shared_uv_cache_sits_inside_the_gc_bounded_directory() {
+        // Two independent properties ride on this one path, and both fail
+        // silently.
+        //
+        // Hardlinking: uv can only link out of its cache into a managed
+        // environment when the two are reachable without crossing a mount point.
+        // Otherwise it copies, exits 0, and two of the three install paths
+        // discard its warning — invisible unless you compare inodes.
+        //
+        // Eviction: the runner pod's `uv-cache-gc` initContainer bounds exactly
+        // one directory — the `uv-cache` subPath of the work PVC, which surfaces
+        // in the job as <runner-root>/uv-cache. It sweeps abandoned `.tmp*`
+        // extractions, then deletes `archive-v0` if FREE space on the volume is
+        // under 60GiB. A free-space floor, not a size cap. A cache placed
+        // elsewhere on the same volume still hardlinks, so every signal stays
+        // green while nothing enforces the floor — and the volume also holds
+        // `.runner`, whose credentials need a repo-Administration token to
+        // re-register. The 49G/49G strand that motivated this was the separate
+        // 50Gi cache PVC, since deleted, which had no floor at all.
+        //
+        // $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so a lane that derives
+        // the cache from it directly lands one level too deep and escapes the GC.
+        // Asserting the derivation rather than a literal keeps this honest if the
+        // runner root ever moves.
+        const DERIVATION: &str = "runner_root=\"$(dirname \"$(dirname \"$RUNNER_WORKSPACE\")\")\"";
+        const EXPORT: &str = "export E2E_SHARED_UV_CACHE_DIR=\"$runner_root/uv-cache\"";
+
+        for (workflow, text) in self_hosted_workflows() {
+            let mut setters = 0;
+            for block in multiline_run_blocks(&text) {
+                let Some(line) = block
+                    .lines()
+                    .find(|line| line.starts_with("export E2E_SHARED_UV_CACHE_DIR="))
+                else {
+                    continue;
+                };
+                setters += 1;
+                // Full-line equality, not `contains`: a substring match accepts
+                // `$runner_root/uv-cache-old`, which is outside the bounded
+                // directory and would fail exactly the way this test exists to
+                // prevent.
+                assert_eq!(
+                    line, EXPORT,
+                    "{workflow} sets the shared uv cache to `{line}`. It must be \
+                     exactly `{EXPORT}` — <runner-root>/uv-cache is the only directory \
+                     the runner's uv-cache-gc initContainer bounds. $RUNNER_WORKSPACE \
+                     itself is one level too deep, which keeps the hardlinks but \
+                     silently drops the 60GiB free-space floor"
+                );
+                assert!(
+                    block.contains(DERIVATION),
+                    "{workflow} exports E2E_SHARED_UV_CACHE_DIR from `$runner_root` \
+                     without defining it in the same run block; add `{DERIVATION}`"
+                );
+            }
+            // Without this, deleting every export is a silent pass — the loop
+            // above simply finds nothing to assert on. Same guard the sibling
+            // `assert_prebuilt_e2e_lanes_export_rocmd` uses.
+            assert!(
+                setters > 0,
+                "{workflow} sets E2E_SHARED_UV_CACHE_DIR nowhere. Its GPU lanes share a \
+                 pre-warmed runtime, so an unset cache sends uv to a per-job default \
+                 outside the GC-bounded directory"
+            );
+        }
+    }
+
+    #[test]
     fn self_hosted_prebuilt_e2e_lanes_export_rocmd() {
         let workflow = read_workflow("e2e-selfhosted.yml");
         assert_prebuilt_e2e_lanes_export_rocmd("e2e-selfhosted.yml", &workflow);
@@ -1039,6 +1196,28 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     fn nightly_prebuilt_e2e_lanes_enable_test_hooks() {
         let workflow = read_workflow("nightly.yml");
         assert_prebuilt_e2e_lanes_enable_test_hooks("nightly.yml", &workflow);
+    }
+
+    #[test]
+    fn gpu_prewarm_caches_are_namespaced_by_source_layout() {
+        // The shared tree survives `git clean` and every branch on the runner.
+        // A branch that composes runtimes under a new source layout would
+        // otherwise leave keys and manifests in that tree which code on the
+        // previous layout cannot read, poisoning the lanes it never touched.
+        for workflow_name in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let workflow = read_workflow(workflow_name);
+            assert!(
+                workflow.contains("e2e-prewarm-multi-arch-v2"),
+                "{workflow_name} must isolate the canonical multi-arch runtime tree"
+            );
+            assert!(
+                !workflow.lines().any(|line| {
+                    line.trim_end().ends_with("e2e-prewarm\"")
+                        || line.trim_end().ends_with("e2e-prewarm'")
+                }),
+                "{workflow_name} still uses the generation-agnostic pre-warm tree"
+            );
+        }
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the

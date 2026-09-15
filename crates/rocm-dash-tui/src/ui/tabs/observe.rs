@@ -93,11 +93,14 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     if inner.height == 0 {
         return;
     }
-    // Track aggregate held: an instance contributes if it has gen_tps AND its
-    // observation metadata says Held. Any contributing Held → whole aggregate is held.
+    // Track aggregate held: an instance contributes if it has a finite gen_tps
+    // AND its observation metadata says Held. Mirrors the finite-value filter
+    // `node_efficiency` applies below, so this can't mark the aggregate held
+    // over an instance that `node_efficiency` itself excludes as NaN/Inf.
+    // Any contributing Held → whole aggregate is held.
     let any_held = state.latest.as_ref().is_some_and(|snap| {
         snap.instances.iter().any(|i| {
-            i.gen_tps.is_some()
+            i.gen_tps.is_some_and(f64::is_finite)
                 && i.gen_tps_observation.as_ref().is_some_and(|m| {
                     m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
                 })
@@ -182,7 +185,9 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
                 let mut has_tps = false;
                 let mut any_held = false;
                 for inst in &snap.instances {
-                    if let Some(v) = inst.gen_tps {
+                    // Finite-value filter: a single NaN/Inf sample must not
+                    // poison the whole sum, mirroring `node_efficiency`.
+                    if let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) {
                         tps += v;
                         has_tps = true;
                         if inst.gen_tps_observation.as_ref().is_some_and(|m| {
@@ -515,6 +520,42 @@ mod tests {
         assert!(
             !out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must not appear for legacy None metadata; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_efficiency_hero_ignores_non_finite_held_gen_tps() {
+        // A NaN gen_tps sample is excluded from `node_efficiency`'s sum, so
+        // the hero's held predicate must exclude it too — otherwise the
+        // legend would claim a value is "held" that never contributed to the
+        // displayed tok/W figure at all.
+        use crate::ui::format;
+        let inst = instance_with_obs("m", f64::NAN, Some(held_obs()));
+        let state = connected_with_instances(vec![inst]);
+        let out = render(&state, 160, 50);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the only held instance's gen_tps is non-finite; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn observe_throughput_hero_ignores_non_finite_gen_tps() {
+        // Mirrors `node_efficiency`'s finite-value guard: one NaN instance
+        // must not poison the Σ tok/s sum for the whole node, and must not
+        // mark the aggregate held on its own.
+        use crate::ui::format;
+        let good = instance_with_obs("good", 250.0, Some(fresh_obs()));
+        let poisoned = instance_with_obs("poisoned", f64::NAN, Some(held_obs()));
+        let state = connected_with_instances(vec![good, poisoned]);
+        let out = render(&state, 160, 50);
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the only held instance's gen_tps is non-finite; got:\n{out}"
+        );
+        assert!(
+            out.contains("250.0 tok/s"),
+            "the finite instance's throughput must still render, unpoisoned by the NaN sibling; got:\n{out}"
         );
     }
 }

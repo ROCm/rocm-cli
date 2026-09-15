@@ -15,6 +15,10 @@
 //! `preferred_serve_engine_for_therock_family` logic. It will drift if the product
 //! changes engine support, so the unit tests below guard it.
 //!
+//! The AMD GPU *count* is re-implemented for the same reason (see
+//! [`probe_amd_gpu_count`]): no `rocm` command reports one, so a scenario whose
+//! premise is a multi-GPU host has nothing else to gate on.
+//!
 //! `examine`'s `default_engine` now reports the host's real engine rather than the
 //! old hardcoded `"lemonade"` constant, so this could in principle be replaced by
 //! reading the product's own answer. Deliberately KEEP the re-implementation: the
@@ -106,6 +110,10 @@ pub struct HostCapability {
     /// scenarios can run. A real `detected_gfx_target`, plus a ready ROCm
     /// driver path on WSL — see [`host_has_usable_gpu`].
     pub has_amd_gpu: bool,
+    /// How many AMD GPUs are PRESENT on this host, before any visibility mask.
+    /// `None` where the count could not be determined (non-Linux, unreadable
+    /// sysfs). Gates `@requires-multi-gpu`; see [`probe_amd_gpu_count`].
+    pub amd_gpu_count: Option<usize>,
     /// Engine adapters the binary reports as present. Both builtins are always
     /// "built-in", so this is NOT the same as "can start here" — use
     /// [`HostCapability::engine_available`] for that.
@@ -244,6 +252,19 @@ fn active_runtime_install_root(
     Some((version, root))
 }
 
+/// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
+///
+/// The list is newest-first, so the first matching key is the runtime installed
+/// by the pre-warm refresh when legacy family-keyed entries coexist with it.
+/// Matching on the `-wheel-multi-arch-` infix rather than a whole key is what
+/// keeps this working once the key carries a composition fingerprint.
+pub fn canonical_wheel_runtime_key(inventory: &str) -> Option<&str> {
+    inventory.lines().find_map(|line| {
+        line.split_whitespace()
+            .find(|field| field.contains("-wheel-multi-arch-"))
+    })
+}
+
 /// Parse the vLLM version from the `vllm-<ver>.dist-info` directory in the
 /// runtime venv's site-packages (works without importing vllm).
 ///
@@ -335,6 +356,7 @@ fn probe_host_capability() -> HostCapability {
         driver_status,
     } = parse_examine_text(&examine);
     let has_amd_gpu = host_has_usable_gpu(gfx_target.as_deref(), is_wsl, &driver_status);
+    let amd_gpu_count = probe_amd_gpu_count();
     let available_engines = parse_engines_list(&engines);
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
@@ -345,6 +367,7 @@ fn probe_host_capability() -> HostCapability {
         is_wsl,
         gfx_target,
         has_amd_gpu,
+        amd_gpu_count,
         available_engines,
         effective_serve_engine,
         platform_slug,
@@ -462,6 +485,111 @@ fn host_has_usable_gpu_with_mask(
         && visibility_mask.is_none_or(|mask| !mask.is_empty())
 }
 
+/// How many AMD GPUs are present on this host, independent of any visibility
+/// mask. `None` when the count could not be determined.
+///
+/// This is the file's second deliberate re-implementation (see the module
+/// header). It mirrors the product's
+/// `combine_amd_gpu_counts(linux_kfd_gpu_node_count(), linux_drm_amdgpu_card_count())`
+/// in rocm-core, because no `rocm` command reports a device count and the suite
+/// is black-box — it cannot ask the crate.
+///
+/// It must answer the same "how many devices are PRESENT" question the product's
+/// `--gpu` validation is built on, which is why it reads sysfs rather than
+/// counting `amd-smi list`. `amd-smi list` is a different answer: it is a
+/// best-effort subprocess the product only falls back to, it is absent on hosts
+/// that serve fine without it, and it can disagree with KFD+DRM (see
+/// `combine_amd_gpu_counts`). Gating on it would skip these scenarios wherever
+/// amd-smi is not installed. The combine rule is unit-tested below; the sysfs
+/// readers are not (they need a real host).
+#[cfg(target_os = "linux")]
+fn probe_amd_gpu_count() -> Option<usize> {
+    combine_amd_gpu_counts(kfd_gpu_node_count(), drm_amdgpu_card_count())
+}
+
+/// Off Linux the product's own probe returns `None` too, so the count is
+/// unknown and every `@requires-multi-gpu` scenario resolves to skip.
+#[cfg(not(target_os = "linux"))]
+fn probe_amd_gpu_count() -> Option<usize> {
+    None
+}
+
+/// KFD-topology and DRM-card counts combined into one "GPUs present" figure,
+/// mirroring `rocm_core::combine_amd_gpu_counts`: KFD is compute-authoritative
+/// whenever it sees a GPU, DRM is the zero-KFD fallback (Strix Halo APUs
+/// enumerate only there), and DRM never *raises* a nonzero KFD count. `None`
+/// only when neither surface could be read.
+#[cfg(any(target_os = "linux", test))]
+fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usize> {
+    match kfd {
+        Some(k) if k > 0 => Some(k),
+        Some(_) => Some(drm.unwrap_or(0)),
+        None => drm,
+    }
+}
+
+/// Count AMD GPU nodes in the KFD topology. `Some(0)` is an authoritative "no
+/// GPU"; `None` means `/dev/kfd` exists but its topology could not be read.
+#[cfg(target_os = "linux")]
+fn kfd_gpu_node_count() -> Option<usize> {
+    let nodes = std::path::Path::new("/sys/class/kfd/kfd/topology/nodes");
+    match std::fs::read_dir(nodes) {
+        Ok(entries) => Some(
+            entries
+                .flatten()
+                .filter(|entry| {
+                    // CPU nodes report a `gfx_target_version` of 0; GPUs don't.
+                    std::fs::read_to_string(entry.path().join("gfx_target_version"))
+                        .ok()
+                        .is_some_and(|value| {
+                            value
+                                .trim()
+                                .parse::<u64>()
+                                .is_ok_and(|version| version != 0)
+                        })
+                })
+                .count(),
+        ),
+        Err(_) if std::path::Path::new("/dev/kfd").exists() => None,
+        Err(_) => Some(0),
+    }
+}
+
+/// Count AMD primary DRM cards under `/sys/class/drm` (`card0`, `card1`, …),
+/// skipping connector sub-nodes like `card0-DP-1`. `None` when the class dir
+/// itself could not be read.
+#[cfg(target_os = "linux")]
+fn drm_amdgpu_card_count() -> Option<usize> {
+    let entries = std::fs::read_dir(std::path::Path::new("/sys/class/drm")).ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter(|entry| {
+                let card = entry.path();
+                let Some(name) = card.file_name().and_then(|value| value.to_str()) else {
+                    return false;
+                };
+                name.starts_with("card")
+                    && !name.contains('-')
+                    && is_amdgpu_device(&card.join("device"))
+            })
+            .count(),
+    )
+}
+
+/// Whether a DRM card's device dir belongs to AMD: PCI vendor `0x1002`, else a
+/// `DRIVER=amdgpu` uevent. Mirrors `rocm_core::is_amdgpu_device`.
+#[cfg(target_os = "linux")]
+fn is_amdgpu_device(device_dir: &std::path::Path) -> bool {
+    if let Ok(vendor) = std::fs::read_to_string(device_dir.join("vendor"))
+        && vendor.trim().eq_ignore_ascii_case("0x1002")
+    {
+        return true;
+    }
+    std::fs::read_to_string(device_dir.join("uevent"))
+        .is_ok_and(|uevent| uevent.lines().any(|line| line.trim() == "DRIVER=amdgpu"))
+}
+
 /// Parse engine names from `rocm engines list`. Engine rows are the lines whose
 /// first non-space token is a known engine name (optionally prefixed by the `*`
 /// default marker), before the indented `adapter:`/`runtime:` detail lines.
@@ -519,7 +647,13 @@ fn derive_platform_slug(
 
 fn platform_hardware_slug(gfx_target: &str) -> String {
     let family = normalize_family(gfx_target);
-    if family.ends_with("-dcgpu") {
+    // Two distinct data-center parts normalize to a `-dcgpu` family, so match the
+    // family rather than the suffix: a suffix test reports gfx950 hardware as
+    // `mi300x`, which would file its results in the MI300X column of the report
+    // grid instead of its own.
+    if family == "gfx950-dcgpu" {
+        "mi350p".to_owned()
+    } else if family.ends_with("-dcgpu") {
         "mi300x".to_owned()
     } else if family.starts_with("gfx115") {
         "strix-halo".to_owned()
@@ -543,6 +677,26 @@ fn os_normalized(os_family: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_wheel_runtime_key_ignores_markers_and_legacy_entries() {
+        let inventory = "registered ROCm runtimes\n  active_runtime_key: <unset>\n  installed:\n    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu\n  * release-wheel-multi-arch-7-14-0-0123456789abcdef runtime_id=therock-release:gfx94X-dcgpu\n";
+        assert_eq!(
+            canonical_wheel_runtime_key(inventory),
+            Some("release-wheel-multi-arch-7-14-0-0123456789abcdef"),
+            "the `* ` active marker is a separate field and must not be taken for the key"
+        );
+    }
+
+    #[test]
+    fn canonical_wheel_runtime_key_returns_none_without_canonical_entry() {
+        assert_eq!(
+            canonical_wheel_runtime_key(
+                "  release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release:gfx94X-dcgpu"
+            ),
+            None
+        );
+    }
 
     // Drift guard (decision #1): these pin the re-implemented rule to the
     // product's known behaviour. When task #16 lands a product probe field,
@@ -597,6 +751,7 @@ mod tests {
             is_wsl: false,
             gfx_target: Some("gfx1151".to_owned()),
             has_amd_gpu: true,
+            amd_gpu_count: Some(1),
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
@@ -610,6 +765,7 @@ mod tests {
             is_wsl: false,
             gfx_target: Some("gfx942".to_owned()),
             has_amd_gpu: true,
+            amd_gpu_count: Some(8),
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
@@ -743,6 +899,27 @@ rocm examine
         ));
     }
 
+    /// Drift guard for the re-implemented device count (see
+    /// [`probe_amd_gpu_count`]). `@requires-multi-gpu` reads "more than one
+    /// device present", so the rule that turns two sysfs surfaces into that
+    /// number has to match `rocm_core::combine_amd_gpu_counts` exactly — the
+    /// same table it is pinned by there.
+    #[test]
+    fn amd_gpu_count_combines_kfd_and_drm_like_the_product() {
+        // KFD is compute-authoritative whenever it sees a GPU; DRM must never
+        // raise it (a display-only AMD card would otherwise invent a device and
+        // make a single-GPU host look multi-GPU).
+        assert_eq!(combine_amd_gpu_counts(Some(1), Some(2)), Some(1));
+        assert_eq!(combine_amd_gpu_counts(Some(8), Some(8)), Some(8));
+        // Zero KFD compute nodes: the Strix Halo APU shape, counted via DRM.
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(1)), Some(1));
+        assert_eq!(combine_amd_gpu_counts(Some(0), Some(0)), Some(0));
+        // KFD unreadable: DRM answers, else the count is unknown.
+        assert_eq!(combine_amd_gpu_counts(None, Some(2)), Some(2));
+        assert_eq!(combine_amd_gpu_counts(None, None), None);
+        assert_eq!(combine_amd_gpu_counts(Some(2), None), Some(2));
+    }
+
     #[test]
     fn parses_engines_list() {
         let text = "\
@@ -762,10 +939,28 @@ Local model engines
     #[test]
     fn platform_slug_derivation() {
         assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
-        assert_eq!(
-            derive_platform_slug(true, Some("gfx942"), "linux", false),
-            "mi300x"
-        );
+        // gfx950 normalizes to a `-dcgpu` family like gfx94x does, but it is a
+        // different part with its own lane and report column — it must not be
+        // slugged as mi300x.
+        //
+        // Cover every form that reaches `platform_hardware_slug`, not just the
+        // bare target the probe happens to emit today: the family label takes
+        // `normalize_family`'s early `-dcgpu` return, while the suffixed form
+        // depends on its `starts_with` — an `==` "tidy-up" there would silently
+        // send a real gfx950 host back into the `mi300x` column.
+        for (gfx_target, expected) in [
+            ("gfx950", "mi350p"),
+            ("gfx950-dcgpu", "mi350p"),
+            ("gfx950:sramecc+:xnack-", "mi350p"),
+            ("gfx942", "mi300x"),
+            ("gfx94X-dcgpu", "mi300x"),
+        ] {
+            assert_eq!(
+                derive_platform_slug(true, Some(gfx_target), "linux", false),
+                expected,
+                "gfx target `{gfx_target}` must slug as `{expected}`"
+            );
+        }
         // Strix Halo: same gfx1151 silicon on both OSes → distinct slugs so the
         // report grid gets a column per platform, not a collision.
         assert_eq!(

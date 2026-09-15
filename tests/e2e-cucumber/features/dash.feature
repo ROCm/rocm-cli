@@ -74,12 +74,11 @@ Feature: Interactive dashboard
   Scenario: dash-08 - Gen throughput stays visible for the validity window after a scrape failure
     # EAI-7960 principal regression: after establishing a positive gen_tps
     # baseline through the scripted mock, a single /metrics transport failure
-    # must NOT immediately clear the displayed "tok/s" value.  The contract
-    # requires the held value to remain visible for the validity window
-    # clamp(3 x instance_tick, 6 s, 30 s).  Current code has no such window
-    # (runner.rs clears gen_tps on the same tick as the failure), so the
-    # "generation throughput remains visible" step is the RED assertion.
+    # must NOT immediately clear the displayed "tok/s" value. The test-only
+    # logical clock advances with daemon cycles rather than runner wall time, so
+    # host scheduling cannot consume the validity window before this assertion.
     Given a managed model exposes scripted serving metrics
+    And dashboard observation time is deterministic
     When the user opens the dashboard
     And the user opens the Observe view
     Then positive generation throughput is displayed for the managed model
@@ -90,17 +89,12 @@ Feature: Interactive dashboard
 
   @id:dash-gen-tps-expiry-boundary @requires-os:linux
   Scenario: dash-09 - Gen throughput expires after the validity window following sustained failure
-    # EAI-7960 expiry-boundary scenario: two contract boundaries are pinned.
-    #
-    # BOUNDARY 1 (held assertion) — immediately after the first failed scrape,
-    # gen_tps must still be visible (Held).  With current code this FAILS (RED)
-    # because runner.rs clears gen_tps immediately.
-    #
-    # BOUNDARY 2 (expired assertion) — after the validity window elapses
-    # (clamp(3 × instance_tick, 6 s, 30 s) = 6 s for the production 2 s tick),
-    # gen_tps must be gone from the screen.  This step is unreachable today
-    # because BOUNDARY 1 fails first; it becomes GREEN once the fix is applied.
+    # EAI-7960 expiry-boundary scenario: immediately after the first failed
+    # scrape, gen_tps remains visible as Held. Advancing the injected logical
+    # clock beyond clamp(3 × instance_tick, 6 s, 30 s) then makes the next scrape
+    # publish an expired value. No wall-clock sleep defines either boundary.
     Given a managed model exposes scripted serving metrics
+    And dashboard observation time is deterministic
     When the user opens the dashboard
     And the user opens the Observe view
     Then positive generation throughput is displayed for the managed model
@@ -124,8 +118,19 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
 
+  # EAI-8366: `--replay <missing>` must fail fast — validate the path BEFORE the
+  # dashboard takes over the terminal, printing a clear error and exiting
+  # non-zero. Driven through a PTY (like the rest of this file): the fail-fast
+  # property is unobservable through a pipe, and under a real terminal the pre-fix
+  # binary enters the alt-screen and hangs, which this scenario pins.
+  @id:dash-replay-missing-file-fails-fast @requires-os:linux
+  Scenario: dash-11 - Replaying a missing recording fails before entering the dashboard
+    When the user replays a recording that does not exist
+    Then the dashboard is refused before taking over the terminal
+    And the user is told the replay file was not found
+
   @id:dash-sigterm-restores-terminal @requires-os:linux
-  Scenario: dash-11 - A SIGTERM restores the terminal and exits 143
+  Scenario: dash-12 - A SIGTERM restores the terminal and exits 143
     # Core regression for this PR: a SIGTERM to a running dashboard (e.g. a
     # supervisor stopping it) must run the restore path — leave the alternate
     # screen and show the cursor — and report the conventional 128+15 exit code,
@@ -137,11 +142,11 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-sigint-restores-terminal @requires-os:linux
-  Scenario: dash-12 - A SIGINT restores the terminal and exits 130
+  Scenario: dash-13 - A SIGINT restores the terminal and exits 130
     # An externally delivered SIGINT (`kill -INT` from another process) takes the
     # same restore path and reports the conventional 128+2 exit code. This is NOT
     # the typed Ctrl-C gesture: raw mode clears ISIG, so that keystroke never
-    # becomes a signal — dash-14 covers it as the key event it actually is.
+    # becomes a signal — dash-15 covers it as the key event it actually is.
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the dashboard receives a SIGINT
@@ -149,7 +154,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-launcher-sigterm-restores-terminal-across-a-session @requires-os:linux
-  Scenario: dash-13 - A SIGTERM to the launcher hub restores the terminal after a session
+  Scenario: dash-14 - A SIGTERM to the launcher hub restores the terminal after a session
     # EAI-7194 launcher-hub regression: bare `rocm` is a persistent hub whose
     # process outlives each session's Tokio runtime. Tokio never unregisters the
     # libc signal handler it installs, so a per-session watcher goes deaf the
@@ -177,7 +182,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-ctrl-c-restores-terminal @requires-os:linux
-  Scenario: dash-14 - Typing Ctrl-C in the dashboard restores the terminal and exits 130
+  Scenario: dash-15 - Typing Ctrl-C in the dashboard restores the terminal and exits 130
     # The gesture a user actually performs, and the one nothing covered. While
     # the TUI holds the terminal in raw mode the driver's ISIG translation is off
     # (ENABLE_PROCESSED_INPUT on Windows), so this keystroke is delivered to the
@@ -193,7 +198,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-launcher-ctrl-c-restores-terminal @requires-os:linux
-  Scenario: dash-15 - Typing Ctrl-C at the launcher front door restores the terminal and exits 130
+  Scenario: dash-16 - Typing Ctrl-C at the launcher front door restores the terminal and exits 130
     # The same keystroke at the hub's synchronous menu. That loop is a separate
     # key loop from the dashboard's and had no Ctrl-C handling at all, so the
     # gesture left bare `rocm` sitting at the front door in raw mode. Both loops
