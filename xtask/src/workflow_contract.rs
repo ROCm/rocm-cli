@@ -392,6 +392,29 @@ mod tests {
             .unwrap_or_else(|| panic!("job defines top-level scalar `{key}`"))
     }
 
+    /// The job-level `if:` condition, flattened across folded (`>-`)
+    /// continuation lines so a clause split over several lines cannot hide.
+    ///
+    /// Scoped to the indent-4 key, so a step-level `if:` (indent 8) can never
+    /// be mistaken for the job's own gate.
+    fn job_if(block: &str) -> String {
+        let start = block
+            .lines()
+            .position(|line| indent_of(line) == 4 && line.trim_start().starts_with("if:"))
+            .expect("job declares a job-level `if:`");
+        let scoped = block.lines().skip(start).collect::<Vec<_>>().join("\n");
+        let value = flattened_values(&scoped, "if")
+            .into_iter()
+            .next()
+            .expect("job-level `if:` has an extractable value");
+        // Drop the block-scalar indicator (`>-`, `|`, …) the folded form opens
+        // with, so the condition reads the same however it was spelled.
+        value
+            .trim_start_matches(['>', '|', '-', '+'])
+            .trim()
+            .to_owned()
+    }
+
     fn markdown_table_rows(text: &str, header: &str) -> Vec<Vec<String>> {
         let mut lines = text.lines().skip_while(|line| *line != header);
         assert_eq!(
@@ -707,6 +730,40 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 );
             }
         }
+    }
+
+    /// `E2E consolidated report` is a required merge check that reports on the
+    /// `E2E tests` lane, so it has to be produced on every run and it has to
+    /// carry that lane's verdict. Both halves have failed silently before: a
+    /// job-level `heavy` clause skips the job on a light PR, and branch
+    /// protection counts a skipped required check as satisfied; and rendering
+    /// the HTML succeeds just as happily when every scenario failed.
+    #[test]
+    fn consolidated_e2e_report_cannot_be_skipped_and_carries_the_lane_verdict() {
+        let ci = read_workflow("ci.yml");
+        let block = job_block(&ci, "e2e-report");
+        let condition = job_if(block);
+
+        assert!(
+            !condition.contains("needs.changes.outputs.heavy"),
+            "e2e-report's job-level `if:` is `{condition}`, which gates on the `heavy` \
+             path filter: on a PR that matches no heavy path the job is SKIPPED, and \
+             GitHub branch protection treats a skipped required check as satisfied, so \
+             the check silently stops gating anything. Mirror the `e2e` job's condition \
+             instead and decide what work happens at the step level."
+        );
+        assert!(
+            block.contains("needs.e2e.result"),
+            "e2e-report never reads `needs.e2e.result`, so its exit status only reflects \
+             whether the HTML rendered — a run in which every E2E scenario failed would \
+             still report this required check as green."
+        );
+        assert!(
+            condition.contains("always()"),
+            "e2e-report's job-level `if:` is `{condition}`, which lacks `always()`: \
+             without it a failed `E2E tests` lane skips the report entirely, and the \
+             failures nobody can see are exactly the ones worth rendering."
+        );
     }
 
     #[test]
