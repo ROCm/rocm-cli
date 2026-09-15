@@ -153,8 +153,16 @@ rocm install sdk --channel release --format wheel --dry-run
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
 
 ```bash
-rocm install sdk --channel release --format wheel
+rocm install sdk --channel release --format wheel --yes
 ```
+
+`--yes` approves replacing whatever managed runtime is currently the active
+default without prompting, which keeps the command non-interactive when the test
+root is reused across runs (a root with no active default runtime never
+prompts). The gate is not scoped to the family or channel being installed, so
+`--yes` is needed on a reused root even when the install targets a family that
+root has never held. It matches the invocation in
+`scripts/therock_sdk_install_test.py`.
 
 Then it verifies:
 

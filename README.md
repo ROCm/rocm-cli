@@ -199,7 +199,11 @@ rocm install sdk
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it.
+creates a separate managed runtime alongside it. Running the command when a
+managed runtime is already the active default asks first, because the new
+install takes over as the active default; see
+[ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
+for that gate and the flags that approve it without a prompt.
 
 Then serve a model:
 
@@ -251,6 +255,7 @@ the JSON report, not the human-readable one.
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
@@ -259,11 +264,30 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it. `--json` prints the check result as a single line of JSON instead
-of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
-`--json`; both conflict with `--apply`).
+by rocm-cli. An install with no active default runtime never prompts, but once a
+managed runtime is the active default every `install sdk` asks first, because
+the new install takes over as the active default. That gate is not scoped to the
+family or channel you are installing: a `--family` or `--channel` you have never
+installed before takes over the active default just as a same-family upgrade
+does, so it asks too. To approve that non-interactively — in scripts or CI, where
+the prompt would otherwise refuse — pass `--approve-replacing-active-default`,
+which is also what the refusal itself recommends and what ROCm CLI's own
+non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
+approval *and* approves installing required system packages (such as OpenMPI for
+vLLM), which means `sudo`; reach for it only where something can answer a sudo
+password prompt, which an unattended job cannot. In the default managed install
+root, the root and its manifest are keyed by version, so an upgrade or downgrade
+keeps the previous install on disk and only a same-version reinstall reuses the
+same root. `--prefix` opts out of that: the folder you name is used verbatim for
+every version, so successive installs into one prefix replace each other in
+place. `install driver` installs the AMD kernel driver on Linux
+(DKMS or native package). `update` checks for a newer ROCm package; pass
+`--apply` to install it. `--json` prints the check result as a single line of
+JSON instead of text; `--timeout-secs` bounds its network calls
+(`--timeout-secs` requires `--json`; both conflict with `--apply`).
+`rocm update --apply` has no `--yes` flag and needs
+none: selecting a runtime to update is itself the approval, and it leaves the
+active default alone unless you add `--activate`.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
