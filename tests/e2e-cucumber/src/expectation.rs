@@ -1533,6 +1533,25 @@ flaky = true
     }
 
     #[test]
+    fn a_claim_does_not_inherit_a_stale_id_from_across_a_blank_line() {
+        // Pins the `pending_ids.clear()` half of the blank-line arm, which the
+        // other scan tests leave dead: without it `stale-id` would still be
+        // pending when the claim below is bound, and the claim would be
+        // attributed to a scenario it says nothing about — silently, and with
+        // the row check then vouching for the wrong id.
+        let claims = claimed_failure_ids(
+            "Feature: f\n\
+             \n\
+             \x20 @id:stale-id\n\
+             \n\
+             \x20 # Expected to FAIL. The thing is broken.\n\
+             \x20 Scenario: f-01 - The thing works\n",
+        );
+        assert!(claims.ids.is_empty(), "{:?}", claims.ids);
+        assert_eq!(claims.unbound, [5]);
+    }
+
+    #[test]
     fn a_claim_dangling_at_end_of_file_is_reported_not_dropped() {
         // The `Scenario:` that would have bound this claim was deleted, leaving
         // the comment as the last thing in the file. Covers the flush after the

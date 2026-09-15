@@ -9,7 +9,7 @@ use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on every platform these
 /// scenarios run on. It keys off `check_1_arch_not_in_wheel`, registered for
-/// `["linux", "windows", "wsl"]` (`crates/rocm-core/src/diagnose.rs:1964`),
+/// `["linux", "windows", "wsl"]` in `CHECKERS` (`crates/rocm-core/src/diagnose.rs`),
 /// which scores 50 on the `HSA_STATUS_ERROR_INVALID_ISA` keyword regardless of
 /// host state — the covered-arch penalty only applies when a framework arch
 /// list is present, so with none installed the match always renders. (The

@@ -54,16 +54,20 @@ pub struct E2eWorld {
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
-    /// STDOUT of a SECOND command, for a scenario whose whole point is that two
+    /// Output of a SECOND command, for a scenario whose whole point is that two
     /// commands agree — a diagnosis against a fix preview, help examples against
     /// the model listing, the human `examine` report against its `--json` form.
+    /// Usually that command's stdout; where a scenario does not care which
+    /// stream carried a line, it may hold both concatenated (the fix preview
+    /// does).
     ///
-    /// Put a second stdout HERE rather than in `cli_stderr`. The rule that slot
-    /// keeps is "this is what the command wrote to stderr", and a reader checks
-    /// it with `grep 'cli_stderr = '` — every hit should be storing a stderr
-    /// capture. Borrowing it for a second stdout breaks that at a distance: the
-    /// step that reads it back looks like it is making a claim about stderr.
-    /// This field exists so nothing has to.
+    /// Put it HERE rather than in `cli_stderr`. The rule that slot keeps is
+    /// "this is what the command wrote to stderr", and a reader settles it with
+    /// `grep -rnE '^\s*world\.cli_stderr = ' tests/e2e-cucumber/` — anchored to
+    /// the assignment so this comment is not itself a hit. Every result should
+    /// be storing a stderr capture. Borrowing that slot for a second command's
+    /// output breaks the rule at a distance: the step reading it back looks like
+    /// it is making a claim about stderr. This field exists so nothing has to.
     pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
@@ -945,7 +949,7 @@ pub fn stat_shim_path(
         .find(|candidate| std::path::Path::new(candidate).is_file())
         .expect("no real `stat` binary to delegate to");
     // Answers only the one call this scenario is substituting: the CLI's
-    // `stat -c %A|%U|%G <device>` (crates/rocm-core/src/examine.rs:1303).
+    // `stat -c %A|%U|%G <device>` in `stat_device` (crates/rocm-core/src/examine.rs).
     // Both the format AND the path must match — keying on the path alone would
     // hand this `mode|owner|group` line to any other `stat` of the same device
     // added later, in whatever format it asked for, and the caller would parse

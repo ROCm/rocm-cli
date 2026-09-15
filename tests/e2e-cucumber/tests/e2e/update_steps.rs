@@ -120,10 +120,10 @@ async fn assert_still_manages_no_runtimes(world: &mut E2eWorld) {
     // this fixture CANNOT make. It would be natural to read this as "the
     // preview did not perform the update", but on an empty registry that
     // outcome is unreachable whether the product is honest or not: `--apply`
-    // resolves a runtime to upgrade through `select_runtime_update_source`,
-    // which bails with "no managed runtimes are registered" when none is
-    // (`apps/rocm/src/main.rs:15939`). `update` upgrades a managed runtime; it
-    // never installs a first one. So "manages none" here is guaranteed by the
+    // resolves a runtime to upgrade through `select_runtime_update_source`
+    // (`apps/rocm/src/main.rs`), which bails with "no managed runtimes are
+    // registered" when none is. `update` upgrades a managed runtime; it never
+    // installs a first one. So "manages none" here is guaranteed by the
     // fixture, and an assertion resting on it would be satisfied forever.
     //
     // What it does hold is the readback path: after a preview, `update` still
@@ -133,7 +133,7 @@ async fn assert_still_manages_no_runtimes(world: &mut E2eWorld) {
     // Proving THAT needs a scenario with a managed runtime registered, where a
     // performed update is observable. It is not done here on purpose: with a
     // manifest present, `render_update_report` resolves the latest version per
-    // runtime (`apps/rocm/src/therock.rs:810` → `resolve_latest_for_manifest`),
+    // runtime (`resolve_latest_for_manifest` in `apps/rocm/src/therock.rs`),
     // which reaches the TheRock index — and this scenario runs on the mock lane,
     // which has no network. Tracked on EAI-8010 rather than forced in here.
     //

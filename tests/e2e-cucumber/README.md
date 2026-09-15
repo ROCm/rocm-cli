@@ -166,6 +166,14 @@ matches a condition is expected to fail (xfail); if it then passes, that is an
 bug. See `src/expectation.rs` for the resolver and `expectations.toml`'s header
 for the condition grammar.
 
+When a comment here points at product code, **cite a symbol, never a line
+number** — `select_runtime_update_source` in `apps/rocm/src/main.rs`, not
+`main.rs:16427`. `apps/rocm/src/main.rs` alone is over twenty thousand lines and
+moves every week; nothing checks these numbers, so a stale one sends the reader
+somewhere confidently wrong, which is worse than no pointer at all. Six such
+citations were written during this suite's review and four of them had drifted —
+one by five hundred lines — before the change that added them had merged.
+
 When a scenario's comment block says **"Expected to FAIL"**, write it directly
 above that scenario's `@id:` tag line with **no blank line between them**. A test
 binds each such claim to the tags immediately beneath it and fails if the row has
