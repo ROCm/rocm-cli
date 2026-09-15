@@ -48,7 +48,11 @@ use examine::extract_rocm_version;
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
-pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use fix::{
+    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
+    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
+    list_recipes as list_fix_recipes,
+};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,

@@ -11,6 +11,7 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod catalog;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
@@ -94,6 +95,13 @@ enum Command {
         /// `origin/main`.
         #[arg(long)]
         base: Option<String>,
+    },
+    /// Regenerate the published Doctor catalog manifest from the compiled catalog.
+    Catalog {
+        /// Verify the published manifest is current without writing; exit
+        /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
     },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
@@ -241,6 +249,7 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::Catalog { check } => catalog::run(check)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,

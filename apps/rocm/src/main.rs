@@ -174,6 +174,9 @@ enum Command {
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
         #[arg(long)]
         device_index: Option<i64>,
+        /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the rocm-cli version.
     Version,
@@ -1779,7 +1782,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             dry_run,
             device_index,
-        }) => fix(fix_id, yes, dry_run, device_index),
+            json,
+        }) => fix(fix_id, yes, dry_run, device_index, json),
         Some(Command::Version) => {
             println!("rocm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -2440,11 +2444,30 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
     Ok(())
 }
 
-fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
+fn fix(
+    fix_id: Option<String>,
+    yes: bool,
+    dry_run: bool,
+    device_index: Option<i64>,
+    json: bool,
+) -> Result<()> {
     let Some(fix_id) = fix_id else {
-        print!("{}", rocm_core::list_fix_recipes());
+        if json {
+            print!("{}", rocm_core::catalog_manifest_json()?);
+        } else {
+            print!("{}", rocm_core::list_fix_recipes());
+        }
         return Ok(());
     };
+    // Refused rather than ignored. "Apply this fix, as JSON" has no meaning, and
+    // quietly dropping the flag would let a caller believe it had asked for
+    // machine-readable output and got it.
+    if json {
+        anyhow::bail!(
+            "`--json` describes the whole catalog, so it cannot be combined with a fix id. \
+             Run `rocm fix --json` to read the catalog, or `rocm fix {fix_id}` to apply this fix."
+        );
+    }
     let opts = rocm_core::FixOptions {
         yes,
         dry_run,
@@ -19953,6 +19976,7 @@ mod tests {
                 yes: true,
                 dry_run: false,
                 device_index: None,
+                json: false,
             }),
         };
         let result = super::dispatch(cli);

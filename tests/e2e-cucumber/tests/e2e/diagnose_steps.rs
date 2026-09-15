@@ -1184,3 +1184,110 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
         "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }
+
+#[when("a tool asks the CLI for its catalog in machine-readable form")]
+async fn tool_reads_catalog(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply that fix in machine-readable form")]
+async fn user_applies_fix_as_json(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id, "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the catalog names every entry and what the CLI does with each")]
+async fn assert_catalog_is_complete(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "reading the catalog is a query");
+    let output = world.cli_output.as_ref().expect("no catalog output");
+    let catalog: serde_json::Value = serde_json::from_str(output)
+        .unwrap_or_else(|e| panic!("the catalog is not machine-readable ({e}):\n{output}"));
+
+    // Against the same pinned list the human listing is held to, so the two
+    // forms cannot come to describe different catalogs.
+    let ids: Vec<&str> = catalog["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no entries in the catalog:\n{catalog:#}"))
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids, CATALOG_FIX_IDS,
+        "the published catalog and the documented one disagree"
+    );
+
+    // Per platform, not per entry: an entry can be applied on one platform and
+    // only explained on another, and a reader that could not see that would be
+    // told the wrong thing on one of them.
+    for entry in catalog["entries"].as_array().expect("entries") {
+        let platforms = entry["platforms"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} names no platforms:\n{entry:#}", entry["id"]));
+        assert!(
+            !platforms.is_empty(),
+            "{} applies nowhere, which cannot be right:\n{entry:#}",
+            entry["id"]
+        );
+        for platform in platforms {
+            assert!(
+                platform["os"].is_string() && platform["class"].is_string(),
+                "{} does not say what it does on a platform it applies to:\n{platform:#}",
+                entry["id"]
+            );
+        }
+    }
+    assert!(
+        catalog["contract_version"].is_number(),
+        "a reader cannot tell whether it understands this catalog:\n{catalog:#}"
+    );
+}
+
+#[then("it gives the meaning of every exit code the CLI can return")]
+async fn assert_exit_codes_published(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no catalog output");
+    let catalog: serde_json::Value = serde_json::from_str(output).expect("catalog parses");
+    let codes = catalog["exit_codes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the catalog publishes no exit codes:\n{catalog:#}"));
+    // Naming them is the point: a caller that receives a 3 and cannot look it up
+    // is back to guessing, which is what the prose it replaces forced it to do.
+    for name in [
+        "ok",
+        "internal",
+        "unknown_id",
+        "not_applicable",
+        "failed",
+        "declined",
+    ] {
+        assert!(
+            codes.contains_key(name),
+            "the published exit codes are missing `{name}`:\n{catalog:#}"
+        );
+    }
+}
+
+#[then("the CLI refuses and explains that the two cannot be combined")]
+async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_ref().expect("no stderr");
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a request with no answer must not look like it succeeded"
+    );
+    assert!(
+        stderr.contains("--json"),
+        "the refusal has to name what was wrong with the request:\n{stderr}"
+    );
+    // Nothing may be emitted that a caller could mistake for the catalog.
+    let stdout = world.cli_output.as_ref().map_or("", String::as_str);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout).is_err(),
+        "a refused request still produced machine-readable output:\n{stdout}"
+    );
+}
