@@ -29,7 +29,7 @@ tar = "0.4"
 [target.'cfg(windows)'.dependencies]
 # Narrow to the deflate backend only; the default `zip` features pull in several
 # extra compression codecs the bundle does not need.
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
