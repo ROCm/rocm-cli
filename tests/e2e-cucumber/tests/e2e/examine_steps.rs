@@ -40,10 +40,18 @@ async fn setup_wsl_host(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user asks for the version")]
+#[when("the user asks for the version through every CLI surface")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
-    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(
+        [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["-V"].as_slice(),
+        ]
+        .into_iter()
+        .map(|args| crate::run_rocm(world, args).0)
+        .collect(),
+    );
 }
 
 #[when("the user lists available engines")]
@@ -76,12 +84,47 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[then("a version string is returned")]
+#[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
+    let outputs = world.cli_outputs.as_ref().expect("no commands were run");
+    assert_eq!(outputs.len(), 3, "expected all three version surfaces");
+    let (version_output, flag_outputs) = outputs.split_first().expect("three version surfaces");
     assert!(
-        output.trim().starts_with("rocm "),
-        "expected version string starting with 'rocm ': {output}"
+        flag_outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "-V/--version returned different output: {flag_outputs:?}"
+    );
+
+    // `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    // so only its first line -- the same traceable build string -- has to
+    // match `-V`/`--version`.
+    let version_first_line = version_output.lines().next().unwrap_or_default();
+    assert_eq!(
+        version_first_line,
+        flag_outputs[0].trim(),
+        "`rocm version`'s build line does not match `-V`/`--version`: {outputs:?}"
+    );
+
+    let output = version_first_line.trim();
+    let parsed = output
+        .strip_prefix("rocm-cli ")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split_once(" ("))
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, hash)| (version, reference, hash))
+        });
+    let Some((version, reference, hash)) = parsed else {
+        panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {output}");
+    };
+    assert!(!version.is_empty(), "version is empty: {output}");
+    assert!(!reference.is_empty(), "version ref is empty: {output}");
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {output}"
+    );
+    assert!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "version hash is not hexadecimal: {output}"
     );
 }
 
