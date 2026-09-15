@@ -671,6 +671,18 @@ impl TuiSession {
             .hide_cursor()
     }
 
+    /// Whether the emulated terminal is currently in the alternate screen — the
+    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
+    /// refusal that never takes over the terminal this must stay `false`.
+    #[must_use]
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
     /// Poll until the child exits, returning its raw exit code regardless of
     /// whether it is zero — journeys whose success case is a specific *nonzero*
     /// code (a declined confirmation, a signal exit) need the code rather than
