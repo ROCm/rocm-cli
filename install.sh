@@ -38,7 +38,12 @@ truthy() {
 }
 
 use_color=0
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+# Both stdout and stderr must be TTYs: color() only ever colors stdout
+# (step/ok) or stderr (fail), and gating on stdout alone would leak raw ANSI
+# escapes into a redirected stderr (e.g. `sh install.sh 2>error.log`, stdout
+# still attached to a terminal) — dropping color entirely is simpler and
+# safer than tracking which fd each helper writes to.
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
   use_color=1
 fi
 if [ "${use_color}" -eq 1 ]; then
