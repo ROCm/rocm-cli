@@ -160,6 +160,13 @@ Feature: Model serving
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
+  #
+  # This is the live coverage for an index the host does not have. The *masked*
+  # sub-case — an index that exists but is hidden by an active visibility mask —
+  # is a different refusal and owns its own scenarios, serve-19 and serve-20.
+  # The step here accepts several refusal wordings only because which authority
+  # answers depends on the lane: the visible set when it could be enumerated,
+  # the raw amd-smi count when it could not.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
@@ -255,3 +262,23 @@ Feature: Model serving
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
+
+  # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
+  # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
+  # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
+  # `diagnose`/`fix` catalog. The GPU lane's real cards are comfortably free, so the
+  # near-full reading is injected via `ROCM_E2E_FORCE_LOW_VRAM` in debug/test builds:
+  # a single synthetic device on this non-APU host keeps the warning honest, while
+  # the engine still launches against the real, free device. Runs on the vLLM GPU
+  # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
+  # legitimately withhold the warning. `--managed` serves under the GPU-required
+  # device policy, which refuses before it ever builds a plan unless a ROCm
+  # runtime is active — hence the same `a managed runtime is active` precondition
+  # every other real-serve scenario on this lane opens with.
+  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  Scenario: serve-22 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+    Given a managed runtime is active
+    And the selected GPU is reported nearly out of VRAM
+    When the user previews a vLLM serve plan pinned to that GPU
+    Then the serve plan warns the GPU is low on VRAM
+    And the serve plan explains how to lower vLLM's memory reservation
