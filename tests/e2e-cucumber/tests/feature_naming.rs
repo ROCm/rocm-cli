@@ -114,12 +114,22 @@ fn the_feature_scan_takes_the_flat_files_it_finds() {
 
 #[test]
 #[should_panic(expected = "found no .feature files")]
-fn the_feature_scan_refuses_an_empty_directory_rather_than_passing_vacuously() {
-    // Without this, every check in this file is a loop over nothing: a
-    // `features/` that stopped yielding files would pass the whole guard rather
-    // than fail it. Unreachable against the real directory, so pinned here —
-    // and pinned identically in `src/expectation.rs`, whose scan makes the same
-    // assertion for the same reason.
+fn the_feature_scan_refuses_a_directory_with_no_feature_files() {
+    // The assertion this pins turns a `features/` that stopped yielding files
+    // into ONE clear failure naming the directory. It is not what stops the
+    // other checks passing vacuously — they already fail on their own, just
+    // confusingly: `feature_files_and_declared_keys_agree` reports the first
+    // FEATURE_KEYS entry as one that "does not exist", and the other three
+    // panic inside `scenarios_of` with a read error. Verified by pointing
+    // `features_dir()` at an empty directory with the assertion deleted: four
+    // of the five checks fail, none of them saying the directory is empty.
+    //
+    // Unreachable against the real directory, so pinned here — and pinned the
+    // same way in `src/expectation.rs`, whose scan carries the same assertion.
+    //
+    // The fixture writes a non-`.feature` file on purpose: what the scan
+    // refuses is an empty RESULT, not an empty directory, and this covers the
+    // stronger case.
     let dir = tempfile::tempdir().expect("no temp dir");
     std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
     let _ = feature_files_in(dir.path());

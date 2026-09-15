@@ -1438,11 +1438,20 @@ flaky = true
 
     #[test]
     #[should_panic(expected = "found no .feature files")]
-    fn the_feature_scan_refuses_an_empty_directory_rather_than_passing_vacuously() {
-        // Without this, the callers that walk the scan's result would walk
-        // nothing and agree with everything. Unreachable against the real
-        // `features/`, so pinned here — and pinned the same way in
-        // `tests/feature_naming.rs`, whose scan carries the same assertion.
+    fn the_feature_scan_refuses_a_directory_with_no_feature_files() {
+        // The assertion this pins reports an emptied `features/` once, at the
+        // scan, naming the directory. It is not what stops the two callers
+        // agreeing with everything — both already guard themselves ("read no
+        // `@id:` tags at all, so this check would pass vacuously" and its
+        // counterpart over claimed ids), so they fail either way; this just
+        // fails first and says what actually went wrong.
+        //
+        // Unreachable against the real `features/`, so pinned here — and
+        // pinned the same way in `tests/feature_naming.rs`, whose scan carries
+        // the same assertion.
+        //
+        // The fixture writes a non-`.feature` file on purpose: what the scan
+        // refuses is an empty RESULT, not an empty directory.
         let dir = tempfile::tempdir().expect("no temp dir");
         std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
         let _ = feature_files_in(dir.path());
