@@ -76,9 +76,16 @@ const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
 const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
 /// For entries whose fault is not tied to bare-metal kernel plumbing.
 ///
-/// `fix-16-vllm-oom` is the case: its remediation is vLLM CLI flags, and its
-/// checker already opts into `wsl` for that reason, so a Linux-only recipe made
-/// `rocm diagnose` name a command `rocm fix` then refused to run.
+/// The amdgpu module, `/dev/kfd` and the render group are what WSL2 does not
+/// have, so a recipe that touches any of them is `LINUX_ONLY`. A recipe whose
+/// fault lives above that layer reproduces on WSL2 exactly as it does on Linux,
+/// and its platform set has to say so — otherwise `rocm fix` refuses to run a
+/// fix `rocm diagnose` has just named. The rule is the checker's own platform
+/// set: a recipe must be runnable everywhere its checker answers
+/// (`every_checker_platform_is_covered_by_its_recipe`).
+///
+/// `fix-16-vllm-oom` (remediated with vLLM CLI flags) and `fix-19-shm-too-small`
+/// (a container's `/dev/shm` size) are both that shape.
 const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];

@@ -1573,13 +1573,16 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
     );
     let fix = Fix {
         summary,
+        // Byte-identical to the `fix-16-vllm-oom` catalog recipe's block, and
+        // pinned there by `the_oom_plan_matches_the_catalog_copy`. The two are
+        // one plan in two modules and a user may meet either copy.
         commands: vec![
-            "# If the GPU is shared/busy (tenancy collision), lower vLLM's reservation:".to_owned(),
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,".to_owned(),
+            "# or steer vLLM onto a less-busy device:".to_owned(),
             "rocm serve <model> --gpu-memory-utilization 0.5".to_owned(),
-            "# ...or steer the server onto a less-busy device:".to_owned(),
             "rocm serve <model> --gpu <index>".to_owned(),
-            "# If the model genuinely does not fit, the reservation is not the problem:".to_owned(),
-            "#   pick a smaller or quantized model (single-GPU serving only).".to_owned(),
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the".to_owned(),
+            "# problem; pick a smaller or quantized model (single-GPU serving only).".to_owned(),
         ],
         fix_id: "fix-16-vllm-oom".to_owned(),
         auto_applicable: false,
@@ -2913,6 +2916,28 @@ mod tests {
         crate::fix::assert_engine_shell_boundary_is_labelled(&fix.fix_id, &commands);
         // The boundary check alone leaves the wording free to drift, so pin the
         // two copies to each other line for line as well.
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_oom_plan_matches_the_catalog_copy() {
+        // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
+        // already opened: the executable lines agreed, so the cross-check that
+        // runs over every matched finding
+        // (`the_reported_fix_agrees_with_the_catalog_recipe`) saw nothing --
+        // it filters `#` lines by construction -- while the comments explaining
+        // *which of the two faults each step addresses* had drifted apart. That
+        // prose is the whole point of this entry: the two faults need opposite
+        // responses, so a user meeting the `diagnose` copy and a user meeting
+        // the `rocm fix` copy must be told the same thing.
+        let report = diagnose(&linux_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
         crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
 
