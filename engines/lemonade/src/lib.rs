@@ -1335,8 +1335,21 @@ fn align_llamacpp_backend_to_version(
              ({pinned_version}): {error:#}"
         );
     }
-    if latest_tag_applied && let Some(tag) = pinned_tag.as_deref() {
-        let _ = write_backend_versions_llamacpp_tag(backend_versions_path, tag);
+    if latest_tag_applied {
+        // Best-effort, matching the therock.version restore above: a failure here
+        // must not skip the fallback reinstall below. Restore the original tag when
+        // there was one; otherwise Tier 2 pinned a key that did not exist before, so
+        // removing it (not writing some placeholder) is what "reverted" means.
+        let restore_result = match pinned_tag.as_deref() {
+            Some(tag) => write_backend_versions_llamacpp_tag(backend_versions_path, tag),
+            None => remove_backend_versions_llamacpp_tag(backend_versions_path),
+        };
+        if let Err(error) = restore_result {
+            eprintln!(
+                "Warning: could not restore Lemonade's default pinned llama.cpp build tag: \
+                 {error:#}"
+            );
+        }
     }
     fallback_install(manifest, true)?;
     Ok(None)
@@ -1458,6 +1471,23 @@ fn write_backend_versions_llamacpp_tag(path: &Path, tag: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Remove `resources/backend_versions.json`'s `llamacpp.rocm-stable` key entirely,
+/// restoring the "never pinned" state — the counterpart to
+/// [`write_backend_versions_llamacpp_tag`] for reverting Tier 2's pin when there was
+/// no prior tag to restore it to.
+fn remove_backend_versions_llamacpp_tag(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    value
+        .get_mut("llamacpp")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("{} has no 'llamacpp' object to patch", path.display()))?
+        .remove("rocm-stable");
+    fs::write(path, serde_json::to_vec_pretty(&value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// The active rocm-cli-managed ROCm SDK version to align Lemonade's backend to,
 /// restricted to plain `X.Y.Z` release versions. Nightly builds carry a date suffix
 /// (e.g. `7.14.0a20260601`) that does not correspond to any llama.cpp build tag
@@ -1518,6 +1548,12 @@ fn write_backend_versions_therock_version(path: &Path, version: &str) -> Result<
 /// inference at runtime instead of failing loudly — unacceptable under the
 /// GPU-required policy (AGENTS.md §6), so this must be verified, not assumed from
 /// version numbers matching.
+///
+/// Linux-only, like the `ldd`-based verification it exists for: the non-Linux
+/// `rocm_backend_resolves` stub below never references it, so leaving it
+/// ungated makes it dead code — and a build failure under `-D warnings` — on
+/// every other target.
+#[cfg(target_os = "linux")]
 const ROCM_BACKEND_REQUIRED_SONAMES: [&str; 4] = [
     "libhipblas.so",
     "librocblas.so",
@@ -1562,7 +1598,7 @@ fn rocm_backend_resolves(
 /// Off Linux, `ldd`-based verification is not exercised: a version-aligned backend is
 /// never accepted without it, so this always reports unresolved.
 #[cfg(not(target_os = "linux"))]
-fn rocm_backend_resolves(
+const fn rocm_backend_resolves(
     _llama_server_binary: &Path,
     _process_env: &LemonadeProcessEnvironment,
 ) -> bool {
@@ -1570,7 +1606,8 @@ fn rocm_backend_resolves(
 }
 
 /// Whether every `required` soname prefix appears in `ldd` output with a resolved
-/// path (i.e. not `=> not found`).
+/// path (i.e. not `=> not found`). Linux-only: see [`ROCM_BACKEND_REQUIRED_SONAMES`].
+#[cfg(target_os = "linux")]
 fn ldd_output_resolves_all(output: &str, required: &[&str]) -> bool {
     required.iter().all(|soname| {
         output.lines().any(|line| {
@@ -5200,6 +5237,84 @@ mod tests {
     }
 
     #[test]
+    fn align_reverts_the_llamacpp_tag_when_tier2_pinned_a_newer_one_and_still_fails() {
+        // Regression test: the tag restore used to be silently skipped whenever
+        // deleted, and nothing caught it -- both tiers must fail here so the
+        // revert path actually runs, and the tag must come back to its original
+        // value rather than staying on Tier 2's newer pin.
+        let dir = scratch_dir("align-revert-restores-tag");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| false,
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall);
+                Ok(())
+            },
+            || Ok("b10952".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("7.13.0".to_owned())
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b9752".to_owned()),
+            "the llama.cpp tag must be restored to its original value, not left on Tier 2's pin"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_removes_the_llamacpp_tag_on_revert_when_none_was_pinned_before() {
+        // The resource file may have no `llamacpp.rocm-stable` key at all (an
+        // embeddable that never shipped a pin). Tier 2 still writes one; reverting
+        // must remove it again rather than leaving it in place with no original
+        // value to restore it to.
+        let dir = scratch_dir("align-revert-removes-tag");
+        let path = dir.join("backend_versions.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "llamacpp": {},
+                "therock": { "version": "7.13.0" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            |_manifest, _target, _force_reinstall, _label| false,
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall);
+                Ok(())
+            },
+            || Ok("b10952".to_owned()),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            None,
+            "no tag was pinned before Tier 2; reverting must remove it, not invent a value"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn align_skips_tier2_reinstall_when_pinned_tag_is_already_latest() {
         let dir = scratch_dir("align-tier2-tag-unchanged");
         let path = dir.join("backend_versions.json");
@@ -5281,6 +5396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn ldd_output_resolves_all_requires_every_soname_resolved() {
         let resolved = "\
 \tlibggml-base.so.0 => /opt/rocm/lib/libggml-base.so.0 (0x00007f0)\n\
