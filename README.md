@@ -290,7 +290,7 @@ empty — it tells you what it could not find instead.
 
 ### Runtime management
 
-Manage multiple side-by-side ROCm installs:
+Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
@@ -308,7 +308,7 @@ runtime. It does not work with standard ROCm package installs (for example,
 
 ### Disk space
 
-Each ROCm install keeps its own multi-gigabyte folder, so installing or
+Each ROCm runtime keeps its own multi-gigabyte folder, so installing or
 updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
