@@ -208,6 +208,8 @@ mod tests {
         // has not been built it silently falls back to the harness itself, which
         // would re-enter libtest instead of running a command — so refuse to
         // proceed rather than measure the wrong process.
+        // The binary is only there because `apps/rocm/tests/` exists and makes
+        // cargo build it; delete those and this guard fires for that reason.
         let binary = rocm_core::daemon_binary_path().expect("resolve the rocm binary");
         assert_eq!(
             binary.file_stem().and_then(std::ffi::OsStr::to_str),

@@ -2415,6 +2415,15 @@ mod tests {
                 && message.contains("nightly-wheel-gfx94x-dcgpu-7-14-0"),
             "error should list the available runtime keys, got: {message}"
         );
+        // This set is ready-filtered, so `format_available_runtime_keys`' bare
+        // `key, key` is the deliberate rendering (see its doc comment): a
+        // per-key status here would annotate every entry `(ready)` and say
+        // nothing. Without this, swapping in `format_runtime_statuses` would
+        // still pass the key assertions above.
+        assert!(
+            !message.contains("(ready)"),
+            "a ready-filtered list must stay bare keys, not per-key statuses, got: {message}"
+        );
         Ok(())
     }
 
@@ -2444,8 +2453,12 @@ mod tests {
             "error should point to `rocm runtimes list`, got: {message}"
         );
         // The setup pointer names the `Set Up ROCm` screen once, as a label. It
-        // must not also use "set up" as the sentence verb: "Set up ROCm first
-        // from Set Up ROCm" made the label read like a repetition of the verb.
+        // must not also use "set up" as the sentence verb. The quoted string
+        // below is not a hypothetical: it is the superseded pre-reword wording
+        // this branch actually emitted before `31957ed`, where the label read
+        // like a repetition of the verb. So the negative assertion is not
+        // vacuous — it is the only thing that catches a revert of that reword,
+        // because the positive assertion above it passes under both wordings.
         assert!(
             message.contains("from Set Up ROCm"),
             "error should still point at the `Set Up ROCm` screen, got: {message}"

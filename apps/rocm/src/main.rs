@@ -11949,7 +11949,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
             args,
-            pending_title: "Change ROCm install".to_owned(),
+            pending_title: "Change ROCm runtime".to_owned(),
             command_title: "Runtimes".to_owned(),
         }),
         Some("engines") if second.as_deref() == Some("install") => {
@@ -19925,6 +19925,24 @@ mod tests {
         assert!(
             !help.contains("ROCm install"),
             "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+
+        // The help is not the only `runtimes` string a user reads: running a
+        // mutating `rocm runtimes …` from chat raises an approval modal whose
+        // title is written here, not by clap, so the help assertions above
+        // cannot reach it. It said "Change ROCm install" until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
         );
     }
 
