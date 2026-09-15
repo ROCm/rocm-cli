@@ -2501,7 +2501,13 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
     let read_only = match first.as_deref() {
         Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => true,
         Some("update") => !args.iter().any(|arg| arg == "--apply"),
-        Some("runtimes") => second.as_deref().is_none_or(|value| value == "list"),
+        Some("runtimes") => {
+            second.as_deref().is_none_or(|value| value == "list")
+                || (second
+                    .as_deref()
+                    .is_some_and(|value| value == "uninstall" || value == "remove")
+                    && args.iter().any(|arg| arg == "--dry-run"))
+        }
         Some("engines") => second.as_deref().is_some_and(|value| value == "list"),
         Some("services") => second
             .as_deref()
@@ -5739,6 +5745,34 @@ mod tests {
         let error = ensure_rocm_command_is_read_only(&reset_args)
             .expect_err("setup reset must go through approval");
         assert!(error.to_string().contains("approval UI"));
+        Ok(())
+    }
+
+    #[test]
+    fn rocm_command_helper_treats_runtimes_uninstall_dry_run_as_read_only() -> Result<()> {
+        // Mirrors the bin's chat_rocm_command_action_from_args classifier so a
+        // dry-run preview stays read-only on every binary's tool surface while
+        // an actual uninstall/remove still requires approval.
+        for verb in ["uninstall", "remove"] {
+            let dry_run_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb, "--dry-run"] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            ensure_rocm_command_is_read_only(&dry_run_args)
+                .unwrap_or_else(|_| panic!("runtimes {verb} --dry-run should be read-only"));
+
+            let mutating_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            let error = match ensure_rocm_command_is_read_only(&mutating_args) {
+                Ok(()) => panic!("runtimes {verb} without --dry-run must go through approval"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("approval UI"));
+        }
         Ok(())
     }
 
