@@ -16,7 +16,7 @@ tooling.
 - It's a general system inspector, so it **always exits 0**. The verdict is the
   `status` field: `ok` · `no-amd-gpu` · `wsl` · `unsupported-os` · `degraded`.
 
-### `rocm diagnose [--symptom "<text>"] [--top N] [--json]`
+### `rocm diagnose [--symptom "<text>"] [--top N] [--json] [--distro [NAME]] [--model REF]`
 
 Match the host + symptom against the closed catalog. **Always exits 0**; read
 the result from `--json`:
@@ -35,6 +35,15 @@ the result from `--json`:
   covered, so this now fires only for a platform outside those three. It means
   nothing was checked — not a clean bill of health.
 - `route_when_no_match` — `{ target, url }` upstream tracker to use when `has_match` is false.
+- `model` — set only when `--model <ref>` was passed; otherwise not set. Answers
+  "will this curated model run here" from the recipe catalog and this host's
+  GPU/RAM, without downloading anything: `{ verdict, evidence[], engine,
+  required_gpu_memory_gib, available_gpu_memory_gib, alternatives[],
+  undetermined_reason, fix }`. `verdict` is one of `ready`, `degraded`,
+  `blocked`, `undetermined` — treat `undetermined` as "the CLI could not find
+  out", never as evidence the model is incompatible. `--model` is refused
+  together with `--distro`: the verdict is about the machine running the
+  command, not the one `--distro` names.
 
 ### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N]`
 
