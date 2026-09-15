@@ -55,17 +55,18 @@ pub use proc_lifecycle::{
 };
 use runtime::env_path_override;
 pub use runtime::{
-    RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
-    default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
-    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
-    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
-    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
-    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,
+    default_cache_dir, default_config_dir, default_data_dir, default_interactive_shell_program,
+    managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir, managed_runtime_data_root,
+    managed_tools_dir, managed_uv_cache_dir, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
+    platform_binary_name, prepend_runtime_path, resolve_path_through_symlinks,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
@@ -3774,6 +3775,58 @@ pub fn active_managed_therock_channel(
     Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.channel))
 }
 
+/// The interpreter a framework probe should run, plus the loader path its torch
+/// needs.
+///
+/// The library paths are not decoration. A TheRock runtime's torch resolves HIP
+/// from a sibling `_rocm_sdk_core` package rather than from its own `torch/lib`,
+/// so running the interpreter without them fails the import outright with
+/// `libroctx64.so.4: cannot open shared object file`. That reads as a broken
+/// runtime rather than as an unconfigured probe, which is a worse answer than
+/// the silence it would replace.
+#[derive(Debug, Clone)]
+pub struct FrameworkInterpreter {
+    pub python: PathBuf,
+    pub library_paths: Vec<PathBuf>,
+}
+
+/// The active managed runtime's Python interpreter, when there is one.
+///
+/// `None` on an unmanaged host, and also when the runtime records an interpreter
+/// that is no longer on disk — a caller that cannot spawn the interpreter is
+/// better served by the ambient one than by a path that fails to execute.
+pub fn active_managed_framework_interpreter(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Option<FrameworkInterpreter> {
+    let record = select_active_managed_therock_record(paths, config)?;
+    let python = managed_therock_python_executable(&record)?;
+    Some(FrameworkInterpreter {
+        python,
+        library_paths: managed_therock_environment_from_record(&record).library_entries,
+    })
+}
+
+/// Prefer the interpreter the installer recorded over the conventional location
+/// inside the install root: an imported or read-only runtime can record an
+/// interpreter that does not sit under `install_root` at all.
+fn managed_therock_python_executable(record: &TheRockFamilyManifest) -> Option<PathBuf> {
+    record
+        .python_executable
+        .as_deref()
+        // Registry paths are used verbatim as stored, so this one still needs
+        // host-normalizing; the derived form below is normalized already.
+        .map(normalize_runtime_path_for_host)
+        .into_iter()
+        .chain(
+            record
+                .install_root
+                .as_deref()
+                .map(runtime_python_executable_in_env),
+        )
+        .find(|candidate| candidate.is_file())
+}
+
 /// Pick the active managed TheRock runtime record: the one matching
 /// `config.active_runtime_key`, falling back to the most recently installed.
 fn select_active_managed_therock_record(
@@ -4039,6 +4092,10 @@ struct TheRockFamilyManifest {
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
     install_root: Option<PathBuf>,
+    /// Recorded by the installer. Absent on records written before it was, and
+    /// on runtimes whose interpreter was never resolved.
+    #[serde(default)]
+    python_executable: Option<PathBuf>,
     #[serde(default)]
     installed_at_unix_ms: Option<u128>,
 }
