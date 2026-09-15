@@ -296,10 +296,12 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     },
     /// Check for a newer ROCm package and optionally install it.
     ///
-    /// Without --apply, only reports whether an update is available. Pass --apply to
-    /// install it, and add --activate to make the new install the default afterward.
+    /// Without --apply or --dry-run, only reports whether an update is available.
+    /// Pass --dry-run to preview what --apply would do, --apply to install it, and
+    /// add --activate to make the new install the default afterward.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
+rocm update --dry-run\n  \
 rocm update --apply --activate\n  \
 rocm update --apply --dry-run\n  \
 rocm update --json")]
@@ -308,10 +310,10 @@ rocm update --json")]
         #[arg(long)]
         apply: bool,
         /// Runtime key to update.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         runtime: Option<String>,
         /// Use the updated ROCm install as the default after installing it.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         activate: bool,
         /// Show what would happen without changing files.
         #[arg(long)]
@@ -320,7 +322,7 @@ rocm update --json")]
         #[arg(long)]
         yes: bool,
         /// Print the check result as a single line of JSON instead of text.
-        #[arg(long, conflicts_with = "apply")]
+        #[arg(long, conflicts_with_all = ["apply", "dry_run"])]
         json: bool,
         /// Bound the version-check network calls to this many seconds each.
         #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
@@ -1960,7 +1962,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
-            if apply {
+            if !apply && !dry_run && (runtime.is_some() || activate) {
+                bail!(
+                    "--runtime and --activate require --apply or --dry-run; \
+                     run `rocm update --dry-run` to preview or add --apply to update"
+                );
+            }
+            if update_should_preview_or_apply(apply, dry_run) {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
                     &paths,
@@ -16359,6 +16367,16 @@ fn append_update_surfaces(output: &mut String) {
     );
 }
 
+/// Whether `rocm update` should route into the runtime update path
+/// (`apply_runtime_update`) instead of the read-only status report.
+///
+/// `--dry-run` alone must take this path too, since `apply_runtime_update`
+/// only mutates anything when `dry_run` is false — a plain status report
+/// would silently ignore `--dry-run` and never show what `--apply` would do.
+const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
+    apply || dry_run
+}
+
 fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -25248,6 +25266,32 @@ install therock";
             .expect("update --dry-run should preview without --apply");
         Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
             .expect("update --apply --dry-run should still parse");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
+            .expect("update --dry-run --runtime should preview without --apply");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
+            .expect("update --dry-run --activate should preview without --apply");
+    }
+
+    #[test]
+    fn update_dry_run_conflicts_with_json() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--json"]).expect_err(
+            "update --dry-run --json should be rejected instead of silently dropping --json",
+        );
+    }
+
+    #[test]
+    fn update_dry_run_routes_into_the_preview_path_without_apply() {
+        assert!(
+            !update_should_preview_or_apply(false, false),
+            "plain `rocm update` should stay on the read-only status report"
+        );
+        assert!(
+            update_should_preview_or_apply(false, true),
+            "`rocm update --dry-run` must route into apply_runtime_update, or --dry-run \
+             is silently ignored"
+        );
+        assert!(update_should_preview_or_apply(true, false));
+        assert!(update_should_preview_or_apply(true, true));
     }
 
     #[test]

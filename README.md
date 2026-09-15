@@ -261,11 +261,13 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
 native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it. `--json` prints the check result as a single line of JSON instead
-of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
-`--json`; both conflict with `--apply`). `update --apply` never prompts;
-`--yes` is accepted for consistency with other mutating commands but has no
-effect on it.
+install it, or `--dry-run` to preview what `--apply` would do without changing
+anything (`--dry-run` does not require `--apply`). `--json` prints the check
+result as a single line of JSON instead of text; `--timeout-secs` bounds its
+network calls (`--timeout-secs` requires `--json`; both `--json` and
+`--timeout-secs` conflict with `--apply`, and `--json` also conflicts with
+`--dry-run`). `update --apply` never prompts; `--yes` is accepted for
+consistency with other mutating commands but has no effect on it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
