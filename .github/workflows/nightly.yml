@@ -352,18 +352,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Reclaim the GPU before running: kill only e2e leftovers scoped to
-      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
-      # any /workload manual-testing processes (see e2e-selfhosted.yml e2e-gpu for the same).
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees, so a manual /workload serve on a shared self-hosted runner is
+      # never touched. See scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
-        run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+        run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
       # GPU is missing, the driver is wedged, or VRAM is still saturated by a
@@ -403,6 +398,10 @@ jobs:
             sleep 5
           done
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          bash scripts/reclaim-gpu.sh --report-holders || true
           exit 1
 
       # cache: false — this self-hosted runner persists the build cache itself via
@@ -476,15 +475,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees, so a manual /workload serve on a shared self-hosted runner is
+      # never touched. See scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
-        run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+        run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU. Floor is half of the R9700S's 32GB — high
       # enough to catch a leftover serve, low enough that a clean pod passes on
@@ -514,6 +511,10 @@ jobs:
             sleep 5
           done
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          bash scripts/reclaim-gpu.sh --report-holders || true
           exit 1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -567,15 +568,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees, so a manual /workload serve on a shared self-hosted runner is
+      # never touched. See scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
-        run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+        run: bash scripts/reclaim-gpu.sh
 
       # Bounded wait for a free GPU. Floor matches the per-PR MI350P lane and the
       # other Instinct lane — high enough to catch a leftover serve, low enough
@@ -605,6 +604,10 @@ jobs:
             sleep 5
           done
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          bash scripts/reclaim-gpu.sh --report-holders || true
           exit 1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
@@ -673,12 +676,8 @@ jobs:
       - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
         run: |
           mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "prepared + reclaimed"
+          echo "prepared"
+          bash scripts/reclaim-gpu.sh
 
       - name: GPU preflight (bounded wait for an available GPU)
         run: |
@@ -705,6 +704,10 @@ jobs:
             sleep 5
           done
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          bash scripts/reclaim-gpu.sh --report-holders || true
           exit 1
 
       - name: Ensure Rust toolchain
@@ -761,10 +764,18 @@ jobs:
       - name: Reclaim GPU from stray E2E processes
         shell: powershell
         run: |
-          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-          Write-Host "reclaimed"
+          # Same rule as scripts/reclaim-gpu.sh, which is the source of truth for
+          # these markers: an E2E-owned root AND an engine process. Native Windows
+          # has no bash, so the rule is mirrored here rather than shared. Keep the
+          # root list in step with the script — `e2e-prewarm` is the shared runtime
+          # tree the engine binaries actually run from.
+          $leaked = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'rocm-e2e|e2e-prewarm|e2e-shared|e2e-target|__engine-serve-http' -and $_.CommandLine -match 'llama-server|vllm|rocm ' }
+          foreach ($p in $leaked) {
+            Write-Host "reclaim: terminating pid=$($p.ProcessId) cmd=$($p.CommandLine)"
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "reclaim: $(@($leaked).Count) process(es) terminated"
 
       # Best-effort when rocm-smi is absent; when present, fail within the bounded
       # ceiling instead of letting a held or wedged GPU consume the full job cap.
@@ -910,14 +921,13 @@ jobs:
             exit 1
           fi
 
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees, so a manual /workload serve on a shared self-hosted runner is
+      # never touched. See scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
-        run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+        run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
@@ -957,6 +967,10 @@ jobs:
             exit 0
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          bash scripts/reclaim-gpu.sh --report-holders || true
           exit 1
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
