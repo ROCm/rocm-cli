@@ -439,6 +439,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_front_door_comes_back_after_a_session_ends_cleanly() {
+        // The launcher-hub regression, at the seam the e2e scenario
+        // `dash-launcher-sigterm-restores-terminal-across-a-session` exercises
+        // end to end: open a session, quit back to the menu, and the front door
+        // must be there. `app::run`'s clean-quit teardown used to CLAIM the
+        // process-exit latch, which nothing ever releases — so the gate above
+        // suppressed every frame for the rest of the process and the user got a
+        // blank terminal instead of the menu.
+        //
+        // This is the cheap version of a 30-second PTY scenario: run the real
+        // teardown, then ask the real gate for a frame.
+        use std::sync::atomic::AtomicBool;
+
+        let latch = AtomicBool::new(false);
+        let restored = std::cell::Cell::new(false);
+        crate::app::restore_after_session(&latch, || restored.set(true));
+        assert!(restored.get(), "the session must restore the terminal");
+
+        let state = base();
+        let theme = state.theme;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &latch)
+            .expect("drawing to a TestBackend cannot fail");
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("Set up this system"),
+            "the launcher front door must repaint once a session returns:\n{painted}"
+        );
+    }
+
     fn base() -> AppState {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.latest = Some(Snapshot {

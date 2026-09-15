@@ -25,6 +25,7 @@ use crate::ui::theme::{self, Theme};
 pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect) -> Rect {
     let h_pct = (area.height * pct_y / 100).min(max_h).max(5);
     let v_pad = (area.height.saturating_sub(h_pct)) / 2;
+    let w_pct = centered_width(pct_x, max_w, area);
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,7 +35,6 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
         ])
         .split(area);
 
-    let w_pct = (area.width * pct_x / 100).min(max_w).max(20);
     let h_pad = (area.width.saturating_sub(w_pct)) / 2;
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
@@ -46,6 +46,13 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
         .split(vert[1]);
 
     horiz[1]
+}
+
+/// Width [`centered_rect`] will give a popup, split out so a caller that needs
+/// to lay its content out *before* the popup exists (to size the popup to that
+/// content) cannot drift from the real geometry.
+pub fn centered_width(pct_x: u16, max_w: u16, area: Rect) -> u16 {
+    (area.width * pct_x / 100).min(max_w).max(20)
 }
 
 /// Render a bordered block with `title` over `area` after clearing it,
@@ -80,10 +87,16 @@ pub fn draw_scrollable_lines(
 }
 
 /// Render the Help modal for the active tab.
+///
+/// The popup is sized to the height its *wrapped* content actually needs,
+/// clamped to `area`, rather than to a fixed share of the screen. A fixed share
+/// silently truncated: at the 80x24 the e2e lane pins, the body is 20 rows, 70%
+/// of that is 14, and two of the key hints wrap to a second line — so the modal
+/// ended mid-list at `{ / }` and the per-tab guidance below it was never drawn,
+/// with no scrollbar or indicator to say so. Content-sizing keeps every hint on
+/// screen wherever the room exists, and adding a hint can no longer push an
+/// unrelated one off the bottom.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
-    let popup = centered_rect(70, 70, 80, 22, area);
-    let inner = draw_popup_frame(f, popup, "Help", theme);
-
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
         // Ctrl-C is a first-class quit gesture in both key loops (it restores the
@@ -146,6 +159,19 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     }
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+
+    // Width first — it does not depend on the height — then ask the paragraph
+    // how many rows it wraps to at that width. `line_count` is the renderer's
+    // own wrap, not an estimate of it, so this cannot drift from what lands on
+    // screen. `pct_y = 100` with `max_h = needed` means "exactly the content,
+    // or the whole area when the content is taller than it".
+    let width = centered_width(70, 80, area);
+    let needed = u16::try_from(p.line_count(width.saturating_sub(2)))
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let popup = centered_rect(70, 100, 80, needed, area);
+    let inner = draw_popup_frame(f, popup, "Help", theme);
+
     f.render_widget(p, inner);
 }
 
@@ -877,5 +903,69 @@ mod ported_chrome_tests {
         assert!(out.contains("Theme"), "label missing: {out:?}");
         assert!(out.contains("tokyo"), "value missing: {out:?}");
         assert!(out.contains('▸'), "focus/control marker missing: {out:?}");
+    }
+
+    /// The help modal must show ALL of its content at the smallest geometry the
+    /// product supports, not as much of it as a fixed share of the screen
+    /// happens to fit.
+    ///
+    /// Regression: adding the Ctrl-C hint pushed the per-tab guidance off the
+    /// bottom at 80x24 and nothing said so — the modal just ended mid-list at
+    /// `{ / }`. That reached CI as an e2e failure on an assertion about
+    /// unrelated text ("Home tab"), because no unit test asserted the modal's
+    /// last row was reachable.
+    ///
+    /// 80x20 is the *body* rect `ui::draw` hands `draw_help` on the 80x24 the
+    /// e2e lane pins (3-row header, 1-row footer), so this is the real
+    /// worst-case geometry rather than an invented one.
+    #[test]
+    fn help_modal_shows_every_hint_at_the_minimum_supported_geometry() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_help(f, area, ActiveTab::Home, &theme))
+            .unwrap();
+        let out = flat(&term);
+
+        // First hint, the hint that wraps, the last global hint, and the per-tab
+        // section that used to fall off the bottom. The last two are the ones
+        // that regress when the modal is sized to anything but its content.
+        for needle in [
+            "quit",
+            "Ctrl-C",
+            "toggle this help",
+            "next / previous tab",
+            "jump ±60s",
+            "Home tab",
+            "no tab-specific keys",
+        ] {
+            assert!(
+                out.contains(needle),
+                "help modal truncated before {needle:?} at 80x20:\n{out}"
+            );
+        }
+    }
+
+    /// A modal taller than the space available must be clamped to the area, not
+    /// allowed to run off it. Content-sizing the popup is only safe if this
+    /// holds.
+    #[test]
+    fn help_modal_is_clamped_when_the_content_cannot_fit() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 10);
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        // The assertion is that this does not panic on an out-of-bounds rect and
+        // still paints the top of the list.
+        term.draw(|f| super::draw_help(f, area, ActiveTab::Chat, &theme))
+            .unwrap();
+        let out = flat(&term);
+        assert!(
+            out.contains("Ctrl-C"),
+            "clamped modal painted nothing:\n{out}"
+        );
     }
 }

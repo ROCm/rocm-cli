@@ -1795,29 +1795,54 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     // paths.
     signal_task.abort();
 
-    // Best-effort terminal restoration, reusing the exact teardown the signal
-    // path runs so the two cannot drift. Never let teardown failures override
-    // the session result: if the controlling terminal already went away (e.g.
-    // the PTY closed on quit), these writes can fail with a broken pipe — that
-    // must not turn a clean exit into a non-zero one (every step inside is
-    // best-effort).
-    //
-    // Gated on the same latch every other restore path claims, because
-    // `abort()` above is not sufficient on its own: it cannot stop a watcher
-    // that has already resumed past its `.await` and is inside its own
-    // synchronous `restore_terminal(); process::exit(code)`. A SIGTERM landing
-    // in the same instant the user presses `q` would otherwise have two threads
-    // writing `write_restore_sequences` to the same stdout, unsynchronised. If
-    // we lose the claim, the watcher owns the teardown and is microseconds from
-    // ending the process; leaving it to do both is what keeps the restore
-    // single-writer. (We still return `res` in that case rather than parking, so
-    // the reported exit code is whichever of the two lands first — the process
-    // is terminating either way, and parking a `block_on` thread to tighten that
-    // is not worth the hang risk if the winner's write ever blocks.)
-    if claim_shutdown(&SHUTTING_DOWN) {
-        restore_terminal();
-    }
+    restore_after_session(&SHUTTING_DOWN, restore_terminal);
     res
+}
+
+/// Teardown for a dash *session* that has ended — the counterpart to the
+/// watcher's and [`exit_on_ctrl_c`]'s teardown, for the one restore path that
+/// does **not** end the process.
+///
+/// Best-effort, reusing the exact teardown the signal path runs so the two
+/// cannot drift, and never letting teardown failures override the session
+/// result: if the controlling terminal already went away (e.g. the PTY closed on
+/// quit), these writes can fail with a broken pipe — that must not turn a clean
+/// exit into a non-zero one (every step inside `restore` is best-effort).
+///
+/// # Why this reads the latch instead of claiming it
+///
+/// [`SHUTTING_DOWN`] is a one-shot *process-exit* arbiter: whoever claims it
+/// restores the terminal and calls `process::exit`, and nothing ever releases
+/// it because there is no "after" to release into. `run` returning is the one
+/// teardown with an after — bare `rocm` is a persistent hub, so `run` hands
+/// control back to a live launcher menu that must keep painting, keep honouring
+/// Ctrl-C, and keep being killable. Claiming the latch here wedged all three at
+/// once: the render gate refused every subsequent launcher frame (a blank front
+/// door), [`exit_on_ctrl_c`] parked forever, and every later `await_termination`
+/// lost the claim and returned without exiting — a signal-swallowing, blank,
+/// unkillable hub after the user's first flow.
+///
+/// So the latch is *read*: if a watcher (or a typed Ctrl-C) has already claimed
+/// the exit, it owns the teardown and is microseconds from ending the process,
+/// and a second restore here would be pure redundancy. Otherwise this session
+/// restores the terminal and leaves the latch untouched for the windows that
+/// come after it.
+///
+/// Single-writer is preserved by [`RESTORE_LOCK`] inside [`restore_terminal`]
+/// rather than by this read, which is deliberately racy on its own: `abort()`
+/// above cannot stop a watcher already resumed past its `.await` and inside its
+/// own synchronous `restore_terminal(); process::exit(code)`, so a SIGTERM
+/// landing in the same instant the user presses `q` can still put two threads on
+/// this path. They serialise on the lock; they no longer contend for the latch.
+///
+/// `restore` is a parameter so a unit test can assert both halves of the
+/// contract — that the teardown runs, and that it leaves the latch unclaimed —
+/// without writing escape sequences to the stdout every other test shares.
+pub(crate) fn restore_after_session(latch: &AtomicBool, restore: impl FnOnce()) {
+    if shutdown_claimed_on(latch) {
+        return;
+    }
+    restore();
 }
 
 /// Best-effort teardown of the terminal modes `run` set up. Disables raw mode
@@ -1849,12 +1874,40 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 /// still interleave *during* the restore. That one is cosmetic — out-of-order
 /// escapes on a terminal being reset in the same breath, with these restore
 /// bytes written last — and is accepted.
+///
+/// # Ordering against another restore
+///
+/// Separate hazard, separate mechanism. Two teardowns can run at once: a signal
+/// watcher resumed past its `.await` races [`run`]'s clean-quit teardown (which
+/// deliberately does not claim the exit latch — see [`restore_after_session`]),
+/// and two watchers on two runtimes both wake on one process-global signal.
+/// [`RESTORE_LOCK`] makes this function the single writer for the duration of
+/// one teardown, so two threads can never interleave `write_restore_sequences`
+/// on the same stdout. It is held only across a handful of escape bytes, so it
+/// adds no hang profile beyond the internal lock `io::stdout()` already takes on
+/// every write.
 pub(crate) fn restore_terminal() {
+    // Poisoning is irrelevant here: nothing inside can panic (every step is
+    // best-effort), and a teardown skipped because some *other* thread panicked
+    // mid-restore is strictly worse than running it again.
+    let _guard = RESTORE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // `disable_raw_mode` mutates the real terminal (there is no in-memory
     // equivalent), so it stays outside the testable sequence writer below.
     let _ = disable_raw_mode();
     let _ = write_restore_sequences(&mut io::stdout());
 }
+
+/// Serialises [`restore_terminal`] so concurrent teardowns cannot interleave
+/// their escape sequences on one stdout.
+///
+/// Distinct from [`SHUTTING_DOWN`], and deliberately so: the latch answers "is
+/// the process exiting" (one-shot, never released, gates rendering), this
+/// answers "is someone writing the restore right now" (re-armable, held for the
+/// length of one teardown). Conflating them is what made a clean session exit
+/// permanently wedge the launcher hub.
+static RESTORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Write the escape sequences that undo `run`'s terminal setup — leave the
 /// alternate screen, disable mouse capture, show the cursor — to `out`. Split
@@ -1923,6 +1976,15 @@ pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle
 /// hazard is two watchers on two *runtimes*, and a path-independent latch covers
 /// every call site (present and future) without each one having to know whether
 /// an outer watcher already exists.
+///
+/// One-shot by construction: it is claimed only by paths that go on to call
+/// `std::process::exit` (the watcher body and [`exit_on_ctrl_c`]), so there is
+/// no "after" to release it into, and every reader — the two render gates,
+/// [`await_termination`]'s arbitration, [`restore_after_session`] — may treat a
+/// claimed latch as "this process is ending". A teardown that does *not* end the
+/// process must therefore never claim it; see [`restore_after_session`] for the
+/// three separate ways that wedged the launcher hub. Mutual exclusion between
+/// concurrent restores is [`RESTORE_LOCK`]'s job, not this latch's.
 pub(crate) static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Claim the single-shot shutdown path on `latch`. Returns `true` exactly once —
@@ -4174,6 +4236,40 @@ mod tests {
             shutdown_claimed_on(&latch),
             "claiming the shutdown must suspend rendering, or a late frame can \
              repaint over the restored terminal"
+        );
+    }
+
+    #[test]
+    fn a_clean_session_teardown_restores_without_claiming_the_exit_latch() {
+        // `run` returning is the one restore path with an "after": bare `rocm` is
+        // a persistent hub, so control goes back to a live launcher menu. Claiming
+        // the one-shot exit latch here wedged that hub three ways at once — the
+        // render gate refused every later frame (blank front door), a typed Ctrl-C
+        // parked forever in `exit_on_ctrl_c`, and every later signal lost the
+        // claim in `await_termination` and was swallowed. So this path must
+        // restore the terminal and leave the latch exactly as it found it.
+        let latch = AtomicBool::new(false);
+        let restored = std::cell::Cell::new(false);
+        restore_after_session(&latch, || restored.set(true));
+        assert!(
+            restored.get(),
+            "a clean session must restore the terminal it put into raw mode"
+        );
+        assert!(
+            !shutdown_claimed_on(&latch),
+            "a teardown that returns to a live process must not claim the exit \
+             latch — nothing ever releases it, so the hub is wedged from here on"
+        );
+
+        // The one thing it may key on the latch: when a watcher or a typed
+        // Ctrl-C has already claimed the exit, that owner is microseconds from
+        // `process::exit` and owns the teardown; restoring again is redundant.
+        let claimed = AtomicBool::new(true);
+        let restored_again = std::cell::Cell::new(false);
+        restore_after_session(&claimed, || restored_again.set(true));
+        assert!(
+            !restored_again.get(),
+            "an exiting process's teardown belongs to whoever claimed the exit"
         );
     }
 
