@@ -1793,7 +1793,22 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     // the PTY closed on quit), these writes can fail with a broken pipe — that
     // must not turn a clean exit into a non-zero one (every step inside is
     // best-effort).
-    restore_terminal();
+    //
+    // Gated on the same latch every other restore path claims, because
+    // `abort()` above is not sufficient on its own: it cannot stop a watcher
+    // that has already resumed past its `.await` and is inside its own
+    // synchronous `restore_terminal(); process::exit(code)`. A SIGTERM landing
+    // in the same instant the user presses `q` would otherwise have two threads
+    // writing `write_restore_sequences` to the same stdout, unsynchronised. If
+    // we lose the claim, the watcher owns the teardown and is microseconds from
+    // ending the process; leaving it to do both is what keeps the restore
+    // single-writer. (We still return `res` in that case rather than parking, so
+    // the reported exit code is whichever of the two lands first — the process
+    // is terminating either way, and parking a `block_on` thread to tighten that
+    // is not worth the hang risk if the winner's write ever blocks.)
+    if claim_shutdown(&SHUTTING_DOWN) {
+        restore_terminal();
+    }
     res
 }
 
@@ -1819,14 +1834,14 @@ pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
 /// show-cursor half of this restore and paint a stale dashboard over the
 /// restored screen. The narrow serialization that closes that window, in
 /// preference to a process-global lock on every terminal write: both render
-/// loops consult [`shutdown_claimed`] before drawing, and the latch is claimed
-/// *before* the restore begins, so no frame can start after the claim.
+/// loops consult [`shutdown_claimed_on`] before drawing, and the latch is
+/// claimed *before* the restore begins, so no frame can start after the claim.
 ///
 /// What remains is a frame already in flight when the claim lands, which can
 /// still interleave *during* the restore. That one is cosmetic — out-of-order
 /// escapes on a terminal being reset in the same breath, with these restore
 /// bytes written last — and is accepted.
-fn restore_terminal() {
+pub(crate) fn restore_terminal() {
     // `disable_raw_mode` mutates the real terminal (there is no in-memory
     // equivalent), so it stays outside the testable sequence writer below.
     let _ = disable_raw_mode();
@@ -1900,7 +1915,7 @@ pub fn spawn_termination_watcher() -> color_eyre::Result<tokio::task::JoinHandle
 /// hazard is two watchers on two *runtimes*, and a path-independent latch covers
 /// every call site (present and future) without each one having to know whether
 /// an outer watcher already exists.
-static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+pub(crate) static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Claim the single-shot shutdown path on `latch`. Returns `true` exactly once —
 /// for whichever caller wins the swap — and `false` for every caller after it.
@@ -1916,23 +1931,21 @@ fn claim_shutdown(latch: &AtomicBool) -> bool {
     !latch.swap(true, Ordering::SeqCst)
 }
 
-/// Whether the shutdown path has already been claimed — by a signal watcher or
-/// by a typed Ctrl-C — meaning the terminal is being restored and the process is
-/// about to exit.
+/// Whether the shutdown path has already been claimed on `latch` — by a signal
+/// watcher or by a typed Ctrl-C — meaning the terminal is being restored and the
+/// process is about to exit.
 ///
-/// Both render loops call this before every frame so a `draw` cannot land after
-/// [`restore_terminal`] has run and undo it. See the ordering note on
-/// [`restore_terminal`] for why that is the chosen fix rather than a lock on
-/// every terminal write.
-#[must_use]
-pub fn shutdown_claimed() -> bool {
-    shutdown_claimed_on(&SHUTTING_DOWN)
-}
-
-/// [`shutdown_claimed`] against an explicit latch, so a test can drive a fresh
-/// one and stay order-independent — the process global cannot be reset once a
-/// test has set it (same reason [`claim_shutdown`] is parameterised).
-fn shutdown_claimed_on(latch: &AtomicBool) -> bool {
+/// Both render gates ([`draw_frame_unless_shutting_down`] and the launcher's
+/// `draw_menu_unless_shutting_down`) consult this before every frame so a `draw`
+/// cannot land after [`restore_terminal`] has run and undo it. See the ordering
+/// note on [`restore_terminal`] for why that is the chosen fix rather than a lock
+/// on every terminal write.
+///
+/// Takes the latch explicitly rather than reading [`SHUTTING_DOWN`] directly so
+/// a test can drive a fresh one and stay order-independent — the process global
+/// cannot be reset once a test has set it (same reason [`claim_shutdown`] is
+/// parameterised). Production callers pass [`SHUTTING_DOWN`].
+pub(crate) fn shutdown_claimed_on(latch: &AtomicBool) -> bool {
     latch.load(Ordering::SeqCst)
 }
 
@@ -1955,16 +1968,31 @@ pub(crate) const fn is_ctrl_c(k: KeyEvent) -> bool {
 }
 
 /// Whether a key event must end the dashboard session: a typed Ctrl-C, unless a
-/// job console is displayed.
+/// console for a *still-running* job is displayed.
 ///
 /// Split out of the event loop's match guard so the precedence is testable
 /// without a terminal. The console exception is the whole reason this is not
-/// simply [`is_ctrl_c`]: while a job console is up, Ctrl+C already means "cancel
+/// simply [`is_ctrl_c`]: while a job is running, Ctrl+C already means "cancel
 /// this running job" (`ui::job_console::on_console_key`), which is the documented
 /// way to stop a focused install/serve without truncating it — killing the
 /// process instead would be a regression.
+///
+/// That justification stops the moment the job reaches a terminal state, and the
+/// exception has to stop with it. No manager clears its `active_job` on
+/// completion — it is cleared only when the user dismisses the console with
+/// Esc/Enter — so a finished console stays on screen indefinitely. Exempting it
+/// unconditionally made Ctrl-C fall through to `on_console_key`, which emits
+/// `CancelJob`, which the reducer ignores on a terminal job: the keystroke was a
+/// **silent no-op**, leaving the user in raw mode on the alternate screen. Gating
+/// on the job being non-terminal keeps "cancel the job" winning only while there
+/// is a job left to cancel.
 fn ctrl_c_should_exit(state: &AppState, k: KeyEvent) -> bool {
-    is_ctrl_c(k) && !state.has_active_console()
+    // Reads as: no job console is up, or the one that is has already finished.
+    is_ctrl_c(k)
+        && state
+            .active_job_id()
+            .and_then(|id| state.jobs.job(id))
+            .is_none_or(rocm_dash_core::state::JobState::is_terminal)
 }
 
 /// End the process from a typed Ctrl-C, taking exactly the path an externally
@@ -2101,6 +2129,39 @@ impl TerminationSignals {
 const EXIT_CODE_SIGINT: i32 = 130;
 /// Conventional shell exit code for a process terminated by SIGTERM (128 + 15).
 const EXIT_CODE_SIGTERM: i32 = 143;
+
+/// Draw one dashboard frame, unless a shutdown has already been claimed on
+/// `latch`.
+///
+/// This is the render gate. A termination may be in flight on another thread
+/// (the signal watcher, or a typed Ctrl-C): the terminal is being restored, so
+/// the frame must not land after the restore and undo it. See the ordering note
+/// on [`restore_terminal`].
+///
+/// Extracted from the event loop's body — and parameterised over the backend and
+/// the latch — purely so the gate is *testable*: a test can drive a
+/// `TestBackend`, claim a local latch, and assert no cells were painted. Inlined
+/// in the loop it was unreachable from any test, and deleting it turned nothing
+/// red.
+///
+/// Focused host renders overlay-only (no header / tabs / dock / footer chrome);
+/// the dashboard renders the full shell.
+fn draw_frame_unless_shutting_down<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut AppState,
+    focus: Option<Focus>,
+    latch: &AtomicBool,
+) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    if shutdown_claimed_on(latch) {
+        return Ok(());
+    }
+    if should_skip_daemon(focus) {
+        terminal.draw(|f| ui::draw_focused(f, state))?;
+    } else {
+        terminal.draw(|f| ui::draw(f, state))?;
+    }
+    Ok(())
+}
 
 async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
@@ -2321,20 +2382,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     let mut local_agent = agent.clone();
 
     loop {
-        // A termination is in flight on another thread (the signal watcher, or a
-        // typed Ctrl-C handled below): the terminal is being restored, so stop
-        // painting rather than have this frame land after the restore and undo
-        // it. See the ordering note on `restore_terminal`.
-        //
-        // Focused host renders overlay-only (no header / tabs / dock / footer
-        // chrome); the dashboard renders the full shell.
-        if !shutdown_claimed() {
-            if should_skip_daemon(args.focus) {
-                terminal.draw(|f| ui::draw_focused(f, &mut state))?;
-            } else {
-                terminal.draw(|f| ui::draw(f, &mut state))?;
-            }
-        }
+        draw_frame_unless_shutting_down(terminal, &mut state, args.focus, &SHUTTING_DOWN)?;
         tokio::select! {
             _ = tick.tick() => {
                 // Advance the animation clock so spinners cycle even while a
@@ -4049,6 +4097,13 @@ mod tests {
     /// it with SIGINT, must not assume the default disposition is still in place.
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Upper bound on any `await_termination` in a test. The signal it waits for
+    /// is already queued before the await starts, so the real latency is
+    /// microseconds; this only exists so a broken registration fails the test
+    /// instead of parking the `.await` forever and burning the lane's job
+    /// timeout. A hanging test is worse than a failing one — it reports nothing.
+    const SIGNAL_AWAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// A current-thread runtime with the signal driver enabled, which
     /// `TerminationSignals::register` needs.
     fn signal_test_runtime() -> tokio::runtime::Runtime {
@@ -4158,6 +4213,106 @@ mod tests {
     }
 
     #[test]
+    fn a_claimed_shutdown_stops_the_dashboard_painting_another_frame() {
+        // The render gate itself, not just the latch predicate underneath it.
+        // `restore_terminal()` runs on a Tokio worker while frames are drawn on
+        // the `block_on` thread, and nothing locks the terminal — so a frame that
+        // *starts* after the restore would hide the cursor again and repaint a
+        // stale dashboard over the restored screen. The claim happens before the
+        // restore begins, so gating on it is what makes that impossible.
+        //
+        // Driven against a `TestBackend` and a local latch: no process-global
+        // state, no real terminal, and the assertion is on painted cells rather
+        // than on the predicate the gate happens to call.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        // Control: with nothing claimed the gate must let the frame through,
+        // otherwise the assertion below would pass on a helper that never draws.
+        let mut s = st();
+        let open = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        draw_frame_unless_shutting_down(&mut term, &mut s, None, &open)
+            .expect("drawing to a TestBackend cannot fail");
+        assert!(
+            !painted(&term).is_empty(),
+            "with no shutdown claimed the dashboard must paint a frame"
+        );
+
+        // The real case: a watcher (or a typed Ctrl-C) has claimed the shutdown
+        // and the restore is under way.
+        let mut s = st();
+        let claimed = AtomicBool::new(false);
+        assert!(claim_shutdown(&claimed), "the test must win its own latch");
+        let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        draw_frame_unless_shutting_down(&mut term, &mut s, None, &claimed)
+            .expect("the gate must not turn a suppressed frame into an error");
+        assert_eq!(
+            painted(&term),
+            "",
+            "once the shutdown is claimed no further frame may be painted — a \
+             late frame lands after `restore_terminal()` and undoes it"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_exits_once_the_console_job_has_finished() {
+        // The gesture the PR exists to fix, in the state that used to swallow it.
+        // Nothing clears `active_job` when a job completes (only an Esc/Enter
+        // dismissal does), so the console stays on screen after the job is done.
+        // While the exemption keyed on "a console is displayed" rather than "a
+        // job is running", Ctrl-C there fell through to `on_console_key` →
+        // `CancelJob`, which the reducer drops on a terminal job: nothing
+        // happened at all, and the user stayed in raw mode on the alt-screen.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Examine); // auto-runs a job
+        let job_id = s
+            .active_job_id()
+            .expect("opening Examine must start a job and show its console")
+            .to_string();
+        assert!(
+            !ctrl_c_should_exit(&s, ctrl_c),
+            "while the job is still running, Ctrl+C must cancel the job"
+        );
+
+        // The job finishes. The console is NOT dismissed — this is the review
+        // state the user is left sitting in.
+        s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
+            id: job_id.clone(),
+            code: 0,
+        });
+        assert!(
+            s.jobs
+                .job(&job_id)
+                .is_some_and(rocm_dash_core::state::JobState::is_terminal),
+            "the job must have reached a terminal state"
+        );
+        assert!(
+            s.has_active_console(),
+            "the finished console must still be displayed — that is the whole \
+             point of this case"
+        );
+        assert!(
+            ctrl_c_should_exit(&s, ctrl_c),
+            "Ctrl+C over a FINISHED job console must end the session; there is no \
+             job left to cancel, so exempting it makes the keystroke a silent \
+             no-op and traps the user in raw mode"
+        );
+    }
+
+    #[test]
     fn termination_watcher_parks_until_aborted() {
         let _guard = SIGNAL_TEST_LOCK
             .lock()
@@ -4222,15 +4377,47 @@ mod tests {
                 let rc = unsafe { libc::raise(signo) };
                 assert_eq!(rc, 0, "raise({signo}) failed");
 
+                // Both `await_termination`s are bounded. A regression that breaks
+                // *registration* of one signal kind (rather than mis-mapping its
+                // exit code) leaves the `.await` parked forever, and an unbounded
+                // await would burn the required lane's job timeout instead of
+                // reporting a failure. The bound is generous — the signal is
+                // already queued by the `raise` above, so the await resolves in
+                // microseconds; anything near 10 s is a genuine hang.
+                let received = tokio::time::timeout(
+                    SIGNAL_AWAIT_TIMEOUT,
+                    await_termination(hub_watcher, &latch),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the first watcher never received signal {signo} within \
+                         {SIGNAL_AWAIT_TIMEOUT:?} — the listener for it is not \
+                         registered, so the watcher would park forever instead of \
+                         restoring the terminal"
+                    )
+                });
                 assert_eq!(
-                    await_termination(hub_watcher, &latch).await,
+                    received,
                     Some(expected),
                     "the first watcher must receive signal {signo} and map it to \
                      the conventional 128 + signo exit code"
                 );
+
+                let stood_down = tokio::time::timeout(
+                    SIGNAL_AWAIT_TIMEOUT,
+                    await_termination(session_watcher, &latch),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the second watcher never woke for signal {signo} within \
+                         {SIGNAL_AWAIT_TIMEOUT:?} — Tokio's registry must wake \
+                         every listener registered for a kind, not just the first"
+                    )
+                });
                 assert_eq!(
-                    await_termination(session_watcher, &latch).await,
-                    None,
+                    stood_down, None,
                     "the second watcher woken by the same signal must stand down \
                      rather than race a concurrent restore + exit"
                 );

@@ -260,14 +260,18 @@ async fn quit_launcher(world: &mut E2eWorld) {
     quit_tui(world, "the launcher").await;
 }
 
-/// Deliver a termination signal to the running dashboard and wait for it to
-/// exit, stashing the observed exit code for the `Then` steps. Shared by the
+/// Deliver a termination signal to the TUI under test and wait for it to exit,
+/// stashing the observed exit code for the `Then` steps. Shared by the
 /// SIGTERM/SIGINT `When` steps so the two cannot drift.
-async fn signal_dashboard(world: &mut E2eWorld, signal: TermSignal) {
+///
+/// Deliberately not named for the dashboard: the process under test is the
+/// launcher in the hub round-trip scenario, and the signal handling being
+/// asserted is process-wide, not dashboard-specific.
+async fn signal_tui(world: &mut E2eWorld, signal: TermSignal) {
     session(world)
         .deliver_signal_and_wait(signal, default_timeout())
         .await
-        .unwrap_or_else(|e| panic!("the dashboard did not exit after {signal:?}: {e}"));
+        .unwrap_or_else(|e| panic!("the process under test did not exit after {signal:?}: {e}"));
 }
 
 #[when("the user opens the dashboard from the launcher")]
@@ -304,17 +308,17 @@ async fn quit_back_to_launcher(world: &mut E2eWorld) {
 
 #[when("the launcher receives a SIGTERM")]
 async fn launcher_receives_sigterm(world: &mut E2eWorld) {
-    signal_dashboard(world, TermSignal::Term).await;
+    signal_tui(world, TermSignal::Term).await;
 }
 
 #[when("the dashboard receives a SIGTERM")]
 async fn dashboard_receives_sigterm(world: &mut E2eWorld) {
-    signal_dashboard(world, TermSignal::Term).await;
+    signal_tui(world, TermSignal::Term).await;
 }
 
 #[when("the dashboard receives a SIGINT")]
 async fn dashboard_receives_sigint(world: &mut E2eWorld) {
-    signal_dashboard(world, TermSignal::Int).await;
+    signal_tui(world, TermSignal::Int).await;
 }
 
 /// Type a literal Ctrl-C at the running TUI and wait for it to exit. Shared by

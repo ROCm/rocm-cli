@@ -155,9 +155,10 @@ small front-door menu that gets you to the common tasks:
 - **Chat** — talk to a local or API-backed model
 - **Open full dashboard →** — escalate into the live dashboard (`rocm dash`)
 
-Pick a row with the arrow keys and `Enter`; press `q` to quit. On a
-non-interactive terminal (or piped output), `rocm` prints a one-shot status
-summary instead of opening the launcher.
+Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which works
+in the launcher and the dashboard alike and always restores your terminal — to
+quit. On a non-interactive terminal (or piped output), `rocm` prints a one-shot
+status summary instead of opening the launcher.
 
 ## Interactive interfaces
 

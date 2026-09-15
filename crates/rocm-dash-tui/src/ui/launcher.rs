@@ -248,7 +248,7 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓←→ move   Enter select   d dashboard   q quit",
+        "↑↓←→ move   Enter select   d dashboard   q / Ctrl-C quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);
@@ -287,9 +287,7 @@ pub fn run_launcher(
     serving: Vec<Instance>,
 ) -> std::io::Result<Option<LauncherChoice>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
@@ -304,14 +302,13 @@ pub fn run_launcher(
 
     let mut sel = 0usize;
     let result = loop {
-        // A termination is in flight on another thread (the hub's signal watcher
-        // runs on its own runtime while this menu loop owns the main thread):
-        // the terminal is being restored, so stop painting rather than let this
-        // frame land after the restore and undo it. See the ordering note on
-        // `crate::app::restore_terminal`.
-        if !crate::app::shutdown_claimed() {
-            terminal.draw(|f| draw(f, f.area(), &state, sel, &theme))?;
-        }
+        draw_menu_unless_shutting_down(
+            &mut terminal,
+            &state,
+            sel,
+            &theme,
+            &crate::app::SHUTTING_DOWN,
+        )?;
         let Event::Key(k) = event::read()? else {
             continue;
         };
@@ -340,10 +337,39 @@ pub fn run_launcher(
         }
     };
 
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // One shared teardown for the whole crate. This used to be an open-coded
+    // `disable_raw_mode` + `LeaveAlternateScreen` + `show_cursor` — a second
+    // restore implementation that could (and would) drift from the one the
+    // signal watcher and the typed-Ctrl-C path run. `restore_terminal` is
+    // best-effort by design: a vanished controlling terminal must not turn a
+    // clean launcher exit into an `Err`, which the `?`s here previously did.
+    crate::app::restore_terminal();
     Ok(result)
+}
+
+/// Draw one launcher frame, unless a shutdown has already been claimed on
+/// `latch`.
+///
+/// The hub's signal watcher runs on its own runtime while this menu loop owns
+/// the main thread, so a termination can be in flight concurrently: the terminal
+/// is being restored, and this frame must not land after the restore and undo
+/// it. See the ordering note on `crate::app::restore_terminal`.
+///
+/// Parameterised over the backend and the latch so the gate is testable against
+/// a `TestBackend` — inlined in the loop it was reachable only from a real
+/// terminal, and deleting it turned no test red.
+fn draw_menu_unless_shutting_down<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &AppState,
+    sel: usize,
+    theme: &Theme,
+    latch: &std::sync::atomic::AtomicBool,
+) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    if crate::app::shutdown_claimed_on(latch) {
+        return Ok(());
+    }
+    terminal.draw(|f| draw(f, f.area(), state, sel, theme))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -365,6 +391,52 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn a_claimed_shutdown_stops_the_launcher_painting_another_frame() {
+        // Same gate as the dashboard's, on the crate's *other* key loop. The hub
+        // menu runs on the main thread while the hub's signal watcher runs on its
+        // own runtime, so a frame started after `restore_terminal()` would hide
+        // the cursor again and repaint the menu over the restored screen.
+        // Local latch, `TestBackend`: asserts painted cells, not the predicate.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+
+        // Control: an unclaimed latch must let the frame through, or the
+        // assertion below would hold for a helper that simply never draws.
+        let open = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &open)
+            .expect("drawing to a TestBackend cannot fail");
+        assert!(
+            !painted(&term).is_empty(),
+            "with no shutdown claimed the launcher must paint its menu"
+        );
+
+        let claimed = AtomicBool::new(true);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &claimed)
+            .expect("the gate must not turn a suppressed frame into an error");
+        assert_eq!(
+            painted(&term),
+            "",
+            "once the shutdown is claimed the launcher must stop painting — a \
+             late frame lands after `restore_terminal()` and undoes it"
+        );
     }
 
     fn base() -> AppState {

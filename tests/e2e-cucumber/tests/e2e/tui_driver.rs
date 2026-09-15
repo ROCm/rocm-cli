@@ -638,28 +638,22 @@ impl TuiSession {
     }
 
     /// Assert the terminal was restored on exit: the child left the alternate
-    /// screen and made the cursor visible again. A dashboard that dies on a
-    /// signal without running its restore path leaves both inverted (still on
-    /// the alt-screen, cursor hidden) — the broken state that needs a `reset`.
+    /// screen and made the cursor visible again. A TUI that dies on a signal
+    /// without running its restore path leaves both inverted (still on the
+    /// alt-screen, cursor hidden) — the broken state that needs a `reset`.
+    ///
+    /// Reuses the public [`in_alternate_screen`](Self::in_alternate_screen)
+    /// rather than carrying a second, byte-identical alt-screen probe.
     pub fn expect_terminal_restored(&self) -> Result<(), String> {
-        let on_alt = self.on_alternate_screen();
+        let on_alt = self.in_alternate_screen();
         let cursor_hidden = self.cursor_hidden();
         if on_alt || cursor_hidden {
             return Err(format!(
-                "terminal was not restored on exit (alternate_screen={on_alt}, cursor_hidden={cursor_hidden}); expected the dashboard to leave the alt-screen and show the cursor.\n{}",
+                "terminal was not restored on exit (alternate_screen={on_alt}, cursor_hidden={cursor_hidden}); expected the process under test to leave the alt-screen and show the cursor.\n{}",
                 self.framed_screen()
             ));
         }
         Ok(())
-    }
-
-    /// Whether the emulated screen is currently on the alternate screen.
-    fn on_alternate_screen(&self) -> bool {
-        self.parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .screen()
-            .alternate_screen()
     }
 
     /// Whether the emulated cursor is currently hidden.

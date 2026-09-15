@@ -86,6 +86,11 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
 
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
+        // Ctrl-C is a first-class quit gesture in both key loops (it restores the
+        // terminal and exits 130), so it belongs on the help surface next to `q`.
+        // The exception is worth stating: over a *running* job console it still
+        // means "cancel this job".
+        key_line("Ctrl-C", "quit (cancels a running job console)", theme),
         key_line("?", "toggle this help", theme),
         key_line("Tab / Shift-Tab", "next / previous tab", theme),
         key_line("1 .. 5", "jump to tab", theme),
@@ -601,7 +606,11 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ),
         (
             "CHAT / GLOBAL",
-            &[("i / Enter", "focus chat input"), ("q", "quit")],
+            &[
+                ("i / Enter", "focus chat input"),
+                ("q", "quit"),
+                ("Ctrl-C", "quit (cancels a running job)"),
+            ],
         ),
     ];
     render_help_groups(f, cols[0], left, theme);
