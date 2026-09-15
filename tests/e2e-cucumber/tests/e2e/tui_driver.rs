@@ -497,55 +497,6 @@ impl TuiSession {
         }
     }
 
-    /// Poll until the child exits, returning its raw exit code regardless of
-    /// whether it is zero. Used by journeys (e.g. a declined confirmation
-    /// prompt) whose success case is a specific *nonzero* code, where
-    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
-    /// would reject the very outcome under test.
-    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
-                    self.finished = true;
-                    self.record_once(code);
-                    return Ok(code);
-                }
-                Ok(None) => {}
-                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
-            }
-            // A reader panic doesn't affect whether the child itself has exited,
-            // but it does mean the screen in any resulting error/diagnostic is
-            // stale, so surface it rather than let this poll silently continue.
-            if let Some(panic_message) = self.take_reader_panic() {
-                return Err(format!(
-                    "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
-    /// Whether the emulated terminal is currently in the alternate screen — the
-    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
-    /// refusal that never takes over the terminal this must stay `false`.
-    #[must_use]
-    pub fn in_alternate_screen(&self) -> bool {
-        self.parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .screen()
-            .alternate_screen()
-    }
-
     /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
     /// fast refusal contract. Unlike [`wait_for_exit`](Self::wait_for_exit) (which
     /// requires success), this fails if the child exits 0, and — crucially — if it
@@ -720,11 +671,16 @@ impl TuiSession {
             .hide_cursor()
     }
 
-    /// Poll until the child exits and return its exit code, giving the reader a
-    /// bounded window to consume the final frame — the terminal-restore
-    /// sequences the signal handler emits arrive immediately before the process
-    /// exits, so the parser must see them before restoration is asserted.
-    async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero — journeys whose success case is a specific *nonzero*
+    /// code (a declined confirmation, a signal exit) need the code rather than
+    /// [`wait_for_exit`](Self::wait_for_exit)'s zero-only assertion.
+    ///
+    /// The reader gets a bounded window to consume the final frame first: the
+    /// terminal-restore sequences a signal handler emits arrive immediately
+    /// before the process exits, so the parser must see them before restoration
+    /// is asserted.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
