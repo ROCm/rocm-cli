@@ -19177,7 +19177,11 @@ fn select_auto_gpu_index(
         }
         // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
         // (not free percentage, which can favor a smaller GPU on heterogeneous
-        // VRAM systems).
+        // VRAM systems). No "does this ordinal have a row?" guard is needed:
+        // inside this branch every candidate came *from* a reported row, so
+        // `usage_for` is total over `candidate_indices`. It was needed when
+        // candidates were a synthetic `0..count` range, where an ordinal could
+        // be selected that telemetry had never reported.
         if let Some(&index) = candidate_indices.iter().max_by(|left, right| {
             let left_free = usage_for(**left).map(|usage| usage.free_mb());
             let right_free = usage_for(**right).map(|usage| usage.free_mb());
@@ -19185,8 +19189,7 @@ fn select_auto_gpu_index(
                 .cmp(&right_free)
                 // Break ties toward the lowest index.
                 .then(right.cmp(left))
-        }) && usage_for(index).is_some()
-        {
+        }) {
             return vec![index];
         }
     }
@@ -19367,21 +19370,17 @@ fn read_sysfs_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
 }
 
-/// Whether a DRM `device` directory belongs to an AMD GPU. Matches on the PCI
-/// `vendor` id (`0x1002`) or, when that is unreadable, an `amdgpu` `uevent`
-/// `DRIVER=` line — the same two-signal test as `rocm_core::is_amdgpu_device`,
-/// so this fallback probe and the KFD/DRM count authority agree on what counts
-/// as an AMD card (a vendor-only test would under-count and let the multi-card
-/// ordinal guard slip).
+/// Whether a DRM `device` directory belongs to an AMD GPU.
+///
+/// Delegates rather than re-implementing. This probe and `rocm-core`'s KFD/DRM
+/// count authority have to agree on what counts as an AMD card — if this one
+/// recognises fewer, it under-counts and the multi-card ordinal guard it feeds
+/// silently narrows — and a second copy of the test with a comment claiming the
+/// two match is not agreement, it is a promise nothing enforces. Calling the
+/// same function is.
 #[cfg(any(target_os = "linux", test))]
 fn drm_device_is_amd(device_dir: &Path) -> bool {
-    if fs::read_to_string(device_dir.join("vendor"))
-        .is_ok_and(|vendor| vendor.trim().eq_ignore_ascii_case("0x1002"))
-    {
-        return true;
-    }
-    fs::read_to_string(device_dir.join("uevent"))
-        .is_ok_and(|uevent| uevent.lines().any(|line| line.trim() == "DRIVER=amdgpu"))
+    rocm_core::is_amdgpu_device(device_dir)
 }
 
 /// Parse `amd-smi metric --json` output into per-GPU VRAM usage. Accepts both
@@ -26847,11 +26846,16 @@ install therock";
             vec![2],
             "the all-busy fallback must name a reported GPU, never a fabricated index 0"
         );
-        // The same holds when the busy set is given in descending order — the
-        // fallback tracks the reported ordinals, not the order they arrive in.
+        // "Lowest reported" has to mean lowest by ordinal, not first in the
+        // rows: `amd-smi` orders its output by enumeration, not by index, so
+        // feed the same two rows in descending order. Varying the *busy* slice's
+        // order instead would prove nothing — it is only ever read through
+        // `.contains()`, so that assertion was a duplicate of the one above.
+        let descending = [vram(3, 190_000, 192_000), vram(2, 182_000, 192_000)];
         assert_eq!(
-            select_auto_gpu_index(None, None, &[3, 2], Some(&usage)),
-            vec![2]
+            select_auto_gpu_index(None, None, &[2, 3], Some(&descending)),
+            vec![2],
+            "the fallback must take the lowest reported ordinal, not the first row"
         );
     }
 

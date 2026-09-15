@@ -5357,8 +5357,21 @@ fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn is_amdgpu_device(device_dir: &Path) -> bool {
+/// Whether a DRM `device` directory belongs to an AMD GPU: the PCI `vendor` id
+/// (`0x1002`), or, when that is unreadable, an `amdgpu` `uevent` `DRIVER=` line.
+///
+/// Both signals are needed. A vendor-only test under-counts on hosts where
+/// `vendor` is absent or unreadable, and the callers are counting *cards* — the
+/// KFD/DRM count authority here and the `rocm` CLI's sysfs fallback probe — so
+/// an under-count silently narrows the multi-card ordinal guard.
+///
+/// `pub` and not `#[cfg(target_os = "linux")]` precisely so there is one copy:
+/// the CLI's fallback probe used to carry its own, with a doc comment asserting
+/// the two were "the same two-signal test" and nothing holding them to it. It
+/// reads files, so there is nothing platform-specific to gate, and gating it
+/// would put it out of reach of a dependent crate's `cfg(test)` build.
+#[must_use]
+pub fn is_amdgpu_device(device_dir: &Path) -> bool {
     if let Ok(vendor) = fs::read_to_string(device_dir.join("vendor"))
         && vendor.trim().eq_ignore_ascii_case("0x1002")
     {
