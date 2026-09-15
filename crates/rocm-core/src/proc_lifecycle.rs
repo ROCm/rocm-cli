@@ -125,7 +125,39 @@ fn identity_state_from_probes(
     if !is_live() {
         return IdentityState::Gone;
     }
-    identity_state_with_observed(id, read_start_ticks())
+    // Compare only. Routing back through `identity_state_with_observed` would
+    // re-run the liveness check just performed, which on Linux is two more
+    // `/proc` reads per call — paid on every 25 ms tick of the bounded waits,
+    // which is where this is called from in a loop.
+    compare_start_ticks(id, read_start_ticks())
+}
+
+/// The identity comparison alone, for callers that have already established
+/// liveness.
+///
+/// Split out so the ordering guarantee above does not have to pay for a second
+/// liveness check. Deliberately not public: on its own it cannot return
+/// [`IdentityState::Gone`], so a caller that had not checked liveness would get
+/// [`IdentityState::Matches`] for a dead PID — the one verdict that authorises a
+/// kill. The two callers that establish liveness first are in this file.
+const fn compare_start_ticks(
+    id: &ProcessIdentity,
+    observed_start_ticks: Option<u64>,
+) -> IdentityState {
+    match (id.start_ticks, observed_start_ticks) {
+        (Some(expected), Some(actual)) => {
+            if expected == actual {
+                IdentityState::Matches
+            } else {
+                IdentityState::Recycled
+            }
+        }
+        // Identity recorded but unconfirmable right now: neither signal nor
+        // claim a stop.
+        (Some(_), None) => IdentityState::Indeterminate,
+        // No recorded identity (legacy state): best-effort proceed.
+        (None, _) => IdentityState::Matches,
+    }
 }
 
 /// [`identity_state`] against a start-time the caller has already observed.
@@ -150,20 +182,7 @@ pub fn identity_state_with_observed(
     if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
         return IdentityState::Gone;
     }
-    match (id.start_ticks, observed_start_ticks) {
-        (Some(expected), Some(actual)) => {
-            if expected == actual {
-                IdentityState::Matches
-            } else {
-                IdentityState::Recycled
-            }
-        }
-        // Identity recorded but unconfirmable right now: neither signal nor
-        // claim a stop.
-        (Some(_), None) => IdentityState::Indeterminate,
-        // No recorded identity (legacy state): best-effort proceed.
-        (None, _) => IdentityState::Matches,
-    }
+    compare_start_ticks(id, observed_start_ticks)
 }
 
 /// Whether `state` means the recorded process is definitively no longer running.
@@ -470,13 +489,13 @@ mod tests {
         // the reading — not the record — that decides. A recycled PID reads
         // differently and must come back `Recycled`.
         //
-        // This one needs a genuinely live PID, so it uses the test process
-        // itself: `identity_state_with_observed` runs its own real liveness
-        // check, so a stubbed-live closure over a made-up PID would still come
-        // back `Gone` and the mapping below would never be reached. The start
-        // times stay synthetic — the mapping compares what it is handed.
+        // The PID is made up on purpose. Reaching the comparison with a PID that
+        // is provably not running is the assertion that this path consults the
+        // liveness it was handed and nothing else — while the comparison went
+        // back through `identity_state_with_observed`, the same call returned
+        // `Gone` from that function's own second liveness check.
         let id = ProcessIdentity {
-            pid: std::process::id(),
+            pid: 4321,
             start_ticks: Some(99),
         };
 

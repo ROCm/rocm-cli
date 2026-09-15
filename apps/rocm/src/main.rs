@@ -15511,7 +15511,7 @@ struct FailedManagedServiceStop {
 /// stop` re-reads the same unparseable JSON and fails the same way, so a record
 /// that will not parse would abort every retry identically. Each failure class
 /// carries the remedy that can actually clear it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopFailureRemedy {
     /// The record parses and its processes are still there, so `rocm services
     /// stop` can act on it.
@@ -15530,6 +15530,71 @@ enum StopFailureRemedy {
     /// recovered from it — "kill that pid" is advice nobody can act on. The file
     /// itself has to be repaired or deleted, so the remedy names it.
     RepairTheDaemonState,
+}
+
+impl StopFailureRemedy {
+    /// The recovery advice for this class, naming `ids` where the advice is
+    /// useless without them.
+    ///
+    /// Exhaustive on purpose, like [`StoppedRecordVerdict::blocks`] and for the
+    /// same reason. This used to be an `if`-chain over the variants, which a
+    /// sixth variant would pass through silently: the gate would still abort —
+    /// correctly — but print no way out of it, and this gate's whole contract is
+    /// that its advice is the operator's only way out. A `match` makes the
+    /// compiler ask.
+    fn advice(self, ids: &[String]) -> String {
+        match self {
+            Self::StopTheService => "Stop them with `rocm services stop <id> --yes`, then re-run \
+                                     uninstall. A server started by another user, or one wedged \
+                                     in the kernel, needs elevated privileges or a manual kill \
+                                     first."
+                .to_owned(),
+            Self::StopWhatHoldsThePort => format!(
+                "Every process recorded for {} is gone, yet the endpoint still answers — the \
+                 engine outlived its supervisor, so `rocm services stop` has nothing left to \
+                 kill. Find what holds that port (`ss -ltnp` on Linux, `Get-NetTCPConnection \
+                 -LocalPort <port>` on Windows), stop it, then re-run uninstall.",
+                ids.join(", ")
+            ),
+            Self::StopTheDaemon => "The background helper restarts managed services on its own, \
+                                    so it has to be stopped before uninstall can safely remove \
+                                    anything: kill that pid, then re-run uninstall."
+                .to_owned(),
+            Self::RepairTheDaemonState => format!(
+                "The background helper's runtime state does not parse, so no pid could be read \
+                 from it and `rocm` cannot tell whether the helper is running. Check for a live \
+                 `rocmd` process and stop it, then repair or delete the file and re-run \
+                 uninstall: {}.",
+                ids.join(", ")
+            ),
+            Self::RepairTheRecord => format!(
+                "No `rocm` command can act on an unparseable record, so these have to be handled \
+                 on disk: check whether the server each one describes is still running (`rocm \
+                 services list` skips them), stop it, then repair or delete the file and re-run \
+                 uninstall: {}.",
+                ids.join(", ")
+            ),
+        }
+    }
+
+    /// Where this class sits in the printed advice.
+    ///
+    /// Also exhaustive, and for a second reason beyond ordering: without it, a
+    /// new variant could compile an `advice()` arm and still never be printed,
+    /// because nothing would have added it to the list of classes to walk.
+    /// Ranking every variant means the set that gets advice is derived from the
+    /// failures themselves rather than from a list somebody has to remember to
+    /// extend. Most actionable first; the two "repair a file by hand" classes
+    /// last.
+    const fn advice_rank(self) -> u8 {
+        match self {
+            Self::StopTheService => 0,
+            Self::StopWhatHoldsThePort => 1,
+            Self::StopTheDaemon => 2,
+            Self::RepairTheDaemonState => 3,
+            Self::RepairTheRecord => 4,
+        }
+    }
 }
 
 /// How long the gate waits for a still-listening endpoint to say what it serves.
@@ -16034,12 +16099,19 @@ fn probe_hosts(host: &str) -> Vec<String> {
 /// What the gate does about a listener answering on an already-stopped record's
 /// recorded port.
 ///
-/// Lifted out of the stop pass so each outcome can be asserted directly. Inside
-/// the loop these arms are reachable only by standing up a server that answers
-/// in a particular way and then reading stderr, which is why two of them went
-/// untested: mutating either "proceed" arm into a block, or deleting the
-/// warning, left every test green while changing what a destructive command
-/// does.
+/// Lifted out of the stop pass so each outcome can be asserted directly. Two of
+/// these arms once went untested because reaching them meant standing up a
+/// server that answers in a particular way and then reading stderr: mutating
+/// either "proceed" arm into a block, or deleting a warning, left every test
+/// green while changing what a destructive command does.
+///
+/// Both halves of that are closed now, so the next reader should not infer a
+/// gap from the paragraph above. `every_identity_answer_maps_to_exactly_one_gate_outcome`
+/// pins the mapping here; `an_endpoint_listing_nothing_does_not_block_uninstall`
+/// and `a_listener_naming_another_model_does_not_block_uninstall` drive the two
+/// proceed-on-a-live-socket arms through the real call site; and the warnings
+/// are values on [`ManagedServiceStopReport`] rather than `eprintln!`s, so the
+/// disclosure is asserted rather than merely emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoppedRecordVerdict {
     /// Serving this record's own model: the engine outlived the supervisor whose
@@ -16211,76 +16283,29 @@ fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Result<Option<St
         // stopped by `rocm services stop` — that command loads the same file and
         // fails identically — so pointing at it would make every retry abort the
         // same way, which is exactly the dead end this gate must not create.
-        let mut remedies = Vec::new();
-        if report
+        //
+        // The classes walked here are derived from the failures themselves and
+        // ordered by `advice_rank`, so no variant can be dropped by forgetting
+        // to extend a list; both that and `advice` are exhaustive matches.
+        let mut classes = report
             .failed
             .iter()
-            .any(|failure| failure.remedy == StopFailureRemedy::StopTheService)
-        {
-            remedies.push(
-                "Stop them with `rocm services stop <id> --yes`, then re-run uninstall. A server \
-                 started by another user, or one wedged in the kernel, needs elevated privileges \
-                 or a manual kill first."
-                    .to_owned(),
-            );
-        }
-        let orphaned = report
-            .failed
-            .iter()
-            .filter(|failure| failure.remedy == StopFailureRemedy::StopWhatHoldsThePort)
-            .map(|failure| failure.service_id.clone())
+            .map(|failure| failure.remedy)
             .collect::<Vec<_>>();
-        if !orphaned.is_empty() {
-            remedies.push(format!(
-                "Every process recorded for {} is gone, yet the endpoint still answers — the \
-                 engine outlived its supervisor, so `rocm services stop` has nothing left to \
-                 kill. Find what holds that port (`ss -ltnp` on Linux, `Get-NetTCPConnection \
-                 -LocalPort <port>` on Windows), stop it, then re-run uninstall.",
-                orphaned.join(", ")
-            ));
-        }
-        if report
-            .failed
-            .iter()
-            .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon)
-        {
-            remedies.push(
-                "The background helper restarts managed services on its own, so it has to be \
-                 stopped before uninstall can safely remove anything: kill that pid, then re-run \
-                 uninstall."
-                    .to_owned(),
-            );
-        }
-        let unreadable_daemon_state = report
-            .failed
-            .iter()
-            .filter(|failure| failure.remedy == StopFailureRemedy::RepairTheDaemonState)
-            .map(|failure| failure.service_id.clone())
+        classes.sort_unstable_by_key(|remedy| remedy.advice_rank());
+        classes.dedup();
+        let remedies = classes
+            .into_iter()
+            .map(|remedy| {
+                let ids = report
+                    .failed
+                    .iter()
+                    .filter(|failure| failure.remedy == remedy)
+                    .map(|failure| failure.service_id.clone())
+                    .collect::<Vec<_>>();
+                remedy.advice(&ids)
+            })
             .collect::<Vec<_>>();
-        if !unreadable_daemon_state.is_empty() {
-            remedies.push(format!(
-                "The background helper's runtime state does not parse, so no pid could be read \
-                 from it and `rocm` cannot tell whether the helper is running. Check for a live \
-                 `rocmd` process and stop it, then repair or delete the file and re-run \
-                 uninstall: {}.",
-                unreadable_daemon_state.join(", ")
-            ));
-        }
-        let unreadable = report
-            .failed
-            .iter()
-            .filter(|failure| failure.remedy == StopFailureRemedy::RepairTheRecord)
-            .map(|failure| failure.service_id.clone())
-            .collect::<Vec<_>>();
-        if !unreadable.is_empty() {
-            remedies.push(format!(
-                "No `rocm` command can act on an unparseable record, so these have to be handled \
-                 on disk: check whether the server each one describes is still running (`rocm \
-                 services list` skips them), stop it, then repair or delete the file and re-run \
-                 uninstall: {}.",
-                unreadable.join(", ")
-            ));
-        }
         bail!(
             "uninstall aborted: could not stop managed service(s): {detail}. Their endpoints may \
              still be serving and holding the GPU. {}{}",
@@ -31590,6 +31615,89 @@ ID_LIKE="suse opensuse"
         assert!(
             error.contains("--allow-public-bind"),
             "says how a public service comes back after losing its key: {error}"
+        );
+    }
+
+    #[test]
+    fn every_failure_class_carries_its_own_recovery_advice() {
+        // This gate refuses to remove anything while a stop is unconfirmed, so
+        // the advice it prints is the operator's only way out; a class that
+        // reaches the abort with no advice turns the refusal into a dead end.
+        // `StopFailureRemedy::advice` and `advice_rank` are exhaustive matches,
+        // so a sixth variant cannot compile without being given text and a
+        // place in the order — but the compiler cannot check that the text is
+        // the *right* text, or that the three id-carrying classes still name
+        // their ids. That is what this asserts, across all five at once.
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![
+                FailedManagedServiceStop {
+                    service_id: "svc-wedged".to_owned(),
+                    reason: "still ready".to_owned(),
+                    remedy: StopFailureRemedy::StopTheService,
+                },
+                FailedManagedServiceStop {
+                    service_id: "svc-orphaned".to_owned(),
+                    reason: "endpoint still answers".to_owned(),
+                    remedy: StopFailureRemedy::StopWhatHoldsThePort,
+                },
+                FailedManagedServiceStop {
+                    service_id: "rocmd (pid 4321)".to_owned(),
+                    reason: "identity unverified".to_owned(),
+                    remedy: StopFailureRemedy::StopTheDaemon,
+                },
+                FailedManagedServiceStop {
+                    service_id: "runtime.json".to_owned(),
+                    reason: "does not parse".to_owned(),
+                    remedy: StopFailureRemedy::RepairTheDaemonState,
+                },
+                FailedManagedServiceStop {
+                    service_id: "svc-corrupt.json".to_owned(),
+                    reason: "does not parse".to_owned(),
+                    remedy: StopFailureRemedy::RepairTheRecord,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+
+        let error = uninstall_removal_gate(&report)
+            .expect_err("a non-empty `failed` must abort uninstall")
+            .to_string();
+
+        // One distinctive phrase per class, none of them supplied by this test.
+        for expected in [
+            "rocm services stop <id> --yes",
+            "Find what holds that port",
+            "restarts managed services on its own",
+            "cannot tell whether the helper is running",
+            "No `rocm` command can act on an unparseable record",
+        ] {
+            assert!(
+                error.contains(expected),
+                "every failure class must carry its own remedy; missing {expected:?} in: {error}"
+            );
+        }
+        // The three classes whose advice is useless without the ids must name
+        // them — "find what holds that port" for an unnamed service is not a
+        // way out. The other two are general instructions and name nothing.
+        for expected in ["svc-orphaned", "runtime.json", "svc-corrupt.json"] {
+            assert!(
+                error.contains(expected),
+                "id-carrying remedies must name their ids; missing {expected:?} in: {error}"
+            );
+        }
+        // Most actionable first, hand-repair last: a dead-end-avoidance
+        // ordering, not cosmetics.
+        let position = |needle: &str| error.find(needle).expect("asserted present above");
+        assert!(
+            position("rocm services stop <id> --yes") < position("Find what holds that port")
+                && position("Find what holds that port")
+                    < position("restarts managed services on its own")
+                && position("restarts managed services on its own")
+                    < position("cannot tell whether the helper is running")
+                && position("cannot tell whether the helper is running")
+                    < position("No `rocm` command can act on an unparseable record"),
+            "remedies must stay ordered most-actionable-first: {error}"
         );
     }
 

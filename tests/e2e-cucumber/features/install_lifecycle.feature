@@ -280,9 +280,16 @@ Feature: Release install lifecycle
     And the install manifest is gone
 
   # The Windows half of EAI-8014. Worth its own scenario rather than trusting the
-  # Linux one: the port reality-check inside the gate exists *because* Windows
-  # terminates only the recorded process, so an engine grandchild can outlive it
-  # and keep serving while the record reads "stopped".
+  # Linux one because the termination path differs: Windows terminates only the
+  # recorded process, where Linux signals the whole tree.
+  #
+  # What this pins is that PID-based termination, not the gate's port
+  # reality-check. The planted record carries port 0, which nothing can ever be
+  # serving on, so the port branch is satisfied trivially on every run. Staging
+  # the case the port check exists for — an engine grandchild outliving the
+  # recorded process and still serving while the record reads "stopped" — needs
+  # a real listener the scenario does not stand up. That branch is covered by
+  # the unit tests around `stopped_record_verdict` instead.
   @id:lifecycle-windows-uninstall-stops-managed-server @lifecycle @requires-os:windows
   Scenario: lifecycle-24 - Windows - uninstall stops the local server it manages
     Given a freshly built release tree
