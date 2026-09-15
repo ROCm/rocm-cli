@@ -9,14 +9,23 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::TuiSession;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
 
 const OOM_GUIDANCE_MODEL: &str = "e2e/oom-model";
-const INTERACTIVE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for an interactive (PTY) serve summary to render and exit.
+///
+/// Routed through the suite-wide [`default_timeout`] rather than a fixed literal
+/// so an operator can raise it with `E2E_TUI_TIMEOUT_SECS` on a contended
+/// self-hosted lane without a code change — the same reason every other PTY wait
+/// uses it.
+fn interactive_summary_timeout() -> Duration {
+    default_timeout()
+}
 /// Model id for the positive OOM-launch scenario. A distinct id from
 /// [`OOM_GUIDANCE_MODEL`] keeps the two OOM scenarios' service records from ever
 /// colliding, and marks this one as the launch (not reuse) case.
@@ -1142,7 +1151,7 @@ async fn open_oom_serve_summary(world: &mut E2eWorld) {
     )
     .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
     session
-        .wait_for_exit(INTERACTIVE_SUMMARY_TIMEOUT)
+        .wait_for_exit(interactive_summary_timeout())
         .await
         .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
     world.tui = Some(session);
@@ -1342,6 +1351,14 @@ async fn open_oom_launch_summary(world: &mut E2eWorld) {
     // pre-flight is bypassed for the simulated launch, so no GPU is touched; the
     // launch resolves the model, "spawns", writes an OOM log it owns, and reports
     // `starting` — exactly the state the memory-guidance note keys on.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/main.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared through
+    // `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails
+    // loudly rather than silently skipping: the fault injection would not arm,
+    // the real GPU pre-flight would bail, and the step below would fail.
     let mut session = TuiSession::spawn_with_env(
         world,
         &[
@@ -1356,7 +1373,7 @@ async fn open_oom_launch_summary(world: &mut E2eWorld) {
     )
     .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
     session
-        .wait_for_exit(INTERACTIVE_SUMMARY_TIMEOUT)
+        .wait_for_exit(interactive_summary_timeout())
         .await
         .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
     world.tui = Some(session);
@@ -1387,12 +1404,19 @@ async fn assert_oom_launch_names_knobs(world: &mut E2eWorld) {
         .expect("no interactive serve summary")
         .screen_text();
     // The actionable fix: lower the reservation or move to a less-busy device.
-    // Assert on the flag name (whitespace-insensitive, since an 80-column wrap can
-    // split the token across rows) so a reworded preamble does not mask a dropped
-    // remediation.
+    // Assert on the flag names (whitespace-insensitive, since an 80-column wrap
+    // can split a token across rows) so a reworded preamble does not mask a
+    // dropped remediation. Both knobs the step promises are checked — the step
+    // passed while only `--gpu-memory-utilization` was asserted, so dropping
+    // `--gpu <index>` from the guidance would not have failed anything.
+    let flattened = screen_without_whitespace(&screen);
     assert!(
-        screen_without_whitespace(&screen).contains("--gpu-memory-utilization"),
+        flattened.contains("--gpu-memory-utilization"),
         "the OOM summary must name the memory knob `--gpu-memory-utilization`:\n{screen}"
+    );
+    assert!(
+        flattened.contains("--gpu<index>"),
+        "the OOM summary must also name the other knob it advertises, `--gpu <index>`:\n{screen}"
     );
 }
 

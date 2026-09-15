@@ -2233,9 +2233,6 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 /// with the `rocm` CLI's pre-launch low-VRAM note so both surfaces point the
 /// user at the same fix rather than drifting into different phrasing.
 fn oom_utilization_hint(log_tail: &str) -> String {
-    if !rocm_core::vllm_log_shows_oom(log_tail) {
-        return String::new();
-    }
     // Route the user's *actual* failing line into the `--symptom` example when
     // it can be rendered as one intact single-quoted argument; otherwise fall
     // back to the canonical symptom so the printed command always reports a
@@ -2245,7 +2242,13 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     // of hand-rolling the selection twice; it classifies each line with the
     // *same* rule the diagnose checker uses, so whatever it returns is
     // diagnosable by construction.
-    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
+    //
+    // No line means the tail carries no OOM, so the helper's `None` is the OOM
+    // gate too: asking `vllm_log_shows_oom` first would evaluate the same
+    // predicate over the same string a second time.
+    let Some(symptom) = rocm_core::vllm_oom_diagnose_symptom(log_tail) else {
+        return String::new();
+    };
     // The line is subprocess output, so it is echoed only after the terminal
     // control bytes vLLM's colourised logger emits are removed.
     let symptom_line = rocm_core::strip_terminal_control_sequences(

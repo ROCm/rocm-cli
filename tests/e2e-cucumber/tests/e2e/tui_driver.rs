@@ -197,7 +197,10 @@ impl TuiSession {
             cmd.env(key, value);
         }
         // Caller-supplied overrides win over the scenario's own isolation
-        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself), but
+        // deliberately stay *above* the provider-credential strip below, so no
+        // `extra_env` entry can reinstate a credential and select a cloud
+        // backend for a journey that is meant to be deterministic local chat.
         for (key, value) in extra_env {
             cmd.env(key, value);
         }
@@ -218,12 +221,6 @@ impl TuiSession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLUMNS", COLS.to_string());
         cmd.env("LINES", ROWS.to_string());
-
-        // Per-child overrides last, so a scenario's explicit variable wins over
-        // the inherited/isolation environment.
-        for (key, value) in extra_env {
-            cmd.env(key, value);
-        }
 
         let mut child = pair
             .slave

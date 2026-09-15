@@ -5378,11 +5378,20 @@ fn serve(args: ServeArgs) -> Result<()> {
     // engine enforces the same rule as a backstop.
     //
     // The precise contract, since the reuse detection above is the one thing that
-    // can precede this bail: engine work runs first only when a live managed
-    // service already matches this engine and model — i.e. only when this
-    // invocation is about to reuse it and legitimately skip the bail. When no such
-    // service exists (the ordinary launch, and every no-GPU refusal path) the
-    // block above is skipped entirely and this is still the first thing that runs.
+    // can precede this bail: *engine* work — the `ResolveModel` round-trip and any
+    // self-managed engine install — runs first only when a live managed service
+    // already matches this engine and model, i.e. only when this invocation is
+    // about to reuse it and legitimately skip the bail. When no such service
+    // exists (the ordinary launch, and every no-GPU refusal path) that block's
+    // body is skipped.
+    //
+    // Its *condition* is not free, though: `any_live_managed_service_for_model`
+    // goes through `load_managed_services`, which refreshes every service record —
+    // including records for unrelated models, since the model filter is applied
+    // afterwards — so a stale `ready`/`running` record costs an endpoint listing
+    // probe and possibly an inference probe, plus a `record.write()`, before this
+    // bail is reached. That is bounded and paid only when such records exist, but
+    // it is not "nothing runs before the pre-flight".
     //
     // Skipped for cpu_only and when reusing an already-running service (nothing is
     // launched); permissive when availability cannot be probed on this platform
@@ -5647,6 +5656,14 @@ fn serve(args: ServeArgs) -> Result<()> {
             // traceback only in its own log. Read that log tail so the summary can
             // name the memory knobs, since the pre-launch low-VRAM warning cannot
             // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which prints `readiness: {status}` and
+            // no notes at all — that path is machine-readable by design and is not
+            // the place to grow prose, but it does mean the same failed launch is
+            // explained in one invocation and not the other.
             let notes = append_oom_serve_note(
                 notes,
                 engine_serves_vllm,
@@ -5832,9 +5849,16 @@ fn simulate_oom_managed_launch(
 /// launched the process (`already_running` is excluded) so healthy deployments,
 /// unrelated failures, and an unrelated invocation that merely reused an
 /// already-live service are never misattributed. The OOM-signature check in
-/// [`serve_summary::oom_memory_note`] narrows it further. Also skips a note
-/// whose hint text is already present in `notes` (the pre-launch low-VRAM
-/// warning may have added it) so the same fix is never printed twice.
+/// [`serve_summary::oom_memory_note`] narrows it further.
+///
+/// When the pre-launch low-VRAM warning already put the shared
+/// `--gpu-memory-utilization` hint in `notes`, the *fragment* is dropped from
+/// the new note rather than the note being suppressed: low VRAM leading to an
+/// OOM is exactly the case this note exists for, and everything else it carries
+/// — the confirmation that this attempt really did run out of GPU memory, the
+/// "if the model doesn't fit, lowering the reservation won't help" branch, and
+/// the `rocm diagnose --symptom` command with the user's real failing line — is
+/// absent from the pre-launch guess.
 fn append_oom_serve_note(
     mut notes: Vec<String>,
     engine_is_vllm: bool,
@@ -5845,15 +5869,13 @@ fn append_oom_serve_note(
     if !engine_is_vllm || already_running || !serve_summary::serve_failed_to_become_ready(status) {
         return notes;
     }
-    // Cheap guard first: if the shared hint is already in `notes` (added by the
-    // pre-launch low-VRAM warning) there is nothing to add, so skip the log read
-    // entirely.
+    // Whether the pre-launch low-VRAM warning already printed the shared hint.
+    // This de-duplicates that one fragment at composition time; it is not a
+    // reason to skip the note, which carries the OOM confirmation and the
+    // diagnose command the pre-launch warning has no way to know about.
     let already_hinted = notes
         .iter()
         .any(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT));
-    if already_hinted {
-        return notes;
-    }
     let Some(log_path) = log_path else {
         return notes;
     };
@@ -5867,7 +5889,7 @@ fn append_oom_serve_note(
         "service log",
     )
     .join("\n");
-    if let Some(note) = serve_summary::oom_memory_note(status, &log_tail) {
+    if let Some(note) = serve_summary::oom_memory_note(status, &log_tail, already_hinted) {
         notes.push(note);
     }
     notes
@@ -17129,13 +17151,19 @@ fn existing_live_managed_service(
 /// `model_ref`, decided from the records alone — no canonical model id, and so
 /// no engine round-trip, required.
 ///
-/// Cheap pre-gate for the reuse detection in `serve`. Everything that check does
-/// is real engine work: a `ResolveModel` round-trip and, for a self-managing
+/// Pre-gate for the reuse detection in `serve`. Everything that check does is
+/// real engine work: a `ResolveModel` round-trip and, for a self-managing
 /// engine, an [`ensure_self_managed_engine_ready`] that may print
 /// "Preparing <engine> for GPU serving..." and install. That work runs ahead of
 /// the no-usable-GPU pre-flight, so it must be reserved for invocations that can
 /// actually reuse something: keying on the engine alone let a live service for an
 /// unrelated model pull an install in front of the bail on a GPU-less host.
+///
+/// Cheap only *relative* to what it guards — it is not free. `load_managed_services`
+/// refreshes liveness for every record before this function's model filter is
+/// applied, so each live record can cost an endpoint listing probe, an inference
+/// probe, and a `record.write()`. It buys no engine round-trip and no install;
+/// it does not buy "no I/O".
 ///
 /// Matching uses [`service_model_names_match`] — the same lenient relation the
 /// service-listing surfaces already use to tie a user-typed name to a record — so
@@ -26891,10 +26919,13 @@ install therock";
     }
 
     #[test]
-    fn append_oom_serve_note_does_not_repeat_a_hint_already_in_the_notes() {
-        // When the pre-launch low-VRAM warning already carried the shared
-        // utilization hint, a post-failure OOM confirmation must not print the
-        // exact same hint text a second time.
+    fn append_oom_serve_note_prints_the_shared_hint_exactly_once() {
+        // The pre-launch low-VRAM warning fired, the user proceeded, and the
+        // launch then OOMed -- the exact causal chain this note exists for. The
+        // shared hint must not be printed twice, but the note itself must still
+        // appear: it is the only place that confirms the attempt *did* run out
+        // of GPU memory, carries the model-too-large branch, and hands over the
+        // diagnose command with the user's own failing line.
         let log_path =
             std::env::temp_dir().join(format!("rocm-oom-note-{}-dedup.log", std::process::id()));
         fs::write(
@@ -26914,9 +26945,38 @@ install therock";
             Some(&log_path),
         );
         let _ = fs::remove_file(&log_path);
+
+        // The hint text appears exactly once across the whole summary.
+        let hinting = notes
+            .iter()
+            .filter(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT))
+            .count();
         assert_eq!(
-            notes, pre_launch_notes,
-            "the hint must not be duplicated once it is already present: {notes:?}"
+            hinting, 1,
+            "the shared hint must be printed exactly once: {notes:?}"
+        );
+
+        // ...and the OOM note is still added, with the content the pre-launch
+        // warning cannot carry.
+        assert_eq!(
+            notes.len(),
+            pre_launch_notes.len() + 1,
+            "the OOM note must still be appended, not suppressed: {notes:?}"
+        );
+        let oom_note = notes.last().expect("the OOM note is the appended note");
+        assert!(
+            oom_note.contains("ran out of GPU memory"),
+            "the note must confirm this attempt really did OOM: {oom_note}"
+        );
+        assert!(
+            oom_note.contains("smaller or quantized model"),
+            "the model-too-large branch must survive de-duplication: {oom_note}"
+        );
+        assert!(
+            oom_note.contains(
+                "rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory."
+            ),
+            "the note must route the user's real failing line to diagnose: {oom_note}"
         );
     }
 

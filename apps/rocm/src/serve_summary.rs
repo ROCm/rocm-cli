@@ -208,10 +208,23 @@ pub(crate) fn serve_failed_to_become_ready(status: &str) -> bool {
 /// earlier OOM for a later one), matching the `rocm diagnose` vLLM-OOM entry it
 /// then routes the user to. It shares
 /// [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] verbatim with the pre-launch
-/// low-VRAM note so both surfaces point at the same fix and the pre-launch
-/// warning can dedup against it.
-pub(crate) fn oom_memory_note(status: &str, log_tail: &str) -> Option<String> {
-    if !serve_failed_to_become_ready(status) || !rocm_core::vllm_log_shows_oom(log_tail) {
+/// low-VRAM note so both surfaces point at the same fix.
+///
+/// `hint_already_present` says that shared hint is already in the summary's
+/// notes (the pre-launch low-VRAM warning added it), and de-duplicates *that
+/// fragment only*: the rest of the note is new information the pre-launch guess
+/// does not carry — that this attempt really did run out of GPU memory rather
+/// than might, the "if the model doesn't fit, lowering the reservation won't
+/// help" branch, and the `rocm diagnose --symptom` command with the user's own
+/// failing line. Low VRAM leading to an OOM is the causal chain this note exists
+/// for, so suppressing the whole note there would silence it on its most likely
+/// trigger.
+pub(crate) fn oom_memory_note(
+    status: &str,
+    log_tail: &str,
+    hint_already_present: bool,
+) -> Option<String> {
+    if !serve_failed_to_become_ready(status) {
         return None;
     }
     // The symptom is vLLM's own subprocess output and it lands inside a
@@ -221,18 +234,28 @@ pub(crate) fn oom_memory_note(status: &str, log_tail: &str) -> Option<String> {
     // [`rocm_core::quotable_in_single_quotes`] for why this rejects rather than
     // escapes. The engine's startup-failure hint guards the same text the same
     // way.
-    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail);
+    //
+    // `None` is also the "this tail shows no OOM" answer, so it doubles as the
+    // OOM gate: asking `vllm_log_shows_oom` first would evaluate the same
+    // predicate over the same string twice.
+    let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail)?;
     let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
         symptom
     } else {
         rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
     };
+    // Printed as its own sentence, or omitted when the pre-launch warning
+    // already printed the identical text.
+    let hint = if hint_already_present {
+        String::new()
+    } else {
+        format!("{} ", rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT)
+    };
     Some(format!(
-        "the serve attempt ran out of GPU memory. {} If the model simply does not fit in this \
+        "the serve attempt ran out of GPU memory. {hint}If the model simply does not fit in this \
          GPU's VRAM, lowering the reservation will not help — serve a smaller or quantized model \
          instead (rocm-cli serves one model on a single GPU). To have the tool pick the \
-         case-appropriate fix, run `rocm diagnose --symptom '{symptom}'`.",
-        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
+         case-appropriate fix, run `rocm diagnose --symptom '{symptom}'`."
     ))
 }
 
@@ -509,6 +532,7 @@ mod tests {
         let note = oom_memory_note(
             "starting",
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            false,
         )
         .expect("an OOM failure must produce a note");
         assert!(note.contains("--gpu-memory-utilization"), "{note}");
@@ -531,14 +555,67 @@ mod tests {
     fn oom_note_is_withheld_for_a_ready_serve_or_a_clean_log() {
         // A serve that became ready is healthy even if the log mentions memory.
         assert_eq!(
-            oom_memory_note("ready", "torch.OutOfMemoryError: HIP out of memory"),
+            oom_memory_note("ready", "torch.OutOfMemoryError: HIP out of memory", false),
             None
         );
         // A failure with no OOM signature must not be given memory advice.
         assert_eq!(
-            oom_memory_note("starting", "OSError: model weights not found"),
+            oom_memory_note("starting", "OSError: model weights not found", false),
             None
         );
+        // ...and neither case becomes advisable just because the pre-launch
+        // low-VRAM warning already fired.
+        assert_eq!(
+            oom_memory_note("ready", "torch.OutOfMemoryError: HIP out of memory", true),
+            None
+        );
+        assert_eq!(
+            oom_memory_note("starting", "OSError: model weights not found", true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_shared_hint_is_de_duplicated_without_losing_the_rest_of_the_oom_note() {
+        // The pre-launch low-VRAM warning already printed the shared hint
+        // verbatim, and low VRAM leading to an OOM is the causal chain this note
+        // exists for -- so what must be dropped is that one fragment, not the
+        // note. Everything else it carries is information the pre-launch guess
+        // does not have: that this attempt actually ran out of GPU memory, the
+        // "if the model doesn't fit, lowering the reservation won't help"
+        // branch, and the diagnose command with the user's real failing line.
+        let log_tail = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let note = oom_memory_note("starting", log_tail, true)
+            .expect("an OOM failure must still carry a note when the hint was already printed");
+
+        // The hint the pre-launch warning printed appears zero further times...
+        assert!(
+            !note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT),
+            "the shared hint must not be printed a second time: {note}"
+        );
+        // ...and the content only this note has must all survive.
+        assert!(
+            note.contains("ran out of GPU memory"),
+            "the note must confirm this attempt really did OOM: {note}"
+        );
+        assert!(
+            note.contains("smaller or quantized model"),
+            "the model-too-large branch is absent from the pre-launch hint: {note}"
+        );
+        assert_eq!(
+            quoted_symptom_argument(&note),
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            "the diagnose command must carry the user's own failing line: {note}"
+        );
+
+        // Counted across the whole summary, the hint is printed exactly once:
+        // the pre-launch note keeps it, the OOM note does not repeat it.
+        let pre_launch = rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned();
+        let printed = [pre_launch, note]
+            .iter()
+            .filter(|line| line.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT))
+            .count();
+        assert_eq!(printed, 1, "the shared hint must appear exactly once");
     }
 
     /// The `--symptom` value the note actually hands the user, read back out of
@@ -567,7 +644,8 @@ mod tests {
             "ERROR 09-14 12:00:01 engine.py:389] torch.OutOfMemoryError: HIP out of memory. ",
             "Tried to allocate 7.21 GiB. GPU 0 can't allocate the model's weights.\n"
         );
-        let note = oom_memory_note("starting", log_tail).expect("an OOM failure must carry a note");
+        let note =
+            oom_memory_note("starting", log_tail, false).expect("an OOM failure must carry a note");
 
         // The rendered command must be one intact single-quoted argument: no
         // byte the vLLM subprocess printed may close the quote and land outside
@@ -605,7 +683,8 @@ mod tests {
         // vLLM's logger colourises; an ANSI-coloured OOM line must not repaint
         // the user's terminal from inside rocm-cli's own serve summary.
         let log_tail = "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}";
-        let note = oom_memory_note("starting", log_tail).expect("an OOM failure must carry a note");
+        let note =
+            oom_memory_note("starting", log_tail, false).expect("an OOM failure must carry a note");
         assert!(
             !note.chars().any(|c| c.is_control() && c != '\n'),
             "no control byte may survive into the printed note: {note:?}"
@@ -630,6 +709,7 @@ mod tests {
         let note = oom_memory_note(
             "starting",
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            false,
         )
         .expect("an OOM failure must carry a note");
         assert_eq!(
@@ -645,6 +725,7 @@ mod tests {
         if let Some(note) = oom_memory_note(
             &summary.status,
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            false,
         ) {
             summary.notes.push(note);
         }

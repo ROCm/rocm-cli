@@ -7768,9 +7768,17 @@ pub fn resolve_amd_smi_binary() -> OsString {
 /// weights of most models people actually serve, so it trades one startup
 /// failure for another. Pinned by
 /// `the_utilization_hint_example_matches_the_recipe_command`.
+///
+/// The stated bound must be the one `rocm serve` actually accepts:
+/// `parse_gpu_memory_utilization` rejects `<= 0` and accepts `1`, so the domain
+/// is `(0, 1]` and the older `<0-1>` wording wrongly advertised `0`. Pinned by
+/// `the_utilization_hint_states_the_bound_the_parser_accepts`, because this
+/// wording has already been reverted once by a merge that resolved the line from
+/// a pre-fix tree.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
 
 /// Whether a vLLM startup-log tail carries a genuine out-of-memory failure.
 ///
@@ -7797,14 +7805,21 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
     })
 }
 
-/// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to.
+/// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to, or
+/// `None` when the tail carries no OOM line to route.
 ///
-/// Prefers the user's actual failing line (so `diagnose` echoes their real
-/// error) and falls back to [`VLLM_OOM_CANONICAL_SYMPTOM`] when no single line
-/// clears the checker's threshold, so the printed command always reports a
-/// cause. Shared by the vLLM engine's post-failure hint and the `rocm` CLI serve
-/// summary so both surfaces route to `diagnose` identically instead of
-/// hand-rolling the line selection twice.
+/// Returns the user's actual failing line (so `diagnose` echoes their real
+/// error), selected with the *same* rule [`vllm_log_shows_oom`] classifies the
+/// tail with, so whatever comes back is diagnosable by construction. Shared by
+/// the vLLM engine's post-failure hint and the `rocm` CLI serve summary so both
+/// surfaces route to `diagnose` identically instead of hand-rolling the line
+/// selection twice.
+///
+/// `None` *is* the "this tail is not an OOM" answer, so callers use it as the
+/// OOM gate directly rather than testing [`vllm_log_shows_oom`] first and then
+/// asking for the line: the two are the same predicate over the same string, so
+/// a caller that did both would evaluate it twice and carry a branch that can
+/// never be taken.
 ///
 /// The return value is *log text*, not a shell-safe token: some callers only
 /// display it. A caller that renders it inside a quoted command must gate it on
@@ -7813,16 +7828,14 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// instead would impose the command-builder's constraint on the display-only
 /// callers, silently withholding the user's real error from text that is never
 /// pasted anywhere.
-pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> String {
+#[must_use]
+pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
     log_tail
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty() && vllm_log_shows_oom(line))
-        .map_or_else(
-            || VLLM_OOM_CANONICAL_SYMPTOM.to_owned(),
-            |line| format!("vllm: {line}"),
-        )
+        .map(|line| format!("vllm: {line}"))
 }
 
 /// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
@@ -12633,6 +12646,46 @@ last_installed_runtime_id = "therock-release"
         ));
         assert!(!vllm_log_shows_oom("OSError: model weights not found"));
         assert!(!vllm_log_shows_oom(""));
+    }
+
+    #[test]
+    fn vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom() {
+        // The selector and the classifier are one predicate: a tail
+        // `vllm_log_shows_oom` accepts always yields a line, and a tail it
+        // rejects always yields `None` — which is what lets callers use this as
+        // the OOM gate instead of asking the same question twice.
+        let tail = concat!(
+            "  File \"/opt/vllm/worker.py\", line 212, in load_model\n",
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+            "INFO shutting down worker\n"
+        );
+        assert_eq!(
+            vllm_oom_diagnose_symptom(tail).as_deref(),
+            Some("vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."),
+            "the user's own failing line must be routed into `rocm diagnose --symptom`"
+        );
+        // Whatever comes back must be diagnosable, or the printed command would
+        // report no known cause.
+        let symptom = vllm_oom_diagnose_symptom(tail).expect("an OOM tail selects a line");
+        assert!(diagnose::vllm_oom_symptom_is_diagnosable(&symptom));
+        // The *last* OOM line wins: a tail ends with the failure that killed the
+        // launch, and an earlier retry's line would misreport it.
+        assert_eq!(
+            vllm_oom_diagnose_symptom("RuntimeError: hipErrorOutOfMemory\nHIP OUT OF MEMORY\n")
+                .as_deref(),
+            Some("vllm: HIP OUT OF MEMORY")
+        );
+        // No OOM line, no symptom — including the sub-threshold shapes the
+        // shared classifier rejects, which must not be reported as a cause.
+        assert_eq!(
+            vllm_oom_diagnose_symptom("OSError: model weights not found"),
+            None
+        );
+        assert_eq!(
+            vllm_oom_diagnose_symptom("Out of memory: Killed process 4242 (python)"),
+            None
+        );
+        assert_eq!(vllm_oom_diagnose_symptom(""), None);
     }
 
     #[test]

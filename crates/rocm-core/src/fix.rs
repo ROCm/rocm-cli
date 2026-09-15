@@ -1590,6 +1590,30 @@ mod tests {
     }
 
     #[test]
+    fn the_utilization_hint_states_the_bound_the_parser_accepts() {
+        // `rocm serve`'s `parse_gpu_memory_utilization` rejects `<= 0` and
+        // accepts `1`, so the domain is (0, 1]. `<0-1>` advertises `0`, and this
+        // hint prints in three places (pre-launch note, engine OOM hint, and the
+        // `fix-16-vllm-oom` summary), so a user who OOMs, reads the tool's own
+        // advice and passes `0` is rejected by the same tool.
+        //
+        // Pinned because the wording was silently reverted once: it was fixed on
+        // this branch, then a merge resolved the same line from a pre-fix tree.
+        // Nothing went red, because the only pin on this const checked the
+        // worked example (`0.5`) and not the range text.
+        const FLAG: &str = "--gpu-memory-utilization";
+        let hint = crate::VLLM_GPU_MEMORY_UTILIZATION_HINT;
+        assert!(
+            hint.contains(&format!("{FLAG} <fraction greater than 0 and at most 1>")),
+            "the hint must state the bound `{FLAG}` actually accepts:\n{hint}"
+        );
+        assert!(
+            !hint.contains("<0-1>"),
+            "`<0-1>` wrongly advertises 0, which `{FLAG}` rejects:\n{hint}"
+        );
+    }
+
+    #[test]
     fn auto_applicable_recipes_have_a_runner() {
         for r in RECIPES {
             assert_eq!(
