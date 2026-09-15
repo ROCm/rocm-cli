@@ -668,6 +668,24 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 
 // ── EAI-7960: scripted metrics / validity-window regression ────────────────
 
+/// Mirrors the daemon's production `instance_tick`
+/// (`crates/rocm-dash-daemon/src/runner.rs`). Sized so the held value's
+/// persistence window below is wide enough to distinguish "held correctly"
+/// (production clears it after `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s)
+/// from the regression (cleared within about one tick).
+const INSTANCE_TICK: Duration = Duration::from_secs(2);
+
+/// The daemon's observation-validity window, `clamp(3 × instance_tick, 6 s, 30 s)`
+/// (`crates/rocm-dash-daemon/src/runner.rs`), evaluated at `INSTANCE_TICK` above:
+/// `3 × 2 s = 6 s`, already inside the `[6 s, 30 s]` clamp bounds. Named so the
+/// clock-advance offset below is derived from it instead of a bare literal.
+const VALIDITY_WINDOW_SECS: u64 = 3 * INSTANCE_TICK.as_secs();
+
+/// One second past `VALIDITY_WINDOW_SECS`, guaranteeing the clock advance in
+/// `validity_window_elapsed` below is provably past the boundary rather than
+/// landing exactly on it.
+const CLOCK_ADVANCE_PAST_VALIDITY_SECS: u64 = VALIDITY_WINDOW_SECS + 1;
+
 /// Start the mock in Growing mode so the daemon builds a positive gen_tps
 /// baseline before the scenario injects the Failure transition.
 #[given("a managed model exposes scripted serving metrics")]
@@ -732,25 +750,28 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    // Allow one TUI render cycle (50 ms >> 20 ms poll) so the failure
-    // snapshot is painted before the assertion reads the screen.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 /// EAI-7960 principal regression assertion.
 ///
 /// The scenario's injected logical clock cannot cross the validity boundary
 /// because the host was descheduled; only an explicit scenario advance can.
+/// The daemon's failed-scrape state is confirmed above; this step asserts
+/// that "tok/s" *persists* on screen across an `INSTANCE_TICK` window rather
+/// than merely appearing, since it's already on screen from the pre-failure
+/// baseline and a "poll until true" check would pass even if the regression
+/// cleared it immediately after this step started polling.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
-    assert!(
-        screen.contains("tok/s"),
-        "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
-         after the first failed scrape instead of being held for the validity \
-         window (clamp(3 × instance_tick, 6 s, 30 s)).\n\n\
-         Last screen:\n{screen}"
-    );
+    session(world)
+        .assert_screen_persists("tok/s", INSTANCE_TICK)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
+                 after the first failed scrape instead of being held for the validity \
+                 window (clamp(3 × instance_tick, 6 s, 30 s)): {e}"
+            )
+        });
 }
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
@@ -766,8 +787,11 @@ async fn validity_window_elapsed(world: &mut E2eWorld) {
         .as_ref()
         .expect("scenario has no isolated root")
         .path();
-    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
-        .expect("failed to advance dashboard test clock");
+    std::fs::write(
+        root.join(DASH_CLOCK_OFFSET_FILE),
+        CLOCK_ADVANCE_PAST_VALIDITY_SECS.to_string(),
+    )
+    .expect("failed to advance dashboard test clock");
 
     let budget = default_timeout();
     let deadline = Instant::now() + budget;
@@ -778,20 +802,24 @@ async fn validity_window_elapsed(world: &mut E2eWorld) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 /// Assert that gen_tps is no longer rendered after the scenario advances the
 /// injected clock beyond the validity boundary and observes the next scrape.
+/// As above, the daemon's expiry is confirmed by the scrape-count poll; this
+/// polls for the TUI's own redraw of that expiry instead of assuming a fixed
+/// sleep bounds the render loop under CI's host scheduling contention.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
-    assert!(
-        !screen.contains("tok/s"),
-        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
-         validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
-         Expected the daemon to have cleared the held value and the TUI to \
-         show the unavailable placeholder.\n\n\
-         Last screen:\n{screen}"
-    );
+    session(world)
+        .wait_for_screen_gone("tok/s", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
+                 validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed. \
+                 Expected the daemon to have cleared the held value and the TUI to \
+                 show the unavailable placeholder: {e}"
+            )
+        });
 }

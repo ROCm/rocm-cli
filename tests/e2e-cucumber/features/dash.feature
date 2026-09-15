@@ -77,6 +77,9 @@ Feature: Interactive dashboard
     # must NOT immediately clear the displayed "tok/s" value. The test-only
     # logical clock advances with daemon cycles rather than runner wall time, so
     # host scheduling cannot consume the validity window before this assertion.
+    # This step only holds for one INSTANCE_TICK (2s) of the real 6s window;
+    # crates/rocm-dash-daemon/tests/telemetry_contract.rs covers the full
+    # clamp(3 × instance_tick, 6 s, 30 s) boundary.
     Given a managed model exposes scripted serving metrics
     And dashboard observation time is deterministic
     When the user opens the dashboard

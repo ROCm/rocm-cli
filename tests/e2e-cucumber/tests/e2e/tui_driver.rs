@@ -476,6 +476,134 @@ impl TuiSession {
         }
     }
 
+    /// Poll the current screen until it no longer contains `marker`, or fail
+    /// with a deadline that includes the last screen for diagnosis.
+    ///
+    /// The inverse of [`wait_for_screen`](Self::wait_for_screen): a step that
+    /// confirms a backend state change (e.g. via a mock server counter) and
+    /// then reads the screen once is racing the TUI's own render cadence,
+    /// which redraws on its own schedule independent of that state change.
+    /// Polling gives the render loop the full timeout budget to catch up
+    /// instead of assuming a fixed delay is always enough.
+    ///
+    /// Liveness (panic / exit) is checked *before* the absence check, unlike
+    /// `wait_for_screen`'s presence-first ordering: `vt100` clears its parsed
+    /// screen on the alternate-screen-exit escape, so a dashboard that
+    /// crashes or quits mid-wait would otherwise make `marker` vanish for the
+    /// wrong reason and be misreported as a successful "gone" result.
+    pub async fn wait_for_screen_gone(
+        &mut self,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                // The process exiting is never a legitimate "gone" outcome for
+                // this helper; drain briefly so the error reflects the final
+                // buffered frame rather than a stale mid-drain snapshot.
+                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                while Instant::now() < drain_deadline
+                    && !self
+                        .reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                if let Some(panic_message) = self.take_reader_panic() {
+                    return Err(format!(
+                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                        self.framed_screen()
+                    ));
+                }
+                return Err(format!(
+                    "process exited ({status:?}) while {marker:?} was still on screen.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if !self.screen_text().contains(marker) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Poll the screen for the full `duration`, failing fast if `marker`
+    /// disappears (or the process panics/exits) before the window elapses.
+    ///
+    /// This is the "survives an event" counterpart to `wait_for_screen`'s
+    /// "eventually becomes true": `wait_for_screen` returns as soon as
+    /// `marker` is present, which a stale pre-event frame can already
+    /// satisfy. Use this when the assertion is that a value is *held*
+    /// across an interval, not merely that it appears at some point within
+    /// it.
+    pub async fn assert_screen_persists(
+        &mut self,
+        marker: &str,
+        duration: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + duration;
+        loop {
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while asserting {marker:?} persists: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                // The process exiting is never a legitimate "persisted" outcome
+                // here; drain briefly so the error reflects the final buffered
+                // frame rather than a stale mid-drain snapshot.
+                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                while Instant::now() < drain_deadline
+                    && !self
+                        .reader
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                if let Some(panic_message) = self.take_reader_panic() {
+                    return Err(format!(
+                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                        self.framed_screen()
+                    ));
+                }
+                return Err(format!(
+                    "process exited ({status:?}) while asserting {marker:?} persists.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if !self.screen_text().contains(marker) {
+                return Err(format!(
+                    "{marker:?} disappeared before the {duration:?} persistence window elapsed.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).
