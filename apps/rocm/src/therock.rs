@@ -2228,6 +2228,16 @@ fn unresolved_active_default_relation_text(
     // Reached only when `active_runtime_key` is also set and also unresolved, so
     // this is always a continuation of the key clause, never a sentence by
     // itself. The count is 0 or >1 for the reason given on the parameter.
+    //
+    // Pinned rather than left in prose because the else branch below states
+    // "no installed runtime manifest matches it" as fact: at exactly 1 that
+    // sentence is false, and the operator would be told nothing matched the
+    // recorded default while a manifest did — sending them to re-register a
+    // runtime that is already there.
+    debug_assert_ne!(
+        default_runtime_id_match_count, 1,
+        "an exactly-one match is what `current_runtime_manifest` resolves, so this function is unreachable with it"
+    );
     let also_unresolved_id = |id: &str| {
         if default_runtime_id_match_count > 1 {
             format!(
@@ -9399,21 +9409,9 @@ echo Python 3.12.10
         );
         write_active_test_runtime(&paths, &manifest)?;
 
-        let manifest_path = runtime_manifest_path(&paths, &manifest.runtime_key);
-        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        value
-            .as_object_mut()
-            .expect("manifest is a JSON object")
-            .remove("family_source")
-            .expect("manifest carries family_source");
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&value)?)?;
-
-        // Precondition: the file still reads, so this is not the I/O path.
-        assert!(fs::read(&manifest_path).is_ok());
-        assert!(
-            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&manifest_path)?).is_err(),
-            "the test fixture must be unparsable, or this asserts nothing"
-        );
+        // The helper carries the preconditions that make this the parse path and
+        // not the I/O path: the file still reads, and it no longer deserializes.
+        let _ = make_test_runtime_manifest_unparsable(&paths, &manifest.runtime_key)?;
 
         let relation = active_default_runtime_relation(
             &paths,

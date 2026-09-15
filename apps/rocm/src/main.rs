@@ -1553,13 +1553,25 @@ fn execute_freeform_next_action(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<()> {
-    let action = prepare_freeform_execution(request, paths, config)?;
-    print!("{}", render_freeform_execution_header(&action));
+    let execution = prepare_freeform_execution(request, paths, config)?;
+    print!("{}", render_freeform_execution_header(&execution));
 
     let mut argv = vec!["rocm".to_owned()];
-    argv.extend(action.args);
+    argv.extend(execution.action.args);
     let cli = Cli::try_parse_from(argv)?;
     dispatch(cli)
+}
+
+/// The argv `execute_freeform_next_action` is about to dispatch, plus whether
+/// [`apply_freeform_execution_consent`] added a flag to it.
+///
+/// The flag is tracked rather than re-detected from `action.args` because the
+/// execution header uses it to tell the operator *why* its `tool_call:` differs
+/// from the one in the request plan above. Looking for the flag in the final
+/// argv would report "added here" for a plan that already carried it.
+pub(crate) struct FreeformExecution {
+    pub action: FreeformPlanAction,
+    pub consent_added: bool,
 }
 
 /// Everything `execute_freeform_next_action` decides before it hands the argv to
@@ -1573,12 +1585,15 @@ fn prepare_freeform_execution(
     request: &str,
     paths: &AppPaths,
     config: &RocmCliConfig,
-) -> Result<FreeformPlanAction> {
+) -> Result<FreeformExecution> {
     let mut action = freeform_plan_next_action_with_context(request, paths, config)
         .context("natural-language plan did not produce a structured tool call")?;
     validate_freeform_execution_action(&action)?;
-    apply_freeform_execution_consent(&mut action.args);
-    Ok(action)
+    let consent_added = apply_freeform_execution_consent(&mut action.args);
+    Ok(FreeformExecution {
+        action,
+        consent_added,
+    })
 }
 
 /// Grant the generated tool call the consent the operator already gave on the
@@ -1621,13 +1636,25 @@ fn prepare_freeform_execution(
 /// reach `render_structured_request_plan`, which the no-`--yes` review path
 /// shares, and would print a pre-approved command to a human being asked to
 /// review it — the case the paragraph above rules out.
-fn apply_freeform_execution_consent(args: &mut Vec<String>) {
+///
+/// So the difference stays deliberate but stops being unexplained: this returns
+/// whether it actually added the flag, and the execution section says so in
+/// words. A doc comment reaches the next reader of this file; the operator
+/// looking at two `tool_call:` lines that disagree is the one who needs it.
+///
+/// Returns `true` only when the flag was not already present, so the disclosure
+/// is about a flag this function added and not one the argv arrived with.
+fn apply_freeform_execution_consent(args: &mut Vec<String>) -> bool {
     let is_install_sdk = args.first().is_some_and(|arg| arg == "install")
         && args.get(1).is_some_and(|arg| arg == "sdk");
     if !is_install_sdk || args.iter().any(|arg| arg == "--dry-run") {
-        return;
+        return false;
     }
+    let already_present = args
+        .iter()
+        .any(|arg| arg == "--approve-replacing-active-default");
     ensure_flag(args, "--approve-replacing-active-default");
+    !already_present
 }
 
 fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()> {
@@ -1645,7 +1672,8 @@ fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()>
     Ok(())
 }
 
-fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
+fn render_freeform_execution_header(execution: &FreeformExecution) -> String {
+    let action = &execution.action;
     let mut output = String::new();
     let _ = writeln!(output);
     let _ = writeln!(output, "execution");
@@ -1663,6 +1691,20 @@ fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
         "  tool_call: {}",
         format_structured_tool_call("rocm", &action.args)
     );
+    // Printed only when the two `tool_call:` lines actually disagree, and
+    // immediately under the one that runs. Without it the operator sees a
+    // consent flag on the executed command that the request plan above never
+    // showed, with nothing on screen saying where it came from — the natural
+    // reading being that something was approved behind their back rather than
+    // that their own `--yes` was carried through.
+    if execution.consent_added {
+        let _ = writeln!(
+            output,
+            "  note: --approve-replacing-active-default was added here from your --yes, so this \
+             tool_call differs from the one under `request plan` above; nothing was approved \
+             between them."
+        );
+    }
     output
 }
 
@@ -12133,7 +12175,16 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             // and re-grant the system-package consent `76c6aa3c` removed. The
             // strip runs before the argv is rendered for human approval, so what
             // is shown is still what runs.
-            args.retain(|arg| arg != "--yes");
+            //
+            // The `--yes=...` form is stripped too. Clap rejects an attached
+            // value on this flag today, so an exact-match strip happens to be
+            // airtight — but only by borrowing a property of clap's error
+            // taxonomy that nothing here owns. Giving `--yes` `num_args`, or a
+            // clap release that starts accepting `--yes=true` on a bare `bool`,
+            // would silently restore the sudo consent this strip exists to
+            // remove. Matching the prefix keeps the guarantee local to this
+            // function.
+            args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
             // Withheld on `--dry-run`, which returns before the consent gate and
             // so needs no consent: `rocmd` and dash-tui omit it there for the
             // same reason, and a preview should not be recorded as carrying an
@@ -22107,8 +22158,9 @@ mod tests {
         // Through the real pre-dispatch path, not the injector in isolation:
         // `execute_freeform_next_action` is this plus the header render and
         // `dispatch`, so dropping the injection from the pipeline fails here.
-        let action = prepare_freeform_execution(request, &test_app_paths(), &config)
+        let execution = prepare_freeform_execution(request, &test_app_paths(), &config)
             .expect("install request should prepare for execution");
+        let action = &execution.action;
 
         assert_eq!(
             format_structured_tool_call("rocm", &action.args),
@@ -22120,13 +22172,23 @@ mod tests {
         assert!(!action.args.iter().any(|arg| arg == "--yes"));
         // The header renders after injection, so the printed tool call is the
         // argv that actually runs.
+        let rendered = render_freeform_execution_header(&execution);
+        assert!(rendered.contains("--approve-replacing-active-default"));
+        // And the operator is told why this `tool_call:` carries a consent flag
+        // the `request plan` section above it did not show. The plan assertion at
+        // the top of this test is what makes the two lines differ here, so the
+        // disclosure and the difference are pinned by the same test.
         assert!(
-            render_freeform_execution_header(&action)
-                .contains("--approve-replacing-active-default")
+            execution.consent_added,
+            "the plan arrived unapproved, so the injector must report adding the flag"
+        );
+        assert!(
+            rendered.contains("was added here from your --yes"),
+            "the execution section must explain the differing tool_call: {rendered}"
         );
         // Re-parsing must reach `install()` with the consent actually set.
         let mut argv = vec!["rocm".to_owned()];
-        argv.extend(action.args);
+        argv.extend(execution.action.args);
         let cli = Cli::try_parse_from(argv).expect("generated argv should parse");
         match cli.command {
             Some(Command::Install {
@@ -22153,7 +22215,7 @@ mod tests {
             "sdk".to_owned(),
             "--dry-run".to_owned(),
         ];
-        apply_freeform_execution_consent(&mut dry_run);
+        assert!(!apply_freeform_execution_consent(&mut dry_run));
         assert_eq!(
             dry_run,
             vec![
@@ -22171,17 +22233,19 @@ mod tests {
             vec!["comfyui".to_owned(), "install".to_owned()],
         ] {
             let before = args.clone();
-            apply_freeform_execution_consent(&mut args);
+            assert!(!apply_freeform_execution_consent(&mut args));
             assert_eq!(args, before);
         }
 
-        // Idempotent: a plan that already carries the flag is not given it twice.
+        // Idempotent: a plan that already carries the flag is not given it twice,
+        // and reports that it added nothing — the execution section must not
+        // claim to have added a flag the argv arrived with.
         let mut already = vec![
             "install".to_owned(),
             "sdk".to_owned(),
             "--approve-replacing-active-default".to_owned(),
         ];
-        apply_freeform_execution_consent(&mut already);
+        assert!(!apply_freeform_execution_consent(&mut already));
         assert_eq!(
             already
                 .iter()
@@ -22196,13 +22260,22 @@ mod tests {
         let action =
             freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
-        let rendered = render_freeform_execution_header(&action);
+        let rendered = render_freeform_execution_header(&FreeformExecution {
+            action,
+            consent_added: false,
+        });
 
         assert!(rendered.contains("execution"));
         assert!(rendered.contains("approval: granted by --yes"));
         assert!(rendered.contains(
             "tool_call: rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
         ));
+        // Nothing was injected on this path, so the two `tool_call:` lines agree
+        // and the disclosure would be noise that contradicts the plan above.
+        assert!(
+            !rendered.contains("was added here"),
+            "the note must be scoped to an argv this surface actually changed: {rendered}"
+        );
     }
 
     #[test]
@@ -22627,20 +22700,59 @@ mod tests {
     }
 
     #[test]
-    fn install_sdk_yes_rejects_an_attached_value_so_the_chat_strip_cannot_be_evaded() {
-        // The chat arm strips a model-supplied `--yes` by exact string match, so
-        // that strip is only airtight because clap refuses the `=`-form: if
-        // `--yes=true` parsed, a model could smuggle the system-package/sudo
-        // consent past `args.retain(|arg| arg != "--yes")` and into a spawn with
-        // null stdin and no terminal to answer a password prompt. `--yes` on
-        // `install sdk` is a bare `bool` today, which is what produces the
-        // rejection; giving it `num_args` later would silently re-grant that
-        // consent, so pin the rejection here rather than leaving it implicit.
+    fn chat_install_sdk_strips_a_model_supplied_yes_with_an_attached_value() {
+        // `--yes=true` is a model-supplied argv that reaches the chat arm intact:
+        // neither `canonicalize_chat_rocm_command` nor
+        // `validate_chat_rocm_command_safety` splits or rejects it. If the strip
+        // only matched `--yes` exactly, the flag would survive into a null-stdin
+        // spawn and re-grant the system-package/sudo consent `76c6aa3c` removed,
+        // on a spawn with no terminal to answer the password prompt.
+        let classify = |args: &[&str]| -> Vec<String> {
+            let action = chat_rocm_command_action_from_args(
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+            .expect("install sdk should classify");
+            let ChatRocmCommandAction::Approval { args, .. } = action else {
+                panic!("install sdk is a mutating command");
+            };
+            args
+        };
+
+        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
+            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", attached]);
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--yes")),
+                "`{attached}` must not survive the chat strip, got {args:?}"
+            );
+            assert_eq!(
+                args,
+                vec![
+                    "install".to_owned(),
+                    "sdk".to_owned(),
+                    "--prefix".to_owned(),
+                    "/tmp/therock".to_owned(),
+                    "--approve-replacing-active-default".to_owned(),
+                ],
+                "stripping `{attached}` must leave the rest of the argv and the narrow consent alone"
+            );
+        }
+
+        // A prefix match must not reach flags that merely start the same way, or
+        // the strip would silently drop arguments the model legitimately sent.
+        let args = classify(&["install", "sdk", "--prefix", "/tmp/--yes-not-a-flag"]);
+        assert!(
+            args.iter().any(|arg| arg == "/tmp/--yes-not-a-flag"),
+            "the strip must only match the flag itself, got {args:?}"
+        );
+
+        // Second layer, and only the second: clap also refuses an attached value
+        // on this flag, so even an unstripped `--yes=true` would not parse today.
+        // That is what the strip above deliberately stops depending on — pinned
+        // here so a later `num_args` on `--yes` shows up as a failure of the
+        // backstop rather than passing unnoticed.
         for attached in ["--yes=true", "--yes=1", "--yes=false"] {
             let error = match Cli::try_parse_from(["rocm", "install", "sdk", attached]) {
-                Ok(cli) => panic!(
-                    "`{attached}` must not parse; the chat `--yes` strip is an exact string match, got {cli:?}"
-                ),
+                Ok(cli) => panic!("`{attached}` must not parse, got {cli:?}"),
                 Err(error) => error,
             };
             assert_eq!(
@@ -22650,9 +22762,8 @@ mod tests {
             );
         }
 
-        // Control: the bare form the strip is written against does parse, so the
-        // assertions above are about the `=`-form and not about `--yes` being
-        // rejected outright.
+        // Control: the bare form does parse, so the assertions above are about
+        // the `=`-form and not about `--yes` being rejected outright.
         let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--yes"])
             .expect("the bare flag is the form the chat arm strips");
         match cli.command {
