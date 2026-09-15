@@ -417,11 +417,17 @@ mod tests {
 
     /// Every `confirmed <YYYY-MM-DD>` date in `text`, in order.
     ///
-    /// Line structure is thrown away first: both carriers wrap the sentence, so
-    /// the word and its date routinely land on different lines (and in the YAML
-    /// each of those lines starts with a `#`). Matching per line would find
-    /// nothing and the guard would pass by never looking. `re-confirmed` is
-    /// matched too — it ends with the same word.
+    /// Line structure is thrown away first, because the two carriers do not
+    /// agree on it: the workflow keeps the whole parenthetical on one line,
+    /// while the docs sentence wraps between `re-confirmed` and its date. A
+    /// per-line rule would therefore read the workflow and stop seeing the
+    /// docs — flattening is what keeps the two comparable. (The comment markers
+    /// go with it, since the YAML carrier is a comment block.)
+    ///
+    /// That mistake would not go quiet: the caller asserts each side holds
+    /// exactly one date, so a rule that stops seeing one of them fails on the
+    /// count rather than passing. `re-confirmed` is matched too — it ends with
+    /// the same word.
     fn confirmed_dates(text: &str) -> Vec<String> {
         let flat = text
             .lines()
