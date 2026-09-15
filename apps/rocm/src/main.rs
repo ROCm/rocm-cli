@@ -6835,29 +6835,25 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 return Ok(());
             }
 
-            let waited_on_confirmation = !yes;
-            if !yes {
+            let plan = if yes {
+                plan
+            } else {
                 if !interactive_terminal() {
                     bail!("runtimes uninstall requires --yes outside an interactive terminal");
                 }
-                if !confirm_uninstall()? {
-                    println!("runtime uninstall cancelled");
-                    return Ok(());
+                match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
+                    RuntimeUninstallConfirmation::Cancelled => {
+                        println!("runtime uninstall cancelled");
+                        return Ok(());
+                    }
+                    RuntimeUninstallConfirmation::Confirmed {
+                        plan: revalidated,
+                        config: reloaded,
+                    } => {
+                        config = *reloaded;
+                        *revalidated
+                    }
                 }
-            }
-
-            if waited_on_confirmation {
-                // The confirmation prompt can block indefinitely; reload the
-                // config another process may have written while we waited,
-                // so both revalidation and the apply step below see (and
-                // save over) the current on-disk state rather than clobbering
-                // a concurrent change with what we loaded before the prompt.
-                config = RocmCliConfig::load(&paths)?;
-            }
-            let plan = if waited_on_confirmation {
-                revalidate_runtime_uninstall_plan(&paths, &config, plan)?
-            } else {
-                plan
             };
             let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
 
@@ -7372,6 +7368,37 @@ fn revalidate_runtime_uninstall_plan(
         );
     }
     Ok(fresh)
+}
+
+enum RuntimeUninstallConfirmation {
+    Cancelled,
+    // `RuntimeUninstallPlan`/`RocmCliConfig` are large; box them so the two
+    // variants stay a similar size (clippy::large_enum_variant).
+    Confirmed {
+        plan: Box<RuntimeUninstallPlan>,
+        config: Box<RocmCliConfig>,
+    },
+}
+
+/// Runs the confirm-then-revalidate sequence used by an interactive
+/// `runtimes uninstall`: waits for the caller-supplied confirmation, then
+/// reloads config from disk and re-derives the plan against it, so a state
+/// change that happened while the (potentially indefinite) prompt was open
+/// cannot be applied against stale data.
+fn confirm_and_revalidate_runtime_uninstall(
+    paths: &AppPaths,
+    plan: RuntimeUninstallPlan,
+    confirm: impl FnOnce() -> Result<bool>,
+) -> Result<RuntimeUninstallConfirmation> {
+    if !confirm()? {
+        return Ok(RuntimeUninstallConfirmation::Cancelled);
+    }
+    let config = RocmCliConfig::load(paths)?;
+    let plan = revalidate_runtime_uninstall_plan(paths, &config, plan)?;
+    Ok(RuntimeUninstallConfirmation::Confirmed {
+        plan: Box::new(plan),
+        config: Box::new(config),
+    })
 }
 
 fn uninstall_runtime(
@@ -25270,13 +25297,13 @@ install therock";
     #[test]
     fn update_dry_run_does_not_require_apply() {
         Cli::try_parse_from(["rocm", "update", "--dry-run"])
-            .expect("update --dry-run should preview without --apply");
+            .expect("update --dry-run should parse without --apply");
         Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
             .expect("update --apply --dry-run should still parse");
         Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
-            .expect("update --dry-run --runtime should preview without --apply");
+            .expect("update --dry-run --runtime should parse without --apply");
         Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
-            .expect("update --dry-run --activate should preview without --apply");
+            .expect("update --dry-run --activate should parse without --apply");
     }
 
     #[test]
@@ -25286,16 +25313,20 @@ install therock";
         );
     }
 
+    // This only pins the free predicate's truth table. The actual dispatch
+    // wiring — that `rocm update --dry-run` really does reach the preview
+    // path without requiring --apply — is covered by e2e scenario
+    // `update-dry-run-reaches-preview-path-without-apply`
+    // (tests/e2e-cucumber/features/update.feature).
     #[test]
-    fn update_dry_run_routes_into_the_preview_path_without_apply() {
+    fn update_should_preview_or_apply_includes_dry_run() {
         assert!(
             !update_should_preview_or_apply(false, false),
             "plain `rocm update` should stay on the read-only status report"
         );
         assert!(
             update_should_preview_or_apply(false, true),
-            "`rocm update --dry-run` must route into apply_runtime_update, or --dry-run \
-             is silently ignored"
+            "the predicate must say dry-run alone should preview"
         );
         assert!(update_should_preview_or_apply(true, false));
         assert!(update_should_preview_or_apply(true, true));
@@ -28599,6 +28630,238 @@ ID_LIKE="suse opensuse"
         assert!(
             result.is_err(),
             "revalidation should refuse a plan whose install_root moved since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_runtime_id_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-runtime-id");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process re-registering this runtime_key under a
+        // different runtime_id while the uninstall confirmation prompt was
+        // waiting on the user. Both the registry entry and the local marker
+        // are updated together so `install_root_decision` stays `Remove` and
+        // only `runtime_id` differs from the plan the user approved.
+        let mut relabeled_manifest = manifest.clone();
+        relabeled_manifest.runtime_id = "therock-release:gfx120X-all-relabeled".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose runtime_id changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_was_active_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-was-active");
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+
+        // Simulate another process activating the target runtime while the
+        // uninstall confirmation prompt was waiting on the user.
+        config.active_runtime_key = Some(target.runtime_key);
+        config.save(&paths)?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose was_active changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_clears_default_runtime_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-clears-default");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+        assert!(
+            plan.clears_default_runtime,
+            "target is the only install with the stale default runtime_id"
+        );
+
+        // Simulate another process installing a sibling that shares the
+        // target's runtime_id while the uninstall confirmation prompt was
+        // waiting on the user; the default would then survive on that
+        // sibling instead of being cleared.
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-1",
+            shared_runtime_id,
+            "7.13.1",
+            30,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose clears_default_runtime changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_decision_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root-decision");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert_eq!(plan.install_root_decision, InstallRootDecision::Remove);
+
+        // Simulate another process overwriting the in-tree marker with one
+        // for a different install while the uninstall confirmation prompt
+        // was waiting on the user; the registry entry (and thus runtime_id
+        // and install_root) is left untouched, so only install_root_decision
+        // should differ from the plan the user approved.
+        let mut mismatched_marker = manifest.clone();
+        mismatched_marker.runtime_key = "some-other-runtime-key".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&mismatched_marker)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root_decision changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_and_revalidate_runtime_uninstall_refuses_state_changed_during_confirmation()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-confirm-and-revalidate-wiring");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+        config.save(&paths)?;
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // The injected "confirm" closure plays the role of the user
+        // approving the prompt; it relocates the install root before
+        // returning, simulating another process racing the confirmation
+        // exactly as `runtime_uninstall_revalidation_detects_install_root_change`
+        // does for the leaf function. This exercises the actual
+        // confirm -> reload-config -> revalidate wiring, not just the
+        // revalidation function in isolation: if the reload/revalidate
+        // calls were ever dropped from `confirm_and_revalidate_runtime_uninstall`,
+        // the call would silently succeed on the stale plan and this
+        // test's `result.is_err()` assertion below would fail, catching
+        // the regression.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        let install_root = manifest.install_root.clone();
+        let runtime_key = manifest.runtime_key.clone();
+        let paths_for_confirm = paths.clone();
+        let result = confirm_and_revalidate_runtime_uninstall(&paths, plan, move || {
+            fs::rename(&install_root, &relocated_root)?;
+            let mut relocated_manifest = manifest.clone();
+            relocated_manifest.install_root = relocated_root.clone();
+            fs::write(
+                relocated_root.join(".rocm-cli-runtime.json"),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            fs::write(
+                runtime_manifest_path(&paths_for_confirm, &runtime_key),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            Ok(true)
+        });
+
+        assert!(
+            result.is_err(),
+            "confirm_and_revalidate_runtime_uninstall must refuse to proceed when the runtime \
+             state changed while the confirmation callback was running"
         );
 
         let _ = fs::remove_dir_all(root);
