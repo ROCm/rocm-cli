@@ -1142,15 +1142,17 @@ fn compare_diagnosis_with_fix(world: &mut E2eWorld, path_override: Option<&str>)
 
 #[given("a user who hit a device-permission failure")]
 async fn user_hit_device_permission_failure(_world: &mut E2eWorld) {
-    // States the premise; carries no fixture. The symptom is `DEVICE_PERMISSION_SYMPTOM`,
-    // which `compare_diagnosis_with_fix` passes directly because it is shared with
-    // the other `When` that calls it — one that this Given does not precede.
+    // States the premise; carries no fixture. The symptom is
+    // `DEVICE_PERMISSION_SYMPTOM`, which the `When` this precedes passes
+    // directly. That constant is also used by a second `When` further down,
+    // which runs its own `diagnose` invocation under a shimmed PATH — so it
+    // belongs to the pair of them, not to this step.
     //
     // This used to write `world.model_name`, which nothing read: the step LOOKED
     // like it parameterised the comparison, so changing the constant here would
     // have had no effect and said nothing about it. Left empty rather than
-    // wired up, because routing a constant through a mutable field for one of
-    // two callers is the fragility, not the fix.
+    // wired up, because a Given that fed only one of the two would make the
+    // constant look local to this scenario when it is not.
 }
 
 #[when("the user compares the diagnosis with the matching fix preview")]

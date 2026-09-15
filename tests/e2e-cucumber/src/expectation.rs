@@ -1243,10 +1243,20 @@ flaky = true
             // A scenario is written comment block → tag line(s) → `Scenario:`, so
             // carry the claim forward from the comments and bind it to the ids on
             // the tag lines, clearing at the `Scenario:` that ends the block.
+            //
+            // A blank line resets it. A comment block is contiguous with the tags
+            // it introduces, so anything separated by a blank line — a file
+            // header, a note in a previous scenario's body — belongs to something
+            // else. Without this, a header merely MENTIONING the phrase condemns
+            // whichever scenario happens to come first, and the failure names an
+            // innocent id: loud, but pointing at the wrong place.
             let (mut expects_failure, mut pending_ids) = (false, Vec::new());
             for line in text.lines() {
                 let line = line.trim();
-                if line.starts_with('#') {
+                if line.is_empty() {
+                    expects_failure = false;
+                    pending_ids.clear();
+                } else if line.starts_with('#') {
                     expects_failure |= line.contains("Expected to FAIL");
                 } else if line.starts_with('@') {
                     for tag in line.split_whitespace() {
