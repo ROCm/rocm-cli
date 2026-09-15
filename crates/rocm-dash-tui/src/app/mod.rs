@@ -2057,12 +2057,23 @@ pub(crate) const fn is_ctrl_c(k: KeyEvent) -> bool {
 /// on the job being non-terminal keeps "cancel the job" winning only while there
 /// is a job left to cancel.
 fn ctrl_c_should_exit(state: &AppState, k: KeyEvent) -> bool {
+    let job = state.active_job_id().and_then(|id| state.jobs.job(id));
+    // The uncodified invariant this predicate leans on: a manager's `active_job`
+    // is the id of a job it just spawned into `state.jobs`, so the lookup above
+    // resolves. Thirteen manager modules set `active_job`; nothing enforces the
+    // pairing at a type level. If it ever breaks, `is_none_or` below silently
+    // reads "no job console is up" and Ctrl-C would quit out from under a
+    // *running* job — the one case this function exists to prevent. Assert it in
+    // debug builds so a manager that sets an id without a matching job trips the
+    // suite rather than shipping the wrong precedence.
+    debug_assert!(
+        state.active_job_id().is_none() || job.is_some(),
+        "active_job id {:?} is not in the jobs map; ctrl_c_should_exit would \
+         treat a live job console as absent",
+        state.active_job_id()
+    );
     // Reads as: no job console is up, or the one that is has already finished.
-    is_ctrl_c(k)
-        && state
-            .active_job_id()
-            .and_then(|id| state.jobs.job(id))
-            .is_none_or(rocm_dash_core::state::JobState::is_terminal)
+    is_ctrl_c(k) && job.is_none_or(rocm_dash_core::state::JobState::is_terminal)
 }
 
 /// End the process from a typed Ctrl-C, taking exactly the path an externally
@@ -4467,6 +4478,14 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         signal_test_runtime().block_on(async {
+            // Scope, so nobody reads more into this than it proves: the
+            // expectation is built from the same `EXIT_CODE_*` constants the
+            // code under test returns, so this pins the SIGTERM→sigterm-code /
+            // SIGINT→sigint-code *mapping* (swapping the two arms turns it red)
+            // but not the literal values. Editing `EXIT_CODE_SIGINT` to 7 leaves
+            // this green. The literals 130/143 are pinned by the e2e scenarios
+            // `dash-12` … `dash-16` in `tests/e2e-cucumber/features/dash.feature`,
+            // which assert the shell-visible exit status of a real process.
             for (signo, expected) in [
                 (libc::SIGTERM, EXIT_CODE_SIGTERM),
                 (libc::SIGINT, EXIT_CODE_SIGINT),
