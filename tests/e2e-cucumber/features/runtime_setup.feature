@@ -184,3 +184,32 @@ Feature: Runtime configuration
   Scenario: runtime-10 - Stating rollback's single-level limit in --help
     When the user asks for rollback help
     Then the help states that rollback has no history
+
+  # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
+  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
+  # to the newest build if the pin is too old to have shipped a matching
+  # ROCm-version asset; revert to the packaged default if neither verifies).
+  # The unit tests exercise that state machine directly against injected
+  # install/align steps, but nothing else asserts that `rocm engines install
+  # lemonade` actually surfaces the outcome to a real user -- this is the one
+  # part of that path with no other e2e coverage.
+  #
+  # `--reinstall` re-extracts the packaged embeddable, resetting
+  # `backend_versions.json` to its pinned defaults, so this fires
+  # deterministically even against a shared runtime tree where an earlier
+  # scenario already left Lemonade's backend aligned (a plain install would
+  # find nothing left to do and print no alignment line at all). Verified
+  # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
+  # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
+  # predates a matching ROCm-version asset), and Tier 2's newest build
+  # succeeds -- producing exactly the line this scenario asserts.
+  #
+  # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
+  # environment and has no llama.cpp backend to align; `@nightly` for the same
+  # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
+  # and a real backend download, not something to repeat on every PR.
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-11 - Reinstalling Lemonade reports whether its ROCm backend was aligned
+    Given a managed runtime is active
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
