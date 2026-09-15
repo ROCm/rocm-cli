@@ -2591,7 +2591,8 @@ fn build_install_sdk_args(
         // `run_rocm_capture_for_paths` spawns `rocm` with null stdin, so
         // `interactive_terminal()` is false in the child and an active default
         // managed runtime would make the approval gate refuse with "re-run with
-        // `--yes`" — a flag no MCP caller of this tool can supply.
+        // `--approve-replacing-active-default`" — a flag no MCP caller of this
+        // tool can supply.
         //
         // Not `--yes` itself: that flag carries a second, unrelated consent —
         // approving required system-package installs, which run `sudo`. This

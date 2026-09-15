@@ -1852,6 +1852,26 @@ fn install_wheel_runtime(
         ));
     }
 
+    // Past the preview, the plan has to be installable. A runtime composed
+    // without its exact device payload loads and then faults on the first
+    // kernel, so an undetermined target is refused here rather than papered
+    // over with every published payload.
+    //
+    // Checked *before* the consent gate: an install that cannot work should say
+    // so, not first demand a consent flag for it. With the order reversed, a
+    // non-interactive host with an unresolvable target reports only "re-run with
+    // --approve-replacing-active-default", and supplying it just surfaces this
+    // error instead.
+    if let Some(reason) = device_target.reason() {
+        bail!(
+            "cannot compose a canonical TheRock {} runtime: {reason}.\n\
+             The aggregate `rocm` distribution ships no GPU backend unless an exact `device-<target>` extra requests one, so this install would produce a runtime that cannot run a kernel.\n\
+             Re-run `rocm install sdk` on the target host, or preview the plan with `--dry-run`.\n\n{}",
+            channel.as_str(),
+            detect_host_gpu_diagnostics()
+        );
+    }
+
     // Installs with no active default runtime proceed with just an informational
     // line. Any install that would displace the current active default — whatever
     // its family or channel, because activation is global — asks for confirmation
@@ -1895,20 +1915,6 @@ fn install_wheel_runtime(
                 existing.as_deref().unwrap_or_default()
             ));
         }
-    }
-
-    // Past the preview, the plan has to be installable. A runtime composed
-    // without its exact device payload loads and then faults on the first
-    // kernel, so an undetermined target is refused here rather than papered
-    // over with every published payload.
-    if let Some(reason) = device_target.reason() {
-        bail!(
-            "cannot compose a canonical TheRock {} runtime: {reason}.\n\
-             The aggregate `rocm` distribution ships no GPU backend unless an exact `device-<target>` extra requests one, so this install would produce a runtime that cannot run a kernel.\n\
-             Re-run `rocm install sdk` on the target host, or preview the plan with `--dry-run`.\n\n{}",
-            channel.as_str(),
-            detect_host_gpu_diagnostics()
-        );
     }
 
     let uv = ensure_uv_binary(paths)?;
@@ -2080,7 +2086,8 @@ fn quote_display_arg(value: &str) -> String {
 /// Describe the managed runtime this install would displace as the active
 /// default: the one the runtime config's `active_runtime_key` (or an
 /// unambiguous `default_runtime_id`) currently resolves to. Returns `None` only
-/// when no active default resolves — a genuinely fresh install, where the new
+/// when nothing on disk points at an active default at all — a genuinely fresh
+/// install, where the new
 /// runtime takes a slot nothing occupies and there is nothing to consent to.
 ///
 /// Deliberately NOT scoped to the target family and channel. Activation is
@@ -2094,16 +2101,38 @@ fn quote_display_arg(value: &str) -> String {
 /// than treated as "no active default": silently falling back to a
 /// fresh-install verdict on a read error would skip the confirmation gate
 /// precisely when we are least sure what is currently active.
+///
+/// The same reasoning covers the two ways an active default can fail to
+/// resolve without any I/O error at all, and both of them used to reach the
+/// fresh-install verdict:
+///
+/// * a registry manifest that reads fine but does not deserialize —
+///   `load_runtime_manifests` drops those silently, so a manifest written by an
+///   older binary (`family_source`, `selected_artifact_url` and
+///   `installed_at_unix_ms` carry no `#[serde(default)]`) vanishes from the
+///   list and `current_runtime_manifest` misses;
+/// * `active_runtime_key` naming a runtime whose manifest is not in the
+///   registry at all.
+///
+/// Either way `rocm runtimes list` already calls this out as
+/// `active_status: missing manifest for active_runtime_key=...`, so proceeding
+/// as a fresh install would have one CLI assert both that a runtime is active
+/// and that none is. These fail closed into the consent gate rather than into a
+/// hard error, so `--approve-replacing-active-default` (or `--yes`) still gets
+/// an operator through a stale manifest.
 fn active_default_runtime_relation(
     paths: &AppPaths,
     channel: TheRockChannel,
     family: &str,
     resolved_version: &str,
 ) -> Result<Option<String>> {
-    let manifests = load_runtime_manifests(paths)?;
+    let (manifests, unparsed) = load_runtime_manifests_reporting_unparsed(paths)?;
     let config = RocmCliConfig::load(paths)?;
     let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
-        return Ok(None);
+        return Ok(unresolved_active_default_relation_text(
+            config.active_runtime_key.as_deref(),
+            &unparsed,
+        ));
     };
     Ok(Some(active_default_relation_text(
         active,
@@ -2111,6 +2140,45 @@ fn active_default_runtime_relation(
         family,
         resolved_version,
     )))
+}
+
+/// Wording for the fail-closed half of [`active_default_runtime_relation`]:
+/// nothing resolved, but the on-disk state says something should have.
+///
+/// `None` here is the only genuinely fresh verdict — no configured active key
+/// and every registry manifest parsed. Anything else names what could not be
+/// resolved, because the relation string is what the prompt, the preapproved
+/// progress line and the non-interactive refusal all print, and "unknown" is
+/// the honest answer the operator needs to see.
+fn unresolved_active_default_relation_text(
+    active_runtime_key: Option<&str>,
+    unparsed: &[PathBuf],
+) -> Option<String> {
+    let unparsed_text = || {
+        unparsed
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match active_runtime_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        Some(key) if unparsed.is_empty() => Some(format!(
+            "recorded as `{key}`, but no installed runtime manifest matches it, so what is currently active cannot be determined"
+        )),
+        Some(key) => Some(format!(
+            "recorded as `{key}`, but its manifest could not be read; unreadable runtime manifests: {}",
+            unparsed_text()
+        )),
+        None if unparsed.is_empty() => None,
+        None => Some(format!(
+            "unknown: {} of the installed runtime manifests could not be read, so an active default cannot be ruled out; unreadable runtime manifests: {}",
+            unparsed.len(),
+            unparsed_text()
+        )),
+    }
 }
 
 /// Pure wording for [`active_default_runtime_relation`].
@@ -2346,12 +2414,19 @@ fn refuse_non_interactive_message(relation: &str) -> String {
 /// stdin. Only reached when an active default runtime exists, consent was not
 /// preapproved, and a terminal is attached (see `sdk_install_approval`).
 ///
-/// "Displacing" rather than "overwriting" is deliberate: `runtime_key` embeds the
-/// resolved version, so an upgrade or downgrade lands in its own install root
-/// with its own manifest and the previous install stays on disk — what changes is
-/// which runtime is the active default. Only a same-version reinstall reuses the
-/// same root. The prompt says so instead of claiming a deletion that does not
-/// happen.
+/// "Displacing" rather than "overwriting" is deliberate: in the default managed
+/// install root `runtime_key` embeds the resolved version, so an upgrade or
+/// downgrade lands in its own install root with its own manifest and the previous
+/// install stays on disk — what changes is which runtime is the active default.
+/// Only a same-version reinstall reuses the same root. The prompt says so instead
+/// of claiming a deletion that does not happen.
+///
+/// `--prefix` is the exception and the prompt does not claim otherwise:
+/// `resolved_install_root` uses the given folder verbatim for every version, so
+/// a second install into one prefix does replace the first in place (and
+/// `ensure_uv_venv` will `remove_dir_all` it outright if the existing venv's
+/// python no longer answers `--version`). The gate is unchanged either way —
+/// what is being consented to is the change of active default, not a deletion.
 fn confirm_overwrite_existing_sdk(
     channel: TheRockChannel,
     family: &str,
@@ -5943,12 +6018,29 @@ fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) 
 }
 
 pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
+    Ok(load_runtime_manifests_reporting_unparsed(paths)?.0)
+}
+
+/// [`load_runtime_manifests`] plus the registry entries that read fine but did
+/// not deserialize.
+///
+/// A manifest written by an older binary is the ordinary way to land here:
+/// `family_source`, `selected_artifact_url` and `installed_at_unix_ms` carry no
+/// `#[serde(default)]`, so an older file fails `from_slice` against a newer
+/// binary. Dropping those silently is right for the listing and lookup callers
+/// — one stale file must not brick `rocm runtimes list` — but it is wrong for
+/// the install consent gate, which has to know that its view of "what is
+/// active" is incomplete. Hence two entry points rather than one hard error.
+fn load_runtime_manifests_reporting_unparsed(
+    paths: &AppPaths,
+) -> Result<(Vec<InstalledRuntimeManifest>, Vec<PathBuf>)> {
     let registry_dir = runtime_registry_dir(paths);
     if !registry_dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut manifests = Vec::new();
+    let mut unparsed = Vec::new();
     for entry in fs::read_dir(&registry_dir)
         .with_context(|| format!("failed to read {}", registry_dir.display()))?
     {
@@ -5959,12 +6051,14 @@ pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRu
         }
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if let Ok(manifest) = serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
-            manifests.push(manifest.normalize_host_paths());
+        match serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
+            Ok(manifest) => manifests.push(manifest.normalize_host_paths()),
+            Err(_) => unparsed.push(path),
         }
     }
     manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
-    Ok(manifests)
+    unparsed.sort();
+    Ok((manifests, unparsed))
 }
 
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
@@ -9199,6 +9293,95 @@ echo Python 3.12.10
         )
         .expect_err("a manifest read failure should be propagated, not swallowed");
         assert!(!error.to_string().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_an_unparsable_active_manifest() -> Result<()> {
+        // The other half of the same policy, and the half that used to fail open:
+        // the manifest file *reads* fine, so nothing errors, but it does not
+        // deserialize. `load_runtime_manifests` dropped it silently,
+        // `current_runtime_manifest` then missed, and the gate was skipped with a
+        // fresh-install verdict while `rocm runtimes list` still reported the
+        // runtime as active. This is the older-manifest/newer-binary shape:
+        // `family_source` carries no `#[serde(default)]`.
+        let (root, paths) = test_paths("active-default-relation-unparsable");
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_active_test_runtime(&paths, &manifest)?;
+
+        let manifest_path = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        value
+            .as_object_mut()
+            .expect("manifest is a JSON object")
+            .remove("family_source")
+            .expect("manifest carries family_source");
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&value)?)?;
+
+        // Precondition: the file still reads, so this is not the I/O path.
+        assert!(fs::read(&manifest_path).is_ok());
+        assert!(
+            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&manifest_path)?).is_err(),
+            "the test fixture must be unparsable, or this asserts nothing"
+        );
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("an unparsable active manifest must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(&manifest.runtime_key),
+            "the relation must name the runtime the config still calls active: {relation}"
+        );
+        assert!(
+            relation.contains("could not be read"),
+            "the relation must say why the active default is unknown: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_a_dangling_active_runtime_key() -> Result<()> {
+        // Same policy, third shape: nothing is unreadable or unparsable, the
+        // config simply names an active runtime the registry has no manifest for.
+        // `rocm runtimes list` reports this as
+        // `active_status: missing manifest for active_runtime_key=...`, so a
+        // fresh-install verdict here would have one CLI assert both that a
+        // runtime is active and that none is.
+        let (root, paths) = test_paths("active-default-relation-dangling");
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.active_runtime_key = Some("release-wheel-gfx120X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling active_runtime_key must not yield a fresh-install verdict");
+        assert!(
+            relation.contains("release-wheel-gfx120X-all"),
+            "the relation must name the unresolved key: {relation}"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())

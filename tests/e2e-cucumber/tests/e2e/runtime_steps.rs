@@ -250,7 +250,9 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // Pick a family the active runtime is not, rather than hard-coding one:
     // this lane's GPU decides what the `Given` installed, and naming that same
     // family would silently collapse this scenario into Scenario runtime-10.
-    // The runtime key carries the family, so the registry listing is enough.
+    // Matching is against the whole `runtimes list` text, which prints a
+    // case-preserving `family=` column — the runtime key alone would not do,
+    // since it is lowercase-slugified and would never match `gfx110X-all`.
     let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     let family = OTHER_FAMILY_CANDIDATES
         .iter()

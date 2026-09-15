@@ -201,11 +201,9 @@ environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
 creates a separate managed runtime alongside it. Running the command when a
 managed runtime is already the active default asks first, because the new
-install takes over as the active default — that includes installing a different
-GPU family or channel, which takes it over just the same. Add
-`--approve-replacing-active-default` to approve that non-interactively, such as
-from a script; `--yes` also approves it but additionally approves installing
-required system packages, which needs `sudo`.
+install takes over as the active default; see
+[ROCm installation](#rocm-installation) for that gate and the flags that approve
+it without a prompt.
 
 Then serve a model:
 
@@ -277,10 +275,12 @@ which is also what the refusal itself recommends and what ROCm CLI's own
 non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
 approval *and* approves installing required system packages (such as OpenMPI for
 vLLM), which means `sudo`; reach for it only where something can answer a sudo
-password prompt, which an unattended job cannot. Because the install
-root and manifest are keyed by version, an upgrade or downgrade keeps the
-previous install on disk — only a same-version reinstall reuses the same install
-root. `install driver` installs the AMD kernel driver on Linux
+password prompt, which an unattended job cannot. In the default managed install
+root, the root and its manifest are keyed by version, so an upgrade or downgrade
+keeps the previous install on disk and only a same-version reinstall reuses the
+same root. `--prefix` opts out of that: the folder you name is used verbatim for
+every version, so successive installs into one prefix replace each other in
+place. `install driver` installs the AMD kernel driver on Linux
 (DKMS or native package). `update` checks for a newer ROCm package; pass
 `--apply` to install it. `--json` prints the check result as a single line of
 JSON instead of text; `--timeout-secs` bounds its network calls
