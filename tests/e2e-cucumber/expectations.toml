@@ -178,13 +178,21 @@ flaky = true
 # synopsis line for `rocm update` brackets `[--apply]` and `[--dry-run]`
 # independently. Argument handling only, so platform-independent.
 #
+# NOT ONLY `--dry-run`. `--runtime` and `--activate` carry the same
+# `requires = "apply"`, and that one synopsis line brackets all four as if
+# independent — so three of its four options are documented as usable on their
+# own and none of them is. This scenario exercises `--dry-run` because it is the
+# one a README reader reaches for first, not because it is the only case.
+#
 # WHICH SIDE IS WRONG IS A MAINTAINER CALL, and this row does not presume it.
 # The defensible alternative reading is that bare `rocm update` is already the
-# preview, making `--dry-run` meaningful only alongside `--apply` — in which case
-# the synopsis is what misleads. This row asserts only that the documented
-# contract and the shipped behaviour disagree, which is true either way.
-# Remove it when they agree: either `rocm update --dry-run` is accepted, or the
-# README stops offering it as a standalone flag. ---
+# preview, making these meaningful only alongside `--apply` — in which case the
+# synopsis is what misleads. This row asserts only that the documented contract
+# and the shipped behaviour disagree, which is true either way.
+#
+# Remove it when they agree — and fix all three together, because a synopsis
+# correction that covers `--dry-run` alone leaves the identical defect standing
+# for its two siblings while this row goes quiet. ---
 [["update-preview-without-applying"]]
 when = {}
 bug = "EAI-8010"

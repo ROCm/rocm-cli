@@ -527,7 +527,7 @@ jobs:
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
-  # no GPU. Non-blocking so it never gates the PR.
+  # no GPU. Non-blocking for the reason in this file's header.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows)
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario

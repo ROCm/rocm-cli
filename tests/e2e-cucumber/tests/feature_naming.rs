@@ -57,8 +57,17 @@ fn features_dir() -> PathBuf {
 /// one of them fail loudly while the other silently skipped it would be the
 /// worst of both.
 fn feature_files() -> Vec<String> {
+    feature_files_in(&features_dir())
+}
+
+/// The scan itself, split out so the subdirectory refusal can be exercised
+/// against a temporary tree — against the real `features/` it could only fire
+/// by someone breaking the repository. Mirrors `feature_files_in` in
+/// `src/expectation.rs`, which is split for the same reason: the two guards
+/// should match in coverage, not only in wording.
+fn feature_files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(features_dir()).expect("features dir") {
+    for entry in std::fs::read_dir(dir).expect("features dir") {
         let path = entry.expect("dir entry").path();
         assert!(
             !path.is_dir(),
@@ -74,6 +83,27 @@ fn feature_files() -> Vec<String> {
     }
     names.sort();
     names
+}
+
+#[test]
+fn the_feature_scan_takes_the_flat_files_it_finds() {
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("b.feature"), "Feature: b\n").unwrap();
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    assert_eq!(feature_files_in(dir.path()), ["a.feature", "b.feature"]);
+}
+
+#[test]
+#[should_panic(expected = "has grown a subdirectory")]
+fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
+    // The branch that stops this scan quietly covering less than it claims.
+    // Unreachable against the real `features/`, so it is pinned here — the same
+    // way `src/expectation.rs` pins its twin.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    let _ = feature_files_in(dir.path());
 }
 
 /// The `@id:` tags and scenario names in one feature file, paired in declaration
