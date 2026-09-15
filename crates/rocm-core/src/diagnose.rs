@@ -87,6 +87,16 @@ pub struct DiagnoseReport {
     /// avoid emitting bare-metal-Linux diagnoses that don't apply.
     #[serde(default)]
     pub out_of_scope: Option<String>,
+    /// The verdict on a model, when `--model` named one.
+    ///
+    /// Attached by the caller after the fact rather than produced by
+    /// [`diagnose`]: answering it needs the host's GPU memory and the engine
+    /// `serve` would select, neither of which an [`Examination`] carries. It
+    /// rides on this report rather than replacing it because the environment
+    /// answer stays true and useful either way — a blocked model on a host whose
+    /// driver is also misconfigured is two findings, not one.
+    #[serde(default)]
+    pub model: Option<crate::model_readiness::ModelReadiness>,
 }
 
 /// Whether any diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
@@ -2046,6 +2056,20 @@ fn catalog_covers(e: &Examination) -> bool {
         .any(|(_, applicable)| applicable.contains(&family))
 }
 
+/// Where to report something this CLI could not answer.
+///
+/// The one place a `Route` is built, so every command that has to say "I don't
+/// recognise this" sends the user to the same tracker for the same target —
+/// `rocm diagnose --model` has the same problem for a model the catalog does not
+/// carry as `rocm diagnose` has for a symptom it does not recognise.
+#[must_use]
+pub fn upstream_route(target: &str) -> Route {
+    Route {
+        target: target.to_owned(),
+        url: upstream_tracker(target).to_owned(),
+    }
+}
+
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
         "pytorch" => "pytorch",
@@ -2055,10 +2079,7 @@ fn route_when_no_match(e: &Examination) -> Route {
         "lm-studio" => "lm-studio",
         _ => "rocm-core",
     };
-    Route {
-        target: target.to_owned(),
-        url: upstream_tracker(target).to_owned(),
-    }
+    upstream_route(target)
 }
 
 /// Diagnose an examination against the closed catalog.
@@ -2085,6 +2106,7 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         high_confidence_threshold: HIGH_CONFIDENCE,
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
+        model: None,
     }
 }
 

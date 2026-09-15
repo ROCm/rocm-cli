@@ -218,6 +218,7 @@ form works depends on the engine your GPU selects.
 |---|---|
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
+| `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
@@ -341,6 +342,27 @@ rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
 Supported engines: `lemonade`, `vllm`.
+
+### Will a model run here?
+
+Ask before downloading anything:
+
+```
+rocm diagnose --model <model> [--json]
+```
+
+Answers in seconds, from the curated recipe and this machine's GPU — it
+fetches no weights and makes no network call. The verdict is `ready`,
+`degraded`, `blocked`, or `undetermined`. A `ready` answer also names the
+engine `rocm serve` would use; a `blocked` one names curated models that would
+run here instead.
+
+`undetermined` is a real answer and not a failure: it is what you get when the
+recipe catalog could not be read, when this machine's GPU memory could not be
+measured, or when the model is not one of the curated recipes (`rocm model`
+lists those). None of those say anything about whether the model fits, so none
+of them are reported as though they did — `rocm serve` still accepts a model
+outside the catalog, this just cannot tell you in advance how it will go.
 
 ### Model serving
 
