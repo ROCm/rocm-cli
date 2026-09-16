@@ -3088,6 +3088,9 @@ struct DriverInstallPlan {
     reason: String,
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
+    /// Rendered to the user under `post_reboot_checks:` — passive
+    /// verification targets to run after reboot (`rocm examine`, `rocminfo`,
+    /// `dkms status`, ...), never a mutating install command.
     checks: Vec<String>,
 }
 
@@ -3288,31 +3291,34 @@ fn build_driver_install_plan(
         // https://repo.radeon.com/amdgpu/latest/ubuntu/dists/ and switch this
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
-        ("ubuntu", "26.04") => DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "ubuntu_native_archive".to_owned(),
-            os_id,
-            version_id,
-            // codename_for_version already resolves this to "resolute" when
-            // VERSION_CODENAME/UBUNTU_CODENAME are absent, so this is never
-            // empty here — no fallback needed.
-            codename,
-            repo_version_expr,
-            reason: "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
-                includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
-                tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
-                commands are planned. Run `sudo apt install rocm` for the userspace ROCm \
-                stack instead."
-                .to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec![
-                "rocm examine".to_owned(),
-                "sudo apt install rocm".to_owned(),
-                "rocminfo".to_owned(),
-            ],
-        },
+        ("ubuntu", "26.04") => {
+            let sudo = escalation.prefix();
+            DriverInstallPlan {
+                supported: false,
+                mutating: false,
+                policy: "ubuntu_native_archive".to_owned(),
+                os_id,
+                version_id,
+                // codename_for_version already resolves this to "resolute" when
+                // VERSION_CODENAME/UBUNTU_CODENAME are absent, so this is never
+                // empty here — no fallback needed.
+                codename,
+                repo_version_expr,
+                reason: format!(
+                    "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
+                    includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
+                    tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
+                    commands are planned. Run `{sudo}apt install rocm` for the userspace ROCm \
+                    stack instead."
+                ),
+                preflight_checks: Vec::new(),
+                commands: Vec::new(),
+                // `checks` renders as `post_reboot_checks:` and, like every other
+                // arm, holds passive verification targets only — the mutating
+                // install command above belongs in `reason`, not here.
+                checks: vec!["rocm examine".to_owned(), "rocminfo".to_owned()],
+            }
+        }
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
             let mut plan = apt_driver_plan(
@@ -27113,19 +27119,63 @@ install therock";
         // root host without the binary the first one died with `sudo: not found`
         // before any driver work. This asserts the ABSENCE of `sudo` across every
         // distro rather than checking known commands one by one — a templating
-        // site missed on some distro fails here instead of shipping.
+        // site missed on some distro fails here instead of shipping, whether it
+        // lives in `commands`, `reason`, or `checks` (the field an earlier
+        // hardcoded-`sudo` regression hid in, since only `commands` was checked).
         for (label, os_release) in dkms_planning_os_releases() {
-            let commands = plan_commands(os_release, PrivilegeEscalation::AlreadyRoot);
+            let plan = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::AlreadyRoot,
+            );
             assert!(
-                !commands.is_empty(),
+                !plan.commands.is_empty(),
                 "{label}: expected a dkms plan to emit commands"
             );
-            for command in &commands {
+            for command in &plan.commands {
                 assert!(
-                    !command.contains("sudo"),
-                    "{label}: a plan built as root must not invoke sudo, got `{command}`"
+                    !command.command.contains("sudo"),
+                    "{label}: a plan built as root must not invoke sudo, got `{}`",
+                    command.command
                 );
             }
+            assert!(
+                !plan.reason.contains("sudo"),
+                "{label}: a plan built as root must not mention sudo in its reason, got `{}`",
+                plan.reason
+            );
+            for check in &plan.checks {
+                assert!(
+                    !check.contains("sudo"),
+                    "{label}: a plan built as root must not mention sudo in its checks, got `{check}`"
+                );
+            }
+        }
+
+        // Ubuntu 26.04's native-archive arm is outside dkms_planning_os_releases
+        // (it emits no dkms commands at all, only a `reason` and `checks`), but
+        // its `reason` text is exactly the site the earlier regression hid in —
+        // cover it explicitly rather than let a policy with no `commands` skip
+        // this guard entirely.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = "ID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION_CODENAME=resolute\n";
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        assert!(
+            !plan.reason.contains("sudo"),
+            "ubuntu 26.04: a plan built as root must not mention sudo in its reason, got `{}`",
+            plan.reason
+        );
+        for check in &plan.checks {
+            assert!(
+                !check.contains("sudo"),
+                "ubuntu 26.04: a plan built as root must not mention sudo in its checks, got `{check}`"
+            );
         }
     }
 
@@ -27339,6 +27389,38 @@ VERSION_CODENAME=resolute
         assert!(rendered.contains("sudo apt install rocm"));
         assert!(!rendered.contains("amdgpu-dkms"));
         assert!(plan.commands.is_empty());
+        // `checks` renders as `post_reboot_checks:` and must hold verification
+        // targets only -- the mutating install guidance belongs in `reason`.
+        assert!(
+            !plan
+                .checks
+                .iter()
+                .any(|check| check.contains("apt install"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_ubuntu_2604_root_guidance_drops_sudo() {
+        // Companion to the Sudo case above: this arm derives its guidance from
+        // `escalation` rather than hardcoding `sudo`, so a root host must see
+        // the same command with no `sudo` prefix.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="26.04"
+VERSION_CODENAME=resolute
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(rendered.contains("apt install rocm"));
+        assert!(!plan.reason.contains("sudo"));
+        assert!(!plan.checks.iter().any(|check| check.contains("sudo")));
     }
 
     #[test]
