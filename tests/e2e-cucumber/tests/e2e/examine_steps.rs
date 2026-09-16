@@ -428,17 +428,25 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
          interpreter's -- is the one the engines will load"
     );
 
+    // Only that the note NAMES an interpreter -- deliberately not that the path
+    // sits under `active_runtime_root`. `managed_therock_python_executable`
+    // prefers the interpreter the installer recorded precisely because an
+    // imported or read-only runtime can record one that is not under
+    // `install_root` at all, so a containment check would fail a correct build
+    // on a host holding such a runtime.
     let names_interpreter = value
         .get("framework_notes")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|notes| {
-            notes.iter().filter_map(serde_json::Value::as_str).any(|n| {
-                n.contains("active managed runtime's interpreter") && n.contains(root.as_str())
-            })
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|note| note.split_once("active managed runtime's interpreter: "))
+                .any(|(_, path)| !path.trim().is_empty())
         });
     assert!(
         names_interpreter,
-        "the report must name the interpreter it used, and it must sit inside {root}: {:?}",
+        "the report must name the interpreter it used (runtime root here is {root}): {:?}",
         value.get("framework_notes")
     );
 }

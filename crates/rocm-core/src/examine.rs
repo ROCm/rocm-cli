@@ -1582,7 +1582,11 @@ fn runtime_library_path_env(
     }
     let mut entries = library_paths.to_vec();
     if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
-        entries.extend(std::env::split_paths(&existing));
+        // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
+        // trims, drops empty entries and host-normalises each one. The sibling
+        // composition in `probe_runtime_devices` already uses it, and the two
+        // building the same variable differently is how they drift.
+        entries.extend(crate::runtime_path_list_split(&existing));
     }
     match std::env::join_paths(entries) {
         Ok(joined) => vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)],
@@ -2611,10 +2615,13 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn the_framework_probe_gives_the_runtimes_torch_its_library_path() {
-        // Dropping the library paths would turn "no torch" into "torch import
+    fn a_runtime_without_its_library_path_reports_the_import_failure() {
+        // Withholding the library paths turns "no torch" into "torch import
         // failed", which reads as a broken runtime -- a worse answer than the
-        // silence it replaced. Same interpreter, library paths withheld.
+        // silence it replaced. This pins how that case is REPORTED; the
+        // composition itself is pinned by
+        // `the_framework_probe_reads_the_active_runtimes_torch`, whose fake
+        // interpreter only answers when the loader path actually reached it.
         let (root, mut interpreter) = plant_fake_runtime_interpreter("runtime-no-libs");
         interpreter.library_paths.clear();
         let mut e = Examination::default();
