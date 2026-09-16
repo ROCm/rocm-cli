@@ -451,13 +451,21 @@ impl TuiSession {
     /// shell that dies, or a pty reader that panics, is reported as the real
     /// cause here instead of running out the full timeout and blaming whatever
     /// the caller happened to be looking for. `wanted` is quoted into those
-    /// messages, so it should read as the thing being waited for.
+    /// messages, so it should read as the thing being waited for — and must be
+    /// non-empty, because the empty string is the exit drain's private "nothing
+    /// in particular" sentinel and would silently drop the context from a
+    /// reader-panic message rather than fail.
     pub async fn wait_for_screen_where(
         &mut self,
         wanted: &str,
         timeout: Duration,
         matches: impl Fn(&str) -> bool + Sync,
     ) -> Result<(), String> {
+        debug_assert!(
+            !wanted.is_empty(),
+            "wait_for_screen_where needs a label naming what is being waited for; \
+             the empty string is reserved for the exit drain"
+        );
         let deadline = Instant::now() + timeout;
         loop {
             if matches(&self.screen_text()) {
@@ -783,9 +791,14 @@ impl TuiSession {
             .map(|_| ())
     }
 
-    /// [`Self::drain_final_frame`] against a predicate, for the caller that is
-    /// racing the drain against a screen assertion. `wanted` names what is being
-    /// waited for, and is read back in the diagnostics.
+    /// The drain loop itself, against a predicate. Two callers:
+    /// `wait_for_screen_where`, which races the drain against a screen
+    /// assertion, and [`Self::drain_final_frame`] directly above, which passes
+    /// a predicate that never matches and waits the window out.
+    ///
+    /// `wanted` names what is being waited for and is read back in the
+    /// diagnostics; the empty string means "nothing in particular", which is
+    /// what the exit drain passes.
     async fn drain_final_frame_where(
         &mut self,
         wanted: &str,
