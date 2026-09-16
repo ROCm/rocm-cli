@@ -2086,9 +2086,9 @@ fn quote_display_arg(value: &str) -> String {
 /// Describe the managed runtime this install would displace as the active
 /// default: the one the runtime config's `active_runtime_key` (or an
 /// unambiguous `default_runtime_id`) currently resolves to. Returns `None` only
-/// when nothing on disk points at an active default at all — a genuinely fresh
-/// install, where the new
-/// runtime takes a slot nothing occupies and there is nothing to consent to.
+/// when neither config pointer points at an active default — a genuinely fresh
+/// install, where the new runtime takes a slot nothing occupies and there is
+/// nothing to consent to.
 ///
 /// Deliberately NOT scoped to the target family and channel. Activation is
 /// global: `finalize_successful_sdk_install` activates whatever was just
@@ -2161,7 +2161,7 @@ fn active_default_runtime_relation(
 ///
 /// `None` here is the only genuinely fresh verdict, and it needs *neither*
 /// config pointer to claim an active default: with no `active_runtime_key` and
-/// no `default_runtime_id`, nothing on disk asserts that a runtime is active,
+/// no `default_runtime_id`, neither pointer asserts that a runtime is active,
 /// so an unparsable manifest is a registry wart rather than a displacement
 /// risk and demanding a consent flag would be a false positive on a genuinely
 /// fresh install. Once a pointer does claim something, anything unresolved

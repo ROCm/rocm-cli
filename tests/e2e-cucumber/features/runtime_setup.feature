@@ -234,7 +234,17 @@ Feature: Runtime configuration
   # unrelated failure (a bad family name would also exit non-zero and could also
   # name the consent flags in a usage line): only the real gate names the
   # runtime it would replace.
-  @id:runtime-install-sdk-other-family-requires-yes @requires-gpu
+  #
+  # `@requires-os:linux` because the second family has to arrive by the tarball
+  # format to reach the gate at all, and tarball installs are refused outright on
+  # Windows. A wheel install picks its device payload from the GPU this host
+  # reports and refuses a family that target does not belong to *before* the
+  # consent gate — correctly, since that install could never have worked — so on
+  # a GPU host the wheel path answers with a target error and the displacement
+  # never comes up. The tarball path takes the family it is given, consults no
+  # host target, and reaches the same gate. What is lost on Windows is this
+  # cross-family case only: Scenario runtime-11 still covers the refusal there.
+  @id:runtime-install-sdk-other-family-requires-yes @requires-gpu @requires-os:linux
   Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without consent
     Given a managed runtime is active
     When the user installs a different GPU family without confirming

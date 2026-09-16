@@ -243,13 +243,16 @@ async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
 /// published names, not placeholders: an unknown family is rejected during
 /// resolution, which would exit non-zero for a reason that has nothing to do
 /// with the consent gate and would still satisfy "the reinstall is refused".
+/// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
+/// canonical release tarball catalog, for the same reason: an artifact the
+/// catalog does not carry fails resolution short of the gate.
 const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
 
 #[when("the user installs a different GPU family without confirming")]
 async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // Pick a family the active runtime is not, rather than hard-coding one:
     // this lane's GPU decides what the `Given` installed, and naming that same
-    // family would silently collapse this scenario into Scenario runtime-10.
+    // family would silently collapse this scenario into Scenario runtime-11.
     // Matching is against the whole `runtimes list` text, which prints a
     // case-preserving `family=` column — the runtime key alone would not do,
     // since it is lowercase-slugified and would never match `gfx110X-all`.
@@ -261,7 +264,21 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
         .unwrap_or_else(|| {
             panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
         });
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["install", "sdk", "--family", family]);
+    // `--format tarball`, because the wheel path cannot reach the consent gate
+    // with another family's name on a host that has a GPU. The wheel install
+    // composes its device payload from the target this host reports, and it
+    // validates that target against the resolved family *before* the gate
+    // (deliberately: an install that cannot work has to say so rather than first
+    // demand a consent flag for it). So `--family gfx110X-all` on a gfx942 host
+    // stops at "detected GPU target `gfx942` belongs to family `gfx94X-dcgpu`"
+    // and never reaches the displacement this scenario is about. The tarball
+    // path resolves the archive for the family it was given and consults no
+    // host target at all, so it reaches the same gate — the one call to
+    // `active_default_runtime_relation` shared by both formats — with a family
+    // the host has genuinely never held. The refusal still costs only the
+    // catalog listing: it bails before the multi-GiB archive is fetched.
+    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
