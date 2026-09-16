@@ -112,21 +112,26 @@ fn git_watch_paths(cwd: &Path) -> Vec<PathBuf> {
         );
 
     let mut paths = vec![git_dir.join("HEAD")];
-    if let Some(reference) = run_git_at(&cwd, &["symbolic-ref", "-q", "HEAD"]) {
-        paths.push(common_dir.join(reference));
-    }
     // Cargo treats a missing `rerun-if-changed` path as permanently dirty (it
     // has nothing to compare a missing file's mtime against), so a path that
-    // doesn't exist in *this* checkout must be skipped rather than watched —
-    // packed-refs in particular does not exist in every checkout shape. The
-    // trade-off: if one of these is created later from nothing (this
-    // specific checkout's first-ever tag, or its first `git gc`), that one
-    // transition can be missed until some other rebuild trigger fires: a far
-    // smaller gap than recompiling on every single build, forever.
-    for watched in [
-        common_dir.join("packed-refs"),
-        common_dir.join("refs").join("tags"),
-    ] {
+    // doesn't exist in *this* checkout must be skipped rather than watched.
+    // packed-refs in particular does not exist in every checkout shape, and
+    // the branch ref is not always a loose file either: `git pack-refs`/
+    // `git gc` (including its automatic `gc --auto`) deletes the loose
+    // branch-ref file while HEAD still points at it, packing the ref into
+    // packed-refs instead — a repo that has ever been gc'd or packed would
+    // otherwise permanently rebuild on every single build. The trade-off: if
+    // one of these is created later from nothing (this specific checkout's
+    // first-ever tag, or its first `git gc`), that one transition can be
+    // missed until some other rebuild trigger fires: a far smaller gap than
+    // recompiling on every single build, forever.
+    let mut watched_refs = Vec::new();
+    if let Some(reference) = run_git_at(&cwd, &["symbolic-ref", "-q", "HEAD"]) {
+        watched_refs.push(common_dir.join(reference));
+    }
+    watched_refs.push(common_dir.join("packed-refs"));
+    watched_refs.push(common_dir.join("refs").join("tags"));
+    for watched in watched_refs {
         if watched.exists() {
             paths.push(watched);
         }
@@ -204,17 +209,49 @@ mod tests {
         repo
     }
 
+    /// Commit in `repo` with a throwaway identity, so tests don't depend on
+    /// the environment having `user.name`/`user.email` configured.
+    fn commit_something(repo: &Path) {
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .current_dir(repo)
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "test commit",
+            ])
+            .status()
+            .expect("run git commit");
+        assert!(status.success(), "git commit failed");
+    }
+
     #[test]
-    fn git_watch_paths_skips_packed_refs_when_it_does_not_exist_yet() {
+    fn git_watch_paths_skips_packed_refs_and_uncommitted_branch_ref() {
         // Regression test: Cargo treats a missing `rerun-if-changed` path as
         // permanently dirty, and a fresh `git init` never creates
         // packed-refs (only a later `git gc`/`git repack`/some clone shapes
-        // do), so watching it unconditionally would recompile on every
-        // build, forever, in exactly this common a checkout shape.
+        // do) or a loose ref for a branch with no commits yet (`symbolic-ref`
+        // still resolves HEAD to it, but nothing has written the file), so
+        // watching either unconditionally would recompile on every build,
+        // forever, in exactly this common a checkout shape.
         // `refs/tags` is a different case: `git init` always creates it
         // (empty), so it is not exercised by this test.
         let repo = init_test_repo("no-packed-refs");
         assert!(!repo.join(".git").join("packed-refs").exists());
+        assert!(
+            !repo
+                .join(".git")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .exists()
+        );
         assert!(repo.join(".git").join("refs").join("tags").exists());
 
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -226,17 +263,17 @@ mod tests {
 
         assert_eq!(
             paths.len(),
-            3,
-            "HEAD, its branch ref, and refs/tags, but not the absent packed-refs: {paths:?}"
+            2,
+            "HEAD and refs/tags, but not the absent branch ref or packed-refs: {paths:?}"
         );
         assert!(paths[0].ends_with(Path::new("HEAD")));
-        assert!(paths[1].ends_with(Path::new("refs").join("heads").join("main")));
-        assert!(paths[2].ends_with(Path::new("refs").join("tags")));
+        assert!(paths[1].ends_with(Path::new("refs").join("tags")));
     }
 
     #[test]
     fn git_watch_paths_include_head_branch_tags_and_packed_refs() {
         let repo = init_test_repo("with-packed-refs");
+        commit_something(&repo);
         // An empty file is a valid (trivial) packed-refs; anything else needs
         // real header/ref-line syntax or git rejects *every* command in this
         // repo with "unexpected line in .git/packed-refs" — including the
@@ -258,5 +295,58 @@ mod tests {
         assert!(paths[1].ends_with(Path::new("refs").join("heads").join("main")));
         assert!(paths[2].ends_with(Path::new("packed-refs")));
         assert!(paths[3].ends_with(Path::new("refs").join("tags")));
+    }
+
+    #[test]
+    fn git_watch_paths_treats_a_packed_branch_ref_as_gone_not_missing() {
+        // `git pack-refs --all` (which `git gc`, including the automatic
+        // `gc --auto`, runs) deletes the loose `refs/heads/<branch>` file
+        // while HEAD still resolves to it, folding the ref into packed-refs
+        // instead. A watch list built after that must not include the now-gone
+        // loose file (Cargo would treat it as permanently dirty) and must
+        // still include packed-refs, which now carries the branch's value.
+        let repo = init_test_repo("packed-branch-ref");
+        commit_something(&repo);
+        let branch_ref = repo.join(".git").join("refs").join("heads").join("main");
+        assert!(
+            branch_ref.exists(),
+            "commit should create the loose branch ref"
+        );
+
+        let status = Command::new("git")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .current_dir(&repo)
+            .args(["pack-refs", "--all"])
+            .status()
+            .expect("run git pack-refs");
+        assert!(status.success(), "git pack-refs failed");
+        assert!(
+            !branch_ref.exists(),
+            "git pack-refs --all should remove the loose branch ref"
+        );
+        assert!(repo.join(".git").join("packed-refs").exists());
+
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let relative_repo = repo
+            .strip_prefix(manifest_dir)
+            .expect("repo is under the manifest dir");
+        let paths = git_watch_paths(relative_repo);
+        fs::remove_dir_all(&repo).expect("remove temporary repository");
+
+        assert_eq!(
+            paths.len(),
+            3,
+            "HEAD, packed-refs, and refs/tags, but not the now-packed branch ref: {paths:?}"
+        );
+        assert!(paths[0].ends_with(Path::new("HEAD")));
+        assert!(paths[1].ends_with(Path::new("packed-refs")));
+        assert!(paths[2].ends_with(Path::new("refs").join("tags")));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.ends_with(Path::new("refs").join("heads").join("main"))),
+            "the packed branch ref has no loose file anymore and must not be watched: {paths:?}"
+        );
     }
 }
