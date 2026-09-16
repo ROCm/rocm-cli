@@ -1386,9 +1386,13 @@ mod tests {
     /// always carried in the data and in `--json`. That is the most actionable
     /// line in the report - `rocm storage remove-downloads` acts on it - so pin
     /// it rather than leaving it as an unwitnessed side effect a refactor could
-    /// drop again. Asserted against the row, not just anywhere in the output:
-    /// the same string is reachable from the `Shared with other tools` loop,
-    /// which already rendered notes before this change.
+    /// drop again. Asserted against the row rather than anywhere in the output
+    /// because the note is per-row and the two rows carry the *same* string:
+    /// a `contains` check passes on either row alone, so dropping the note from
+    /// `downloaded helper tools` would stay green. Anchoring also pins what the
+    /// user reads - the `note: ` line directly under its own row - so a loop
+    /// that emitted the notes detached from the rows they describe, or beside
+    /// the wrong label, would be caught here instead of shipping.
     #[test]
     fn report_marks_the_re_downloadable_folders_as_safe_to_remove() -> Result<()> {
         let (root, paths) = test_paths("report-download-notes");

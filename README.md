@@ -384,9 +384,14 @@ keeps `--keep` installs for each of them. Anything it declines to remove is
 listed with the reason, and `--dry-run` shows the whole plan without changing
 anything. `remove-downloads` clears cached archives that rocm-cli can download
 again; a cache folder that is a link to somewhere else is left alone rather
-than followed. The report also lists the
-`uv` package cache and downloaded models; those are shared with other tools
-and are never removed by rocm-cli.
+than followed. The two archive rows the report prints are tagged
+`note: can be downloaded again; safe to remove`, so it is visible which rows
+`remove-downloads` acts on. The report also lists `local server records` — one
+JSON record plus the engine's log for each `rocm serve --managed` launch, kept
+after the server stops; `rocm services list --all` lists them, and no `rocm
+storage` command removes them — and the `uv` package cache, the Hugging Face
+model cache, and downloaded models; those last three are shared with other
+tools and are never removed by rocm-cli.
 
 ### Inference engines
 

@@ -835,7 +835,8 @@ enum ComfyuiCommand {
 
 #[derive(Subcommand, Debug)]
 enum ServicesCommand {
-    /// Show currently running local model servers.
+    /// Show currently running local model servers, and count the records that
+    /// are no longer running.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]

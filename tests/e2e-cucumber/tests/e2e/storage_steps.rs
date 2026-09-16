@@ -71,9 +71,13 @@ async fn assert_re_downloadable_notes(world: &mut E2eWorld) {
     // remove-downloads` acts on exactly these - so pin it here rather than leave
     // it as an unwitnessed side effect.
     //
-    // Asserted against the row, not merely somewhere in the output: the same
-    // string is reachable from the `Shared with other tools` loop, which
-    // rendered notes before this change.
+    // Asserted against the row rather than merely somewhere in the output
+    // because the note is per-row and both rows carry the *same* string: a
+    // `contains` check is satisfied by either one, so dropping the note from
+    // `downloaded helper tools` would leave this green. Anchoring also pins
+    // the shape the user reads - the `note: ` line directly under its own row
+    // - so notes rendered detached from their rows, or beside the wrong
+    // label, fail here rather than ship.
     let lines: Vec<&str> = stdout.lines().collect();
     for label in ["downloaded ROCm archives", "downloaded helper tools"] {
         let at = lines
