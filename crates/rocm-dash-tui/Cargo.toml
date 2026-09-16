@@ -51,3 +51,9 @@ rig = { package = "rig-core", version = "=0.38.1", default-features = false, fea
 # same 0.13 line Rig already pulls in (TUI crate only) so the tree keeps one
 # reqwest version; `json` for response parsing, `rustls-tls` to match Rig's stack.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# Test-only, Unix-only: `raise(3)` lets the termination-watcher unit tests drive
+# a real SIGTERM/SIGINT through Tokio's signal registry in-process. Not a runtime
+# dependency — the production signal path goes through `tokio::signal`.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
