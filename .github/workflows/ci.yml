@@ -641,8 +641,8 @@ jobs:
           section below, then:
 
           ```powershell
-          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath .   # GitHub's wrapper zip
-          Expand-Archive rocm-cli-pr-windows-amd64\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
+          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath pr-artifact   # GitHub's wrapper zip
+          Expand-Archive pr-artifact\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
           $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
@@ -675,6 +675,11 @@ jobs:
   pr-linux-binaries:
     name: Build Linux PR binaries
     runs-on: ubuntu-latest
+    # 30min: a cold containerised release build (image pull, yum install,
+    # rustup install, then `cargo build --release` for 3 crates) plus none of
+    # its steps below are individually bounded -- see the convention comment
+    # at the top of this block.
+    timeout-minutes: 30
     needs: [changes, clippy, prek]
     if: >-
       (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true') &&
@@ -735,9 +740,9 @@ jobs:
           ```sh
           unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
           tar -xzf rocm-cli-pr-linux-amd64.tar.gz
-          cd rocm-cli-pr-linux-amd64
-          chmod +x bin/rocm bin/rocmd
-          install -Dm0755 bin/rocm bin/rocmd -t "$HOME/.local/bin"
+          dest="$HOME/rocm-cli-pr/bin"
+          install -Dm0755 rocm-cli-pr-linux-amd64/bin/rocm rocm-cli-pr-linux-amd64/bin/rocmd -t "$dest"
+          export PATH="$dest:$PATH"
           rocm --version
           ```
 

@@ -690,6 +690,30 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
     #[test]
+    fn every_ci_job_declares_a_timeout() {
+        let ci = read_workflow("ci.yml");
+        let jobs = top_level_block(&ci, "jobs");
+        let job_ids: Vec<&str> = jobs
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .collect();
+        assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
+        for job in job_ids {
+            let block = job_block(&ci, job);
+            assert!(
+                block
+                    .lines()
+                    .any(|line| indent_of(line) == 4 && line.trim().starts_with("timeout-minutes:")),
+                "job `{job}` in ci.yml has no timeout-minutes -- GitHub's 360min default applies, \
+                 so a hung step (an unbounded network call, an unresponsive registry) holds a \
+                 runner for six hours instead of failing fast (see the convention comment at the \
+                 top of the jobs: block)"
+            );
+        }
+    }
+
+    #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
         let values = runs_on_values(&ci);
