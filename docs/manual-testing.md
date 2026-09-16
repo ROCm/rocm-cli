@@ -123,8 +123,34 @@ rocm examine
 Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`.
 Omit `--prefix` if you want rocm-cli to choose its standard managed folder.
 
+Section 1 has already made a managed runtime the active default, so the
+`install sdk` above will **ask for confirmation before it installs**: the new
+install takes over as the active default. That is the expected behaviour, not a
+regression. Answer the prompt to continue. The gate is not scoped to the family
+or channel, so it asks even when this install targets a family this machine has
+never held. To take the same step without a prompt — and this is required in a
+non-interactive shell, where the command refuses instead of asking — re-run it
+with `--approve-replacing-active-default`:
+
+```powershell
+rocm install sdk --channel release --format wheel --prefix .\.rocm-work\data\envs\default --approve-replacing-active-default
+```
+
+Use `--yes` only if you also want to approve installing required system
+packages with `sudo`, which needs a terminal to answer a password prompt.
+
 Expected result:
 
+- On a machine with an active default runtime (the state section 1 leaves
+  behind), the install prompts first and names what would be displaced;
+  declining leaves the existing runtime untouched.
+- In a non-interactive shell with neither approval flag, the install refuses
+  rather than silently displacing the active default, and the error names
+  `--approve-replacing-active-default` as the flag to add.
+- With `--approve-replacing-active-default`, the install proceeds without
+  asking and prints a line crediting that flag by name — not `--yes`.
+- `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
+  active default is: the preview stops before the gate.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
