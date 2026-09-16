@@ -110,7 +110,7 @@ Before each stateful decision or public status update:
 - verify review context against current PR head commit
 
 Do not rely on stale memory, partial CI views, or prior snapshots.
-Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan.
+Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan. A passing unit test asserting exact string content only proves the string is unchanged, not that the claim is true — re-derive the claim against the actual code path rather than accepting the test as proof.
 
 After rebase/cherry-pick/merge, grep for conflict markers:
 
@@ -143,6 +143,18 @@ Understand existing patterns first:
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
+Keep docs and behavior claims in sync while editing:
+
+- when a command's flags, defaults, arguments, or observable behavior
+  change, update README.md, its --help/doc comment, docs/testing.md, and
+  docs/manual-testing.md in the same change — do not leave user-facing docs
+  for a follow-up
+- the same behavior claim (e.g. "does X automatically") often repeats across
+  README.md, --help doc comments, printed CLI output, and docs/*.md; each
+  drifts independently, so grep for the claim's wording across all of them,
+  not just the surface you're editing, and check each against the actual
+  code path
+
 ## 6) rocm-cli Architecture Guardrails
 
 Current workspace members:
@@ -165,6 +177,7 @@ Guardrails:
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
+- before hand-rolling CLI output (completion reports, progress/spinner indicators, confirmation/approval prompts), check for and reuse the existing shared components (e.g. `apps/rocm/src/cli_report.rs::ActionReport`) instead of duplicating the pattern inline; extend the shared component if it doesn't yet cover the needed case
 - supported host platforms are Windows and Linux only (including WSL where documented)
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
@@ -235,6 +248,8 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
+- automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
+- to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
 **Stacked and dependent PRs:**
 
