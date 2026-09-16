@@ -670,6 +670,7 @@ async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
         .path();
     let path = root.join(DASH_CLOCK_OFFSET_FILE);
     std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
+    world.dash_clock_zero = Some(Instant::now());
     world.command_env.push((
         "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
         path.into_os_string(),
@@ -693,6 +694,17 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 /// counter until the daemon delivers at least one 503 — confirming the failure
 /// scrape actually landed before the assertion checks the TUI. This avoids a
 /// fixed wall-time sleep while remaining deterministic.
+///
+/// Reaching that 503 already costs real wall-clock time (the poll loop below,
+/// plus whatever host scheduling delay stretched the scrape cadence to get
+/// here) — time the injected clock's tick counter keeps accruing against
+/// regardless, since it advances once per real daemon cycle. Left uncorrected,
+/// that cost is subtracted from the 6 s validity window before
+/// `gen_tps_held_after_failure` even starts polling for the TUI to repaint,
+/// so a slow host can consume the window before the persistence check gets a
+/// chance to run. Roll the injected clock back by the real time spent getting
+/// here so the check downstream starts from a fresh window instead of racing
+/// whatever margin survived this wait.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     let mock = world.mock.as_ref().expect("no mock server running");
@@ -713,6 +725,18 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let clock_zero = world
+        .dash_clock_zero
+        .expect("dashboard observation time is deterministic must run first");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let elapsed_secs = i64::try_from(clock_zero.elapsed().as_secs()).unwrap_or(i64::MAX);
+    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), (-elapsed_secs).to_string())
+        .expect("failed to roll back dashboard test clock");
 }
 /// EAI-7960 principal regression assertion.
 ///
