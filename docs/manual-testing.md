@@ -197,6 +197,33 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
+Then delete a record you no longer want. Removal is destructive and cannot be
+undone, so read the log first:
+
+```powershell
+rocm services logs <service-id>
+rocm services remove <service-id> --yes
+rocm services prune --dry-run --older-than-hours 0
+rocm services prune --yes --older-than-hours 0
+```
+
+Expected result:
+
+- `rocm services remove` on a *running* server fails and tells you to run
+  `rocm services stop <service-id> --yes` first; nothing is deleted.
+- Without `--yes` both commands fail and print the command to repeat.
+- After a successful removal, `rocm services list --all` no longer lists the
+  record, `rocm services logs <service-id>` fails, and all of
+  `<data>/services/<service-id>.json`, `<data>/services/<service-id>.log`,
+  `<data>/engines/<engine>/state/<service-id>.json` and any
+  `<data>/services/<service-id>.endpoint-key` are gone.
+- `<data>/services/launch.lock` is untouched — it is shared by every launch.
+- `rocm services prune --dry-run` prints the same plan and changes nothing.
+- `rocm services prune` leaves running servers alone and says how many it
+  skipped, and also removes leftover engine state files whose record is gone.
+- Without `--older-than-hours 0`, a record written in the last 24 hours is left
+  alone and the output says so.
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

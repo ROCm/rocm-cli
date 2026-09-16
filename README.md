@@ -475,7 +475,17 @@ rocm services list [--all]
 rocm services logs <service-id>
 rocm services stop <service-id> [--yes]
 rocm services restart <service-id> [--yes]
+rocm services remove <service-id> --yes
+rocm services prune [--older-than-hours <n>] [--dry-run] [--yes]
 ```
+
+`remove` deletes one record that is no longer running, together with its log,
+its engine state file, and its endpoint key file; a running server is refused,
+so stop it first. `prune` does the same in bulk, always leaves running servers
+alone, and additionally clears leftover files whose record is already gone.
+Removal destroys both the log and the `restart` option for the records it
+takes, so `prune` only considers records untouched for 24 hours unless
+`--older-than-hours` says otherwise.
 
 ### Dashboard
 

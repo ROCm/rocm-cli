@@ -464,6 +464,16 @@ still enforcing the key — and the deferred cleanup lands on the liveness refre
 that later observes the process dead. There is no e2e coverage of `services
 stop`/`restart` or endpoint auth; these paths are unit-tested only.
 
+`rocm services remove` / `rocm services prune` are the one place a key file is
+dropped for a service that was never stopped: the record itself is being
+deleted, so keeping its key would strand a 0600 secret belonging to a service
+that can no longer be restarted. Neither will touch a record the liveness
+refresh still reads as running, so this cannot race a live server.
+`features/service_record_cleanup.feature` covers both commands on the mock lane,
+asserting on the files left on disk rather than on the summary line the command
+prints — the defect they exist to fix is a file being left behind, which a
+summary claiming success cannot reveal.
+
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
