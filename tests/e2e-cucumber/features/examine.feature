@@ -275,3 +275,21 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system in machine-readable form
     Then the inspection attributes a code object manager library to that runtime
+
+  # `rocm_install_method` used to report "amdgpu-install"/"tarball-or-other";
+  # renamed to "repo-native"/"runfile-or-tarball" alongside the switch away
+  # from the amdgpu-install wrapper. It also drives fix-12's remediation
+  # choice, so a silent revert of the rename would misfire there without any
+  # test catching it -- this pins the JSON contract directly rather than only
+  # asserting the human-readable form (examine-06), which never named it. A
+  # whitelist rather than one pinned value keeps this hermetic: which method
+  # actually fires depends on this host's real ROCm repo markers (some
+  # developer machines and self-hosted GPU runners have them, a clean mock
+  # lane does not), not just on the install this scenario plants. No GPU
+  # needed: the install is planted by the harness (`plant_unmanaged_rocm`),
+  # same as examine-06.
+  @id:examine-reports-a-current-install-method-name
+  Scenario: examine-20 - System inspection reports a current install-method name, not the retired amdgpu-install naming
+    Given a machine with a ROCm install that was not set up by the CLI
+    When the user inspects the system as machine-readable JSON
+    Then the inspection reports a current install-method name
