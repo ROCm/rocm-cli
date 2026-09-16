@@ -266,3 +266,50 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that machine
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
+
+  # `--model` answers the question that comes before the other two: given this
+  # machine and that model, will it run. The point is that it answers in seconds
+  # and fetches nothing, so the user is not told by a download that failed.
+  #
+  # Host-agnostic in the same way diagnose-10 is, and for the same reason. The
+  # verdict depends on what this machine can measure of its own GPU, which
+  # differs per lane, so the scenario asks the CLI what it measured and then
+  # holds it to the matching half of the contract. Each half can fail, which is
+  # the bar an assertion has to clear: the mock lane (no GPU at all) exercises
+  # the "there is nothing to serve this on" half, the GPU lanes the "measured
+  # and it does not fit" half. What holds everywhere is that a model no machine
+  # could serve is never called ready, and that asking costs no download.
+  @id:diagnose-model-too-large-is-refused-with-something-that-fits
+  Scenario: diagnose-20 - A model this machine cannot serve is refused before anything is downloaded
+    Given a user asking about a model no single machine could serve
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the model is never reported as ready
+    And a machine that measured its GPU is told the model will not run, and what would
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+    And the human-readable answer names what would run instead
+    And no model weights were fetched
+
+  # The other half of the verdict, and the one a user acts on: a model that does
+  # fit has to say which engine would serve it, because that is what `rocm serve`
+  # will pick and the user has no other way to know before starting it.
+  @id:diagnose-model-that-fits-is-ready-and-names-the-engine
+  Scenario: diagnose-21 - A model this machine can serve is reported ready, with the engine that would serve it
+    Given a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then a machine with enough measured GPU memory is told the model is ready
+    And the answer names the engine that would serve it
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+
+  # The failure this guards is not an error, it is a WRONG ANSWER that reads like
+  # a real one. If a recipe catalog that cannot be read is scored as though it
+  # had been, the user is told their machine cannot run a model when the truth is
+  # that the CLI never found out what the model needs — and they go looking for
+  # hardware they may already have. Deterministic on every lane: the catalog
+  # source is pointed at a path that does not exist.
+  @id:diagnose-model-unreachable-catalog-is-not-an-incompatible-model
+  Scenario: diagnose-22 - A recipe catalog that cannot be read is not reported as an incompatible model
+    Given a machine that cannot reach the model recipe catalog
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is the unreachable catalog, not the model
+    And nothing is claimed about whether the model fits this machine

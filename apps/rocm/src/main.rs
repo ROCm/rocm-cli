@@ -26,6 +26,9 @@ use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rocm_core::model_readiness::{
+    AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
+};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -151,6 +154,19 @@ enum Command {
         /// name only when more than one is installed.
         #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
         distro: Option<String>,
+        /// Also answer whether a model would run on this machine, before
+        /// downloading it.
+        ///
+        /// Takes a curated model name or alias (see `rocm model`). Nothing is
+        /// fetched: the answer comes from the recipe and this host's GPU. A
+        /// model the catalog does not carry is reported as undetermined rather
+        /// than blocked — `rocm serve` still accepts it, this just cannot say
+        /// in advance whether it fits.
+        ///
+        /// A flag rather than a positional: `diagnose` takes no positional
+        /// today, and one added now would be ambiguous against `--symptom`.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -1769,7 +1785,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             top,
             json,
             distro,
-        }) => diagnose(symptom, top, json, distro),
+            model,
+        }) => diagnose(symptom, top, json, distro, model),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2399,7 +2416,13 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
+fn diagnose(
+    symptom: Option<String>,
+    top: usize,
+    json: bool,
+    distro: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
@@ -2419,11 +2442,34 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         .wsl
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
-    let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    // The model verdict is about THIS machine, always. `--distro` retargets the
+    // environment examination at another one, but the GPU memory and engine
+    // selection behind a model verdict are read locally -- so answering for a
+    // model here would describe the wrong host under a heading naming another.
+    // Refuse rather than substitute, the same way `--distro` itself does when it
+    // cannot reach a machine.
+    if model.is_some() && inspected_remotely {
+        bail!(
+            "--model answers for the machine running this command, and --distro points the \
+             examination at a different one. Run `rocm diagnose --model <model>` inside the \
+             distribution instead."
+        );
+    }
+    let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    if let Some(model_ref) = &model {
+        report.model = Some(assess_model_on_this_host(model_ref, &examination));
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
+        if let Some(readiness) = &report.model {
+            println!();
+            print!(
+                "{}",
+                rocm_core::model_readiness::render_model_readiness_text(readiness)
+            );
+        }
         // Inspecting a distribution from outside it collects no environment, so
         // the checks that read one never run. Without saying so, "no known
         // misconfiguration matched" reads as a clean bill of health for the
@@ -2438,6 +2484,128 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         }
     }
     Ok(())
+}
+
+/// Answer `--model` for the machine running the command.
+///
+/// Gathers only what the verdict needs, and keeps every "could not read it"
+/// apart from every "it is not there": an unreadable recipe index becomes
+/// `Unreachable` rather than an empty catalog, and GPU memory that `amd-smi`
+/// could not report becomes `Unknown` rather than zero. Both collapses would
+/// turn a gap in what the CLI can see into a confident refusal of the model.
+fn assess_model_on_this_host(
+    model_ref: &str,
+    examination: &rocm_core::Examination,
+) -> ModelReadiness {
+    let host_gpu_summary = detect_host_gpu_summary(None);
+    let host = HostFacts {
+        accelerator_memory: host_accelerator_memory(&host_gpu_summary, examination),
+        system_ram_gib: rocm_core::detect_system_ram_gib(),
+    };
+    let configured_engine = AppPaths::discover()
+        .ok()
+        .and_then(|paths| RocmCliConfig::load(&paths).ok())
+        .and_then(|config| config.default_engine);
+    match load_model_recipe_registry() {
+        Ok(registry) => assess_model_for_host(
+            model_ref,
+            &ModelCatalogSource::Available(&registry),
+            &host,
+            configured_engine.as_deref(),
+            Some(&host_gpu_summary),
+        ),
+        Err(error) => assess_model_for_host(
+            model_ref,
+            &ModelCatalogSource::Unreachable {
+                detail: format!("{error:#}"),
+            },
+            &host,
+            configured_engine.as_deref(),
+            Some(&host_gpu_summary),
+        ),
+    }
+}
+
+/// The memory pool an engine on this host would allocate a model from.
+///
+/// The APU case is why this is not simply a sum of `total_vram`. An APU has no
+/// private VRAM; `amd-smi` reports the fixed BIOS carve-out (often ~4 GiB) while
+/// the allocator serves the model out of GTT-backed system RAM. Comparing a
+/// recipe minimum against the carve-out would refuse a 22 GiB model on a 128 GiB
+/// Strix Halo, which serves it fine. [`vram_capacity_is_meaningful`] is the same
+/// test `serve`'s low-VRAM warning uses, so the two cannot disagree about which
+/// hosts the figure describes.
+///
+/// The examination is what makes "there is no GPU" reachable at all. `amd-smi`
+/// answers "how much memory", and its absence is ambiguous — no GPU, or no
+/// `amd-smi`. The examination reads the devices themselves, so it can tell those
+/// two apart, and they deserve different answers: one is a machine that needs a
+/// GPU, the other a machine whose GPU could not be measured.
+fn host_accelerator_memory(
+    host_gpu_summary: &rocm_core::HostGpuSummary,
+    examination: &rocm_core::Examination,
+) -> AcceleratorMemory {
+    let Some(vram) = gpu_vram_usage() else {
+        if examination.has_amd_gpu {
+            return AcceleratorMemory::Unknown;
+        }
+        return AcceleratorMemory::None;
+    };
+    let total_gib = vram
+        .iter()
+        .map(|usage| usage.total_mb as f64 / 1024.0)
+        .sum::<f64>();
+    if vram_capacity_is_meaningful(host_gpu_summary.gfx_target.as_deref(), vram.len()) {
+        return AcceleratorMemory::Dedicated(total_gib);
+    }
+    rocm_core::detect_system_ram_gib().map_or(AcceleratorMemory::Unknown, |ram_gib| {
+        AcceleratorMemory::UnifiedSystemMemory(ram_gib)
+    })
+}
+
+/// Assess a model against this host, with `serve`'s own engine decision.
+///
+/// The engine is not re-derived here. `select_serve_engine` is the one place
+/// that answers "which engine serves this model on this host", and passing it in
+/// is what keeps `rocm diagnose --model` from confidently naming an engine
+/// `rocm serve` would never pick. An engine ruled out by the platform gate is
+/// reported as such rather than silently swapped for another: `serve` does not
+/// fall back either, and a verdict that pretended otherwise would be wrong in
+/// the user's favour.
+fn assess_model_for_host(
+    model_ref: &str,
+    catalog: &ModelCatalogSource<'_>,
+    host: &HostFacts,
+    configured_default_engine: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+) -> ModelReadiness {
+    let engine_for = |recipe: &ModelRecipeRecord| {
+        let selection = select_serve_engine(
+            None,
+            configured_default_engine,
+            Some(recipe),
+            host_gpu_summary,
+        );
+        HostEngineChoice {
+            unsupported_here: engine_ruled_out_by_platform(&selection.engine).then(|| {
+                format!(
+                    "{} has no adapter on native Windows; serve it from WSL or Linux",
+                    selection.engine
+                )
+            }),
+            engine: selection.engine,
+            source: selection.source.to_owned(),
+        }
+    };
+    rocm_core::model_readiness::assess_model_readiness(model_ref, catalog, host, &engine_for)
+}
+
+/// Whether the platform gate rules this engine out on this host.
+///
+/// One place, so the `/model` adapter-availability note and the readiness
+/// verdict cannot answer differently about the same host and engine.
+const fn engine_ruled_out_by_platform(engine: &str) -> bool {
+    rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm")
 }
 
 fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
@@ -14904,9 +15072,14 @@ fn append_model_fit_lines(
                     output,
                     "      reason: current telemetry has no aggregate GPU VRAM reading"
                 );
+                // Not `/examine`: an `Examination` is a static host snapshot and
+                // carries no VRAM figure at all, so sending the user there for a
+                // missing VRAM reading is a confident dead end. `amd-smi` is
+                // where the reading actually comes from, and it is the same
+                // command `rocm diagnose --model` names for the same gap.
                 let _ = writeln!(
                     output,
-                    "      action: run /examine or refresh GPU telemetry, then retry /model {}",
+                    "      action: make `amd-smi metric --json` work on this host, then retry /model {}",
                     recipe_display_ref(recipe)
                 );
             }
@@ -14936,19 +15109,36 @@ fn append_manual_alternative_lines(
     }
 }
 
+/// Curated models to suggest in place of one that does not fit, for `/model`.
+///
+/// The *selection policy* — declared alternatives first, else same-task curated
+/// recipes, capped — lives in `rocm_core::model_readiness::curated_alternatives`
+/// and is shared with `rocm diagnose --model`, so the two commands cannot come
+/// to answer "what should I run instead" differently. What stays local is the
+/// predicate and the wording: `/model` asks only whether the VRAM minimum is
+/// met, while `diagnose --model` asks the whole readiness question, and each is
+/// right for its own report.
 #[allow(dead_code)]
 fn manual_alternative_recommendations(
     recipe: &ModelRecipeRecord,
     aggregate_gpu_vram_gib: Option<f64>,
 ) -> Vec<String> {
-    let declared = recipe
-        .manual_alternatives
-        .iter()
-        .filter_map(|candidate_ref| {
-            resolve_builtin_model_recipe(candidate_ref).map(|candidate| (candidate_ref, candidate))
-        })
-        .filter(|(_, candidate)| recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib))
-        .map(|(candidate_ref, candidate)| {
+    let catalog = builtin_model_recipes();
+    rocm_core::model_readiness::curated_alternatives(Some(recipe), &catalog, &|candidate| {
+        recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib)
+    })
+    .into_iter()
+    .map(|(candidate_ref, candidate)| {
+        // A declared alternative is shown with its requirement, a fallback with
+        // its name alone. The two branches are exclusive -- a fallback only runs
+        // when no declared candidate survived the predicate, and a candidate
+        // that failed it in one branch fails it in the other -- so testing the
+        // declared list here recovers exactly which branch produced this pick.
+        if recipe
+            .manual_alternatives
+            .iter()
+            .any(|declared| declared == candidate_ref)
+        {
             format!(
                 "{} ({})",
                 candidate_ref,
@@ -14957,19 +15147,11 @@ fn manual_alternative_recommendations(
                     |value| format!("{} min GPU", format_gib(f64::from(value)))
                 )
             )
-        })
-        .collect::<Vec<_>>();
-    if !declared.is_empty() {
-        return declared;
-    }
-    builtin_model_recipes()
-        .into_iter()
-        .filter(|candidate| candidate.canonical_model_id != recipe.canonical_model_id)
-        .filter(|candidate| candidate.task == recipe.task)
-        .filter(|candidate| recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib))
-        .take(3)
-        .map(|candidate| recipe_display_ref(&candidate).to_owned())
-        .collect()
+        } else {
+            candidate_ref.to_owned()
+        }
+    })
+    .collect()
 }
 
 #[allow(dead_code)]
@@ -15051,7 +15233,7 @@ fn append_model_engine_support_lines(
 
 #[allow(dead_code)]
 const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
+    if engine_ruled_out_by_platform(engine) {
         Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
@@ -15060,12 +15242,12 @@ const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'stat
     }
 }
 
+/// One definition, shared with `rocm diagnose --model`: a model named in a
+/// suggestion has to be a string the user can paste back into `rocm serve`, and
+/// two answers to "what do I call this recipe" is one too many.
 #[allow(dead_code)]
 fn recipe_display_ref(recipe: &ModelRecipeRecord) -> &str {
-    recipe
-        .aliases
-        .first()
-        .map_or(recipe.canonical_model_id.as_str(), String::as_str)
+    rocm_core::model_readiness::recipe_display_ref(recipe)
 }
 
 #[allow(dead_code)]
@@ -31908,6 +32090,94 @@ ID_LIKE="suse opensuse"
                 None,
                 "whitespace-only stdin must yield no prompt; input: {input:?}"
             );
+        }
+    }
+
+    /// Hosts whose engine choice differs, so the assertion below is exercised on
+    /// more than one branch of `select_serve_engine`.
+    fn engine_selection_hosts() -> Vec<(&'static str, rocm_core::HostGpuSummary)> {
+        vec![
+            (
+                "Instinct MI300X",
+                rocm_core::HostGpuSummary {
+                    name: Some("AMD Instinct MI300X".to_owned()),
+                    gfx_target: Some("gfx942".to_owned()),
+                    therock_family: Some("gfx94X-dcgpu".to_owned()),
+                },
+            ),
+            (
+                "Strix Halo",
+                rocm_core::HostGpuSummary {
+                    name: Some("AMD Radeon 8060S".to_owned()),
+                    gfx_target: Some("gfx1151".to_owned()),
+                    therock_family: Some("gfx1151".to_owned()),
+                },
+            ),
+            ("no detected GPU", rocm_core::HostGpuSummary::default()),
+        ]
+    }
+
+    /// I3 — `rocm diagnose --model` never names an engine `rocm serve` would not
+    /// select.
+    ///
+    /// Two layers agreeing about one decision. The defect this catches is not a
+    /// wrong `select_serve_engine`, it is the readiness path re-deriving the
+    /// choice from `recipe.preferred_engines` and drifting: that reads correctly
+    /// and is wrong on exactly the hosts where serve overrides the recipe. So
+    /// both real call sites are driven with the same inputs and compared, rather
+    /// than either being called with literal arguments.
+    #[test]
+    fn the_engine_doctor_names_is_the_engine_serve_would_select() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(192.0),
+            system_ram_gib: Some(1024.0),
+        };
+
+        // Non-vacuity: at least one pair must be a case where serve OVERRIDES the
+        // recipe's own first preference, because that is the only case a
+        // re-derivation would get wrong. Native Windows has no such case --
+        // `preferred_serve_engine_for_host_gpu_summary` never prefers vLLM there
+        // -- so the check is stated where it exists and the equality assertion
+        // below still runs everywhere.
+        if !rocm_core::runtime_is_windows() {
+            let overridden = engine_selection_hosts().into_iter().any(|(_, summary)| {
+                registry.recipes.iter().any(|recipe| {
+                    let selected = select_serve_engine(None, None, Some(recipe), Some(&summary));
+                    recipe
+                        .preferred_engines
+                        .first()
+                        .is_some_and(|preferred| !preferred.eq_ignore_ascii_case(&selected.engine))
+                })
+            });
+            assert!(
+                overridden,
+                "no host/recipe pair here exercises serve overriding the recipe's preferred \
+                 engine, so the comparison below cannot catch the readiness path re-deriving \
+                 the choice itself"
+            );
+        }
+
+        for (label, summary) in engine_selection_hosts() {
+            for recipe in &registry.recipes {
+                let expected = select_serve_engine(None, None, Some(recipe), Some(&summary));
+                let report = assess_model_for_host(
+                    &recipe.canonical_model_id,
+                    &ModelCatalogSource::Available(&registry),
+                    &host,
+                    None,
+                    Some(&summary),
+                );
+                assert_eq!(
+                    report.engine.as_deref(),
+                    Some(expected.engine.as_str()),
+                    "on {label}, `rocm diagnose --model {}` names {:?} but `rocm serve` would \
+                     select `{}`",
+                    recipe.canonical_model_id,
+                    report.engine,
+                    expected.engine
+                );
+            }
         }
     }
 }

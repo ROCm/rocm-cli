@@ -1057,3 +1057,366 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
         "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }
+
+// ── `rocm diagnose --model` ────────────────────────────────────────
+
+/// The largest curated recipe. Its 905 GiB minimum is above any single machine
+/// the suite runs on, which is what makes the "will not run" half of
+/// diagnose-20 hold on every lane rather than only on the small ones.
+const OVERSIZED_MODEL_REF: &str = "glm5";
+
+/// The smallest curated recipe (2 GiB minimum). Any machine that can measure a
+/// GPU at all can serve it, so the "ready" half of diagnose-21 holds on every
+/// GPU lane rather than only the Instinct one.
+const SMALLEST_MODEL_REF: &str = "qwen-smoke";
+
+/// A recipe index path that cannot exist, used to make the catalog source
+/// genuinely unreachable rather than merely empty. Under the scenario's isolated
+/// root so it is impossible for a runner to have planted one there.
+fn unreachable_index_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-recipe-index.json")
+}
+
+/// A model-weight cache the scenario owns and that starts out absent, so
+/// "nothing was fetched" is a question about a directory the runner cannot have
+/// pre-populated. The shared `HF_HOME` the harness normally sets could not
+/// answer it: it is deliberately shared across scenarios and already holds
+/// weights.
+fn scenario_weights_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("weights-must-stay-empty")
+}
+
+/// Read the `model` section of a `rocm diagnose --model ... --json` report.
+fn model_section(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let report: serde_json::Value =
+        serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    report
+        .get("model")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("diagnose --model emitted no model section:\n{output}"))
+}
+
+fn model_field<'a>(model: &'a serde_json::Value, field: &str) -> &'a serde_json::Value {
+    model
+        .get(field)
+        .unwrap_or_else(|| panic!("the model section has no `{field}`: {model:#}"))
+}
+
+fn model_verdict(model: &serde_json::Value) -> &str {
+    model_field(model, "verdict")
+        .as_str()
+        .expect("verdict is not a string")
+}
+
+/// Whether this host measured its own GPU memory. Everything downstream of it
+/// differs per lane, so it is read back from the report rather than assumed.
+fn measured_gpu_gib(model: &serde_json::Value) -> Option<f64> {
+    model_field(model, "available_gpu_memory_gib").as_f64()
+}
+
+#[given("a user asking about a model no single machine could serve")]
+async fn user_asks_about_an_oversized_model(world: &mut E2eWorld) {
+    world.model_name = Some(OVERSIZED_MODEL_REF.to_string());
+    let weights = scenario_weights_dir(world);
+    world
+        .command_env
+        .push(("HF_HOME", weights.into_os_string()));
+}
+
+#[given("a user asking about the smallest curated model")]
+async fn user_asks_about_the_smallest_model(world: &mut E2eWorld) {
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[given("a machine that cannot reach the model recipe catalog")]
+async fn machine_cannot_reach_the_catalog(world: &mut E2eWorld) {
+    // The public key path is supplied too. Without it the CLI fails earlier, on
+    // the missing key rather than the missing index, and the scenario would be
+    // asserting about a different unreachable thing than the one it names.
+    let index = unreachable_index_path(world);
+    let key = index.with_extension("pem");
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        key.into_os_string(),
+    ));
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[when("the user asks the CLI whether that model would run, in machine-readable form")]
+async fn user_asks_whether_a_model_would_run(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--model", &model, "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the model is never reported as ready")]
+async fn assert_model_is_never_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_ne!(
+        model_verdict(&model),
+        "ready",
+        "the `{OVERSIZED_MODEL_REF}` recipe needs more memory than any single machine here has, \
+         so no lane may call it ready: {model:#}"
+    );
+}
+
+#[then("a machine that measured its GPU is told the model will not run, and what would")]
+async fn assert_measured_machine_is_blocked_with_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    assert_eq!(
+        model_verdict(&model),
+        "blocked",
+        "this machine measured {available} GiB against a 905 GiB recipe, so the answer is a \
+         refusal and not anything softer: {model:#}"
+    );
+    let alternatives = model_field(&model, "alternatives")
+        .as_array()
+        .expect("alternatives is not an array")
+        .clone();
+    assert!(
+        !alternatives.is_empty(),
+        "a refusal with nothing offered instead leaves the user where they started: {model:#}"
+    );
+    // The point of naming an alternative is that it runs HERE. One that does not
+    // fit either is worse than silence: it costs the user a second download to
+    // find out.
+    for alternative in &alternatives {
+        let required = alternative
+            .get("required_gpu_memory_gib")
+            .and_then(serde_json::Value::as_f64);
+        assert!(
+            required.is_none_or(|required| required <= available),
+            "`{}` was offered as what would run instead, but it needs {required:?} GiB and this \
+             machine measured {available} GiB: {model:#}",
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+        );
+    }
+}
+
+#[then(
+    "a machine that could not measure its GPU is told why, rather than that the model is incompatible"
+)]
+async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_some() {
+        return;
+    }
+    // Two different machines land here and they do not deserve the same answer.
+    // One has no GPU at all, which is a fact and a refusal the CLI can stand
+    // behind. The other has a GPU whose memory it could not read, which is a gap
+    // in what it can see and must not be dressed up as a verdict about the
+    // model. Neither may be reported as "this model is too big for you".
+    let evidence = model_field(&model, "evidence").to_string();
+    match model_verdict(&model) {
+        "blocked" => {
+            assert!(
+                evidence.contains("no GPU is visible to ROCm"),
+                "the only refusal a machine with no measurement may make is about the GPU, and \
+                 this one does not say so: {model:#}"
+            );
+            assert!(
+                model_field(&model, "available_gpu_memory_gib").is_null(),
+                "a machine that measured nothing must not report a figure it compared against: \
+                 {model:#}"
+            );
+        }
+        "undetermined" => {
+            assert_eq!(
+                model_field(&model, "undetermined_reason")
+                    .as_str()
+                    .unwrap_or_default(),
+                "accelerator_memory_unknown",
+                "the reason has to name the missing measurement, or the user reads it as a fact \
+                 about the model: {model:#}"
+            );
+        }
+        other => panic!(
+            "a machine that could not measure its GPU reported `{other}`, which claims more than \
+             it knows: {model:#}"
+        ),
+    }
+}
+
+#[then("the human-readable answer names what would run instead")]
+async fn assert_human_answer_names_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_none() {
+        return;
+    }
+    let expected = model_field(&model, "alternatives")
+        .as_array()
+        .and_then(|alternatives| alternatives.first().cloned())
+        .and_then(|alternative| {
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .expect("the machine-readable answer offered no alternative to look for");
+    // The same question again without `--json`: the structured answer being
+    // right is no use if the report the user actually reads does not carry it.
+    let (stdout, _, rc) = crate::run_rocm(world, &["diagnose", "--model", OVERSIZED_MODEL_REF]);
+    assert_eq!(rc, 0, "diagnose should exit 0 (it is a query)");
+    assert!(
+        stdout.contains(&expected),
+        "the human-readable report never names `{expected}` as what would run instead:\n{stdout}"
+    );
+}
+
+#[then("no model weights were fetched")]
+async fn assert_no_weights_were_fetched(world: &mut E2eWorld) {
+    // Two places a fetch would land: the model-weight cache the scenario pointed
+    // the CLI at, and rocm-cli's own artifact cache under the isolated data dir.
+    // Neither exists before the run, so their continued absence is not something
+    // the runner could have arranged in advance.
+    let weights = scenario_weights_dir(world);
+    assert!(
+        !weights.exists(),
+        "asking whether a model would run created {} -- the answer is supposed to cost no \
+         download",
+        weights.display()
+    );
+    let artifacts = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("models")
+        .join("artifacts");
+    assert!(
+        !artifacts.exists(),
+        "asking whether a model would run populated the artifact cache at {}",
+        artifacts.display()
+    );
+}
+
+#[then("a machine with enough measured GPU memory is told the model is ready")]
+async fn assert_fitting_model_is_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    let required = model_field(&model, "required_gpu_memory_gib")
+        .as_f64()
+        .unwrap_or(0.0);
+    if available < required {
+        return;
+    }
+    // `degraded` is allowed alongside `ready`: a machine whose system RAM is
+    // below the recipe's recommendation still runs it, and calling that a
+    // failure would make the scenario a test of the runner's RAM.
+    assert!(
+        matches!(model_verdict(&model), "ready" | "degraded"),
+        "this machine measured {available} GiB against a {required} GiB recipe, so the model runs \
+         here: {model:#}"
+    );
+}
+
+#[then("the answer names the engine that would serve it")]
+async fn assert_answer_names_the_engine(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // Named whatever the verdict, as long as a recipe was read: which engine
+    // would serve a model does not depend on whether it fits, and withholding it
+    // on a refusal is what would leave the user unable to check an alternative.
+    if model_field(&model, "canonical_model_id").is_null() {
+        return;
+    }
+    let engine = model_field(&model, "engine")
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !engine.is_empty(),
+        "the answer names no engine, so the user cannot tell what `rocm serve` would start: \
+         {model:#}"
+    );
+}
+
+#[then("the CLI reports that it could not determine the answer")]
+async fn assert_catalog_failure_is_undetermined(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "a catalog that could not be read says nothing about the model, so no verdict about the \
+         model may be reported: {model:#}"
+    );
+}
+
+#[then("the reason given is the unreachable catalog, not the model")]
+async fn assert_reason_is_the_catalog(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "catalog_unreachable",
+        "the reason must name the source, not the model: {model:#}"
+    );
+    let index = unreachable_index_path(world);
+    let file_name = index
+        .file_name()
+        .expect("index path has no file name")
+        .to_string_lossy()
+        .into_owned();
+    let evidence = model_field(&model, "evidence").to_string();
+    assert!(
+        evidence.contains(&file_name),
+        "the evidence never names the source that could not be read ({}): {evidence}",
+        index.display()
+    );
+}
+
+#[then("nothing is claimed about whether the model fits this machine")]
+async fn assert_nothing_claimed_about_fit(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // The recipe was never read, so its requirement is not known. Reporting one
+    // anyway -- even a plausible one -- is how an unreachable source turns into
+    // a confident statement about the model.
+    for field in ["required_gpu_memory_gib", "canonical_model_id"] {
+        assert!(
+            model_field(&model, field).is_null(),
+            "`{field}` was reported for a model whose recipe was never read: {model:#}"
+        );
+    }
+}
