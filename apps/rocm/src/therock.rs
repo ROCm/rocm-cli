@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
+    AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
     disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
@@ -2691,7 +2691,14 @@ fn install_tarball_runtime(
     });
     drop(spinner);
     download_result?;
-    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
+
+    let extract_spinner =
+        crate::cli_progress::AnimatedSpinner::start(format!("Extracting {}…", artifact.file_name));
+    let extract_result = extract_tarball_and_discard_archive(&cache_path, &install_root);
+    drop(extract_spinner);
+    if let Some(cleanup_warning) = extract_result? {
+        progress_line(cleanup_warning);
+    }
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -4253,10 +4260,12 @@ fn preflight_tarball_space(
         disk_space::with_margin(download_bytes),
     )?;
 
-    // When the cache and the install root share a filesystem, the archive and
-    // the extracted tree must both fit at the same time.
+    // When the cache and the install root share a mount, the archive and the
+    // extracted tree must both fit at the same time. Conservative in the other
+    // direction: two mounts backed by one filesystem also share a pool, and this
+    // treats them as separate, so the estimate can come in under the true need.
     let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
-    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+    if disk_space::on_same_mount(cache_path, install_root) == Some(true) {
         extract_estimate = extract_estimate.saturating_add(download_bytes);
     }
     Ok(disk_space::warn_if_low_space(
@@ -4594,16 +4603,22 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
 /// `ensure_uv_binary` already performs after unpacking its own download.
 ///
 /// Removing the archive is best-effort: the install has already succeeded by
-/// this point, so a cleanup failure is reported rather than raised.
-fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+/// this point, so a cleanup failure is non-fatal. The message is returned
+/// rather than printed directly, so callers running a progress spinner over
+/// this call can drop it first and avoid interleaving spinner frames with
+/// the report.
+fn extract_tarball_and_discard_archive(
+    archive_path: &Path,
+    target_dir: &Path,
+) -> Result<Option<String>> {
     extract_tarball(archive_path, target_dir)?;
     if let Err(error) = fs::remove_file(archive_path) {
-        progress_line(format!(
+        return Ok(Some(format!(
             "Could not remove the downloaded archive {}: {error}",
             archive_path.display()
-        ));
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn ensure_uv_venv(
@@ -4742,13 +4757,13 @@ pub(crate) fn probe_runtime_devices(
     let mut env = Vec::new();
     if !library_paths.is_empty() {
         let mut entries = library_paths.to_vec();
-        if let Some(existing) = std::env::var_os(LIBRARY_PATH_ENV) {
+        if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
             entries.extend(split_runtime_path(&existing));
         }
         let joined = std::env::join_paths(entries)
             .context("failed to compose the runtime library path for the device probe")?;
         env.push((
-            LIBRARY_PATH_ENV.to_owned(),
+            RUNTIME_LIBRARY_PATH_ENV.to_owned(),
             joined.to_string_lossy().into_owned(),
         ));
     }
@@ -4770,12 +4785,6 @@ pub(crate) fn probe_runtime_devices(
 fn parse_runtime_device_probe(output: &str) -> Result<RuntimeDeviceProbe> {
     serde_json::from_str(output.trim()).context("failed to parse runtime device probe output")
 }
-
-/// The loader search-path variable used to expose the runtime's ROCm libraries.
-#[cfg(windows)]
-const LIBRARY_PATH_ENV: &str = "PATH";
-#[cfg(not(windows))]
-const LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 
 /// Reports what torch sees, never raising: an unusable runtime must be
 /// described, not turned into a probe crash.
@@ -7822,7 +7831,11 @@ mod tests {
 
         let target = root.join("install");
         fs::create_dir_all(&target)?;
-        extract_tarball_and_discard_archive(&archive, &target)?;
+        let cleanup_warning = extract_tarball_and_discard_archive(&archive, &target)?;
+        assert!(
+            cleanup_warning.is_none(),
+            "archive cleanup should succeed: {cleanup_warning:?}"
+        );
 
         assert!(
             target.join("marker.txt").is_file(),
@@ -7832,6 +7845,78 @@ mod tests {
             !archive.exists(),
             "the archive should be removed once unpacked, found {}",
             archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// If the archive can't be removed after a successful extraction, the
+    /// extraction result still succeeds and callers receive a warning message
+    /// describing the cleanup failure instead of a raised error.
+    #[cfg(unix)]
+    #[test]
+    fn extracting_the_sdk_archive_reports_cleanup_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, _paths) = test_paths("discard-archive-cleanup-failure");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
+        // Root can unlink a file regardless of its parent directory's write
+        // permission bit, so the `chmod 0o555` below would not actually block
+        // the removal and `cleanup_warning` would come back `None`, failing
+        // the `.expect(...)` below on a mismatched assumption rather than the
+        // behavior under test.
+        #[allow(unsafe_code)] // libc FFI
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipping: test requires a non-root user to enforce permissions");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+
+        // Removing the archive requires write access to its parent directory;
+        // strip that so `fs::remove_file` fails after a successful extraction.
+        let cache_perms = fs::metadata(&cache)?.permissions();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o555))?;
+        let result = extract_tarball_and_discard_archive(&archive, &target);
+        fs::set_permissions(&cache, cache_perms)?;
+
+        let cleanup_warning = result?;
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should still be extracted"
+        );
+        assert!(
+            archive.is_file(),
+            "archive removal should have failed, leaving it in place"
+        );
+        let message = cleanup_warning.expect("a cleanup failure should produce a warning message");
+        assert!(
+            message.contains("Could not remove the downloaded archive"),
+            "{message}"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -8097,15 +8182,17 @@ mod tests {
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
         assert!(install_root.starts_with(&paths.data_dir));
         // Without --prefix the generated runtime folder is itself under the data dir, so
-        // the uv cache shares a filesystem with the environment it populates.
+        // the uv cache is reachable from the environment it populates without crossing a
+        // mount point.
         assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
     }
 
     #[test]
     fn uv_cache_does_not_follow_a_prefix_install_root() {
         // Documents a known gap rather than an intended behavior: `--prefix` relocates
-        // install_root only, while the uv cache stays keyed off the data dir. When the two
-        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // install_root only, while the uv cache stays keyed off the data dir. When reaching
+        // one from the other crosses a mount point uv falls back to copying — it is the
+        // mount, not the filesystem, so a bind mount is enough. Tracked separately; see
         // the `--prefix` non-goal on the PR that introduced the colocation.
         let (_root, paths) = test_paths("prefix-uv-cache");
         let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");

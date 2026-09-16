@@ -103,6 +103,14 @@ pub const fn runtime_python_executable_name() -> &'static str {
     }
 }
 
+/// The loader search-path variable used to expose a runtime's ROCm libraries to
+/// a child process.
+pub const RUNTIME_LIBRARY_PATH_ENV: &str = if cfg!(windows) {
+    "PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
 pub fn runtime_python_env_bin_dir(env_root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(env_root).join(runtime_python_bin_dir_name())
 }
@@ -300,8 +308,12 @@ pub fn managed_pip_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("pip-cache")
 }
 
-/// `uv`'s content-addressed cache, kept under the managed root so it shares a filesystem
-/// with the environments `uv` populates and hardlinking keeps working (see issue #160).
+/// `uv`'s content-addressed cache, kept under the managed root (see issue #160).
+///
+/// Colocating it keeps the cache reachable from the environments `uv` populates without
+/// crossing a mount point, which is what lets `uv` hardlink into them instead of copying.
+/// It is the mount, not the filesystem: a bind mount or `subPath` volume is enough to make
+/// Linux refuse the hardlink and send `uv` back to copying.
 pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("uv-cache")
 }

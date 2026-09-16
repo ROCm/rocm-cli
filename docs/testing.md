@@ -72,8 +72,8 @@ python scripts/build_single_exe_release.py standalone
 On Windows this writes `.rocm-work/standalone-release/rocm.exe`; on Linux it
 writes `.rocm-work/standalone-release/rocm`. The artifact is the rocm-cli binary
 itself, not a self-extracting launcher and not a model bundle. Running it with
-no arguments opens normal rocm-cli; if setup is not complete, the first-time
-setup wizard appears automatically.
+no arguments opens the normal rocm-cli launcher; choose "Set up this system"
+there to run first-time setup (it does not open automatically).
 
 rocm-cli ships native per-OS binaries; there is no cross-OS universal binary.
 Build and test the binary natively on each supported target (native Windows,
