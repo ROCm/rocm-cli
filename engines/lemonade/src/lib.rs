@@ -1193,6 +1193,24 @@ where
     })
 }
 
+/// The variable that opts a machine out of rocm-cli aligning Lemonade's
+/// `llamacpp:rocm` backend to the active ROCm SDK.
+///
+/// `resources/backend_versions.json` is a documented, first-party
+/// customization point — its own header comment invites users to hand-edit it
+/// to pin specific versions without rebuilding — so alignment running
+/// unconditionally on every plain install would silently overwrite a user's
+/// manual pin. Mirrors vLLM's `ROCM_CLI_DISABLE_TORCH_ALIGNMENT`
+/// (`rocm_core::TORCH_ALIGNMENT_DISABLED_ENV`): presence is the signal, so any
+/// value — including the empty string — disables the alignment.
+pub const LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV: &str =
+    "ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT";
+
+/// Whether the user has opted out of rocm-cli aligning Lemonade's backend.
+fn lemonade_backend_alignment_disabled() -> bool {
+    std::env::var_os(LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV).is_some()
+}
+
 /// Point Lemonade's `llamacpp:rocm` backend at the ROCm version rocm-cli already has
 /// installed and active, instead of Lemonade's hardcoded pin (which does not track
 /// whatever the user separately installed via `rocm install sdk`).
@@ -1210,6 +1228,14 @@ fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
 ) -> Result<Option<String>> {
+    if lemonade_backend_alignment_disabled() {
+        eprintln!(
+            "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
+             using whatever backend_versions.json already pins."
+        );
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    }
     // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
     // reports unresolved elsewhere), so attempting it on Windows can only burn up to
     // three multi-GB backend installs and a network round-trip for a guaranteed-futile
@@ -1275,13 +1301,11 @@ fn align_llamacpp_backend_to_version(
 
     // Tier 1: keep Lemonade's own pinned llama.cpp build, just point it at the active
     // ROCm version. Works when that specific build's release actually shipped a
-    // matching ROCm-version asset.
-    if align(
-        manifest,
-        target_version,
-        false,
-        "its pinned llama.cpp build",
-    ) {
+    // matching ROCm-version asset. Always forces a reinstall: this whole function
+    // only runs when the pin actually changed (the `pinned_version == target_version`
+    // check above), so a backend already on disk was installed against the OLD
+    // pin and must not be trusted just because it happens to still resolve.
+    if align(manifest, target_version, true, "its pinned llama.cpp build") {
         return Ok(Some(target_version.to_owned()));
     }
 
@@ -1359,14 +1383,22 @@ fn align_llamacpp_backend_to_version(
 /// (already written into `resources/backend_versions.json`), then verify — never
 /// simply trust Lemonade's own reported success — that the resulting GPU backend
 /// actually resolves against rocm-cli's active ROCm SDK (AGENTS.md §6: no silent CPU
-/// fallback). Returns whether a verified backend is now in place; on success,
-/// `manifest.backend_name` is updated to match it.
+/// fallback). `force_reinstall` must be `true` for every caller here: alignment is
+/// only ever attempted when the pin actually changed, and a skipped "already
+/// installed" reinstall would leave a stale, pre-alignment binary that can still
+/// pass the `ldd`-resolves check below, reporting success for a version that was
+/// never actually installed. Returns whether a verified backend is now in place; on
+/// success, `manifest.backend_name` is updated to match it.
 fn try_llamacpp_backend_alignment(
     manifest: &mut LemonadeInstallManifest,
     target_version: &str,
     force_reinstall: bool,
     attempt_label: &str,
 ) -> bool {
+    debug_assert!(
+        force_reinstall,
+        "every alignment attempt must force a reinstall; see the doc comment above"
+    );
     let install_result = install_best_llamacpp_backend(manifest, force_reinstall);
     // `ensure_best_llamacpp_backend` records the backend it attempted into
     // `manifest.backend_name` before the fallible install step runs, so this is accurate
@@ -1380,11 +1412,16 @@ fn try_llamacpp_backend_alignment(
             find_llama_server_binary_for_backend(manifest, &backend_name)
                 .is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
         });
-    if !has_usable_binary {
+    if !llamacpp_backend_alignment_succeeded(&install_result, has_usable_binary) {
         match install_result {
             Ok(()) => eprintln!(
                 "Warning: {attempt_label} installed for ROCm {target_version}, but its GPU \
                  backend does not resolve against rocm-cli's active ROCm SDK; not using it."
+            ),
+            Err(error) if has_usable_binary => eprintln!(
+                "Warning: could not install {attempt_label} for ROCm {target_version} \
+                 ({error:#}); a backend binary is present but may predate this alignment \
+                 attempt, so it is not trusted without a completed install."
             ),
             Err(error) => eprintln!(
                 "Warning: could not install {attempt_label} for ROCm {target_version}: {error:#}"
@@ -1392,21 +1429,21 @@ fn try_llamacpp_backend_alignment(
         }
         return false;
     }
-    match install_result {
-        Ok(()) => {
-            eprintln!("Aligned Lemonade's ROCm backend to {target_version} using {attempt_label}.");
-        }
-        Err(error) => {
-            eprintln!(
-                "Warning: Lemonade reported an error installing {attempt_label} for ROCm \
-                 {target_version} ({error:#}), but the backend resolves against rocm-cli's \
-                 active ROCm SDK; continuing with it."
-            );
-            // `manifest.backend_name` is already correct: set by `ensure_best_llamacpp_backend`
-            // before the fallible install step ran, and verified against just above.
-        }
-    }
+    eprintln!("Aligned Lemonade's ROCm backend to {target_version} using {attempt_label}.");
     true
+}
+
+/// Whether an alignment attempt counts as a verified success: the install must
+/// have actually completed, not merely have left behind some binary that
+/// happens to resolve. `ldd`-based verification cannot tell a stale build
+/// (paired with a different ROCm version, possibly left over from before this
+/// attempt) from a version-matched one, so a failed install must never be
+/// forgiven by a leftover binary passing that check.
+const fn llamacpp_backend_alignment_succeeded(
+    install_result: &Result<()>,
+    has_usable_binary: bool,
+) -> bool {
+    install_result.is_ok() && has_usable_binary
 }
 
 /// GitHub repo backing Lemonade's `llamacpp:rocm-stable` builds. Bumping
@@ -5173,6 +5210,24 @@ mod tests {
     }
 
     #[test]
+    fn llamacpp_backend_alignment_requires_both_a_successful_install_and_a_usable_binary() {
+        // The bug this guards: a failed install (e.g. Tier 1's pinned build 404ing
+        // for a ROCm version it predates) must never be forgiven by a leftover
+        // binary from a PREVIOUS, different-version install that happens to still
+        // pass the ldd-resolves check -- `ldd` cannot tell the two apart.
+        assert!(llamacpp_backend_alignment_succeeded(&Ok(()), true));
+        assert!(!llamacpp_backend_alignment_succeeded(&Ok(()), false));
+        assert!(!llamacpp_backend_alignment_succeeded(
+            &Err(anyhow!("boom")),
+            true
+        ));
+        assert!(!llamacpp_backend_alignment_succeeded(
+            &Err(anyhow!("boom")),
+            false
+        ));
+    }
+
+    #[test]
     fn align_tier1_success_keeps_target_version_pinned() {
         let dir = scratch_dir("align-tier1-success");
         let path = dir.join("backend_versions.json");
@@ -5185,7 +5240,10 @@ mod tests {
             "10.0.0",
             "7.13.0",
             |_manifest, _target, force_reinstall, _label| {
-                assert!(!force_reinstall, "tier 1 never forces a reinstall");
+                // A stale backend installed against the OLD pin must not be able to
+                // fake success just because it happens to still resolve -- Tier 1
+                // must force a real reinstall attempt every time.
+                assert!(force_reinstall, "tier 1 must force a reinstall");
                 true
             },
             |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
@@ -5206,7 +5264,7 @@ mod tests {
         let path = dir.join("backend_versions.json");
         write_backend_versions_fixture(&path, "7.13.0", "b9752");
         let mut manifest = test_manifest(dir.clone());
-        let mut align_calls = Vec::new();
+        let mut align_calls = 0;
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
@@ -5214,16 +5272,22 @@ mod tests {
             "10.0.0",
             "7.13.0",
             |_manifest, _target, force_reinstall, _label| {
-                align_calls.push(force_reinstall);
-                // Tier 1 (force_reinstall=false) fails; Tier 2 (true) succeeds.
-                force_reinstall
+                // Both tiers force a reinstall now, so the mock can no longer use
+                // force_reinstall itself to distinguish tier 1 from tier 2 -- use
+                // call order instead. Tier 1 fails; Tier 2 succeeds.
+                assert!(
+                    force_reinstall,
+                    "every alignment attempt forces a reinstall"
+                );
+                align_calls += 1;
+                align_calls > 1
             },
             |_manifest, _force_reinstall| panic!("tier 2 succeeded; no fallback install"),
             || Ok("b10952".to_owned()),
         );
 
         assert_eq!(result.unwrap(), Some("10.0.0".to_owned()));
-        assert_eq!(align_calls, vec![false, true], "both tiers were attempted");
+        assert_eq!(align_calls, 2, "both tiers were attempted");
         assert_eq!(
             read_backend_versions_therock_version(&path),
             Some("10.0.0".to_owned())
