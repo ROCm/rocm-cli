@@ -452,15 +452,22 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         ),
         PathUsage::measure("ROCm CLI cache folder", paths.cache_dir.clone(), None),
         PathUsage::measure("ROCm CLI data folder", paths.data_dir.clone(), None),
-        // One JSON file per `rocm serve --managed` launch, kept after the server
-        // exits. Tiny individually, never mentioned anywhere, and nothing ever
-        // removed them - so the folder was invisible to a user asking what is on
-        // disk. Reported, never touched by any prune path here.
+        // One JSON record per `rocm serve --managed` launch, kept after the
+        // server exits. Never mentioned anywhere and nothing ever removed them,
+        // so the folder was invisible to a user asking what is on disk.
+        // Reported, never touched by any prune path here.
+        //
+        // The note names the engine log too, not just the record: `measure`
+        // walks the whole folder, and `ManagedServiceRecord::new` puts the
+        // engine's redirected stdout/stderr (`<service_id>.log`) in it. Nothing
+        // rotates that log, so on a host that has served real models the size
+        // printed here is dominated by logs - a note promising only "small
+        // files" would contradict the number beside it.
         PathUsage::measure(
             "local server records",
             paths.services_dir(),
             Some(
-                "one small file per local server launch, kept after it stops; list them with `rocm services list --all`"
+                "one record plus the engine log per local server launch, kept after it stops; list them with `rocm services list --all`"
                     .to_owned(),
             ),
         ),
@@ -1356,6 +1363,43 @@ mod tests {
             rendered.contains("list them with `rocm services list --all`"),
             "{rendered}"
         );
+        // The folder holds the engine's unrotated log as well as the record, and
+        // `measure` sums the whole tree - so the note has to name the log, or it
+        // contradicts the size printed next to it on a host that has served.
+        assert!(
+            rendered.contains("one record plus the engine log per local server launch"),
+            "{rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Rendering notes in the `ROCm CLI folders` loop was needed for the row
+    /// above, and it also made the two archive rows print the note they have
+    /// always carried in the data and in `--json`. That is the most actionable
+    /// line in the report - `rocm storage remove-downloads` acts on it - so pin
+    /// it rather than leaving it as an unwitnessed side effect a refactor could
+    /// drop again. Asserted against the row, not just anywhere in the output:
+    /// the same string is reachable from the `Shared with other tools` loop,
+    /// which already rendered notes before this change.
+    #[test]
+    fn report_marks_the_re_downloadable_folders_as_safe_to_remove() -> Result<()> {
+        let (root, paths) = test_paths("report-download-notes");
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+
+        for label in ["downloaded ROCm archives", "downloaded helper tools"] {
+            let lines: Vec<&str> = rendered.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(&format!("- {label}:")))
+                .unwrap_or_else(|| panic!("no `{label}` row in:\n{rendered}"));
+            assert_eq!(
+                lines.get(at + 1).map(|line| line.trim()),
+                Some("note: can be downloaded again; safe to remove"),
+                "`{label}` must carry its note:\n{rendered}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

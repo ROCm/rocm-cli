@@ -164,6 +164,51 @@ async fn open_observe_view(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 
+#[when("the user opens the managed services overlay")]
+async fn open_services_overlay(world: &mut E2eWorld) {
+    // `s` opens the services overlay, but only from the Observe tab (the same
+    // key stops the selected server once the overlay has focus), so the step
+    // before this one is load-bearing. Retry until the overlay's own title is on
+    // screen, for the reason `open_observe_view` documents: a key can land
+    // before the event loop is reading.
+    session(world)
+        .send_until("s", "Services", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the overlay reports the record that is no longer running")]
+async fn services_overlay_reports_past_attempts(world: &mut E2eWorld) {
+    // The overlay renders only the live instances the daemon scrapes, so the
+    // failed record left no trace here at all. The count is read from the
+    // registry at launch, so it survives the daemon never having seen it.
+    let tui = session(world);
+    tui.wait_for_screen(
+        "1 local server record(s) are no longer running",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the overlay never counted the failed record: {e}"));
+    // And it points at a command that exists today - the overlay cannot show
+    // the record itself, so the note has to say where it can be seen.
+    tui.wait_for_screen("rocm services list --all", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the overlay never named how to see the record: {e}"));
+}
+
+#[when("the user closes the managed services overlay")]
+async fn close_services_overlay(world: &mut E2eWorld) {
+    // An open overlay eats the quit key - it closes the overlay instead - so a
+    // scenario that opened one has to close it before the quit step, or the
+    // dashboard is still running when that step gives up. Waiting for an Observe
+    // panel the overlay was covering proves the overlay is actually gone rather
+    // than assuming one Esc was enough.
+    session(world)
+        .send_until("\u{1b}", "Node efficiency", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to close the services overlay: {e}"));
+}
+
 #[when("the user opens dashboard help")]
 async fn open_dashboard_help(world: &mut E2eWorld) {
     session(world)

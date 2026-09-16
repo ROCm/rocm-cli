@@ -15619,7 +15619,12 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         } else {
             writeln!(output, "No local servers are running.")
         };
-        if !all {
+        // Gate the separator on the same condition as the hint, not just on
+        // `!all`: `write_past_attempts_hint` early-returns at zero, so a host
+        // that has never served would otherwise gain a blank line between "No
+        // local servers are running." and the next line - a visible change to
+        // the one output this PR is not meant to touch.
+        if !all && counts.past_attempts > 0 {
             write_past_attempts_hint(
                 &mut output,
                 counts.past_attempts,
@@ -25069,6 +25074,33 @@ install therock";
         Ok(())
     }
 
+    /// The host this change is NOT meant to touch: nothing has ever been served,
+    /// so there is no record to point at and the output must read exactly as it
+    /// did before. Every other test here plants at least one record, so without
+    /// this one the zero case has no coverage at all - and it is the case the
+    /// hint's separator regressed, by printing a blank line the old output never
+    /// had between "No local servers are running." and the next line.
+    #[test]
+    fn render_services_text_leaves_a_host_that_never_served_untouched() -> Result<()> {
+        let (root, paths) = test_paths("services-never-served");
+        paths.ensure()?;
+
+        let rendered = render_services_text(&paths, false)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            rendered,
+            "Local Servers\n\
+             \n\
+             Status: none ready\n\
+             \n\
+             No local servers are running.\n\
+             Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve.\n",
+            "{rendered}"
+        );
+        Ok(())
+    }
+
     /// A host can have one server running and several that failed, so the
     /// populated branch of the default view needs the same pointer as the empty
     /// one - the failed records are hidden there too.
@@ -25174,6 +25206,11 @@ install therock";
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("No local servers are running."));
+        // The transition this test is named for reaches the header too: once the
+        // record is demoted it is a past attempt, so the header says so instead
+        // of the old "none ready" - which described the live set correctly and
+        // the disk misleadingly.
+        assert!(rendered.contains("Status: 1 not running"), "{rendered}");
         assert!(all.contains("- svc-stale-ready"));
         assert!(all.contains("  status: stopped"));
         assert_eq!(reloaded.status, "stopped");

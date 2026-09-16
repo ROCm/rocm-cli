@@ -33,6 +33,9 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    // Not `records`: a key has to say what kind of record, and this file is
+    // about the ones a managed `rocm serve` leaves behind.
+    ("local_server_records.feature", "server-records"),
     ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
