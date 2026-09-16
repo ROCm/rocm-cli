@@ -783,7 +783,10 @@ impl TuiSession {
             // No marker: drain for the window and report nothing found, which is
             // what the exit path wants. `|_| false` never short-circuits, so the
             // loop runs to its deadline exactly as before.
-            None => self.drain_final_frame_where("the final frame", &|_: &str| false).await,
+            None => {
+                self.drain_final_frame_where("the final frame", &|_: &str| false)
+                    .await
+            }
         }
     }
 
