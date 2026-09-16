@@ -20,11 +20,25 @@ use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::{self, Theme};
 
+/// `extent * pct / 100`, computed in `u32` so the intermediate product cannot
+/// overflow a `u16`.
+///
+/// `area.height * pct_y` overflows above 655 rows once `pct_y` is 100 — which
+/// [`draw_help`] now passes, to mean "the whole area when the content is taller
+/// than it". That is a debug-build panic on a terminal tall enough (tmux panes
+/// and some GUI terminals report large synthetic sizes), and a wrap-around in
+/// release. Widening here removes the ceiling for every caller rather than
+/// leaving each one to know where it is.
+fn scale_pct(extent: u16, pct: u16) -> u16 {
+    u16::try_from(u32::from(extent) * u32::from(pct) / 100).unwrap_or(u16::MAX)
+}
+
 /// Centered rectangle taking `pct_x`% width and `pct_y`% height of `area`,
 /// clamped to a maximum so it doesn't drown the screen on big terminals.
 pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect) -> Rect {
-    let h_pct = (area.height * pct_y / 100).min(max_h).max(5);
+    let h_pct = centered_height(pct_y, max_h, area);
     let v_pad = (area.height.saturating_sub(h_pct)) / 2;
+    let w_pct = centered_width(pct_x, max_w, area);
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,7 +48,6 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
         ])
         .split(area);
 
-    let w_pct = (area.width * pct_x / 100).min(max_w).max(20);
     let h_pad = (area.width.saturating_sub(w_pct)) / 2;
     let horiz = Layout::default()
         .direction(Direction::Horizontal)
@@ -46,6 +59,49 @@ pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect)
         .split(vert[1]);
 
     horiz[1]
+}
+
+/// Narrowest a popup is allowed to be shrunk to by the percentage, so a modal
+/// on a merely small terminal is still wide enough to read.
+const MIN_POPUP_WIDTH: u16 = 20;
+
+/// Width [`centered_rect`] will give a popup, split out so a caller that needs
+/// to lay its content out *before* the popup exists (to size the popup to that
+/// content) cannot drift from the real geometry.
+///
+/// The [`MIN_POPUP_WIDTH`] floor is itself clamped to `area.width`, which is the
+/// difference between a number the popup might get and the number it *will*
+/// get. An unclamped floor returns 20 on a terminal narrower than 20 — a width
+/// the popup can never have, because [`centered_rect`]'s `Layout::split`
+/// truncates the segment to the area. That is harmless for a caller that only
+/// renders, but both help modals now *measure* their wrapped content against
+/// this width before the popup exists: measuring the wrap at 20 columns and
+/// rendering it into 12 under-counts the rows the content needs and cuts the
+/// tail off — the precise silent truncation content-sizing was added to remove.
+pub fn centered_width(pct_x: u16, max_w: u16, area: Rect) -> u16 {
+    let floor = MIN_POPUP_WIDTH.min(area.width);
+    scale_pct(area.width, pct_x).min(max_w).max(floor)
+}
+
+/// Shortest a popup is allowed to be shrunk to by the percentage: a border pair
+/// plus enough body rows to be worth opening.
+const MIN_POPUP_HEIGHT: u16 = 5;
+
+/// Height [`centered_rect`] will give a popup — the exact counterpart of
+/// [`centered_width`], and split out for the same reason: the number this
+/// computes has to be the number the popup gets.
+///
+/// The [`MIN_POPUP_HEIGHT`] floor is clamped to `area.height` for the reason
+/// spelled out on [`centered_width`]. An unclamped floor asks for 5 rows on an
+/// area shorter than 5, which the `Layout::split` below then truncates, so the
+/// requested geometry and the rendered geometry disagree. Nothing measures
+/// against the height *today* — the callers measure their content and pass the
+/// answer in as `max_h` — so this is a latent form of the defect that had gone
+/// live on the width. Keeping the two sides identical is what stops it going
+/// live here the first time a caller needs the height before the popup exists.
+fn centered_height(pct_y: u16, max_h: u16, area: Rect) -> u16 {
+    let floor = MIN_POPUP_HEIGHT.min(area.height);
+    scale_pct(area.height, pct_y).min(max_h).max(floor)
 }
 
 /// Render a bordered block with `title` over `area` after clearing it,
@@ -80,12 +136,29 @@ pub fn draw_scrollable_lines(
 }
 
 /// Render the Help modal for the active tab.
+///
+/// The popup is sized to the height its *wrapped* content actually needs,
+/// clamped to `area`, rather than to a fixed share of the screen. A fixed share
+/// silently truncated: at the 80x24 the e2e lane pins, the body is 20 rows, 70%
+/// of that is 14, and two of the key hints wrap to a second line — so the modal
+/// ended mid-list at `{ / }` and the per-tab guidance below it was never drawn,
+/// with no scrollbar or indicator to say so. Content-sizing keeps every hint on
+/// screen wherever the room exists, and adding a hint can no longer push an
+/// unrelated one off the bottom.
+///
+/// Where the room does *not* exist — a terminal too short for the hint list even
+/// at full height — the content is still cut, and the modal does not scroll.
+/// [`help_title`] marks the title in that case rather than leaving the user to
+/// guess, which is the whole of what is claimed here: an honest indicator, not a
+/// guarantee that everything is visible.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
-    let popup = centered_rect(70, 70, 80, 22, area);
-    let inner = draw_popup_frame(f, popup, "Help", theme);
-
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
+        // Ctrl-C is a first-class quit gesture in both key loops (it restores the
+        // terminal and exits 130), so it belongs on the help surface next to `q`.
+        // The exception is worth stating: over a *running* job console it still
+        // means "cancel this job".
+        key_line("Ctrl-C", "quit (cancels a running job console)", theme),
         key_line("?", "toggle this help", theme),
         key_line("Tab / Shift-Tab", "next / previous tab", theme),
         key_line("1 .. 5", "jump to tab", theme),
@@ -141,7 +214,65 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     }
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+
+    // Width first — it does not depend on the height — then ask the paragraph
+    // how many rows it wraps to at that width. `line_count` is the renderer's
+    // own wrap, not an estimate of it, so this cannot drift from what lands on
+    // screen. `pct_y = 100` with `max_h = needed` means "exactly the content,
+    // or the whole area when the content is taller than it". `+ 2` is the
+    // popup's top and bottom border rows; `- 2` on the width is the left and
+    // right ones.
+    //
+    // `line_count` sits behind ratatui's `unstable-rendered-line-info` feature
+    // (already enabled in this crate's Cargo.toml for the scroll bounds). It is
+    // now load-bearing for *layout*, not just for how far a scrollbar may
+    // travel: if a ratatui release changes or withdraws it, this modal silently
+    // mis-sizes rather than merely mis-scrolling.
+    // `help_modal_is_sized_to_exactly_its_content_on_every_tab` (in this
+    // module's `ported_chrome_tests`) is the tripwire for that.
+    let width = centered_width(70, 80, area);
+    let needed = popup_height_for(p.line_count(width.saturating_sub(2)));
+    let popup = centered_rect(70, 100, 80, needed, area);
+    let inner = draw_popup_frame(f, popup, &help_title("Help", needed, popup), theme);
+
     f.render_widget(p, inner);
+}
+
+/// Title for a content-sized help popup, marked when the content did not fit.
+///
+/// `needed` is the height the wrapped content asked for; `popup` is what the
+/// area could actually give it. When the popup is shorter, the tail of the
+/// content is off-screen — and these modals are *sized*, not scrolled, so there
+/// is no scrollbar, no scroll position, and nothing the user can press to see
+/// the rest. Saying so is the only honest option left; the alternative is the
+/// silent truncation this module's doc comments call the original defect.
+///
+/// The marker goes in the border title rather than the body because a body
+/// marker would cost a content row on precisely the terminal that has none to
+/// spare — it would evict a hint to announce that hints were evicted.
+///
+/// Residual, stated rather than papered over: [`panel::title_fits`] is false on
+/// a popup too narrow for the marked form, and a title that does not fit is
+/// dropped rather than overflowing the border. Rather than lose the plain
+/// "Help" as well, the bare title is used there and the truncation goes
+/// unmarked. That is a popup under ~30 columns, i.e. a terminal well below
+/// anything the dashboard lays out usefully.
+fn help_title(base: &str, needed: u16, popup: Rect) -> String {
+    let marked = format!("{base} (truncated — resize)");
+    if needed > popup.height && panel::title_fits(popup.width, &marked) {
+        marked
+    } else {
+        base.to_string()
+    }
+}
+
+/// Popup height that shows `content_rows` rows of wrapped content: the content
+/// plus the popup's top and bottom border rows. Shared by [`draw_help`] and
+/// [`draw_global_help`] so the two content-sized modals cannot drift apart.
+fn popup_height_for(content_rows: usize) -> u16 {
+    u16::try_from(content_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
 }
 
 fn key_line<'a>(key: &'a str, desc: &'a str, theme: &Theme) -> Line<'a> {
@@ -559,18 +690,20 @@ pub fn draw_options(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 
 /// Global 2-column keyboard reference (NAVIGATE / OVERLAYS / ACTIONS / CHAT /
 /// GLOBAL). Distinct from the contextual per-tab `?` help (`draw_help`).
+///
+/// Content-sized exactly like [`draw_help`], and for the same reason. The old
+/// fixed `centered_rect(80, 80, 100, 26, area)` shape truncated silently, with
+/// no scrollbar and no indicator: at the 80x24 the e2e lane pins it had *zero*
+/// rows of margin (14 available, 14 needed), so the Ctrl-C hint this PR adds to
+/// the right-hand column landed on the last usable row and one more hint — or
+/// one more wrap, from a wording change — would have pushed it off. On a roomy
+/// terminal the same fixed shape drew ten blank rows below the content.
+///
+/// Shares [`help_title`] with [`draw_help`], so the residual case — a terminal
+/// too short even for the content-sized modal — is marked here the same way and
+/// under the same caveat.
 pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
     grey_overlay(f);
-    let modal = centered_rect(80, 80, 100, 26, area);
-    let inner = draw_popup_frame(f, modal, "Keyboard", theme);
-    if inner.height == 0 {
-        return;
-    }
-    f.render_widget(Clear, inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
     let left: &[(&str, &[(&str, &str)])] = &[
         (
             "NAVIGATE",
@@ -601,21 +734,63 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ),
         (
             "CHAT / GLOBAL",
-            &[("i / Enter", "focus chat input"), ("q", "quit")],
+            &[
+                ("i / Enter", "focus chat input"),
+                ("q", "quit"),
+                ("Ctrl-C", "quit (cancels a running job)"),
+            ],
         ),
     ];
-    render_help_groups(f, cols[0], left, theme);
-    render_help_groups(f, cols[1], right, theme);
+    let left_p = Paragraph::new(help_group_lines(left, theme)).wrap(Wrap { trim: false });
+    let right_p = Paragraph::new(help_group_lines(right, theme)).wrap(Wrap { trim: false });
+
+    // Width first, then the height the *taller* column wraps to at the width
+    // the 50/50 split will actually hand it. The split is run here on a stand-in
+    // rect rather than the ratio being re-derived by hand, so the measurement
+    // cannot drift from the render below.
+    let width = centered_width(80, 100, area);
+    let measure = help_columns(Rect::new(0, 0, width.saturating_sub(2), 1));
+    let needed = popup_height_for(
+        left_p
+            .line_count(measure[0].width)
+            .max(right_p.line_count(measure[1].width)),
+    );
+
+    let modal = centered_rect(80, 100, 100, needed, area);
+    let inner = draw_popup_frame(f, modal, &help_title("Keyboard", needed, modal), theme);
+    if inner.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, inner);
+    let cols = help_columns(inner);
+    f.render_widget(left_p, cols[0]);
+    f.render_widget(right_p, cols[1]);
 }
 
-fn render_help_groups(
-    f: &mut Frame,
-    area: Rect,
-    groups: &[(&str, &[(&str, &str)])],
+/// The two equal columns [`draw_global_help`] lays its groups out in. Returned
+/// as an array so the same split serves both the measure and the render.
+fn help_columns(area: Rect) -> [Rect; 2] {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    [cols[0], cols[1]]
+}
+
+/// Titled key/description groups as renderable lines.
+///
+/// The blank separator sits *between* groups, not after each one: a trailing
+/// blank would make the content-sized popup one row taller than its content and
+/// show as a gap above the bottom border.
+fn help_group_lines<'a>(
+    groups: &'a [(&'a str, &'a [(&'a str, &'a str)])],
     theme: &Theme,
-) {
+) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
-    for (title, rows) in groups {
+    for (i, (title, rows)) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+        }
         lines.push(Line::from(Span::styled(
             *title,
             Style::default()
@@ -625,9 +800,8 @@ fn render_help_groups(
         for (k, desc) in *rows {
             lines.push(key_line(k, desc, theme));
         }
-        lines.push(Line::raw(""));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
 }
 
 // ===========================================================================
@@ -868,5 +1042,342 @@ mod ported_chrome_tests {
         assert!(out.contains("Theme"), "label missing: {out:?}");
         assert!(out.contains("tokyo"), "value missing: {out:?}");
         assert!(out.contains('▸'), "focus/control marker missing: {out:?}");
+    }
+
+    /// The help modal must show ALL of its content at the smallest geometry the
+    /// product supports, not as much of it as a fixed share of the screen
+    /// happens to fit.
+    ///
+    /// Regression: adding the Ctrl-C hint pushed the per-tab guidance off the
+    /// bottom at 80x24 and nothing said so — the modal just ended mid-list at
+    /// `{ / }`. That reached CI as an e2e failure on an assertion about
+    /// unrelated text ("Home tab"), because no unit test asserted the modal's
+    /// last row was reachable.
+    ///
+    /// 80x20 is the *body* rect `ui::draw` hands `draw_help` on the 80x24 the
+    /// e2e lane pins (3-row header, 1-row footer), so this is the real
+    /// worst-case geometry rather than an invented one.
+    #[test]
+    fn help_modal_shows_every_hint_at_the_minimum_supported_geometry() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_help(f, area, ActiveTab::Home, &theme))
+            .unwrap();
+        let out = flat(&term);
+
+        // First hint, the hint that wraps, the last global hint, and the per-tab
+        // section that used to fall off the bottom. The last two are the ones
+        // that regress when the modal is sized to anything but its content.
+        for needle in [
+            "quit",
+            "Ctrl-C",
+            "toggle this help",
+            "next / previous tab",
+            "jump ±60s",
+            "Home tab",
+            "no tab-specific keys",
+        ] {
+            assert!(
+                out.contains(needle),
+                "help modal truncated before {needle:?} at 80x20:\n{out}"
+            );
+        }
+    }
+
+    /// Render `draw` onto a fresh `w`x`h` backend and return it row by row,
+    /// trailing blanks trimmed. Row structure is what the sizing tests below
+    /// assert on — `flat` throws it away.
+    fn rows(w: u16, h: u16, draw: impl Fn(&mut ratatui::Frame)) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Index of the popup's bottom border row (the rounded bottom-left corner).
+    fn bottom_border_row(rows: &[String]) -> usize {
+        rows.iter()
+            .position(|r| r.contains('╰'))
+            .unwrap_or_else(|| panic!("no popup bottom border was painted:\n{}", rows.join("\n")))
+    }
+
+    /// The popup is sized to *exactly* its wrapped content whenever the area has
+    /// room: the last hint lands on the row directly above the bottom border,
+    /// with no filler row after it and nothing evicted before it.
+    ///
+    /// This is the property the crate actually owns — `needed` is computed here
+    /// from `Paragraph::line_count` and handed to `centered_rect` as `max_h`.
+    /// (That a popup cannot overrun its area is ratatui's own guarantee:
+    /// `Layout::split` structurally cannot emit a segment larger than its input,
+    /// so asserting it here would constrain no branch of this module.)
+    ///
+    /// Checked on every tab, because each has a different hint list and a
+    /// different set of lines that wrap; the sibling test above pins a single
+    /// geometry on a single tab.
+    #[test]
+    fn help_modal_is_sized_to_exactly_its_content_on_every_tab() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        // (tab, the tail of that tab's LAST hint — the text that must land on
+        // the row immediately above the bottom border). Several of these are
+        // wrap continuations, which is the point: the sizing has to account for
+        // the renderer's own wrapping, not the unwrapped line count.
+        let cases = [
+            (ActiveTab::Home, "Serving tabs)"),
+            (ActiveTab::Rocm, "Actions)"),
+            (ActiveTab::Serving, "Actions)"),
+            (ActiveTab::Observe, "update / install / logs"),
+            (ActiveTab::Chat, "focused)"),
+        ];
+        for (tab, tail) in cases {
+            // Tall enough that every tab's help fits with room to spare, so any
+            // mismatch is the sizing arithmetic and not the clamp.
+            let area = Rect::new(0, 0, 80, 44);
+            let painted = rows(80, 44, |f| super::draw_help(f, area, tab, &theme));
+            let bottom = bottom_border_row(&painted);
+            let last = &painted[bottom - 1];
+            assert!(
+                last.contains(tail),
+                "{tab:?}: the last hint must sit directly above the bottom \
+                 border, but row {} is {last:?} (expected it to contain \
+                 {tail:?}) — the popup is over- or under-sized for its \
+                 content:\n{}",
+                bottom - 1,
+                painted.join("\n")
+            );
+        }
+    }
+
+    /// When the content genuinely cannot fit, the modal takes **every** row of
+    /// the area rather than a fixed share of it, so the most hints the terminal
+    /// can hold are shown. This is what `pct_y = 100` buys over the old 70%.
+    #[test]
+    fn help_modal_fills_every_available_row_when_the_content_cannot_fit() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        // Chat has the longest hint list; at 10 rows it cannot fit by a wide
+        // margin, so the popup is clamp-bound rather than content-bound.
+        let area = Rect::new(0, 0, 80, 10);
+        let painted = rows(80, 10, |f| {
+            super::draw_help(f, area, ActiveTab::Chat, &theme);
+        });
+        assert!(
+            painted[0].contains('╭'),
+            "the modal must start on the first row of the area:\n{}",
+            painted.join("\n")
+        );
+        assert_eq!(
+            bottom_border_row(&painted),
+            9,
+            "the modal must end on the last row of the area, using all 10 rows \
+             rather than a fixed share of them:\n{}",
+            painted.join("\n")
+        );
+        // Eight inner rows, so eight wrapped hint rows: `q`, the two the Ctrl-C
+        // hint wraps to, `?`, Tab, `1 .. 5`, `t`, Space. A 70% share would stop
+        // five rows in, at `next / previous tab`.
+        assert!(
+            painted[8].contains("pause / resume"),
+            "a full-height modal must paint every row it has:\n{}",
+            painted.join("\n")
+        );
+    }
+
+    /// The global keyboard reference is content-sized the same way `draw_help`
+    /// is: no filler rows on a roomy terminal, and — the regression that
+    /// matters — nothing silently evicted at the smallest geometry the product
+    /// supports, where the fixed 80%-of-area shape had zero rows of margin and
+    /// this PR added a hint to it.
+    #[test]
+    fn global_help_is_sized_to_its_content_and_evicts_nothing() {
+        let theme = Theme::from_name("default-dark");
+        // 80x20 is the body rect on the 80x24 the e2e lane pins; 120x30 is a
+        // roomy terminal, where a fixed 26-row modal left ten blank rows.
+        for (w, h) in [(80u16, 20u16), (120, 30)] {
+            let area = Rect::new(0, 0, w, h);
+            let painted = rows(w, h, |f| super::draw_global_help(f, area, &theme));
+            let bottom = bottom_border_row(&painted);
+            let last = painted[bottom - 1].trim_end();
+            // Two separate properties, in order. The first is *not* a
+            // no-filler check: a blank row inside a bordered popup paints as
+            // `│      │` and ends with '│' too, so `ends_with` can never tell
+            // filler from content. What it does establish is that the row above
+            // the bottom border is an interior row — a body row between the two
+            // side borders, rather than the popup's own top border (`╭───╮`,
+            // which ends with '╮') as it would be on a two-row popup. The
+            // second assertion is the one that rules out filler.
+            assert!(
+                last.ends_with('│'),
+                "{w}x{h}: the row above the bottom border must be a body row \
+                 between the side borders, but row {} is {last:?}:\n{}",
+                bottom - 1,
+                painted.join("\n")
+            );
+            assert!(
+                last.trim_matches(['│', ' ']).chars().count() > 0,
+                "{w}x{h}: the row above the bottom border is blank — the popup \
+                 is taller than its content:\n{}",
+                painted.join("\n")
+            );
+            let flat = painted.join("");
+            for needle in [
+                "NAVIGATE",
+                "OVERLAYS",
+                "ACTIONS",
+                "CHAT / GLOBAL",
+                "main menu",
+                "cancels a running",
+            ] {
+                assert!(
+                    flat.contains(needle),
+                    "{w}x{h}: the keyboard reference is truncated before \
+                     {needle:?}:\n{}",
+                    painted.join("\n")
+                );
+            }
+        }
+    }
+
+    /// The width the content-sized modals *measure* their wrapped content
+    /// against must be the width the popup actually gets.
+    ///
+    /// `centered_width`'s minimum-width floor is what can break that. On a
+    /// terminal narrower than the floor, an unclamped floor hands back a number
+    /// `centered_rect` then truncates (`Layout::split` cannot emit a segment
+    /// wider than its input), so `draw_help` / `draw_global_help` count the rows
+    /// their content wraps to at one width and render it at a narrower one —
+    /// under-counting the rows needed and cutting the tail off. That is the
+    /// silent truncation content-sizing exists to remove, re-introduced at a
+    /// geometry nothing else in this module exercises.
+    ///
+    /// Both live `(pct_x, max_w)` pairs are checked: `draw_help`'s 70/80 and
+    /// `draw_global_help`'s 80/100.
+    #[test]
+    fn popup_width_is_never_wider_than_a_narrow_area() {
+        for w in 0..=24u16 {
+            let area = Rect::new(0, 0, w, 40);
+            for (pct_x, max_w) in [(70u16, 80u16), (80, 100)] {
+                let measured = super::centered_width(pct_x, max_w, area);
+                assert!(
+                    measured <= w,
+                    "centered_width({pct_x}, {max_w}) returned {measured} on a \
+                     {w}-column area: the modals would measure their content at \
+                     a width the popup cannot have"
+                );
+                assert_eq!(
+                    super::centered_rect(pct_x, 100, max_w, 10, area).width,
+                    measured,
+                    "the popup's rendered width must equal the width its \
+                     content was measured against ({w}-column area)"
+                );
+            }
+        }
+    }
+
+    /// The height counterpart of the sweep above, pinned for the same reason.
+    ///
+    /// Unlike the width, nothing measures its content against this number yet,
+    /// so the defect is latent rather than live: `centered_rect` returns a rect
+    /// `Layout::split` has already truncated to the area, and *that* is why this
+    /// test asserts on `centered_height` rather than on `centered_rect(..).
+    /// height`. A test written against the returned rect could not fail — it
+    /// would be re-asserting ratatui's own invariant, which is precisely the
+    /// mistake `help_modal_is_clamped_when_the_content_cannot_fit` made before
+    /// it was deleted. The property this crate owns is that the height it *asks*
+    /// for is the height it gets.
+    ///
+    /// Both live `(pct_y, max_h)` shapes are swept: the content-sized help
+    /// modals' `pct_y = 100`, and a fixed-height overlay's 80/30.
+    #[test]
+    fn popup_height_is_never_taller_than_a_short_area() {
+        for h in 0..=8u16 {
+            let area = Rect::new(0, 0, 80, h);
+            for (pct_y, max_h) in [(100u16, 12u16), (80, 30)] {
+                let asked = super::centered_height(pct_y, max_h, area);
+                assert!(
+                    asked <= h,
+                    "centered_height({pct_y}, {max_h}) returned {asked} on a \
+                     {h}-row area: the popup would be laid out to a height it \
+                     cannot have"
+                );
+                assert_eq!(
+                    super::centered_rect(100, pct_y, 80, max_h, area).height,
+                    asked,
+                    "the popup's rendered height must equal the height it was \
+                     laid out to ({h}-row area)"
+                );
+            }
+        }
+    }
+
+    /// When the content still cannot fit at full height, the modal says so.
+    ///
+    /// It is sized, not scrolled: there is no scrollbar and nothing to press, so
+    /// an unmarked short modal is indistinguishable from a complete one. The
+    /// marker lives in the border title, which costs no content row.
+    #[test]
+    fn help_modals_mark_the_title_when_the_content_still_cannot_fit() {
+        use crate::app::ActiveTab;
+        let theme = Theme::from_name("default-dark");
+        let painted = |w: u16, h: u16, global: bool| -> String {
+            let area = Rect::new(0, 0, w, h);
+            rows(w, h, |f| {
+                if global {
+                    super::draw_global_help(f, area, &theme);
+                } else {
+                    super::draw_help(f, area, ActiveTab::Chat, &theme);
+                }
+            })
+            .join("\n")
+        };
+
+        // Ten rows holds neither hint list — the sibling test above pins that
+        // `draw_help` is clamp-bound here — so both must be marked.
+        for global in [false, true] {
+            let out = painted(80, 10, global);
+            assert!(
+                out.contains("truncated"),
+                "a modal that cut its content must say so (global={global}):\n{out}"
+            );
+        }
+        // Roomy: every hint fits, so the marker must NOT appear — it would be a
+        // false alarm on the geometry the product is normally used at.
+        for (w, h, global) in [(80u16, 44u16, false), (80, 20, true), (120, 30, true)] {
+            let out = painted(w, h, global);
+            assert!(
+                !out.contains("truncated"),
+                "{w}x{h}: a modal that fits must not claim it was truncated \
+                 (global={global}):\n{out}"
+            );
+        }
+    }
+
+    /// `centered_rect` scales a percentage of the area, and `area.height` is a
+    /// `u16`. Since `draw_help` passes `pct_y = 100`, a `u16` product overflows
+    /// above 655 rows — a debug-build panic on a tall terminal. The arithmetic
+    /// widens to `u32` so no caller has to know where the ceiling is.
+    #[test]
+    fn centered_rect_does_not_overflow_on_a_very_tall_or_wide_area() {
+        for (w, h) in [(2000u16, 2000u16), (u16::MAX, u16::MAX)] {
+            let area = Rect::new(0, 0, w, h);
+            let r = super::centered_rect(100, 100, u16::MAX, u16::MAX, area);
+            assert!(
+                r.height <= h && r.width <= w,
+                "centered_rect({w}x{h}) escaped its area: {r:?}"
+            );
+            assert_eq!(super::centered_width(100, u16::MAX, area), w);
+        }
     }
 }

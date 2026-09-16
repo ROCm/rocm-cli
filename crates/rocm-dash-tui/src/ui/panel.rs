@@ -114,6 +114,24 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
     }
 }
 
+/// Whether [`stamp_title`] has room to draw `title` on a box `area_width`
+/// columns wide.
+///
+/// The top row spends one column on each rounded corner, one on the dash before
+/// the label, and one on each label bracket, so the label itself needs
+/// `area_width - 4` columns. A title that does not fit is dropped rather than
+/// overflowing the border.
+///
+/// Public so a caller choosing between a long and a short title — the help
+/// modals, which append a truncation marker only when they have to — can *ask*
+/// instead of re-deriving this arithmetic and drifting from it. Without it the
+/// longer form would silently erase the title it was meant to annotate.
+#[must_use]
+pub fn title_fits(area_width: u16, title: &str) -> bool {
+    let label_w = title.trim().chars().count();
+    label_w > 0 && label_w.saturating_add(4) < usize::from(area_width)
+}
+
 /// Overlay the btop-style title onto the already-drawn rounded top border.
 ///
 /// Layout on the top row: `╭─╮ Title ╭───────╮` — the inner `╮`/`╭` are the label
@@ -123,17 +141,13 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 /// tint on every theme.
 fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, bg: Color, text_fg: Color) {
     let title = title.trim();
-    if title.is_empty() {
-        return;
+    if !title_fits(area.width, title) {
+        return; // empty, or not enough room — leave the plain rounded top edge
     }
     let label_w = title.chars().count() as u16;
     // corner(x0) + at least one dash, then the left bracket.
     let lb = area.x + 2;
     let rb = lb + 1 + label_w; // right bracket column
-    let x1 = area.x + area.width - 1;
-    if rb >= x1 {
-        return; // not enough room — leave the plain rounded top edge
-    }
     let y0 = area.y;
     let bracket = Style::default().fg(border).bg(bg);
     let text = Style::default()
