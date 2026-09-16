@@ -257,13 +257,13 @@ fails, just later.
 required check that *never reports* (because its self-hosted runner is
 offline) is treated as missing and still blocks the merge, `continue-on-error`
 notwithstanding. That branch-protection change has since landed (re-confirmed
-2026-09-15 by reading `required_status_checks.contexts`, which lists sixteen
-names and none of these): none of the self-hosted lane names, nor the
-self-hosted consolidated report, are in the required list anymore (`ci.yml`'s
-own mock `E2E tests` / `E2E consolidated report` are the required checks —
-similarly prefixed but distinct from the self-hosted names above, so no name
-string actually collides). An offline or unclaimed self-hosted runner can no
-longer block a merge.
+2026-09-15 by reading `required_status_checks.contexts`, which names none of
+these): none of the self-hosted lane names, nor the self-hosted consolidated
+report, are in the required list anymore (`ci.yml`'s own mock `E2E tests` /
+`E2E consolidated report` are the required checks — similarly prefixed but
+distinct from the self-hosted names above, so no name string actually
+collides). An offline or unclaimed self-hosted runner can no longer block a
+merge.
 
 ## Fork safety
 

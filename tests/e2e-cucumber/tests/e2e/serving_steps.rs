@@ -1287,10 +1287,26 @@ async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
     // busy. Planning to use it anyway is the one that collides with the server
     // already there.
     match planned {
-        None => assert!(
-            world.cli_rc != Some(0),
-            "the CLI neither planned an address nor refused:\n{output}"
-        ),
+        None => {
+            assert!(
+                world.cli_rc != Some(0),
+                "the CLI neither planned an address nor refused:\n{output}"
+            );
+            // A nonzero exit alone is not the second outcome. Any unrelated
+            // failure — a missing model, a broken runtime — would also plan no
+            // address and exit nonzero, and would be accepted here as though
+            // the CLI had honestly reported the conflict. Require it to say so.
+            let said = output.to_lowercase();
+            let port = SERVE_PORT.to_string();
+            assert!(
+                said.contains(&port)
+                    || said.contains("in use")
+                    || said.contains("already")
+                    || said.contains("address"),
+                "the CLI refused, but not about the address that is taken — so this \
+                 says nothing about whether it noticed the conflict:\n{output}"
+            );
+        }
         Some(port) => assert_ne!(
             port,
             SERVE_PORT.to_string(),

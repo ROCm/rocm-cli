@@ -738,7 +738,7 @@ impl TuiSession {
                     self.finished = true;
                     let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.record_once(code);
-                    self.drain_final_frame(None).await?;
+                    self.drain_final_frame().await?;
                     return Ok(code);
                 }
                 Ok(None) => {}
@@ -766,33 +766,26 @@ impl TuiSession {
     /// single poll is not enough when a large frame is still buffered behind the
     /// process exit notification.
     ///
-    /// The one drain loop for both exit paths, so they cannot drift: pass
-    /// `stop_on: Some(marker)` to also return as soon as `marker` appears (that
-    /// caller is racing the drain against a screen assertion), or `None` to just
-    /// wait out the window. Returns whether `stop_on` was found; `Err` if the
-    /// reader thread panicked, which must win over the caller's generic timeout
-    /// or "process exited" message (and would otherwise be swallowed entirely
-    /// when `Drop` runs during another unwind).
-    async fn drain_final_frame(&mut self, stop_on: Option<&str>) -> Result<bool, String> {
-        match stop_on {
-            Some(marker) => {
-                let wanted = format!("{marker:?}");
-                self.drain_final_frame_where(&wanted, &|screen: &str| screen.contains(marker))
-                    .await
-            }
-            // No marker: drain for the window and report nothing found, which is
-            // what the exit path wants. `|_| false` never short-circuits, so the
-            // loop runs to its deadline exactly as before.
-            None => {
-                self.drain_final_frame_where("the final frame", &|_: &str| false)
-                    .await
-            }
-        }
+    /// This path has nothing to watch for: it waits the window out and returns.
+    /// `wait_for_screen_where` races its own drain against a screen predicate
+    /// and so calls [`Self::drain_final_frame_where`] directly; the two share
+    /// that one loop rather than keeping a copy each.
+    ///
+    /// `Err` if the reader thread panicked, which must win over the caller's
+    /// generic timeout or "process exited" message (and would otherwise be
+    /// swallowed entirely when `Drop` runs during another unwind).
+    async fn drain_final_frame(&mut self) -> Result<(), String> {
+        // `|_| false` never short-circuits, so the loop runs to its deadline.
+        // Nothing is being looked for, so the `bool` is uninformative here and
+        // the empty `wanted` keeps it out of the reader-panic message.
+        self.drain_final_frame_where("", &|_: &str| false)
+            .await
+            .map(|_| ())
     }
 
-    /// [`drain_final_frame`] against an arbitrary predicate rather than a
-    /// substring, for callers that match a screen some other way. `wanted`
-    /// names what was being waited for in the diagnostics.
+    /// [`Self::drain_final_frame`] against a predicate, for the caller that is
+    /// racing the drain against a screen assertion. `wanted` names what is being
+    /// waited for, and is read back in the diagnostics.
     async fn drain_final_frame_where(
         &mut self,
         wanted: &str,
@@ -832,8 +825,16 @@ impl TuiSession {
     /// Reader-panic diagnostic for [`drain_final_frame_where`], naming what the
     /// drain was racing.
     fn drain_panic_message(&self, wanted: &str, panic_message: &str) -> String {
+        // The exit drain waits for nothing and passes "", so it reads as it did
+        // before this loop was shared: naming a thing it is not waiting for
+        // would be worse than naming nothing.
+        let context = if wanted.is_empty() {
+            String::new()
+        } else {
+            format!(" for {wanted}")
+        };
         format!(
-            "pty reader thread panicked while draining the final frame for {wanted}: {panic_message}\n{}",
+            "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
             self.framed_screen()
         )
     }

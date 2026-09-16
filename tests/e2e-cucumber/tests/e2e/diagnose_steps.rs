@@ -1145,8 +1145,19 @@ fn compare_diagnosis_with_fix(world: &mut E2eWorld, path_override: Option<&str>)
     };
     // No `--yes`, so nothing is applied; the preview is the user-facing account
     // of what the fix would do.
-    let (preview, preview_err, _) =
-        crate::run_rocm(world, &["fix", DEVICE_PERMISSION_FIX_ID, "--dry-run"]);
+    //
+    // The shim goes to BOTH sides. Today the fix recipe never consults the
+    // device, so passing it only to `diagnose` would happen to work — but the
+    // whole point of this pair is that the two disagree, and the natural fix is
+    // to make `fix` read what `diagnose` read. On the day that lands, a shim on
+    // one side only would silently turn this into a shimmed-against-real
+    // comparison and the scenario would report a divergence that is the
+    // fixture's, not the product's.
+    let fix_args = ["fix", DEVICE_PERMISSION_FIX_ID, "--dry-run"];
+    let (preview, preview_err, _) = match path_override {
+        Some(path) => crate::run_rocm_with_env(world, &fix_args, &[("PATH", path)]),
+        None => crate::run_rocm(world, &fix_args),
+    };
     world.cli_output = Some(diagnosis);
     world.cli_other_output = Some(format!("{preview}{preview_err}"));
 }

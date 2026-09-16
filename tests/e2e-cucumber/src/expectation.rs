@@ -1373,8 +1373,19 @@ flaky = true
         );
 
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        let orphans: Vec<&str> = m
-            .declared_ids()
+        // Both sides, not just the scenarios. An `expectations.toml` that
+        // declared nothing would make `orphans` empty and this check green —
+        // it would be reporting "no stale rows" about a file it never read.
+        // A sibling test would catch the empty parse, but this one should not
+        // depend on that to mean what it says.
+        let declared: Vec<&str> = m.declared_ids().collect();
+        assert!(
+            !declared.is_empty(),
+            "expectations.toml declared no rows at all, so this check would pass vacuously"
+        );
+        let orphans: Vec<&str> = declared
+            .iter()
+            .copied()
             .filter(|id| !scenario_ids.contains(*id))
             .collect();
         assert!(

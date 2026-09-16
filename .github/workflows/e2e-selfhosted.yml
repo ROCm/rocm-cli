@@ -24,14 +24,16 @@ name: E2E self-hosted
 # (`gh api repos/:owner/:repo/branches/main/protection`) or watching what a red
 # lane actually blocks.
 #
-# Re-date it here AND in docs/ci-hardware-testing.md — its "Blocking vs.
-# non-blocking" section and its "Required-check history" paragraph, which
-# carries the same date and the fuller story of why these names used to be
-# required. Those are the places known to carry it; ci.yml,
-# tests/e2e-cucumber/README.md and crates/e2e-report (which prints the reason
-# into the consolidated report) point at them rather than asserting it
-# themselves. Deliberately no count of how many places there are: naming them is
-# what helps, and a tally is what goes stale the moment someone adds another.
+# Re-date it here AND in docs/ci-hardware-testing.md's "Required-check history"
+# paragraph, which carries the same date and the fuller story of why these names
+# used to be required. Those two are the only places that carry the date, and a
+# contract test asserts they agree — that doc's "Blocking vs. non-blocking"
+# section states the fact but defers the date to that paragraph, so do not add
+# one there. ci.yml, tests/e2e-cucumber/README.md and crates/e2e-report (which
+# prints the reason into the consolidated report) point at these rather than
+# asserting it themselves. Deliberately no count of how many places there are:
+# naming them is what helps, and a tally is what goes stale the moment someone
+# adds another.
 
 on:
   push:
