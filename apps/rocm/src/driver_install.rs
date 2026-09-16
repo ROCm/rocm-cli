@@ -652,7 +652,7 @@ fn wsl_rocdxg_refusal_plan(repo_version: String, reason: String) -> DriverInstal
         os_id: "wsl".to_owned(),
         version_id: String::new(),
         codename: String::new(),
-        repo_version,
+        repo_version_expr: repo_version,
         reason,
         preflight_checks: Vec::new(),
         commands: Vec::new(),
@@ -720,7 +720,7 @@ fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan 
         os_id: "wsl".to_owned(),
         version_id: String::new(),
         codename: String::new(),
-        repo_version: version,
+        repo_version_expr: version,
         reason:
             "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
                 .to_owned(),
@@ -861,31 +861,38 @@ fn build_driver_install_plan(
         // https://repo.radeon.com/amdgpu/latest/ubuntu/dists/ and switch this
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
-        ("ubuntu", "26.04") => DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "ubuntu_native_archive".to_owned(),
-            os_id,
-            version_id,
-            // codename_for_version already resolves this to "resolute" when
-            // VERSION_CODENAME/UBUNTU_CODENAME are absent, so this is never
-            // empty here -- no fallback needed.
-            codename,
-            repo_version_expr,
-            reason: "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
-                includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
-                tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
-                commands are planned. Run `sudo apt install rocm` for the userspace ROCm \
-                stack instead."
-                .to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec![
-                "rocm examine".to_owned(),
-                "sudo apt install rocm".to_owned(),
-                "rocminfo".to_owned(),
-            ],
-        },
+        ("ubuntu", "26.04") => {
+            let sudo = escalation.prefix();
+            DriverInstallPlan {
+                supported: false,
+                mutating: false,
+                policy: "ubuntu_native_archive".to_owned(),
+                os_id,
+                version_id,
+                // codename_for_version already resolves this to "resolute" when
+                // VERSION_CODENAME/UBUNTU_CODENAME are absent, so this is never
+                // empty here -- no fallback needed.
+                codename,
+                repo_version_expr,
+                reason: format!(
+                    "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
+                    includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
+                    tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
+                    commands are planned. Run `{sudo}apt install rocm` for the userspace ROCm \
+                    stack instead."
+                ),
+                preflight_checks: Vec::new(),
+                commands: Vec::new(),
+                // `checks` renders as `post_reboot_checks:` and, like every other
+                // arm, holds passive verification targets only -- the mutating
+                // install command above belongs in `reason`, not here.
+                checks: vec!["rocm examine".to_owned(), "rocminfo".to_owned()],
+                // Guidance only, but `apt install rocm` pulls in the amdgpu
+                // kernel driver in-tree -- same conservative default as the
+                // other guidance-only arms above.
+                reboot_required: true,
+            }
+        }
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
             let mut plan = apt_driver_plan(
@@ -1462,6 +1469,38 @@ fn driver_command(phase: DriverCommandPhase, command: &str) -> DriverPlanCommand
     }
 }
 
+/// Resolve a `${VAR:-default}` shell parameter-expansion template to its
+/// effective value: the value of `VAR` when it is set and non-empty (matching
+/// the shell `:-` semantics), otherwise the literal default. This is resolved
+/// once at plan-build time so the concrete value is baked into both the
+/// human-readable summary and the commands the plan runs, rather than leaking an
+/// unexpanded `${...}` placeholder into user-facing output or depending on the
+/// runtime shell — which, for the single-quoted apt `sources.list` line, would
+/// never expand it at all.
+///
+/// Only a single, flat `${VAR:-default}` template is recognized. Anything else —
+/// a bare `${VAR}`, a `${VAR:=x}`/`${VAR-x}` form, or a nested default such as
+/// `${A:-${B:-x}}` whose default itself contains `${` — is returned unchanged, so
+/// an unresolvable shape degrades to its literal input rather than to a
+/// half-resolved string.
+fn resolve_shell_default_template(expr: &str) -> String {
+    let Some(inner) = expr.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return expr.to_owned();
+    };
+    let Some((var, default)) = inner.split_once(":-") else {
+        return expr.to_owned();
+    };
+    if default.contains("${") {
+        // Nested or embedded templates are beyond this flat matcher; return the
+        // input untouched rather than emitting a partially resolved string.
+        return expr.to_owned();
+    }
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
 fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "driver install plan");
@@ -1870,6 +1909,66 @@ mod tests {
     }
 
     #[test]
+    fn resolve_shell_default_template_uses_default_when_env_unset() {
+        let _env = ScopedTestEnv::new();
+        // A made-up variable name that nothing else sets, cleared under the lock,
+        // isolates the default path.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION:-7.2.4}"),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_prefers_env_value_when_set() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_OVERRIDE";
+        env.set(var, "9.9.9");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "9.9.9"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_treats_empty_env_as_unset() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_EMPTY";
+        env.set(var, "");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_passes_through_non_template() {
+        assert_eq!(resolve_shell_default_template("7.2.4"), "7.2.4");
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_bare_var_untouched() {
+        let _env = ScopedTestEnv::new();
+        // No `:-default`, so there is nothing to resolve to; the input must pass
+        // through unchanged rather than being partially rewritten.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION}"),
+            "${ROCM_CLI_TEST_UNSET_REPO_VERSION}"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_nested_default_untouched() {
+        let _env = ScopedTestEnv::new();
+        // A nested default is beyond the flat matcher; returning the literal
+        // input keeps a `${B:-x}` fragment from leaking as a "resolved" value.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"),
+            "${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"
+        );
+    }
+
+    #[test]
     fn driver_plan_ubuntu_2404_uses_official_dkms_commands() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
@@ -2143,6 +2242,38 @@ VERSION_CODENAME=resolute
         assert!(rendered.contains("sudo apt install rocm"));
         assert!(!rendered.contains("amdgpu-dkms"));
         assert!(plan.commands.is_empty());
+        // `checks` renders as `post_reboot_checks:` and must hold verification
+        // targets only -- the mutating install guidance belongs in `reason`.
+        assert!(
+            !plan
+                .checks
+                .iter()
+                .any(|check| check.contains("apt install"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_ubuntu_2604_root_guidance_drops_sudo() {
+        // Companion to the Sudo case above: this arm derives its guidance from
+        // `escalation` rather than hardcoding `sudo`, so a root host must see
+        // the same command with no `sudo` prefix.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="26.04"
+VERSION_CODENAME=resolute
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(rendered.contains("apt install rocm"));
+        assert!(!plan.reason.contains("sudo"));
+        assert!(!plan.checks.iter().any(|check| check.contains("sudo")));
     }
 
     #[test]
@@ -3098,7 +3229,7 @@ VERSION_ID="41"
         let mut env = scoped_rocdxg_env();
 
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
-        assert_eq!(plan.repo_version, "1.2.2");
+        assert_eq!(plan.repo_version_expr, "1.2.2");
         let commands = plan.execution_commands().join("\n");
         // The version is resolved here, not deferred to the shell: the plan the
         // user approves has to name the build the install will actually fetch.
@@ -3123,7 +3254,7 @@ VERSION_ID="41"
         env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
         env.set(ROCDXG_SHA256_ENV, &"b".repeat(64));
         let overridden = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
-        assert_eq!(overridden.repo_version, "9.9.9");
+        assert_eq!(overridden.repo_version_expr, "9.9.9");
         let commands = overridden.execution_commands().join("\n");
         assert!(
             commands.contains("rocdxg-roct_9.9.9_amd64.deb"),

@@ -119,7 +119,7 @@ Feature: GPU detection and system inspection
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
 
-  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_DRIVER_VERSION:-...}` shell
   # placeholder on its `repo_version:` line instead of the effective version, so
   # the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
