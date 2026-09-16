@@ -1029,7 +1029,13 @@ jobs:
           # Best-effort per the step name: an earlier failure (e.g. the distro
           # itself never came up) already failed the job through its own step,
           # so this one must not also report red on the resulting "no such
-          # distribution" from the commands above.
+          # distribution" from the commands above. Still warn so a copy that
+          # failed for its own reason isn't silently indistinguishable from a
+          # clean run with an empty results dir -- the upload step below only
+          # catches that downstream, as a missing artifact.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::copy-out of E2E results exited $LASTEXITCODE (best-effort, not fatal)"
+          }
           exit 0
 
       - name: Upload E2E report
