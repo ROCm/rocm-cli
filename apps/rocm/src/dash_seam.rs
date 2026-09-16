@@ -69,6 +69,17 @@ impl RocmToolExecutor for BinToolExecutor {
         // corruption.
         match crate::run_internal_mcp_call(&self.paths, name, args.clone(), true) {
             Ok(v) => RocmToolOutcome::Result(v),
+            // `Error` is *not* the failed-command arm. `run_rocm_capture_for_paths`
+            // captures a non-zero `rocm` exit, so a refused command still returns
+            // `Ok` — an `isError: true` envelope that takes the `Result` arm above
+            // and gets collapsed by `summarize_json_value`. This arm fires only
+            // when the call itself fails: validation, spawn, timeout, unknown
+            // tool. That split is pinned by
+            // `seam_execute_approved_captures_a_failing_command_as_a_result`
+            // below, which drives this function against a real `rocm`
+            // subprocess that exits non-zero; the collapsing half is pinned by
+            // `approved_command_failure_stays_a_collapsed_envelope` in
+            // `crates/rocm-dash-tui/src/app/mod.rs`.
             Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }
@@ -172,6 +183,99 @@ mod tests {
         assert!(
             matches!(outcome, RocmToolOutcome::Error(_)),
             "CPU-device launch_server must be rejected, got {outcome:?}"
+        );
+    }
+
+    /// Drives the *real* approved-replay chain for a `rocm` command that exits
+    /// non-zero: `execute_approved` → `run_internal_mcp_call(…, true)` →
+    /// `run_rocm_capture_for_paths` (a genuine subprocess) →
+    /// `internal_mcp_tool_result_from_command`. None of those are stubbed here,
+    /// which is the point: the arm a refused command lands in is what the
+    /// ComfyUI e2e scenario's CLI-only scope rests on. Making this function map
+    /// a captured non-zero exit to `RocmToolOutcome::Error` turns this red.
+    ///
+    /// `runtimes activate <unknown key>` is the cheapest command that gets
+    /// there: `chat_rocm_command_action_from_args` classifies any non-`list`
+    /// `runtimes` invocation as `Approval`, and against the hermetic
+    /// [`temp_paths`] registry below (which has no manifests at all) the child
+    /// refuses deterministically with no network, no GPU and no real state.
+    /// The asserted argv, exit code and stderr together pin *that* refusal, so
+    /// the test cannot pass off some other non-zero exit as the captured one.
+    #[test]
+    fn seam_execute_approved_captures_a_failing_command_as_a_result() {
+        // `run_rocm_capture_for_paths` spawns `daemon_binary_path()`, which from
+        // a unit test means "the `rocm` next to the test harness". If the binary
+        // has not been built it silently falls back to the harness itself, which
+        // would re-enter libtest instead of running a command — so skip rather
+        // than measure the wrong process.
+        //
+        // This *skips* instead of failing on purpose. The binary is present for
+        // every gate that matters (unfiltered `cargo test -p rocm` builds it,
+        // as do the nextest and `--all-targets` lanes), but `docs/testing.md`
+        // teaches the filtered `cargo test -p rocm --bin rocm <filter>` form,
+        // which builds only the unit-test harness. Failing there would hand a
+        // contributor a red test unrelated to their change.
+        let binary = rocm_core::daemon_binary_path().expect("resolve the rocm binary");
+        if binary.file_stem().and_then(std::ffi::OsStr::to_str) != Some("rocm") {
+            eprintln!(
+                "skipping `seam_execute_approved_captures_a_failing_command_as_a_result`: \
+                 it replays through a real `rocm` subprocess but resolved `{}`. \
+                 Build the binary first (`cargo build -p rocm`) — `cargo test -p rocm \
+                 --bin rocm <filter>` on its own only builds the unit-test harness.",
+                binary.display()
+            );
+            return;
+        }
+
+        let exec = BinToolExecutor::new(temp_paths());
+        let outcome = exec.execute_approved(
+            "rocm_command",
+            &serde_json::json!({
+                "args": ["runtimes", "activate", "no-such-runtime-key"],
+            }),
+        );
+        let RocmToolOutcome::Result(v) = outcome else {
+            panic!(
+                "a captured non-zero `rocm` exit must stay a Result envelope, got {outcome:?}; \
+                 the `Error` arm is for calls that never ran"
+            );
+        };
+        // `argv[0]` is the resolved binary path, which is machine-dependent; the
+        // arguments after it are what this test pins.
+        assert_eq!(
+            v["structuredContent"]["argv"].as_array().map(|argv| argv
+                .iter()
+                .skip(1)
+                .filter_map(serde_json::Value::as_str)
+                .collect()),
+            Some(vec!["runtimes", "activate", "no-such-runtime-key"]),
+            "the envelope must carry the argv actually spawned: {v}"
+        );
+        assert_eq!(
+            v["structuredContent"]["exit_status"],
+            serde_json::json!(1),
+            "the child really did refuse; without that this test proves nothing: {v}"
+        );
+        assert_eq!(
+            v["isError"],
+            serde_json::json!(true),
+            "a captured non-zero exit is flagged inside the envelope, not raised: {v}"
+        );
+        // The refusal text is buried in the envelope rather than surfaced —
+        // exactly the shape `approved_command_failure_stays_a_collapsed_envelope`
+        // (`crates/rocm-dash-tui/src/app/mod.rs`) then collapses out of the chat.
+        //
+        // Anchored on the rejected selector rather than on `select_runtime_manifest`'s
+        // current "installed runtime not found" wording: that message is on this
+        // PR's Deferred list to be reworked into the "refuse and list keys" shape,
+        // and any such refusal still names the key it would not resolve. This
+        // keeps the test proving "the child really refused, and said why" without
+        // pinning a sentence already scheduled for rewrite.
+        assert!(
+            v["structuredContent"]["stderr"]
+                .as_str()
+                .is_some_and(|stderr| stderr.contains("no-such-runtime-key")),
+            "the CLI's own refusal is carried as captured stderr: {v}"
         );
     }
 

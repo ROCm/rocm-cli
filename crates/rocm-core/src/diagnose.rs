@@ -182,6 +182,30 @@ const KEYWORDS_MODULE_NOT_LOADED: KeywordTable = &[
     ("hsa_status_error", 10, "HSA error (broad)"),
 ];
 
+/// What a shared-memory shortage leaves in the error text.
+///
+/// Weak on purpose, and none of them reaches the match threshold alone. The
+/// defining property of this failure is that the crash **does not** name shared
+/// memory — a bus error in a data-loader worker, or a write failure against a
+/// temporary file. An entry that needed the right words would never fire for the
+/// user who needs it, so the machine state has to carry the finding and these
+/// only raise it.
+const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
+    (r"/dev/shm", 40, "error mentions /dev/shm"),
+    ("shared memory", 35, "error mentions shared memory"),
+    (
+        "bus error",
+        25,
+        "bus error -- what a data-loader worker reports when the allowance runs out",
+    ),
+    (
+        "dataloader worker.*killed",
+        25,
+        "a data-loader worker was killed",
+    ),
+    ("no space left on device", 20, "the device reported full"),
+];
+
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
     ("rocminfo: command not found", 50, "rocminfo not on PATH"),
     ("command not found.*hipcc", 40, "hipcc not on PATH"),
@@ -380,6 +404,13 @@ fn finalize(id: &str, title: &str, score: i32, evidence: Vec<String>, fix: Fix) 
 
 // ---------------------------------------------------------------------------
 // Per-misconfiguration checkers (1:1 with diagnose.py)
+//
+// A new checker goes at the END of this section, next to where its `CHECKERS`
+// entry was appended. Inserting one between an existing function and the doc
+// comment above it silently rebinds that comment to the new item: Rust joins a
+// run of `///` lines with no blank line between them, so the old rationale ends
+// up documenting the new constant and the old function is left with none. That
+// compiles, and clippy, rustfmt and every test pass.
 // ---------------------------------------------------------------------------
 
 fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
@@ -435,9 +466,7 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         fix_id: "fix-1-arch".to_owned(),
         auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
-        notes: vec![
-            "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
-        ],
+        notes: notes_1_arch(e),
         ..Fix::default()
     };
     finalize(
@@ -447,6 +476,24 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// The arch-list evidence this checker reads can now come from a managed
+/// runtime's torch, which the bare `pip` commands above would not touch — they
+/// resolve against whatever interpreter is on `PATH`, a different environment.
+/// Say which one the evidence describes rather than letting the commands imply
+/// it.
+fn notes_1_arch(e: &Examination) -> Vec<String> {
+    let mut notes = vec![
+        "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
+    ];
+    if e.framework_source == "managed-runtime" {
+        notes.push(
+            "This host's torch was read from the active managed runtime, not from `PATH`. Run the commands above against that runtime's own interpreter -- `rocm examine --json` names it under framework_notes -- or a bare `pip` will change a different environment and leave this unfixed."
+                .to_owned(),
+        );
+    }
+    notes
 }
 
 fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
@@ -847,8 +894,14 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
 
     let fw_major = major_version(fw_rocm);
     let sys_major = major_version(sys_rocm);
+    // Only meaningful when the framework resolves its HIP from the system. A
+    // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
+    // inside the runtime, so its HIP major is free to differ from the system's
+    // on a completely healthy host — and "reinstall torch" would be wrong there.
+    let framework_uses_system_rocm = e.framework_source != "managed-runtime";
     if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
         && fw != sys
+        && framework_uses_system_rocm
     {
         score += 50;
         let runtime = if windows { "HIP SDK" } else { "ROCm" };
@@ -1169,7 +1222,14 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
         ));
     }
-    if e.has_amd_gpu && e.framework == "pytorch" && e.framework_rocm_version.starts_with("hip=") {
+    // Skipped for a managed runtime for the reason this checker's own note
+    // already gives: those wheels bring their own HIP runtime, so a missing
+    // system HIP SDK is not evidence against them.
+    if e.has_amd_gpu
+        && e.framework == "pytorch"
+        && e.framework_rocm_version.starts_with("hip=")
+        && e.framework_source != "managed-runtime"
+    {
         score += 25;
         evidence
             .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
@@ -1376,6 +1436,108 @@ fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagno
         evidence,
         fix,
     )
+}
+
+/// The shared-memory allowance below which a serving workload is in trouble.
+///
+/// Chosen to separate the failure from the healthy majority rather than to
+/// describe what a workload wants. A container's default is 64 MB; an ordinary
+/// Linux host gives `/dev/shm` half its RAM, clearing this on anything with 2 GB
+/// or more. WSL2 ships the same 64 MB default a container does.
+///
+/// This deliberately under-reports. A container given 2 GB is still short for a
+/// large model and will not be flagged here. That is the right way to be wrong:
+/// a diagnosis that fires on healthy machines is one people stop reading, and a
+/// threshold set at what a workload *wants* would trip every ordinary laptop.
+const SHM_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What the catalog already tells users to ask for. Quoted rather than restated
+/// so the two cannot drift: `fix-10-container` prints `--shm-size=8g`.
+const SHM_RECOMMENDED: &str = "8g";
+
+/// `/dev/shm` too small for a serving workload.
+///
+/// Established from the state of the machine, not from the error text. That
+/// ordering is forced by the failure itself: the crash never names shared
+/// memory, which is exactly why the user cannot get from the message to the
+/// cause on their own.
+fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-19-shm-too-small";
+    const TITLE: &str = "shared memory allowance too small for a serving workload";
+
+    // Unmeasured is not short. `None` means the path was absent or the query
+    // failed, and reporting a shortage on that basis would be a finding about
+    // the probe rather than about the machine.
+    let Some(total) = e.shm_total_bytes else {
+        return zero(ID, TITLE);
+    };
+    if total >= SHM_MIN_BYTES {
+        return zero(ID, TITLE);
+    }
+
+    let mut score = 60;
+    let mut evidence = vec![format!(
+        "{} is {}, and a serving workload needs gigabytes",
+        crate::disk_space::format_bytes(total),
+        "the whole shared-memory allowance"
+    )];
+    if let Some(available) = e.shm_available_bytes
+        && available != total
+    {
+        evidence.push(format!(
+            "{} of it is free",
+            crate::disk_space::format_bytes(available)
+        ));
+    }
+    if e.in_container {
+        // Not more certain that the allowance is small -- that is measured. More
+        // certain about the cause and the remedy, because a container's default
+        // is exactly this, and restarting it with a larger one is a known step.
+        score += 10;
+        evidence.push(format!(
+            "this is a {} container, whose default allowance is 64 MiB",
+            // Matches the generic `probe_container` writes when it cannot name
+            // the runtime. Saying "linux container" invented a kind the probe
+            // never reports.
+            if e.container_kind.is_empty() {
+                "container"
+            } else {
+                &e.container_kind
+            }
+        ));
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_SHM_TOO_SMALL);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Raise the shared-memory allowance before running the workload.".to_owned(),
+        commands: vec![
+            "# In a container: restart it with a larger allowance.".to_owned(),
+            format!("#   docker run --shm-size={SHM_RECOMMENDED} ...    # see fix-10-container"),
+            "# On a host: remount it, and make that survive a reboot.".to_owned(),
+            format!("sudo mount -o remount,size={SHM_RECOMMENDED} /dev/shm"),
+            format!("# /etc/fstab:  tmpfs  /dev/shm  tmpfs  defaults,size={SHM_RECOMMENDED}  0 0"),
+        ],
+        needs_sudo: true,
+        fix_id: ID.to_owned(),
+        auto_applicable: false,
+        verify: "df -h /dev/shm".to_owned(),
+        notes: vec![
+            "A running container cannot have its allowance changed; it has to be started again."
+                .to_owned(),
+            // The threshold under-reports on purpose, and until now that was
+            // said only in the source. A reader who is told nothing reads
+            // silence as a clean bill of health.
+            format!(
+                "This is reported below {}. Silence is not proof of enough: a container given \
+                 2 GiB clears that bar and can still be too small for a large model.",
+                crate::disk_space::format_bytes(SHM_MIN_BYTES)
+            ),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,6 +2018,12 @@ const CHECKERS: &[Checker] = &[
     (check_wsl_5_distro_too_old, WSL_ONLY),
     (check_wsl_6_host_driver_too_old, WSL_ONLY),
     (check_wsl_7_wsl1, WSL_ONLY),
+    // Both families, opting in explicitly as the platform split requires. The
+    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
+    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
+    // leaving this tagged `linux` alone would silence it on one of the two
+    // platforms most likely to have it.
+    (check_19_shm_too_small, &["linux", "wsl"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2089,6 +2257,280 @@ mod tests {
             os_family: "linux".to_owned(),
             ..Examination::default()
         }
+    }
+
+    /// A host whose framework HIP major differs from its system ROCm: torch on
+    /// HIP 7, a system ROCm 6 beside it.
+    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+        Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: framework_source.to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        }
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
+        // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
+        // package inside the runtime, never from the system install, so the two
+        // majors are free to differ on a perfectly healthy host. Before
+        // `examine` probed the runtime this could not fire, because the field it
+        // reads was always empty; now that it is populated, the comparison has
+        // to be told when it is meaningless -- or fixing the probe would hand
+        // every such host a spurious "reinstall torch".
+        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        assert!(
+            !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
+            "a managed runtime must not be told to reinstall torch: {:?}",
+            managed
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // The same host, same versions, with torch coming from the ambient
+        // interpreter: there the comparison is exactly right, and the checker
+        // must keep its full strength.
+        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let finding = ambient
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-8-wheel-rocm")
+            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the version evidence alone has to establish it: {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
+        // The Windows-shaped sibling of the check_8 gate, and the reason
+        // check_13's own note already gives: TheRock wheels bring their own HIP
+        // runtime, so a HIP-build torch on a host with no system HIP SDK says
+        // nothing when that torch came from a managed runtime.
+        let windows = |source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+
+        let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        let ambient = check_13_hip_sdk_missing(&windows("path"), "");
+        assert_eq!(
+            ambient.score - managed.score,
+            25,
+            "the HIP-build clause must apply to the ambient torch and only to it \
+             (managed {}, ambient {})",
+            managed.score,
+            ambient.score
+        );
+    }
+
+    fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-19-shm-too-small")
+    }
+
+    #[test]
+    fn a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs() {
+        // The container default, which is also what WSL2 ships. The point of the
+        // entry is that it fires on machine state alone: the crash this prevents
+        // never names shared memory, so a user who pasted it would get nothing.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e.shm_available_bytes = Some(64 * 1024 * 1024);
+
+        let report = diagnose(&e, "");
+        let finding = shm_finding(&report).expect("a 64 MiB allowance must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the shortage is established by measurement, so it has to clear the \
+             threshold with no help from the symptom text: {}",
+            finding.score
+        );
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("64"),
+            "the report has to state what is actually available:\n{evidence}"
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "raising the allowance means restarting a container or remounting; \
+             neither is something to do on the user's behalf"
+        );
+        assert!(
+            fix.commands.iter().any(|c| c.contains("8g")),
+            "the steps have to name a size to raise it to:\n{:#?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_pinned_at_its_edge_rather_than_somewhere_between() {
+        // 64 MiB and 8 GiB leave everything in between unpinned: a threshold
+        // silently moved to 512 MiB or 2 GiB would pass both. The boundary is
+        // the only value worth asserting, because it is the only one a change
+        // to the constant has to cross.
+        let at_threshold = shm_report(SHM_MIN_BYTES);
+        assert!(
+            shm_finding(&at_threshold).is_none(),
+            "exactly the threshold is enough; the rule is 'below', not 'at or below'"
+        );
+        let just_under = shm_report(SHM_MIN_BYTES - 1);
+        assert!(
+            shm_finding(&just_under).is_some(),
+            "one byte under the threshold has to report, or the constant means nothing"
+        );
+
+        // Both assertions above are written in terms of the constant, so they
+        // move with it: they pin the rule ("below", not "at or below") and say
+        // nothing about the value. The value is a promise now -- the fix notes
+        // tell the user the figure -- so pin it literally. This is meant to fail
+        // when someone changes it, which makes the change deliberate and forces
+        // the note to move with it.
+        assert_eq!(
+            SHM_MIN_BYTES,
+            1024 * 1024 * 1024,
+            "the threshold is published to users in the fix notes; changing it means \
+             changing what they were told, so update both together"
+        );
+        // And a value from the middle of the range, which neither 64 MiB nor
+        // 8 GiB constrains: an ordinary host with 4 GB of RAM gets 2 GiB here
+        // and must stay silent.
+        assert!(
+            shm_finding(&shm_report(2 * 1024 * 1024 * 1024)).is_none(),
+            "2 GiB is what a modest but healthy host provides"
+        );
+    }
+
+    #[test]
+    fn the_symptom_text_raises_the_finding_without_being_needed_for_it() {
+        // Both halves matter. The keywords must earn their place, and they must
+        // not be load-bearing: the whole premise is that the crash never names
+        // shared memory, so a user who pastes an unrelated error still gets the
+        // finding.
+        let machine_only = shm_finding(&shm_report(64 * 1024 * 1024))
+            .expect("machine state alone reports")
+            .score;
+
+        for symptom in [
+            "RuntimeError: DataLoader worker (pid 12) is killed by signal: Bus error",
+            "OSError: [Errno 28] No space left on device: '/dev/shm/torch_abc'",
+            "failed to allocate shared memory",
+        ] {
+            let mut e = linux_base();
+            e.shm_total_bytes = Some(64 * 1024 * 1024);
+            let report = diagnose(&e, symptom);
+            let scored = shm_finding(&report)
+                .expect("still reports with a symptom")
+                .score;
+            assert!(
+                scored > machine_only,
+                "{symptom:?} should raise the finding above the machine-state score \
+                 ({scored} vs {machine_only})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partly_used_allowance_reports_what_is_left_as_well_as_the_size() {
+        // The two numbers answer different questions, and the evidence only
+        // mentions what is free when it differs from the total -- otherwise it
+        // would repeat itself on an idle machine.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e.shm_available_bytes = Some(2 * 1024 * 1024);
+
+        let report = diagnose(&e, "");
+        let evidence = shm_finding(&report)
+            .expect("a short allowance reports")
+            .evidence
+            .join("\n");
+        assert!(
+            evidence.contains("2.0 MiB"),
+            "a mostly-full allowance has to say how little is left:\n{evidence}"
+        );
+    }
+
+    /// A Linux machine whose only notable property is its shared-memory size.
+    fn shm_report(total: u64) -> DiagnoseReport {
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(total);
+        e.shm_available_bytes = Some(total);
+        diagnose(&e, "")
+    }
+
+    #[test]
+    fn an_ordinary_shared_memory_allowance_is_not_reported() {
+        // The control. An ordinary Linux host gives /dev/shm half its RAM, so
+        // this is the common case -- and an entry that fired here would fire on
+        // nearly every machine, which is how a catalog stops being read.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        e.shm_available_bytes = Some(8 * 1024 * 1024 * 1024);
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "8 GiB is what the catalog itself tells users to ask for"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_shared_memory_allowance_is_not_reported() {
+        // Unknown is not zero. `None` means the path was absent or the query
+        // failed, and a shortage reported on that basis would be a finding about
+        // the probe rather than about the user's machine.
+        let mut e = linux_base();
+        e.shm_total_bytes = None;
+        e.shm_available_bytes = None;
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn being_in_a_container_raises_the_finding_without_creating_it() {
+        // The container flag says the cause and the remedy are known exactly, so
+        // it raises confidence. It must not be able to conjure a finding on a
+        // machine whose allowance is fine.
+        let mut healthy = linux_base();
+        healthy.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        healthy.in_container = true;
+        healthy.container_kind = "docker".to_owned();
+        assert!(
+            shm_finding(&diagnose(&healthy, "")).is_none(),
+            "a container with a healthy allowance has nothing wrong with it"
+        );
+
+        let mut short = linux_base();
+        short.shm_total_bytes = Some(64 * 1024 * 1024);
+        let outside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        short.in_container = true;
+        short.container_kind = "docker".to_owned();
+        let inside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        assert!(
+            inside > outside,
+            "knowing it is a container makes the cause certain, so it should rank \
+             higher there: {inside} vs {outside}"
+        );
     }
 
     #[test]

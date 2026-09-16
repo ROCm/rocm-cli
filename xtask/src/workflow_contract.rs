@@ -1107,6 +1107,74 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_shared_uv_cache_sits_inside_the_gc_bounded_directory() {
+        // Two independent properties ride on this one path, and both fail
+        // silently.
+        //
+        // Hardlinking: uv can only link out of its cache into a managed
+        // environment when the two are reachable without crossing a mount point.
+        // Otherwise it copies, exits 0, and two of the three install paths
+        // discard its warning — invisible unless you compare inodes.
+        //
+        // Eviction: the runner pod's `uv-cache-gc` initContainer bounds exactly
+        // one directory — the `uv-cache` subPath of the work PVC, which surfaces
+        // in the job as <runner-root>/uv-cache. It sweeps abandoned `.tmp*`
+        // extractions, then deletes `archive-v0` if FREE space on the volume is
+        // under 60GiB. A free-space floor, not a size cap. A cache placed
+        // elsewhere on the same volume still hardlinks, so every signal stays
+        // green while nothing enforces the floor — and the volume also holds
+        // `.runner`, whose credentials need a repo-Administration token to
+        // re-register. The 49G/49G strand that motivated this was the separate
+        // 50Gi cache PVC, since deleted, which had no floor at all.
+        //
+        // $RUNNER_WORKSPACE is <runner-root>/_work/<repo>, so a lane that derives
+        // the cache from it directly lands one level too deep and escapes the GC.
+        // Asserting the derivation rather than a literal keeps this honest if the
+        // runner root ever moves.
+        const DERIVATION: &str = "runner_root=\"$(dirname \"$(dirname \"$RUNNER_WORKSPACE\")\")\"";
+        const EXPORT: &str = "export E2E_SHARED_UV_CACHE_DIR=\"$runner_root/uv-cache\"";
+
+        for (workflow, text) in self_hosted_workflows() {
+            let mut setters = 0;
+            for block in multiline_run_blocks(&text) {
+                let Some(line) = block
+                    .lines()
+                    .find(|line| line.starts_with("export E2E_SHARED_UV_CACHE_DIR="))
+                else {
+                    continue;
+                };
+                setters += 1;
+                // Full-line equality, not `contains`: a substring match accepts
+                // `$runner_root/uv-cache-old`, which is outside the bounded
+                // directory and would fail exactly the way this test exists to
+                // prevent.
+                assert_eq!(
+                    line, EXPORT,
+                    "{workflow} sets the shared uv cache to `{line}`. It must be \
+                     exactly `{EXPORT}` — <runner-root>/uv-cache is the only directory \
+                     the runner's uv-cache-gc initContainer bounds. $RUNNER_WORKSPACE \
+                     itself is one level too deep, which keeps the hardlinks but \
+                     silently drops the 60GiB free-space floor"
+                );
+                assert!(
+                    block.contains(DERIVATION),
+                    "{workflow} exports E2E_SHARED_UV_CACHE_DIR from `$runner_root` \
+                     without defining it in the same run block; add `{DERIVATION}`"
+                );
+            }
+            // Without this, deleting every export is a silent pass — the loop
+            // above simply finds nothing to assert on. Same guard the sibling
+            // `assert_prebuilt_e2e_lanes_export_rocmd` uses.
+            assert!(
+                setters > 0,
+                "{workflow} sets E2E_SHARED_UV_CACHE_DIR nowhere. Its GPU lanes share a \
+                 pre-warmed runtime, so an unset cache sends uv to a per-job default \
+                 outside the GC-bounded directory"
+            );
+        }
+    }
+
+    #[test]
     fn self_hosted_prebuilt_e2e_lanes_export_rocmd() {
         let workflow = read_workflow("e2e-selfhosted.yml");
         assert_prebuilt_e2e_lanes_export_rocmd("e2e-selfhosted.yml", &workflow);
@@ -1150,6 +1218,87 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{workflow_name} still uses the generation-agnostic pre-warm tree"
             );
         }
+    }
+
+    /// The Windows lane must hand its lifecycle E2E run the release binaries the
+    /// Build step already produced.
+    ///
+    /// Without `ROCM_CLI_BINARY`, `cargo xtask e2e` builds `rocm`/`rocmd` for
+    /// itself WITH `--features rocm/e2e-test-hooks`. That is a different feature
+    /// resolution than the Build step's, so cargo rebuilds the entire release
+    /// graph instead of reusing it — a second 3-4 minute release build on the one
+    /// job that alone determines total CI wall clock.
+    ///
+    /// Note this is the mirror image of
+    /// [`assert_prebuilt_e2e_lanes_enable_test_hooks`]: lanes running the FULL
+    /// suite must build WITH the hooks, while this lifecycle-only lane must build
+    /// WITHOUT them. `E2E_ONLY_LIFECYCLE` keeps it to @lifecycle scenarios, none
+    /// of which use a scripted seam, and the lane packages and installs the
+    /// binary through the real installer — so it must ship what a release ships.
+    #[test]
+    fn ci_windows_lifecycle_lane_reuses_the_binaries_it_built() {
+        let ci = read_workflow("ci.yml");
+        let windows = job_block(&ci, "windows-build-and-test");
+
+        assert!(
+            windows.contains("cargo build --release -p rocm -p rocmd"),
+            "the Windows lane must pre-build the release binaries"
+        );
+
+        assert!(
+            windows.contains("cargo xtask e2e"),
+            "the Windows lane must run the lifecycle E2E suite"
+        );
+
+        // A bare `run: cargo xtask e2e` is exactly the regression this guards:
+        // no run block can export the binaries, so xtask rebuilds them itself.
+        let lifecycle = multiline_run_blocks(windows)
+            .into_iter()
+            .find(|block| invokes_e2e(block))
+            .unwrap_or_else(|| "<no multiline run block invoking `cargo xtask e2e`>".to_owned());
+
+        for var in ["ROCM_CLI_BINARY", "ROCM_CLI_ROCMD_BINARY"] {
+            assert!(
+                lifecycle.contains(var),
+                "the Windows lifecycle lane must export {var} so `cargo xtask e2e` \
+                 reuses the already-built release binaries instead of recompiling \
+                 the whole release graph under a different feature set:\n{lifecycle}"
+            );
+        }
+
+        // Naming the variables is not enough: pointing them at `target\debug\`
+        // would satisfy the check above while defeating the reuse this test is
+        // named for. Pin the whole assignment for BOTH, so neither can drift to a
+        // debug or stale target dir. `assert_prebuilt_e2e_lanes_export_rocmd` pins
+        // only `rocmd` for the other PowerShell prebuilt lanes; closing that half
+        // of the mirror belongs with the shared helper, not here.
+        for (var, exe) in [
+            ("ROCM_CLI_BINARY", "rocm.exe"),
+            ("ROCM_CLI_ROCMD_BINARY", "rocmd.exe"),
+        ] {
+            assert!(
+                lifecycle.contains(&format!("$env:{var} = \"$targetDir\\release\\{exe}\"")),
+                "the Windows lifecycle lane must export the RELEASE {exe} path — the \
+                 binaries the Build step produced, not a debug or stale target dir:\n{lifecycle}"
+            );
+        }
+
+        // The fail-fast guard is a deliberate part of this lane: without it a
+        // missing binary surfaces as a `failed to run` deep in the suite. Nothing
+        // else here references it, so without this assertion the whole
+        // `Test-Path`/`throw` block can be deleted with every test still green.
+        assert!(
+            lifecycle.contains("Test-Path -LiteralPath")
+                && lifecycle.contains("throw \"expected the Build step to have produced"),
+            "the Windows lifecycle lane must fail fast, naming the missing binary, \
+             when the Build step did not produce it:\n{lifecycle}"
+        );
+
+        assert!(
+            !lifecycle.contains("e2e-test-hooks"),
+            "the lifecycle-only lane packages and installs what a release ships, \
+             so it must NOT carry the test hooks:\n{lifecycle}"
+        );
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the

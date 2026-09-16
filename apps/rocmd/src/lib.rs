@@ -2522,7 +2522,8 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
         // two `remove-*` verbs delete, so they stay off the read-only list.
         Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
         // `setup status` reports first-time setup state (read-only); `setup reset`
-        // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
+        // clears the completion/dismissal state and is mutating (it does not by
+        // itself reopen onboarding). Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
         Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
         _ => false,

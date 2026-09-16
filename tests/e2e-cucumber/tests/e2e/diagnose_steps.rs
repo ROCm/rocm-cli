@@ -88,6 +88,9 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-5-distro-too-old",
     "fix-wsl-6-host-driver-too-old",
     "fix-wsl-7-wsl1",
+    // `fix-18` is the code object manager entry on its own branch, kept
+    // distinct for the same reason `fix-16` is.
+    "fix-19-shm-too-small",
 ];
 
 /// The fixes the CLI carries out itself. Every other entry only prints a plan.
