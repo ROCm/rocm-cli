@@ -1025,8 +1025,10 @@ pub(crate) fn install_sdk(
 ///
 /// Consent is preapproved rather than asked for: the update targets the runtime
 /// the user selected (or the active default), so installing over it is the
-/// operation requested, and `rocm update` has no `--yes` flag and no terminal
-/// contract — reaching a prompt here would only fail the command.
+/// operation requested, and `rocm update` has no terminal contract — reaching a
+/// prompt here would only fail the command. `rocm update` does accept a `--yes`
+/// flag for consistency with other mutating commands, but it is inert and never
+/// reaches this function, so it grants nothing here.
 ///
 /// `activate_after_install` mirrors `rocm update --apply --activate` so the
 /// approval line can state what will actually happen. Without it,
@@ -2380,8 +2382,11 @@ fn repo_version_without_wheels(
 
 /// Where an already-granted approval for displacing the active default came
 /// from. Carried rather than collapsed to a bare bool so the line the CLI
-/// prints can name the real source: `rocm update --apply` has no `--yes` flag,
-/// so a message crediting one would name a flag the user could not have passed.
+/// prints can name the real source: `rocm update --apply` takes its approval
+/// from the runtime the user selected, not from a flag, so a message crediting
+/// `--yes` would name an approval that was never given. (`rocm update` does
+/// accept a `--yes` flag, but it is inert by its own documentation — applying
+/// never prompts — so it grants nothing to credit.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SdkInstallApprovalSource {
     /// The user passed `--yes` to `rocm install sdk`, which also approves
@@ -2454,9 +2459,13 @@ const fn sdk_install_approval(
 /// Each arm states only what that caller will actually do. `update --apply`
 /// without `--activate` installs beside the active default and leaves it alone,
 /// so claiming the new install "becomes the active default runtime" there would
-/// be false — and crediting `--yes` would name a flag `rocm update` does not
-/// have.
-fn preapproved_install_line(
+/// be false — and crediting `--yes` would claim an approval the update path
+/// never received, since `rocm update`'s `--yes` is inert and its approval
+/// comes from the runtime selection instead.
+///
+/// `pub(crate)` so the `Update` subcommand's own test can pin that invariant at
+/// the site of the flag it must not credit.
+pub(crate) fn preapproved_install_line(
     source: SdkInstallApprovalSource,
     relation: &str,
     resolved_display: &str,
@@ -9904,8 +9913,9 @@ echo Python 3.12.10
 
     #[test]
     fn preapproved_install_line_credits_the_real_consent_source() {
-        // `rocm update --apply` has no `--yes` flag, so a line crediting one
-        // names something the user could not have passed. And without
+        // `rocm update --apply` draws its approval from the runtime the user
+        // selected, not from a flag — its `--yes` is inert — so a line
+        // crediting `--yes` names an approval that was never given. And without
         // `--activate`, `apply_runtime_update` leaves the active default alone,
         // so claiming the install "becomes the active default runtime" is false.
         let by_yes = preapproved_install_line(
@@ -9942,7 +9952,7 @@ echo Python 3.12.10
         );
         assert!(
             !update_activates.contains("--yes"),
-            "the update path must not credit a flag `rocm update` does not have: {update_activates}"
+            "the update path must not credit an approval `--yes` did not grant: {update_activates}"
         );
         assert!(update_activates.contains("becomes the active default runtime"));
 
@@ -9953,7 +9963,7 @@ echo Python 3.12.10
         );
         assert!(
             !update_only.contains("--yes"),
-            "the update path must not credit a flag `rocm update` does not have: {update_only}"
+            "the update path must not credit an approval `--yes` did not grant: {update_only}"
         );
         assert!(
             !update_only.contains("becomes the active default runtime"),
