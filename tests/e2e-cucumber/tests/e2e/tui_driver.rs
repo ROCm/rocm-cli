@@ -476,6 +476,33 @@ impl TuiSession {
         }
     }
 
+    /// Drain the PTY for up to [`DRAIN_TIMEOUT`] after the child has exited, so
+    /// a process-exit error below reflects the final buffered frame rather
+    /// than a stale mid-drain snapshot. Shared by `wait_for_screen_gone` and
+    /// `assert_screen_persists`, whose exit handling is otherwise identical;
+    /// `wait_for_screen` drains differently (it keeps re-checking for `marker`
+    /// while draining, since exit is not automatically a failure on that path)
+    /// and so isn't a candidate for this helper.
+    async fn drain_after_exit(&mut self) {
+        // `reader` is only ever `None` after `Drop` has taken it, which never
+        // happens before this call (both callers run from an active session).
+        // Guard it anyway: without this, a missing reader would read as
+        // "never finished" and burn the full timeout instead of returning
+        // immediately.
+        if self.reader.is_none() {
+            return;
+        }
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline
+            && !self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Poll the current screen until it no longer contains `marker`, or fail
     /// with a deadline that includes the last screen for diagnosis.
     ///
@@ -487,10 +514,12 @@ impl TuiSession {
     /// instead of assuming a fixed delay is always enough.
     ///
     /// Liveness (panic / exit) is checked *before* the absence check, unlike
-    /// `wait_for_screen`'s presence-first ordering: `vt100` clears its parsed
-    /// screen on the alternate-screen-exit escape, so a dashboard that
-    /// crashes or quits mid-wait would otherwise make `marker` vanish for the
-    /// wrong reason and be misreported as a successful "gone" result.
+    /// `wait_for_screen`'s presence-first ordering: on the alternate-screen-exit
+    /// escape, `vt100` swaps back to the primary grid, which was never written
+    /// to and so reads as blank — not because the parsed screen was cleared,
+    /// but with the same practical effect. A dashboard that crashes or quits
+    /// mid-wait would otherwise make `marker` vanish for the wrong reason and
+    /// be misreported as a successful "gone" result.
     pub async fn wait_for_screen_gone(
         &mut self,
         marker: &str,
@@ -510,15 +539,7 @@ impl TuiSession {
                 // The process exiting is never a legitimate "gone" outcome for
                 // this helper; drain briefly so the error reflects the final
                 // buffered frame rather than a stale mid-drain snapshot.
-                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-                while Instant::now() < drain_deadline
-                    && !self
-                        .reader
-                        .as_ref()
-                        .is_some_and(std::thread::JoinHandle::is_finished)
-                {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
+                self.drain_after_exit().await;
                 if let Some(panic_message) = self.take_reader_panic() {
                     return Err(format!(
                         "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
@@ -571,15 +592,7 @@ impl TuiSession {
                 // The process exiting is never a legitimate "persisted" outcome
                 // here; drain briefly so the error reflects the final buffered
                 // frame rather than a stale mid-drain snapshot.
-                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-                while Instant::now() < drain_deadline
-                    && !self
-                        .reader
-                        .as_ref()
-                        .is_some_and(std::thread::JoinHandle::is_finished)
-                {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
+                self.drain_after_exit().await;
                 if let Some(panic_message) = self.take_reader_panic() {
                     return Err(format!(
                         "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
