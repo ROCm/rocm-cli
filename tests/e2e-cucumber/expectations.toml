@@ -173,36 +173,6 @@ flaky = true
 # product does not do that yet — so the day one is fixed its row goes stale and
 # deletes itself.
 
-# --- EAI-8010: `--dry-run` is declared as requiring `--apply`, so previewing an
-# update without asking for one is rejected as a usage error, though README.md's
-# synopsis line for `rocm update` brackets `[--apply]` and `[--dry-run]`
-# independently. Argument handling only, so platform-independent.
-#
-# NOT ONLY `--dry-run`. `--runtime` and `--activate` carry the same
-# `requires = "apply"`, and the synopsis brackets all three alongside `[--apply]`
-# as if independent — so three options are documented as usable on their own and
-# none of them is. This scenario exercises `--dry-run` because it is the one a
-# README reader reaches for first, not because it is the only case.
-#
-# Scoped to those three on purpose. The synopsis spans two lines and six
-# options; the other two, `--json` and `--timeout-secs`, are NOT part of this:
-# the README prose under it spells their relationship out ("`--timeout-secs`
-# requires `--json`; both conflict with `--apply`"), and the code agrees.
-#
-# WHICH SIDE IS WRONG IS A MAINTAINER CALL, and this row does not presume it.
-# The defensible alternative reading is that bare `rocm update` is already the
-# preview, making these meaningful only alongside `--apply` — in which case the
-# synopsis is what misleads. This row asserts only that the documented contract
-# and the shipped behaviour disagree, which is true either way.
-#
-# Remove it when they agree — and fix all three together, because a synopsis
-# correction that covers `--dry-run` alone leaves the identical defect standing
-# for its two siblings while this row goes quiet. ---
-[["update-preview-without-applying"]]
-when = {}
-bug = "EAI-8010"
-reason = "`rocm update --dry-run` is refused as a usage error unless --apply is also given."
-
 # --- EAI-8020: `diagnose` and `fix` each carry their own copy of the
 # render-group remedy, and the verification step has drifted between them
 # (`diagnose` adds `ls -l /dev/kfd`). Both strings are constants, so this holds

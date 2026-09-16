@@ -25,23 +25,33 @@ Feature: Update report
     When the user checks for updates as machine-readable JSON with a 5 second timeout
     Then the machine-readable check reports no runtimes to update
 
-  # `rocm update` is a query by default and only changes the machine when asked
-  # to. Nothing here installs anything: this scenario covers what the command
-  # accepts, which is pure argument handling and so needs no GPU, no runtime,
-  # and no network.
-  #
-  # Expected to FAIL. Asking to see what an update would do, without asking for
-  # it to be done, is refused as a misuse — even though checking is what this
-  # command does when left alone. README.md's synopsis for `rocm update` brackets
-  # `[--apply]` and `[--dry-run]` as independent options, so a user who wants a
-  # preview before committing to anything is turned away from the one command
-  # the documentation told them would give it.
-  #
-  # The row in expectations.toml records why this does not presume which side is
-  # wrong: closing the gap by correcting the synopsis would satisfy it just as
-  # well as accepting the flag.
-  @id:update-preview-without-applying
-  Scenario: update-04 - Previewing an update without asking to install it is accepted
-    When the user asks to see what updating would do without asking for it to be done
-    Then the request is accepted rather than refused as a misuse
-    And the machine still manages no runtimes
+  # `--dry-run` used to `requires = "apply"` in clap, so `rocm update --dry-run`
+  # alone failed with a bare usage error instead of previewing. It no longer
+  # requires `--apply`, so this asserts the command reaches real business logic
+  # (the "no managed runtimes" bail, which reads nothing like a clap usage error)
+  # rather than being rejected before `rocm` even looks at the registry.
+  @id:update-dry-run-reaches-preview-path-without-apply
+  Scenario: update-04 - Previewing an update with --dry-run does not require --apply
+    Given a machine with no managed runtimes
+    When the user previews an update
+    Then the CLI refuses because no managed runtimes are registered
+
+  # `--runtime`/`--activate` are apply-only flags: without `--apply` or
+  # `--dry-run` alongside them, the old code rejected them with a bare clap
+  # usage error (both were declared `requires = "apply"`) instead of a message
+  # naming the actual constraint. This pins the intentional refusal message.
+  @id:update-runtime-or-activate-without-apply-or-dry-run-is-refused
+  Scenario: update-05 - --runtime or --activate without --apply or --dry-run is refused
+    Given a machine with no managed runtimes
+    When the user requests updating a specific runtime without --apply or --dry-run
+    Then the CLI refuses because --apply or --dry-run is required with --runtime or --activate
+
+  # --dry-run and --json are mutually exclusive: --json emits a single line of
+  # machine-readable JSON, and --dry-run would print human-readable preview text
+  # on top of it, corrupting the JSON contract. Pins the clap conflict instead of
+  # one flag silently winning.
+  @id:update-dry-run-conflicts-with-json
+  Scenario: update-06 - --dry-run and --json cannot be combined
+    Given a machine with no managed runtimes
+    When the user checks for updates as JSON with --dry-run
+    Then the CLI refuses because --dry-run and --json cannot be combined

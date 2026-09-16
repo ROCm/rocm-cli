@@ -9,18 +9,13 @@
 //! not-configured feeds" behaviour. Contracts verified against the running Linux
 //! binary (EAI-8072). Mock lane.
 //!
-//! The preview steps below are argument handling only: nothing there contacts a
-//! package index or changes the machine either, so they run on every lane too.
+//! The flag-handling steps below are argument handling only: nothing there
+//! contacts a package index or changes the machine either, so they run on every
+//! lane too.
 
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-
-/// The exit code a CLI uses to reject the way it was CALLED, as opposed to
-/// failing at the work it was asked to do. Anything the command decides about
-/// the machine — no runtime registered, nothing to update — is a different
-/// outcome and not what that scenario is about.
-const USAGE_ERROR: i32 = 2;
 
 #[given("a machine with no managed runtimes")]
 async fn no_managed_runtimes(_world: &mut E2eWorld) {
@@ -89,68 +84,6 @@ async fn reports_feed_status(world: &mut E2eWorld) {
     }
 }
 
-#[when("the user asks to see what updating would do without asking for it to be done")]
-async fn user_previews_update(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run"]);
-    world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
-    world.cli_rc = Some(rc);
-}
-
-#[then("the request is accepted rather than refused as a misuse")]
-async fn assert_preview_accepted(world: &mut E2eWorld) {
-    let combined = format!(
-        "{}{}",
-        world.cli_output.as_deref().unwrap_or(""),
-        world.cli_stderr.as_deref().unwrap_or("")
-    );
-    // Deliberately NOT "exits 0": a host with no ROCm install registered has
-    // nothing to check and says so, which is a legitimate answer to a legitimate
-    // question. The contract is only that asking was allowed.
-    assert_ne!(
-        world.cli_rc,
-        Some(USAGE_ERROR),
-        "asking to preview an update was rejected as a misuse of the command:\n{combined}"
-    );
-}
-
-#[then("the machine still manages no runtimes")]
-async fn assert_still_manages_no_runtimes(world: &mut E2eWorld) {
-    // Scoped deliberately narrowly, because the obvious stronger claim is one
-    // this fixture CANNOT make. It would be natural to read this as "the
-    // preview did not perform the update", but on an empty registry that
-    // outcome is unreachable whether the product is honest or not: `--apply`
-    // resolves a runtime to upgrade through `select_runtime_update_source`
-    // (`apps/rocm/src/main.rs`), which bails with "no managed runtimes are
-    // registered" when none is. `update` upgrades a managed runtime; it never
-    // installs a first one. So "manages none" here is guaranteed by the
-    // fixture, and an assertion resting on it would be satisfied forever.
-    //
-    // What it does hold is the readback path: after a preview, `update` still
-    // answers, exits 0, and reports the same machine `update-01` pins. That is
-    // worth asserting and it can fail — but it is not the non-mutation contract.
-    //
-    // Proving THAT needs a scenario with a managed runtime registered, where a
-    // performed update is observable. It is not done here on purpose: with a
-    // manifest present, `render_update_report` resolves the latest version per
-    // runtime (`resolve_latest_for_manifest` in `apps/rocm/src/therock.rs`),
-    // which reaches the TheRock index — and this scenario runs on the mock lane,
-    // which has no network. Tracked on EAI-8010 rather than forced in here.
-    //
-    // Today this never runs: the step above fails first on the usage error, so
-    // it neither weakens nor satisfies the row that pins EAI-8010.
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["update"]);
-    assert_eq!(
-        rc, 0,
-        "`update` stopped answering after the preview:\n{stdout}{stderr}"
-    );
-    assert!(
-        stdout.contains("managed runtimes: none"),
-        "reading the machine back after the preview did not report the empty registry \
-         this scenario runs against:\n{stdout}"
-    );
-}
-
 // Covers the JSON envelope shape only (single line, `runtimes: []`).
 // Suppressing wheel-resolution progress output ahead of the JSON contract is
 // a separate concern with no managed runtimes here to trigger it — that's
@@ -177,6 +110,76 @@ async fn json_reports_empty_runtimes(world: &mut E2eWorld) {
     assert!(
         runtimes.is_empty(),
         "expected an empty `runtimes` array, got: {runtimes:?}"
+    );
+}
+
+#[when("the user previews an update")]
+async fn preview_update(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because no managed runtimes are registered")]
+async fn refuses_no_managed_runtimes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("no managed runtimes are registered"),
+        "expected the real 'no managed runtimes are registered' bail (not a \
+         clap usage error), got:\n{combined}"
+    );
+}
+
+#[when("the user requests updating a specific runtime without --apply or --dry-run")]
+async fn update_runtime_without_apply_or_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--runtime", "some-runtime"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because --apply or --dry-run is required with --runtime or --activate")]
+async fn refuses_apply_or_dry_run_required(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("--runtime and --activate require --apply or --dry-run"),
+        "expected the --runtime/--activate no-op guard bail, got:\n{combined}"
+    );
+}
+
+#[when("the user checks for updates as JSON with --dry-run")]
+async fn check_updates_json_with_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because --dry-run and --json cannot be combined")]
+async fn refuses_dry_run_json_conflict(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("cannot be used with"),
+        "expected a clap conflict error naming --dry-run/--json, got:\n{combined}"
     );
 }
 

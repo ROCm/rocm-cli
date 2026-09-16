@@ -297,15 +297,21 @@ rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
-                    [--json] [--timeout-secs SECS]
+                    [--json] [--timeout-secs SECS] [--yes]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
 native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it. `--json` prints the check result as a single line of JSON instead
-of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
-`--json`; both conflict with `--apply`).
+install it, or `--dry-run` to preview what `--apply` would do without changing
+anything (`--dry-run` does not require `--apply`). `--runtime` and `--activate`
+require `--apply` or `--dry-run` — pass one of those instead of naming a
+runtime or requesting activation on its own. `--json` prints the check
+result as a single line of JSON instead of text; `--timeout-secs` bounds its
+network calls (`--timeout-secs` requires `--json`; both `--json` and
+`--timeout-secs` conflict with `--apply`, and `--json` also conflicts with
+`--dry-run`). `update --apply` never prompts; `--yes` is accepted for
+consistency with other mutating commands but has no effect on it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
@@ -338,11 +344,15 @@ Manage multiple side-by-side ROCm runtimes:
 rocm runtimes list
 rocm runtimes activate <runtime-key>
 rocm runtimes rollback
-rocm runtimes uninstall <runtime-key>
+rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`uninstall` prompts for confirmation unless `--yes` is passed; outside an
+interactive terminal `--yes` is required. `--dry-run` prints the plan and
+exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,
@@ -528,13 +538,17 @@ use the provider's default.
 Install and manage ComfyUI for image generation (alias: `rocm comfy`):
 
 ```
-rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run]
-rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser]
-rocm comfyui stop
+rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run] [--yes]
+rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser] [--yes]
+rocm comfyui stop       [--yes]
 rocm comfyui status
 rocm comfyui logs       [--lines N]
 rocm comfyui models-path
 ```
+
+None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
+accepted on each for consistency with other mutating commands but currently
+has no effect.
 
 ### Automations
 
