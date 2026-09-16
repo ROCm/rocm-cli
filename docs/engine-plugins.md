@@ -32,6 +32,26 @@ The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
 unsupported. rocm-cli does not use a CPU fallback for this path.
 
+## Lemonade backend alignment on engine install
+
+Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
+`llamacpp:rocm` backend downloads. `rocm engines install lemonade` rewrites
+that pin to match the active ROCm SDK so the backend it installs is paired
+with the SDK actually in use, rather than whatever version Lemonade shipped
+pinned to.
+
+Set `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` to keep whatever
+`backend_versions.json` already pins and skip the rewrite — any value works,
+including an empty one, since the variable being set is the signal:
+
+```bash
+ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT=1 rocm engines install lemonade --yes
+```
+
+Use it if you have hand-edited `backend_versions.json` to pin a specific
+version, matching that file's own documented use as a first-party
+customization point.
+
 ## Pinned runtime versions
 
 The versions of the third-party runtimes rocm-cli downloads are pinned in
