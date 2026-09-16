@@ -654,8 +654,11 @@ jobs:
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
-    # `native` disambiguates the two Linux Strix runners: the WSL host also
-    # carries `strix-halo`, but the paths below exist only on the native one.
+    # `native` disambiguates this runner from any host that might carry a bare
+    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
+    # before the WSL lanes moved to the ephemeral pool) -- the paths below
+    # exist only on the native host, whether or not that other runner remains
+    # registered.
     runs-on: [self-hosted, linux, strix-halo, native]
     continue-on-error: true
     env:
@@ -1028,7 +1031,7 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
@@ -1101,6 +1104,12 @@ jobs:
         with:
           name: e2e-gpu-strix-wsl-report
           path: tests/e2e-cucumber/results/
+          # The copy-out step above is deliberately best-effort (it must not
+          # report red just because an earlier step already failed the job),
+          # so this is the only place left to catch a copy that failed for its
+          # own reason: default `warn` would upload nothing and still look
+          # like a clean, empty run in the consolidated report.
+          if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the
