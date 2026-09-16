@@ -1583,9 +1583,15 @@ fn runtime_library_path_env(
     let mut entries = library_paths.to_vec();
     if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
         // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
-        // trims, drops empty entries and host-normalises each one. The sibling
-        // composition in `probe_runtime_devices` already uses it, and the two
-        // building the same variable differently is how they drift.
+        // trims, drops empty entries and host-normalises each one, on top of the
+        // same quoting rules `split_paths` applies. The sibling composition in
+        // `probe_runtime_devices` already uses it, and the two building the same
+        // variable differently is how they drift.
+        //
+        // The quoting is what keeps the `join_paths` below on its `Ok` arm: this
+        // variable is `PATH` on Windows, a quoted entry anywhere in the inherited
+        // one is legal, and a splitter that left the `"` in place would fail the
+        // join and cost the interpreter every library path rather than one.
         entries.extend(crate::runtime_path_list_split(&existing));
     }
     match std::env::join_paths(entries) {

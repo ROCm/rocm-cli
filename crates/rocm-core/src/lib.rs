@@ -10450,6 +10450,44 @@ Class Name:                Display
     }
 
     #[test]
+    fn a_recorded_interpreter_outside_the_install_root_wins_over_the_derived_one() -> Result<()> {
+        // The branch the e2e scenario's relaxed assertion rests on: an imported
+        // or read-only runtime can record an interpreter that does not sit under
+        // `install_root`, and preferring the derived path would hand back the
+        // wrong interpreter whenever both exist.
+        let (root, paths) = temp_app_paths("framework-interpreter-recorded");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-recorded");
+        let elsewhere = paths.data_dir.join("outside").join("venv");
+        let recorded = runtime_python_executable_in_env(&elsewhere);
+        fs::create_dir_all(recorded.parent().expect("an interpreter has a parent"))?;
+        fs::write(&recorded, b"#!/bin/sh\nexit 0\n")?;
+        // `write_therock_runtime_with_interpreter` also plants the derived
+        // interpreter under `install_root`, so both candidates are on disk and
+        // the `exists()` gate cannot decide this for us.
+        write_therock_runtime_with_interpreter(
+            &registry,
+            &install_root,
+            "recorded",
+            Some(&recorded),
+        )?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("a managed runtime with an interpreter on disk must resolve");
+        assert_eq!(
+            interpreter.python, recorded,
+            "the recorded interpreter must win over the one derived from install_root"
+        );
+        assert!(
+            !interpreter.python.starts_with(&install_root),
+            "the point of the recorded path is that it need not sit under install_root"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn a_recorded_interpreter_that_is_gone_does_not_resolve() -> Result<()> {
         // Handing back a path that cannot be spawned would turn "no torch" into
         // a spawn failure; the ambient probe is the better answer, so this must
