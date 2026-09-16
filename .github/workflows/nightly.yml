@@ -1114,6 +1114,9 @@ jobs:
           fi
           "@ | wsl -d Ubuntu-24.04 -u root -- bash
           # Best-effort per the step name: see e2e-wsl in e2e-selfhosted.yml.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::copy-out of E2E results exited $LASTEXITCODE (best-effort, not fatal)"
+          }
           exit 0
 
       - name: Upload E2E report
