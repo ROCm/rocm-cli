@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Position = 0)]
     [string] $Channel = $env:ROCM_CLI_CHANNEL,
 
@@ -58,7 +58,14 @@ function Write-Ok {
 
 function Write-CompletionBanner {
     param([string] $NextHint)
-    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    } catch {
+        # No real console attached (WinRM remoting, a scheduled task, etc.) —
+        # see the NoColor comment above. The banner just renders with
+        # whatever encoding is already active.
+        Write-Verbose "Could not set console output encoding to UTF-8: $_"
+    }
     $art = @'
  ██████╗  ██████╗  ██████╗███╗   ███╗     ██████╗██╗     ██╗
  ██╔══██╗██╔═══██╗██╔════╝████╗ ████║    ██╔════╝██║     ██║
