@@ -805,6 +805,25 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
+    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
+    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
+    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to the old
+    /// static `native` labels would leave every other assertion in this file
+    /// green while the doc and the comment both quietly went false again.
+    #[test]
+    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let nightly = read_workflow("nightly.yml");
+        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
+        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
+        assert_eq!(
+            per_pr, nightly_wsl,
+            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
+             the same DevLab Dispatch pool"
+        );
+    }
+
     #[test]
     fn every_nightly_strix_job_uses_the_shared_machine_tui_budget() {
         let nightly = read_workflow("nightly.yml");
