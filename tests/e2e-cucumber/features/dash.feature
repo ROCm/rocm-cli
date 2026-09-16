@@ -78,8 +78,9 @@ Feature: Interactive dashboard
     # logical clock advances with daemon cycles rather than runner wall time, so
     # host scheduling cannot consume the validity window before this assertion.
     # This step only holds for one INSTANCE_TICK (2s) of the real 6s window;
-    # crates/rocm-dash-daemon/tests/telemetry_contract.rs covers the full
-    # clamp(3 × instance_tick, 6 s, 30 s) boundary.
+    # crates/rocm-dash-daemon/tests/telemetry_contract.rs covers the 6 s lower-clamp
+    # boundary of clamp(3 × instance_tick, 6 s, 30 s) (its INSTANCE_TICK is fixed at
+    # 400ms, so 3 × instance_tick always clamps to the floor there).
     Given a managed model exposes scripted serving metrics
     And dashboard observation time is deterministic
     When the user opens the dashboard

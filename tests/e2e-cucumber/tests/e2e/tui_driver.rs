@@ -520,6 +520,13 @@ impl TuiSession {
     /// but with the same practical effect. A dashboard that crashes or quits
     /// mid-wait would otherwise make `marker` vanish for the wrong reason and
     /// be misreported as a successful "gone" result.
+    ///
+    /// Edge case: because liveness is checked before the absence check on
+    /// every iteration, a process that exits in the exact poll tick the
+    /// marker would otherwise be confirmed gone is reported as an exit
+    /// error rather than `Ok(())`. No current caller relies on marker
+    /// disappearance racing process exit; a future one that does should
+    /// account for this ordering.
     pub async fn wait_for_screen_gone(
         &mut self,
         marker: &str,
@@ -546,8 +553,13 @@ impl TuiSession {
                         self.framed_screen()
                     ));
                 }
+                let while_clause = if self.screen_text().contains(marker) {
+                    format!("while {marker:?} was still on screen")
+                } else {
+                    format!("before {marker:?} was confirmed gone")
+                };
                 return Err(format!(
-                    "process exited ({status:?}) while {marker:?} was still on screen.\n{}",
+                    "process exited ({status:?}) {while_clause}.\n{}",
                     self.framed_screen()
                 ));
             }
@@ -573,6 +585,19 @@ impl TuiSession {
     /// satisfy. Use this when the assertion is that a value is *held*
     /// across an interval, not merely that it appears at some point within
     /// it.
+    ///
+    /// Liveness is checked before the persistence check each iteration, as
+    /// in `wait_for_screen_gone`, but here the outcome is `Err` regardless
+    /// of ordering — exiting before the window elapses is never a pass, so
+    /// checking liveness first only changes which error message is
+    /// produced, not the result.
+    ///
+    /// Edge case: because liveness is checked before the persistence check,
+    /// a process that exits in the exact poll tick the persistence window
+    /// would otherwise complete is reported as an exit error rather than
+    /// `Ok(())`. No current caller relies on exit racing window
+    /// completion; a future one that does should account for this
+    /// ordering.
     pub async fn assert_screen_persists(
         &mut self,
         marker: &str,
