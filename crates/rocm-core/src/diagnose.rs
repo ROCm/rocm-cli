@@ -1161,7 +1161,12 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
 /// Best-effort package-manager family for this host: prefer the family
 /// implied by the repo dir the marker files live under, since that's the
 /// config these commands act on, and fall back to the same `ID_LIKE`-aware
-/// resolver `openmpi` uses only when no repo file was found.
+/// resolver `openmpi` uses only when no repo file was found -- restricted to
+/// apt/dnf/zypper, the only families this check has remediation for: a
+/// pacman host (which `openmpi`'s resolver can return, for its own,
+/// unrelated library installers) falls back to `"apt"` like any other
+/// unrecognized family, rather than the remediation commands mismatching a
+/// real "pacman" answer.
 fn repo_pkg_family(e: &Examination) -> &'static str {
     if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/apt/")) {
         return "apt";
@@ -1175,10 +1180,24 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
     if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/zypp/")) {
         return "zypper";
     }
+    // The two `match family` sites below only implement apt/dnf/zypper
+    // remediation (this check has no pacman-based repo-native ROCm install to
+    // recover, unlike `openmpi`'s library installers) -- filter the resolver's
+    // fourth possible answer out here, rather than let it silently fall
+    // through both matches' `_` arms and print an apt command on a pacman
+    // host.
     crate::openmpi::resolve_package_manager(
         &e.distro_id.to_ascii_lowercase(),
         &e.distro_id_like.to_ascii_lowercase(),
     )
+    .filter(|pm| {
+        matches!(
+            pm,
+            crate::openmpi::PackageManager::Apt
+                | crate::openmpi::PackageManager::Dnf
+                | crate::openmpi::PackageManager::Zypper
+        )
+    })
     .map_or("apt", crate::openmpi::PackageManager::as_str)
 }
 
@@ -3677,6 +3696,18 @@ mod tests {
         e.distro_id = "some-rhel-rebuild".to_owned();
         e.distro_id_like = "rhel fedora".to_owned();
         assert_eq!(repo_pkg_family(&e), "dnf");
+    }
+
+    #[test]
+    fn repo_pkg_family_falls_back_to_apt_on_pacman_hosts() {
+        // openmpi's resolver can answer "pacman" (it has its own, unrelated
+        // library installers for Arch et al.), but this check has no pacman
+        // remediation -- it must degrade to the same "apt" default as any
+        // other unhandled family, not surface "pacman" and hit both match
+        // arms' silently-wrong `_` cases downstream in check_12.
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        assert_eq!(repo_pkg_family(&e), "apt");
     }
 
     #[test]
