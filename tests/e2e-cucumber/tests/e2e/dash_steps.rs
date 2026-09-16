@@ -617,8 +617,11 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 
 // ── EAI-7960: scripted metrics / validity-window regression ────────────────
 
-/// Mirrors the daemon's production `instance_tick`
-/// (`crates/rocm-dash-daemon/src/runner.rs`). Sized so the held value's
+/// Copy of the daemon's default `instance_tick`
+/// (`RunnerOptions::instance_tick`, `crates/rocm-dash-daemon/src/runner.rs`).
+/// `instance_tick` is a runtime-configurable field, not a constant, so this is
+/// a hand-kept mirror with no compile-time link back to the daemon — it must
+/// be updated by hand if the default ever changes. Sized so the held value's
 /// persistence window below is wide enough to distinguish "held correctly"
 /// (production clears it after `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s)
 /// from the regression (cleared within about one tick).
@@ -634,6 +637,14 @@ const VALIDITY_WINDOW_SECS: u64 = 3 * INSTANCE_TICK.as_secs();
 /// `validity_window_elapsed` below is provably past the boundary rather than
 /// landing exactly on it.
 const CLOCK_ADVANCE_PAST_VALIDITY_SECS: u64 = VALIDITY_WINDOW_SECS + 1;
+
+/// Substring the TUI renders only when the displayed gen_tps is `Held` rather
+/// than `Fresh` (`format::tps_opt`/`tps_held` and friends append `HELD_MARKER`
+/// after the unit, e.g. `"42.0 tok/s*"` — `crates/rocm-dash-tui/src/ui/format.rs`).
+/// A hand-kept mirror, not a shared constant: this e2e crate is black-box and
+/// does not depend on `rocm-dash-tui`, so it must be updated by hand if the
+/// TUI's held-marker rendering ever changes.
+const HELD_TPS_MARKER: &str = "tok/s*";
 
 /// Start the mock in Growing mode so the daemon builds a positive gen_tps
 /// baseline before the scenario injects the Failure transition.
@@ -704,21 +715,41 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 ///
 /// The scenario's injected logical clock cannot cross the validity boundary
 /// because the host was descheduled; only an explicit scenario advance can.
-/// The daemon's failed-scrape state is confirmed above; this step asserts
-/// that "tok/s" *persists* on screen across an `INSTANCE_TICK` window rather
-/// than merely appearing, since it's already on screen from the pre-failure
-/// baseline and a "poll until true" check would pass even if the regression
-/// cleared it immediately after this step started polling.
+/// The daemon's failed-scrape state is confirmed above; this step first waits
+/// for the TUI to actually render gen_tps as `Held` (`HELD_TPS_MARKER`), then
+/// asserts that held rendering *persists* across an `INSTANCE_TICK` window
+/// rather than merely appearing once.
+///
+/// Two checks, not one, because either alone would under-prove the claim:
+/// a bare `wait_for_screen(HELD_TPS_MARKER, ...)` would pass on the star's
+/// first appearance even if the regression cleared it moments later, and
+/// asserting persistence of plain `"tok/s"` (as this step used to) only
+/// proves *some* throughput number is on screen — a stale pre-failure
+/// `Fresh` frame satisfies that just as well as a genuinely `Held` one. The
+/// first wait bridges the render lag between the confirmed failed scrape and
+/// the TUI's next repaint (bounded by `default_timeout()`, matching every
+/// other "eventually true" wait in this file) without racing the pre-failure
+/// frame: `HELD_TPS_MARKER` cannot appear before the tracker actually enters
+/// `Held`, so there is no stale frame that could satisfy it early.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
-    session(world)
-        .assert_screen_persists("tok/s", INSTANCE_TICK)
+    let session = session(world);
+    session
+        .wait_for_screen(HELD_TPS_MARKER, default_timeout())
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "EAI-7960 REGRESSION: gen throughput (\"tok/s\") was cleared immediately \
-                 after the first failed scrape instead of being held for the validity \
-                 window (clamp(3 × instance_tick, 6 s, 30 s)): {e}"
+                "EAI-7960 REGRESSION: gen throughput was never rendered as held \
+                 (\"{HELD_TPS_MARKER}\") after the first failed scrape: {e}"
+            )
+        });
+    session
+        .assert_screen_persists(HELD_TPS_MARKER, INSTANCE_TICK)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "EAI-7960 REGRESSION: gen throughput (\"{HELD_TPS_MARKER}\") was cleared \
+                 before the validity window (clamp(3 × instance_tick, 6 s, 30 s)) elapsed: {e}"
             )
         });
 }
