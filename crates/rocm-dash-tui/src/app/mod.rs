@@ -134,6 +134,13 @@ pub struct ResolvedArgs {
     /// When `Some`, the bench-run form defaults `--out` to this path so appended
     /// rows appear live in the bench tab. Adapted by the bin (owns `rocm-core`).
     pub bench_results_dir: Option<std::path::PathBuf>,
+    /// Managed-service records that are no longer running, counted from the
+    /// registry by the bin at launch (the same seam `model_recipes` / `runtimes`
+    /// / `automations` use - a snapshot, not a live feed). The services overlay
+    /// only ever renders the live instances the daemon surfaces, so without this
+    /// a host whose servers had all failed showed an empty overlay and no sign
+    /// that any record existed. 0 when there are none.
+    pub services_past_attempts: usize,
 }
 
 impl ResolvedArgs {
@@ -617,6 +624,10 @@ pub struct AppState {
     /// from `replay`, which is playback-control state and is not set by the
     /// screenshot/cast generators.
     pub simulated: bool,
+    /// Managed-service records that are no longer running, from the bin's
+    /// registry read at launch (see `ResolvedArgs::services_past_attempts`).
+    /// Rendered by the services overlay so failed servers are not invisible.
+    pub services_past_attempts: usize,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -766,6 +777,7 @@ impl AppState {
             chat_endpoint_rebuild: None,
             replay: None,
             simulated: false,
+            services_past_attempts: 0,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -1832,6 +1844,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.tool_executor = args.tool_executor.clone();
     // Daemon-tailed bench CSV path for the bench-run form's default --out.
     state.bench_results_dir = args.bench_results_dir.clone();
+    // Managed-service records that are no longer running, counted by the bin.
+    state.services_past_attempts = args.services_past_attempts;
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -5725,6 +5739,7 @@ mod tests {
             chat_system_prompt: None,
             tool_executor: None,
             bench_results_dir: None,
+            services_past_attempts: 0,
         }
     }
 

@@ -452,6 +452,18 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         ),
         PathUsage::measure("ROCm CLI cache folder", paths.cache_dir.clone(), None),
         PathUsage::measure("ROCm CLI data folder", paths.data_dir.clone(), None),
+        // One JSON file per `rocm serve --managed` launch, kept after the server
+        // exits. Tiny individually, never mentioned anywhere, and nothing ever
+        // removed them - so the folder was invisible to a user asking what is on
+        // disk. Reported, never touched by any prune path here.
+        PathUsage::measure(
+            "local server records",
+            paths.services_dir(),
+            Some(
+                "one small file per local server launch, kept after it stops; list them with `rocm services list --all`"
+                    .to_owned(),
+            ),
+        ),
     ];
 
     let mut shared_with_other_tools = vec![PathUsage::measure(
@@ -535,6 +547,9 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
             usage.size_text(),
             usage.path.display()
         );
+        if let Some(note) = usage.note.as_deref() {
+            let _ = writeln!(output, "      note: {note}");
+        }
     }
 
     let _ = writeln!(output);
@@ -1317,6 +1332,30 @@ mod tests {
         assert!(rendered.contains("status: in use"));
         assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
         assert!(rendered.contains("downloaded models"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `rocm serve --managed` leaves one JSON record per launch, kept after the
+    /// server exits, and nothing ever removed them. The report never named the
+    /// folder, so a user asking what is on disk could not see it existed.
+    #[test]
+    fn report_lists_the_local_server_records_folder() -> Result<()> {
+        let (root, paths) = test_paths("report-services");
+        std::fs::create_dir_all(paths.services_dir())?;
+        std::fs::write(paths.services_dir().join("svc.json"), b"{}")?;
+
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+        assert!(rendered.contains("local server records"), "{rendered}");
+        assert!(
+            rendered.contains(paths.services_dir().display().to_string().as_str()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("list them with `rocm services list --all`"),
+            "{rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

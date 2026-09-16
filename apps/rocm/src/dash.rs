@@ -230,7 +230,20 @@ pub fn resolved_args(
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
+        // Records for local servers that are no longer running. The overlay
+        // renders only the live instances the daemon surfaces, so nothing there
+        // would otherwise admit that a failed server was ever recorded.
+        services_past_attempts: services_past_attempts(paths),
     }
+}
+
+/// Managed-service records that are no longer running, read from the same
+/// registry `rocm services` reads. A status-only file read: no readiness
+/// probes, no daemon.
+fn services_past_attempts(paths: &AppPaths) -> usize {
+    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+    let records = load_service_records(&paths.services_dir());
+    discover_managed_services(&records).past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -826,6 +839,45 @@ mod tests {
             data_dir: PathBuf::from("/tmp/rocm-data"),
             cache_dir: PathBuf::from("/tmp/rocm-cache"),
         }
+    }
+
+    /// The services overlay renders only live instances, so the count of
+    /// records that are no longer running has to be adapted by the bin like
+    /// `model_recipes` / `runtimes` / `automations` are.
+    #[test]
+    fn resolved_args_counts_records_that_are_no_longer_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(args.services_past_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
