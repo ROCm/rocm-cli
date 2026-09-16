@@ -103,6 +103,14 @@ pub const fn runtime_python_executable_name() -> &'static str {
     }
 }
 
+/// The loader search-path variable used to expose a runtime's ROCm libraries to
+/// a child process.
+pub const RUNTIME_LIBRARY_PATH_ENV: &str = if cfg!(windows) {
+    "PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
 pub fn runtime_python_env_bin_dir(env_root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(env_root).join(runtime_python_bin_dir_name())
 }

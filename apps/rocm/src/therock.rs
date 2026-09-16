@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gfx_target,
+    AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_managed_therock_family, disk_space, ensure_uv_binary,
     extract_first_gfx_token, known_therock_families, managed_tools_dir,
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
@@ -4045,13 +4045,13 @@ pub(crate) fn probe_runtime_devices(
     let mut env = Vec::new();
     if !library_paths.is_empty() {
         let mut entries = library_paths.to_vec();
-        if let Some(existing) = std::env::var_os(LIBRARY_PATH_ENV) {
+        if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
             entries.extend(split_runtime_path(&existing));
         }
         let joined = std::env::join_paths(entries)
             .context("failed to compose the runtime library path for the device probe")?;
         env.push((
-            LIBRARY_PATH_ENV.to_owned(),
+            RUNTIME_LIBRARY_PATH_ENV.to_owned(),
             joined.to_string_lossy().into_owned(),
         ));
     }
@@ -4073,12 +4073,6 @@ pub(crate) fn probe_runtime_devices(
 fn parse_runtime_device_probe(output: &str) -> Result<RuntimeDeviceProbe> {
     serde_json::from_str(output.trim()).context("failed to parse runtime device probe output")
 }
-
-/// The loader search-path variable used to expose the runtime's ROCm libraries.
-#[cfg(windows)]
-const LIBRARY_PATH_ENV: &str = "PATH";
-#[cfg(not(windows))]
-const LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 
 /// Reports what torch sees, never raising: an unusable runtime must be
 /// described, not turned into a probe crash.

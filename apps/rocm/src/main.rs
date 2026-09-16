@@ -2371,7 +2371,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     if json {
-        let examination = rocm_core::Examination::probe(framework);
+        // Prefer the active runtime's interpreter: in the managed configuration
+        // torch lives only in its site-packages, so probing PATH would report
+        // `unknown` for a host that has one.
+        let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
+        let examination =
+            rocm_core::Examination::probe_with_interpreter(framework, interpreter.as_ref());
         // `gather` rather than `examine_human_report`: the latter first runs
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
@@ -2410,13 +2415,25 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
     // `--distro` is the exception that still errors: the user named a machine to
     // inspect, and silently reporting on a different one would be worse than
     // failing. `--distro` with no value means "the only one installed".
-    let examination = match distro {
-        Some(name) => {
-            let selected = (!name.is_empty()).then_some(name);
-            rocm_core::probe_wsl_distro_from_host(selected.as_deref())
-                .map_err(|reason| anyhow::anyhow!("{reason}"))?
-        }
-        None => rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto),
+    let examination = if let Some(name) = distro {
+        let selected = (!name.is_empty()).then_some(name);
+        rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+    } else {
+        // Same reasoning as `examine --json`: the catalog reasons over the torch
+        // the engines will load, which is the active runtime's.
+        //
+        // Best-effort, unlike `examine`'s copy: this command already promises to
+        // answer on a degraded host, so a path-discovery failure must cost only
+        // the managed-runtime lookup, never the diagnosis.
+        let interpreter = AppPaths::discover().ok().and_then(|paths| {
+            let config = RocmCliConfig::load(&paths).unwrap_or_default();
+            rocm_core::active_managed_framework_interpreter(&paths, &config)
+        });
+        rocm_core::Examination::probe_with_interpreter(
+            rocm_core::FrameworkProbe::Auto,
+            interpreter.as_ref(),
+        )
     };
     let inspected_remotely = examination
         .wsl
