@@ -689,6 +689,7 @@ mod tests {
 trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
+
     #[test]
     fn every_ci_job_declares_a_timeout() {
         let ci = read_workflow("ci.yml");

@@ -32,6 +32,10 @@ on:
       # Opt a dispatch into building the same downloadable Linux + Windows PR
       # bundles a pull_request push produces (see pr-linux-binaries and the PR
       # bundle steps on windows-build-and-test), without needing an open PR.
+      # On the Windows job this also runs the full 45min build/test/lifecycle
+      # suite, not just the packaging steps -- `heavy` is forced true on any
+      # dispatch, so every heavy-gated step in that job runs, same as it would
+      # on a PR push.
       build_binaries:
         description: "Also build downloadable PR-style binaries (Linux + Windows)"
         type: boolean
@@ -489,8 +493,18 @@ jobs:
     needs: [changes, clippy, prek]
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest — unless
     # the dispatch explicitly asked for PR-style binaries, which this job's
-    # build step produces.
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true'
+    # build step produces. `clippy`/`prek` are themselves always skipped on
+    # workflow_dispatch (their own `if:`), and a job whose `needs` were SKIPPED
+    # (not just failed) is skipped by default too — so without `always()` plus
+    # the explicit skipped-or-success checks below, `build_binaries: true`
+    # could never actually run this job. The success requirement is still
+    # enforced on every other trigger, where clippy/prek always run for real.
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -666,10 +680,11 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # Downloadable Linux PR-testing bundle. No existing Linux job builds a
-  # release binary in the release manylinux2014 container (build-and-test
-  # only does a debug, non-containerized build), so this is a standalone job
-  # rather than an extension. Mirrors release.yml's Linux build minus
+  # Downloadable Linux PR-testing bundle. No job in THIS file builds a release
+  # binary in the release manylinux2014 container (build-and-test only does a
+  # debug, non-containerized build; release.yml and nightly.yml both already
+  # do the containerized build, just not for a PR), so this is a standalone
+  # job rather than an extension. Mirrors release.yml's Linux build minus
   # versioning/signing/release-upload — these are unsigned, disposable,
   # per-run artifacts for manual testing, not a publication.
   pr-linux-binaries:
@@ -681,9 +696,19 @@ jobs:
     # at the top of this block.
     timeout-minutes: 30
     needs: [changes, clippy, prek]
+    # `clippy`/`prek` are themselves always skipped on workflow_dispatch (their
+    # own `if:`), and a job whose `needs` were SKIPPED (not just failed) is
+    # skipped by default too — so without `always()` plus the explicit
+    # skipped-or-success checks below, `build_binaries: true` could never
+    # actually run this job. The success requirement is still enforced on
+    # every other trigger, where clippy/prek always run for real.
     if: >-
-      (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true') &&
-      needs.changes.outputs.heavy == 'true'
+      always()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+      && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
