@@ -617,14 +617,16 @@ async fn privacy_notice_shown(world: &mut E2eWorld) {
 
 // ── EAI-7960: scripted metrics / validity-window regression ────────────────
 
-/// Copy of the daemon's default `instance_tick`
-/// (`RunnerOptions::instance_tick`, `crates/rocm-dash-daemon/src/runner.rs`).
+/// Copy of the daemon's default instance tick — tracks
+/// `DashboardDaemonConfig::instance_tick_secs` (default in
+/// `crates/rocm-core/src/lib.rs`), which `apps/rocm/src/dash.rs` wires into
+/// `RunnerOptions::instance_tick` (`crates/rocm-dash-daemon/src/runner.rs`).
 /// `instance_tick` is a runtime-configurable field, not a constant, so this is
 /// a hand-kept mirror with no compile-time link back to the daemon — it must
-/// be updated by hand if the default ever changes. Sized so the held value's
-/// persistence window below is wide enough to distinguish "held correctly"
-/// (production clears it after `clamp(3 × instance_tick, 6 s, 30 s)` = 6 s)
-/// from the regression (cleared within about one tick).
+/// be updated by hand if the config default ever changes. Sized so the held
+/// value's persistence window below is wide enough to distinguish "held
+/// correctly" (production clears it after `clamp(3 × instance_tick, 6 s, 30 s)`
+/// = 6 s) from the regression (cleared within about one tick).
 const INSTANCE_TICK: Duration = Duration::from_secs(2);
 
 /// The daemon's observation-validity window, `clamp(3 × instance_tick, 6 s, 30 s)`
@@ -639,8 +641,9 @@ const VALIDITY_WINDOW_SECS: u64 = 3 * INSTANCE_TICK.as_secs();
 const CLOCK_ADVANCE_PAST_VALIDITY_SECS: u64 = VALIDITY_WINDOW_SECS + 1;
 
 /// Substring the TUI renders only when the displayed gen_tps is `Held` rather
-/// than `Fresh` (`format::tps_opt`/`tps_held` and friends append `HELD_MARKER`
-/// after the unit, e.g. `"42.0 tok/s*"` — `crates/rocm-dash-tui/src/ui/format.rs`).
+/// than `Fresh` (`gen_tps_cell`/`gen_tps_compact`/`gen_tps_aggregate` append
+/// `HELD_MARKER` after the unit, e.g. `"42.0 tok/s*"` —
+/// `crates/rocm-dash-tui/src/ui/format.rs`).
 /// A hand-kept mirror, not a shared constant: this e2e crate is black-box and
 /// does not depend on `rocm-dash-tui`, so it must be updated by hand if the
 /// TUI's held-marker rendering ever changes.
@@ -727,10 +730,15 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 /// proves *some* throughput number is on screen — a stale pre-failure
 /// `Fresh` frame satisfies that just as well as a genuinely `Held` one. The
 /// first wait bridges the render lag between the confirmed failed scrape and
-/// the TUI's next repaint (bounded by `default_timeout()`, matching every
-/// other "eventually true" wait in this file) without racing the pre-failure
-/// frame: `HELD_TPS_MARKER` cannot appear before the tracker actually enters
-/// `Held`, so there is no stale frame that could satisfy it early.
+/// the TUI's next repaint, bounded by `default_timeout()` (matching every
+/// other "eventually true" wait in this file). It is deliberately *not*
+/// sufficient on its own: the held marker also appears about half the time in
+/// healthy operation (snapshot cadence 1 s vs. scrape cadence 2 s), so a
+/// routine pre-failure frame can satisfy it just as well.
+/// `assert_screen_persists` below is what makes the assertion real —
+/// `tok/s*` is only continuously present across a full `INSTANCE_TICK` once
+/// the tracker is in permanent-Held after a failed scrape. Do not drop it,
+/// and do not shorten its window below `INSTANCE_TICK`.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let session = session(world);
@@ -739,8 +747,9 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "EAI-7960 REGRESSION: gen throughput was never rendered as held \
-                 (\"{HELD_TPS_MARKER}\") after the first failed scrape: {e}"
+                "gen throughput was never rendered as held (\"{HELD_TPS_MARKER}\") \
+                 after the first failed scrape — this only shows the TUI never \
+                 repainted in time, not a confirmed EAI-7960 regression: {e}"
             )
         });
     session
