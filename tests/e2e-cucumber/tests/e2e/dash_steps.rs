@@ -741,8 +741,11 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     // elapsed time instead. `as i64` on a float saturates rather than
     // overflowing, so this stays safe even for a pathologically long poll.
     let elapsed_secs = clock_zero.elapsed().as_secs_f64().ceil() as i64;
-    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), (-elapsed_secs).to_string())
-        .expect("failed to roll back dashboard test clock");
+    std::fs::write(
+        root.join(DASH_CLOCK_OFFSET_FILE),
+        (-elapsed_secs).to_string(),
+    )
+    .expect("failed to roll back dashboard test clock");
 }
 /// EAI-7960 principal regression assertion.
 ///
