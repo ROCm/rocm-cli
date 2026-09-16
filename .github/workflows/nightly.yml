@@ -929,7 +929,10 @@ jobs:
         run: |
           # See e2e-wsl in e2e-selfhosted.yml: --shutdown first avoids
           # wsl.exe's "the file cannot be accessed by the system" against a
-          # VM that is still mid-startup.
+          # VM that is still mid-startup. It also tears down every WSL VM on
+          # the host, not just this job's -- safe only because the pool hands
+          # out one fresh, exclusive host per job; see that job's comment for
+          # the scoped fallback if the pool ever starts packing jobs.
           wsl --shutdown
           wsl --unregister Ubuntu-24.04 2>$null | Out-Null
           wsl --install Ubuntu-24.04 --web-download --no-launch
@@ -1049,7 +1052,12 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          # No `-eo pipefail` here, unlike its siblings: this script's own
+          # empty-value guard above (`[ -z "$total" ] || [ -z "$used" ]`)
+          # relies on a non-matching `grep` in the pipeline being tolerated
+          # rather than aborting the script, so `rocm-smi` output this parser
+          # doesn't recognize retries instead of hard-failing the step.
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
@@ -1128,8 +1136,13 @@ jobs:
           # The copy-out step above is deliberately best-effort (it must not
           # report red just because an earlier step already failed the job),
           # so this is the only place left to catch a copy that failed for its
-          # own reason: default `warn` would upload nothing and still look
-          # like a clean, empty run in the consolidated report.
+          # own reason: default `warn` would upload nothing, and the
+          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
+          # omits any platform with no report.json rather than flagging it, so
+          # the lane would silently vanish from the report instead of showing
+          # as a failure. Only the WSL lanes need this: every other lane
+          # writes report.json directly in-job, with no extra guest-to-host
+          # copy step that can fail on its own.
           if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a

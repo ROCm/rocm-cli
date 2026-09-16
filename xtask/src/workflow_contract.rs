@@ -808,15 +808,24 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
     /// byte: both jobs claim to run on the same DevLab Dispatch pool host
     /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
-    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to the old
-    /// static `native` labels would leave every other assertion in this file
-    /// green while the doc and the comment both quietly went false again.
+    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
+    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
+    /// runs-on; `native` never applied to this job, only to the two
+    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
+    /// this file green while the doc and the comment both quietly went false
+    /// again.
     #[test]
     fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
         let sh = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
         let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
         let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
+        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
+        assert!(
+            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
+             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
+        );
         assert_eq!(
             per_pr, nightly_wsl,
             "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
