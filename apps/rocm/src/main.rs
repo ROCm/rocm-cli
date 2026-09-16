@@ -322,7 +322,7 @@ rocm update --json")]
         #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
-    /// List, choose, add, or remove ROCm installs (runtimes).
+    /// List, choose, add, or remove ROCm runtimes.
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
@@ -682,26 +682,26 @@ rocm engines install vllm --reinstall")]
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
-    /// Show ROCm installs known to ROCm CLI.
+    /// Show ROCm runtimes known to ROCm CLI.
     List,
-    /// Use the selected ROCm install by default.
+    /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Switch back to the previously selected ROCm install.
+    /// Switch back to the previously selected ROCm runtime.
     #[command(
         after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
     Rollback,
-    /// Remove a ROCm install from ROCm CLI.
+    /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Add a ROCm install from a saved manifest file.
+    /// Add a ROCm runtime from a saved manifest file.
     Import {
         /// Manifest file path.
         manifest: PathBuf,
@@ -785,7 +785,7 @@ enum ComfyuiCommand {
     },
     /// Install ComfyUI into ROCm CLI's app folder.
     Install {
-        /// ROCm runtime key to use.
+        /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
         /// Reinstall even if ComfyUI already exists.
@@ -938,7 +938,10 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Reset setup so the next TUI launch shows first-time setup again.
+    /// Clear recorded setup completion/dismissal state.
+    ///
+    /// Does not by itself re-trigger onboarding in the TUI; open it manually
+    /// from `rocm dash`'s Observe tab with `n`.
     Reset,
 }
 
@@ -1461,7 +1464,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup will show"
+        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1495,7 +1498,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Setup will show again the next time you run `rocm`.",
+        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -2368,7 +2371,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     if json {
-        let examination = rocm_core::Examination::probe(framework);
+        // Prefer the active runtime's interpreter: in the managed configuration
+        // torch lives only in its site-packages, so probing PATH would report
+        // `unknown` for a host that has one.
+        let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
+        let examination =
+            rocm_core::Examination::probe_with_interpreter(framework, interpreter.as_ref());
         // `gather` rather than `examine_human_report`: the latter first runs
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
@@ -2407,13 +2415,25 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
     // `--distro` is the exception that still errors: the user named a machine to
     // inspect, and silently reporting on a different one would be worse than
     // failing. `--distro` with no value means "the only one installed".
-    let examination = match distro {
-        Some(name) => {
-            let selected = (!name.is_empty()).then_some(name);
-            rocm_core::probe_wsl_distro_from_host(selected.as_deref())
-                .map_err(|reason| anyhow::anyhow!("{reason}"))?
-        }
-        None => rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto),
+    let examination = if let Some(name) = distro {
+        let selected = (!name.is_empty()).then_some(name);
+        rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+    } else {
+        // Same reasoning as `examine --json`: the catalog reasons over the torch
+        // the engines will load, which is the active runtime's.
+        //
+        // Best-effort, unlike `examine`'s copy: this command already promises to
+        // answer on a degraded host, so a path-discovery failure must cost only
+        // the managed-runtime lookup, never the diagnosis.
+        let interpreter = AppPaths::discover().ok().and_then(|paths| {
+            let config = RocmCliConfig::load(&paths).unwrap_or_default();
+            rocm_core::active_managed_framework_interpreter(&paths, &config)
+        });
+        rocm_core::Examination::probe_with_interpreter(
+            rocm_core::FrameworkProbe::Auto,
+            interpreter.as_ref(),
+        )
     };
     let inspected_remotely = examination
         .wsl
@@ -12120,7 +12140,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
             args,
-            pending_title: "Change ROCm install".to_owned(),
+            pending_title: "Change ROCm runtime".to_owned(),
             command_title: "Runtimes".to_owned(),
         }),
         Some("engines") if second.as_deref() == Some("install") => {
@@ -20198,6 +20218,46 @@ mod tests {
     }
 
     #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime".
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+
+        // The help is not the only `runtimes` string a user reads: running a
+        // mutating `rocm runtimes …` from chat raises an approval modal whose
+        // title is written here, not by clap, so the help assertions above
+        // cannot reach it. It said "Change ROCm install" until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
+        );
+    }
+
+    #[test]
     fn out_of_scope_commands_are_marked_preview_in_help() {
         let help = Cli::command().render_long_help().to_string();
         for command in ["chat", "comfyui", "automations"] {
@@ -25364,7 +25424,13 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
-        assert!(rendered.contains("Setup will show again"));
+        // The claim itself (onboarding only opens via an explicit `n` on the
+        // Observe tab, never automatically) is proven by
+        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
+        // test and the `onboarding.rs` module doc — this assertion only
+        // guards the string, not the behavior.
+        assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
         assert!(!rendered.contains("request plan"));
@@ -25435,7 +25501,10 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
-        assert!(rendered.contains("status: first-time setup will show"));
+        // See the pointer comment in
+        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
+        // above: this only guards the string, not the underlying behavior.
+        assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }

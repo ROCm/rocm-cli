@@ -1763,6 +1763,21 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
     fx
 }
 
+/// The dashboard's entire startup gate: an overlay opens only when an
+/// explicit `Focus` was resolved from the command line. `event_loop` calls
+/// this directly (rather than inlining the `match`) so a regression test can
+/// exercise the actual gate instead of `AppState::new`, which takes no focus
+/// argument and can't observe it either way.
+fn apply_startup_focus(
+    state: &mut AppState,
+    focus: Option<Focus>,
+) -> Vec<rocm_dash_core::state::SideEffect> {
+    match focus {
+        Some(focus) => open_overlay_for_focus(state, focus),
+        None => Vec::new(),
+    }
+}
+
 pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1835,10 +1850,8 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
-    if let Some(focus) = args.focus {
-        let fx = open_overlay_for_focus(&mut state, focus);
-        crate::jobs::run_effects(fx, &job_tx);
-    }
+    let fx = apply_startup_focus(&mut state, args.focus);
+    crate::jobs::run_effects(fx, &job_tx);
     state.replay = replay_controller.map(ReplayState::new);
     // Both `--demo` (a generated session replayed) and `--replay <file>` present
     // non-live data, so mark the session simulated for the honesty chrome.
@@ -4432,6 +4445,27 @@ mod tests {
     }
 
     #[test]
+    fn startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus() {
+        // Regression guard: this calls `apply_startup_focus`, the same gate
+        // `event_loop` uses, not just `AppState::new` — which takes no focus
+        // argument and hardcodes `onboarding: None` regardless, so it cannot
+        // exhibit an auto-open regression either way.
+        let mut s = st();
+        assert!(apply_startup_focus(&mut s, None).is_empty());
+        assert!(
+            s.onboarding.is_none(),
+            "no --focus flag must not open onboarding"
+        );
+
+        let mut s = st();
+        assert!(apply_startup_focus(&mut s, Some(Focus::Setup)).is_empty());
+        assert!(
+            s.onboarding.is_some(),
+            "an explicit Focus::Setup must open onboarding"
+        );
+    }
+
+    #[test]
     fn opening_an_overlay_closes_the_others() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         apply_action(&mut s, KeyAction::OpenServices);
@@ -6653,6 +6687,102 @@ mod tests {
         assert!(
             summary.contains("Approved"),
             "concise summary, not raw JSON"
+        );
+    }
+
+    /// The leading sentences of the CLI refusal `rocm comfyui install` prints
+    /// when two managed ROCm runtimes are ready and none is activated. This is a
+    /// verbatim *prefix*, not the whole message: the real one continues with an
+    /// `Available: <key>, <key>.` list and a trailing pointer to
+    /// `rocm runtimes list`, both of which depend on the planted runtimes and
+    /// neither of which this test inspects — it only pins what the seam does
+    /// with the envelope it is handed, so the remedy-bearing prefix is the
+    /// relevant part.
+    const AMBIGUOUS_RUNTIME_REFUSAL: &str = "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default \
+         with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`.";
+
+    /// An executor whose approved replay *replicates* what the real seam returns
+    /// for a `rocm` subprocess that exited non-zero: `run_rocm_capture_for_paths`
+    /// *captures* the failure, so `run_internal_mcp_call` returns `Ok` with an
+    /// `isError: true` envelope and the stderr buried in `structuredContent` —
+    /// it never returns `Err`, so the seam never builds `RocmToolOutcome::Error`.
+    ///
+    /// Replicates, not reaches: those producers live in the bin, which depends
+    /// on this crate, so this crate cannot call them. The envelope below is
+    /// hand-built to their shape and the test pins only what happens
+    /// *downstream* of it. That the producers really do hand the seam an `Ok`
+    /// envelope for a non-zero exit is pinned separately, against a real `rocm`
+    /// subprocess, by `seam_execute_approved_captures_a_failing_command_as_a_result`
+    /// in `apps/rocm/src/dash_seam.rs`.
+    #[derive(Debug)]
+    struct CapturedFailureExecutor;
+    impl crate::tool_exec::RocmToolExecutor for CapturedFailureExecutor {
+        fn execute(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
+                title: "Install ComfyUI".to_string(),
+                body: vec!["rocm comfyui install".to_string()],
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+        }
+        fn execute_approved(
+            &self,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Ran `rocm` command.\n\nstderr:\n{AMBIGUOUS_RUNTIME_REFUSAL}"),
+                }],
+                "structuredContent": {
+                    "argv": ["rocm", "comfyui", "install"],
+                    "exit_status": 1,
+                    "stdout": "",
+                    "stderr": AMBIGUOUS_RUNTIME_REFUSAL,
+                },
+                "isError": true,
+            }))
+        }
+    }
+
+    #[test]
+    fn approved_command_failure_stays_a_collapsed_envelope() {
+        // Pins the second half of the premise the ComfyUI e2e scenario's
+        // CLI-only scope rests on (`tests/e2e-cucumber/features/comfyui.feature`):
+        // *given* the captured `isError: true` envelope, `run_approved` takes
+        // the `Result` arm and `summarize_json_value` collapses every field, so
+        // the refusal text stays out of the chat — reading the `Error` arm
+        // (`Approved · … failed: {e}`) as this path's renderer is wrong. The
+        // first half — that a non-zero `rocm` exit really does arrive as that
+        // envelope rather than as an `Err` — is pinned by the seam test named
+        // on `CapturedFailureExecutor` above.
+        let shared: crate::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(CapturedFailureExecutor);
+        let summary = run_approved(
+            &shared,
+            "rocm_command",
+            &serde_json::json!({ "args": ["comfyui", "install"] }),
+        );
+        assert!(
+            summary.contains("content: [1 items]"),
+            "the command envelope is collapsed, not inlined: {summary}"
+        );
+        assert!(
+            summary.contains("structuredContent: {4 fields}"),
+            "the captured stdout/stderr subtree is collapsed too: {summary}"
+        );
+        assert!(
+            !summary.contains("Multiple ROCm runtimes are ready"),
+            "the CLI refusal must not reach the chat: {summary}"
+        );
+        assert!(
+            !summary.contains("failed:"),
+            "a captured non-zero exit is not the Error arm: {summary}"
         );
     }
 

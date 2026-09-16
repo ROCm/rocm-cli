@@ -10,11 +10,12 @@
 //! shapes mirror `examine.py` field-for-field so the catalog consumes the CLI's
 //! output unchanged.
 
-use crate::{runtime_is_linux, runtime_is_windows};
+use crate::{FrameworkInterpreter, RUNTIME_LIBRARY_PATH_ENV, runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -219,6 +220,16 @@ pub struct Examination {
     pub framework_rocm_version: String,
     pub framework_arch_list: Vec<String>,
     pub framework_notes: Vec<String>,
+    /// Which interpreter answered: `"managed-runtime"`, `"path"`, or `""` when
+    /// no framework was probed.
+    ///
+    /// The versions themselves carry no provenance — `hip=7.2.53211` reads the
+    /// same whether it came from a managed runtime or an ambient pip wheel — and
+    /// the distinction decides whether comparing it against the *system* ROCm
+    /// means anything. A managed runtime ships its own ROCm and never loads the
+    /// system's, so for it the comparison is meaningless. See
+    /// `check_8_wheel_rocm_mismatch` in `diagnose.rs`.
+    pub framework_source: String,
 
     // environment
     pub env: BTreeMap<String, String>,
@@ -303,6 +314,7 @@ impl Default for Examination {
             framework_rocm_version: String::new(),
             framework_arch_list: Vec::new(),
             framework_notes: Vec::new(),
+            framework_source: String::new(),
             env: BTreeMap::new(),
             in_container: false,
             container_kind: String::new(),
@@ -340,6 +352,21 @@ impl Examination {
     /// their defaults (matching `examine.py`'s degrade-gracefully behavior).
     #[must_use]
     pub fn probe(framework: FrameworkProbe) -> Self {
+        Self::probe_with_interpreter(framework, None)
+    }
+
+    /// As [`Self::probe`], but running the framework probe under `interpreter`
+    /// when one is given.
+    ///
+    /// The interpreter is injected rather than resolved here on purpose: which
+    /// runtime is active is registry and config policy, and threading it in
+    /// keeps that out of the host prober — and keeps the probe testable without
+    /// standing up a fake `$HOME` *and* a real torch.
+    #[must_use]
+    pub fn probe_with_interpreter(
+        framework: FrameworkProbe,
+        interpreter: Option<&FrameworkInterpreter>,
+    ) -> Self {
         let mut e = Self::default();
         probe_os(&mut e);
         if e.is_wsl {
@@ -358,7 +385,7 @@ impl Examination {
             probe_rocm_install(&mut e);
             probe_env(&mut e);
             probe_container(&mut e);
-            probe_framework(&mut e, framework);
+            probe_framework(&mut e, framework, interpreter);
             // WSL2 ships the same 64 MB default a container does, so this is one
             // of the platforms where the shortage is most likely to be real.
             probe_shared_memory(&mut e);
@@ -380,7 +407,7 @@ impl Examination {
             probe_container(&mut e);
             probe_shared_memory(&mut e);
             probe_dmesg_amdgpu(&mut e);
-            probe_framework(&mut e, framework);
+            probe_framework(&mut e, framework, interpreter);
         } else if e.os_family == "windows" {
             probe_cpu_windows(&mut e);
             probe_gpus_windows(&mut e);
@@ -389,7 +416,7 @@ impl Examination {
             probe_msvc_redist_windows(&mut e);
             summarise_gpu_categories(&mut e);
             probe_env(&mut e);
-            probe_framework(&mut e, framework);
+            probe_framework(&mut e, framework, interpreter);
         } else {
             e.notes.push(format!(
                 "rocm examine supports Linux and Windows; got {}. This skill cannot help on this platform.",
@@ -426,7 +453,17 @@ impl Examination {
 /// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is `127`
 /// when the program can't be spawned and `124` on timeout.
 pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, String, String) {
-    let (rc, stdout, stderr) = run_raw(program, args, timeout);
+    run_with_env(program, args, &[], timeout)
+}
+
+/// [`run`] with extra environment variables overlaid on the inherited ones.
+pub(crate) fn run_with_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(String, OsString)],
+    timeout: Duration,
+) -> (i32, String, String) {
+    let (rc, stdout, stderr) = run_raw(program, args, envs, timeout);
     (
         rc,
         String::from_utf8_lossy(&stdout).into_owned(),
@@ -435,9 +472,15 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
 }
 
 /// [`run`] without the UTF-8 assumption, for output that is not UTF-8.
-fn run_raw(program: &str, args: &[&str], timeout: Duration) -> (i32, Vec<u8>, Vec<u8>) {
+fn run_raw(
+    program: &str,
+    args: &[&str],
+    envs: &[(String, OsString)],
+    timeout: Duration,
+) -> (i32, Vec<u8>, Vec<u8>) {
     let Ok(mut child) = Command::new(program)
         .args(args)
+        .envs(envs.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -499,7 +542,7 @@ fn run_raw(program: &str, args: &[&str], timeout: Duration) -> (i32, Vec<u8>, Ve
 /// mojibake — no NUL-density or validity test can tell the two apart. The one
 /// reliable fact is which program produced the bytes.
 fn run_utf16le(program: &str, args: &[&str], timeout: Duration) -> (i32, String) {
-    let (rc, stdout, _) = run_raw(program, args, timeout);
+    let (rc, stdout, _) = run_raw(program, args, &[], timeout);
     (rc, decode_utf16le(&stdout))
 }
 
@@ -1471,14 +1514,20 @@ const PYTORCH_PROBE: &str = concat!(
     "sys.stdout.write(json.dumps(out))\n",
 );
 
-fn probe_framework(e: &mut Examination, framework: FrameworkProbe) {
+fn probe_framework(
+    e: &mut Examination,
+    framework: FrameworkProbe,
+    interpreter: Option<&FrameworkInterpreter>,
+) {
     match framework {
         FrameworkProbe::Skip => e.framework = "skipped".to_owned(),
-        FrameworkProbe::PyTorch => probe_pytorch(e),
+        FrameworkProbe::PyTorch => probe_pytorch(e, interpreter),
         FrameworkProbe::LlamaCpp => probe_llama_cpp(e),
         FrameworkProbe::Auto => {
-            if which("python") || which("python3") {
-                probe_pytorch(e);
+            // A managed runtime brings its own interpreter, so the ambient PATH
+            // no longer decides whether torch is worth asking about.
+            if interpreter.is_some() || which("python") || which("python3") {
+                probe_pytorch(e, interpreter);
                 if e.framework == "pytorch" {
                     return;
                 }
@@ -1488,7 +1537,66 @@ fn probe_framework(e: &mut Examination, framework: FrameworkProbe) {
     }
 }
 
-fn probe_pytorch(e: &mut Examination) {
+fn probe_pytorch(e: &mut Examination, interpreter: Option<&FrameworkInterpreter>) {
+    match interpreter {
+        Some(interpreter) => probe_pytorch_in_runtime(e, interpreter),
+        None => probe_pytorch_on_path(e),
+    }
+}
+
+/// Probe the torch the engines will actually load.
+///
+/// Deliberately does not fall back to the `PATH` interpreter when the runtime's
+/// torch fails to import. Falling back would double the timeout budget and
+/// produce an examination whose fields describe one interpreter while its notes
+/// describe another — and a broken active runtime *is* the host's real answer,
+/// because that is the torch `rocm serve` will run.
+fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpreter) {
+    e.framework_source = "managed-runtime".to_owned();
+    e.framework_notes.push(format!(
+        "Probed torch with the active managed runtime's interpreter: {}",
+        interpreter.python.display()
+    ));
+    let env = runtime_library_path_env(e, &interpreter.library_paths);
+    let (rc, out, err) = run_with_env(
+        &interpreter.python.display().to_string(),
+        &["-c", PYTORCH_PROBE],
+        &env,
+        Duration::from_secs(20),
+    );
+    record_pytorch_probe(e, rc, &out, &err);
+}
+
+/// Compose the loader path a runtime's torch needs, runtime entries ahead of
+/// whatever the host already has, so the runtime's own ROCm wins.
+///
+/// A failure to compose it is recorded rather than swallowed: the import that
+/// follows would die on a missing ROCm library and read as a broken runtime,
+/// which is the misdiagnosis this whole path exists to avoid.
+fn runtime_library_path_env(
+    e: &mut Examination,
+    library_paths: &[PathBuf],
+) -> Vec<(String, OsString)> {
+    if library_paths.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = library_paths.to_vec();
+    if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
+        entries.extend(std::env::split_paths(&existing));
+    }
+    match std::env::join_paths(entries) {
+        Ok(joined) => vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)],
+        Err(err) => {
+            e.framework_notes.push(format!(
+                "Could not compose {RUNTIME_LIBRARY_PATH_ENV} for the runtime's interpreter ({err}); \
+                 its torch may fail to load the runtime's ROCm libraries."
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn probe_pytorch_on_path(e: &mut Examination) {
     let py = if which("python") {
         "python"
     } else if which("python3") {
@@ -1498,22 +1606,38 @@ fn probe_pytorch(e: &mut Examination) {
             .push("No python interpreter found to probe torch.".to_owned());
         return;
     };
+    e.framework_source = "path".to_owned();
     let (rc, out, err) = run(py, &["-c", PYTORCH_PROBE], Duration::from_secs(20));
-    let (out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3") {
-        let (_, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
+    let (rc, out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3")
+    {
+        let (rc2, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
         if out2.trim().is_empty() {
-            (out, err)
+            (rc, out, err)
         } else {
-            (out2, err2)
+            (rc2, out2, err2)
         }
     } else {
-        (out, err)
+        (rc, out, err)
     };
+    record_pytorch_probe(e, rc, &out, &err);
+}
+
+fn record_pytorch_probe(e: &mut Examination, rc: i32, out: &str, err: &str) {
     if out.trim().is_empty() {
-        e.framework_notes.push(
-            "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
+        // `run` reports 127 when the program could not be spawned and 124 on
+        // timeout. Those are facts about the interpreter, not about torch, and
+        // the venv advice below is actively wrong for a managed runtime — its
+        // interpreter is the one that was asked.
+        e.framework_notes.push(match rc {
+            127 => "The torch probe interpreter could not be started.".to_owned(),
+            124 => "The torch probe timed out.".to_owned(),
+            _ if e.framework_source == "managed-runtime" => {
+                "The active managed runtime's interpreter returned nothing for the torch probe."
+                    .to_owned()
+            }
+            _ => "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
                 .to_owned(),
-        );
+        });
         if let Some(last) = err.trim().lines().last() {
             let snippet: String = last.chars().take(200).collect();
             e.framework_notes.push(format!("python stderr: {snippet}"));
@@ -1585,6 +1709,10 @@ fn probe_llama_cpp(e: &mut Examination) {
             .push(format!("{binary} --version exited rc={rc}"));
         return;
     }
+    // Set only now that this probe is the one answering. Setting it on finding
+    // the binary would, on the `Auto` fall-through from a failed runtime probe,
+    // relabel the runtime's answer as the ambient one.
+    e.framework_source = "path".to_owned();
     e.framework = "llama-cpp".to_owned();
     e.framework_version = body.trim().lines().next().map_or_else(
         || "unknown".to_owned(),
@@ -2277,6 +2405,14 @@ mod tests {
         // `wsl` is one of the intentional ones: WSL2 has no examine.py analogue,
         // and nesting its facts under a single key keeps the rest of the contract
         // byte-identical instead of scattering ten flat `wsl_*` fields through it.
+        //
+        // `framework_source` is another. examine.py only ever probes the ambient
+        // interpreter, so it has no need to say which one answered; the CLI
+        // prefers the active managed runtime's, and the version strings alone
+        // cannot distinguish the two. Without it, `check_8_wheel_rocm_mismatch`
+        // compares a managed runtime's HIP against the *system* ROCm — versions
+        // that are free to differ on a perfectly healthy host — and tells the
+        // user to reinstall torch.
         let expected: std::collections::BTreeSet<&str> = [
             "os_family",
             "os_version",
@@ -2322,6 +2458,7 @@ mod tests {
             "framework_rocm_version",
             "framework_arch_list",
             "framework_notes",
+            "framework_source",
             "env",
             "in_container",
             "container_kind",
@@ -2384,7 +2521,7 @@ mod tests {
         // anywhere. "skipped" is a distinct answer from "unknown" -- the latter
         // means the probe ran and found nothing.
         let mut e = Examination::default();
-        probe_framework(&mut e, FrameworkProbe::Skip);
+        probe_framework(&mut e, FrameworkProbe::Skip, None);
         assert_eq!(e.framework, "skipped");
     }
 
@@ -2394,11 +2531,105 @@ mod tests {
         // read the framework's ROCm build. Nothing else on the Examination may
         // move, or "skip" would be quietly doing work.
         let mut e = Examination::default();
-        probe_framework(&mut e, FrameworkProbe::Skip);
+        probe_framework(&mut e, FrameworkProbe::Skip, None);
         assert!(e.framework_version.is_empty());
         assert!(e.framework_rocm_version.is_empty());
         assert!(e.framework_arch_list.is_empty());
         assert!(e.framework_notes.is_empty());
+    }
+
+    /// A stand-in for a managed runtime's interpreter.
+    ///
+    /// It answers like a ROCm torch **only** when the runtime's library
+    /// directory reached it on the loader path, which is what the real thing
+    /// does: a TheRock runtime's torch resolves HIP from a sibling
+    /// `_rocm_sdk_core` package, so without those directories the import dies on
+    /// `libroctx64.so.4`. Keying the fake on that means a probe that forgets the
+    /// library paths fails the test instead of quietly reporting a broken
+    /// runtime.
+    #[cfg(unix)]
+    fn plant_fake_runtime_interpreter(label: &str) -> (std::path::PathBuf, FrameworkInterpreter) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-{label}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let libs = root.join("lib");
+        std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
+        let python = root.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 case \"${env}\" in\n\
+                 *{marker}*) printf '%s' '{ok}' ;;\n\
+                 *) printf '%s' '{broken}' ;;\n\
+                 esac\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                marker = libs.display(),
+                ok = r#"{"ok":true,"version":"2.11.0+rocm7.14.1","hip":"7.14.60850","cuda":null,"is_available":true,"device_count":1,"arch_list":["gfx942"]}"#,
+                broken = r#"{"ok":false,"error":"ImportError: libroctx64.so.4: cannot open shared object file"}"#,
+            ),
+        )
+        .expect("plant the fake interpreter");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fake interpreter executable");
+
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![libs],
+        };
+        (root, interpreter)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_framework_probe_reads_the_active_runtimes_torch() {
+        // The bug this pins: torch lives only inside the managed runtime, so a
+        // probe that resolves its interpreter from PATH reports `unknown` for a
+        // host that has a working one.
+        let (root, interpreter) = plant_fake_runtime_interpreter("runtime-torch");
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(e.framework, "pytorch");
+        assert_eq!(e.framework_version, "2.11.0+rocm7.14.1");
+        assert_eq!(e.framework_rocm_version, "hip=7.14.60850");
+        assert_eq!(e.framework_arch_list, vec!["gfx942".to_owned()]);
+        assert_eq!(e.framework_source, "managed-runtime");
+        assert!(
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("active managed runtime's interpreter")),
+            "the shift away from PATH must be self-describing: {:?}",
+            e.framework_notes
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_framework_probe_gives_the_runtimes_torch_its_library_path() {
+        // Dropping the library paths would turn "no torch" into "torch import
+        // failed", which reads as a broken runtime -- a worse answer than the
+        // silence it replaced. Same interpreter, library paths withheld.
+        let (root, mut interpreter) = plant_fake_runtime_interpreter("runtime-no-libs");
+        interpreter.library_paths.clear();
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(e.framework, "unknown");
+        assert_eq!(e.framework_source, "managed-runtime");
+        assert!(
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("libroctx64.so.4")),
+            "expected the loader failure to be reported: {:?}",
+            e.framework_notes
+        );
     }
 
     #[test]

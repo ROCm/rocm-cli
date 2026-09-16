@@ -153,13 +153,35 @@ Feature: GPU detection and system inspection
     Then the inspection explains the default-engine marker
     And the host's default engine is marked in the inspection's engine inventory
 
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # `Given a managed runtime is active` is what lets this scenario fail. Without
+  # it the world's `<data>/runtimes` stays isolated and empty by design (see
+  # `E2eWorld::default`), no interpreter resolves, and any assertion would land
+  # on the `PATH` fallback — holding whether the fix is present or reverted.
+  # That precondition is also why this is `@requires-gpu`: the step installs the
+  # SDK, so only a GPU lane exercises it.
+  #
+  # `framework_source` is what check_8 reads to decide whether comparing this
+  # torch against the *system* ROCm means anything, so it is the field worth
+  # pinning rather than the versions themselves.
+  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    Given a managed runtime is active
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the runtime's interpreter
+
   # The help's own worked examples are the first thing a new user copies, so a
   # model named there has to be one this CLI can actually serve. The check
   # accepts either form the README documents — a name the model listing knows,
   # or an explicit `owner/repo` reference — and so does not prescribe which
   # model the examples should use.
   @id:examine-help-serve-example-names-a-resolvable-model
-  Scenario: examine-15 - Every model the help offers as an example is one the CLI can resolve
+  Scenario: examine-16 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
 
@@ -168,6 +190,6 @@ Feature: GPU detection and system inspection
   # no way to learn what the plain command does or that there is anything else
   # to reach.
   @id:examine-help-describes-the-default-command
-  Scenario: examine-16 - The help tells the two ways of opening a screen apart
+  Scenario: examine-17 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command

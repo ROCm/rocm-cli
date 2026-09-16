@@ -1,4 +1,4 @@
-Feature: ComfyUI dependency install failures name the log to read
+Feature: ComfyUI install reports progress and makes failures actionable
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
   # dependencies. A failed resolve (a version conflict, a yanked release, a
@@ -14,7 +14,7 @@ Feature: ComfyUI dependency install failures name the log to read
   # scripts.
   @id:comfyui-uv-install-failure-names-log @requires-os:linux
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
-    Given a ready ROCm install with a ComfyUI checkout pending dependencies
+    Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv fails
     When the user installs ComfyUI
     Then the CLI fails and names the install log it wrote
@@ -27,7 +27,37 @@ Feature: ComfyUI dependency install failures name the log to read
   # directly, on the success path (the failure path is `comfyui-01` above).
   @id:comfyui-uv-install-progress-streamed @requires-os:linux
   Scenario: comfyui-02 - A dependency install streams progress output
-    Given a ready ROCm install with a ComfyUI checkout pending dependencies
+    Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv prints progress and succeeds
     When the user installs ComfyUI
     Then the CLI succeeds and shows the install progress
+
+  # `rocm comfyui install` picks the ROCm runtime to install into. When more than
+  # one managed runtime is ready and none is activated as the default, the CLI
+  # refuses to guess — the same all-or-nothing policy `serve` uses. That refusal
+  # is surfaced in `rocm comfyui install`'s command output, where `--runtime-id`
+  # and `rocm runtimes activate` apply and the `/runtimes` pointer is for the same
+  # text read from a terminal. This scenario asserts that CLI surface only: the
+  # refusal does not reach the TUI chat. Both halves of that are machine-checked
+  # — that a non-zero `rocm` exit arrives as a captured `isError: true` envelope
+  # rather than as an error, by
+  # `seam_execute_approved_captures_a_failing_command_as_a_result`
+  # (`apps/rocm/src/dash_seam.rs`, which replays a real refusing subprocess), and
+  # that such an envelope is then collapsed out of the chat, by
+  # `approved_command_failure_stays_a_collapsed_envelope`
+  # (`crates/rocm-dash-tui/src/app/mod.rs`). The reasoning is written out at the
+  # seam that decides it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
+  #
+  # No GPU is needed: runtime readiness is filesystem + manifest state, so the
+  # scenario plants two ready wheel runtimes and asserts the refusal names every
+  # remediation and lists both keys. Linux-only because the planted rocm_sdk stub
+  # uses `.so` library names; the selection logic it exercises is platform-agnostic.
+  @id:comfyui-ambiguous-runtime-actionable @requires-os:linux
+  Scenario: comfyui-03 - ComfyUI install refuses an ambiguous runtime choice and names every remediation
+    Given two ready ROCm runtimes and no active default
+    When the user installs ComfyUI without choosing a runtime
+    Then ComfyUI install is refused as ambiguous
+    And the refusal offers the /runtimes picker
+    And the refusal names the --runtime-id flag
+    And the refusal names rocm runtimes activate
+    And the refusal lists both runtime keys
