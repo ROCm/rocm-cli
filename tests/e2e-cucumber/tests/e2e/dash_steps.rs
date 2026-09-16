@@ -748,7 +748,13 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 ///
 /// The scenario's injected logical clock cannot cross the validity boundary
 /// because the host was descheduled; only an explicit scenario advance can.
-/// The daemon's failed-scrape state is confirmed above; this step first waits
+/// This holds because `cycle_timestamp` (`crates/rocm-dash-daemon/src/runner.rs`)
+/// derives the clock from `tick_count`, which only advances once per *executed*
+/// daemon loop iteration; the ticker's `MissedTickBehavior::Skip` collapses any
+/// number of missed ticks from a host stall into a single catch-up tick on
+/// resume rather than a burst. So a long real-time wait here — however slow the
+/// host gets — costs the logical clock at most one tick, never more. The
+/// daemon's failed-scrape state is confirmed above; this step first waits
 /// for the TUI to actually render gen_tps as `Held` (`HELD_TPS_MARKER`), then
 /// asserts that held rendering *persists* across an `INSTANCE_TICK` window
 /// rather than merely appearing once.
