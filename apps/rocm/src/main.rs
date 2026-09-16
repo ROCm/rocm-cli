@@ -887,6 +887,13 @@ enum ServicesCommand {
         /// 0 to include everything that is not running.
         #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
         older_than_hours: u64,
+        /// Remove every record that is not running, however recent.
+        ///
+        /// The same thing as `--older-than-hours 0`, named so it can be reached
+        /// without knowing the age rule exists -- which is how most people will
+        /// arrive here, after the summary tells them recent records were kept.
+        #[arg(long, conflicts_with = "older_than_hours")]
+        any_age: bool,
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
@@ -6769,9 +6776,11 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
         }
         ServicesCommand::Prune {
             older_than_hours,
+            any_age,
             dry_run,
             yes,
         } => {
+            let older_than_hours = if any_age { 0 } else { older_than_hours };
             let outcome = prune_managed_service_records(&paths, older_than_hours, dry_run, yes)?;
             print!("{}", outcome.text);
             if !dry_run && (outcome.removed_records > 0 || outcome.removed_files > 0) {
@@ -7186,6 +7195,11 @@ struct ServicePrunePlan {
     skipped: Vec<String>,
     /// How many records were skipped purely because they are still running.
     skipped_live: usize,
+    /// How many were removable in every respect but too recent. Counted apart
+    /// from `skipped` so the summary can name the flag that includes them: a
+    /// silent "nothing to do" on a host full of fresh failures reads as the
+    /// command being broken.
+    skipped_recent: usize,
 }
 
 /// Age of `path` from its modification time. `None` when the time cannot be read
@@ -7304,6 +7318,7 @@ fn build_service_prune_plan(
             }
         };
         if !prunable_by_age(&artifacts.manifest, min_age, now) {
+            plan.skipped_recent += 1;
             plan.skipped.push(format!(
                 "{} changed less than {} ago",
                 record.service_id,
@@ -7345,6 +7360,14 @@ fn render_service_prune_plan(plan: &ServicePrunePlan, hours: u64, dry_run: bool)
 
     if plan.remove.is_empty() && plan.orphans.is_empty() {
         let _ = writeln!(output, "Nothing would be removed.");
+    }
+    if plan.skipped_recent > 0 {
+        let _ = writeln!(
+            output,
+            "{} record(s) stopped less than {} ago and are kept; add --any-age to include them.",
+            plan.skipped_recent,
+            describe_hours(hours)
+        );
     }
     if !plan.remove.is_empty() {
         let _ = writeln!(
@@ -7407,6 +7430,7 @@ struct ServicePruneOutcome {
     removed_files: usize,
     /// Records left in place purely because they are still running.
     skipped_live: usize,
+    skipped_recent: usize,
 }
 
 /// Bulk-remove the local server records that are no longer running.
@@ -7431,6 +7455,7 @@ fn prune_managed_service_records(
     let mut outcome = ServicePruneOutcome {
         text: render_service_prune_plan(&plan, hours, dry_run),
         skipped_live: plan.skipped_live,
+        skipped_recent: plan.skipped_recent,
         ..ServicePruneOutcome::default()
     };
     if dry_run {
@@ -7459,8 +7484,19 @@ fn prune_managed_service_records(
             .detail("records removed", outcome.removed_records)
             .detail("files removed", outcome.removed_files)
             .detail("still running, left alone", outcome.skipped_live)
+            .detail("too recent, kept", outcome.skipped_recent)
             .render()
     );
+    // A bulk cleanup that silently keeps things is indistinguishable from one
+    // that found nothing, and the records most worth reading are exactly the
+    // ones this keeps.
+    if outcome.skipped_recent > 0 {
+        let _ = writeln!(
+            outcome.text,
+            "  Those are recent enough to still be worth reading: `rocm services logs <id>`.\n  \
+             Run `rocm services prune --any-age --yes` to remove them too."
+        );
+    }
     Ok(outcome)
 }
 
@@ -26179,6 +26215,74 @@ install therock";
                 .text
                 .contains("svc-fresh changed less than 24 hours ago"),
             "prune must say why it was kept:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// A cleanup that keeps things silently is indistinguishable from one that
+    /// found nothing, and what it keeps is exactly what a user debugging a fresh
+    /// failure still wants. The count and the way to override it both have to be
+    /// on screen.
+    #[test]
+    fn services_prune_says_how_many_it_kept_for_being_recent() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-recent-report");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(outcome.skipped_recent, 1);
+        assert!(
+            outcome.text.contains("  too recent, kept: 1"),
+            "the summary must count what it kept:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("rocm services prune --any-age --yes"),
+            "the summary must name the flag that includes them:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// `--any-age` is the reachable form of `--older-than-hours 0`: the summary
+    /// points at it, so it has to actually take the record the default kept.
+    #[test]
+    fn services_prune_any_age_removes_a_just_stopped_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "--any-age must remove the record the default keeps:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "nothing is 'too recent' once the age rule is off:\n{}",
             outcome.text
         );
         Ok(())
