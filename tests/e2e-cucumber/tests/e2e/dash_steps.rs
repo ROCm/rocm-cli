@@ -734,7 +734,13 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         .as_ref()
         .expect("scenario has no isolated root")
         .path();
-    let elapsed_secs = i64::try_from(clock_zero.elapsed().as_secs()).unwrap_or(i64::MAX);
+    // `.ceil()` rather than the truncating `Duration::as_secs`: flooring the
+    // sub-second remainder would roll the clock back slightly less than the
+    // real time spent above, silently eating into the validity window this
+    // rollback exists to protect. Rounding up compensates for the full
+    // elapsed time instead. `as i64` on a float saturates rather than
+    // overflowing, so this stays safe even for a pathologically long poll.
+    let elapsed_secs = clock_zero.elapsed().as_secs_f64().ceil() as i64;
     std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), (-elapsed_secs).to_string())
         .expect("failed to roll back dashboard test clock");
 }
