@@ -89,8 +89,8 @@
 //! boundaries are for, since a window title would then be scored as if the
 //! process had printed it. The residual is therefore disclosed here rather than
 //! papered over: a break inside a string body is the one way two rendered rows
-//! come back as one segment, and — where no drawable text follows the sequence —
-//! the one way a rendered row comes back in none.
+//! come back as one segment, and — where no drawable text follows the sequence
+//! in that same segment — the one way a rendered row comes back in none.
 //!
 //! This section is the single authoritative statement of the exception. The
 //! code that creates it and the test that pins it both point here rather than
