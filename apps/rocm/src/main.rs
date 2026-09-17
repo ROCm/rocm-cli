@@ -26771,7 +26771,7 @@ install therock";
         Ok(())
     }
 
-    /// The window the pre-delete liveness re-check exists to close: the plan is
+    /// The window the pre-delete liveness re-check exists to narrow: the plan is
     /// built from a snapshot, and a `rocm services restart <id> --yes` landing
     /// between that snapshot and the delete would otherwise have its log and its
     /// 0600 endpoint key deleted out from under a serving process.
