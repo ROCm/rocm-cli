@@ -727,6 +727,33 @@ async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
         "default SDK install recorded the compiler toolchain as present: {manifest}"
     );
 
+    // The specs are the authoritative record — they are what `uv` was handed,
+    // and `InstalledRuntimeManifest::includes_devel` reads the answer back out
+    // of them. Asserting the `devel` field alone would miss the install args
+    // and the manifest disagreeing, which is the drift this guards.
+    let specs = manifest
+        .get("wheel_composition")
+        .and_then(|composition| composition.get("package_specs"))
+        .and_then(serde_json::Value::as_array)
+        .expect("wheel runtime manifest has no recorded package_specs");
+    let rocm_spec = specs
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find(|spec| spec.starts_with("rocm["))
+        .expect("no rocm requirement in the recorded package_specs");
+    let extras = rocm_spec
+        .strip_prefix("rocm[")
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(extras, _)| extras)
+        .expect("malformed rocm requirement in the recorded package_specs");
+    assert!(
+        !extras
+            .split(',')
+            .map(str::trim)
+            .any(|extra| extra == "devel"),
+        "default SDK install requested the toolchain: {rocm_spec}"
+    );
+
     let python = manifest
         .get("python_executable")
         .and_then(serde_json::Value::as_str)
