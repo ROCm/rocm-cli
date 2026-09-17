@@ -130,6 +130,7 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
 /// guess, which is the whole of what is claimed here: an honest indicator, not a
 /// guarantee that everything is visible.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
+    grey_overlay(f);
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
         // Ctrl-C is a first-class quit gesture in both key loops (it restores the
@@ -886,7 +887,8 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod ported_chrome_tests {
-    use super::{draw_logo, grey_overlay, opt_row};
+    use super::{draw_help, draw_logo, grey_overlay, opt_row};
+    use crate::app::ActiveTab;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -952,6 +954,27 @@ mod ported_chrome_tests {
         assert!(
             buf.content().iter().all(|c| c.style().bg == Some(wash)),
             "overlay did not wash every cell"
+        );
+    }
+
+    #[test]
+    fn draw_help_dims_the_backdrop() {
+        // `draw_help` sizes its popup to its content, so on a large area there
+        // is backdrop left uncovered around it — the corner is always part of
+        // that backdrop, not the popup. Before `draw_help` called
+        // `grey_overlay`, that corner kept whatever the tab underneath had
+        // painted there instead of the dimmed wash every other modal uses.
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(120, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_help(f, f.area(), ActiveTab::Observe, &theme))
+            .unwrap();
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "help modal must dim its backdrop like every other modal"
         );
     }
 

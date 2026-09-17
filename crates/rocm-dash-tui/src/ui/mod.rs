@@ -807,12 +807,15 @@ mod tests {
         let row: String = (0..90)
             .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
             .collect();
+        // The `q` chip always says "close" while any overlay is open, root or
+        // not, so an unscoped substring check here would pass even if the Esc
+        // chip's own label were wrong — check the Esc chip specifically.
         assert!(
-            row.contains("close"),
+            row.contains("Esc  close"),
             "job console Esc chip should say close: {row:?}"
         );
         assert!(
-            !row.contains("cancel"),
+            !row.contains("Esc  cancel"),
             "job console Esc chip should not say cancel: {row:?}"
         );
     }

@@ -664,7 +664,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
 
     render_summary(f, chunks[0], inst, snap_ts, theme);
     let max_scroll = render_body(f, chunks[1], inst, theme, state.instance_detail_scroll);
-    render_footer(f, chunks[2], inst, theme);
+    render_footer(f, chunks[2], inst, theme, max_scroll > 0);
     max_scroll
 }
 
@@ -835,12 +835,21 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
     args_max.max(env_max)
 }
 
-fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme) {
+fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scrollable: bool) {
     let log = inst.log_file.as_deref().unwrap_or("-");
-    let p = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled("log: ", Style::default().fg(theme.muted)),
         Span::styled(log.to_string(), Style::default().fg(theme.muted)),
-    ]));
+    ];
+    if scrollable {
+        // Only shown once `render_body` reports overflow — the launch_args/
+        // env_vars panes otherwise give no hint that ↑/↓ do anything here.
+        spans.push(Span::styled(
+            "  ·  ↑/↓ scroll",
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
 

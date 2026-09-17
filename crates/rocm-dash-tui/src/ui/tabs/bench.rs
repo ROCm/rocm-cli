@@ -410,7 +410,9 @@ pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyActio
 
     let target = row_hit(rows_inner, start, end, x, y)?;
     if target == state.bench_sel {
-        Some(KeyAction::OpenDetail)
+        // No bench detail view exists any more (folded into Observe by the P3
+        // IA redesign) — clicking the already-selected row has nothing to open.
+        None
     } else {
         let delta = target.cast_signed() - state.bench_sel.cast_signed();
         Some(KeyAction::Move(delta))

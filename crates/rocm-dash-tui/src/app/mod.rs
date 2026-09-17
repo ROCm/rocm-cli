@@ -5354,6 +5354,19 @@ mod tests {
     }
 
     #[test]
+    fn scroll_instance_detail_clamps_to_measured_max() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instance_detail_max_scroll = 9;
+        // i16::MAX is the jump-to-end gesture; it must land on the measured
+        // max, not overflow past it.
+        s.scroll_instance_detail(i16::MAX);
+        assert_eq!(s.instance_detail_scroll, 9, "jump-to-end clamps to max");
+        // i16::MIN is jump-to-start; it must land on 0, not underflow.
+        s.scroll_instance_detail(i16::MIN);
+        assert_eq!(s.instance_detail_scroll, 0, "jump-to-start clamps to 0");
+    }
+
+    #[test]
     fn wheel_over_form_screen_overlay_is_swallowed() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
