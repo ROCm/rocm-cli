@@ -145,14 +145,24 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user reinstalls vllm
     Then the install reports the vLLM ROCm 10.x discovery pins
 
-  # The opt-in half of therock-next-02. Both polarities run here, on the mock
-  # lane, because this is the only place the flag's effect on the real install
-  # plan is observable without a GPU and a multi-GiB download.
+  # The opt-in half of therock-next-02, which covers the default.
+  #
+  # `@nightly` for the reason runtime-06 documents: one more index-resolving
+  # scenario on the no-GPU mock lane is enough to push
+  # `dash-gen-tps-held-after-scrape-failure` and `dash-gen-tps-expiry-boundary`
+  # past the validity window they assert on. Measured here too — both failed
+  # 2/2 mock-lane runs with this scenario ungated, and the lane is green with
+  # it on the nightly one.
+  #
+  # The per-PR guard that matters is unaffected: therock-next-02 still pins the
+  # DEFAULT on the mock lane, which is the direction a regression would take,
+  # and `wheel_composition_requests_the_toolchain_only_when_asked` pins both
+  # polarities as a unit test on every PR.
   #
   # The `@id:` still reads `-09-`: this scenario was written as therock-next-09
   # and the display index moved when main landed one ahead of it. The id is the
   # stable identifier and is deliberately not renumbered with the index.
-  @id:therock-next-09-wheel-devel-adds-the-toolchain
+  @id:therock-next-09-wheel-devel-adds-the-toolchain @nightly
   Scenario: therock-next-10 - A pinned ROCm 10 wheel install adds the toolchain when asked
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
