@@ -1442,7 +1442,7 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
         verify: "rocm examine --json | grep -q '\"rocm_install_method\": \"repo-native\"' && rocminfo | head -n 5".to_owned(),
-        notes: vec!["If the package-manager update/refresh warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
+        notes: vec!["If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
     };
     finalize(
