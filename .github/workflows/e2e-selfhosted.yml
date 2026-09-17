@@ -863,13 +863,14 @@ jobs:
           $script | wsl -d Ubuntu-24.04 -u root -- bash
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The concrete ask behind the pool maintainer's ~5min/job estimate:
       # librocdxg is not part of a bare Ubuntu-24.04 image, so it needs
-      # installing every job. Advisory, like the GPU preflight below — a
-      # distro without working passthrough still runs the non-GPU suite, the
-      # capability probe's `driver_status` check resolves @requires-gpu
-      # scenarios to skip rather than failing them on a premise the host
-      # can't meet.
+      # installing every job (the per-job distro install is the ~5min/job cost
+      # the pool maintainer flagged — see the job header above; this step is
+      # not that estimate, just one of the things a freshly installed distro
+      # needs). Advisory, like the GPU preflight below — a distro without
+      # working passthrough still runs the non-GPU suite, the capability
+      # probe's `driver_status` check resolves @requires-gpu scenarios to skip
+      # rather than failing them on a premise the host can't meet.
       - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
         shell: powershell
         run: |
