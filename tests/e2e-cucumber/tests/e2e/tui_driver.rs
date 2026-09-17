@@ -485,11 +485,12 @@ impl TuiSession {
     /// condition being waited on and is quoted in every diagnostic.
     ///
     /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
-    /// and deliberately so. The order is only observable on the poll where the
-    /// child has already exited, and there the liveness check returns before the
-    /// predicate is ever consulted — so the only outcome the ordering can change
-    /// is a would-be success into a named "process exited" error, never the
-    /// reverse. That direction is the safe one whatever shape the predicate has,
+    /// and deliberately so. The order is only observable on a poll where one of
+    /// them fires — the child has exited, or the reader thread has panicked —
+    /// and there that check returns before the predicate is ever consulted, so
+    /// the only outcome the ordering can change is a would-be success into a
+    /// named "process exited" or reader-panic error, never the reverse. That
+    /// direction is the safe one whatever shape the predicate has,
     /// and it is the necessary one for the conditions this form mostly
     /// expresses — an absence, or a cleared cell, is satisfied by accident by
     /// the near-empty frame a dead process leaves behind, so a predicate checked
@@ -499,7 +500,8 @@ impl TuiSession {
     /// (a cell that must still be rendered, only with a different value): if
     /// such a condition first holds in the frame the child left behind, this
     /// reports the exit instead. The positive form can afford the opposite
-    /// order — and drains the final frame after `try_wait` — because a marker
+    /// order — and drains the final frame after `try_wait`, via
+    /// [`drain_final_frame`](Self::drain_final_frame) — because a marker
     /// that appeared as the child exited did genuinely appear. Here that
     /// recovery is given up on purpose: a diagnosed exit is worth more than a
     /// condition that only ever held in a dying process's last frame.
