@@ -128,7 +128,10 @@ a Windows lane as Linux; `xtask`'s
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request`, and `merge_group` when the workflow's own `changes` job's
-`serve` path filter is `true`. `serve` is narrower than `heavy`: it matches only
+`serve` path filter is `true`. `push` fires on `main` and on any `release/**`
+branch, so pushing to a release branch runs the full matrix ahead of cutting
+the `v*` tag that `release.yml` builds/publishes from; `pull_request` fires
+against any base branch. `serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
@@ -140,7 +143,10 @@ pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
 non-fatally). `ci.yml`'s required `build-and-test` and mock `e2e` remain the
-authoritative pre-merge build gate.
+authoritative pre-merge build gate; `ci.yml`'s `push` trigger carries the same
+`main`/`release/**` branch list as `e2e-selfhosted.yml`'s, so that gate also
+runs on a release-branch push, alongside the self-hosted GPU matrix (neither
+workflow gates the other).
 
 They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:

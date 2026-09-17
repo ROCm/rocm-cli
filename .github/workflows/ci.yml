@@ -2,11 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `release/**` (EAI-8761): so the hosted build-and-test/clippy/mock-e2e gate
+    # — the authoritative pre-merge build gate per docs/ci-hardware-testing.md —
+    # also runs on a release-branch push, alongside e2e-selfhosted.yml's
+    # self-hosted GPU matrix (same branches: list there; neither workflow gates
+    # the other — each GPU job still builds its own binary).
+    branches: [main, "release/**"]
   # Run on PRs against ANY base branch, not just main, so a stacked PR (based on
   # another in-flight feature branch) still gets CI instead of no checks until it
   # is retargeted to main. Affected-crate selection already diffs against
-  # `github.base_ref`, so a non-main base works. push/merge_group stay main-only.
+  # `github.base_ref`, so a non-main base works. merge_group stays main-only.
   pull_request:
   # The merge queue creates a temporary branch and fires `merge_group`; without
   # this trigger the required checks never start and queued PRs stall forever.
@@ -223,8 +228,11 @@ jobs:
     # keys are derived from the compiler, source and flags, so anyone holding the
     # credential can compute the key a trusted build will look up and store an
     # arbitrary artifact under it. Limiting writes to push and merge_group leaves
-    # only main and the merge queue able to populate, while pull requests keep the
-    # full read-side speedup — which is where the measured gain comes from anyway.
+    # only main, the merge queue, and a push to a release/** branch able to
+    # populate — the latter is a deliberate widening: release branches are an
+    # ordinary push-protected branch, not a fork PR, so they sit at the same
+    # trust tier as main. Pull requests keep the full read-side speedup — which
+    # is where the measured gain comes from anyway.
     # READ_ONLY also short-circuits the write half of sccache's startup store
     # check, so the probe below behaves identically on pull requests.
     #
