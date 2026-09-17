@@ -42,9 +42,9 @@ pub enum JobStatus {
 
 impl JobStatus {
     /// Single glyph (with trailing space) used everywhere a job's status is
-    /// shown as an icon: the job console banner, the Home tab activity feed,
-    /// and the LOGS dock. Centralized so those three renderers can't drift
-    /// apart on which glyph means what.
+    /// shown as an icon: the job console banner and the Home tab activity
+    /// feed. Centralized so those renderers can't drift apart on which glyph
+    /// means what.
     pub const fn glyph(&self) -> &'static str {
         match self {
             Self::Running => "⋯ ",
