@@ -126,8 +126,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     match state.modal {
         Modal::None => {}
         Modal::Help => {
-            state.help_max_scroll =
-                modal::draw_help(f, body, state.active_tab, &theme, state.help_scroll);
+            modal::draw_help(f, body, state.active_tab, &theme);
         }
         // Observe folds the telemetry tabs; its detail modal is the instance
         // detail (the selectable list on that surface).
@@ -144,7 +143,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
         Modal::GlobalHelp => {
-            state.help_max_scroll = modal::draw_global_help(f, body, &theme, state.help_scroll);
+            modal::draw_global_help(f, body, &theme);
         }
     }
 

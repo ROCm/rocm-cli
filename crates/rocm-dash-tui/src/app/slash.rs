@@ -47,7 +47,6 @@ impl AppState {
             "home" => self.active_tab = ActiveTab::Home,
             "gpu" => self.active_tab = ActiveTab::Observe,
             "help" | "?" => {
-                self.reset_help_scroll();
                 self.modal = Modal::Help;
             }
             "clear" => self.chat.clear(),
@@ -252,8 +251,11 @@ impl AppState {
             }
             "setup" => {
                 // Bare `/setup` (or `/setup status`) reports first-time setup
-                // (read-only); `/setup reset` re-arms it (approval-gated). The CLI
-                // only has status + reset — anything else is guided, not run.
+                // (read-only); `/setup reset` clears the completion/dismissal
+                // state (approval-gated) but does not reopen onboarding by
+                // itself — that still needs the explicit `n` key on Observe.
+                // The CLI only has status + reset — anything else is guided,
+                // not run.
                 let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
                 match sub.as_deref() {
                     None | Some("status") => {

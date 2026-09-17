@@ -989,8 +989,6 @@ mod tests {
             theme_name: "default-dark".into(),
             theme: Theme::default_dark(),
             theme_picker_sel: 0,
-            help_scroll: 0,
-            help_max_scroll: 0,
             instance_detail_scroll: 0,
             instance_detail_max_scroll: 0,
             console_scroll: 0,
