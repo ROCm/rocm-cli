@@ -17,7 +17,18 @@ use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+/// File the daemon's test-only logical clock reads every cycle (see
+/// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
 const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
+
+/// The Observe instances table's TTFT cell while the scripted mock is serving:
+/// its histogram pins time-to-first-token at exactly 50 ms
+/// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
+/// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
+/// (`runner.rs`), so this string disappearing is the screen's own proof that
+/// the frame on display was assembled after the failure — the only frame the
+/// held-throughput assertion is about.
+const SCRIPTED_TTFT_CELL: &str = "50ms";
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -825,17 +836,55 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
 
 #[given("dashboard observation time is deterministic")]
 async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    let path = root.join(DASH_CLOCK_OFFSET_FILE);
-    std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
+    let path = dash_clock_path(world);
+    write_dash_clock(&path, "0");
     world.command_env.push((
         "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
         path.into_os_string(),
     ));
+}
+
+/// Path of this scenario's test-clock file, inside its isolated root.
+fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join(DASH_CLOCK_OFFSET_FILE)
+}
+
+/// Publish a clock directive atomically (write a sibling temp file, then
+/// rename). The daemon re-reads this file every cycle, so a plain truncating
+/// write can be observed mid-update as an empty file; rename makes each
+/// directive visible all-at-once instead.
+fn write_dash_clock(path: &std::path::Path, directive: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, directive).expect("failed to stage the dashboard test clock");
+    std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
+}
+
+/// Poll the live screen until `marker` is gone. On timeout, return the last
+/// screen so the caller can frame it with what its own step was waiting for.
+///
+/// The mirror of `TuiSession::wait_for_screen`, for the case where the evidence
+/// a frame is current is something the frame stopped showing.
+async fn wait_until_screen_lacks(
+    world: &mut E2eWorld,
+    marker: &str,
+    budget: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let screen = session(world).screen_text();
+        if !screen.contains(marker) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(screen);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -851,10 +900,36 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
         });
 }
 
-/// Switch the scripted mock to Failure mode, then poll the mock's own failure
-/// counter until the daemon delivers at least one 503 — confirming the failure
-/// scrape actually landed before the assertion checks the TUI. This avoids a
-/// fixed wall-time sleep while remaining deterministic.
+/// Stop the daemon's logical observation clock where it stands.
+///
+/// Free-running, that clock advances one `gpu_tick` per daemon cycle and the
+/// cycles are paced by a wall-clock interval — so it tracks wall time, and a
+/// scenario descheduled between the failure below and its assertion spends
+/// validity budget it never meant to. That is not hypothetical: on the
+/// 64-concurrent-scenario mock lane this step's successor was reached four
+/// failed scrapes (8 logical seconds) late, past the 6 s window, and the
+/// scenario reported a regression the daemon had not committed.
+///
+/// Held, the clock cannot be moved by anything except this scenario rewriting
+/// the file, so the assertions below hold at any later moment, and only the
+/// explicit advance in `validity_window_elapsed` crosses the boundary.
+///
+/// Held *before* the failure, deliberately: the daemon adopts the directive
+/// within one cycle of the write, independently of how the harness is
+/// scheduled, so the last successful observation is at most
+/// `instance_tick + gpu_tick` (3 s) older than the frozen instant — inside the
+/// 6 s window with margin, and it stays there.
+#[when("dashboard observation time is held")]
+async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
+    write_dash_clock(&dash_clock_path(world), "hold");
+}
+
+/// Switch the scripted mock to Failure mode and wait for the failure to reach
+/// the screen: first the mock's own counter proves the daemon was served a 503,
+/// then the cleared TTFT cell proves the frame on display is one the daemon
+/// assembled after that scrape. Both waits are synchronizations on observed
+/// events, not fixed sleeps, and — the clock being held — neither can consume
+/// the validity window they precede.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     let mock = world.mock.as_ref().expect("no mock server running");
@@ -876,14 +951,24 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Allow one TUI render cycle (50 ms >> 20 ms poll) so the failure
-    // snapshot is painted before the assertion reads the screen.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until_screen_lacks(world, SCRIPTED_TTFT_CELL, default_timeout())
+        .await
+        .unwrap_or_else(|screen| {
+            panic!(
+                "the failed scrape never reached the screen: the scripted TTFT cell \
+                 ({SCRIPTED_TTFT_CELL:?}) is still displayed, so no frame here is \
+                 known to postdate the failure.\n\n\
+                 Last screen:\n{screen}"
+            )
+        });
 }
+
 /// EAI-7960 principal regression assertion.
 ///
-/// The scenario's injected logical clock cannot cross the validity boundary
-/// because the host was descheduled; only an explicit scenario advance can.
+/// The frame under assertion is provably post-failure (the TTFT cell it used to
+/// show is gone) and the logical clock is held, so the only way "tok/s" can be
+/// missing here is the regression itself: the daemon clearing a held rate on a
+/// failed scrape instead of keeping it for the validity window.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
@@ -898,43 +983,32 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
 
-/// Advance the test-only logical clock beyond the six-second validity window,
-/// then synchronize on the next failed scrape that publishes the expired value.
+/// Step the held clock 7 s past where it was held — one second beyond the 6 s
+/// window, from an observation at most 3 s older than the hold point, so the
+/// held value is unambiguously expired and stays expired. Nothing else moves
+/// this clock, so the assertion below is about the daemon's arithmetic alone.
 #[when("the validity window has elapsed")]
 async fn validity_window_elapsed(world: &mut E2eWorld) {
-    let mock = world.mock.as_ref().expect("no mock server running");
-    let prior_failures = mock.metrics_failure_count();
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
-        .expect("failed to advance dashboard test clock");
-
-    let budget = default_timeout();
-    let deadline = Instant::now() + budget;
-    while mock.metrics_failure_count() == prior_failures {
-        assert!(
-            Instant::now() < deadline,
-            "no metrics scrape observed after advancing the dashboard clock"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_dash_clock(&dash_clock_path(world), "hold 7");
 }
 
-/// Assert that gen_tps is no longer rendered after the scenario advances the
-/// injected clock beyond the validity boundary and observes the next scrape.
+/// Assert that gen_tps is no longer rendered after the scenario steps the held
+/// clock past the validity boundary.
+///
+/// The expired state is published every cycle and, the clock being held, it is
+/// permanent — so waiting for it to reach the screen cannot mask a daemon that
+/// kept the value: that daemon simply never clears it and this times out.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
-    assert!(
-        !screen.contains("tok/s"),
-        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
-         validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
-         Expected the daemon to have cleared the held value and the TUI to \
-         show the unavailable placeholder.\n\n\
-         Last screen:\n{screen}"
-    );
+    wait_until_screen_lacks(world, "tok/s", default_timeout())
+        .await
+        .unwrap_or_else(|screen| {
+            panic!(
+                "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
+                 validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
+                 Expected the daemon to have cleared the held value and the TUI to \
+                 show the unavailable placeholder.\n\n\
+                 Last screen:\n{screen}"
+            )
+        });
 }
