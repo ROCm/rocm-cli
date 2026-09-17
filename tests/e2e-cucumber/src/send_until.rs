@@ -95,20 +95,36 @@ mod diagnostic_wording {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// A format placeholder as it appears in source: `arg("describe")` is
+    /// `{describe}`. Built rather than written so no literal in this file
+    /// contains an uninterpolated `{…}`.
+    fn arg(name: &str) -> String {
+        format!("{{{name}}}")
+    }
+
     /// The four templates `wait_for_screen_where`'s doc enumerates, which its
     /// contract requires a caller's `describe` clause to read correctly after.
     #[test]
     fn the_clause_templates_are_the_ones_the_contract_names() {
         let source = driver_source();
+        // Each brace-delimited placeholder is spelled through `arg()` rather
+        // than written into the literal: these are fragments of OTHER format
+        // strings, and a literal containing `{describe}` reads to clippy as a
+        // formatting argument nobody interpolated
+        // (`literal_string_with_formatting_args`).
         for template in [
-            "panicked while waiting until {describe}",
-            "timed out after {timeout:?} waiting until {describe}",
-            "before {describe}.",
-            "draining the final frame{context}",
-            ", waiting until {wanted}",
+            format!("panicked while waiting until {}", arg("describe")),
+            format!(
+                "timed out after {} waiting until {}",
+                arg("timeout:?"),
+                arg("describe")
+            ),
+            format!("before {}.", arg("describe")),
+            format!("draining the final frame{}", arg("context")),
+            format!(", waiting until {}", arg("wanted")),
         ] {
             assert!(
-                source.contains(template),
+                source.contains(&template),
                 "tui_driver.rs no longer contains {template:?}, so the clause contract \
                  documented on `wait_for_screen_where` describes a template that is gone \
                  — update that doc comment with this change"
@@ -121,12 +137,13 @@ mod diagnostic_wording {
     #[test]
     fn the_bare_marker_templates_still_quote_the_marker_themselves() {
         let source = driver_source();
+        // Spelled through `arg()`, for the reason given in the sibling test.
         for template in [
-            "panicked while waiting for {marker:?}",
-            "before {marker:?} appeared.",
+            format!("panicked while waiting for {}", arg("marker:?")),
+            format!("before {} appeared.", arg("marker:?")),
         ] {
             assert!(
-                source.contains(template),
+                source.contains(&template),
                 "tui_driver.rs no longer contains {template:?}, so the noun convention \
                  documented on `terminal_state_after_wait` describes a template that is \
                  gone — update that doc comment with this change"
@@ -141,7 +158,7 @@ mod diagnostic_wording {
     fn the_clause_label_is_never_debug_formatted() {
         let source = driver_source();
         assert!(
-            !source.contains("{describe:?}"),
+            !source.contains(&arg("describe:?")),
             "a diagnostic Debug-formats `describe`, but `wait_for_screen_where` \
              documents it as interpolated verbatim — callers that quote their own \
              text would now be double-quoted"
