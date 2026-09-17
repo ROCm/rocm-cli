@@ -547,23 +547,56 @@ async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
     );
 }
 
+/// The `version=` field on the active runtime's line in `rocm runtimes list`
+/// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
+///
+/// Read independently of Lemonade's own reporting, on purpose: this is the
+/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
+/// rewritten to match it, so it must not come from anything alignment itself
+/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// branch -- that surface is a different, later change).
+fn active_runtime_version(world: &E2eWorld) -> String {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .and_then(|line| line.split_once("version="))
+        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default())
+        .unwrap_or_else(|| panic!("no active runtime line with a version= field:\n{stdout}"))
+        .to_owned()
+}
+
 /// The packaged pin was not rewritten.
 ///
 /// Reads `resources/backend_versions.json` inside the runtime tree the install
-/// itself reports (`env_path:`), rather than inferring the outcome from an
-/// absent log line: the alignment's revert path can fail to restore the pin
-/// (best-effort, matching its sibling warnings) while still printing no
-/// "Aligned ..." line, and a step that only checks for that line's absence
-/// cannot tell that state apart from an honestly untouched pin. `--reinstall`
-/// (the When's own mechanism) always re-extracts the packaged embeddable
-/// first, so the file's `therock.version` at this point is either the
-/// packaged default (opt-out held) or the active SDK version (opt-out was
-/// bypassed) -- there is no third value alignment can produce here. The
-/// active SDK version is read independently via `rocm version` so this does
-/// not need to know Lemonade's packaged pin ahead of time.
+/// itself reports (`env_path:`) and compares it against the active runtime's
+/// own version (from `rocm runtimes list`, not from anything Lemonade's
+/// alignment reports), rather than inferring the outcome from an absent log
+/// line alone. Both checks matter: the revert path can fail to restore the
+/// pin (best-effort, matching its sibling warnings) while still printing no
+/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// failed-restore from an honestly untouched pin -- hence also checking for
+/// the revert path's own "could not align ... reverting" warning, which does
+/// fire whenever a restore was attempted. `--reinstall` (the When's own
+/// mechanism) always re-extracts the packaged embeddable first, and the
+/// disabled gate returns before any write to `backend_versions.json` at all
+/// (see `align_llamacpp_backend_to_version`), so the llama.cpp tag limb of
+/// the same file is provably untouched whenever both checks below hold --
+/// Tier 2 is the only code that writes it, and reaching Tier 2 requires
+/// passing the same gate.
 #[then("the packaged pin survives the install")]
 async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        !output.contains("Aligned Lemonade's ROCm") && !stderr.contains("Aligned Lemonade's ROCm"),
+        "the backend was realigned even though the user opted out:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("could not align Lemonade's ROCm backend to"),
+        "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
+    );
+
     let env_path = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
@@ -586,17 +619,9 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
         .as_str()
         .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
 
-    let (version_output, _, _) = crate::run_rocm(world, &["version"]);
-    let active_sdk_line = version_output
-        .lines()
-        .find_map(|line| line.strip_prefix("ROCm SDK: "))
-        .unwrap_or_else(|| panic!("no ROCm SDK line in `rocm version` output:\n{version_output}"));
-    let active_sdk_version = active_sdk_line
-        .split_once(" (")
-        .map_or(active_sdk_line, |(version, _)| version);
-
+    let active_version = active_runtime_version(world);
     assert_ne!(
-        pinned_version, active_sdk_version,
+        pinned_version, active_version,
         "the packaged pin was rewritten to the active ROCm SDK version even though the user \
          opted out"
     );

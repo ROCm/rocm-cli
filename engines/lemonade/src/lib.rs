@@ -1228,6 +1228,18 @@ fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
 ) -> Result<Option<String>> {
+    // Announced here, unconditionally, rather than only where `align_llamacpp_backend_to_version`
+    // happens to be reached: that function is the enforcement point (it decides whether to
+    // skip the write), but every one of the skip branches below -- not Linux, no active SDK
+    // version, unreadable pin, pin already matches -- would otherwise leave a user who set the
+    // variable unable to tell it took effect, exactly the silence this message exists to avoid.
+    let disabled = lemonade_backend_alignment_disabled();
+    if disabled {
+        eprintln!(
+            "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
+             using whatever backend_versions.json already pins."
+        );
+    }
     // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
     // reports unresolved elsewhere), so attempting it on Windows can only burn up to
     // three multi-GB backend installs and a network round-trip for a guaranteed-futile
@@ -1264,7 +1276,7 @@ fn prepare_llamacpp_backend_for_active_rocm(
         &backend_versions_path,
         &target_version,
         &pinned_version,
-        lemonade_backend_alignment_disabled(),
+        disabled,
         try_llamacpp_backend_alignment,
         install_best_llamacpp_backend,
         latest_llamacpp_rocm_stable_tag,
@@ -1283,7 +1295,10 @@ fn prepare_llamacpp_backend_for_active_rocm(
 /// untouched -- and because that check now lives on the one function this crate's own
 /// unit tests already exercise with every install/align/tag step injected, a test can
 /// assert `align`/`latest_tag` are never called and `fallback_install` runs unforced,
-/// covering the gate on every lane instead of only the nightly GPU one.
+/// covering the gate on every lane instead of only the nightly GPU one. The user-facing
+/// announcement lives in the caller ([`prepare_llamacpp_backend_for_active_rocm`])
+/// instead of here, so it fires on every skip path the opt-out affects, not only the
+/// one this function's own gate reaches.
 #[allow(clippy::too_many_arguments)]
 fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
@@ -1296,10 +1311,6 @@ fn align_llamacpp_backend_to_version(
     mut latest_tag: impl FnMut() -> Result<String>,
 ) -> Result<Option<String>> {
     if disabled {
-        eprintln!(
-            "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
-             using whatever backend_versions.json already pins."
-        );
         fallback_install(manifest, false)?;
         return Ok(None);
     }
