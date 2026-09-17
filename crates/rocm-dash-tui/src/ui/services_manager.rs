@@ -730,6 +730,67 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_hides_held_legend_when_the_past_attempts_note_costs_a_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Same shape as the test above, but with a past-attempts note on
+        // screen — which pins the `note_rows` term of the `max_visible`
+        // bound, the one branch the zero-`past_attempts` sibling cannot see.
+        //
+        // Geometry on a 160x20 backend: `bento` spends 2 rows on borders and
+        // 1 on top padding, so `inner.height == 17`. The note takes a row, so
+        // the list viewport is `17 - note(1) - footer(1) == 15` rows and the
+        // scrolled list shows rows 15..30. `max_visible` must therefore be 15
+        // — `17 - (1 + note_rows)` — and "s14" is the first row outside it.
+        // Drop the `+ note_rows` term and `max_visible` becomes 16, pulling
+        // the held "s14" into the `any_held` scan while it stays off-screen:
+        // the legend would then advertise a marker the user cannot see.
+        // Why 14 is the boundary row, pinned on the pure helper so the fixture
+        // cannot drift into a weaker duplicate of the sibling above. Note that
+        // nothing about the *rendered* viewport is a safe setup assumption
+        // here: dropping the term flips `any_held`, which spends `body[3]` and
+        // shrinks the list by a further row, so the rows on screen move too.
+        assert_eq!(visible_list_window(29, 30, 15), 15..30);
+        let insts = many_rows_one_held(14, 30);
+        let sm = ServicesManagerState {
+            selected: 29,
+            ..ServicesManagerState::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| {
+            draw_services_manager(
+                f,
+                f.area(),
+                &sm,
+                &insts,
+                &State::default(),
+                2,
+                &Theme::from_name("default-dark"),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("no longer running"),
+            "test setup assumption broken: the note must render, else note_rows is 0; got:\n{out}"
+        );
+        assert!(
+            !out.contains("s14"),
+            "test setup assumption broken: the held row must scroll off-screen; got:\n{out}"
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the note's row pushed the only held row off-screen; got:\n{out}"
+        );
+    }
+
+    #[test]
     fn snapshot_shows_held_legend_when_held_row_is_visible_after_scroll() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
