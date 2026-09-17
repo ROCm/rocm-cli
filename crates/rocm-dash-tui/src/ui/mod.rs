@@ -539,16 +539,20 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Key("+/-", Some(KeyAction::ReplaySpeedUp)));
         segs.push(Seg::Sep(" speed  "));
     }
-    if state.has_open_overlay() {
+    if state.has_open_overlay() || state.approval.is_some() {
         // While a manager overlay is open it owns every key (the event loop
         // routes each keypress to its `on_key`, never falling through to
         // `apply_action`), so a real `t`/`?`/`q` press can't reach
         // `OpenThemePicker`/`ToggleHelp`/`KeyAction::Quit` there — it cancels
         // the approval, closes the job console, or backs the manager out
         // instead, but it never opens the theme picker, toggles help, or
-        // tears down the app the way those actions do. `None` keeps the
-        // chips non-clickable so a click can't do something the key never
-        // would.
+        // tears down the app the way those actions do. The same is true while
+        // an approval is pending: `has_open_overlay()` deliberately excludes
+        // `approval` (it's a separate gating layer), so it has to be checked
+        // here too, or these chips would stay clickable and let a mouse click
+        // silently discard a pending approval that a real keypress never
+        // could. `None` keeps the chips non-clickable so a click can't do
+        // something the key never would.
         segs.push(Seg::Key("t", None));
         segs.push(Seg::Sep(" theme  "));
         segs.push(Seg::Key("?", None));
@@ -925,6 +929,57 @@ mod tests {
             !row.contains("quit"),
             "q chip should not say quit while an overlay is open: {row:?}"
         );
+    }
+
+    #[test]
+    fn footer_q_t_help_chips_are_not_clickable_when_an_approval_is_pending() {
+        // Regression: `has_open_overlay()` deliberately excludes `approval`
+        // (it's a separate gating layer with its own routing — see its doc
+        // comment), so a pending approval alone must still gate these chips.
+        // Keyboard input has a dedicated `state.approval.is_some()` arm ahead
+        // of general key dispatch that routes every key to `approval_key`;
+        // a footer-chip click bypasses that dispatch entirely and would
+        // otherwise silently discard the pending approval (or, for `q`, tear
+        // the app down without ever recording a verdict).
+        use crate::app::PendingApproval;
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest};
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.approval = Some(PendingApproval {
+            req: ApprovalRequest::new("run it", vec!["echo hi".into()]),
+            choice: ApprovalChoice::default(),
+            name: "tool".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!state.has_open_overlay());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::Quit,
+                "no chip may dispatch Quit while an approval is pending"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenThemePicker,
+                "no chip may dispatch OpenThemePicker while an approval is pending"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::ToggleHelp,
+                "no chip may dispatch ToggleHelp while an approval is pending"
+            );
+        }
     }
 
     /// The wash `grey_overlay` paints behind an open overlay (see
