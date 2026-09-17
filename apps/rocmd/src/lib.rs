@@ -1212,21 +1212,35 @@ fn sandbox_check_updates_value(output: CommandCapture) -> Value {
 fn update_check_status(output: &CommandCapture) -> &'static str {
     if output.exit_status != 0 {
         "error"
-    } else if update_output_reports_update_available(&output.stdout) {
+    // A newer version outranks a composition repair: reporting the repair while
+    // some runtime is a whole release behind would understate the tree.
+    } else if update_output_reports_status(&output.stdout, "update_available") {
         "update_available"
+    } else if update_output_reports_status(&output.stdout, "repair_available") {
+        "repair_available"
     } else {
         "checked"
     }
 }
 
+fn update_output_reports_status(stdout: &str, status: &str) -> bool {
+    let expected = format!("status={status}");
+    stdout.split_whitespace().any(|part| part == expected)
+}
+
 fn update_output_reports_update_available(stdout: &str) -> bool {
-    stdout
-        .split_whitespace()
-        .any(|part| part == "status=update_available" || part == "update_available=true")
+    update_output_reports_status(stdout, "update_available")
+        || update_output_reports_status(stdout, "repair_available")
+        || stdout
+            .split_whitespace()
+            .any(|part| part == "update_available=true")
 }
 
 fn update_check_message(status: &str) -> &'static str {
     match status {
+        "repair_available" => {
+            "ran read-only `rocm update`; a ROCm runtime repair is available because its package composition changed; no updates were applied"
+        }
         "update_available" => {
             "ran read-only `rocm update`; a ROCm runtime update is available; no updates were applied"
         }
@@ -2487,7 +2501,13 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
     let read_only = match first.as_deref() {
         Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => true,
         Some("update") => !args.iter().any(|arg| arg == "--apply"),
-        Some("runtimes") => second.as_deref().is_none_or(|value| value == "list"),
+        Some("runtimes") => {
+            second.as_deref().is_none_or(|value| value == "list")
+                || (second
+                    .as_deref()
+                    .is_some_and(|value| value == "uninstall" || value == "remove")
+                    && args.iter().any(|arg| arg == "--dry-run"))
+        }
         Some("engines") => second.as_deref().is_some_and(|value| value == "list"),
         Some("services") => second
             .as_deref()
@@ -2502,7 +2522,8 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
         // two `remove-*` verbs delete, so they stay off the read-only list.
         Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
         // `setup status` reports first-time setup state (read-only); `setup reset`
-        // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
+        // clears the completion/dismissal state and is mutating (it does not by
+        // itself reopen onboarding). Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
         Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
         _ => false,
@@ -2985,6 +3006,12 @@ async fn run_daemon(
         .filter(|watcher| watcher.enabled)
         .count();
     println!("  enabled watchers: {enabled_count}");
+    // This banner is the foreground-loop readiness contract used by callers and
+    // integration tests. Flush it before any persistent work so piped stdout on
+    // Windows cannot retain the line in a userspace buffer indefinitely.
+    io::stdout()
+        .flush()
+        .context("failed to flush rocmd run banner")?;
 
     if !automations_enabled {
         println!(
@@ -3841,7 +3868,7 @@ where
                         None,
                     )?;
                     if result.update_available {
-                        record_update_available_notification(paths, state)?;
+                        record_update_available_notification(paths, state, result.status)?;
                     }
                 }
                 Err(error) => {
@@ -3897,7 +3924,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
     let update_available = value
         .get("update_available")
         .and_then(Value::as_bool)
-        .unwrap_or(status == "update_available");
+        .unwrap_or(matches!(status, "update_available" | "repair_available"));
     let exit_status = value
         .get("exit_status")
         .and_then(Value::as_i64)
@@ -3912,9 +3939,13 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
 fn record_update_available_notification(
     paths: &AppPaths,
     state: &mut AutomationRuntimeState,
+    status: &str,
 ) -> Result<()> {
-    let message =
-        "A ROCm runtime update is available. Preview it before applying. No updates were applied.";
+    let message = if status == "repair_available" {
+        "A ROCm runtime repair is available because its package composition changed. Preview it before applying. No updates were applied."
+    } else {
+        "A ROCm runtime update is available. Preview it before applying. No updates were applied."
+    };
     record_event(
         paths,
         state,
@@ -5715,6 +5746,34 @@ mod tests {
         let error = ensure_rocm_command_is_read_only(&reset_args)
             .expect_err("setup reset must go through approval");
         assert!(error.to_string().contains("approval UI"));
+        Ok(())
+    }
+
+    #[test]
+    fn rocm_command_helper_treats_runtimes_uninstall_dry_run_as_read_only() -> Result<()> {
+        // Mirrors the bin's chat_rocm_command_action_from_args classifier so a
+        // dry-run preview stays read-only on every binary's tool surface while
+        // an actual uninstall/remove still requires approval.
+        for verb in ["uninstall", "remove"] {
+            let dry_run_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb, "--dry-run"] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            ensure_rocm_command_is_read_only(&dry_run_args)
+                .unwrap_or_else(|_| panic!("runtimes {verb} --dry-run should be read-only"));
+
+            let mutating_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            let error = match ensure_rocm_command_is_read_only(&mutating_args) {
+                Ok(()) => panic!("runtimes {verb} without --dry-run must go through approval"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("approval UI"));
+        }
         Ok(())
     }
 
@@ -7912,7 +7971,7 @@ mod tests {
             }],
         };
 
-        record_update_available_notification(&paths, &mut state)?;
+        record_update_available_notification(&paths, &mut state, "update_available")?;
 
         let audit_text = fs::read_to_string(paths.audit_events_path())?;
         let audit = audit_text
@@ -8002,6 +8061,49 @@ mod tests {
                 .get("stdout")
                 .and_then(Value::as_str)
                 .is_some_and(|stdout| stdout.contains("status=update_available"))
+        );
+    }
+
+    #[test]
+    fn sandbox_check_updates_value_marks_runtime_repair_available() {
+        let value = sandbox_check_updates_value(CommandCapture {
+            argv: vec!["rocm".to_owned(), "update".to_owned()],
+            exit_status: 0,
+            stdout: "update\n  runtime release-wheel-multi-arch-7-14-0 status=repair_available installed=7.14.0 latest=7.14.0\n".to_owned(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("repair_available")
+        );
+        // The watcher's notify decision reads this flag, so a repair the user
+        // has to apply by hand must not be reported as nothing to do.
+        assert_eq!(
+            value.get("update_available").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("runtime repair is available")
+                    && message.contains("no updates were applied"))
+        );
+    }
+
+    #[test]
+    fn a_newer_version_outranks_a_composition_repair_in_the_watcher_report() {
+        let value = sandbox_check_updates_value(CommandCapture {
+            argv: vec!["rocm".to_owned(), "update".to_owned()],
+            exit_status: 0,
+            stdout: "update\n  runtime old status=repair_available installed=7.14.0 latest=7.14.0\n  runtime stale status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
+            stderr: String::new(),
+        });
+
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("update_available")
         );
     }
 

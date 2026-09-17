@@ -26,6 +26,11 @@ const TPN_FILE: &str = "THIRD_PARTY_NOTICES.txt";
 const ABOUT_TEMPLATE: &str = "about.hbs";
 /// cargo-about config, committed at the workspace root.
 const ABOUT_CONFIG: &str = "about.toml";
+/// cargo-about version the committed notices are reproducible with. Different
+/// versions format the output differently, so regenerating with anything else
+/// produces a file that fails the byte-for-byte `--check` gate in CI. Kept in
+/// sync with the workflows by `pinned_version_matches_workflows` below.
+const ABOUT_VERSION: &str = "0.9.1";
 
 /// What to do with freshly generated notices relative to what is on disk.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +54,38 @@ fn decide(check: bool, current: Option<&str>, generated: &str) -> Decision {
         Decision::Stale
     } else {
         Decision::Write
+    }
+}
+
+/// Usability of the local cargo-about install.
+#[derive(Debug, PartialEq, Eq)]
+enum Generator {
+    /// Installed at [`ABOUT_VERSION`]; its output will match CI byte-for-byte.
+    Ready,
+    /// Not installed at all.
+    Absent,
+    /// Installed, but at a version whose output would not match CI.
+    WrongVersion,
+}
+
+/// Pure policy: classify the generator from the detected version (`None` when
+/// the subcommand is absent or unrecognisable).
+fn classify_generator(detected: Option<&str>) -> Generator {
+    match detected {
+        Some(ABOUT_VERSION) => Generator::Ready,
+        Some(_) => Generator::WrongVersion,
+        None => Generator::Absent,
+    }
+}
+
+/// Pure parser for `cargo about --version` output, which prints
+/// `cargo-about <semver>`. `None` if the output is not in that form, so an
+/// unexpected format is treated as "unusable" rather than silently accepted.
+fn parse_about_version(stdout: &str) -> Option<&str> {
+    let mut parts = stdout.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some("cargo-about"), Some(version)) => Some(version),
+        _ => None,
     }
 }
 
@@ -77,27 +114,30 @@ fn workspace_root() -> Result<PathBuf> {
     })
 }
 
-/// Fail early with an actionable message if cargo-about is not installed, rather
-/// than surfacing cargo's opaque "no such subcommand" error.
-fn ensure_cargo_about(cargo: &std::ffi::OsStr) -> Result<()> {
-    let probe = Command::new(cargo).args(["about", "--version"]).output();
-    let ok = matches!(probe, Ok(output) if output.status.success());
-    if !ok {
-        bail!(
-            "cargo-about is required to generate {TPN_FILE}.\n\
-             Install it with: cargo install cargo-about --locked --features cli"
-        );
+/// Probe the installed cargo-about version, so a missing or mismatched
+/// generator produces an actionable message rather than cargo's opaque "no such
+/// subcommand" error or notices that silently fail CI.
+fn detect_about_version(cargo: &std::ffi::OsStr) -> Option<String> {
+    let output = Command::new(cargo)
+        .args(["about", "--version"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    Ok(())
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_about_version(&stdout).map(str::to_owned)
+}
+
+/// The `cargo install` line that produces the exact generator CI uses.
+fn install_hint() -> String {
+    format!("cargo install cargo-about@{ABOUT_VERSION} --locked --features cli")
 }
 
 /// Run `cargo about generate` against the committed template/config and return
 /// the rendered notices.
-fn generate(root: &Path) -> Result<String> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    ensure_cargo_about(&cargo)?;
-
-    let output = Command::new(&cargo)
+fn generate(root: &Path, cargo: &std::ffi::OsStr) -> Result<String> {
+    let output = Command::new(cargo)
         .current_dir(root)
         .args([
             "about",
@@ -119,9 +159,50 @@ fn generate(root: &Path) -> Result<String> {
 }
 
 /// Entry point for the `tpn` subcommand.
-pub fn run(check: bool) -> Result<()> {
+///
+/// With `if_available`, an unusable generator is a clean no-op instead of an
+/// error, so the local git hook does not block commits for contributors who
+/// have not installed cargo-about (or have a different version). CI never
+/// passes it, and clap forbids combining it with `--check`, so the staleness
+/// gate can never be silently skipped.
+pub fn run(check: bool, if_available: bool) -> Result<()> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let generator = classify_generator(detect_about_version(&cargo).as_deref());
+
+    match (&generator, if_available) {
+        (Generator::Ready, _) => {}
+        (Generator::Absent, true) => {
+            eprintln!(
+                "tpn: cargo-about not installed; skipping {TPN_FILE} regeneration. \
+                 Install it with: {}",
+                install_hint()
+            );
+            return Ok(());
+        }
+        (Generator::WrongVersion, true) => {
+            eprintln!(
+                "tpn: cargo-about is not version {ABOUT_VERSION}; skipping {TPN_FILE} \
+                 regeneration, because other versions format the notices differently and \
+                 would fail CI. Pin it with: {}",
+                install_hint()
+            );
+            return Ok(());
+        }
+        (Generator::Absent, false) => bail!(
+            "cargo-about is required to generate {TPN_FILE}.\n\
+             Install it with: {}",
+            install_hint()
+        ),
+        (Generator::WrongVersion, false) => bail!(
+            "cargo-about must be version {ABOUT_VERSION} to generate {TPN_FILE} \
+             reproducibly; other versions format the notices differently.\n\
+             Pin it with: {}",
+            install_hint()
+        ),
+    }
+
     let root = workspace_root()?;
-    let generated = generate(&root)?;
+    let generated = generate(&root, &cargo)?;
     let path = root.join(TPN_FILE);
     let current = fs::read_to_string(&path).ok();
 
@@ -158,5 +239,42 @@ mod tests {
     fn write_mode_writes_on_diff_or_missing() {
         assert_eq!(decide(false, Some("old"), "new"), Decision::Write);
         assert_eq!(decide(false, None, "new"), Decision::Write);
+    }
+
+    #[test]
+    fn generator_is_ready_only_at_the_pinned_version() {
+        assert_eq!(classify_generator(Some(ABOUT_VERSION)), Generator::Ready);
+        assert_eq!(classify_generator(Some("0.9.0")), Generator::WrongVersion);
+        assert_eq!(classify_generator(Some("0.10.0")), Generator::WrongVersion);
+        assert_eq!(classify_generator(None), Generator::Absent);
+    }
+
+    #[test]
+    fn version_parser_accepts_cargo_about_output_only() {
+        assert_eq!(parse_about_version("cargo-about 0.9.1\n"), Some("0.9.1"));
+        // Unexpected shapes must read as unusable, never as a usable version.
+        assert_eq!(parse_about_version("cargo-about"), None);
+        assert_eq!(parse_about_version("cargo-deny 0.9.1"), None);
+        assert_eq!(parse_about_version(""), None);
+    }
+
+    /// The pinned constant and the version CI installs must never drift: if they
+    /// do, the hook regenerates notices that fail the byte-for-byte gate.
+    #[test]
+    fn pinned_version_matches_workflows() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask crate has a parent directory")
+            .to_path_buf();
+        let expected = format!("cargo-about@{ABOUT_VERSION}");
+        for workflow in ["ci.yml", "dependabot-manifests.yml"] {
+            let path = root.join(".github/workflows").join(workflow);
+            let yaml = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            assert!(
+                yaml.contains(&expected),
+                "{workflow} must install {expected} to match ABOUT_VERSION in tpn.rs"
+            );
+        }
     }
 }

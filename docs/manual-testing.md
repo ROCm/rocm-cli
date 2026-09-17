@@ -46,12 +46,14 @@ choose a managed runtime folder and still place the pip cache inside that
 runtime folder at `<managed-runtime-folder>\pip-cache`.
 
 The `uv` package cache is separate from that pip cache and does **not** follow
-`--prefix`. It lives at `<data-dir>\uv-cache` so it shares a filesystem with the
-managed environments and `uv` can hardlink into them. With `--prefix` pointing at
-a different filesystem from `ROCM_CLI_DATA_DIR`, `uv` falls back to copying
-packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on the prefix filesystem to
-restore hardlinking. Making `--prefix` do this automatically is tracked
-separately.
+`--prefix`. It lives at `<data-dir>\uv-cache` so it is reachable from the managed
+environments without crossing a mount point and `uv` can hardlink into them. With
+`--prefix` pointing somewhere that is a separate mount from `ROCM_CLI_DATA_DIR`,
+`uv` falls back to copying packages; set `ROCM_CLI_UV_CACHE_DIR` to a folder on
+the prefix mount to restore hardlinking. Note it is the mount, not the
+filesystem: a bind mount is enough to trigger the fallback even when both paths
+resolve to one underlying filesystem. Making `--prefix` do this automatically is
+tracked separately.
 
 ## 1. First-Time Setup
 
@@ -63,8 +65,9 @@ rocm
 
 Expected result:
 
-- A setup screen opens automatically before the main TUI.
-- The user does not need to type `/setup`.
+- The launcher opens; choosing "Set up this system" there opens the setup
+  screen. It does not open automatically before the main TUI, and the user
+  does not need to type `/setup`.
 - The setup shows a recommended ROCm folder.
 - The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
   can see that pip downloads stay inside the chosen ROCm folder.
@@ -123,15 +126,18 @@ Omit `--prefix` if you want rocm-cli to choose its standard managed folder.
 Expected result:
 
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
-- pip installs pinned `rocm[libraries,devel]`, `torch`, `torchvision`, and
-  `torchaudio` versions from the TheRock index.
+- pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
+  exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
+  `libraries,devel`), alongside pinned `torchaudio` from the TheRock index. On a host
+  with no detectable AMD GPU the preview reports `device_target: undetermined`
+  and a real install refuses rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
   all four packages in one pip transaction.
 - The install does not ask for an external Python venv.
 - Runtime validation uses TheRock's runtime/devel package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
-  pinned `rocm[libraries,devel]` install succeeds.
+  pinned `rocm[libraries,devel,device-…]` install succeeds.
 - `rocm examine` reports the active runtime as ready.
 
 Developer-only deterministic override:

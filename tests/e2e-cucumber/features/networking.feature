@@ -12,7 +12,7 @@ Feature: Native HTTP networking
   # native HTTP GET to `/v1/models` as its readiness probe (served by the mock).
   # Listing the model and its endpoint therefore exercises that native GET.
   @id:networking-native-http-endpoint-reachable
-  Scenario: 1 - The CLI reaches a served endpoint over the native HTTP stack
+  Scenario: networking-01 - The CLI reaches a served endpoint over the native HTTP stack
     Given a model is being served
     And the model is registered with the CLI
     When the user lists running services
@@ -23,8 +23,19 @@ Feature: Native HTTP networking
   # to GET `/v1/models` and POST `/v1/chat/completions` over the native stack, then
   # prints the reply — proving the native HTTP client works end-to-end via the CLI.
   @id:networking-native-http-chat-round-trip
-  Scenario: 2 - A chat round-trip over a local endpoint uses the native HTTP stack
+  Scenario: networking-02 - A chat round-trip over a local endpoint uses the native HTTP stack
     Given a model is being served
     And the model is registered with the CLI
     When the user sends a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
+
+  # The EAI-7409 public-bind contract. Binding the server to a non-loopback
+  # interface exposes it to the network, so the CLI refuses unless the user
+  # explicitly opts in with `--allow-public-bind`. This check is pre-flight — the
+  # first thing `serve` does, before any engine or model work — so it needs no GPU
+  # and runs on the mock lane every PR.
+  @id:networking-public-bind-requires-opt-in
+  Scenario: networking-03 - Binding to a public interface without opt-in is refused up front
+    When the user serves a model bound to a public interface without allowing public binding
+    Then serving is refused before any engine starts
+    And the user is told to allow public binding first

@@ -74,6 +74,19 @@ pub struct RunnerOptions {
     /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
     /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
     pub amd_smi_binary: Option<OsString>,
+    /// **Test-only.** Skip the mandatory `/dev/kfd` pre-flight in amd-smi
+    /// detection so a *fake* `amd_smi_binary` is actually invoked on a GPU-less
+    /// CI host instead of short-circuiting to "no GPU". Never set in
+    /// production: the KFD guard prevents a *real* `amd-smi` from hanging in
+    /// uninterruptible D-state. Only the daemon integration test that points
+    /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
+    /// off-critical-path detection behaviour is genuinely exercised.
+    pub amd_smi_skip_kfd_preflight: bool,
+    /// **Test-only.** When set, cycle timestamps advance from a fixed epoch by
+    /// the logical tick count plus the signed seconds stored in this file.
+    /// Production callers leave this unset; E2E scenarios use it to cross
+    /// observation-validity boundaries without racing wall-clock scheduling.
+    pub test_clock_offset_path: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -93,6 +106,8 @@ impl Default for RunnerOptions {
             persist_dir: None,
             services_dir: None,
             amd_smi_binary: None,
+            amd_smi_skip_kfd_preflight: false,
+            test_clock_offset_path: None,
         }
     }
 }
@@ -113,6 +128,27 @@ const fn vllm_metrics_enabled(opts: &RunnerOptions) -> bool {
     !opts.disable_vllm_metrics
 }
 
+fn cycle_timestamp(
+    epoch: DateTime<Utc>,
+    tick: Duration,
+    tick_count: u64,
+    offset_path: Option<&std::path::Path>,
+) -> DateTime<Utc> {
+    let Some(path) = offset_path else {
+        return Utc::now();
+    };
+    let tick_millis = tick.as_millis().saturating_mul(u128::from(tick_count));
+    let logical_millis = i64::try_from(tick_millis).unwrap_or(i64::MAX);
+    let offset_secs = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_default();
+    epoch
+        .checked_add_signed(chrono::TimeDelta::milliseconds(logical_millis))
+        .and_then(|at| at.checked_add_signed(chrono::TimeDelta::seconds(offset_secs)))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
 /// Loop forever: tick host + gpu metrics + bench rows, apply through reducer, broadcast.
 ///
 /// `tick_override` lets tests run faster than `opts.gpu_tick`; production passes
@@ -129,6 +165,7 @@ pub async fn run_loop(
     let mut host = HostCollector::new();
     let tick = tick_override.unwrap_or(opts.gpu_tick);
     let mut ticker = interval(tick);
+    let test_clock_epoch = Utc::now();
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Compute multipliers vs the gpu tick.
@@ -200,23 +237,36 @@ pub async fn run_loop(
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
     let mut per_container_used: HashMap<String, u64> = HashMap::new();
 
-    let gpu = match opts.amd_smi_binary.clone() {
-        Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
-        None => AmdSmiCollector::detect().await,
-    };
-    let mut gpu_system_info: Option<GpuSystemInfo> = if let Some(g) = &gpu {
-        let info = g.system_info().await;
-        info!(
-            gpus = info.physical_gpu_count,
-            model = %info.gpu_model,
-            rocm = info.rocm_version.as_deref().unwrap_or("?"),
-            "amd-smi detected"
-        );
-        Some(info)
-    } else {
-        warn!("amd-smi not available (no /dev/kfd or `amd-smi version` failed); GPU disabled");
-        None
-    };
+    // amd-smi GPU detection plus the first `system_info()` can take up to ~15s
+    // on some hosts (subprocess spawn plus the per-call detect/run timeouts).
+    // Doing it inline here blocked the run loop's very first tick — and thus
+    // managed-service discovery and the first snapshot broadcast — behind it, so
+    // an already-running model did not surface in the dashboard until GPU
+    // detection finished (a visible ~15-20s "0 models running" lag while
+    // `rocm services` already reported it). Run detection off the critical path:
+    // the loop starts ticking immediately (surfacing serving instances within
+    // one discovery tick) and GPU metrics fill in the moment detection lands.
+    let amd_smi_binary = opts.amd_smi_binary.clone();
+    let amd_smi_skip_kfd_preflight = opts.amd_smi_skip_kfd_preflight;
+    let (gpu_init_tx, mut gpu_init_rx) =
+        tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
+    tokio::spawn(async move {
+        let gpu = match amd_smi_binary {
+            Some(binary) if amd_smi_skip_kfd_preflight => {
+                AmdSmiCollector::detect_with_binary_skipping_kfd_preflight(binary).await
+            }
+            Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
+            None => AmdSmiCollector::detect().await,
+        };
+        let info = match &gpu {
+            Some(g) => Some(g.system_info().await),
+            None => None,
+        };
+        let _ = gpu_init_tx.send((gpu, info));
+    });
+    let mut gpu: Option<AmdSmiCollector> = None;
+    let mut gpu_system_info: Option<GpuSystemInfo> = None;
+    let mut gpu_init_done = false;
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
@@ -232,7 +282,51 @@ pub async fn run_loop(
         // Single wall-clock anchor for this loop iteration. All counter/direct
         // observations and the assembled Snapshot timestamp share this instant so
         // every instance refreshed in this cycle serialises Fresh deterministically.
-        let cycle_at = Utc::now();
+        let cycle_at = cycle_timestamp(
+            test_clock_epoch,
+            tick,
+            tick_count,
+            opts.test_clock_offset_path.as_deref(),
+        );
+
+        // Adopt the background amd-smi detection result the moment it lands,
+        // without ever blocking the loop while it is still in flight. Until then
+        // `gpu` stays `None` (GPU panels read "unavailable") but discovery and
+        // snapshots run every tick, so serving instances appear promptly.
+        if !gpu_init_done {
+            match gpu_init_rx.try_recv() {
+                Ok((detected, info)) => {
+                    gpu_init_done = true;
+                    if let Some(i) = &info {
+                        info!(
+                            gpus = i.physical_gpu_count,
+                            model = %i.gpu_model,
+                            rocm = i.rocm_version.as_deref().unwrap_or("?"),
+                            "amd-smi detected"
+                        );
+                    } else {
+                        warn!(
+                            "amd-smi not available (no /dev/kfd or `amd-smi version` failed); GPU disabled"
+                        );
+                    }
+                    gpu = detected;
+                    gpu_system_info = info;
+                    last_sysinfo_refresh = tick_count;
+                }
+                // The detection task dropped its sender without ever sending.
+                // It has no fallible await today, so this is latent rather than
+                // a live path — but if it ever regressed, polling `Empty`
+                // forever would hang `gpu_init_done` at false and suppress the
+                // honest "unavailable" warning below. Settle as unavailable and
+                // say so once, so the badge resolves instead of silently never
+                // clearing.
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    gpu_init_done = true;
+                    warn!("amd-smi detection task ended without a result; GPU disabled");
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
 
         let mut warnings = Vec::new();
         let gpus = if let Some(g) = &gpu {
@@ -243,8 +337,14 @@ pub async fn run_loop(
                     Vec::new()
                 }
             }
-        } else {
+        } else if gpu_init_done {
             warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+            Vec::new()
+        } else {
+            // Detection is still in flight (spawned off the critical path), so
+            // `gpu == None` is transient here. Stay silent instead of flashing a
+            // false "unavailable" alarm on healthy hardware for the ~15s window
+            // until the first detection result lands.
             Vec::new()
         };
 
@@ -924,6 +1024,25 @@ fn avg_ms_from_histogram(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn test_clock_advances_by_ticks_and_external_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = dir.path().join("offset-secs");
+        std::fs::write(&offset, "0").unwrap();
+        let epoch = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+        assert_eq!(
+            cycle_timestamp(epoch, Duration::from_secs(1), 3, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(3)
+        );
+
+        std::fs::write(&offset, "7").unwrap();
+        assert_eq!(
+            cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(11)
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()

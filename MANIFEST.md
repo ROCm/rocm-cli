@@ -81,9 +81,8 @@ repository.
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
 | block-padding | 0.3.3 | MIT OR Apache-2.0 |
 | blocking | 1.6.2 | Apache-2.0 OR MIT |
-| bollard | 0.17.1 | Apache-2.0 |
-| bollard-stubs | 1.45.0-rc.26.0.1 | Apache-2.0 |
-| bs58 | 0.5.1 | MIT/Apache-2.0 |
+| bollard | 0.21.0 | Apache-2.0 |
+| bollard-stubs | 1.53.1-rc.29.3.1 | Apache-2.0 |
 | bstr | 1.12.3 | MIT OR Apache-2.0 |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 |
 | by_address | 1.2.1 | MIT OR Apache-2.0 |
@@ -203,7 +202,6 @@ repository.
 | globset | 0.4.18 | Unlicense OR MIT |
 | globwalk | 0.9.1 | MIT |
 | h2 | 0.4.15 | MIT |
-| hashbrown | 0.12.3 | MIT OR Apache-2.0 |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
@@ -237,7 +235,6 @@ repository.
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT |
 | ignore | 0.4.27 | Unlicense OR MIT |
 | indenter | 0.3.4 | MIT OR Apache-2.0 |
-| indexmap | 1.9.3 | Apache-2.0 OR MIT |
 | indexmap | 2.14.0 | Apache-2.0 OR MIT |
 | indoc | 2.0.7 | MIT OR Apache-2.0 |
 | inflections | 1.1.1 | MIT |
@@ -357,7 +354,7 @@ repository.
 | quote | 1.0.46 | MIT OR Apache-2.0 |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
-| rand | 0.8.6 | MIT OR Apache-2.0 |
+| rand | 0.8.7 | MIT OR Apache-2.0 |
 | rand | 0.9.4 | MIT OR Apache-2.0 |
 | rand_chacha | 0.3.1 | MIT OR Apache-2.0 |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
@@ -401,7 +398,6 @@ repository.
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | schannel | 0.1.29 | MIT |
-| schemars | 0.9.0 | MIT |
 | schemars | 1.2.1 | MIT |
 | schemars_derive | 1.2.1 | MIT |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |
@@ -647,8 +643,8 @@ ROCm distribution. Two install formats are supported:
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
   installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl/<gpu-family>/`. Nightly
-  channel wheels are served from `https://rocm.nightlies.amd.com/v2/<gpu-family>/`.
+  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
+  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
   `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
@@ -670,13 +666,15 @@ The binary is cached in the rocm-cli managed data directory and reused for
 subsequent operations. The version may be pinned via `ROCM_CLI_UV_VERSION`.
 
 `uv`'s own content-addressed package cache is also kept in the managed data
-directory (at `<data-dir>/uv-cache`), so that it shares a filesystem with the
-environments `uv` populates and packages can be hardlinked into them instead of
-copied. This cache holds every wheel `uv` downloads — the ROCm SDK and the
-torch stack included — so it is typically the largest directory rocm-cli
-manages, on the order of several GB per SDK version installed. It is removed by
-`rocm uninstall` unless `--keep-data` is passed, and its location can be
-overridden with `ROCM_CLI_UV_CACHE_DIR`.
+directory (at `<data-dir>/uv-cache`), so that it is reachable from the
+environments `uv` populates without crossing a mount point and packages can be
+hardlinked into them instead of copied. Note it is the mount, not the
+filesystem: a bind mount or `subPath` volume is enough to make Linux refuse the
+hardlink, and `uv` then silently copies. This cache holds every wheel `uv`
+downloads — the ROCm SDK and the torch stack included — so it is typically the
+largest directory rocm-cli manages, on the order of several GB per SDK version
+installed. It is removed by `rocm uninstall` unless `--keep-data` is passed, and
+its location can be overridden with `ROCM_CLI_UV_CACHE_DIR`.
 
 ### Lemonade Embeddable Runtime
 
@@ -737,6 +735,10 @@ dependency tree changes — and as part of every release — with:
 cargo install cargo-about@0.9.1 --locked --features cli   # one-time
 cargo xtask tpn
 ```
+
+With the prek hooks installed this runs automatically whenever you commit a
+dependency-graph change, so the notices rarely go stale by hand; the hook skips
+if cargo-about is absent or not the pinned version.
 
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the

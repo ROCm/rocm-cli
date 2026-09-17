@@ -106,12 +106,36 @@ There is no tag-filter tiering. Each CI job runs the **whole** suite
 **pass / xfail / skip** at runtime from its capability tags plus the known-bug
 matrix, then reconciles the actual result against that expectation.
 
+### Naming
+
+Each feature file has a short **key** that prefixes both its scenario names and
+its ids. The key is usually the file's stem in kebab-case, but not always —
+`install_lifecycle` uses `lifecycle`, `model_serving` uses `serve`, and
+`dependency_guard` uses `deps-guard` — so `FEATURE_KEYS` in
+`tests/feature_naming.rs` is the list, not this page.
+
+Keys must also be **distinct between files**: `runtime_setup` owns `runtime`, so
+`runtime_lifecycle` takes `runtime-lifecycle`. Two files sharing a key would emit
+the same `<key>-01` index twice, which is exactly what the key exists to prevent.
+
+- **Scenario name** — `Scenario: <key>-<NN> - <description>`, numbered
+  sequentially in declaration order. The report sorts the grid's rows by this
+  index, so it must match the order in the file. Without the key the index names
+  nothing: every file used to number from 1, so "1" meant eight different
+  scenarios.
+- **`@id:`** — `<key>-<slug>`, so an id alone says which feature it belongs to.
+
+`tests/feature_naming.rs` enforces all of this (sequential, unique suite-wide,
+feature-qualified ids) in the ordinary `cargo test` run. Adding a feature file
+means adding its key to `FEATURE_KEYS` there.
+
 Scenarios carry stable-id and capability tags:
 
 | Tag | Meaning |
 |---|---|
-| `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
+| `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
@@ -149,6 +173,8 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
+| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon R9700 (self-hosted) | no |
+| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -159,12 +185,14 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on
-Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then consolidates them
-into the same cross-platform grid. The
-shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
-the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
-through Lemonade on Strix Halo.
+The nightly workflow covers the same hardware as the table above, as
+non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
+`e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
+`E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
+grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
+MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
+checkpoint through Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on

@@ -18,9 +18,11 @@
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
 //! first-run auto-trigger + `onboarding_dismissed` persistence, and the frozen
 //! flow's post-install `reconcile_onboarding_engine_preference` are documented
-//! fast-follows — this overlay is additive and key-triggered (`n`), so it never
-//! touches the frozen tui.rs first-run gate. Both paths run through the approval
-//! gate and the job-bridge — zero `std::thread::spawn`/`try_recv`.
+//! fast-follows — this overlay is additive and opens only via the explicit
+//! `n` key on the Observe tab (or explicit `Focus::Setup` selection); no
+//! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
+//! it. Both paths run through the approval gate and the job-bridge — zero
+//! `std::thread::spawn`/`try_recv`.
 
 use std::path::Path;
 

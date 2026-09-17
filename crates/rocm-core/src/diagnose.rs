@@ -15,7 +15,7 @@
 //! data; the per-check logic mirrors `diagnose.py` field-for-field so the two
 //! stay behaviorally identical.
 
-use crate::examine::Examination;
+use crate::examine::{Examination, WslFacts};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -182,6 +182,30 @@ const KEYWORDS_MODULE_NOT_LOADED: KeywordTable = &[
     ("hsa_status_error", 10, "HSA error (broad)"),
 ];
 
+/// What a shared-memory shortage leaves in the error text.
+///
+/// Weak on purpose, and none of them reaches the match threshold alone. The
+/// defining property of this failure is that the crash **does not** name shared
+/// memory — a bus error in a data-loader worker, or a write failure against a
+/// temporary file. An entry that needed the right words would never fire for the
+/// user who needs it, so the machine state has to carry the finding and these
+/// only raise it.
+const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
+    (r"/dev/shm", 40, "error mentions /dev/shm"),
+    ("shared memory", 35, "error mentions shared memory"),
+    (
+        "bus error",
+        25,
+        "bus error -- what a data-loader worker reports when the allowance runs out",
+    ),
+    (
+        "dataloader worker.*killed",
+        25,
+        "a data-loader worker was killed",
+    ),
+    ("no space left on device", 20, "the device reported full"),
+];
+
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
     ("rocminfo: command not found", 50, "rocminfo not on PATH"),
     ("command not found.*hipcc", 40, "hipcc not on PATH"),
@@ -288,6 +312,34 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
     ("out_of_registers", 30, "compiler OUT_OF_REGISTERS"),
 ];
 
+/// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
+/// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
+///
+/// `libtorch_cuda.so` alone is worth exactly [`MIN_SCORE_FOR_MATCH`], on
+/// purpose. It is the one token in that traceback that cannot mean anything
+/// else — a ROCm build of torch ships `libtorch_hip.so` and never that file —
+/// and a user who pastes only the `OSError` line still has to clear the bar, or
+/// the entry loses to the sub-threshold noise it exists to outrank. Everything
+/// less specific stays below it: `torch_c_dlpack_ext` on its own says the
+/// extension is in the picture, not that it chose the wrong variant.
+const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
+    (
+        r"libtorch_cuda\.so",
+        50,
+        "error names libtorch_cuda.so, which a ROCm build of torch does not ship",
+    ),
+    (
+        "torch_c_dlpack_ext",
+        45,
+        "error names the torch_c_dlpack_ext extension",
+    ),
+    (
+        "_optional_torch_c_dlpack",
+        35,
+        "error names tvm_ffi's _optional_torch_c_dlpack shim",
+    ),
+];
+
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
 fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
     if symptom.is_empty() {
@@ -352,6 +404,13 @@ fn finalize(id: &str, title: &str, score: i32, evidence: Vec<String>, fix: Fix) 
 
 // ---------------------------------------------------------------------------
 // Per-misconfiguration checkers (1:1 with diagnose.py)
+//
+// A new checker goes at the END of this section, next to where its `CHECKERS`
+// entry was appended. Inserting one between an existing function and the doc
+// comment above it silently rebinds that comment to the new item: Rust joins a
+// run of `///` lines with no blank line between them, so the old rationale ends
+// up documenting the new constant and the old function is left with none. That
+// compiles, and clippy, rustfmt and every test pass.
 // ---------------------------------------------------------------------------
 
 fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
@@ -407,9 +466,7 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         fix_id: "fix-1-arch".to_owned(),
         auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
-        notes: vec![
-            "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
-        ],
+        notes: notes_1_arch(e),
         ..Fix::default()
     };
     finalize(
@@ -419,6 +476,24 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// The arch-list evidence this checker reads can now come from a managed
+/// runtime's torch, which the bare `pip` commands above would not touch — they
+/// resolve against whatever interpreter is on `PATH`, a different environment.
+/// Say which one the evidence describes rather than letting the commands imply
+/// it.
+fn notes_1_arch(e: &Examination) -> Vec<String> {
+    let mut notes = vec![
+        "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
+    ];
+    if e.framework_source == "managed-runtime" {
+        notes.push(
+            "This host's torch was read from the active managed runtime, not from `PATH`. Run the commands above against that runtime's own interpreter -- `rocm examine --json` names it under framework_notes -- or a bare `pip` will change a different environment and leave this unfixed."
+                .to_owned(),
+        );
+    }
+    notes
 }
 
 fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
@@ -575,11 +650,15 @@ fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
     if score <= 0 {
         return zero("fix-4-render-group", "User missing render/video group");
     }
+    // `stat -c %G` prints the literal "UNKNOWN" when the device GID has no
+    // matching group name (common in containers). Treat that the same as an
+    // empty value and fall back to the render group, so the suggested command
+    // never names a group that does not exist.
     let kfd_group = e
         .kfd
         .as_ref()
         .map(|k| k.owner_group.clone())
-        .filter(|g| !g.is_empty())
+        .filter(|g| !g.is_empty() && !g.eq_ignore_ascii_case("UNKNOWN"))
         .unwrap_or_else(|| "render".to_owned());
     let fix = Fix {
         summary: format!("Add the current user to '{kfd_group}' (and 'video' for safety) and log out/in."),
@@ -815,8 +894,14 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
 
     let fw_major = major_version(fw_rocm);
     let sys_major = major_version(sys_rocm);
+    // Only meaningful when the framework resolves its HIP from the system. A
+    // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
+    // inside the runtime, so its HIP major is free to differ from the system's
+    // on a completely healthy host — and "reinstall torch" would be wrong there.
+    let framework_uses_system_rocm = e.framework_source != "managed-runtime";
     if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
         && fw != sys
+        && framework_uses_system_rocm
     {
         score += 50;
         let runtime = if windows { "HIP SDK" } else { "ROCm" };
@@ -1137,7 +1222,14 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
         ));
     }
-    if e.has_amd_gpu && e.framework == "pytorch" && e.framework_rocm_version.starts_with("hip=") {
+    // Skipped for a managed runtime for the reason this checker's own note
+    // already gives: those wheels bring their own HIP runtime, so a missing
+    // system HIP SDK is not evidence against them.
+    if e.has_amd_gpu
+        && e.framework == "pytorch"
+        && e.framework_rocm_version.starts_with("hip=")
+        && e.framework_source != "managed-runtime"
+    {
         score += 25;
         evidence
             .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
@@ -1267,18 +1359,646 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
+/// The vLLM engine-startup import failure (EAI-8012).
+///
+/// Keyword-only, and not by preference. The fact that decides this failure is
+/// the torch version inside the *managed runtime*, and `Examination`'s framework
+/// probe imports torch from the ambient interpreter instead — on an affected
+/// host it reports `framework: unknown` with a `torch import failed` note, so
+/// the deciding fact is absent from the examination entirely. Nothing structural
+/// can fire until that probe targets the active runtime's interpreter, which is
+/// why the parameter is unused: the user has to supply the error text through
+/// `rocm diagnose --symptom "<pasted error>"`.
+///
+/// That is the only route to this entry from the symptom, and it is a narrow
+/// one: nothing on the serve or `rocm services` path points at `rocm diagnose`
+/// at all — a service that died at startup renders a `logs:` and a `restart:`
+/// hint and no more — so reaching this requires already knowing to paste the
+/// error into `diagnose`. The recipe is also reachable by name (`rocm fix` lists
+/// it, `rocm fix fix-17-torch-dlpack` prints it), but that needs the id rather
+/// than the symptom. Closing that gap means adding a diagnose hint to the
+/// service-failure output, which changes a shared surface for every failed
+/// service regardless of cause and belongs in its own change.
+fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
+    let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
+    if score <= 0 {
+        return zero(
+            "fix-17-torch-dlpack",
+            "torch-c-dlpack-ext loads its CUDA variant on ROCm",
+        );
+    }
+    let fix = Fix {
+        summary: "Only if the engine's runtime holds a ROCm build of torch in the 2.4-2.9 range with torch-c-dlpack-ext installed: reinstall the engine so its pinned torch is restored, which moves torch off the versions the extension ships prebuilts for.".to_owned(),
+        // Three labelled groups, because the steps run in three different places
+        // and the report renders them as one undifferentiated `$`-prefixed list.
+        // Unlabelled, a user pasting the block wholesale is relying on terminal
+        // stdin buffering to land the probes in the subshell -- and on the
+        // reinstall NOT landing there, since it replaces the very environment
+        // that shell is standing in.
+        commands: vec![
+            "# --- step 1 of 3, in YOUR shell ---".to_owned(),
+            "# Opens an INTERACTIVE subshell with the engine's environment active,".to_owned(),
+            "# and does not return until you leave it. Run this line on its own.".to_owned(),
+            "rocm engines shell vllm".to_owned(),
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---".to_owned(),
+            "# Confirm the trigger before changing anything. It has to be the".to_owned(),
+            "# ENGINE's interpreter, not the one on your PATH -- they are different".to_owned(),
+            "# interpreters, and only the engine's decides this failure.".to_owned(),
+            "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
+            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\""
+                .to_owned(),
+            "# This entry applies ONLY when torch.version.hip is set, torch.__version__".to_owned(),
+            "# is in the 2.4-2.9 range, and torch-c-dlpack-ext is installed. Outside".to_owned(),
+            "# that range the extension raises a handled ImportError and this is not".to_owned(),
+            "# the failure you are looking at. Then leave the subshell:".to_owned(),
+            "exit".to_owned(),
+            "# --- step 3 of 3, back in YOUR OWN shell ---".to_owned(),
+            "# If all three held, put the engine's pinned torch back. Do NOT run".to_owned(),
+            "# this from inside the subshell: it replaces the environment that".to_owned(),
+            "# shell is standing in.".to_owned(),
+            "rocm engines install vllm --reinstall".to_owned(),
+        ],
+        fix_id: "fix-17-torch-dlpack".to_owned(),
+        auto_applicable: false,
+        verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts".to_owned(),
+        notes: vec![
+            "Running vLLM on ROCm is not by itself a reason to apply this. The trigger is narrow: a ROCm build of torch in the 2.4-2.9 range (the versions torch-c-dlpack-ext ships prebuilts for), torch without a native __dlpack_c_exchange_api__, and torch-c-dlpack-ext present -- it arrives as a transitive dependency of tilelang, which vLLM pins.".to_owned(),
+            "The usual way a runtime lands in that range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.".to_owned(),
+            "The defect is upstream and there is nothing to correct locally: torch-c-dlpack-ext picks its variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant to pick. tvm_ffi imports it as optional but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so an explicitly optional import kills the process.".to_owned(),
+            "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-17-torch-dlpack",
+        "vLLM engine start aborts on torch-c-dlpack-ext loading its CUDA variant",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+/// The shared-memory allowance below which a serving workload is in trouble.
+///
+/// Chosen to separate the failure from the healthy majority rather than to
+/// describe what a workload wants. A container's default is 64 MB; an ordinary
+/// Linux host gives `/dev/shm` half its RAM, clearing this on anything with 2 GB
+/// or more. WSL2 ships the same 64 MB default a container does.
+///
+/// This deliberately under-reports. A container given 2 GB is still short for a
+/// large model and will not be flagged here. That is the right way to be wrong:
+/// a diagnosis that fires on healthy machines is one people stop reading, and a
+/// threshold set at what a workload *wants* would trip every ordinary laptop.
+const SHM_MIN_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What the catalog already tells users to ask for. Quoted rather than restated
+/// so the two cannot drift: `fix-10-container` prints `--shm-size=8g`.
+const SHM_RECOMMENDED: &str = "8g";
+
+/// `/dev/shm` too small for a serving workload.
+///
+/// Established from the state of the machine, not from the error text. That
+/// ordering is forced by the failure itself: the crash never names shared
+/// memory, which is exactly why the user cannot get from the message to the
+/// cause on their own.
+fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-19-shm-too-small";
+    const TITLE: &str = "shared memory allowance too small for a serving workload";
+
+    // Unmeasured is not short. `None` means the path was absent or the query
+    // failed, and reporting a shortage on that basis would be a finding about
+    // the probe rather than about the machine.
+    let Some(total) = e.shm_total_bytes else {
+        return zero(ID, TITLE);
+    };
+    if total >= SHM_MIN_BYTES {
+        return zero(ID, TITLE);
+    }
+
+    let mut score = 60;
+    let mut evidence = vec![format!(
+        "{} is {}, and a serving workload needs gigabytes",
+        crate::disk_space::format_bytes(total),
+        "the whole shared-memory allowance"
+    )];
+    if let Some(available) = e.shm_available_bytes
+        && available != total
+    {
+        evidence.push(format!(
+            "{} of it is free",
+            crate::disk_space::format_bytes(available)
+        ));
+    }
+    if e.in_container {
+        // Not more certain that the allowance is small -- that is measured. More
+        // certain about the cause and the remedy, because a container's default
+        // is exactly this, and restarting it with a larger one is a known step.
+        score += 10;
+        evidence.push(format!(
+            "this is a {} container, whose default allowance is 64 MiB",
+            // Matches the generic `probe_container` writes when it cannot name
+            // the runtime. Saying "linux container" invented a kind the probe
+            // never reports.
+            if e.container_kind.is_empty() {
+                "container"
+            } else {
+                &e.container_kind
+            }
+        ));
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_SHM_TOO_SMALL);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Raise the shared-memory allowance before running the workload.".to_owned(),
+        commands: vec![
+            "# In a container: restart it with a larger allowance.".to_owned(),
+            format!("#   docker run --shm-size={SHM_RECOMMENDED} ...    # see fix-10-container"),
+            "# On a host: remount it, and make that survive a reboot.".to_owned(),
+            format!("sudo mount -o remount,size={SHM_RECOMMENDED} /dev/shm"),
+            format!("# /etc/fstab:  tmpfs  /dev/shm  tmpfs  defaults,size={SHM_RECOMMENDED}  0 0"),
+        ],
+        needs_sudo: true,
+        fix_id: ID.to_owned(),
+        auto_applicable: false,
+        verify: "df -h /dev/shm".to_owned(),
+        notes: vec![
+            "A running container cannot have its allowance changed; it has to be started again."
+                .to_owned(),
+            // The threshold under-reports on purpose, and until now that was
+            // said only in the source. A reader who is told nothing reads
+            // silence as a clean bill of health.
+            format!(
+                "This is reported below {}. Silence is not proof of enough: a container given \
+                 2 GiB clears that bar and can still be too small for a large model.",
+                crate::disk_space::format_bytes(SHM_MIN_BYTES)
+            ),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
+// ---------------------------------------------------------------------------
+// WSL2 catalog
+//
+// A parallel catalog, not a port of the bare-metal one. WSL2 reaches the GPU
+// through /dev/dxg and the Windows host driver (dxgkrnl), so the questions worth
+// asking are about the DXCore handoff, the ROCDXG userspace, and the host — none
+// of which the bare-metal checks know anything about.
+// ---------------------------------------------------------------------------
+
+const KEYWORDS_WSL_NO_DEVICE: KeywordTable = &[
+    (
+        "no rocm-capable device",
+        40,
+        "error mentions no ROCm-capable device",
+    ),
+    (
+        "no hip-capable device",
+        40,
+        "error mentions no HIP-capable device",
+    ),
+    (r"/dev/dxg", 45, "error mentions /dev/dxg"),
+    (
+        "hsa_status_error_out_of_resources",
+        25,
+        "error mentions HSA_STATUS_ERROR_OUT_OF_RESOURCES",
+    ),
+    (
+        "no amd gpus? (?:were )?(?:found|detected)",
+        35,
+        "error mentions no AMD GPU found",
+    ),
+];
+
+const KEYWORDS_WSL_LOADER: KeywordTable = &[
+    (r"librocdxg\.so", 50, "error names librocdxg.so"),
+    (r"libdxcore\.so", 50, "error names libdxcore.so"),
+    (
+        "cannot open shared object file",
+        30,
+        "error mentions a shared object that could not be opened",
+    ),
+    (
+        "error while loading shared libraries",
+        35,
+        "error mentions a shared library load failure",
+    ),
+];
+
+/// The WSL facts, or a default set when the probe did not populate them.
+///
+/// A WSL host whose `wsl` section is missing is a probe failure, not a healthy
+/// machine, so every field reads false and the checks fire on the missing
+/// plumbing rather than silently passing.
+fn wsl_facts(e: &Examination) -> WslFacts {
+    e.wsl.clone().unwrap_or_default()
+}
+
+fn check_wsl_1_gpu_not_exposed(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    if w.dxg_device {
+        return zero("fix-wsl-1-gpu-not-exposed", "GPU not exposed to the distro");
+    }
+    // WSL 1 has no GPU path at all; fix-wsl-7 says so in terms the user can act
+    // on, and two findings for one cause is noise.
+    if w.version == 1 {
+        return zero("fix-wsl-1-gpu-not-exposed", "GPU not exposed to the distro");
+    }
+    let mut score = 55;
+    let mut evidence = vec!["/dev/dxg is missing, so the distro has no GPU path".to_owned()];
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_NO_DEVICE);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    // Three different causes produce the same missing device, and they need
+    // different actions. Naming which one this is spares the user from updating a
+    // Windows driver that was never the problem.
+    let (cause, commands, notes) = if e.in_container {
+        (
+            "this is a container, and containers only see /dev/dxg when it is passed in",
+            vec![
+                "# Re-run the container with the WSL GPU device and libraries:".to_owned(),
+                "#   --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl".to_owned(),
+                "# and add /usr/lib/wsl/lib to the loader path inside it.".to_owned(),
+            ],
+            vec![
+                "The Windows host driver is probably fine here: the device is missing because this container was not given it, not because the host lacks GPU support.".to_owned(),
+            ],
+        )
+    } else if !w.wsl_lib_dir {
+        (
+            "/usr/lib/wsl is absent too, so this distro never had WSL GPU support wired in",
+            vec![
+                "# Update WSL itself, then restart the distro from Windows:".to_owned(),
+                "#   wsl --update".to_owned(),
+                "#   wsl --shutdown".to_owned(),
+            ],
+            Vec::new(),
+        )
+    } else {
+        (
+            "/usr/lib/wsl is present but the device is not, which points at the Windows host driver or the WSL kernel",
+            vec![
+                "# On the Windows host: install a WSL-capable AMD Adrenalin driver,".to_owned(),
+                "# then update the WSL kernel and restart the distro:".to_owned(),
+                "#   wsl --update".to_owned(),
+                "#   wsl --shutdown".to_owned(),
+            ],
+            vec![format!("Driver and WSL setup steps: {WSL_DOCS_URL}")],
+        )
+    };
+    evidence.push(cause.to_owned());
+
+    let fix = Fix {
+        summary: "Expose the GPU to the distro: /dev/dxg is how WSL reaches it, and nothing works until it is there.".to_owned(),
+        commands,
+        fix_id: "fix-wsl-1-gpu-not-exposed".to_owned(),
+        auto_applicable: false,
+        verify: "ls -l /dev/dxg".to_owned(),
+        notes,
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-1-gpu-not-exposed",
+        "GPU not exposed to the distro (/dev/dxg missing)",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_2_dxcore_missing(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Without the device there is nothing for DXCore to talk to; fix-wsl-1 is the
+    // cause and this would only add a second finding for it.
+    if w.dxcore || !w.dxg_device {
+        return zero("fix-wsl-2-dxcore-missing", "WSL DXCore libraries missing");
+    }
+    let mut score = 50;
+    let mut evidence =
+        vec!["/usr/lib/wsl/lib/libdxcore.so is missing, so the ROCm runtime cannot reach the host driver".to_owned()];
+    if !w.wsl_lib_dir {
+        score += 15;
+        evidence.push("/usr/lib/wsl/lib does not exist at all".to_owned());
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Restore the WSL DXCore libraries, then make sure they are on the loader path."
+            .to_owned(),
+        commands: vec![
+            "# From Windows, refresh the WSL runtime that ships these libraries:".to_owned(),
+            "#   wsl --update".to_owned(),
+            "#   wsl --shutdown".to_owned(),
+            "# Inside the distro, confirm the loader can see them:".to_owned(),
+            "echo /usr/lib/wsl/lib | sudo tee /etc/ld.so.conf.d/wsl.conf".to_owned(),
+            "sudo ldconfig".to_owned(),
+        ],
+        needs_sudo: true,
+        fix_id: "fix-wsl-2-dxcore-missing".to_owned(),
+        auto_applicable: false,
+        verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore".to_owned(),
+        notes: vec![
+            "/usr/lib/wsl is mounted by WSL itself, not installed by the distro's package manager, so apt cannot repair it -- the fix is on the Windows side.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-2-dxcore-missing",
+        "WSL DXCore libraries missing or not on the loader path",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    if w.librocdxg || !w.dxg_device {
+        return zero("fix-wsl-3-rocdxg-missing", "ROCDXG not installed");
+    }
+    let mut score = 50;
+    let mut evidence = vec!["librocdxg.so was not found under any ROCm install".to_owned()];
+    if w.dxcore {
+        // The host side is ready and only the distro-side package is absent, which
+        // is both the most common case and the one the user can fix alone.
+        score += 15;
+        evidence.push(
+            "the WSL DXCore handoff is present, so only the distro-side ROCDXG is missing"
+                .to_owned(),
+        );
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Install ROCDXG inside the distro: it is the ROCm-to-DXCore shim the WSL path runs on.".to_owned(),
+        commands: vec![
+            "bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+            "# Or, to pin the package you install:".to_owned(),
+            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+        ],
+        needs_sudo: true,
+        fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
+        auto_applicable: false,
+        verify: "ldconfig -p | grep librocdxg".to_owned(),
+        notes: vec![
+            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. Set ROCDXG_SHA256 to verify the download against a digest you trust.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-3-rocdxg-missing",
+        "ROCDXG not installed in the distro",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Only meaningful once the library is actually on disk: when it is not,
+    // fix-wsl-3 is the finding and the missing linker entry is a consequence.
+    //
+    // The device guard matches its siblings. librocdxg can be installed while
+    // /dev/dxg is absent, and running `ldconfig` fixes nothing then -- offering
+    // it beside the real cause just leaves the user to guess which to act on.
+    // `Some(false)` only: `None` means ldconfig could not be run, and an
+    // unreadable linker cache is not an unregistered library.
+    if !w.librocdxg || w.ldconfig_librocdxg != Some(false) || !w.dxg_device {
+        return zero(
+            "fix-wsl-4-rocdxg-not-linked",
+            "ROCDXG installed but not on the loader path",
+        );
+    }
+    let mut score = 55;
+    let mut evidence = vec![
+        "librocdxg.so is installed but does not appear in `ldconfig -p`, so the runtime will not load it".to_owned(),
+    ];
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_LOADER);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let fix = Fix {
+        summary: "Refresh the linker cache so the installed ROCDXG becomes loadable.".to_owned(),
+        commands: vec!["sudo ldconfig".to_owned()],
+        needs_sudo: true,
+        fix_id: "fix-wsl-4-rocdxg-not-linked".to_owned(),
+        auto_applicable: false,
+        verify: "ldconfig -p | grep librocdxg".to_owned(),
+        notes: vec![
+            "If `ldconfig` alone does not fix it, the install went somewhere outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-4-rocdxg-not-linked",
+        "ROCDXG installed but invisible to the dynamic linker",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // `None` means the release could not be read. That is not evidence of an old
+    // distro, so this stays silent rather than guessing.
+    if w.distro_supported != Some(false) {
+        return zero("fix-wsl-5-distro-too-old", "Distro release below the floor");
+    }
+    let (major, minor) = crate::examine::WSL_MIN_UBUNTU;
+    let evidence = vec![format!(
+        "distro is {} {}, below the {major}.{minor:02} floor the WSL path requires",
+        e.distro_id, e.distro_version
+    )];
+    let fix = Fix {
+        summary: format!(
+            "Move to Ubuntu {major}.{minor:02} or newer: older releases ship a glibc the engines cannot run against."
+        ),
+        commands: vec![
+            "# From Windows, install a supported distro alongside the current one:".to_owned(),
+            "#   wsl --install -d Ubuntu-24.04".to_owned(),
+        ],
+        fix_id: "fix-wsl-5-distro-too-old".to_owned(),
+        auto_applicable: false,
+        verify: "grep VERSION_ID /etc/os-release".to_owned(),
+        notes: vec![
+            "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-5-distro-too-old",
+        "Distro release is below the supported floor for WSL",
+        70,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) -> Diagnosis {
+    let w = wsl_facts(e);
+    // Abstain unless the host was actually reached. Treating "could not ask" as
+    // "driver is old" would fire on every host with interop switched off and on
+    // every container, where the question is unanswerable rather than answered.
+    //
+    // WSL 1 abstains too: it has no GPU path for any driver to serve, so the
+    // host's driver version cannot be the reason anything failed. Without this
+    // the symptom keywords alone were enough to raise it alongside fix-wsl-7,
+    // pointing the user at a Windows driver that could never have helped.
+    if !w.host_reachable || w.version == 1 {
+        return zero(
+            "fix-wsl-6-host-driver-too-old",
+            "Windows host GPU driver too old",
+        );
+    }
+    let mut score = 0;
+    let mut evidence = Vec::new();
+    match w.host_driver_version.as_deref() {
+        // Guarded on the device like its siblings: without /dev/dxg, fix-wsl-1
+        // is the finding, and adding a second one for the same root cause just
+        // leaves the user choosing between them.
+        Some("") if w.dxg_device => {
+            score += 45;
+            evidence.push(
+                "the Windows host reports no AMD display adapter, so no WSL-capable AMD driver is installed there"
+                    .to_owned(),
+            );
+        }
+        // The plumbing is present but the runtime still cannot see a GPU, which
+        // on a machine with a working DXCore handoff points at the host driver.
+        //
+        // `rocm_sees_gpu`, not `has_amd_gpu`: the probes that populate the latter
+        // are skipped on WSL, so it reads false on every host here, healthy or
+        // not, and this check fired on a complete working stack. `Some(false)`
+        // specifically -- `None` means rocminfo was absent so the question went
+        // unasked, which is not evidence of anything.
+        //
+        // Guarded on the linker cache like fix-wsl-4: when `ldconfig` positively
+        // shows librocdxg is not registered, that is the root cause and this
+        // check must not also fire for the same symptom -- the user would be
+        // left choosing between "run ldconfig" and "update the host driver" for
+        // a fault that only the former explains.
+        Some(version)
+            if w.dxg_device
+                && w.dxcore
+                && w.librocdxg
+                && w.ldconfig_librocdxg != Some(false)
+                && w.rocm_sees_gpu == Some(false) =>
+        {
+            score += 40;
+            evidence.push(format!(
+                "host AMD display driver {version} is installed and the distro plumbing is complete, but rocminfo enumerates no GPU"
+            ));
+        }
+        Some(_) | None => {}
+    }
+
+    // Symptom keywords only ever CORROBORATE machine evidence here; they cannot
+    // stand alone. Every other WSL entry either carries a base score from a fact
+    // or returns before scoring keywords, so this was the one place where the
+    // words a user typed could clear the threshold by themselves -- and the
+    // table it shares with fix-wsl-1 is generic enough ("/dev/dxg", "no
+    // HIP-capable device") that an ordinary description of any GPU failure hit
+    // 85 on a completely healthy machine, outranking the check that had found
+    // the real fault. The WSL-1 guard above was one instance of this; the floor
+    // is the general fix.
+    if score <= 0 {
+        return zero(
+            "fix-wsl-6-host-driver-too-old",
+            "Windows host GPU driver too old",
+        );
+    }
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_WSL_NO_DEVICE);
+    score += kw_score;
+    evidence.extend(kw_ev);
+    let fix = Fix {
+        summary: "Update the AMD driver on the Windows host: the GPU driver WSL uses lives there, not in the distro.".to_owned(),
+        commands: vec![
+            "# On the Windows host, not in this distro:".to_owned(),
+            "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.".to_owned(),
+        ],
+        fix_id: "fix-wsl-6-host-driver-too-old".to_owned(),
+        auto_applicable: false,
+        verify: "rocminfo | head -n 20".to_owned(),
+        notes: vec![
+            format!("Driver and ROCm version pairing: {WSL_DOCS_URL}"),
+            "Nothing inside the distro can carry this out -- `rocm fix` prints the steps because the change belongs to the Windows host.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-6-host-driver-too-old",
+        "Windows host AMD driver missing or too old for ROCm on WSL",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+fn check_wsl_7_wsl1(e: &Examination, _symptom: &str) -> Diagnosis {
+    if wsl_facts(e).version != 1 {
+        return zero("fix-wsl-7-wsl1", "Distro is running under WSL 1");
+    }
+    let evidence = vec![format!(
+        "kernel '{}' is a WSL 1 kernel; WSL 1 translates syscalls and exposes no GPU device at all",
+        e.kernel_release
+    )];
+    let fix = Fix {
+        summary: "Convert the distro to WSL 2: WSL 1 has no GPU path, so no amount of driver or package work will help.".to_owned(),
+        commands: vec![
+            "# From Windows PowerShell:".to_owned(),
+            "#   wsl --set-version <distro> 2".to_owned(),
+            "#   wsl --set-default-version 2".to_owned(),
+        ],
+        fix_id: "fix-wsl-7-wsl1".to_owned(),
+        auto_applicable: false,
+        verify: "uname -r".to_owned(),
+        notes: vec![
+            "Converting rewrites the distro's filesystem and can take a while on a large install; back up anything you cannot lose first.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-wsl-7-wsl1",
+        "Distro is running under WSL 1, which has no GPU support",
+        80,
+        evidence,
+        fix,
+    )
+}
+
 /// A checker plus the OS families it applies to.
 type Checker = (fn(&Examination, &str) -> Diagnosis, &'static [&'static str]);
 
+// The `wsl` entries below run on less evidence than on bare metal: WSL collects
+// no GPU topology (`gpus` is empty, because the probes that fill it read KFD and
+// DRM), so the parts of those checks that compare a detected gfx target against a
+// wheel's arch list cannot contribute. They still fire on the evidence WSL does
+// have -- environment, ROCm install, symptom keywords -- which is strictly better
+// than the previous behaviour of not running at all.
+//
+// The degradation is one-directional and must stay that way: less evidence means
+// a check may miss a real fault, never that it invents one. Pinned by
+// `the_shared_checks_under_report_on_wsl_rather_than_over_report`.
 const CHECKERS: &[Checker] = &[
-    (check_1_arch_not_in_wheel, &["linux", "windows"]),
-    (check_2_hsa_override_unneeded, &["linux", "windows"]),
+    (check_1_arch_not_in_wheel, &["linux", "windows", "wsl"]),
+    (check_2_hsa_override_unneeded, &["linux", "windows", "wsl"]),
     (check_3_rocm_kernel_unsupported, &["linux"]),
     (check_4_render_group, &["linux"]),
     (check_5_amdgpu_blacklisted, &["linux"]),
-    (check_6_path_missing, &["linux", "windows"]),
+    (check_6_path_missing, &["linux", "windows", "wsl"]),
     (check_7_stale_repos, &["linux"]),
-    (check_8_wheel_rocm_mismatch, &["linux", "windows"]),
+    (check_8_wheel_rocm_mismatch, &["linux", "windows", "wsl"]),
+    // Not "wsl": WSL2 exposes no per-device topology to collide over.
     (check_9_igpu_dgpu_collision, &["linux", "windows"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
@@ -1286,25 +2006,73 @@ const CHECKERS: &[Checker] = &[
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
+    // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
+    // gated off native Windows. 17 rather than 16 because the vLLM
+    // out-of-memory entry reserves 16 on its own branch; the number is a stable
+    // handle, so the two do not get to share one.
+    (check_17_torch_dlpack_cuda_variant, &["linux"]),
+    (check_wsl_1_gpu_not_exposed, WSL_ONLY),
+    (check_wsl_2_dxcore_missing, WSL_ONLY),
+    (check_wsl_3_rocdxg_missing, WSL_ONLY),
+    (check_wsl_4_rocdxg_not_linked, WSL_ONLY),
+    (check_wsl_5_distro_too_old, WSL_ONLY),
+    (check_wsl_6_host_driver_too_old, WSL_ONLY),
+    (check_wsl_7_wsl1, WSL_ONLY),
+    // Both families, opting in explicitly as the platform split requires. The
+    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
+    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
+    // leaving this tagged `linux` alone would silence it on one of the two
+    // platforms most likely to have it.
+    (check_19_shm_too_small, &["linux", "wsl"]),
 ];
+
+const WSL_ONLY: &[&str] = &["wsl"];
+
+/// The platform family a catalog entry is selected by.
+///
+/// This is deliberately NOT `Examination::os_family`. WSL2 reports an `os_family`
+/// of `linux` and must keep doing so — `install`, `serve` and the engine crates
+/// branch on it — but it is a different platform for diagnosis: it reaches the
+/// GPU through `/dev/dxg` and the Windows host driver, with no `amdgpu` module
+/// and no `/dev/kfd`.
+///
+/// Resolving the family here rather than in each check is what makes the split
+/// safe. Every bare-metal entry is tagged `linux` only, so it stops applying on
+/// WSL automatically; an entry that genuinely applies to both opts in by naming
+/// `wsl` as well. That preserves the property the old wholesale WSL short-circuit
+/// bought — no `fix-4-render-group` on a healthy WSL box — without also
+/// suppressing the checks that were always valid there.
+const fn platform_family(e: &Examination) -> &str {
+    if e.is_wsl {
+        return "wsl";
+    }
+    if e.os_family.is_empty() {
+        return "linux";
+    }
+    e.os_family.as_str()
+}
 
 /// Run every applicable checker, drop zero-score results, sort by score
 /// descending (stable, so ties keep catalog order).
 fn run_all_checks(e: &Examination, symptom: &str) -> Vec<Diagnosis> {
-    let os_family = if e.os_family.is_empty() {
-        "linux"
-    } else {
-        e.os_family.as_str()
-    };
+    let family = platform_family(e);
     let mut results: Vec<Diagnosis> = CHECKERS
         .iter()
-        .filter(|(_, applicable)| applicable.contains(&os_family))
+        .filter(|(_, applicable)| applicable.contains(&family))
         .map(|(check, _)| check(e, symptom))
         .filter(|d| d.score > 0)
         .collect();
     // Stable sort by score descending: ties keep catalog order.
     results.sort_by_key(|d| std::cmp::Reverse(d.score));
     results
+}
+
+/// Whether any catalog entry at all applies to this platform.
+fn catalog_covers(e: &Examination) -> bool {
+    let family = platform_family(e);
+    CHECKERS
+        .iter()
+        .any(|(_, applicable)| applicable.contains(&family))
 }
 
 fn route_when_no_match(e: &Examination) -> Route {
@@ -1325,12 +2093,15 @@ fn route_when_no_match(e: &Examination) -> Route {
 /// Diagnose an examination against the closed catalog.
 #[must_use]
 pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
-    // WSL2 is a distinct platform (it uses /dev/dxg + the Windows host driver,
-    // not the in-tree amdgpu module or /dev/kfd), and `examine` already treats
-    // it as out of scope (exit_code() == 2). Mirror that here: skip the
-    // bare-metal Linux catalog entirely so we don't emit false positives like
-    // fix-4-render-group / fix-5-amdgpu-load on a healthy WSL2 box.
-    let out_of_scope = wsl_out_of_scope_message(e);
+    // WSL2 used to be short-circuited here as out of scope. It is a real platform
+    // in the catalog now, with its own entries; what keeps the bare-metal checks
+    // off it is `platform_family`, not a special case at this level.
+    //
+    // `out_of_scope` still exists, for the platforms that genuinely have no
+    // entries. That case used to fall through to an empty catalog and report "no
+    // known misconfiguration", which reads as "your machine looks fine" when the
+    // truth is that nothing was ever checked.
+    let out_of_scope = uncovered_platform_message(e);
     let matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
@@ -1349,15 +2120,19 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
 /// ROCm-on-WSL2 setup guidance (distinct from the bare-metal catalog).
 const WSL_DOCS_URL: &str = "https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
-fn wsl_out_of_scope_message(e: &Examination) -> Option<String> {
-    e.is_wsl.then(|| {
-        format!(
-            "ROCm on WSL2 is a distinct platform: it uses /dev/dxg and the Windows host \
-             driver (dxgkrnl), not the in-tree amdgpu kernel module or /dev/kfd. This catalog \
-             targets bare-metal Linux, so its checks (render group, /dev/kfd, modprobe amdgpu) \
-             do not apply here. For ROCm-on-WSL2 setup, see {WSL_DOCS_URL}"
-        )
-    })
+/// Say so when the catalog has no entries for the running platform.
+///
+/// Returning `None` here means the platform is covered, not that it is healthy.
+fn uncovered_platform_message(e: &Examination) -> Option<String> {
+    if catalog_covers(e) {
+        return None;
+    }
+    Some(format!(
+        "rocm diagnose covers Linux, Windows and WSL2. This host reports '{}', which the \
+         catalog has no entries for, so nothing was checked -- this is not a clean bill of \
+         health. Run `rocm examine --json` and report the platform upstream.",
+        e.os_family
+    ))
 }
 
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
@@ -1484,6 +2259,280 @@ mod tests {
         }
     }
 
+    /// A host whose framework HIP major differs from its system ROCm: torch on
+    /// HIP 7, a system ROCm 6 beside it.
+    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+        Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: framework_source.to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        }
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
+        // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
+        // package inside the runtime, never from the system install, so the two
+        // majors are free to differ on a perfectly healthy host. Before
+        // `examine` probed the runtime this could not fire, because the field it
+        // reads was always empty; now that it is populated, the comparison has
+        // to be told when it is meaningless -- or fixing the probe would hand
+        // every such host a spurious "reinstall torch".
+        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        assert!(
+            !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
+            "a managed runtime must not be told to reinstall torch: {:?}",
+            managed
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // The same host, same versions, with torch coming from the ambient
+        // interpreter: there the comparison is exactly right, and the checker
+        // must keep its full strength.
+        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let finding = ambient
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-8-wheel-rocm")
+            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the version evidence alone has to establish it: {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
+        // The Windows-shaped sibling of the check_8 gate, and the reason
+        // check_13's own note already gives: TheRock wheels bring their own HIP
+        // runtime, so a HIP-build torch on a host with no system HIP SDK says
+        // nothing when that torch came from a managed runtime.
+        let windows = |source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+
+        let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        let ambient = check_13_hip_sdk_missing(&windows("path"), "");
+        assert_eq!(
+            ambient.score - managed.score,
+            25,
+            "the HIP-build clause must apply to the ambient torch and only to it \
+             (managed {}, ambient {})",
+            managed.score,
+            ambient.score
+        );
+    }
+
+    fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-19-shm-too-small")
+    }
+
+    #[test]
+    fn a_tiny_shared_memory_allowance_is_reported_before_the_workload_runs() {
+        // The container default, which is also what WSL2 ships. The point of the
+        // entry is that it fires on machine state alone: the crash this prevents
+        // never names shared memory, so a user who pasted it would get nothing.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e.shm_available_bytes = Some(64 * 1024 * 1024);
+
+        let report = diagnose(&e, "");
+        let finding = shm_finding(&report).expect("a 64 MiB allowance must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the shortage is established by measurement, so it has to clear the \
+             threshold with no help from the symptom text: {}",
+            finding.score
+        );
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("64"),
+            "the report has to state what is actually available:\n{evidence}"
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "raising the allowance means restarting a container or remounting; \
+             neither is something to do on the user's behalf"
+        );
+        assert!(
+            fix.commands.iter().any(|c| c.contains("8g")),
+            "the steps have to name a size to raise it to:\n{:#?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn the_threshold_is_pinned_at_its_edge_rather_than_somewhere_between() {
+        // 64 MiB and 8 GiB leave everything in between unpinned: a threshold
+        // silently moved to 512 MiB or 2 GiB would pass both. The boundary is
+        // the only value worth asserting, because it is the only one a change
+        // to the constant has to cross.
+        let at_threshold = shm_report(SHM_MIN_BYTES);
+        assert!(
+            shm_finding(&at_threshold).is_none(),
+            "exactly the threshold is enough; the rule is 'below', not 'at or below'"
+        );
+        let just_under = shm_report(SHM_MIN_BYTES - 1);
+        assert!(
+            shm_finding(&just_under).is_some(),
+            "one byte under the threshold has to report, or the constant means nothing"
+        );
+
+        // Both assertions above are written in terms of the constant, so they
+        // move with it: they pin the rule ("below", not "at or below") and say
+        // nothing about the value. The value is a promise now -- the fix notes
+        // tell the user the figure -- so pin it literally. This is meant to fail
+        // when someone changes it, which makes the change deliberate and forces
+        // the note to move with it.
+        assert_eq!(
+            SHM_MIN_BYTES,
+            1024 * 1024 * 1024,
+            "the threshold is published to users in the fix notes; changing it means \
+             changing what they were told, so update both together"
+        );
+        // And a value from the middle of the range, which neither 64 MiB nor
+        // 8 GiB constrains: an ordinary host with 4 GB of RAM gets 2 GiB here
+        // and must stay silent.
+        assert!(
+            shm_finding(&shm_report(2 * 1024 * 1024 * 1024)).is_none(),
+            "2 GiB is what a modest but healthy host provides"
+        );
+    }
+
+    #[test]
+    fn the_symptom_text_raises_the_finding_without_being_needed_for_it() {
+        // Both halves matter. The keywords must earn their place, and they must
+        // not be load-bearing: the whole premise is that the crash never names
+        // shared memory, so a user who pastes an unrelated error still gets the
+        // finding.
+        let machine_only = shm_finding(&shm_report(64 * 1024 * 1024))
+            .expect("machine state alone reports")
+            .score;
+
+        for symptom in [
+            "RuntimeError: DataLoader worker (pid 12) is killed by signal: Bus error",
+            "OSError: [Errno 28] No space left on device: '/dev/shm/torch_abc'",
+            "failed to allocate shared memory",
+        ] {
+            let mut e = linux_base();
+            e.shm_total_bytes = Some(64 * 1024 * 1024);
+            let report = diagnose(&e, symptom);
+            let scored = shm_finding(&report)
+                .expect("still reports with a symptom")
+                .score;
+            assert!(
+                scored > machine_only,
+                "{symptom:?} should raise the finding above the machine-state score \
+                 ({scored} vs {machine_only})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partly_used_allowance_reports_what_is_left_as_well_as_the_size() {
+        // The two numbers answer different questions, and the evidence only
+        // mentions what is free when it differs from the total -- otherwise it
+        // would repeat itself on an idle machine.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(64 * 1024 * 1024);
+        e.shm_available_bytes = Some(2 * 1024 * 1024);
+
+        let report = diagnose(&e, "");
+        let evidence = shm_finding(&report)
+            .expect("a short allowance reports")
+            .evidence
+            .join("\n");
+        assert!(
+            evidence.contains("2.0 MiB"),
+            "a mostly-full allowance has to say how little is left:\n{evidence}"
+        );
+    }
+
+    /// A Linux machine whose only notable property is its shared-memory size.
+    fn shm_report(total: u64) -> DiagnoseReport {
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(total);
+        e.shm_available_bytes = Some(total);
+        diagnose(&e, "")
+    }
+
+    #[test]
+    fn an_ordinary_shared_memory_allowance_is_not_reported() {
+        // The control. An ordinary Linux host gives /dev/shm half its RAM, so
+        // this is the common case -- and an entry that fired here would fire on
+        // nearly every machine, which is how a catalog stops being read.
+        let mut e = linux_base();
+        e.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        e.shm_available_bytes = Some(8 * 1024 * 1024 * 1024);
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "8 GiB is what the catalog itself tells users to ask for"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_shared_memory_allowance_is_not_reported() {
+        // Unknown is not zero. `None` means the path was absent or the query
+        // failed, and a shortage reported on that basis would be a finding about
+        // the probe rather than about the user's machine.
+        let mut e = linux_base();
+        e.shm_total_bytes = None;
+        e.shm_available_bytes = None;
+
+        assert!(
+            shm_finding(&diagnose(&e, "")).is_none(),
+            "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn being_in_a_container_raises_the_finding_without_creating_it() {
+        // The container flag says the cause and the remedy are known exactly, so
+        // it raises confidence. It must not be able to conjure a finding on a
+        // machine whose allowance is fine.
+        let mut healthy = linux_base();
+        healthy.shm_total_bytes = Some(8 * 1024 * 1024 * 1024);
+        healthy.in_container = true;
+        healthy.container_kind = "docker".to_owned();
+        assert!(
+            shm_finding(&diagnose(&healthy, "")).is_none(),
+            "a container with a healthy allowance has nothing wrong with it"
+        );
+
+        let mut short = linux_base();
+        short.shm_total_bytes = Some(64 * 1024 * 1024);
+        let outside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        short.in_container = true;
+        short.container_kind = "docker".to_owned();
+        let inside = shm_finding(&diagnose(&short, ""))
+            .expect("short allowance reports")
+            .score;
+        assert!(
+            inside > outside,
+            "knowing it is a container makes the cause certain, so it should rank \
+             higher there: {inside} vs {outside}"
+        );
+    }
+
     #[test]
     fn render_group_missing_is_diagnosed() {
         let mut e = linux_base();
@@ -1605,6 +2654,120 @@ mod tests {
     }
 
     #[test]
+    fn unknown_kfd_group_falls_back_to_render() {
+        // `stat -c %G /dev/kfd` prints "UNKNOWN" when the GID has no group
+        // name. That value must not leak into the remediation command, which
+        // would otherwise suggest `usermod -a -G UNKNOWN,video` -- a group that
+        // does not exist. Fall back to the render group instead. Exercise both
+        // casings so the case-insensitive guard cannot silently regress to an
+        // exact-match check while this test stays green.
+        for sentinel in ["UNKNOWN", "unknown"] {
+            let mut e = linux_base();
+            e.in_render_group = Some(false);
+            e.kfd = Some(Device {
+                path: "/dev/kfd".to_owned(),
+                exists: true,
+                mode: "crw-rw----".to_owned(),
+                owner_group: sentinel.to_owned(),
+                user_can_write: Some(false),
+                ..Device::default()
+            });
+            let report = diagnose(&e, "");
+            let top = &report.matched[0];
+            assert_eq!(top.id, "fix-4-render-group");
+            let fix = top.fix.as_ref().expect("fix-4 carries a fix");
+            assert_eq!(
+                fix.commands,
+                vec!["sudo usermod -a -G render,video \"$USER\"".to_owned()],
+                "{sentinel} group must fall back to render, not leak into the command"
+            );
+            assert!(
+                !fix.summary.to_uppercase().contains("UNKNOWN"),
+                "summary must not name the bogus {sentinel} group:\n{}",
+                fix.summary
+            );
+        }
+    }
+
+    #[test]
+    fn the_engine_import_failure_outranks_the_render_group_false_lead() {
+        // The reported case, reduced to what makes the false lead fire: the user
+        // is outside the render and video groups, so the catalog's best answer
+        // to this symptom was fix-4 at 45 (35 render + 10 video), and following
+        // it meant a usermod, a re-login, and no progress. The fixture leaves
+        // `kfd` unset rather than modelling the reported host's permissions,
+        // because fix-4's score here comes from the group membership alone.
+        // The fixture reproduces that false lead, so the assertion is about the
+        // ranking and not only about the new entry's score.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+
+        let report = diagnose(
+            &e,
+            "vllm engine fails to start: OSError: libtorch_cuda.so: cannot open shared object file",
+        );
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-17-torch-dlpack");
+        assert!(top.score >= MIN_SCORE_FOR_MATCH, "score was {}", top.score);
+        assert!(report.has_match());
+
+        let render_group = report
+            .matched
+            .iter()
+            .position(|d| d.id == "fix-4-render-group")
+            .expect("the fixture must still produce the false lead this outranks");
+        assert!(
+            render_group > 0,
+            "the render-group suggestion must no longer be the top answer here"
+        );
+    }
+
+    #[test]
+    fn the_engine_import_plan_says_which_shell_each_step_runs_in() {
+        // The plan `diagnose` attaches to the finding is a second copy of the
+        // catalog recipe's command block, and it is the copy the reported user
+        // actually saw. Hold it to the same boundary the recipe is held to, so
+        // the two cannot drift into disagreeing about which shell runs what.
+        let report = diagnose(
+            &linux_base(),
+            "OSError: libtorch_cuda.so: cannot open shared object file",
+        );
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-17-torch-dlpack")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_engine_shell_boundary_is_labelled(&fix.fix_id, &commands);
+        // The boundary check alone leaves the wording free to drift, so pin the
+        // two copies to each other line for line as well.
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_extension_name_alone_does_not_establish_the_variant_failure() {
+        // The extension appearing in a traceback says it is involved, not that
+        // it loaded the CUDA variant. Holding this under the threshold is what
+        // stops the entry from answering every vLLM import error.
+        let report = diagnose(
+            &linux_base(),
+            "ImportError raised from torch_c_dlpack_ext during startup",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-17-torch-dlpack")
+            .expect("the keyword should still register as a weak signal");
+        assert!(
+            hit.score < MIN_SCORE_FOR_MATCH,
+            "score was {}, which would promote a weak signal to an established cause",
+            hit.score
+        );
+    }
+
+    #[test]
     fn arch_not_in_wheel_strong_signal() {
         let mut e = linux_base();
         e.framework = "pytorch".to_owned();
@@ -1723,29 +2886,505 @@ mod tests {
         assert!(report.matched.iter().all(|d| d.id != "fix-1-arch"));
     }
 
-    #[test]
-    fn wsl2_is_out_of_scope_and_emits_no_false_positives() {
+    /// A WSL2 host with the GPU stack fully in place.
+    fn wsl_base() -> Examination {
         let mut e = linux_base();
         e.is_wsl = true;
-        // Signals that WOULD fire fix-4/fix-5/fix-3/fix-6 on bare-metal Linux —
-        // all normal/irrelevant on WSL2, so none must surface.
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.kernel_release = "6.6.87.2-microsoft-standard-WSL2".to_owned();
+        e.wsl = Some(WslFacts {
+            version: 2,
+            dxg_device: true,
+            dxcore: true,
+            wsl_lib_dir: true,
+            librocdxg: true,
+            rocdxg_dids: true,
+            ldconfig_librocdxg: Some(true),
+            rocminfo: true,
+            rocm_sees_gpu: Some(true),
+            distro_supported: Some(true),
+            host_driver_version: Some("32.0.12033.1030".to_owned()),
+            host_reachable: true,
+            locally_probed: true,
+        });
+        // The shared cross-platform checks read these, and on a real WSL host
+        // `probe_wsl` fills them from the WSL facts. A fixture that left them at
+        // their defaults would be a healthier machine than any real one.
+        e.rocminfo_present = true;
+        e.rocminfo_status = "ok".to_owned();
+        e
+    }
+
+    #[test]
+    fn wsl2_never_runs_the_bare_metal_catalog() {
+        // The property the old wholesale WSL short-circuit bought, kept after
+        // WSL became a real platform in the catalog. Every signal below WOULD
+        // fire a bare-metal check; none of them mean anything on WSL2, where
+        // there is no amdgpu module, no /dev/kfd and no render group.
+        let mut e = wsl_base();
         e.in_render_group = Some(false);
         e.in_video_group = Some(false);
         e.amdgpu_loaded = Some(false);
         e.rocm_version = "6.4.1".to_owned();
-        e.rocm_path = "/opt/rocm".to_owned();
-        e.rocminfo_present = false;
+        e.amdgpu_blacklisted_in = vec!["/etc/modprobe.d/blacklist.conf".to_owned()];
+        e.rocm_repos_seen = vec![
+            "repo.radeon.com/rocm/6.2".to_owned(),
+            "repo.radeon.com/rocm/6.4".to_owned(),
+        ];
         let report = diagnose(&e, "unable to open /dev/kfd permission denied");
+        for bare_metal in [
+            "fix-3-rocm-kernel",
+            "fix-4-render-group",
+            "fix-5-amdgpu-load",
+            "fix-7-stale-repos",
+            "fix-10-container",
+            "fix-11-iommu",
+            "fix-12-installer",
+        ] {
+            assert!(
+                !report.matched.iter().any(|d| d.id == bare_metal),
+                "{bare_metal} must not fire on WSL2"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_checks_never_fire_on_bare_metal() {
+        // The converse guard. A bare-metal host has no WSL facts at all, and the
+        // WSL checks read those facts as false -- so without the family gate they
+        // would report a missing /dev/dxg on every ordinary Linux box.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        assert!(
+            !report.matched.iter().any(|d| d.id.starts_with("fix-wsl-")),
+            "no WSL entry may fire on bare metal: {:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_healthy_wsl_host_gets_no_diagnosis() {
+        // Scenario 2: the platform is covered, so `out_of_scope` stays clear, and
+        // a symptom the catalog does not recognise must not manufacture a cause.
+        let report = diagnose(&wsl_base(), "the model output looks wrong");
+        assert!(
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform now"
+        );
+        // Emptiness, not just `!has_match()`. A sub-threshold finding is still
+        // printed and still tells the user something is wrong with their machine,
+        // so a healthy host must produce NO entries at all. Asserting only on the
+        // verdict let a permanent score-40 false positive through: the host-driver
+        // check read a field the WSL probe never populates.
         assert!(
             report.matched.is_empty(),
-            "WSL2 must not run the bare-metal catalog"
-        );
-        assert!(
-            report.out_of_scope.is_some(),
-            "WSL2 should be flagged out of scope"
+            "a healthy WSL host must produce no findings at all, got: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
         );
         assert!(!report.has_match());
-        assert!(report.out_of_scope.as_deref().unwrap().contains("WSL2"));
+        assert!(!report.route_when_no_match.url.is_empty());
+    }
+
+    #[test]
+    fn an_installed_rocm_is_not_reported_as_missing_from_path_on_wsl() {
+        // `rocminfo_present` is set by the bare-metal GPU probe, which WSL skips.
+        // Left at its default it read as "rocminfo is not on PATH", so fix-6 --
+        // enabled on WSL because PATH problems are real there -- scored 50 on
+        // every WSL host that had ROCm installed.
+        let mut e = wsl_base();
+        e.rocm_path = "/opt/rocm".to_owned();
+        e.rocminfo_present = true;
+        e.env
+            .insert("PATH".to_owned(), "/opt/rocm/bin:/usr/bin:/bin".to_owned());
+        let report = diagnose(&e, "");
+        assert!(
+            !report.matched.iter().any(|d| d.id == "fix-6-path"),
+            "ROCm is installed and on PATH here: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_is_not_reported_when_the_device_is_missing() {
+        // librocdxg can be installed while /dev/dxg is absent. Running `ldconfig`
+        // then fixes nothing, and offering it alongside the real cause leaves the
+        // user to guess which to act on -- the same reason the DXCore and ROCDXG
+        // checks already stand down without the device.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_dxg_device_is_the_top_finding() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").dxg_device = false;
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-1-gpu-not-exposed");
+        assert!(top.score >= HIGH_CONFIDENCE, "score {}", top.score);
+    }
+
+    #[test]
+    fn a_container_without_the_device_is_not_blamed_on_the_windows_driver() {
+        // A container on WSL2 reports itself as WSL but only sees /dev/dxg when
+        // it was started with it. Telling that user to update a Windows driver
+        // sends them to fix a machine that was never broken.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").dxg_device = false;
+        e.in_container = true;
+        e.container_kind = "docker".to_owned();
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-1-gpu-not-exposed");
+        assert!(
+            top.evidence.iter().any(|line| line.contains("container")),
+            "evidence must name the container as the reason: {:?}",
+            top.evidence
+        );
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("host driver is probably fine")),
+            "must say the Windows driver is not the suspect: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn only_the_root_cause_of_a_broken_stack_is_reported() {
+        // With no device, the missing DXCore shim and the missing ROCDXG package
+        // are consequences, not causes. Reporting all three would leave the user
+        // to guess which one to act on.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.dxcore = false;
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_rocdxg_package_is_reported_when_the_host_side_is_ready() {
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-3-rocdxg-missing");
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            !fix.auto_applicable,
+            "installing a .deb with sudo must stay print-only"
+        );
+        assert!(
+            fix.notes.iter().any(|n| n.contains("ROCDXG_SHA256")),
+            "must offer the checksum option: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn an_installed_but_unlinked_rocdxg_is_a_distinct_finding() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-4-rocdxg-not-linked");
+    }
+
+    #[test]
+    fn an_unlinked_rocdxg_does_not_also_raise_the_host_driver_finding() {
+        // Same fault as above, but with `rocm_sees_gpu = Some(false)` added so
+        // this machine also satisfies every other condition
+        // check_wsl_6_host_driver_too_old's second arm checks (dxg_device,
+        // dxcore, librocdxg, rocminfo seeing no GPU). Without the ldconfig
+        // guard on that arm, it fires alongside fix-wsl-4 for the same
+        // underlying fault, leaving the user to guess between "run ldconfig"
+        // and "update the Windows host driver" when only the former is true.
+        //
+        // The symptom text also carries a generic "cannot open shared object
+        // file" keyword that fix-8-wheel-rocm scores on regardless of WSL
+        // state -- that overlap is real and expected, so this only asserts on
+        // the two WSL findings that fix #2's guard actually governs.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.ldconfig_librocdxg = Some(false);
+        w.rocm_sees_gpu = Some(false);
+        let report = diagnose(&e, "librocdxg.so: cannot open shared object file");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert!(
+            ids.contains(&"fix-wsl-4-rocdxg-not-linked"),
+            "the unlinked-library finding must still fire: ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"fix-wsl-6-host-driver-too-old"),
+            "the host-driver-too-old finding must not overlap with the unlinked-library \
+             finding on the same fault: ids: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_distro_below_the_floor_is_reported() {
+        let mut e = wsl_base();
+        e.distro_version = "22.04".to_owned();
+        e.wsl.as_mut().expect("wsl facts").distro_supported = Some(false);
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-5-distro-too-old");
+        assert!(
+            top.evidence[0].contains("22.04"),
+            "evidence must name the release found: {:?}",
+            top.evidence
+        );
+    }
+
+    #[test]
+    fn an_unreadable_distro_release_is_not_reported_as_too_old() {
+        // `None` means the release could not be parsed. That is not evidence of
+        // an old distro, and a finding here would send the user to reinstall a
+        // perfectly supported one.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").distro_supported = None;
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-5-distro-too-old"),
+            "must not guess: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_typed_symptom_alone_never_blames_the_windows_host_driver() {
+        // The host-driver check shares a generic keyword table with fix-wsl-1
+        // ("/dev/dxg", "no HIP-capable device"), and unlike every other WSL entry
+        // it has no base score from a fact. Scoring keywords before checking that
+        // anything was actually measured let an ordinary description of a GPU
+        // problem reach 85 -- HIGH confidence -- on a fully healthy machine,
+        // with both evidence lines being the user's own words.
+        let symptom = "no hip-capable device found, see /dev/dxg";
+        let report = diagnose(&wsl_base(), symptom);
+        assert!(
+            report.matched.is_empty(),
+            "a healthy host must stay silent whatever the user typed: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // And the real cause must outrank a keyword-only guess. With ROCDXG
+        // missing, the driver check previously scored 85 against fix-wsl-3's 65
+        // and sent the user to reinstall a current driver.
+        let mut broken = wsl_base();
+        let w = broken.wsl.as_mut().expect("wsl facts");
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&broken, symptom);
+        assert_eq!(
+            report.matched[0].id,
+            "fix-wsl-3-rocdxg-missing",
+            "the measured fault must rank first: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_linker_cache_is_not_an_unregistered_library() {
+        // `ldconfig` lives in /sbin, off a non-root user's PATH on Debian. When
+        // it cannot be run the cache is unknown, not empty -- reading it as empty
+        // told users with a correctly installed ROCDXG to re-run `ldconfig`.
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").ldconfig_librocdxg = None;
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-4-rocdxg-not-linked"),
+            "unknown must not be reported as not-linked: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_amd_adapter_is_not_reported_twice_with_the_device_missing() {
+        // Without /dev/dxg, fix-wsl-1 is the cause. The driver check's
+        // no-adapter arm lacked the device guard its siblings carry, so both
+        // fired for one root cause.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxg_device = false;
+        w.host_driver_version = Some(String::new());
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-1-gpu-not-exposed"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_missing_dxcore_shim_is_reported_when_the_device_is_present() {
+        // The only WSL entry with no fire-case test: both existing tests that
+        // clear `dxcore` also clear `dxg_device`, so they exercised the abstain
+        // path and an inverted condition here would have passed CI.
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.dxcore = false;
+        w.wsl_lib_dir = false;
+        let report = diagnose(&e, "libdxcore.so: cannot open shared object file");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-2-dxcore-missing");
+        assert!(top.score >= MIN_SCORE_FOR_MATCH, "score {}", top.score);
+    }
+
+    #[test]
+    fn an_unreachable_windows_host_never_blames_the_host_driver() {
+        // Scenario 6. Interop is off or this is a container, so the host driver
+        // is unknown -- and unknown must not read as "too old".
+        let mut e = wsl_base();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.host_reachable = false;
+        w.host_driver_version = None;
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-wsl-6-host-driver-too-old"),
+            "the check must abstain when the host was never asked: {:?}",
+            report.matched
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_amd_adapter_is_reported() {
+        let mut e = wsl_base();
+        e.wsl.as_mut().expect("wsl facts").host_driver_version = Some(String::new());
+        let report = diagnose(&e, "");
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-wsl-6-host-driver-too-old");
+        let fix = top.fix.as_ref().expect("carries a fix");
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("Nothing inside the distro")),
+            "must say the remedy belongs to the Windows host: {:?}",
+            fix.notes
+        );
+    }
+
+    #[test]
+    fn wsl1_is_reported_instead_of_a_missing_device() {
+        // WSL 1 has no GPU path at all, so "install a driver" is the wrong advice
+        // and fix-wsl-1 must stand down in favour of the conversion.
+        let mut e = wsl_base();
+        e.kernel_release = "4.4.0-19041-Microsoft".to_owned();
+        let w = e.wsl.as_mut().expect("wsl facts");
+        w.version = 1;
+        w.dxg_device = false;
+        w.dxcore = false;
+        w.wsl_lib_dir = false;
+        w.librocdxg = false;
+        w.ldconfig_librocdxg = Some(false);
+        let report = diagnose(&e, "no ROCm-capable device is detected");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["fix-wsl-7-wsl1"], "ids: {ids:?}");
+    }
+
+    #[test]
+    fn the_shared_checks_under_report_on_wsl_rather_than_over_report() {
+        // WSL does not collect GPU topology: `gpus` stays empty because the
+        // probes that fill it read KFD and DRM, which do not exist there. The
+        // cross-platform checks enabled on WSL read those fields, so they run on
+        // less evidence here than on bare metal.
+        //
+        // That degradation has to be one-directional. Missing topology must mean
+        // a check cannot reach its threshold on structure alone -- never that it
+        // invents a fault. This pins the direction: on a healthy host with a
+        // framework installed, no shared check may fire at all.
+        let mut e = wsl_base();
+        e.framework = "pytorch".to_owned();
+        e.framework_version = "2.6.0".to_owned();
+        e.framework_rocm_version = "6.4".to_owned();
+        e.rocm_version = "6.4.1".to_owned();
+        e.framework_arch_list = vec!["gfx1100".to_owned(), "gfx1151".to_owned()];
+        e.rocm_path = "/opt/rocm".to_owned();
+        e.env
+            .insert("PATH".to_owned(), "/opt/rocm/bin:/usr/bin".to_owned());
+        assert!(e.gpus.is_empty(), "WSL collects no GPU topology");
+
+        let report = diagnose(&e, "");
+        assert!(
+            report.matched.is_empty(),
+            "no shared check may fire without topology: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_environment_override_is_still_diagnosed_on_wsl() {
+        // The gain from the family split: HSA_OVERRIDE_GFX_VERSION has nothing to
+        // do with the kernel module, so it was always a valid question on WSL --
+        // but the old wholesale skip meant it went unanswered there.
+        let mut e = wsl_base();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        let report = diagnose(&e, "memory access fault page fault");
+        assert!(
+            report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-2-unset-override"),
+            "matched: {:?}",
+            report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_platform_with_no_catalog_entries_says_nothing_was_checked() {
+        // Previously only WSL set this. An unsupported OS fell through to an
+        // empty catalog and reported "no known misconfiguration", which reads as
+        // a clean bill of health when in truth nothing ran.
+        let mut e = linux_base();
+        e.os_family = "other".to_owned();
+        let report = diagnose(&e, "anything at all");
+        let reason = report
+            .out_of_scope
+            .as_deref()
+            .expect("an uncovered platform must say so");
+        assert!(reason.contains("other"), "must name the platform: {reason}");
+        assert!(
+            reason.contains("not a clean bill of health"),
+            "must not be mistaken for a pass: {reason}"
+        );
+        assert!(report.matched.is_empty());
+        assert!(!report.has_match());
     }
 
     #[test]
