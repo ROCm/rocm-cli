@@ -22,14 +22,14 @@
 //! the grammar lives here once, in one private stepping function, and each
 //! caller interprets the classified tokens it yields.
 //!
-//! # The one exception to the never-merge property
+//! # Line breaks inside a string body: merging and losing rows
 //!
 //! [`rendered_lines`] is an over-approximation of what a terminal would have
-//! drawn: it may split one rendered line in two, or lose one altogether, and in
-//! the other direction it merges two rendered rows in exactly one shape. A line
-//! break *inside* the body of a string-argument sequence (`OSC`, `DCS`, `SOS`,
-//! `PM`, `APC`) is consumed with that body, so the text either side of the
-//! sequence joins up:
+//! drawn: it may split one rendered line in two, or lose one or more
+//! altogether, and in the other direction it merges two rendered rows in
+//! exactly one shape. A line break *inside* the body of a string-argument
+//! sequence (`OSC`, `DCS`, `SOS`, `PM`, `APC`) is consumed with that body, so
+//! the text either side of the sequence joins up:
 //!
 //! ```text
 //! rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}llama.cpp OOM")
@@ -46,10 +46,9 @@
 //! in every one of those cases, terminated or not.
 //!
 //! Swallowing the break is not always a *merge*, though. A merge needs drawable
-//! text on both sides of the break landing in one segment, so what decides is
-//! whether drawable text follows the sequence in that same segment — however the
-//! body ended. Where none does there is no far side to join to, and what the
-//! terminal drew past the break comes back in no segment at all:
+//! text on both sides of the break landing in one segment — however the body
+//! ended. Where either side is missing, what the terminal drew past the break
+//! comes back in no segment at all:
 //!
 //! ```text
 //! rendered_lines("vllm\u{1b}]0;ti\ntle")          == ["vllm"]
@@ -65,16 +64,16 @@
 //! otherwise have made, and the canonical-symptom fallback covers it.
 //!
 //! Common terminals abort a control string on an embedded C0 byte and would
-//! draw two rows there, so this is a real divergence rather than a technicality.
-//! Nor does it take crafted input to reach, which an earlier wording of this
-//! section claimed on the strength of a terminator being required. What it takes
-//! is an *interleaved* capture: `rocm serve` hands the subprocess's stdout and
-//! stderr the *same* file handle, so a title written on one stream can be cut by
-//! the other stream's next line landing between the introducer and the
-//! terminator, with neither writer doing anything unusual. A process killed
-//! part-way through the same title is the other ordinary half of it, leaving a
-//! body with no terminator at all — and killed output is the case this walk is
-//! built for.
+//! draw both sides of the break, so this is a real divergence rather than a
+//! technicality. Nor does it take crafted input to reach, which an earlier
+//! wording of this section claimed on the strength of a terminator being
+//! required. What it takes is an *interleaved* capture: `rocm serve` hands the
+//! subprocess's stdout and stderr the *same* file handle, so a title written on
+//! one stream can be cut by the other stream's next line landing between the
+//! introducer and the terminator, with neither writer doing anything unusual.
+//! A process killed part-way through the same title is the other ordinary half
+//! of it, leaving a body with no terminator at all — and killed output is the
+//! case this walk is built for.
 //!
 //! Such a capture reaches [`rendered_lines`] whole when a user pastes it into
 //! `rocm diagnose --symptom`. The vLLM engine's own path cannot carry an
@@ -89,13 +88,12 @@
 //! boundaries are for, since a window title would then be scored as if the
 //! process had printed it. The residual is therefore disclosed here rather than
 //! papered over: a break inside a string body is the one way two rendered rows
-//! come back as one segment, and — where no drawable text follows the sequence
-//! in that same segment — the one way a rendered row comes back in none.
+//! come back as one segment, and the one way a rendered row comes back in none.
 //!
-//! This section is the single authoritative statement of the exception. The
-//! code that creates it and the test that pins it both point here rather than
-//! restating it, so that a change to the behaviour cannot leave a stale copy of
-//! the guarantee behind in a doc a consumer reads.
+//! This section states the rule normatively; the comments on the code that
+//! creates it and on the test that pins it are local commentary, not the
+//! statement of record. A change to the behaviour has to land here, and any
+//! comment that has drifted from this section has to be brought back into line.
 
 /// What one step of the ECMA-48 walk found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
