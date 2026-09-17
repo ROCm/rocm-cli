@@ -533,8 +533,6 @@ pub struct AppState {
     pub theme_name: String,
     pub theme: Theme,
     pub theme_picker_sel: usize,
-    /// Scroll offset (in lines) inside the Bench Detail modal. Reset on Open.
-    pub bench_detail_scroll: u16,
     /// Scroll offset (in lines) inside the Help / GlobalHelp overlays. Both
     /// modals are mutually exclusive so one field suffices; reset on open.
     pub help_scroll: u16,
@@ -756,7 +754,6 @@ impl AppState {
             theme_name,
             theme,
             theme_picker_sel,
-            bench_detail_scroll: 0,
             help_scroll: 0,
             help_max_scroll: 0,
             instance_detail_scroll: 0,
@@ -984,7 +981,6 @@ impl AppState {
             ScrollTarget::Console => self.console_scroll = p,
             ScrollTarget::ConsoleH => self.console_hscroll = p,
             ScrollTarget::Chat => self.set_chat_scroll(position),
-            ScrollTarget::BenchDetail => self.bench_detail_scroll = p,
             ScrollTarget::DockLogs => self.dock_logs_scroll = p,
         }
     }
@@ -1182,19 +1178,6 @@ impl AppState {
         if len > 0 {
             self.theme_picker_sel = len - 1;
         }
-    }
-
-    /// Reset the bench-detail scroll offset (called when opening the modal).
-    pub const fn reset_bench_detail_scroll(&mut self) {
-        self.bench_detail_scroll = 0;
-    }
-
-    /// Adjust the bench-detail scroll. `delta` is in lines; clamped at 0
-    /// (no upper bound — the renderer clamps against the actual line count).
-    pub fn scroll_bench_detail(&mut self, delta: i16) {
-        let cur = i32::from(self.bench_detail_scroll);
-        let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
-        self.bench_detail_scroll = next;
     }
 
     /// Reset the Help / GlobalHelp scroll offset (called when opening either
@@ -2986,7 +2969,6 @@ fn target_position(state: &AppState, h: &ScrollbarHandle) -> usize {
         ScrollTarget::Console => usize::from(state.console_scroll),
         ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
         ScrollTarget::Chat => usize::from(state.chat_scroll),
-        ScrollTarget::BenchDetail => usize::from(state.bench_detail_scroll),
         ScrollTarget::DockLogs => h
             .max_position()
             .saturating_sub(usize::from(state.dock_logs_scroll)),
@@ -3188,8 +3170,6 @@ pub enum ScrollTarget {
     ConsoleH,
     /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
     DockLogs,
-    /// Bench row detail modal (`bench_detail_scroll`).
-    BenchDetail,
     /// Chat transcript (`chat_scroll`).
     Chat,
 }
@@ -4903,16 +4883,6 @@ mod tests {
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
             KeyAction::Nothing
         );
-    }
-
-    #[test]
-    fn scroll_bench_detail_clamps_at_zero() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.bench_detail_scroll = 5;
-        s.scroll_bench_detail(-100);
-        assert_eq!(s.bench_detail_scroll, 0);
-        s.scroll_bench_detail(7);
-        assert_eq!(s.bench_detail_scroll, 7);
     }
 
     #[test]
