@@ -117,4 +117,16 @@ Feature: TheRock "next" ROCm 10 install layout
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     And a registered ROCm 10 wheel runtime with a grouped family
     When the user previews applying the pending update to that runtime
-    Then the preview requests the gfx1200 device extras
+    # With the toolchain because that runtime's recorded specs have it: an
+    # update must reinstall what was installed, not the current default.
+    Then the preview requests the gfx1200 device extras with the toolchain
+
+  # The opt-in half of therock-next-02. Both polarities run here, on the mock
+  # lane, because this is the only place the flag's effect on the real install
+  # plan is observable without a GPU and a multi-GiB download.
+  @id:therock-next-09-wheel-devel-adds-the-toolchain
+  Scenario: therock-next-09 - A pinned ROCm 10 wheel install adds the toolchain when asked
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
+    Then the preview resolves the ROCm 10 pip index
+    And the preview requests the gfx1200 device extras with the toolchain
