@@ -46,6 +46,7 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the CLI describes what the fix would change
     And nothing on the machine is changed
+    And the preview states plainly that this fix is manual only
 
   @id:diagnose-fix-unknown-id-rejected
   Scenario: diagnose-06 - Asking for a fix the CLI does not know is refused clearly
@@ -266,3 +267,20 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that machine
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
+
+  # diagnose-05 only proves the manual/zero-optional-flags wording, because
+  # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
+  # sudo+re-login combination only exists on a fix gated to bare-metal Linux
+  # (fix-4-render-group), so it needs its own scenario -- but, like
+  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
+  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
+  # under test renders identically regardless of which lane runs it. The step
+  # asserts only that printed text, never the exit code -- `fix-4-render-group`
+  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
+  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
+  @id:diagnose-fix-preview-states-required-flags
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so
+    Given a user who has chosen a fix that needs sudo and a re-login
+    When the user previews that fix without applying it
+    Then the preview states that the fix requires sudo and a re-login
+    And the preview states that the CLI can run it automatically

@@ -201,6 +201,11 @@ async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen a fix that needs sudo and a re-login")]
+async fn user_chose_fix_needing_sudo_and_relogin(world: &mut E2eWorld) {
+    world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
+}
+
 #[given("a user who names a fix the CLI does not offer")]
 async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
@@ -908,6 +913,42 @@ async fn assert_describes_change(world: &mut E2eWorld) {
     assert!(
         output.contains("Fix:") && output.contains(PREVIEW_FIX_ID),
         "expected a plan describing {PREVIEW_FIX_ID}:\n{output}"
+    );
+}
+
+#[then("the preview states plainly that this fix is manual only")]
+async fn assert_preview_states_manual_only(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    assert!(
+        output.contains("Flags:      manual only (this command will NOT run it)"),
+        "expected a bare manual-only Flags: line for {PREVIEW_FIX_ID}, with no \
+         sudo/reboot/re-login flags ahead of it:\n{output}"
+    );
+}
+
+// Exercises COMMAND_FAILURE_FIX_ID (fix-4-render-group: needs_sudo +
+// needs_relogin + auto_applicable), the only catalog entry that combines sudo,
+// re-login, and AUTO in one recipe -- so it is the one place that can prove
+// `format_flags` renders more than one optional flag, and the auto-applicable
+// line, from a real `rocm fix <id> --dry-run` invocation. Deliberately checked
+// as one line, not three separate `contains`, so a regression that reordered
+// the flags (e.g. put re-login before sudo) would also be caught.
+#[then("the preview states that the fix requires sudo and a re-login")]
+async fn assert_preview_states_sudo_and_relogin(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    assert!(
+        output.contains("Flags:      requires sudo, requires re-login,"),
+        "expected sudo and re-login flags, in that order, for \
+         {COMMAND_FAILURE_FIX_ID}:\n{output}"
+    );
+}
+
+#[then("the preview states that the CLI can run it automatically")]
+async fn assert_preview_states_auto_applicable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    assert!(
+        output.contains("rocm fix can run it"),
+        "expected the auto-applicable flag text for {COMMAND_FAILURE_FIX_ID}:\n{output}"
     );
 }
 

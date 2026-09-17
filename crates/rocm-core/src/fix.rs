@@ -1664,4 +1664,112 @@ mod tests {
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
     }
+
+    #[test]
+    fn format_flags_covers_every_required_flag_combination_and_both_auto_states() {
+        // Exhaustive over the 3 optional flags (sudo/reboot/relogin) x both
+        // auto_applicable states, so a wording regression on any one flag, or
+        // on the always-present auto/manual marker, fails here rather than
+        // only being visible by eyeballing `rocm fix`/`rocm diagnose` output.
+        let cases: &[(bool, bool, bool, bool, &[&str])] = &[
+            (
+                false,
+                false,
+                false,
+                false,
+                &["manual only (this command will NOT run it)"],
+            ),
+            (false, false, false, true, &["rocm fix can run it"]),
+            (
+                true,
+                false,
+                false,
+                false,
+                &[
+                    "requires sudo",
+                    "manual only (this command will NOT run it)",
+                ],
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                &["requires sudo", "rocm fix can run it"],
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                &[
+                    "requires reboot",
+                    "manual only (this command will NOT run it)",
+                ],
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                &["requires reboot", "rocm fix can run it"],
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                &[
+                    "requires re-login",
+                    "manual only (this command will NOT run it)",
+                ],
+            ),
+            (
+                false,
+                false,
+                true,
+                true,
+                &["requires re-login", "rocm fix can run it"],
+            ),
+            (
+                true,
+                true,
+                true,
+                false,
+                &[
+                    "requires sudo",
+                    "requires reboot",
+                    "requires re-login",
+                    "manual only (this command will NOT run it)",
+                ],
+            ),
+            (
+                true,
+                true,
+                true,
+                true,
+                &[
+                    "requires sudo",
+                    "requires reboot",
+                    "requires re-login",
+                    "rocm fix can run it",
+                ],
+            ),
+            (
+                true,
+                false,
+                true,
+                true,
+                &["requires sudo", "requires re-login", "rocm fix can run it"],
+            ),
+        ];
+
+        for (needs_sudo, needs_reboot, needs_relogin, auto_applicable, expected) in cases {
+            let flags = format_flags(*needs_sudo, *needs_reboot, *needs_relogin, *auto_applicable);
+            assert_eq!(
+                flags, *expected,
+                "sudo={needs_sudo} reboot={needs_reboot} relogin={needs_relogin} auto={auto_applicable}"
+            );
+        }
+    }
 }
