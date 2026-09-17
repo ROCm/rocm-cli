@@ -88,72 +88,286 @@ mod tests {
     /// The mutating calls that need serializing.
     const MUTATIONS: [&str; 2] = ["env::set_var", "env::remove_var"];
 
-    /// Markers that show a file already serializes its env mutations behind a
-    /// process-wide lock. Both are existing repo mechanisms; a file using
-    /// either has opted into the discipline this guard enforces.
-    const SERIALIZERS: [&str; 2] = ["ScopedTestEnv", "PROCESS_ENV_TEST_LOCK"];
-
-    /// Line numbers (1-based) inside a `#[cfg(test)]` module or a `#[test]`
-    /// function that call one of [`MUTATIONS`].
+    /// Named helpers that serialize env mutation for their whole scope.
     ///
-    /// Brace-depth tracking rather than a whole-file substring match: production
-    /// code in the same file may legitimately set an environment variable (it
-    /// owns the process), and a file-level match could not tell the two apart.
-    fn env_mutations_in_test_code(text: &str) -> Vec<(usize, String)> {
-        let mut hits = Vec::new();
+    /// Anything ending `_TEST_LOCK` counts too, and is matched by suffix rather
+    /// than listed — see [`serializes`]. A fixed list of lock NAMES went stale
+    /// within days of this guard being written: `main` added
+    /// `UPDATE_CHECK_ENV_TEST_LOCK` and the guard then flagged correctly
+    /// disciplined code and told its author to rename the lock.
+    const NAMED_SERIALIZERS: [&str; 2] = ["ScopedTestEnv", "ScopedEnvVar"];
+
+    /// Whether `text` takes one of the process-wide serializers.
+    ///
+    /// The suffix rule recognises the DISCIPLINE rather than a specific lock, so
+    /// a new `*_TEST_LOCK` is covered the day it is declared.
+    fn serializes(text: &str) -> bool {
+        NAMED_SERIALIZERS.iter().any(|name| text.contains(name))
+            || text
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|word| word.ends_with("_TEST_LOCK"))
+    }
+
+    /// Replace the CONTENTS of string literals, char literals and comments with
+    /// spaces, preserving line structure and everything outside them.
+    ///
+    /// The scan below counts braces and looks for call text, and both are
+    /// wrong if a literal can contribute either. Two real files in this repo
+    /// break the naive version:
+    ///
+    /// * `engines/lemonade/src/lib.rs` contains
+    ///   `ensure_cached_archive("test://archive", ..., |_, destination| {`.
+    ///   Truncating the line at `//` throws away the closure's opening brace,
+    ///   so the enclosing test module reads as closed hundreds of lines early
+    ///   and every mutation after it becomes invisible.
+    /// * `tests/e2e-cucumber/src/mock_server.rs` contains format strings such
+    ///   as `vllm:num_requests_running{{model=...}}`. Those braces inflate the
+    ///   depth, which drags PRODUCTION code into the scanned region and makes
+    ///   the guard fail a build for a mutation it should not be watching.
+    ///
+    /// Both directions are silent, which is the one failure mode a permanent
+    /// guard must not have, so literals are tokenized rather than approximated.
+    fn strip_literals_and_comments(text: &str) -> String {
+        #[derive(Clone, Copy)]
+        enum State {
+            Code,
+            LineComment,
+            BlockComment(usize),
+            Str,
+            RawStr(usize),
+            Char,
+        }
+
+        let mut out = String::with_capacity(text.len());
+        let mut state = State::Code;
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                State::Code => {
+                    // A raw string opener: `r"`, `r#"`, `br##"` and so on. Checked
+                    // before the plain-string case so the hashes are counted.
+                    if (c == 'r' || c == 'b')
+                        && let Some((hashes, consumed)) = raw_string_opener(&chars, i)
+                    {
+                        out.extend(std::iter::repeat_n(' ', consumed));
+                        state = State::RawStr(hashes);
+                        i += consumed;
+                        continue;
+                    }
+                    if c == '/' && next == Some('/') {
+                        state = State::LineComment;
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c == '/' && next == Some('*') {
+                        state = State::BlockComment(1);
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        state = State::Str;
+                        out.push(' ');
+                        i += 1;
+                        continue;
+                    }
+                    // A lifetime (`'a`) is not a char literal. A char literal is
+                    // `'x'` or `'\n'`, so require a closing quote nearby.
+                    if c == '\'' && is_char_literal(&chars, i) {
+                        state = State::Char;
+                        out.push(' ');
+                        i += 1;
+                        continue;
+                    }
+                    out.push(c);
+                    i += 1;
+                }
+                State::LineComment => {
+                    if c == '\n' {
+                        state = State::Code;
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    i += 1;
+                }
+                State::BlockComment(depth) => {
+                    if c == '*' && next == Some('/') {
+                        state = if depth == 1 {
+                            State::Code
+                        } else {
+                            State::BlockComment(depth - 1)
+                        };
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c == '/' && next == Some('*') {
+                        state = State::BlockComment(depth + 1);
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                State::Str => {
+                    if c == '\\' {
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        state = State::Code;
+                    }
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                State::RawStr(hashes) => {
+                    if c == '"' && closing_hashes(&chars, i + 1) >= hashes {
+                        state = State::Code;
+                        out.extend(std::iter::repeat_n(' ', hashes + 1));
+                        i += hashes + 1;
+                        continue;
+                    }
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                State::Char => {
+                    if c == '\\' {
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    if c == '\'' {
+                        state = State::Code;
+                    }
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// `Some((hash_count, chars_consumed))` when a raw-string literal opens at
+    /// `i` (`r"`, `r#"`, `br##"`, ...).
+    fn raw_string_opener(chars: &[char], i: usize) -> Option<(usize, usize)> {
+        let mut j = i;
+        if chars.get(j) == Some(&'b') {
+            j += 1;
+        }
+        if chars.get(j) != Some(&'r') {
+            return None;
+        }
+        j += 1;
+        let hash_start = j;
+        while chars.get(j) == Some(&'#') {
+            j += 1;
+        }
+        if chars.get(j) == Some(&'"') {
+            Some((j - hash_start, j - i + 1))
+        } else {
+            None
+        }
+    }
+
+    fn closing_hashes(chars: &[char], mut i: usize) -> usize {
+        let start = i;
+        while chars.get(i) == Some(&'#') {
+            i += 1;
+        }
+        i - start
+    }
+
+    /// Distinguish `'x'` from a lifetime such as `'a` in `&'a str`.
+    fn is_char_literal(chars: &[char], i: usize) -> bool {
+        match chars.get(i + 1) {
+            // `'\n'`, `'\''`, `'\\'` -- always a literal.
+            Some('\\') => true,
+            Some(_) => chars.get(i + 2) == Some(&'\''),
+            None => false,
+        }
+    }
+
+    /// A `#[test]` function that mutates the environment.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Offense {
+        line: usize,
+        call: String,
+    }
+
+    /// Mutations inside a `#[test]` function that does not serialize itself.
+    ///
+    /// Scoped to the test FUNCTION, not the file. The file-level rule this
+    /// replaces asked only whether a marker appeared anywhere in the text, so a
+    /// comment reading "maybe migrate this to ScopedTestEnv one day" exempted
+    /// every test in the file — and `apps/rocm/src/main.rs` (379 tests) and
+    /// `apps/rocm/src/therock.rs` (73) were both wholly exempt for that reason,
+    /// which is precisely where the next unguarded test is most likely to land.
+    ///
+    /// Known limit: a `#[test]` that delegates its mutation to an unguarded
+    /// helper is not caught, because the helper's body is a different scope.
+    /// Mutations outside `#[test]` functions are deliberately not flagged —
+    /// that is production code, and test-support types such as `ScopedTestEnv`
+    /// whose whole job is to perform the mutation on a test's behalf.
+    fn env_mutations_in_unserialized_tests(text: &str) -> Vec<Offense> {
+        let stripped = strip_literals_and_comments(text);
+        let mut offenses = Vec::new();
         let mut depth: usize = 0;
-        // Depth at which the enclosing test block opened, if we are inside one.
-        let mut test_block: Option<usize> = None;
         let mut pending_test_attr = false;
+        // (depth at which the test fn body opened, body text so far, hits so far)
+        let mut current: Option<(usize, String, Vec<Offense>)> = None;
 
-        for (index, raw) in text.lines().enumerate() {
-            let line = raw.trim();
-            let code = line.split("//").next().unwrap_or(line);
+        for (index, line) in stripped.lines().enumerate() {
+            let code = line.trim();
 
-            if test_block.is_none() && (line.contains("#[cfg(test)]") || line.contains("#[test]")) {
+            if current.is_none() && code.contains("#[test]") {
                 pending_test_attr = true;
             }
 
-            if test_block.is_some()
-                && let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle))
-            {
-                hits.push((index + 1, (*found).to_owned()));
+            if let Some((_, body, hits)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+                if let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle)) {
+                    hits.push(Offense {
+                        line: index + 1,
+                        call: (*found).to_owned(),
+                    });
+                }
             }
 
             let opens = code.matches('{').count();
             let closes = code.matches('}').count();
-            if pending_test_attr {
-                if opens > 0 {
-                    test_block.get_or_insert(depth);
-                    pending_test_attr = false;
-                } else if code.trim_end().ends_with(';') {
-                    // The attribute belonged to a braceless item -- a
-                    // `#[cfg(test)] use ...;` import, say. Disarm, or the next
-                    // brace anywhere in the file would be mistaken for the
-                    // start of a test block and production code below it would
-                    // be scanned as test code.
-                    pending_test_attr = false;
-                }
+
+            if pending_test_attr && opens > 0 {
+                pending_test_attr = false;
+                current = Some((depth, String::new(), Vec::new()));
+            } else if pending_test_attr && code.ends_with(';') {
+                // The attribute gated a braceless item; disarm so the next brace
+                // anywhere in the file is not mistaken for a test body.
+                pending_test_attr = false;
             }
-            // Saturating: a brace inside a string or macro can make a line look
-            // unbalanced, and the scan should degrade rather than panic.
+
             depth = (depth + opens).saturating_sub(closes);
-            if let Some(open_depth) = test_block
-                && depth <= open_depth
+
+            if let Some((open_depth, body, hits)) = current.as_ref()
+                && depth <= *open_depth
             {
-                test_block = None;
+                if !serializes(body) {
+                    offenses.extend(hits.iter().map(|hit| Offense {
+                        line: hit.line,
+                        call: hit.call.clone(),
+                    }));
+                }
+                current = None;
             }
         }
-        hits
-    }
-
-    /// Whether `text` serializes its env mutations behind a process-wide lock.
-    ///
-    /// File-level on purpose: both existing mechanisms declare the lock once and
-    /// take it in each test that needs it, so the guard asks whether the file
-    /// has opted in rather than trying to prove each call site is covered.
-    fn serializes_env_mutations(text: &str) -> bool {
-        SERIALIZERS.iter().any(|marker| text.contains(marker))
+        offenses
     }
 
     #[test]
@@ -164,12 +378,9 @@ mod tests {
         for path in workspace_rust_sources() {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            if serializes_env_mutations(&text) {
-                continue;
-            }
             let relative = path.strip_prefix(&root).unwrap_or(&path).display();
-            for (line, call) in env_mutations_in_test_code(&text) {
-                offenders.push(format!("{relative}:{line}: {call}"));
+            for offense in env_mutations_in_unserialized_tests(&text) {
+                offenders.push(format!("{relative}:{}: {}", offense.line, offense.call));
             }
         }
 
@@ -180,31 +391,39 @@ mod tests {
              any test reading the same key and fails only under a threaded \
              runner (the Windows lane, a required check). Prefer passing the \
              value in through a seam (see `newest_rocm_install_dir_in`); \
-             otherwise hold `ScopedTestEnv` or `PROCESS_ENV_TEST_LOCK`. \
-             Offenders:\n{}",
+             otherwise take `ScopedTestEnv` or any `*_TEST_LOCK` in the test \
+             body. Offenders:\n{}",
             offenders.join("\n")
         );
     }
 
     /// A mutating call, assembled at runtime.
     ///
-    /// Spelling `env::set_var` literally in a fixture below would make this
-    /// file's own test code match the scan it defines, so the fixtures build
-    /// the needle instead of containing it.
+    /// Spelling `env::set_var` literally in a fixture would make this file's own
+    /// test code match the scan it defines, so the fixtures build the needle
+    /// instead of containing it. The `MUTATIONS` const above still spells them
+    /// literally; that is fine now the exemption is per-test-function rather
+    /// than per-file, because the const is not inside a `#[test]` body.
     fn mutation_call(kind: &str) -> String {
         format!("unsafe {{ std::env::{kind}(\"KEY\", \"value\") }}")
     }
 
+    fn unguarded_test(body: &str) -> String {
+        format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {body}\n    }}\n}}\n"
+        )
+    }
+
     #[test]
-    fn the_scanner_sees_a_mutation_inside_a_test_module() {
+    fn the_scanner_sees_a_mutation_inside_a_test() {
         let call = mutation_call("set_var");
         let source = format!(
             "fn production() {{\n    {call}\n}}\n\
              #[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {call}\n    }}\n}}\n"
         );
-        let hits = env_mutations_in_test_code(&source);
+        let hits = env_mutations_in_unserialized_tests(&source);
         assert_eq!(hits.len(), 1, "expected exactly the in-test hit: {hits:?}");
-        assert_eq!(hits[0].0, 8, "should flag the line inside the test module");
+        assert_eq!(hits[0].line, 8, "should flag the line inside the test");
     }
 
     #[test]
@@ -213,21 +432,21 @@ mod tests {
         // the hazard is specific to tests sharing one process under `cargo test`.
         let source = format!("fn production() {{\n    {}\n}}\n", mutation_call("set_var"));
         assert!(
-            env_mutations_in_test_code(&source).is_empty(),
+            env_mutations_in_unserialized_tests(&source).is_empty(),
             "a mutation outside test code is not an offense"
         );
     }
 
     #[test]
-    fn the_scanner_stops_flagging_after_the_test_module_closes() {
+    fn the_scanner_stops_flagging_after_the_test_closes() {
         let source = format!(
             "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        let _ = 1;\n    }}\n}}\n\
              fn later_production() {{\n    {}\n}}\n",
             mutation_call("remove_var")
         );
         assert!(
-            env_mutations_in_test_code(&source).is_empty(),
-            "the test module ended; the later mutation is production code"
+            env_mutations_in_unserialized_tests(&source).is_empty(),
+            "the test ended; the later mutation is production code"
         );
     }
 
@@ -235,37 +454,158 @@ mod tests {
     fn the_scanner_ignores_a_cfg_test_attribute_on_a_braceless_item() {
         // `#[cfg(test)] use ...;` gates an import, not a block. Treating it as
         // the opening of a test block would make every brace after it -- the
-        // whole rest of the file -- read as test code. Several files in this
-        // repo (crates/rocm-dash-tui/src/ui/dock.rs, apps/rocmd/src/lib.rs) do
-        // exactly this above production code that sets an env var.
+        // whole rest of the file -- read as test code.
         let source = format!(
             "#[cfg(test)]\nuse foo::Bar;\n\nfn production() {{\n    {}\n}}\n",
             mutation_call("set_var")
         );
         assert!(
-            env_mutations_in_test_code(&source).is_empty(),
+            env_mutations_in_unserialized_tests(&source).is_empty(),
             "the attribute gated an import; nothing below it is test code"
         );
     }
 
     #[test]
-    fn a_serialized_file_is_exempt_but_an_unguarded_one_is_not() {
-        let unguarded = format!(
-            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {}\n    }}\n}}\n",
+    fn a_serialized_test_is_exempt_but_an_unguarded_one_is_not() {
+        let unguarded = unguarded_test(&mutation_call("set_var"));
+        assert_eq!(
+            env_mutations_in_unserialized_tests(&unguarded).len(),
+            1,
+            "nothing in this test takes a process-wide lock"
+        );
+
+        for marker in [
+            "let _env = ScopedTestEnv::new();",
+            "let _env = ScopedEnvVar::new(\"K\");",
+            "let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();",
+            // The suffix rule: a lock this guard has never heard of.
+            "let _guard = SOME_BRAND_NEW_TEST_LOCK.lock().unwrap();",
+        ] {
+            let guarded =
+                unguarded_test(&format!("{marker}\n        {}", mutation_call("set_var")));
+            assert!(
+                env_mutations_in_unserialized_tests(&guarded).is_empty(),
+                "taking {marker} should satisfy the guard"
+            );
+        }
+    }
+
+    /// The exemption must not be file-wide.
+    ///
+    /// Under the previous rule this whole file was exempt because SOME test in
+    /// it took a lock -- or merely because a comment named one. That is how
+    /// `apps/rocm/src/main.rs` (379 tests) and `apps/rocm/src/therock.rs` (73)
+    /// ended up with no line-level enforcement at all.
+    #[test]
+    fn one_serialized_test_does_not_exempt_its_neighbour() {
+        let call = mutation_call("set_var");
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n\
+             \x20   #[test]\n    fn guarded() {{\n        let _env = ScopedTestEnv::new();\n        {call}\n    }}\n\
+             \x20   #[test]\n    fn unguarded() {{\n        {call}\n    }}\n}}\n"
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the unguarded test is an offense: {hits:?}"
+        );
+        assert_eq!(hits[0].line, 10);
+    }
+
+    #[test]
+    fn a_comment_naming_a_serializer_does_not_exempt_anything() {
+        let source = unguarded_test(&format!(
+            "// TODO: maybe migrate this to ScopedTestEnv one day\n        {}",
+            mutation_call("set_var")
+        ));
+        assert_eq!(
+            env_mutations_in_unserialized_tests(&source).len(),
+            1,
+            "a comment is not a lock"
+        );
+    }
+
+    /// A `}}` inside a string literal used to close the enclosing test early,
+    /// making every later mutation invisible. Real instance:
+    /// `tests/e2e-cucumber/src/mock_server.rs` builds Prometheus format strings
+    /// containing `{{...}}`.
+    #[test]
+    fn a_brace_inside_a_string_literal_does_not_close_the_test() {
+        let source = unguarded_test(&format!(
+            "let _s = \"}}}}\";\n        {}",
+            mutation_call("set_var")
+        ));
+        assert_eq!(
+            env_mutations_in_unserialized_tests(&source).len(),
+            1,
+            "a brace inside a literal must not end the test block"
+        );
+    }
+
+    /// A `//` inside a string literal used to truncate the line, discarding any
+    /// brace after it. Real instance: `engines/lemonade/src/lib.rs` passes
+    /// `"test://archive"` on a line that also opens a closure.
+    #[test]
+    fn a_double_slash_inside_a_string_literal_does_not_truncate_the_line() {
+        let call = mutation_call("set_var");
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n\
+             \x20       helper(\"test://archive\", |_| {{\n            let _ = 1;\n        }});\n\
+             \x20       {call}\n    }}\n}}\n"
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the closure's brace was inside a literal-bearing line: {hits:?}"
+        );
+    }
+
+    /// The mirror failure: an unbalanced `{{` in a literal inflates the depth and
+    /// keeps the scan inside a test long after it ended, so PRODUCTION code
+    /// downstream gets flagged and the build fails for nothing.
+    #[test]
+    fn an_opening_brace_in_a_literal_does_not_drag_in_production_code() {
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        let _s = \"{{\";\n    }}\n}}\n\
+             fn later_production() {{\n    {}\n}}\n",
             mutation_call("set_var")
         );
         assert!(
-            !serializes_env_mutations(&unguarded),
-            "nothing in this source takes a process-wide lock"
+            env_mutations_in_unserialized_tests(&source).is_empty(),
+            "an opening brace inside a literal must not extend the test block"
         );
+    }
 
-        let guarded = unguarded.replace(
-            "    #[test]",
-            "    static PROCESS_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());\n    #[test]",
+    #[test]
+    fn literals_and_comments_are_stripped_but_line_numbers_survive() {
+        let source =
+            "let a = \"}}}}\"; // }}\nlet b = r#\"raw } {\"#;\n/* block } */\nlet c = 1;\n";
+        let stripped = strip_literals_and_comments(source);
+        assert_eq!(
+            stripped.lines().count(),
+            source.lines().count(),
+            "line structure must survive: {stripped:?}"
         );
         assert!(
-            serializes_env_mutations(&guarded),
-            "declaring the shared lock opts the file into the discipline"
+            !stripped.contains('}') && !stripped.contains('{'),
+            "every brace here is inside a literal or comment: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("let c = 1;"),
+            "code must survive: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn a_lifetime_is_not_mistaken_for_a_char_literal() {
+        // `'a` opens no literal; treating it as one would swallow the rest of
+        // the line, including any brace or call on it.
+        let stripped = strip_literals_and_comments("fn f<'a>(x: &'a str) -> &'a str { x }\n");
+        assert!(
+            stripped.contains('{') && stripped.contains('}'),
+            "{stripped:?}"
         );
     }
 }
