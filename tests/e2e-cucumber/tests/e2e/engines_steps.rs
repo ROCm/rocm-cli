@@ -114,14 +114,14 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     // that happened earlier and elsewhere.
     session
         .wait_for_screen_where(
-            &format!("{marker} on a prompt line"),
-            SCREEN_TIMEOUT,
+            &format!("{marker} appears on a prompt line"),
             |screen| {
                 screen
                     .lines()
                     .filter(|line| line.contains(&marker))
                     .any(|line| line.contains('$'))
             },
+            SCREEN_TIMEOUT,
         )
         .await
         .unwrap_or_else(|e| panic!("the engine shell's prompt was never marked: {e}"));

@@ -440,52 +440,58 @@ impl TuiSession {
     /// the child exits before the marker appears.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
         let wanted = format!("{marker:?}");
-        self.wait_for_screen_where(&wanted, timeout, |screen| screen.contains(marker))
+        self.wait_for_screen_where(&wanted, |screen| screen.contains(marker), timeout)
             .await
     }
 
-    /// The same wait as [`Self::wait_for_screen`], for a condition a substring
-    /// cannot express.
+    /// Poll the current screen until `is_ready` accepts it, with the same
+    /// fail-fast diagnostics as [`wait_for_screen`](Self::wait_for_screen): a
+    /// reader-thread panic or a child that exits mid-wait is reported as itself
+    /// rather than as a timeout against the frozen last screen.
     ///
-    /// Callers that hand-roll this loop lose what the waiting is really for: a
-    /// shell that dies, or a pty reader that panics, is reported as the real
-    /// cause here instead of running out the full timeout and blaming whatever
-    /// the caller happened to be looking for. `wanted` is quoted into those
-    /// messages, so it should read as the thing being waited for.
+    /// The general form of `wait_for_screen`, for evidence a frame is current
+    /// that is not "it contains this string" — a cleared table cell, or a
+    /// marker the frame stopped showing. `describe` names the condition being
+    /// waited on and is quoted in every diagnostic.
+    ///
+    /// A child that has exited does not end the wait on its own: the reader is
+    /// given a bounded window to commit whatever was still buffered behind the
+    /// exit notification, because the frame that satisfies `is_ready` is often
+    /// in it. Only then is the exit reported.
     pub async fn wait_for_screen_where(
         &mut self,
-        wanted: &str,
+        describe: &str,
+        mut is_ready: impl FnMut(&str) -> bool + Send,
         timeout: Duration,
-        matches: impl Fn(&str) -> bool + Sync,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if matches(&self.screen_text()) {
+            if is_ready(&self.screen_text()) {
                 return Ok(());
             }
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
-                    "pty reader thread panicked while waiting for {wanted}: {panic_message}\n{}",
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
                     self.framed_screen()
                 ));
             }
-            // If the process is gone, let the reader drain the final frame for a
-            // short bounded window. A single poll is not enough when a large frame
-            // is still buffered behind the process exit notification.
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                if self.drain_final_frame_where(Some(wanted), &matches).await? {
+                if self
+                    .drain_final_frame_where(Some(describe), &mut is_ready)
+                    .await?
+                {
                     return Ok(());
                 }
                 return Err(format!(
-                    "process exited ({status:?}) before {wanted} appeared.\n{}",
+                    "process exited ({status:?}) before {describe}.\n{}",
                     self.framed_screen()
                 ));
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "timed out after {timeout:?} waiting for {wanted}.\n{}",
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
                     self.framed_screen()
                 ));
             }
@@ -778,7 +784,7 @@ impl TuiSession {
         // `|_| false` never short-circuits, so the loop runs to its deadline.
         // Nothing is being looked for, so the `bool` is uninformative here and
         // `None` keeps the absent label out of the reader-panic message.
-        self.drain_final_frame_where(None, &|_: &str| false)
+        self.drain_final_frame_where(None, &mut |_: &str| false)
             .await
             .map(|_| ())
     }
@@ -795,12 +801,11 @@ impl TuiSession {
     async fn drain_final_frame_where(
         &mut self,
         wanted: Option<&str>,
-        matches: &(impl Fn(&str) -> bool + Sync + ?Sized),
+        is_ready: &mut (impl FnMut(&str) -> bool + Send + ?Sized),
     ) -> Result<bool, String> {
-        let found = |session: &Self| matches(&session.screen_text());
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         loop {
-            if found(self) {
+            if is_ready(&self.screen_text()) {
                 return Ok(true);
             }
             if let Some(panic_message) = self.take_reader_panic() {
@@ -819,7 +824,7 @@ impl TuiSession {
         // Final checks after the drain window closes: the reader may have
         // committed the last frame — or panicked — between the loop's checks and
         // the `is_finished`/deadline exit, so re-read before declaring failure.
-        if found(self) {
+        if is_ready(&self.screen_text()) {
             return Ok(true);
         }
         if let Some(panic_message) = self.take_reader_panic() {
