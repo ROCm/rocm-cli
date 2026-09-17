@@ -439,7 +439,10 @@ impl TuiSession {
     /// deadline that includes the last screen for diagnosis. Also fails fast if
     /// the child exits before the marker appears.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
-        let wanted = format!("{marker:?}");
+        // A phrase, not the bare marker: the general helper reads its label as
+        // "waiting until {describe}", so a lone `"Ready"` would land as
+        // `waiting until "Ready"`.
+        let wanted = format!("the screen shows {marker:?}");
         self.wait_for_screen_where(&wanted, |screen| screen.contains(marker), timeout)
             .await
     }
@@ -452,7 +455,9 @@ impl TuiSession {
     /// The general form of `wait_for_screen`, for evidence a frame is current
     /// that is not "it contains this string" — a cleared table cell, or a
     /// marker the frame stopped showing. `describe` names the condition being
-    /// waited on and is quoted in every diagnostic.
+    /// waited on and is interpolated into every diagnostic as-is, so a caller
+    /// wanting quotes around it quotes its own text — `wait_for_screen` does,
+    /// which is why its messages read as quoted and these do not.
     ///
     /// A child that has exited does not end the wait on its own: the reader is
     /// given a bounded window to commit whatever was still buffered behind the
@@ -461,7 +466,7 @@ impl TuiSession {
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,
-        mut is_ready: impl FnMut(&str) -> bool + Send,
+        mut is_ready: impl FnMut(&str) -> bool,
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
@@ -801,7 +806,7 @@ impl TuiSession {
     async fn drain_final_frame_where(
         &mut self,
         wanted: Option<&str>,
-        is_ready: &mut (impl FnMut(&str) -> bool + Send + ?Sized),
+        is_ready: &mut (impl FnMut(&str) -> bool + ?Sized),
     ) -> Result<bool, String> {
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         loop {
