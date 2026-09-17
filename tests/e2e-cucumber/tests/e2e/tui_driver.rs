@@ -544,6 +544,50 @@ impl TuiSession {
         }
     }
 
+    /// Poll the current screen until `is_ready` accepts it, with the same
+    /// fail-fast diagnostics as [`wait_for_screen`](Self::wait_for_screen): a
+    /// reader-thread panic or a child that exits mid-wait is reported as itself
+    /// rather than as a timeout against the frozen last screen.
+    ///
+    /// The general form of `wait_for_screen`, for evidence a frame is current
+    /// that is not "it contains this string" — a cleared table cell, or a
+    /// marker the frame stopped showing. `describe` names the condition being
+    /// waited on and is quoted in every diagnostic.
+    pub async fn wait_for_screen_where(
+        &mut self,
+        describe: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if is_ready(&self.screen_text()) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).
