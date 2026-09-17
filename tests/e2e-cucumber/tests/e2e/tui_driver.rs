@@ -375,6 +375,10 @@ impl TuiSession {
     /// Reached only through [`send_until`](Self::send_until), whose own
     /// signature takes the marker rather than a description of a condition, so
     /// there is nothing for a caller to phrase.
+    ///
+    /// `src/diagnostic_wording.rs` holds this comment and these templates
+    /// together in both directions, so reword one there too — including the
+    /// example marker, which it reads from the caller.
     fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
         let reader_finished = self
             .reader
@@ -474,6 +478,11 @@ impl TuiSession {
     /// fits all four ("the screen shows X", "generation throughput leaves
     /// the screen"), not a bare noun; and it carries whatever quoting the
     /// caller puts in it, since none is added here.
+    ///
+    /// `src/diagnostic_wording.rs` pins this list against the templates below
+    /// — both that each one still exists and that this comment still names it,
+    /// and that there are no more of them than it claims. Change a message and
+    /// that file is where the failure points.
     ///
     /// A child that has exited does not end the wait on its own: the reader is
     /// given a bounded window to commit whatever was still buffered behind the
