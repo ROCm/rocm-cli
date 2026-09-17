@@ -283,3 +283,18 @@ Feature: Diagnosing failures and listing fixes
     # disagree while each looks right alone. Every Linux lane runs this step; the
     # WSL one is where the two lists can differ.
     And the CLI can act on the fix the diagnosis named
+
+  # `--symptom` is where a user pastes a raw terminal capture, and a terminal
+  # capture is full of line advances that are not `\n`: a progress bar repaints
+  # with `\r`, and curses- and `rich`-style progress UIs move down with `ESC E`,
+  # `ESC D` or `CSI n B` (terminfo's `nel`, `ind` and `cud1`). If those are not
+  # line boundaries the whole paste collapses into a single line, a `vllm`
+  # mention anywhere in it anchors another engine's OOM, and the user is told
+  # with high confidence that vLLM ran out of memory -- quoting the other
+  # engine's error text back as the evidence for it. A confidently wrong cause is
+  # worse than no cause, so this is pinned at the level the user sees it.
+  @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
+  Scenario: diagnose-21 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+    Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no vLLM startup OOM is reported
