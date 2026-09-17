@@ -1228,14 +1228,6 @@ fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
 ) -> Result<Option<String>> {
-    if lemonade_backend_alignment_disabled() {
-        eprintln!(
-            "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
-             using whatever backend_versions.json already pins."
-        );
-        install_best_llamacpp_backend(manifest, false)?;
-        return Ok(None);
-    }
     // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
     // reports unresolved elsewhere), so attempting it on Windows can only burn up to
     // three multi-GB backend installs and a network round-trip for a guaranteed-futile
@@ -1272,6 +1264,7 @@ fn prepare_llamacpp_backend_for_active_rocm(
         &backend_versions_path,
         &target_version,
         &pinned_version,
+        lemonade_backend_alignment_disabled(),
         try_llamacpp_backend_alignment,
         install_best_llamacpp_backend,
         latest_llamacpp_rocm_stable_tag,
@@ -1282,15 +1275,34 @@ fn prepare_llamacpp_backend_for_active_rocm(
 /// lookups above so it can be exercised in tests against a temp `backend_versions.json`
 /// with the install/align/latest-tag steps injected, instead of spawning a real
 /// `lemond` and reaching GitHub.
+///
+/// `disabled` is the resolved value of [`lemonade_backend_alignment_disabled`], passed
+/// in rather than read here so a test can drive both branches without touching process
+/// environment (mirrors vLLM's `torch_alignment_disabled` parameter). Checked first,
+/// before any `backend_versions.json` write, so the opt-out really does leave the pin
+/// untouched -- and because that check now lives on the one function this crate's own
+/// unit tests already exercise with every install/align/tag step injected, a test can
+/// assert `align`/`latest_tag` are never called and `fallback_install` runs unforced,
+/// covering the gate on every lane instead of only the nightly GPU one.
+#[allow(clippy::too_many_arguments)]
 fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
     backend_versions_path: &Path,
     target_version: &str,
     pinned_version: &str,
+    disabled: bool,
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
     mut latest_tag: impl FnMut() -> Result<String>,
 ) -> Result<Option<String>> {
+    if disabled {
+        eprintln!(
+            "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
+             using whatever backend_versions.json already pins."
+        );
+        fallback_install(manifest, false)?;
+        return Ok(None);
+    }
     if let Err(error) =
         write_backend_versions_therock_version(backend_versions_path, target_version)
     {
@@ -5228,6 +5240,52 @@ mod tests {
     }
 
     #[test]
+    fn align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps() {
+        // The fast-lane regression guard for the opt-out: previously this gate was
+        // covered only by a @nightly @requires-gpu e2e scenario, which every per-PR
+        // and merge-queue lane skips -- so a regression that silently re-enabled the
+        // alignment shipped green everywhere that actually gates a merge. `align`
+        // and `latest_tag` panicking if called is the falsifiable half; the pin
+        // staying byte-identical is the other.
+        let dir = scratch_dir("align-disabled");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            true,
+            |_manifest, _target, _force_reinstall, _label| {
+                panic!("disabled means no alignment attempt of any kind")
+            },
+            |_manifest, force_reinstall| {
+                assert!(
+                    !force_reinstall,
+                    "the disabled path installs whatever is already pinned, not a fresh reinstall"
+                );
+                Ok(())
+            },
+            || panic!("disabled means tier 2's tag lookup must not run either"),
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(
+            read_backend_versions_therock_version(&path),
+            Some("7.13.0".to_owned()),
+            "the packaged pin must survive untouched when alignment is disabled"
+        );
+        assert_eq!(
+            read_backend_versions_llamacpp_tag(&path),
+            Some("b9752".to_owned()),
+            "the packaged llama.cpp tag must survive untouched when alignment is disabled"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn align_tier1_success_keeps_target_version_pinned() {
         let dir = scratch_dir("align-tier1-success");
         let path = dir.join("backend_versions.json");
@@ -5239,6 +5297,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, force_reinstall, _label| {
                 // A stale backend installed against the OLD pin must not be able to
                 // fake success just because it happens to still resolve -- Tier 1
@@ -5271,6 +5330,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, force_reinstall, _label| {
                 // Both tiers force a reinstall now, so the mock can no longer use
                 // force_reinstall itself to distinguish tier 1 from tier 2 -- use
@@ -5316,6 +5376,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, _force_reinstall, _label| false,
             |_manifest, force_reinstall| {
                 assert!(force_reinstall);
@@ -5361,6 +5422,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, _force_reinstall, _label| false,
             |_manifest, force_reinstall| {
                 assert!(force_reinstall);
@@ -5391,6 +5453,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, _force_reinstall, _label| {
                 align_calls += 1;
                 false
@@ -5434,6 +5497,7 @@ mod tests {
             &path,
             "10.0.0",
             "7.13.0",
+            false,
             |_manifest, _target, _force_reinstall, _label| {
                 fs::write(
                     &path,

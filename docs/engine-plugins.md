@@ -44,6 +44,17 @@ version rather than a plain `X.Y.Z` the alignment can match against. An
 attempt that cannot be verified against the installed backend's shared
 libraries reverts to the packaged pin instead of being kept.
 
+The rewrite tries two builds in order. The first keeps Lemonade's own pinned
+llama.cpp release and just repoints it at the active ROCm version — a
+deliberate, reproducible pin. If that release never shipped an asset for that
+ROCm version, the second queries GitHub's `releases/latest` for
+`lemonade-sdk/llama.cpp` (an unauthenticated `api.github.com` call, subject to
+GitHub's public rate limit) and installs whatever build is newest at that
+moment. That second build is a moving target, not a pin: which llama.cpp
+commit actually gets installed depends on when the install ran, and the
+version installed is not recorded anywhere `rocm examine`/`rocm version`
+report.
+
 Set `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` to keep whatever
 `backend_versions.json` already pins and skip the rewrite — any value works,
 including an empty one, since the variable being set is the signal:
