@@ -8102,6 +8102,126 @@ mod tests {
         );
     }
 
+    fn devel_test_resolution() -> PipRuntimeResolution {
+        PipRuntimeResolution {
+            family: "gfx94X-dcgpu".to_owned(),
+            family_source: "detected".to_owned(),
+            index_url: "https://example.invalid/simple".to_owned(),
+            layout: SourceLayout::Canonical,
+            latest_version: "7.13.0".to_owned(),
+            newest_repo_version: None,
+            package_versions: TheRockPipPackageVersions {
+                rocm: "7.13.0".to_owned(),
+                torch: "2.11.0+rocm7.13.0".to_owned(),
+                torchvision: "0.26.0+rocm7.13.0".to_owned(),
+                torchaudio: "2.11.0+rocm7.13.0".to_owned(),
+                compatibility_key: "7.13.0".to_owned(),
+            },
+            device_target: AggregateDeviceTarget::Exact("gfx942".to_owned()),
+            published_device_targets: vec!["gfx942".to_owned()],
+        }
+    }
+
+    /// The seam the `--devel` flag actually travels through.
+    ///
+    /// `wheel_runtime_composition` produces the specs handed to `uv` AND the
+    /// specs recorded in the manifest, so hardcoding either polarity here is
+    /// the single change that would silently restore the old behaviour. Both
+    /// directions are pinned, and the device extra is asserted alongside so a
+    /// fix to one axis cannot quietly drop the other.
+    #[test]
+    fn wheel_composition_requests_the_toolchain_only_when_asked() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        let runtime_only = wheel_runtime_composition(&resolution, &target, false);
+        assert_eq!(
+            runtime_only.package_specs[0], "rocm[libraries,device-gfx942]==7.13.0",
+            "a default install must not request the toolchain: {:?}",
+            runtime_only.package_specs
+        );
+
+        let with_devel = wheel_runtime_composition(&resolution, &target, true);
+        assert_eq!(
+            with_devel.package_specs[0], "rocm[libraries,devel,device-gfx942]==7.13.0",
+            "--devel must reach the specs: {:?}",
+            with_devel.package_specs
+        );
+
+        // The two axes are independent: opting into the toolchain must not
+        // disturb the device payload, and vice versa.
+        assert_eq!(
+            runtime_only.package_specs[1..],
+            with_devel.package_specs[1..],
+            "devel must only affect the rocm spec"
+        );
+        assert_eq!(runtime_only.rocm_sdk_target, with_devel.rocm_sdk_target);
+    }
+
+    /// The manifest answer is derived from the specs that were installed, so a
+    /// recorded composition and the `devel` field can never disagree.
+    #[test]
+    fn manifest_reads_devel_back_out_of_the_recorded_composition() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                wheel_composition_includes_devel(Some(&composition)),
+                Some(include_devel),
+                "composition round-trip failed for include_devel={include_devel}"
+            );
+
+            // Even when the `devel` field contradicts the specs, the specs win:
+            // they are what `uv` was given.
+            let manifest = InstalledRuntimeManifest {
+                wheel_composition: Some(composition),
+                devel: !include_devel,
+                ..test_runtime_manifest(
+                    "release-wheel-gfx94X-dcgpu-7.13.0",
+                    "therock-release:gfx94X-dcgpu",
+                    1,
+                )
+            };
+            assert_eq!(
+                manifest.includes_devel(),
+                include_devel,
+                "the recorded specs must outrank a stale devel field"
+            );
+        }
+    }
+
+    /// A manifest from before compositions were recorded has only the field,
+    /// and one older still has neither — those installs all had the toolchain.
+    #[test]
+    fn manifest_without_a_composition_falls_back_to_the_devel_field() {
+        let without_composition = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: false,
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(!without_composition.includes_devel());
+
+        let legacy = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: devel_default_for_legacy_manifest(),
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(
+            legacy.includes_devel(),
+            "a manifest predating the flag must be treated as a toolchain install"
+        );
+    }
+
     /// Writing a manifest over an existing one for the same `runtime_key`
     /// REPLACES it — `devel` included — rather than merging with what was on
     /// disk. That is the storage half of the reinstall-drift case: a user who
