@@ -364,6 +364,12 @@ impl TuiSession {
 
     /// Retrieve a terminal failure that landed after a wait's final poll but
     /// before the retry loop decides whether another key is safe to send.
+    ///
+    /// Takes a bare marker and quotes it here, so its messages read
+    /// `waiting for "Ready"` — deliberately NOT the clause convention
+    /// `wait_for_screen_where` documents. Its callers hold the marker itself
+    /// rather than a description of a condition, and there is nothing for them
+    /// to phrase.
     fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
         let reader_finished = self
             .reader
@@ -460,8 +466,8 @@ impl TuiSession {
     /// four diagnostics, which read `waiting until {describe}`, `timed out …
     /// waiting until {describe}`, `before {describe}`, and `… draining the
     /// final frame, waiting until {describe}`. So it must be a clause that
-    /// fits all four ("the screen shows X", "the table clears X"), not a bare
-    /// noun; and it carries whatever quoting the caller puts in it, since none
+    /// fits all four ("the screen shows X", "generation throughput leaves the
+    /// screen"), not a bare noun; and it carries whatever quoting the caller puts in it, since none
     /// is added here.
     ///
     /// A child that has exited does not end the wait on its own: the reader is
