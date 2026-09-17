@@ -73,6 +73,83 @@ where
 }
 
 #[cfg(test)]
+mod diagnostic_wording {
+    //! The TUI driver's wait diagnostics are described by doc comments in
+    //! `tests/e2e/tui_driver.rs` — which templates exist, and what shape of
+    //! label each expects. Nothing ran those descriptions, so three review
+    //! rounds in a row found them describing code they no longer matched, each
+    //! time only because a person read both.
+    //!
+    //! These read the driver source and assert the templates the docs name are
+    //! the templates that exist. Reword a message and this fails, naming the
+    //! doc that has gone stale; the doc is then wrong for as long as it takes
+    //! to run the tests, rather than until someone notices.
+    //!
+    //! Source text rather than rendered output on purpose: rendering one needs
+    //! a live pty, a child process and a reader thread, which is what the
+    //! scenarios themselves are for. What rots here is the wording, and the
+    //! wording is in the file.
+
+    fn driver_source() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/tui_driver.rs");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The four templates `wait_for_screen_where`'s doc enumerates, which its
+    /// contract requires a caller's `describe` clause to read correctly after.
+    #[test]
+    fn the_clause_templates_are_the_ones_the_contract_names() {
+        let source = driver_source();
+        for template in [
+            "panicked while waiting until {describe}",
+            "timed out after {timeout:?} waiting until {describe}",
+            "before {describe}.",
+            "draining the final frame{context}",
+            ", waiting until {wanted}",
+        ] {
+            assert!(
+                source.contains(template),
+                "tui_driver.rs no longer contains {template:?}, so the clause contract \
+                 documented on `wait_for_screen_where` describes a template that is gone \
+                 — update that doc comment with this change"
+            );
+        }
+    }
+
+    /// `terminal_state_after_wait` quotes its own bare marker, which its doc
+    /// states is deliberate and distinct from the clause convention above.
+    #[test]
+    fn the_bare_marker_templates_still_quote_the_marker_themselves() {
+        let source = driver_source();
+        for template in [
+            "panicked while waiting for {marker:?}",
+            "before {marker:?} appeared.",
+        ] {
+            assert!(
+                source.contains(template),
+                "tui_driver.rs no longer contains {template:?}, so the noun convention \
+                 documented on `terminal_state_after_wait` describes a template that is \
+                 gone — update that doc comment with this change"
+            );
+        }
+    }
+
+    /// The contract says the label is interpolated verbatim. A `{describe:?}`
+    /// anywhere would quote it a second time on top of whatever the caller
+    /// already put in, which is what the doc promises does not happen.
+    #[test]
+    fn the_clause_label_is_never_debug_formatted() {
+        let source = driver_source();
+        assert!(
+            !source.contains("{describe:?}"),
+            "a diagnostic Debug-formats `describe`, but `wait_for_screen_where` \
+             documents it as interpolated verbatim — callers that quote their own \
+             text would now be double-quoted"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{RetryTiming, TerminalState, send_until};
     use crate::reader_failure::{ReaderFailure, ReaderFailureObservation};
