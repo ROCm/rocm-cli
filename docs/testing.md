@@ -468,7 +468,9 @@ stop`/`restart` or endpoint auth; these paths are unit-tested only.
 dropped for a service that was never stopped: the record itself is being
 deleted, so keeping its key would strand a 0600 secret belonging to a service
 that can no longer be restarted. Neither will touch a record the liveness
-refresh still reads as running, so this cannot race a live server.
+refresh still reads as running, and `prune` re-checks liveness immediately
+before each delete — but the check and the delete are not atomic, so that
+narrows the race against a concurrent `restart` rather than eliminating it.
 `features/service_record_cleanup.feature` covers both commands on the mock lane,
 asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a

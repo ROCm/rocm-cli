@@ -895,7 +895,7 @@ enum ServicesCommand {
         /// arrive here, after the summary tells them recent records were kept.
         #[arg(long, conflicts_with = "older_than_hours")]
         any_age: bool,
-        /// Show what would happen without changing files.
+        /// Show what would be removed, without removing anything.
         #[arg(long)]
         dry_run: bool,
         /// Do not ask for confirmation.
@@ -6801,6 +6801,9 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
             // could not delete still has to fail the command, but not at the
             // cost of the record of what it *did* delete.
             if !outcome.failures.is_empty() {
+                // Only reachable through this dispatch, so no unit test covers
+                // it: `service-cleanup-06` in
+                // `features/service_record_cleanup.feature` is its cover.
                 bail!(
                     "{} file(s) could not be removed; see the list above",
                     outcome.failures.len()
