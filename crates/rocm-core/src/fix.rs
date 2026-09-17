@@ -762,6 +762,35 @@ pub fn list_recipes() -> String {
     out
 }
 
+/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>` and
+/// `rocm diagnose` so the same fix-id reads identically from either command.
+// These mirror the `FixRecipe`/`Fix` struct fields (`struct_excessive_bools` is
+// already allowed workspace-wide for that reason); this fn just forwards them.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn format_flags(
+    needs_sudo: bool,
+    needs_reboot: bool,
+    needs_relogin: bool,
+    auto_applicable: bool,
+) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if needs_sudo {
+        flags.push("requires sudo");
+    }
+    if needs_reboot {
+        flags.push("requires reboot");
+    }
+    if needs_relogin {
+        flags.push("requires re-login");
+    }
+    flags.push(if auto_applicable {
+        "rocm fix can run it"
+    } else {
+        "manual only (this command will NOT run it)"
+    });
+    flags
+}
+
 fn print_recipe(r: &FixRecipe) {
     println!("Fix:        {}  -- {}", r.fix_id, r.title);
     println!("OS scope:   {}", r.applies_on.join(", "));
@@ -772,22 +801,13 @@ fn print_recipe(r: &FixRecipe) {
             println!("  $ {c}");
         }
     }
-    let mut flags = Vec::new();
-    if r.needs_sudo {
-        flags.push("requires sudo");
-    }
-    if r.needs_reboot {
-        flags.push("requires reboot");
-    }
-    if r.needs_relogin {
-        flags.push("requires re-login");
-    }
-    if !r.auto_applicable {
-        flags.push("manual only (this command will NOT run it)");
-    }
-    if !flags.is_empty() {
-        println!("Flags:      {}", flags.join(", "));
-    }
+    let flags = format_flags(
+        r.needs_sudo,
+        r.needs_reboot,
+        r.needs_relogin,
+        r.auto_applicable,
+    );
+    println!("Flags:      {}", flags.join(", "));
     for n in r.notes {
         println!("Note:       {n}");
     }

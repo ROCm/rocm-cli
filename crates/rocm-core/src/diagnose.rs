@@ -2184,22 +2184,13 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             for c in &fix.commands {
                 let _ = writeln!(out, "     $ {c}");
             }
-            let mut flags = Vec::new();
-            if fix.needs_sudo {
-                flags.push("sudo");
-            }
-            if fix.needs_reboot {
-                flags.push("reboot required");
-            }
-            if fix.needs_relogin {
-                flags.push("re-login required");
-            }
-            if fix.auto_applicable {
-                flags.push("rocm fix can run it");
-            }
-            if !flags.is_empty() {
-                let _ = writeln!(out, "   flags: {}", flags.join(", "));
-            }
+            let flags = crate::fix::format_flags(
+                fix.needs_sudo,
+                fix.needs_reboot,
+                fix.needs_relogin,
+                fix.auto_applicable,
+            );
+            let _ = writeln!(out, "   flags: {}", flags.join(", "));
             for n in &fix.notes {
                 let _ = writeln!(out, "   note: {n}");
             }
