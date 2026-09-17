@@ -16,11 +16,59 @@ Run the Rust test suite:
 cargo test --workspace --all-targets
 ```
 
+Note that `cargo test` runs every test as a thread in **one process**, which is
+also what the required `windows-build-and-test` lane does. See
+[Tests that touch the environment](#tests-that-touch-the-environment) before
+writing a test that sets an environment variable.
+
 Run clippy with warnings as errors:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+### Tests that touch the environment
+
+`std::env::set_var` / `remove_var` change state shared by every thread in the
+process. Under a threaded harness two tests touching the same key race, and one
+reads the other's value and fails an assertion unrelated to what it tests. This
+is enforced: `cargo xtask`'s `a_test_mutating_the_environment_serializes_itself`
+scans the tree and **fails the build** on an unguarded mutation inside a
+`#[test]`.
+
+Best is not to touch the environment at all — pass the value in through a test
+seam, as `newest_rocm_install_dir_in` and `engine_envs_root_from` do. A seam
+cannot test the wiring it bypasses, though, so when exercising the real
+env-reading path *is* the point, take a process-wide lock for the duration of
+the test and restore the previous value before releasing it:
+
+```rust
+#[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+#[test]
+fn reads_its_setting_from_the_environment() {
+    let _guard = SOMETHING_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = std::env::var_os("KEY");
+    unsafe { std::env::set_var("KEY", "value") };
+    let observed = production_function();
+    match &previous {
+        Some(value) => unsafe { std::env::set_var("KEY", value) },
+        None => unsafe { std::env::remove_var("KEY") },
+    }
+    assert_eq!(observed, "value");
+}
+```
+
+The guard accepts `ScopedTestEnv`, `ScopedEnvVar`, or **any** static named
+`*_TEST_LOCK` taken inside the test body. The suffix is the rule, so a new lock
+is recognised the day it is declared rather than when someone remembers to add
+it to a list. The exemption is per test function, not per file: one test taking
+a lock does not cover its neighbours.
+
+Keep the mutation and the lock in the same test body. A `#[test]` that delegates
+its mutation to an unguarded helper is a known blind spot — the helper is a
+different scope, so the scan cannot see the two together.
 
 Run the cross-platform smoke test:
 
