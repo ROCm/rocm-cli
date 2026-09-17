@@ -549,18 +549,56 @@ async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
 
 /// The packaged pin was not rewritten.
 ///
-/// `--reinstall` (the When's own mechanism) re-extracts the packaged embeddable
-/// on every run, so the only way a rewritten pin could still show up here is the
-/// alignment itself running despite the opt-out -- which is exactly what the
-/// "Aligned ..." line reports when it fires. Its absence is the functional
-/// signal that the pin survived, the same way scenario 4 reads the torch
-/// alignment's verdict rather than re-reading a file the CLI already reports on.
+/// Reads `resources/backend_versions.json` inside the runtime tree the install
+/// itself reports (`env_path:`), rather than inferring the outcome from an
+/// absent log line: the alignment's revert path can fail to restore the pin
+/// (best-effort, matching its sibling warnings) while still printing no
+/// "Aligned ..." line, and a step that only checks for that line's absence
+/// cannot tell that state apart from an honestly untouched pin. `--reinstall`
+/// (the When's own mechanism) always re-extracts the packaged embeddable
+/// first, so the file's `therock.version` at this point is either the
+/// packaged default (opt-out held) or the active SDK version (opt-out was
+/// bypassed) -- there is no third value alignment can produce here. The
+/// active SDK version is read independently via `rocm version` so this does
+/// not need to know Lemonade's packaged pin ahead of time.
 #[then("the packaged pin survives the install")]
 async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
-    assert!(
-        !output.contains("Aligned Lemonade's ROCm llama.cpp backend"),
-        "the backend was realigned even though the user opted out:\n{output}"
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let pinned_version = parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
+
+    let (version_output, _, _) = crate::run_rocm(world, &["version"]);
+    let active_sdk_line = version_output
+        .lines()
+        .find_map(|line| line.strip_prefix("ROCm SDK: "))
+        .unwrap_or_else(|| panic!("no ROCm SDK line in `rocm version` output:\n{version_output}"));
+    let active_sdk_version = active_sdk_line
+        .split_once(" (")
+        .map_or(active_sdk_line, |(version, _)| version);
+
+    assert_ne!(
+        pinned_version, active_sdk_version,
+        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
+         opted out"
     );
 }
 
