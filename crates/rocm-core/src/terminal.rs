@@ -45,15 +45,20 @@
 //! one sequence wide — or to the end of the input, and the break is swallowed
 //! in every one of those cases, terminated or not.
 //!
-//! Swallowing the break is not always a *merge*, though, and the end-of-input
-//! case is the one where it is not. A merge needs drawable text on both sides of
-//! the break landing in one segment; when the body runs out over the end of the
-//! input there is no far side left to join to, and what the terminal drew past
-//! the break comes back in no segment at all:
+//! Swallowing the break is not always a *merge*, though. A merge needs drawable
+//! text on both sides of the break landing in one segment, so what decides is
+//! whether drawable text follows the sequence in that same segment — however the
+//! body ended. Where none does there is no far side to join to, and what the
+//! terminal drew past the break comes back in no segment at all:
 //!
 //! ```text
-//! rendered_lines("vllm\u{1b}]0;ti\ntle") == ["vllm"]
+//! rendered_lines("vllm\u{1b}]0;ti\ntle")          == ["vllm"]
+//! rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}")     == ["vllm"]
+//! rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}\nx")  == ["vllm", "x"]
 //! ```
+//!
+//! The last two bodies are properly `BEL`-terminated, and the last is not near
+//! the end of the input either; the `tle` is lost all the same.
 //!
 //! That is a loss, not a misattribution, so it belongs with the splitting
 //! direction where nothing is promised: it costs a diagnosis the tool would
@@ -69,9 +74,7 @@
 //! terminator, with neither writer doing anything unusual. A process killed
 //! part-way through the same title is the other ordinary half of it, leaving a
 //! body with no terminator at all — and killed output is the case this walk is
-//! built for. Which of the two shapes reads back is then only a question of
-//! whether the capture carries on past the body: text after it joins up, and
-//! text the body runs out over is lost.
+//! built for.
 //!
 //! Such a capture reaches [`rendered_lines`] whole when a user pastes it into
 //! `rocm diagnose --symptom`. The vLLM engine's own path cannot carry an
@@ -86,8 +89,8 @@
 //! boundaries are for, since a window title would then be scored as if the
 //! process had printed it. The residual is therefore disclosed here rather than
 //! papered over: a break inside a string body is the one way two rendered rows
-//! come back as one segment, and — where that body runs out over the end of the
-//! input — the one way a rendered row comes back in none.
+//! come back as one segment, and — where no drawable text follows the sequence —
+//! the one way a rendered row comes back in none.
 //!
 //! This section is the single authoritative statement of the exception. The
 //! code that creates it and the test that pins it both point here rather than
@@ -526,12 +529,21 @@ mod tests {
             rendered_lines("vllm\u{1b}]0;ti\ntle\u{1b}[0mllama.cpp OOM"),
             ["vllmllama.cpp OOM"],
         );
-        // End of input is the one way of ending the body that does *not* merge:
-        // there is no far side to join to, so the `tle` a terminal would have
-        // drawn on its second row comes back in no segment at all. That is the
-        // losing direction, not the misattributing one, and it is why the
-        // module section documents a third behaviour rather than two. Pinned
-        // because prose has twice claimed this shape as a route to the merge.
+        // Swallowing the break merges only where drawable text follows the
+        // sequence in the same segment. Where none does, the `tle` a terminal
+        // would have drawn on its second row comes back in no segment at all --
+        // and how the body ended is not what decides that. The second case below
+        // is properly `BEL`-terminated and the third is terminated with more of
+        // the capture still to come, only behind a break; both lose the row just
+        // as the unterminated first one does. That is the losing direction, not
+        // the misattributing one, and it is why the module section documents a
+        // third behaviour rather than two. Pinned because prose has three times
+        // now named a narrower trigger than the code has.
         assert_eq!(rendered_lines("vllm\u{1b}]0;ti\ntle"), ["vllm"]);
+        assert_eq!(rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}"), ["vllm"]);
+        assert_eq!(
+            rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}\nx"),
+            ["vllm", "x"]
+        );
     }
 }
