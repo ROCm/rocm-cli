@@ -333,7 +333,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "rocm examine --json | grep -q '\"rocm_install_method\": \"repo-native\"' && rocminfo | head -n 5",
         notes: &[
-            "If the package-manager update/refresh warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
+            "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
         ],
         applies_on: LINUX_ONLY,
         runner: None,

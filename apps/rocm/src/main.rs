@@ -3291,6 +3291,19 @@ fn build_driver_install_plan(
         // https://repo.radeon.com/amdgpu/latest/ubuntu/dists/ and switch this
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
+        //
+        // No Gherkin scenario covers this arm's output (AGENTS.md #3). That is
+        // not one of #3's two named exceptions (a gated lane, or a purely
+        // internal change) -- this is user-observable `rocm install driver`
+        // output on a real OS release, just one no CI lane or test host runs:
+        // `read_os_release()` reads `/etc/os-release` directly with no
+        // override, so nothing short of an actual Ubuntu 26.04 host can drive
+        // this branch. A prior commit message claimed #3 has a standing
+        // exception for this; it does not, and this comment corrects that.
+        // Closing the gap needs either a test-only `/etc/os-release` override
+        // hook (there is precedent for `#[cfg(feature = "e2e-test-hooks")]`
+        // seams elsewhere in this crate, e.g. `dash.rs`) plus a scenario built
+        // on it, or an actual Ubuntu 26.04 CI lane once one exists.
         ("ubuntu", "26.04") => {
             let sudo = escalation.prefix();
             DriverInstallPlan {
