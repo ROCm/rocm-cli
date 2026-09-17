@@ -8642,16 +8642,25 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         } else {
             "managed"
         };
+        // `toolchain` is the only runtime property a user cannot otherwise
+        // see: the compiler is opt-in, and `rocm update` reinstalls whatever
+        // this says, so an install missing it should not be silent about that.
+        let toolchain = if manifest.includes_devel() {
+            "included"
+        } else {
+            "excluded"
+        };
         let _ = writeln!(
             output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={}",
+            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
             manifest.runtime_key,
             manifest.runtime_id,
             therock::runtime_version_display(&manifest.version),
             manifest.format,
             manifest.family,
             mode,
-            status
+            status,
+            toolchain
         );
         let _ = writeln!(
             output,
@@ -32226,6 +32235,57 @@ ID_LIKE="suse opensuse"
         assert!(
             legend_pos < entry_pos,
             "legend must appear before the entries it explains:\n{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Whether a runtime carries the compiler toolchain is otherwise invisible:
+    /// nothing else in the CLI reports it, and `rocm update` reinstalls whatever
+    /// the runtime recorded — so a user who installed without it has no way to
+    /// see that, or to understand why a later build step fails.
+    #[test]
+    fn runtime_list_reports_whether_the_toolchain_is_installed() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-toolchain");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        // The fixture records `devel: true` with no composition.
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=included"),
+            "a toolchain install must say so:\n{rendered}"
+        );
+
+        // A runtime-only install reports the other way. Written through the
+        // recorded specs, which is what `includes_devel` actually reads.
+        let runtime_only = therock::InstalledRuntimeManifest {
+            devel: false,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "canonical".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..manifest
+        };
+        fs::write(
+            runtime_manifest_path(&paths, &runtime_only.runtime_key),
+            serde_json::to_vec_pretty(&runtime_only)?,
+        )?;
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=excluded"),
+            "a runtime-only install must say so:\n{rendered}"
         );
 
         let _ = fs::remove_dir_all(root);

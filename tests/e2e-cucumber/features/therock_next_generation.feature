@@ -121,7 +121,9 @@ Feature: TheRock "next" ROCm 10 install layout
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     And a registered ROCm 10 wheel runtime with a grouped family
     When the user previews applying the pending update to that runtime
-    Then the preview requests the gfx1200 device extras
+    # With the toolchain because that runtime's recorded specs have it: an
+    # update must reinstall what was installed, not the current default.
+    Then the preview requests the gfx1200 device extras with the toolchain
 
   # Proves the vLLM ROCm 10.x wheel discovery route rather than the fixed pin
   # table other SDK versions use: AMD publishes vllm, flash-attn, and
@@ -142,3 +144,17 @@ Feature: TheRock "next" ROCm 10 install layout
     And the runtime includes an inference engine
     When the user reinstalls vllm
     Then the install reports the vLLM ROCm 10.x discovery pins
+
+  # The opt-in half of therock-next-02. Both polarities run here, on the mock
+  # lane, because this is the only place the flag's effect on the real install
+  # plan is observable without a GPU and a multi-GiB download.
+  #
+  # The `@id:` still reads `-09-`: this scenario was written as therock-next-09
+  # and the display index moved when main landed one ahead of it. The id is the
+  # stable identifier and is deliberately not renumbered with the index.
+  @id:therock-next-09-wheel-devel-adds-the-toolchain
+  Scenario: therock-next-10 - A pinned ROCm 10 wheel install adds the toolchain when asked
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
+    Then the preview resolves the ROCm 10 pip index
+    And the preview requests the gfx1200 device extras with the toolchain

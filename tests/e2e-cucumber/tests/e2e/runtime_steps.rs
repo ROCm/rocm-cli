@@ -849,7 +849,7 @@ async fn assert_release_device_payload(world: &mut E2eWorld) {
     );
     assert_eq!(
         requested_rocm_extras(preview_rocm_spec(output)),
-        format!("libraries,devel,device-{detected}"),
+        format!("libraries,device-{detected}"),
         "the install does not request exactly this host's device payload:\n{output}"
     );
 
