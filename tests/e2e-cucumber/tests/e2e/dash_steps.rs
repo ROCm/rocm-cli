@@ -229,13 +229,6 @@ async fn close_dashboard_help(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to close dashboard help: {e}"));
 }
 
-#[when("the user scrolls to the end of dashboard help")]
-async fn scroll_to_end_of_dashboard_help(world: &mut E2eWorld) {
-    session(world)
-        .send("G")
-        .unwrap_or_else(|e| panic!("failed to scroll dashboard help: {e}"));
-}
-
 #[when("the user opens the command palette")]
 async fn open_command_palette(world: &mut E2eWorld) {
     session(world)
@@ -756,26 +749,10 @@ async fn navigation_guidance_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard help did not appear: {e}"));
     let screen = tui.screen_text();
     assert!(
-        screen.contains("next / previous tab") && screen.contains("HOME"),
+        screen.contains("next / previous tab")
+            && screen.contains("Home tab")
+            && screen.contains("jump ±60s"),
         "navigation or contextual guidance missing:\n{screen}"
-    );
-}
-
-#[then("replay controls guidance is displayed")]
-async fn replay_controls_guidance_displayed(world: &mut E2eWorld) {
-    let tui = session(world);
-    // REPLAY is the last group in the flattened, scrollable help body, but
-    // most of it (including "pause / resume") already fits on an 80x24
-    // screen at scroll=0. Only "jump ±60s" — the group's last line — sits
-    // past the fold, so it's the one line that actually proves the scroll
-    // wiring reaches previously-clipped content.
-    tui.wait_for_screen("jump ±60s", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("replay controls guidance did not appear after scrolling: {e}"));
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("REPLAY") && screen.contains("jump ±60s"),
-        "replay controls guidance missing after scrolling to end of help:\n{screen}"
     );
 }
 

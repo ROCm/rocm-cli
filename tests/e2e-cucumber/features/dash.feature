@@ -46,8 +46,6 @@ Feature: Interactive dashboard
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
-    When the user scrolls to the end of dashboard help
-    Then replay controls guidance is displayed
     When the user closes dashboard help
     And the user quits the dashboard
     Then the dashboard exits successfully
