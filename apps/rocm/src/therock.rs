@@ -1018,6 +1018,7 @@ pub(crate) fn install_sdk(paths: &AppPaths, request: SdkInstallRequest<'_>) -> R
 
 /// Apply an update using the exact family, device payload, and source layout
 /// resolved by its plan.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk_for_update(
     paths: &AppPaths,
     channel: &str,
@@ -1025,6 +1026,7 @@ pub(crate) fn install_sdk_for_update(
     family: &str,
     device_target: Option<&str>,
     source_layout_generation: Option<&str>,
+    include_devel: bool,
     dry_run: bool,
 ) -> Result<String> {
     let channel = TheRockChannel::parse(channel)?;
@@ -1042,6 +1044,7 @@ pub(crate) fn install_sdk_for_update(
             },
             None,
             dry_run,
+            include_devel,
         ),
         "tarball" => {
             install_tarball_runtime(paths, channel, None, Some(family), None, layout, dry_run)
@@ -1426,9 +1429,11 @@ fn resolve_latest_for_manifest(
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
             let wheel_composition = match &device_target {
-                AggregateDeviceTarget::Exact(_) => {
-                    Some(wheel_runtime_composition(&resolution, &device_target))
-                }
+                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
+                    &resolution,
+                    &device_target,
+                    manifest.includes_devel(),
+                )),
                 AggregateDeviceTarget::Undetermined(_) => None,
             };
             let target_runtime_key = wheel_composition.as_ref().map_or_else(
@@ -1674,7 +1679,7 @@ fn install_wheel_runtime(
     // usable target still composes a key here — from the `<undetermined>` extras
     // — which no real install can ever produce, and the refusal below stops it
     // from reaching a manifest.
-    let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target, include_devel);
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -1747,7 +1752,6 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
-
     );
     if dry_run {
         let env_python = venv_python_path(&install_root);
@@ -1984,7 +1988,12 @@ fn wheel_composition_includes_devel(composition: Option<&WheelRuntimeComposition
     let composition = composition?;
     composition.package_specs.iter().find_map(|spec| {
         let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
-        Some(extras.split(',').map(str::trim).any(|extra| extra == "devel"))
+        Some(
+            extras
+                .split(',')
+                .map(str::trim)
+                .any(|extra| extra == "devel"),
+        )
     })
 }
 
@@ -2158,6 +2167,7 @@ fn resolve_pip_runtime(
 #[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
+    channel: TheRockChannel,
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
@@ -2227,6 +2237,7 @@ fn resolve_pip_runtime_with_timeout(
 
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
+    channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
@@ -7245,6 +7256,7 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
 
     /// The default install skips the compiler toolchain, which is roughly half
     /// the download and is only needed to build GPU code. The torch stack is
