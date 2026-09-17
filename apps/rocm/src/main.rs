@@ -19309,12 +19309,13 @@ fn validate_pinned_gpu_index(
 }
 
 /// The GPU count to rank `--gpu auto` candidates over. Prefers the `amd-smi`
-/// device count; when `amd-smi` is unavailable (`detected` is `None`) but the
-/// DRM sysfs VRAM fallback still produced rows, its length stands in so
-/// auto-selection can still consider those devices. Used only to decide whether
+/// device count, but only when that count is usable — `None` (amd-smi
+/// unavailable) and `Some(0)` (amd-smi ran and saw no devices) both fall through
+/// to the DRM sysfs VRAM fallback's row count, so auto-selection can still
+/// consider devices amd-smi did not enumerate. Used only to decide whether
 /// `--gpu auto` has anything at all to rank, never as a `--gpu <index>`
 /// validation bound — see [`validate_pinned_gpu_index`]. `None` when neither
-/// source is available.
+/// source yields a non-zero count.
 fn effective_gpu_count(detected: Option<usize>, vram: Option<&[GpuVramUsage]>) -> Option<usize> {
     detected
         .filter(|&count| count > 0)
@@ -27510,9 +27511,18 @@ install therock";
         assert_eq!(effective_gpu_count(Some(4), Some(&usage)), Some(4));
         // amd-smi unavailable (`None`): the sysfs VRAM fallback row count stands in.
         assert_eq!(effective_gpu_count(None, Some(&usage)), Some(2));
+        // The second, previously untested fallback trigger: amd-smi ran and
+        // reported zero devices. `Some(0)` must fall through to the VRAM rows
+        // just as `None` does, or a host amd-smi cannot enumerate but sysfs can
+        // would have nothing for `--gpu auto` to rank. Dropping the
+        // `filter(|&count| count > 0)` on `detected` turns this line red.
+        assert_eq!(effective_gpu_count(Some(0), Some(&usage)), Some(2));
         // Neither source available.
         assert_eq!(effective_gpu_count(None, None), None);
         assert_eq!(effective_gpu_count(None, Some(&[])), None);
+        // Both present but both empty: still nothing to rank.
+        assert_eq!(effective_gpu_count(Some(0), Some(&[])), None);
+        assert_eq!(effective_gpu_count(Some(0), None), None);
     }
 
     #[test]

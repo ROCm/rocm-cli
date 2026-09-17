@@ -141,9 +141,11 @@ pub fn quotable_in_single_quotes(symptom: &str) -> bool {
 /// What this deliberately does not do is second-guess a well-formed sequence.
 /// `ESC [ SP K` is a valid CSI (`SP` is an intermediate, `K` the final byte), so
 /// it is consumed whole even though the `K` may have been the first letter of a
-/// truncated process's "Killed" — a real terminal consumes it too, and the
-/// contract here is "render what the terminal would have rendered", which is
-/// the only rule that stays decidable on a byte stream with no framing.
+/// truncated process's "Killed": a well-formed sequence is consumed whole
+/// because a real terminal consumes it too. That rule settles *how much* of the
+/// byte stream one step eats, and only that — which [`Token`] the consumed
+/// sequence is then labelled with is a separate question, answered below, and
+/// answered deliberately unlike a terminal.
 ///
 /// # Why [`Token::LineBreak`] is the default for anything unrecognised
 ///
@@ -193,6 +195,18 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
         // The string-argument sequences: OSC, DCS, SOS, PM, APC. Their bodies
         // are arbitrary text (a window title, say) and must not be emitted as if
         // the process had printed it, but they draw nothing at the cursor.
+        //
+        // This is the one known hole in the never-merge guarantee, and it is a
+        // crafted-input one. ECMA-48 says the body runs to its terminator, so a
+        // `\n` *inside* a properly terminated body is swallowed with the rest of
+        // it and the text either side of the sequence joins up
+        // (`"vllm\u{1b}]0;ti\ntle\u{7}llama.cpp OOM"` comes back as the single
+        // line `"vllmllama.cpp OOM"`). Common terminals abort a control string
+        // on an embedded C0 byte and would draw two rows. Following the grammar
+        // is still the right call — the alternative is guessing where an
+        // unterminated body ends, which reintroduces the leak of OSC bodies as
+        // text — and ordinary log output cannot produce the shape, since it
+        // needs a well-formed introducer and terminator around the newline.
         Some(']' | 'P' | 'X' | '^' | '_') => {
             chars.next();
             skip_string_sequence_body(chars);
@@ -224,6 +238,17 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
 ///
 /// `U+2028`/`U+2029` are `Zl`/`Zp` rather than `Cc`, so `char::is_control` does
 /// not cover them, but Unicode defines both as mandatory line breaks.
+///
+/// Those two scalars are the one place where moving this walk out of the vLLM
+/// engine changed [`strip_terminal_control_sequences`] rather than merely
+/// relocating it, and the commit that moved it says "behaviour is unchanged",
+/// which is true of everything except this. The engine-local stripper tested
+/// every non-escape character with [`is_control_or_format`] alone; that is
+/// `false` for both (neither is `Cc`, neither is in the enumerated `Cf` set), so
+/// both used to survive into the stripped message and now do not. The widening
+/// is intentional — a mandatory line break is exactly the kind of non-drawing
+/// character that stripper exists to remove — and the stripper table test in
+/// `engines/vllm/src/lib.rs` pins both scalars so the next drift is caught.
 fn classify_char(c: char) -> Token {
     if c == '\t' {
         return Token::Text(c);
@@ -315,12 +340,13 @@ pub fn strip_terminal_control_sequences(line: &str) -> String {
     out
 }
 
-/// Splits `text` into the lines a terminal would have rendered it as, with the
-/// escape sequences and non-drawing characters removed from each.
+/// Splits `text` into segments no coarser than the lines a terminal would have
+/// rendered it as, with the escape sequences and non-drawing characters removed
+/// from each.
 ///
-/// This is a deliberate *over*-approximation, not a terminal emulator: it
-/// guarantees that two pieces of text the terminal drew on different rows never
-/// end up in the same returned line, and makes no promise in the other
+/// That is deliberately an *over*-approximation rather than a terminal emulator:
+/// it guarantees that two pieces of text the terminal drew on different rows
+/// never end up in the same returned segment, and makes no promise in the other
 /// direction — one rendered line may come back split. See [`next_token`] for why
 /// that asymmetry is the right one, and for exactly which sequences are treated
 /// as boundaries.
