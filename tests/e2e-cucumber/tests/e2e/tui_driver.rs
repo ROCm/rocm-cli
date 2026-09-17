@@ -474,6 +474,60 @@ impl TuiSession {
         }
     }
 
+    /// Poll the current screen until `is_ready` accepts it, with the same
+    /// fail-fast diagnostics as [`wait_for_screen`](Self::wait_for_screen): a
+    /// reader-thread panic or a child that exits mid-wait is reported as itself
+    /// rather than as a timeout against the frozen last screen.
+    ///
+    /// The general form of `wait_for_screen`, for evidence a frame is current
+    /// that is not "it contains this string" — a cleared table cell, or a
+    /// marker the frame stopped showing. `describe` names the condition being
+    /// waited on and is quoted in every diagnostic.
+    ///
+    /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
+    /// and deliberately so. Every condition this general form exists to express
+    /// is satisfied by a frame that stopped showing something, and a dead
+    /// process leaves behind a final frame that shows almost nothing — so a
+    /// predicate evaluated first would accept a crashed child as success. The
+    /// positive form can keep checking the screen first, because a marker that
+    /// appeared as the child exited did genuinely appear (`wait_for_screen`
+    /// leans on exactly that, draining the final frame after `try_wait`); a
+    /// disappearance carries no such evidence.
+    pub async fn wait_for_screen_where(
+        &mut self,
+        describe: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if is_ready(&self.screen_text()) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Poll the current screen until it no longer contains `marker`, or fail
     /// with a deadline that includes the last screen for diagnosis.
     ///
@@ -482,43 +536,20 @@ impl TuiSession {
     /// seen on screen: an absence is trivially true of a marker that never
     /// appeared, so the caller must have asserted its presence first. A child
     /// that exits first is a failure rather than a success - the final frame a
-    /// dead process leaves behind would satisfy any absence.
+    /// dead process leaves behind would satisfy any absence, which is why
+    /// [`wait_for_screen_where`](Self::wait_for_screen_where) — the loop this
+    /// spells a common case of — checks the child before the screen.
     pub async fn wait_for_screen_absent(
         &mut self,
         marker: &str,
         timeout: Duration,
     ) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            // The liveness checks come first, and deliberately so: a dead
-            // process leaves a final frame that almost never contains the
-            // marker, so an absence check placed ahead of them would report
-            // success for a child that had crashed.
-            if let Some(panic_message) = self.take_reader_panic() {
-                return Err(format!(
-                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.finished = true;
-                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                return Err(format!(
-                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if !self.screen_text().contains(marker) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
+        self.wait_for_screen_where(
+            &format!("{marker:?} leaves the screen"),
+            |screen| !screen.contains(marker),
+            timeout,
+        )
+        .await
     }
 
     /// Send the quit gesture appropriate to the session and wait for a clean
