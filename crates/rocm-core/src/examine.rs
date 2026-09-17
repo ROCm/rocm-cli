@@ -2084,6 +2084,46 @@ mod tests {
     #[cfg(unix)]
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Replaces a process-global environment variable for as long as it lives,
+    /// putting the previous value back on drop.
+    ///
+    /// A scope guard rather than straight-line save/restore because the restore
+    /// has to survive a panic: an assertion firing between the two halves skips
+    /// the restore, and the mutated variable then leaks into every later test in
+    /// this binary. The lock above only serialises those tests -- it does not
+    /// undo the write, and recovering from its poison hands the next test the
+    /// leaked value.
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_unmeasurable_shared_memory_allowance_leaves_a_trace() {
         // The distinction the fields exist to preserve, tested at the layer that
@@ -2710,7 +2750,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
     fn the_runtime_loader_path_keeps_the_entries_the_host_already_had() {
         // The merge branch neither sibling reaches: one clears `library_paths`
         // and returns before the merge, the other never sets the variable, so on
@@ -2732,18 +2771,11 @@ mod tests {
         // as a substring of the runtime's own `lib` entry.
         let inherited = root.join("host-lib");
 
-        let previous = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV);
-        unsafe {
-            std::env::set_var(RUNTIME_LIBRARY_PATH_ENV, &inherited);
-        }
+        // Dropped before `_guard`, so the variable is restored while this test
+        // still holds the lock, and restored at all if an assertion below panics.
+        let _env = EnvVarGuard::set(RUNTIME_LIBRARY_PATH_ENV, &inherited);
         let mut e = Examination::default();
         probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(RUNTIME_LIBRARY_PATH_ENV, value),
-                None => std::env::remove_var(RUNTIME_LIBRARY_PATH_ENV),
-            }
-        }
 
         let seen = std::fs::read_to_string(&recorded)
             .expect("the recording interpreter must have written its loader path");

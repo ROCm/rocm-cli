@@ -10385,9 +10385,18 @@ Class Name:                Display
         Ok(())
     }
 
-    /// Write a registry record whose recorded interpreter really exists, so the
-    /// `exists()` gate in `managed_therock_python_executable` is exercised
-    /// rather than short-circuited.
+    /// Write a registry record for a managed TheRock runtime, always planting a
+    /// real interpreter at the conventional location under `install_root` so the
+    /// DERIVED candidate exists on disk.
+    ///
+    /// `recorded_python` decides the record's `python_executable` key:
+    ///
+    /// - `None` writes no such key at all -- the shape of a record from before
+    ///   the installer recorded one, where only the derived candidate exists.
+    /// - `Some(path)` records that path verbatim, whether or not anything is
+    ///   there. Planting it is the caller's business, so a caller can exercise
+    ///   either side of the gate in `managed_therock_python_executable` -- which
+    ///   is `is_file()`, not `exists()`.
     fn write_therock_runtime_with_interpreter(
         registry: &Path,
         install_root: &Path,
@@ -10492,25 +10501,50 @@ Class Name:                Display
         // Handing back a path that cannot be spawned would turn "no torch" into
         // a spawn failure; the ambient probe is the better answer, so this must
         // be `None` rather than the missing path.
+        //
+        // The record really carries a `python_executable`, which is the whole
+        // point: with none recorded this would drive the gate on the DERIVED
+        // candidate and stay green however the recorded half of it is mangled.
         let (root, paths) = temp_app_paths("framework-interpreter-missing");
         let registry = paths.data_dir.join("runtimes").join("registry");
         fs::create_dir_all(&registry)?;
-        fs::write(
-            registry.join("gone.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "runtime_id": "therock-release:gone",
-                "runtime_key": "gone",
-                "family": "gfx94X-dcgpu",
-                "channel": "release",
-                "installed_at_unix_ms": 10,
-                "install_root": paths.data_dir.join("rt-gone"),
-                "rocm_sdk": { "import_ok": true },
-            }))?,
-        )?;
+        let install_root = paths.data_dir.join("rt-gone");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("gone").join("venv"));
+        write_therock_runtime_with_interpreter(&registry, &install_root, "gone", Some(&recorded))?;
+        // The helper plants the derived interpreter; take it away so that BOTH
+        // candidates are recorded-or-derived paths that are not on disk, and
+        // neither can carry the result.
+        fs::remove_dir_all(&install_root)?;
+        assert!(!recorded.exists(), "the recorded interpreter must be gone");
 
         assert!(
             active_managed_framework_interpreter(&paths, &RocmCliConfig::default()).is_none(),
             "a recorded interpreter that is not on disk must not be handed back"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_that_is_a_directory_is_passed_over() -> Result<()> {
+        // `exists()` would accept a directory and hand back something that
+        // cannot be spawned, which is the failure the gate exists to prevent;
+        // `is_file()` passes over it and the derived interpreter answers
+        // instead. Relaxing the predicate is otherwise invisible to the suite.
+        let (root, paths) = temp_app_paths("framework-interpreter-dir");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-dir");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("dir").join("venv"));
+        fs::create_dir_all(&recorded)?;
+        write_therock_runtime_with_interpreter(&registry, &install_root, "dir", Some(&recorded))?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("the derived interpreter is on disk, so something must resolve");
+        assert_eq!(
+            interpreter.python,
+            runtime_python_executable_in_env(&install_root),
+            "a recorded path that is a directory must not be preferred over a real interpreter"
         );
         fs::remove_dir_all(root).ok();
         Ok(())

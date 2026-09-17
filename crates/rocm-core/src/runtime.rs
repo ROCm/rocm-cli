@@ -382,8 +382,13 @@ fn split_windows_path_list_text(value: &str) -> Vec<String> {
 /// Render one entry for a Windows path list, quoting it when it contains the
 /// `;` separator so that [`runtime_path_list_split`] can recover it whole.
 ///
-/// `"` needs no escape: it is a reserved character in a Windows path, so a
-/// correctly split entry cannot contain one.
+/// A `"` in the entry goes out raw, where [`std::env::join_paths`] rejects the
+/// list outright. That rests on a precondition rather than on a check, so name
+/// it: `"` is reserved in a Windows path, and the splitter above consumes quotes
+/// rather than emitting them, so neither a path from disk nor an entry recovered
+/// from a list can hold one. Rejecting the character would trade that
+/// unreachable case for the failure this pair exists to avoid -- one bad entry
+/// costing the caller every entry.
 fn windows_path_list_entry_text(path: &Path) -> String {
     let text = runtime_path_for_windows_child(path);
     if text.contains(';') {
