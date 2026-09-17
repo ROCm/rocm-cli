@@ -69,18 +69,30 @@ No reboot is needed: ROCDXG is userspace.
 Confirm afterwards with `rocm examine`, which should report
 `driver_status: wsl_rocdxg_ready`.
 
+The download is verified before it is installed. `rocm install driver` carries a
+SHA-256 digest for each published ROCDXG release and checks the `.deb` against
+it; on a mismatch the plan stops before `apt install` runs the package's
+maintainer scripts as root. Nothing needs to be set for this.
+
 To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
-To require checksum verification before the package is installed, set
-`ROCM_CLI_ROCDXG_SHA256` to the trusted 64-character SHA-256 digest for that
-exact package:
+Because rocm-cli has no digest for a release it predates, supply one:
 
 ```bash
+ROCM_CLI_ROCDXG_VERSION=<version> \
 ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
 
-No production checksum is embedded, so verification is opt-in; when the
-variable is set and the download does not match, the install stops before
-`apt install`.
+`ROCM_CLI_ROCDXG_SHA256` also overrides the pinned digest for a known version.
+If you genuinely want to install without verifying, that has to be said out
+loud — the plan then prints a warning naming the version it is not checking:
+
+```bash
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
+```
+
+Without one of those, an unpinned version is refused rather than installed
+unverified.
 
 ### Doing it by hand
 
