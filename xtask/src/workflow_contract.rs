@@ -1138,8 +1138,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         for row in &self_hosted_rows {
             assert_eq!(
                 row[3], "no",
-                "self-hosted lane `{}` is continue-on-error, so the README must not \
-                 document it as blocking",
+                "self-hosted lane `{}` is non-blocking — its check name is not in branch \
+                 protection's required list (see e2e-selfhosted.yml's header) — so the \
+                 README must not document it as blocking",
                 row[0]
             );
         }

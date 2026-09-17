@@ -260,6 +260,10 @@ Feature: Model serving
   # has to be the list the command accepts. Runs on the no-GPU lane, where a
   # refusal that names the policy itself is cleanly distinguishable from the
   # ordinary "this machine has no GPU" refusal every policy gets there.
+  #
+  # Since fixed on main (EAI-8019 made `--device` a clap `ValueEnum`, so the
+  # advertised list and the accepted list are one list), so this ships as a
+  # guard rather than an expected failure.
   @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
   Scenario: serve-22 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers

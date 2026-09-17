@@ -451,21 +451,13 @@ impl TuiSession {
     /// shell that dies, or a pty reader that panics, is reported as the real
     /// cause here instead of running out the full timeout and blaming whatever
     /// the caller happened to be looking for. `wanted` is quoted into those
-    /// messages, so it should read as the thing being waited for — and must be
-    /// non-empty, because the empty string is the exit drain's private "nothing
-    /// in particular" sentinel and would silently drop the context from a
-    /// reader-panic message rather than fail.
+    /// messages, so it should read as the thing being waited for.
     pub async fn wait_for_screen_where(
         &mut self,
         wanted: &str,
         timeout: Duration,
         matches: impl Fn(&str) -> bool + Sync,
     ) -> Result<(), String> {
-        debug_assert!(
-            !wanted.is_empty(),
-            "wait_for_screen_where needs a label naming what is being waited for; \
-             the empty string is reserved for the exit drain"
-        );
         let deadline = Instant::now() + timeout;
         loop {
             if matches(&self.screen_text()) {
@@ -483,7 +475,7 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                if self.drain_final_frame_where(wanted, &matches).await? {
+                if self.drain_final_frame_where(Some(wanted), &matches).await? {
                     return Ok(());
                 }
                 return Err(format!(
@@ -785,8 +777,8 @@ impl TuiSession {
     async fn drain_final_frame(&mut self) -> Result<(), String> {
         // `|_| false` never short-circuits, so the loop runs to its deadline.
         // Nothing is being looked for, so the `bool` is uninformative here and
-        // the empty `wanted` keeps it out of the reader-panic message.
-        self.drain_final_frame_where("", &|_: &str| false)
+        // `None` keeps the absent label out of the reader-panic message.
+        self.drain_final_frame_where(None, &|_: &str| false)
             .await
             .map(|_| ())
     }
@@ -797,11 +789,12 @@ impl TuiSession {
     /// a predicate that never matches and waits the window out.
     ///
     /// `wanted` names what is being waited for and is read back in the
-    /// diagnostics; the empty string means "nothing in particular", which is
-    /// what the exit drain passes.
+    /// diagnostics; `None` means "nothing in particular", which is what the
+    /// exit drain passes — unrepresentable as a label rather than spelled with
+    /// one, so no caller can supply it by accident.
     async fn drain_final_frame_where(
         &mut self,
-        wanted: &str,
+        wanted: Option<&str>,
         matches: &(impl Fn(&str) -> bool + Sync + ?Sized),
     ) -> Result<bool, String> {
         let found = |session: &Self| matches(&session.screen_text());
@@ -837,15 +830,11 @@ impl TuiSession {
 
     /// Reader-panic diagnostic for [`drain_final_frame_where`], naming what the
     /// drain was racing.
-    fn drain_panic_message(&self, wanted: &str, panic_message: &str) -> String {
-        // The exit drain waits for nothing and passes "", so it reads as it did
-        // before this loop was shared: naming a thing it is not waiting for
-        // would be worse than naming nothing.
-        let context = if wanted.is_empty() {
-            String::new()
-        } else {
-            format!(" for {wanted}")
-        };
+    fn drain_panic_message(&self, wanted: Option<&str>, panic_message: &str) -> String {
+        // The exit drain waits for nothing, so it reads as it did before this
+        // loop was shared: naming a thing it is not waiting for would be worse
+        // than naming nothing.
+        let context = wanted.map_or_else(String::new, |wanted| format!(" for {wanted}"));
         format!(
             "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
             self.framed_screen()
