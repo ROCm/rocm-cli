@@ -367,9 +367,10 @@ impl TuiSession {
     ///
     /// Takes a bare marker and quotes it here, so both of its marker-bearing
     /// messages read as nouns — deliberately NOT the clause convention
-    /// `wait_for_screen_where` documents. For `send_until`'s marker they are
-    /// `pty reader thread panicked while waiting for "● Observe"` and
-    /// `process exited (…) before "● Observe" appeared.`; a third path
+    /// `wait_for_screen_where` documents. There are two messages, and for
+    /// `send_until`'s marker they read
+    /// `panicked while waiting for "● Observe"` and
+    /// `before "● Observe" appeared.`; a third path
     /// reports a poll failure and names no marker at all.
     ///
     /// Reached only through [`send_until`](Self::send_until), whose own
@@ -472,9 +473,11 @@ impl TuiSession {
     /// marker the frame stopped showing.
     ///
     /// `describe` is interpolated verbatim — no quoting, no rewording — into
-    /// four diagnostics, which read `waiting until {describe}`, `timed out …
-    /// waiting until {describe}`, `before {describe}`, and `… draining the
-    /// final frame, waiting until {describe}`. So it must be a clause that
+    /// four diagnostics, which read `panicked while waiting until {describe}`,
+    /// `timed out … waiting until {describe}`, `before {describe}.`, and `…
+    /// draining the final frame, waiting until {describe}`. The last of those
+    /// is assembled from two fragments in two functions, and both carry the
+    /// clause. So it must be a clause that
     /// fits all four ("the screen shows X", "generation throughput leaves
     /// the screen"), not a bare noun; and it carries whatever quoting the
     /// caller puts in it, since none is added here.
