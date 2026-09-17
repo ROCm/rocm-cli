@@ -6,25 +6,21 @@ use cucumber::{then, when};
 
 use crate::E2eWorld;
 
-#[when("the user previews driver installation with a WSL detection signal")]
+#[when("the user previews driver installation on this WSL host")]
 async fn preview_wsl_driver_install(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm_with_env(
-        world,
-        &["install", "driver", "--dry-run"],
-        &[("WSL_DISTRO_NAME", "Ubuntu")],
-    );
+    // No env signal: `is_wsl_host()` reads `/dev/dxg` and `/proc/version` and
+    // does not trust `$WSL_DISTRO_NAME`, so the scenario relies on the
+    // `@requires-wsl` gate having put it on a real WSL host.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_env(world, &["install", "driver", "--dry-run"], &[]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
-#[when("the user reviews driver installation with a WSL detection signal without approval")]
+#[when("the user reviews driver installation on this WSL host without approval")]
 async fn review_wsl_driver_install_without_approval(world: &mut E2eWorld) {
-    let (stdout, stderr, rc) = crate::run_rocm_with_env(
-        world,
-        &["install", "driver"],
-        &[("WSL_DISTRO_NAME", "Ubuntu")],
-    );
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(world, &["install", "driver"], &[]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -122,10 +118,7 @@ async fn preview_wsl_driver_install_unpinned(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_env(
         world,
         &["install", "driver", "--dry-run"],
-        &[
-            ("WSL_DISTRO_NAME", "Ubuntu"),
-            ("ROCM_CLI_ROCDXG_VERSION", "99.99.99"),
-        ],
+        &[("ROCM_CLI_ROCDXG_VERSION", "99.99.99")],
     );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
