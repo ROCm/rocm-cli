@@ -3040,6 +3040,26 @@ mod tests {
                 "RuntimeError: HIP out of memory",
                 "a bidi override must not survive into the message",
             ),
+            // U+2028/U+2029 are `Zl`/`Zp`, not `Cc`, and are in neither the
+            // enumerated `Cf` set, so the engine-local stripper this one
+            // replaced let both through verbatim -- it classified every
+            // non-escape character with `is_control_or_format` alone. Moving the
+            // walk into `rocm-core::terminal` widened that one case on purpose:
+            // both are mandatory Unicode line breaks, so a terminal draws the
+            // rest of the message on the next row, which is exactly what this
+            // stripper exists to stop untrusted output doing. These two cases
+            // are the only thing pinning it -- drop the pair from
+            // `classify_char`'s boundary set and both go red.
+            (
+                "RuntimeError: HIP\u{2028}out of memory",
+                "RuntimeError: HIPout of memory",
+                "a line separator must not survive into the message",
+            ),
+            (
+                "RuntimeError: HIP\u{2029}out of memory",
+                "RuntimeError: HIPout of memory",
+                "a paragraph separator must not survive into the message",
+            ),
             // The text-only control: nothing is removed from a clean line.
             (
                 "RuntimeError: HIP out of memory",

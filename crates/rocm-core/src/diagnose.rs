@@ -2950,8 +2950,8 @@ mod tests {
         // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
         // already opened: the executable lines agreed, so the cross-check that
         // runs over every matched finding
-        // (`the_reported_fix_agrees_with_the_catalog_recipe`) saw nothing --
-        // it filters `#` lines by construction -- while the comments explaining
+        // (`diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`)
+        // saw nothing -- it filters `#` lines by construction -- while the comments explaining
         // *which of the two faults each step addresses* had drifted apart. That
         // prose is the whole point of this entry: the two faults need opposite
         // responses, so a user meeting the `diagnose` copy and a user meeting
