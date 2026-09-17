@@ -86,15 +86,18 @@ exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
 
-`e2e-wsl` runs on an Ubuntu distro hosted in WSL2 on the Strix Halo Windows box
-and mirrors the sibling Linux lane step for step: stray-serve reclaim, GPU
-preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
-with no hand filtering. It covers WSL host detection, the Windows-to-WSL
-execution boundary, and whatever GPU access WSL exposes on that machine. The
-GPU preflight is advisory here precisely because GPU-on-WSL is what the lane is
-proving out: where it is unavailable the capability probe resolves those
-scenarios to not-applicable and the rest of the suite still runs. Scenarios the
-product deliberately routes around on WSL carry `@requires-bare-metal`;
+`e2e-wsl` runs on the DevLab Dispatch pool, in the WSL2/Ubuntu-24.04 distro the
+job installs fresh (see above) rather than a persistent host, so it has no
+stray serve from a prior run to reclaim — unlike the sibling Linux lane, which
+does carry that step for exactly that reason. It otherwise mirrors that lane:
+GPU preflight, toolchain bootstrap, shared-runtime pre-warm, then the full
+suite with no hand filtering. It covers WSL host detection, the
+Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
+machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
+what the lane is proving out: where it is unavailable the capability probe
+resolves those scenarios to not-applicable and the rest of the suite still
+runs. Scenarios the product deliberately routes around on WSL carry
+`@requires-bare-metal`;
 scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
 only lane that runs them.
 
