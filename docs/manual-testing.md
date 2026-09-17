@@ -203,8 +203,10 @@ undone, so read the log first:
 ```powershell
 rocm services logs <service-id>
 rocm services remove <service-id> --yes
-rocm services prune --dry-run --older-than-hours 0
-rocm services prune --yes --older-than-hours 0
+rocm services prune --dry-run
+rocm services prune --dry-run --any-age
+rocm services prune --yes --any-age
+rocm services prune --any-age --older-than-hours 0
 ```
 
 Expected result:
@@ -218,11 +220,21 @@ Expected result:
   `<data>/engines/<engine>/state/<service-id>.json` and any
   `<data>/services/<service-id>.endpoint-key` are gone.
 - `<data>/services/launch.lock` is untouched — it is shared by every launch.
-- `rocm services prune --dry-run` prints the same plan and changes nothing.
+- `rocm services prune --dry-run` prints the plan and removes nothing. (It still
+  refreshes each record against the real processes, so a record whose server has
+  since died can have its status corrected on disk; nothing is deleted.)
 - `rocm services prune` leaves running servers alone and says how many it
   skipped, and also removes leftover engine state files whose record is gone.
-- Without `--older-than-hours 0`, a record written in the last 24 hours is left
-  alone and the output says so.
+- With no age argument, a record written in the last 24 hours is left alone, and
+  the output both counts it ("too recent, kept: 1") and names the flag to
+  include it: `rocm services prune --any-age --yes`.
+- `--any-age` then removes that same record. `--older-than-hours 0` is the
+  equivalent long form.
+- `--any-age` together with `--older-than-hours` is rejected by the argument
+  parser rather than one of them silently winning.
+- A record whose server died long ago but has not been listed since is still
+  removed by a plain `rocm services prune --yes`: age is read from the record
+  file as it was before the command refreshed it, not after.
 
 ## 5. ComfyUI Verification
 

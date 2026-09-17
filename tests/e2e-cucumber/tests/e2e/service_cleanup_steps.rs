@@ -146,6 +146,29 @@ async fn record_still_running(world: &mut E2eWorld) {
     );
 }
 
+/// A record still claiming `ready` whose server is long gone, and whose files
+/// have not been touched since.
+///
+/// No `services list` premise guard here, unlike the steps above: listing is
+/// exactly what refreshes and rewrites the record, and "never observed since it
+/// died" is the premise. The status is `ready` so the CLI's first look at it
+/// corrects the status and persists that correction mid-prune — the rewrite the
+/// age gate must not mistake for the record being new.
+#[given("a local server record whose server died long ago and was never listed since")]
+async fn record_died_long_ago(world: &mut E2eWorld) {
+    plant_record(world, "ready");
+    let month_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(24 * 30);
+    for path in record_files(world) {
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("failed to open {} : {error}", path.display()));
+        handle
+            .set_modified(month_ago)
+            .unwrap_or_else(|error| panic!("failed to backdate {} : {error}", path.display()));
+    }
+}
+
 #[given("an engine state file whose local server record was deleted by hand")]
 async fn orphaned_engine_state(world: &mut E2eWorld) {
     let states = engine_state_dir(world);
@@ -188,6 +211,23 @@ async fn run_prune(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+/// No age argument at all — the invocation a user reaches for first, and the one
+/// whose behaviour the README and the command's own summary describe.
+#[when("the user prunes with the default age rule")]
+async fn run_prune_default_age(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "prune", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+/// `--any-age`, spelled the way the summary tells the user to spell it, not the
+/// `--older-than-hours 0` equivalent: the point is that the advertised flag
+/// reaches the same code path.
+#[when("the user prunes every record whatever its age")]
+async fn run_prune_any_age(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "prune", "--any-age", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("the CLI names the log file before deleting it")]
@@ -223,6 +263,30 @@ async fn record_files_present(world: &mut E2eWorld) {
             combined_output(world)
         );
     }
+}
+
+#[then("the CLI says it kept the record for being recent and names --any-age")]
+async fn kept_for_being_recent(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains("too recent, kept: 1"),
+        "a silent keep is indistinguishable from finding nothing, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("rocm services prune --any-age --yes"),
+        "the summary must name the flag that includes the kept record, got:\n{combined}"
+    );
+}
+
+#[then("the CLI does not claim it kept anything for being recent")]
+async fn kept_nothing_for_being_recent(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let combined = combined_output(world);
+    assert!(
+        combined.contains("too recent, kept: 0"),
+        "a record untouched for a month is not recent, got:\n{combined}"
+    );
 }
 
 #[then("the shared launch lock is still there")]
@@ -275,7 +339,7 @@ async fn preview_lists_both(world: &mut E2eWorld) {
         "the preview must name the leftover engine state file:\n{combined}"
     );
     assert!(
-        combined.contains("Nothing was changed. Re-run without --dry-run to remove."),
+        combined.contains("Nothing was removed. Re-run without --dry-run to remove."),
         "the preview must say nothing was changed:\n{combined}"
     );
 }

@@ -57,7 +57,7 @@ use rocm_engine_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -882,9 +882,10 @@ enum ServicesCommand {
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///
-        /// Age is measured from when the record was last written, so a server
-        /// that has only just stopped keeps its log and stays restartable. Pass
-        /// 0 to include everything that is not running.
+        /// Age is measured from when the record file was last written — a stop,
+        /// a restart, or a status correction all count as touching it — so a
+        /// server that has only just stopped keeps its log and stays
+        /// restartable. Pass 0 to include everything that is not running.
         #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
         older_than_hours: u64,
         /// Remove every record that is not running, however recent.
@@ -6780,7 +6781,7 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
             dry_run,
             yes,
         } => {
-            let older_than_hours = if any_age { 0 } else { older_than_hours };
+            let older_than_hours = service_prune_min_age_hours(older_than_hours, any_age);
             let outcome = prune_managed_service_records(&paths, older_than_hours, dry_run, yes)?;
             print!("{}", outcome.text);
             if !dry_run && (outcome.removed_records > 0 || outcome.removed_files > 0) {
@@ -6794,6 +6795,15 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
                         outcome.removed_records, outcome.removed_files
                     ),
                     None,
+                );
+            }
+            // Deliberately after the print and the audit event: a file this run
+            // could not delete still has to fail the command, but not at the
+            // cost of the record of what it *did* delete.
+            if !outcome.failures.is_empty() {
+                bail!(
+                    "{} file(s) could not be removed; see the list above",
+                    outcome.failures.len()
                 );
             }
             Ok(())
@@ -7104,22 +7114,60 @@ fn service_record_artifacts(
     })
 }
 
-/// Delete every artifact that exists, returning the paths actually removed.
+/// Delete every artifact that exists, collecting failures instead of stopping at
+/// the first one.
 ///
 /// A missing file is not an error: a record whose log was already deleted by
-/// hand (the workaround this command replaces) must still be removable.
-fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result<Vec<PathBuf>> {
+/// hand (the workaround this command replaces) must still be removable. An
+/// unremovable one is returned as a message rather than propagated, because
+/// `prune` walks many records and aborting mid-loop would throw away the
+/// rendered plan and the audit event covering everything already deleted in the
+/// same run — losing the record of a destructive action exactly when something
+/// went wrong.
+fn try_remove_service_record_artifacts(
+    artifacts: &ServiceRecordArtifacts,
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut removed = Vec::new();
+    let mut failures = Vec::new();
     for path in artifacts.paths() {
         match fs::remove_file(path) {
             Ok(()) => removed.push(path.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to remove {}", path.display()));
-            }
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
         }
     }
+    (removed, failures)
+}
+
+/// Delete every artifact that exists, returning the paths actually removed.
+///
+/// The strict form, for `remove`, which owns exactly one record and has no
+/// partial progress to report: any file it could not delete is the command
+/// failing. Every artifact is still attempted first, so a single stubborn file
+/// does not strand the other three.
+fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result<Vec<PathBuf>> {
+    let (removed, failures) = try_remove_service_record_artifacts(artifacts);
+    if !failures.is_empty() {
+        bail!("failed to remove {}", failures.join("; "));
+    }
     Ok(removed)
+}
+
+/// Whether a record is too alive to delete: the CLI reads it as live, *or* a
+/// process it recorded is still running.
+///
+/// The status string alone is not enough for a destructive command.
+/// `refresh_from_engine_state` adopts `failed` straight from the engine's own
+/// state file, and `refresh_managed_service_runtime_liveness` then returns early
+/// for any non-live status without ever consulting the recorded pids — so a
+/// server whose engine reported failure while its process is still up reads as
+/// removable, and deleting it takes the log and the 0600 endpoint key out from
+/// under a process that may still be serving.
+fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+    managed_service_is_live(record)
+        || recorded_service_pids(record)
+            .iter()
+            .any(|pid| process_is_running(*pid))
 }
 
 /// Remove one non-running local server record and everything it owns.
@@ -7136,7 +7184,7 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     // Checked before `--yes` on purpose: for a running server "stop it first" is
     // the actionable error, and repeating the command with --yes must not be the
     // advice a user takes away from it.
-    if managed_service_is_live(&record) {
+    if managed_service_record_is_in_use(&record) {
         bail!(
             "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
             record.status
@@ -7202,22 +7250,74 @@ struct ServicePrunePlan {
     skipped_recent: usize,
 }
 
-/// Age of `path` from its modification time. `None` when the time cannot be read
-/// or is in the future, which is treated as "too new to touch".
-fn path_age(path: &Path, now: SystemTime) -> Option<Duration> {
-    now.duration_since(fs::metadata(path).ok()?.modified().ok()?)
-        .ok()
+/// Modification time of `path`, or `None` when it cannot be read.
+fn path_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Age of a modification time relative to `now`. `None` when the time is missing
+/// or in the future, which is treated as "too new to touch".
+fn age_from_modified(modified: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+    now.duration_since(modified?).ok()
+}
+
+/// Whether a modification time is old enough to prune, given a threshold.
+///
+/// Fail-closed: a time that cannot be determined is kept, except when the
+/// threshold is zero (the explicit "everything that is not running" opt-out).
+fn prunable_by_modified(modified: Option<SystemTime>, min_age: Duration, now: SystemTime) -> bool {
+    if min_age.is_zero() {
+        return true;
+    }
+    age_from_modified(modified, now).is_some_and(|age| age >= min_age)
 }
 
 /// Whether `path` is old enough to prune, given a threshold in hours.
 ///
-/// Fail-closed: a path whose age cannot be determined is kept, except when the
-/// threshold is zero (the explicit "everything that is not running" opt-out).
+/// Only sound for files nothing in this run rewrites. Service manifests are
+/// rewritten by [`load_managed_services`], so their times are snapshotted up
+/// front by [`service_manifest_modified_times`] and gated with
+/// [`prunable_by_modified`] instead.
 fn prunable_by_age(path: &Path, min_age: Duration, now: SystemTime) -> bool {
-    if min_age.is_zero() {
-        return true;
+    prunable_by_modified(path_modified(path), min_age, now)
+}
+
+/// Modification times of every `*.json` in the services directory, taken before
+/// anything in this run can rewrite them.
+///
+/// [`load_managed_services`] refreshes each record against the engine state and
+/// the real processes, and persists the result whenever that changes the status
+/// — which is exactly what happens the first time anything observes that a
+/// `ready`/`running`/`starting` server has died. That rewrite lands *after* the
+/// `now` the age gate compares against, so a manifest read afterwards looks
+/// newer than the run itself and the fail-closed branch keeps it forever. A host
+/// whose servers died weeks ago but were never listed since would see
+/// `rocm services prune --yes` remove nothing while reporting those records as
+/// too recent to touch.
+fn service_manifest_modified_times(paths: &AppPaths) -> HashMap<PathBuf, SystemTime> {
+    let mut times = HashMap::new();
+    let Ok(entries) = fs::read_dir(paths.services_dir()) else {
+        return times;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(modified) = path_modified(&path) {
+            times.insert(path, modified);
+        }
     }
-    path_age(path, now).is_some_and(|age| age >= min_age)
+    times
+}
+
+/// The age threshold one `prune` invocation runs with, in hours.
+///
+/// `--any-age` is the discoverable spelling of `--older-than-hours 0` — clap
+/// rejects the two together — so this only has to collapse the flag. It is a
+/// function rather than a line inside the dispatch `match` so a test can drive
+/// the real parsed arguments through the same mapping the command uses.
+const fn service_prune_min_age_hours(older_than_hours: u64, any_age: bool) -> u64 {
+    if any_age { 0 } else { older_than_hours }
 }
 
 fn describe_hours(hours: u64) -> String {
@@ -7298,11 +7398,16 @@ fn build_service_prune_plan(
     now: SystemTime,
 ) -> Result<ServicePrunePlan> {
     let mut plan = ServicePrunePlan::default();
+    // Taken first, because `load_managed_services` below rewrites the manifest of
+    // every record whose status its refresh corrects — see
+    // `service_manifest_modified_times` for why reading the time afterwards makes
+    // the age gate keep exactly the long-dead records prune exists to remove.
+    let manifest_times = service_manifest_modified_times(paths);
     // `load_managed_services` refreshes each record against the engine state and
     // the real processes before returning it, so liveness below is read from the
     // refreshed view, never from the manifest as it was on disk.
     for record in load_managed_services(paths)? {
-        if managed_service_is_live(&record) {
+        if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
                 "{} is {} — stop it first with `rocm services stop {} --yes`",
@@ -7317,7 +7422,11 @@ fn build_service_prune_plan(
                 continue;
             }
         };
-        if !prunable_by_age(&artifacts.manifest, min_age, now) {
+        if !prunable_by_modified(
+            manifest_times.get(&artifacts.manifest).copied(),
+            min_age,
+            now,
+        ) {
             plan.skipped_recent += 1;
             plan.skipped.push(format!(
                 "{} changed less than {} ago",
@@ -7364,7 +7473,7 @@ fn render_service_prune_plan(plan: &ServicePrunePlan, hours: u64, dry_run: bool)
     if plan.skipped_recent > 0 {
         let _ = writeln!(
             output,
-            "{} record(s) stopped less than {} ago and are kept; add --any-age to include them.",
+            "{} record(s) changed less than {} ago and are kept; add --any-age to include them.",
             plan.skipped_recent,
             describe_hours(hours)
         );
@@ -7415,9 +7524,13 @@ fn render_service_prune_plan(plan: &ServicePrunePlan, hours: u64, dry_run: bool)
     }
     if dry_run {
         let _ = writeln!(output);
+        // "Nothing was removed", not "nothing was changed": building the plan
+        // loads every record, and loading corrects a status that no longer
+        // matches the real processes and persists that correction. No file is
+        // deleted, which is the promise a dry run of a removal command makes.
         let _ = writeln!(
             output,
-            "Nothing was changed. Re-run without --dry-run to remove."
+            "Nothing was removed. Re-run without --dry-run to remove."
         );
     }
     output
@@ -7431,6 +7544,10 @@ struct ServicePruneOutcome {
     /// Records left in place purely because they are still running.
     skipped_live: usize,
     skipped_recent: usize,
+    /// Paths the run could not delete, one message each. Collected rather than
+    /// propagated so the plan still prints and the audit event is still
+    /// recorded; the caller turns a non-empty list into a failing exit.
+    failures: Vec<String>,
 }
 
 /// Bulk-remove the local server records that are no longer running.
@@ -7463,16 +7580,36 @@ fn prune_managed_service_records(
     }
 
     for entry in &plan.remove {
-        outcome.removed_files += remove_service_record_artifacts(&entry.artifacts)?.len();
-        outcome.removed_records += 1;
+        // Liveness was snapshotted while the plan was built. A
+        // `rocm services restart <id> --yes` landing in that window would have
+        // its log and 0600 endpoint key deleted out from under a live process,
+        // so re-read the record immediately before touching its files —
+        // `remove` closes the same window by loading the record it deletes.
+        if load_managed_service(paths, &entry.service_id)
+            .is_ok_and(|record| managed_service_record_is_in_use(&record))
+        {
+            outcome.skipped_live += 1;
+            let _ = writeln!(
+                outcome.text,
+                "  {} started again while this ran and was left alone.",
+                entry.service_id
+            );
+            continue;
+        }
+        let (removed, failures) = try_remove_service_record_artifacts(&entry.artifacts);
+        outcome.removed_files += removed.len();
+        if failures.is_empty() {
+            outcome.removed_records += 1;
+        }
+        outcome.failures.extend(failures);
     }
     for path in &plan.orphans {
         match fs::remove_file(path) {
             Ok(()) => outcome.removed_files += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to remove {}", path.display()));
-            }
+            Err(error) => outcome
+                .failures
+                .push(format!("{}: {error}", path.display())),
         }
     }
 
@@ -7495,6 +7632,21 @@ fn prune_managed_service_records(
             outcome.text,
             "  Those are recent enough to still be worth reading: `rocm services logs <id>`.\n  \
              Run `rocm services prune --any-age --yes` to remove them too."
+        );
+    }
+    if !outcome.failures.is_empty() {
+        let _ = writeln!(outcome.text);
+        let _ = writeln!(
+            outcome.text,
+            "{} file(s) could not be removed:",
+            outcome.failures.len()
+        );
+        for failure in &outcome.failures {
+            let _ = writeln!(outcome.text, "  - {failure}");
+        }
+        let _ = writeln!(
+            outcome.text,
+            "Re-running is safe: everything already removed stays removed."
         );
     }
     Ok(outcome)
@@ -26177,7 +26329,7 @@ install therock";
         assert!(
             outcome
                 .text
-                .contains("Nothing was changed. Re-run without --dry-run to remove.")
+                .contains("Nothing was removed. Re-run without --dry-run to remove.")
         );
         Ok(())
     }
@@ -26220,6 +26372,53 @@ install therock";
         Ok(())
     }
 
+    /// The age gate reads the manifest's modification time, and
+    /// `load_managed_services` rewrites that manifest the first time it observes
+    /// that a `ready` server has died — a crash, a kill, a reboot. Read after
+    /// that rewrite the record looks newer than the prune run itself, so the
+    /// fail-closed branch keeps it: on a host whose servers died weeks ago and
+    /// have not been listed since, `rocm services prune --yes` removed nothing
+    /// at all and called every one of them too recent to touch.
+    #[test]
+    fn services_prune_default_age_removes_a_record_the_refresh_rewrote() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-refresh-rewrite");
+        paths.ensure()?;
+        // `ready` with a dead pid is the state that triggers the rewrite: the
+        // liveness refresh demotes the status and persists the demotion.
+        let record = plant_service_record(&paths, "svc-long-dead", "ready", 999_999_999)?;
+        let month_ago = SystemTime::now() - Duration::from_hours(24 * 30);
+        fs::File::options()
+            .write(true)
+            .open(&record.manifest_path)?
+            .set_modified(month_ago)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "a record last written a month ago must be pruned even though the \
+             liveness refresh rewrote its manifest during this run:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "the refresh's own rewrite must not make a month-old record recent:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
     /// A cleanup that keeps things silently is indistinguishable from one that
     /// found nothing, and what it keeps is exactly what a user debugging a fresh
     /// failure still wants. The count and the way to override it both have to be
@@ -26255,15 +26454,54 @@ install therock";
         Ok(())
     }
 
+    /// Parse a real `rocm services prune` command line and return exactly what
+    /// the dispatch at `ServicesCommand::Prune` would hand
+    /// [`prune_managed_service_records`]. Nothing here re-implements the flag
+    /// mapping: it runs [`service_prune_min_age_hours`], the same function the
+    /// command uses, so a test driving this covers the wiring and not a copy of
+    /// it.
+    fn parse_services_prune_args(argv: &[&str]) -> Result<(u64, bool, bool)> {
+        let cli = Cli::try_parse_from(argv)?;
+        let Some(Command::Services {
+            command:
+                Some(ServicesCommand::Prune {
+                    older_than_hours,
+                    any_age,
+                    dry_run,
+                    yes,
+                }),
+        }) = cli.command
+        else {
+            bail!("{argv:?} did not parse as `services prune`");
+        };
+        Ok((
+            service_prune_min_age_hours(older_than_hours, any_age),
+            dry_run,
+            yes,
+        ))
+    }
+
     /// `--any-age` is the reachable form of `--older-than-hours 0`: the summary
     /// points at it, so it has to actually take the record the default kept.
+    ///
+    /// Driven from the argument vector rather than by passing 0 by hand —
+    /// otherwise this is just another call with `hours = 0` and the flag's only
+    /// wiring, the collapse in [`service_prune_min_age_hours`], is never
+    /// executed by any test.
     #[test]
     fn services_prune_any_age_removes_a_just_stopped_record() -> Result<()> {
         let (root, paths) = test_paths("services-prune-any-age");
         paths.ensure()?;
         let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
 
-        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome =
+            parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                .and_then(|(hours, dry_run, yes)| {
+                    assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                    assert!(!dry_run);
+                    assert!(yes);
+                    prune_managed_service_records(&paths, hours, dry_run, yes)
+                });
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -26284,6 +26522,152 @@ install therock";
             outcome.skipped_recent, 0,
             "nothing is 'too recent' once the age rule is off:\n{}",
             outcome.text
+        );
+        Ok(())
+    }
+
+    /// Without the flag the very same parsed command line must keep the record,
+    /// which is what makes the assertion above about `--any-age` and not about
+    /// prune deleting things in general.
+    #[test]
+    fn services_prune_without_any_age_keeps_the_default_threshold() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-no-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let parsed = parse_services_prune_args(&["rocm", "services", "prune", "--yes"]);
+        let outcome = parsed.and_then(|(hours, dry_run, yes)| {
+            assert_eq!(
+                hours, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS,
+                "no --any-age means the default age rule still applies"
+            );
+            prune_managed_service_records(&paths, hours, dry_run, yes)
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "the default must keep it:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.skipped_recent, 1);
+        Ok(())
+    }
+
+    /// `--any-age` and an explicit `--older-than-hours` would be two answers to
+    /// one question; clap has to reject the pair rather than silently pick one.
+    #[test]
+    fn services_prune_rejects_any_age_with_an_explicit_age() {
+        let error = Cli::try_parse_from([
+            "rocm",
+            "services",
+            "prune",
+            "--any-age",
+            "--older-than-hours",
+            "5",
+        ])
+        .expect_err("the two age arguments must conflict");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
+            "the conflict must name both arguments:\n{rendered}"
+        );
+    }
+
+    /// `collect_service_orphans`' doc comment leans on this: an *unparseable*
+    /// manifest is skipped by `load_managed_services`, so widening the orphan
+    /// rule from "no `<id>.json` on disk" to "no record in the list" would
+    /// delete the log of the one record a user most needs to read, and the
+    /// corrupt manifest with it. Nothing asserted that until now — the other
+    /// tests only ever plant a fully absent manifest.
+    #[test]
+    fn services_prune_keeps_a_corrupt_manifest_and_its_siblings() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-corrupt");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-corrupt", "failed", 999_999_999)?;
+        // Valid JSON, not a valid record: `serde_json::from_slice` fails, so
+        // `load_managed_services` skips it without reporting an error.
+        fs::write(&record.manifest_path, b"{\"service_id\": 12345}")?;
+        let key_path = endpoint_keys::endpoint_key_file_path(&paths, "svc-corrupt");
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let state_exists = record.engine_state_path.exists();
+        let key_exists = key_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a manifest that cannot be parsed must never be deleted:\n{}",
+            outcome.text
+        );
+        assert!(
+            log_exists,
+            "the log of an unreadable record is exactly what a user needs:\n{}",
+            outcome.text
+        );
+        assert!(state_exists, "the engine state must not look orphaned");
+        assert!(key_exists, "the endpoint key must not look orphaned");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        Ok(())
+    }
+
+    /// The status string is not proof of death. `refresh_from_engine_state`
+    /// adopts `failed` straight from the engine's own state file and the
+    /// liveness refresh then returns early for a non-live status, so a server
+    /// whose engine reported failure while its process is still up would be
+    /// removable — taking the log and the 0600 endpoint key of a live process.
+    #[test]
+    fn services_removal_refuses_a_failed_record_whose_process_is_still_alive() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-live-pid");
+        paths.ensure()?;
+        // This test process: a pid that is unambiguously running.
+        let record = plant_service_record(&paths, "svc-zombie", "failed", std::process::id())?;
+
+        let remove_error = remove_managed_service_record(&paths, "svc-zombie", true);
+        let prune = prune_managed_service_records(&paths, 0, false, true);
+        let prune = match prune {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = remove_error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("cannot be removed while it is running"),
+            "a record with a live pid must be refused whatever its status: {message}"
+        );
+        assert!(manifest_exists, "nothing may be deleted:\n{}", prune.text);
+        assert_eq!(prune.removed_records, 0);
+        assert_eq!(
+            prune.skipped_live, 1,
+            "prune must count it as still running:\n{}",
+            prune.text
         );
         Ok(())
     }

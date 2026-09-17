@@ -43,3 +43,28 @@ Feature: Local server record cleanup
     When the user prunes every record that is not running
     Then every file belonging to that record is gone
     And the leftover engine state file is gone
+
+  # The age rule only helps if the way past it is discoverable. A user who ran
+  # `prune`, saw nothing happen and read the summary has to be able to act on
+  # what it says, so this drives the exact flag that summary prints rather than
+  # the `--older-than-hours 0` long form every scenario above uses.
+  @id:service-cleanup-any-age-takes-what-the-default-kept
+  Scenario: service-cleanup-04 - The default keeps a fresh record and --any-age takes it
+    Given a local server record that is no longer running
+    When the user prunes with the default age rule
+    Then the CLI says it kept the record for being recent and names --any-age
+    And every file belonging to that record is still there
+    When the user prunes every record whatever its age
+    Then every file belonging to that record is gone
+
+  # The case the default invocation exists for. `prune` reads the record file's
+  # age, and loading the records rewrites that file whenever it first notices
+  # the server has died — so on the host this command is most needed on, a
+  # plain `rocm services prune --yes` removed nothing and called every
+  # long-dead record too recent to touch.
+  @id:service-cleanup-prunes-a-server-that-died-long-ago
+  Scenario: service-cleanup-05 - A record whose server died long ago is pruned by default
+    Given a local server record whose server died long ago and was never listed since
+    When the user prunes with the default age rule
+    Then every file belonging to that record is gone
+    And the CLI does not claim it kept anything for being recent
