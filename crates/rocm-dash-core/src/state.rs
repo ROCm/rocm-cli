@@ -40,6 +40,33 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    /// Single glyph (with trailing space) used everywhere a job's status is
+    /// shown as an icon: the job console banner, the Home tab activity feed,
+    /// and the LOGS dock. Centralized so those three renderers can't drift
+    /// apart on which glyph means what.
+    pub const fn glyph(&self) -> &'static str {
+        match self {
+            Self::Running => "⋯ ",
+            Self::Done { code: 0 } => "✓ ",
+            Self::Done { .. } => "! ",
+            Self::Failed { .. } => "✗ ",
+            Self::Cancelled => "○ ",
+        }
+    }
+
+    /// Human-readable status label, e.g. for the job console's status chip.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Running => "running".to_string(),
+            Self::Done { code: 0 } => "done".to_string(),
+            Self::Done { code } => format!("exited ({code})"),
+            Self::Failed { message } => format!("failed: {message}"),
+            Self::Cancelled => "cancelled".to_string(),
+        }
+    }
+}
+
 /// Per-job model: the streamed output ring plus the shared cancel flag the
 /// async runtime watches. `Arc<AtomicBool>` is `std` only (no `tokio`), so it
 /// is safe at the core boundary.
@@ -268,6 +295,36 @@ mod tests {
             timestamp: chrono::DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
             ..Snapshot::default()
         }
+    }
+
+    #[test]
+    fn job_status_glyph_covers_all_variants() {
+        assert_eq!(JobStatus::Running.glyph(), "⋯ ");
+        assert_eq!(JobStatus::Done { code: 0 }.glyph(), "✓ ");
+        assert_eq!(JobStatus::Done { code: 1 }.glyph(), "! ");
+        assert_eq!(
+            JobStatus::Failed {
+                message: "boom".into()
+            }
+            .glyph(),
+            "✗ "
+        );
+        assert_eq!(JobStatus::Cancelled.glyph(), "○ ");
+    }
+
+    #[test]
+    fn job_status_label_covers_all_variants() {
+        assert_eq!(JobStatus::Running.label(), "running");
+        assert_eq!(JobStatus::Done { code: 0 }.label(), "done");
+        assert_eq!(JobStatus::Done { code: 2 }.label(), "exited (2)");
+        assert_eq!(
+            JobStatus::Failed {
+                message: "boom".into()
+            }
+            .label(),
+            "failed: boom"
+        );
+        assert_eq!(JobStatus::Cancelled.label(), "cancelled");
     }
 
     #[test]

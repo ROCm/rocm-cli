@@ -71,13 +71,7 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
 
 /// Human-readable status label + the color it should render in.
 pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
-    match &job.status {
-        JobStatus::Running => ("running".to_string(), theme.accent),
-        JobStatus::Done { code: 0 } => ("done".to_string(), theme.ok),
-        JobStatus::Done { code } => (format!("exited ({code})"), theme.warn),
-        JobStatus::Failed { message } => (format!("failed: {message}"), theme.err),
-        JobStatus::Cancelled => ("cancelled".to_string(), theme.muted),
-    }
+    (job.status.label(), theme.job_status_color(&job.status))
 }
 
 /// Render the job console centered over `area`.
@@ -118,14 +112,7 @@ pub fn draw_job_console(
     let is_terminal = !matches!(job.status, JobStatus::Running);
     let mut header = Vec::new();
     if is_terminal {
-        let glyph = match job.status {
-            JobStatus::Failed { .. } => "✗ ",
-            JobStatus::Cancelled => "○ ",
-            JobStatus::Done { code: 0 } => "✓ ",
-            JobStatus::Done { .. } => "! ",
-            // Unreachable: `is_terminal` (above) excludes `Running`.
-            JobStatus::Running => unreachable!("terminal banner only renders for finished jobs"),
-        };
+        let glyph = job.status.glyph();
         header.push(Span::styled(
             format!(" {glyph}{label} "),
             Style::default()
@@ -324,6 +311,36 @@ mod tests {
             code: 0,
         });
         assert_eq!(status_label(s.job("j").unwrap(), &t).0, "done");
+    }
+
+    #[test]
+    fn status_label_glyph_and_color_match_shared_job_status_helpers() {
+        // Guards against `job_console`, `tabs/home`, and `dock` re-diverging on
+        // what a `JobStatus` looks like: all three must render the glyph/color
+        // that come from `JobStatus::glyph()`/`Theme::job_status_color()`, not
+        // a hand-rolled match of their own.
+        let t = theme();
+        let statuses = [
+            JobStatus::Running,
+            JobStatus::Done { code: 0 },
+            JobStatus::Done { code: 7 },
+            JobStatus::Failed {
+                message: "boom".into(),
+            },
+            JobStatus::Cancelled,
+        ];
+        for status in statuses {
+            let job = JobState {
+                cmd: "x".into(),
+                args: Vec::new(),
+                status: status.clone(),
+                output: std::collections::VecDeque::default(),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let (label, color) = status_label(&job, &t);
+            assert_eq!(label, status.label());
+            assert_eq!(color, t.job_status_color(&status));
+        }
     }
 
     #[test]

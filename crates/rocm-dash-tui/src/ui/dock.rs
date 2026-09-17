@@ -18,7 +18,6 @@ use ratatui::widgets::Paragraph;
 
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
-use rocm_dash_core::state::JobStatus;
 
 use crate::app::{ActiveTab, AppState};
 use crate::ui::format;
@@ -148,11 +147,7 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     jobs.sort_by(|a, b| a.0.cmp(b.0));
     let mut lines: Vec<Line> = Vec::new();
     for (_, job) in jobs {
-        let color = match job.status {
-            JobStatus::Failed { .. } => theme.err,
-            JobStatus::Done { .. } => theme.ok,
-            _ => theme.fg,
-        };
+        let color = theme.job_status_color(&job.status);
         for l in &job.output {
             lines.push(Line::from(Span::styled(
                 l.clone(),

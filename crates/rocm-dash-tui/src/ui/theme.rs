@@ -14,6 +14,7 @@
 //! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
 
 use ratatui::style::{Color, Modifier, Style};
+use rocm_dash_core::state::JobStatus;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -244,6 +245,21 @@ impl Theme {
             StatusTone::Success => self.ok,
             StatusTone::Error | StatusTone::Alert => self.err,
         }
+    }
+
+    /// Color for a [`JobStatus`], via [`Self::tone_color`]. The single source
+    /// of truth for job-status color shared by the job console banner, the
+    /// Home tab activity feed, and the LOGS dock — they must not each pick
+    /// their own mapping.
+    pub const fn job_status_color(&self, status: &JobStatus) -> Color {
+        let tone = match status {
+            JobStatus::Running => StatusTone::Accent,
+            JobStatus::Done { code: 0 } => StatusTone::Success,
+            JobStatus::Done { .. } => StatusTone::Warning,
+            JobStatus::Failed { .. } => StatusTone::Error,
+            JobStatus::Cancelled => StatusTone::Muted,
+        };
+        self.tone_color(tone)
     }
 }
 

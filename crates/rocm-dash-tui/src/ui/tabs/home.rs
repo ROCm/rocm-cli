@@ -21,6 +21,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::state::JobStatus;
+
 use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
@@ -203,13 +205,8 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .map(|(_, job)| job)
         .take(feed.height as usize)
     {
-        let (glyph, color) = match job.status {
-            rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
-            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
-            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
-        };
+        let glyph = job.status.glyph();
+        let color = theme.job_status_color(&job.status);
         lines.push(Line::from(vec![
             Span::styled(glyph, Style::default().fg(color)),
             Span::styled(job.cmd.clone(), Style::default().fg(theme.fg)),
@@ -223,9 +220,21 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     // Glyph key, appended last: `truncate` below already drops it whenever
     // there's no spare room, so it never displaces real activity on a
-    // squeezed card — no separate room check needed.
+    // squeezed card — no separate room check needed. Built from the same
+    // `JobStatus::glyph()` used above so the key can't drift from the real
+    // glyphs.
+    let done = JobStatus::Done { code: 0 }.glyph();
+    let warn = JobStatus::Done { code: 1 }.glyph();
+    let failed = JobStatus::Failed {
+        message: String::new(),
+    }
+    .glyph();
+    let running = JobStatus::Running.glyph();
+    let cancelled = JobStatus::Cancelled.glyph();
     lines.push(Line::from(Span::styled(
-        "● live  ✓ done  ! warn  ✗ failed  ⋯ running  ○ cancelled",
+        format!(
+            "● live  {done}done  {warn}warn  {failed}failed  {running}running  {cancelled}cancelled"
+        ),
         Style::default().fg(theme.muted),
     )));
     lines.truncate(feed.height as usize);
