@@ -25,10 +25,11 @@
 //! # The one exception to the never-merge property
 //!
 //! [`rendered_lines`] is an over-approximation of what a terminal would have
-//! drawn: it may split one rendered line in two, and in the other direction it
-//! merges two rendered rows in exactly one shape. A line break *inside* the
-//! body of a string-argument sequence (`OSC`, `DCS`, `SOS`, `PM`, `APC`) is
-//! consumed with that body, so the text either side of the sequence joins up:
+//! drawn: it may split one rendered line in two, or lose one altogether, and in
+//! the other direction it merges two rendered rows in exactly one shape. A line
+//! break *inside* the body of a string-argument sequence (`OSC`, `DCS`, `SOS`,
+//! `PM`, `APC`) is consumed with that body, so the text either side of the
+//! sequence joins up:
 //!
 //! ```text
 //! rendered_lines("vllm\u{1b}]0;ti\ntle\u{7}llama.cpp OOM")
@@ -44,16 +45,38 @@
 //! one sequence wide — or to the end of the input, and the break is swallowed
 //! in every one of those cases, terminated or not.
 //!
+//! Swallowing the break is not always a *merge*, though, and the end-of-input
+//! case is the one where it is not. A merge needs drawable text on both sides of
+//! the break landing in one segment; when the body runs out over the end of the
+//! input there is no far side left to join to, and what the terminal drew past
+//! the break comes back in no segment at all:
+//!
+//! ```text
+//! rendered_lines("vllm\u{1b}]0;ti\ntle") == ["vllm"]
+//! ```
+//!
+//! That is a loss, not a misattribution, so it belongs with the splitting
+//! direction where nothing is promised: it costs a diagnosis the tool would
+//! otherwise have made, and the canonical-symptom fallback covers it.
+//!
 //! Common terminals abort a control string on an embedded C0 byte and would
 //! draw two rows there, so this is a real divergence rather than a technicality.
 //! Nor does it take crafted input to reach, which an earlier wording of this
-//! section claimed on the strength of a terminator being required. Two ordinary
-//! routes produce it. A process killed part-way through writing an `OSC` title
-//! leaves an unterminated body, and killed output is the case this walk is built
-//! for. And the capture being read is an interleaved one: the serve log hands
-//! the subprocess's stdout and stderr the *same* file handle, so a title written
-//! on one stream can be cut by the other stream's next line landing between the
-//! introducer and the terminator, with neither writer doing anything unusual.
+//! section claimed on the strength of a terminator being required. What it takes
+//! is an *interleaved* capture: `rocm serve` hands the subprocess's stdout and
+//! stderr the *same* file handle, so a title written on one stream can be cut by
+//! the other stream's next line landing between the introducer and the
+//! terminator, with neither writer doing anything unusual. A process killed
+//! part-way through the same title is the other ordinary half of it, leaving a
+//! body with no terminator at all — and killed output is the case this walk is
+//! built for. Which of the two shapes reads back is then only a question of
+//! whether the capture carries on past the body: text after it joins up, and
+//! text the body runs out over is lost.
+//!
+//! Such a capture reaches [`rendered_lines`] whole when a user pastes it into
+//! `rocm diagnose --symptom`. The vLLM engine's own path cannot carry an
+//! embedded `\n` there: it pre-splits its log tail with `str::lines` and builds
+//! its candidate symptom from a single line of it.
 //!
 //! Following the grammar is still the right call. The alternative is guessing
 //! where an unterminated body ends, and the guess would have to be made on
@@ -63,7 +86,8 @@
 //! boundaries are for, since a window title would then be scored as if the
 //! process had printed it. The residual is therefore disclosed here rather than
 //! papered over: a break inside a string body is the one way two rendered rows
-//! come back as one segment.
+//! come back as one segment, and — where that body runs out over the end of the
+//! input — the one way a rendered row comes back in none.
 //!
 //! This section is the single authoritative statement of the exception. The
 //! code that creates it and the test that pins it both point here rather than
@@ -208,7 +232,7 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
         // Consuming the body whole is also the one hole in the never-merge
         // property, since a line break inside the body goes with it — and the
         // scan below ends on a bare `ESC` or on end of input as readily as on a
-        // terminator, so an unterminated body swallows the break just the same.
+        // terminator, so a terminator is not what creates the hole.
         // The module documentation is where that exception is stated, and it is
         // stated there rather than here because a body comment in a private
         // function reaches no reader of the public docs. Any change to what this
@@ -351,19 +375,17 @@ pub fn strip_terminal_control_sequences(line: &str) -> String {
 /// escape sequences and non-drawing characters removed from each segment.
 ///
 /// It is deliberately an *over*-approximation rather than a terminal emulator,
-/// and the approximation is one-sided. Nothing at all is promised in the
-/// splitting direction: one rendered line may come back split in two.
+/// and the approximation is one-sided. Nothing at all is promised in the losing
+/// direction: one rendered line may come back split in two, and text the
+/// terminal drew may come back in no segment at all.
 ///
 /// In the merging direction the promise holds with exactly one exception. Two
 /// pieces of text the terminal drew on different rows share a returned segment
 /// only when the break between them sits inside the body of a string-argument
-/// sequence (`OSC`, `DCS`, `SOS`, `PM`, `APC`), which is consumed whole. A
-/// terminator is not required for that: the body scan runs to the next `BEL`,
-/// to `ST`, to an unrelated `ESC`, or to the end of the input, and swallows the
-/// break in all four cases. Ordinary log output can reach that shape — a
-/// process killed mid-title is enough. See [the module documentation](self) for
-/// the worked examples, for why the exception is not worth closing anyway, and
-/// for exactly which sequences are treated as boundaries.
+/// sequence (`OSC`, `DCS`, `SOS`, `PM`, `APC`), which is consumed whole. See
+/// [the module documentation](self) for the worked examples, for which ordinary
+/// captures reach that shape, for why the exception is not worth closing
+/// anyway, and for exactly which sequences are treated as boundaries.
 ///
 /// Empty segments are returned as-is; callers that filter their lines drop them
 /// for free.
@@ -504,5 +526,12 @@ mod tests {
             rendered_lines("vllm\u{1b}]0;ti\ntle\u{1b}[0mllama.cpp OOM"),
             ["vllmllama.cpp OOM"],
         );
+        // End of input is the one way of ending the body that does *not* merge:
+        // there is no far side to join to, so the `tle` a terminal would have
+        // drawn on its second row comes back in no segment at all. That is the
+        // losing direction, not the misattributing one, and it is why the
+        // module section documents a third behaviour rather than two. Pinned
+        // because prose has twice claimed this shape as a route to the merge.
+        assert_eq!(rendered_lines("vllm\u{1b}]0;ti\ntle"), ["vllm"]);
     }
 }

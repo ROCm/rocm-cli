@@ -1523,17 +1523,18 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// from a different rendered line, past a `HIGH_CONFIDENCE` threshold of 75, and
 /// cited the other engine's tokens as its evidence.
 ///
-/// What this is *not* is a terminal emulator. The contract is one-sided, and it
-/// is stated once — in [`crate::terminal::rendered_lines`] and the module
-/// section it points at, which also names the single shape in which two
-/// rendered rows still come back as one segment. It is deliberately not
-/// restated here: a second copy is a stale copy waiting to happen, and this
-/// function is where a stale one would do the damage. What matters at this call
-/// site is the direction of the error that remains: a capture whose cursor
-/// addressing that walk does not model loses a diagnosis rather than inventing
-/// one, and the canonical-symptom fallback already covers that. The
-/// misattribution is the failure mode with a user-visible cost, and this is
-/// what narrows it to the one shape that contract calls out.
+/// What this is *not* is a terminal emulator. The contract is one-sided, and
+/// [`crate::terminal::rendered_lines`] is where to read it — that doc carries
+/// the contract itself and points on to the module section holding the detail
+/// behind it, including the single shape in which two rendered rows still come
+/// back as one segment. It is deliberately not restated here: a second copy is
+/// a stale copy waiting to happen, and this function is where a stale one would
+/// do the damage. What matters at this call site is the direction of the error
+/// that remains: a capture whose cursor addressing that walk does not model
+/// loses a diagnosis rather than inventing one, and the canonical-symptom
+/// fallback already covers that. The misattribution is the failure mode with a
+/// user-visible cost, and this is what narrows it to the one shape that
+/// contract calls out.
 ///
 /// Sharing that walk with the vLLM engine's sanitizer is also what keeps the
 /// `SGR` exception right. A colourised logger emits `ESC [ 31 m` *inside* a
