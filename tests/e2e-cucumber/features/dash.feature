@@ -74,15 +74,18 @@ Feature: Interactive dashboard
   Scenario: dash-08 - Gen throughput stays visible for the validity window after a scrape failure
     # EAI-7960 principal regression: after establishing a positive gen_tps
     # baseline through the scripted mock, a single /metrics transport failure
-    # must NOT immediately clear the displayed "tok/s" value. The test-only
-    # logical clock advances with daemon cycles rather than runner wall time, so
-    # host scheduling cannot consume the validity window before this assertion.
+    # must NOT immediately clear the displayed "tok/s" value. Observation time is
+    # held before the failure is injected, because a free-running logical clock
+    # still advances with the daemon's wall-clock-paced cycles: a scenario
+    # descheduled on a loaded runner would otherwise reach the assertion below
+    # after the window had honestly expired and call that a regression.
     Given a managed model exposes scripted serving metrics
     And dashboard observation time is deterministic
     When the user opens the dashboard
     And the user opens the Observe view
     Then positive generation throughput is displayed for the managed model
-    When the metrics endpoint fails transiently
+    When dashboard observation time is held
+    And the metrics endpoint fails transiently
     Then generation throughput remains visible within the validity window
     When the user quits the dashboard
     Then the dashboard exits successfully
@@ -90,15 +93,17 @@ Feature: Interactive dashboard
   @id:dash-gen-tps-expiry-boundary @requires-os:linux
   Scenario: dash-09 - Gen throughput expires after the validity window following sustained failure
     # EAI-7960 expiry-boundary scenario: immediately after the first failed
-    # scrape, gen_tps remains visible as Held. Advancing the injected logical
-    # clock beyond clamp(3 × instance_tick, 6 s, 30 s) then makes the next scrape
-    # publish an expired value. No wall-clock sleep defines either boundary.
+    # scrape, gen_tps remains visible as Held. Stepping the held clock past
+    # clamp(3 × instance_tick, 6 s, 30 s) then makes the daemon publish an
+    # expired value. Neither boundary is defined by wall time: the clock is held
+    # across the first, and only this scenario's explicit step crosses the second.
     Given a managed model exposes scripted serving metrics
     And dashboard observation time is deterministic
     When the user opens the dashboard
     And the user opens the Observe view
     Then positive generation throughput is displayed for the managed model
-    When the metrics endpoint fails transiently
+    When dashboard observation time is held
+    And the metrics endpoint fails transiently
     Then generation throughput remains visible within the validity window
     When the validity window has elapsed
     Then generation throughput is no longer displayed
