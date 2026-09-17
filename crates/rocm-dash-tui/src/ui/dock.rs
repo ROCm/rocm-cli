@@ -368,6 +368,55 @@ mod tests {
     }
 
     #[test]
+    fn logs_dock_tints_nonzero_exit_as_warn_not_ok() {
+        // Regression guard for the bug this PR fixes: `logs_dock` used to map
+        // every `Done{code}` to `theme.ok` (green), so a job that exited
+        // nonzero showed green log lines while every other renderer flagged
+        // it as a warn state. Render through the real `logs_dock` path (not
+        // just the shared color helper in isolation) so a reintroduced
+        // hand-rolled match here would fail this test.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "warned line".into(),
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "build".into(),
+            code: 1,
+        });
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let row = buf
+            .content()
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("warned line")
+            })
+            .expect("rendered log line not found");
+        let col = row
+            .iter()
+            .position(|cell| cell.symbol() == "w")
+            .expect("start of log line text not found in row");
+        let fg = row[col].fg;
+        assert_eq!(fg, theme.warn, "nonzero-exit job line should be theme.warn");
+        assert_ne!(fg, theme.ok, "nonzero-exit job line must not be theme.ok");
+    }
+
+    #[test]
     fn context_rail_shows_sections() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.instances.insert(
