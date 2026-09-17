@@ -13860,7 +13860,7 @@ fn parse_optional_lines(args: &[String]) -> Result<usize> {
 /// is the field that most needs one: nothing downstream re-derives it, so if
 /// the flag stopped being forwarded here the install would silently go back to
 /// pulling the compiler toolchain and every other assertion would still pass.
-fn sdk_install_request<'a>(
+const fn sdk_install_request<'a>(
     channel: &'a str,
     format: &'a str,
     prefix: Option<PathBuf>,
