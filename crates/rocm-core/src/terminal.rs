@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
 //! One ECMA-48 walk over untrusted terminal output, shared by the two callers
 //! that need it.
 //!
