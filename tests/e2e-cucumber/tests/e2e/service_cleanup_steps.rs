@@ -361,7 +361,7 @@ async fn preview_lists_both(world: &mut E2eWorld) {
     );
     assert!(
         combined.contains("Nothing was removed. Re-run without --dry-run to remove."),
-        "the preview must say nothing was changed:\n{combined}"
+        "the preview must say it removed nothing:\n{combined}"
     );
 }
 
