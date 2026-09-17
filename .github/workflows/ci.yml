@@ -495,12 +495,15 @@ jobs:
     # the dispatch explicitly asked for PR-style binaries, which this job's
     # build step produces. `clippy`/`prek` are themselves always skipped on
     # workflow_dispatch (their own `if:`), and a job whose `needs` were SKIPPED
-    # (not just failed) is skipped by default too — so without `always()` plus
-    # the explicit skipped-or-success checks below, `build_binaries: true`
+    # (not just failed) is skipped by default too — so without `!cancelled()`
+    # plus the explicit skipped-or-success checks below, `build_binaries: true`
     # could never actually run this job. The success requirement is still
     # enforced on every other trigger, where clippy/prek always run for real.
+    # `!cancelled()` rather than `always()`: this job (like pr-linux-binaries
+    # below) still needs to be cancelled when a new commit supersedes the run,
+    # per this workflow's `concurrency: cancel-in-progress: true`.
     if: >-
-      always()
+      !cancelled()
       && needs.changes.result == 'success'
       && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
       && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
@@ -698,12 +701,15 @@ jobs:
     needs: [changes, clippy, prek]
     # `clippy`/`prek` are themselves always skipped on workflow_dispatch (their
     # own `if:`), and a job whose `needs` were SKIPPED (not just failed) is
-    # skipped by default too — so without `always()` plus the explicit
+    # skipped by default too — so without `!cancelled()` plus the explicit
     # skipped-or-success checks below, `build_binaries: true` could never
     # actually run this job. The success requirement is still enforced on
-    # every other trigger, where clippy/prek always run for real.
+    # every other trigger, where clippy/prek always run for real. `!cancelled()`
+    # rather than `always()`: this job still needs to be cancelled when a new
+    # commit supersedes the run, per this workflow's `concurrency:
+    # cancel-in-progress: true` (see windows-build-and-test above).
     if: >-
-      always()
+      !cancelled()
       && needs.changes.result == 'success'
       && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
       && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
