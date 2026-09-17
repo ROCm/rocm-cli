@@ -1427,9 +1427,6 @@ mod tests {
         // outright, so it returned nothing here no matter what was planted.
         // Going through the shared resolver is what makes this pass -- and is
         // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-resolver-{}-{:?}",
             std::process::id(),
@@ -1453,14 +1450,51 @@ mod tests {
         );
     }
 
+    /// The seam tests above deliberately bypass `$ROCM_PATH`, so on their own
+    /// the production read could be deleted and the suite would stay green.
+    /// This one drives the real entry point against a real variable.
+    ///
+    /// It takes the lock rather than a seam because exercising the env read IS
+    /// the point — the escape hatch the contract guard advertises for exactly
+    /// this case.
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    #[test]
+    fn the_path_fix_reads_rocm_path_from_the_environment() {
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("rocm-6.10.0");
+        plant_install(&install);
+
+        let previous = std::env::var_os("ROCM_PATH");
+        // SAFETY: the lock above serializes every test in this process that
+        // touches this key, and the value is restored before it is released.
+        unsafe { std::env::set_var("ROCM_PATH", &install) };
+        let found = newest_rocm_install_dir();
+        match &previous {
+            Some(value) => unsafe { std::env::set_var("ROCM_PATH", value) },
+            None => unsafe { std::env::remove_var("ROCM_PATH") },
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            found,
+            install.to_string_lossy(),
+            "fix-6-path must reach $ROCM_PATH through the shared resolver"
+        );
+    }
+
     #[test]
     fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
         // marker.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),

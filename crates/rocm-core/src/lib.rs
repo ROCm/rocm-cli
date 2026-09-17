@@ -1803,6 +1803,17 @@ impl AppPaths {
         self.engine_dir(engine).join("logs")
     }
 
+    /// Where engine virtualenvs live, honouring `ROCM_CLI_ENGINE_ENVS_ROOT`.
+    ///
+    /// Read-side of a write-only contract at present: `apps/rocm` exports this
+    /// key into the children it spawns, and this is the only code that reads it
+    /// back, so no in-tree production path reaches here today. That predates
+    /// the seam below and is deliberate — the key exists for an engine process
+    /// to honour. Being `pub` says nothing either way: `unreachable_pub` is
+    /// switched off workspace-wide (see the root `Cargo.toml`), so nothing warns
+    /// about an unused one. Delete this and the key together if the contract is
+    /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
+    /// keeps the lookup honest meanwhile.
     pub fn engine_envs_root(&self) -> PathBuf {
         self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
     }
@@ -12380,6 +12391,46 @@ Class Name:                Display
             normalize_runtime_path_for_host(&override_root)
                 .join("vllm")
                 .join("envs")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Serializes tests that replace a process-global env var while they run.
+    ///
+    /// Named `*_TEST_LOCK` so the env-mutation contract guard recognises the
+    /// discipline by suffix rather than by a hardcoded list of lock names.
+    static ENGINE_ENVS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The two tests around this one drive the seam, which deliberately does
+    /// not read the environment — so on their own the production lookup, and
+    /// the key it names, could both be deleted without failing anything. This
+    /// drives `engine_envs_dir` itself against a real variable.
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    #[test]
+    fn engine_envs_dir_reads_its_root_from_the_environment() {
+        let _guard = ENGINE_ENVS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = temp_app_paths("engine-envs-root-env");
+        let override_root = root.join("runtime").join("engines");
+
+        let previous = std::env::var_os("ROCM_CLI_ENGINE_ENVS_ROOT");
+        // SAFETY: the lock above serializes every test in this process that
+        // touches this key, and the value is restored before it is released.
+        unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root) };
+        let resolved = paths.engine_envs_dir("vllm");
+        match &previous {
+            Some(value) => unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", value) },
+            None => unsafe { std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT") },
+        }
+
+        assert_eq!(
+            resolved,
+            normalize_runtime_path_for_host(&override_root)
+                .join("vllm")
+                .join("envs"),
+            "engine_envs_dir must reach $ROCM_CLI_ENGINE_ENVS_ROOT"
         );
 
         fs::remove_dir_all(root).ok();
