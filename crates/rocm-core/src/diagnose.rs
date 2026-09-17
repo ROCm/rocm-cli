@@ -85,8 +85,8 @@ pub struct DiagnoseReport {
     /// Set when the catalog has no entries at all for the running platform, and
     /// carrying the routing note that says so.
     ///
-    /// Decided purely by platform coverage ([`catalog_covers`]) — never by a
-    /// score. When this is `Some`, no checker ran, so `matched` is empty and
+    /// Decided purely by whether the catalog covers the running platform — never
+    /// by a score. When this is `Some`, no checker ran, so `matched` is empty and
     /// `has_match` is false; a consumer must not wait for sub-threshold rows
     /// alongside it. Pinned by
     /// `an_out_of_scope_report_never_carries_matched_entries`.
@@ -2948,8 +2948,8 @@ mod tests {
     #[test]
     fn the_oom_plan_matches_the_catalog_copy() {
         // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
-        // already opened: the executable lines agreed, so the cross-check that
-        // runs over every matched finding
+        // already opened: the executable lines agreed, so the cross-check over
+        // the fixes shared with the catalog
         // (`diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`)
         // saw nothing -- it filters `#` lines by construction -- while the comments explaining
         // *which of the two faults each step addresses* had drifted apart. That
