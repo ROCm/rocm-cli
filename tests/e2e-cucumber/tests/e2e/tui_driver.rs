@@ -604,6 +604,7 @@ impl TuiSession {
         duration: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + duration;
+        let mut observed_marker = false;
         loop {
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
@@ -629,9 +630,16 @@ impl TuiSession {
                     self.framed_screen()
                 ));
             }
-            if !self.screen_text().contains(marker) {
+            if self.screen_text().contains(marker) {
+                observed_marker = true;
+            } else if observed_marker {
                 return Err(format!(
                     "{marker:?} disappeared before the {duration:?} persistence window elapsed.\n{}",
+                    self.framed_screen()
+                ));
+            } else {
+                return Err(format!(
+                    "{marker:?} was not present when the persistence check began.\n{}",
                     self.framed_screen()
                 ));
             }

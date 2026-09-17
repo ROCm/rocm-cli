@@ -640,10 +640,12 @@ const VALIDITY_WINDOW_SECS: u64 = 3 * INSTANCE_TICK.as_secs();
 /// landing exactly on it.
 const CLOCK_ADVANCE_PAST_VALIDITY_SECS: u64 = VALIDITY_WINDOW_SECS + 1;
 
-/// Substring the TUI renders only when the displayed gen_tps is `Held` rather
-/// than `Fresh` (`gen_tps_cell`/`gen_tps_compact`/`gen_tps_aggregate` append
-/// `HELD_MARKER` after the unit, e.g. `"42.0 tok/s*"` —
-/// `crates/rocm-dash-tui/src/ui/format.rs`).
+/// Substring produced only by a `Held` (not `Fresh`) gen_tps rendering.
+/// `gen_tps_compact`/`gen_tps_aggregate` append `HELD_MARKER` after the
+/// `"tok/s"` unit, e.g. `"42.0 tok/s*"` (`crates/rocm-dash-tui/src/ui/format.rs`).
+/// `gen_tps_cell` also appends `HELD_MARKER` when held, but renders a bare
+/// number with no unit, so it never produces this `"tok/s*"` substring — only
+/// the other two formatters do.
 /// A hand-kept mirror, not a shared constant: this e2e crate is black-box and
 /// does not depend on `rocm-dash-tui`, so it must be updated by hand if the
 /// TUI's held-marker rendering ever changes.
@@ -670,7 +672,6 @@ async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
         .path();
     let path = root.join(DASH_CLOCK_OFFSET_FILE);
     std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
-    world.dash_clock_zero = Some(Instant::now());
     world.command_env.push((
         "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
         path.into_os_string(),
@@ -695,18 +696,18 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 /// scrape actually landed before the assertion checks the TUI. This avoids a
 /// fixed wall-time sleep while remaining deterministic.
 ///
-/// Reaching that 503 already costs real wall-clock time (the poll loop below,
-/// plus whatever host scheduling delay stretched the scrape cadence to get
-/// here) — time the injected clock's tick counter keeps accruing against
-/// regardless, since it advances once per real daemon cycle. Left uncorrected,
-/// that cost is subtracted from the 6 s validity window before
-/// `gen_tps_held_after_failure` even starts polling for the TUI to repaint,
-/// so a slow host can consume the window before the persistence check gets a
-/// chance to run. Roll the injected clock back by the real time spent getting
-/// here so the check downstream starts from a fresh window instead of racing
-/// whatever margin survived this wait.
+/// Reaching that 503 already costs real wall-clock time (switching the mock
+/// mode plus the poll loop below) — time the injected clock's tick counter
+/// keeps accruing against regardless, since it advances once per real daemon
+/// cycle. Left uncorrected, that cost is subtracted from the 6 s validity
+/// window before `gen_tps_held_after_failure` even starts polling for the TUI
+/// to repaint, so a slow host can consume the window before the persistence
+/// check gets a chance to run. Roll the injected clock back by the real time
+/// spent in this function so the check downstream starts from a fresh window
+/// instead of racing whatever margin survived this wait.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    let poll_start = Instant::now();
     let mock = world.mock.as_ref().expect("no mock server running");
     mock.set_metrics_mode(MetricsMode::Failure);
 
@@ -726,21 +727,26 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let clock_zero = world
-        .dash_clock_zero
-        .expect("dashboard observation time is deterministic must run first");
     let root = world
         .isolated_root
         .as_ref()
         .expect("scenario has no isolated root")
         .path();
-    // `.ceil()` rather than the truncating `Duration::as_secs`: flooring the
-    // sub-second remainder would roll the clock back slightly less than the
-    // real time spent above, silently eating into the validity window this
-    // rollback exists to protect. Rounding up compensates for the full
-    // elapsed time instead. `as i64` on a float saturates rather than
-    // overflowing, so this stays safe even for a pathologically long poll.
-    let elapsed_secs = clock_zero.elapsed().as_secs_f64().ceil() as i64;
+    // Deliberately under-correct by one tick: `snapshot`'s freshness check
+    // (`crates/rocm-dash-core/src/observation.rs`) treats `observed_at == now`
+    // as `Fresh`, not `Held` — an *exact* cancellation of the elapsed time
+    // would make the rolled-back clock land precisely on top of the
+    // pre-failure observation's timestamp, spuriously reporting a brand-new
+    // fresh scrape (dropping `HELD_MARKER`) even though nothing was actually
+    // observed this cycle. Rounding the elapsed time up and then subtracting
+    // one extra tick guarantees the rollback always leaves a small positive
+    // residual age, so `now` is strictly after `observed_at` — genuinely
+    // `Held`, never an accidental `Fresh` collision. That residual costs at
+    // most ~1-2 s of the 6 s validity window, which is negligible next to the
+    // render-lag and persistence checks downstream. `as i64` on a float
+    // saturates rather than overflowing, so this stays safe even for a
+    // pathologically long poll.
+    let elapsed_secs = poll_start.elapsed().as_secs_f64().ceil() as i64 - 1;
     std::fs::write(
         root.join(DASH_CLOCK_OFFSET_FILE),
         (-elapsed_secs).to_string(),
@@ -749,15 +755,17 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 }
 /// EAI-7960 principal regression assertion.
 ///
-/// The scenario's injected logical clock cannot cross the validity boundary
-/// because the host was descheduled; only an explicit scenario advance can.
-/// This holds because `cycle_timestamp` (`crates/rocm-dash-daemon/src/runner.rs`)
-/// derives the clock from `tick_count`, which only advances once per *executed*
-/// daemon loop iteration; the ticker's `MissedTickBehavior::Skip` collapses any
-/// number of missed ticks from a host stall into a single catch-up tick on
-/// resume rather than a burst. So a long real-time wait here — however slow the
-/// host gets — costs the logical clock at most one tick, never more. The
-/// daemon's failed-scrape state is confirmed above; this step first waits
+/// `cycle_timestamp` (`crates/rocm-dash-daemon/src/runner.rs`) derives the
+/// injected clock from `tick_count`, which advances once per *executed*
+/// daemon loop iteration at the real gpu-tick cadence — so while the daemon
+/// loop keeps up, logical time tracks real time roughly 1:1. The ticker's
+/// `MissedTickBehavior::Skip` only bounds the catch-up burst *after a stall*
+/// (collapsing any missed ticks into a single tick on resume); it does not
+/// cap the ticks a loop that is running normally accrues. That means a real
+/// wait anywhere in this scenario — including the poll in
+/// `metrics_endpoint_fails` above — consumes the validity window one-for-one,
+/// which is exactly why that step rolls the injected clock back by the real
+/// time it spent polling. The daemon's failed-scrape state is confirmed above; this step first waits
 /// for the TUI to actually render gen_tps as `Held` (`HELD_TPS_MARKER`), then
 /// asserts that held rendering *persists* across an `INSTANCE_TICK` window
 /// rather than merely appearing once.
@@ -787,8 +795,10 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
         .unwrap_or_else(|e| {
             panic!(
                 "gen throughput was never rendered as held (\"{HELD_TPS_MARKER}\") \
-                 after the first failed scrape — this only shows the TUI never \
-                 repainted in time, not a confirmed EAI-7960 regression: {e}"
+                 after the first failed scrape — either the TUI never repainted in \
+                 time, or the value was cleared outright instead of held (a possible \
+                 EAI-7960 regression); assert_screen_persists below is what \
+                 distinguishes render lag from a real regression, not this wait: {e}"
             )
         });
     session

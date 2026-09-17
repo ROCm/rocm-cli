@@ -9,7 +9,6 @@
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
@@ -96,13 +95,6 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
-    /// Real-clock instant captured when the injected dashboard test clock's
-    /// offset file is first zeroed (see `dash_steps::dashboard_observation_time_is_deterministic`).
-    /// Lets a later step measure how much real wall-clock time has elapsed
-    /// since then and roll the injected clock back by that amount, so host
-    /// scheduling delays don't eat into the observation-validity window the
-    /// scenario is asserting against.
-    pub dash_clock_zero: Option<Instant>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -230,7 +222,6 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
-            dash_clock_zero: None,
         }
     }
 }

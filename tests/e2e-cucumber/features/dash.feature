@@ -75,9 +75,13 @@ Feature: Interactive dashboard
     # EAI-7960 principal regression: after establishing a positive gen_tps
     # baseline through the scripted mock, a single /metrics transport failure
     # must NOT immediately clear the displayed "tok/s" value. The test-only
-    # logical clock advances with daemon cycles rather than runner wall time, so
-    # host scheduling cannot consume the validity window before this assertion.
-    # This step only holds for one INSTANCE_TICK (2s) of the real 6s window;
+    # logical clock advances with daemon cycles rather than runner wall time,
+    # so real time spent waiting for the failure to land would otherwise eat
+    # into the validity window before this assertion runs; the "the metrics
+    # endpoint fails transiently" step compensates by rolling the injected
+    # clock back by the real time it spent polling for that failure.
+    # "generation throughput remains visible within the validity window" only
+    # holds for one INSTANCE_TICK (2s) of the real 6s window;
     # crates/rocm-dash-daemon/tests/telemetry_contract.rs covers the 6 s lower-clamp
     # boundary of clamp(3 × instance_tick, 6 s, 30 s) (its INSTANCE_TICK is fixed at
     # 400ms, so 3 × instance_tick always clamps to the floor there).
