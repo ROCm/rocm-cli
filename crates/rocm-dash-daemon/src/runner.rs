@@ -1042,6 +1042,16 @@ mod tests {
             cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),
             epoch + chrono::TimeDelta::seconds(11)
         );
+
+        // Negative offsets roll the clock backward (e.g. dash-08's e2e clock
+        // rollback, which compensates for real time spent polling for a
+        // scripted failure) — `checked_add_signed` must handle these the
+        // same as positive ones, not just avoid panicking on them.
+        std::fs::write(&offset, "-5").unwrap();
+        assert_eq!(
+            cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),
+            epoch - chrono::TimeDelta::seconds(1)
+        );
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
