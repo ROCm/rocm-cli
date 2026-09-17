@@ -1519,13 +1519,11 @@ fn resolve_latest_for_manifest(
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
             let wheel_composition = match &device_target {
-                AggregateDeviceTarget::Exact(_) => {
-                    Some(wheel_runtime_composition(
-                        &resolution,
-                        &device_target,
-                        manifest.includes_devel(),
-                    ))
-                }
+                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
+                    &resolution,
+                    &device_target,
+                    manifest.includes_devel(),
+                )),
                 AggregateDeviceTarget::Undetermined(_) => None,
             };
             let target_runtime_key = wheel_composition.as_ref().map_or_else(
@@ -1860,7 +1858,6 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
-
     );
     let no_wheel_warning = repo_version_without_wheels(
         resolution.newest_repo_version.as_deref(),
@@ -2181,7 +2178,12 @@ fn wheel_composition_includes_devel(composition: Option<&WheelRuntimeComposition
     let composition = composition?;
     composition.package_specs.iter().find_map(|spec| {
         let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
-        Some(extras.split(',').map(str::trim).any(|extra| extra == "devel"))
+        Some(
+            extras
+                .split(',')
+                .map(str::trim)
+                .any(|extra| extra == "devel"),
+        )
     })
 }
 
@@ -2896,6 +2898,7 @@ fn resolve_pip_runtime(
 #[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
+    channel: TheRockChannel,
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
@@ -2965,6 +2968,7 @@ fn resolve_pip_runtime_with_timeout(
 
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
+    channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
