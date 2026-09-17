@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 THEROCK_TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 THEROCK_RUNTIME_PACKAGES = ["rocm", "rocm-sdk-core"]
 
