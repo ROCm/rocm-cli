@@ -53,6 +53,22 @@ is an escape hatch, not a supported configuration: the resulting combination is
 not validated against the supported matrix, and a runtime that cannot execute a
 kernel will fail at serving time.
 
+### ROCm 10.x wheel discovery
+
+For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
+and index URL. ROCm SDK 10.0.0 is different: AMD publishes vLLM, flash-attn,
+and amd-aiter there under a rotating dev-tag filename (for example
+`vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
+so there is no fixed filename to pin in the adapter.
+
+Instead, the install resolves each package's current wheel from AMD's index
+with `uv pip download --no-deps --no-index`, then reinstalls pinned to the
+exact version that resolved (torch and tensorizer stay pinned as usual). If
+discovery finds zero or more than one matching wheel for a package, the
+install fails rather than falling back to an unpinned or CPU install. Every
+other ROCm SDK version, including 7.2.3, is unaffected and keeps using the
+static pin table.
+
 Supported discovery paths:
 
 - `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`
