@@ -176,7 +176,8 @@ enum Command {
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {

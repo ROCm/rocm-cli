@@ -230,7 +230,7 @@ form works depends on the engine your GPU selects.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash |
+| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
