@@ -35,10 +35,14 @@ unsupported. rocm-cli does not use a CPU fallback for this path.
 ## Lemonade backend alignment on engine install
 
 Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
-`llamacpp:rocm` backend downloads. `rocm engines install lemonade` rewrites
-that pin to match the active ROCm SDK so the backend it installs is paired
-with the SDK actually in use, rather than whatever version Lemonade shipped
-pinned to.
+`llamacpp:rocm` backend downloads. On Linux/WSL, `rocm engines install
+lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
+backend it installs is paired with the SDK actually in use, rather than
+whatever version Lemonade shipped pinned to. The attempt is skipped outright
+on native Windows, and left alone when the active SDK reports a nightly
+version rather than a plain `X.Y.Z` the alignment can match against. An
+attempt that cannot be verified against the installed backend's shared
+libraries reverts to the packaged pin instead of being kept.
 
 Set `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` to keep whatever
 `backend_versions.json` already pins and skip the rewrite — any value works,
