@@ -454,10 +454,15 @@ impl TuiSession {
     ///
     /// The general form of `wait_for_screen`, for evidence a frame is current
     /// that is not "it contains this string" — a cleared table cell, or a
-    /// marker the frame stopped showing. `describe` names the condition being
-    /// waited on and is interpolated into every diagnostic as-is, so a caller
-    /// wanting quotes around it quotes its own text — `wait_for_screen` does,
-    /// which is why its messages read as quoted and these do not.
+    /// marker the frame stopped showing.
+    ///
+    /// `describe` is interpolated verbatim — no quoting, no rewording — into
+    /// four diagnostics, which read `waiting until {describe}`, `timed out …
+    /// waiting until {describe}`, `before {describe}`, and `… draining the
+    /// final frame, waiting until {describe}`. So it must be a clause that
+    /// fits all four ("the screen shows X", "the table clears X"), not a bare
+    /// noun; and it carries whatever quoting the caller puts in it, since none
+    /// is added here.
     ///
     /// A child that has exited does not end the wait on its own: the reader is
     /// given a bounded window to commit whatever was still buffered behind the
@@ -841,10 +846,11 @@ impl TuiSession {
     /// Reader-panic diagnostic for [`drain_final_frame_where`], naming what the
     /// drain was racing.
     fn drain_panic_message(&self, wanted: Option<&str>, panic_message: &str) -> String {
-        // The exit drain waits for nothing, so it reads as it did before this
-        // loop was shared: naming a thing it is not waiting for would be worse
-        // than naming nothing.
-        let context = wanted.map_or_else(String::new, |wanted| format!(" for {wanted}"));
+        // Clause-shaped, like the three templates in `wait_for_screen_where`:
+        // `describe` is a clause, and " for <clause>" does not parse. The exit
+        // drain waits for nothing and adds no context at all, so it reads as it
+        // did before this loop was shared.
+        let context = wanted.map_or_else(String::new, |wanted| format!(", waiting until {wanted}"));
         format!(
             "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
             self.framed_screen()
