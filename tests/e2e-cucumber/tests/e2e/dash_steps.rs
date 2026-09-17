@@ -25,10 +25,22 @@ const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 /// its histogram pins time-to-first-token at exactly 50 ms
 /// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
 /// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
-/// (`runner.rs`), so this string disappearing is the screen's own proof that
-/// the frame on display was assembled after the failure — the only frame the
+/// (`runner.rs`), so this cell changing is the screen's own proof that the
+/// frame on display was assembled after the failure — the only frame the
 /// held-throughput assertion is about.
 const SCRIPTED_TTFT_CELL: &str = "50ms";
+
+/// Zero-based index of the TTFT cell within an Observe instances row, counting
+/// from the model id: `MODEL TOK/S TOK/W TTFT TPOT POWER QUEUE KV%`
+/// (`instances.rs`).
+///
+/// The cell is read by position on the scripted instance's own row rather than
+/// matched as a substring of the whole screen. A bare substring cannot tell a
+/// cleared cell from a surviving one: any future ms-suffixed value that merely
+/// *contains* the scripted one (`150ms`, `250ms`), or a second row whose TTFT
+/// is also 50 ms, would keep the marker on screen and time this step out for a
+/// reason that has nothing to do with the scrape it synchronises on.
+const TTFT_COLUMN: usize = 3;
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -864,27 +876,19 @@ fn write_dash_clock(path: &std::path::Path, directive: &str) {
     std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
 }
 
-/// Poll the live screen until `marker` is gone. On timeout, return the last
-/// screen so the caller can frame it with what its own step was waiting for.
+/// The TTFT cell `model`'s row is currently rendering, or `None` while that row
+/// is not on screen at all.
 ///
-/// The mirror of `TuiSession::wait_for_screen`, for the case where the evidence
-/// a frame is current is something the frame stopped showing.
-async fn wait_until_screen_lacks(
-    world: &mut E2eWorld,
-    marker: &str,
-    budget: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
-    loop {
-        let screen = session(world).screen_text();
-        if !screen.contains(marker) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(screen);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// Cells are whitespace-separated and a model id carries no spaces, so counting
+/// fields from the id yields one field per column — including the `—`
+/// placeholder a cleared cell renders, which keeps the columns aligned.
+fn scripted_ttft_cell<'a>(screen: &'a str, model: &str) -> Option<&'a str> {
+    screen
+        .lines()
+        .find(|line| line.contains(model))?
+        .split_whitespace()
+        .skip_while(|field| *field != model)
+        .nth(TTFT_COLUMN)
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -951,14 +955,23 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    wait_until_screen_lacks(world, SCRIPTED_TTFT_CELL, default_timeout())
+    let model = world
+        .model_name
+        .clone()
+        .expect("the scripted-metrics Given records the model this row belongs to");
+    session(world)
+        .wait_for_screen_where(
+            &format!("the scripted instance's TTFT cell leaves {SCRIPTED_TTFT_CELL:?}"),
+            |screen| {
+                scripted_ttft_cell(screen, &model).is_some_and(|cell| cell != SCRIPTED_TTFT_CELL)
+            },
+            default_timeout(),
+        )
         .await
-        .unwrap_or_else(|screen| {
+        .unwrap_or_else(|e| {
             panic!(
-                "the failed scrape never reached the screen: the scripted TTFT cell \
-                 ({SCRIPTED_TTFT_CELL:?}) is still displayed, so no frame here is \
-                 known to postdate the failure.\n\n\
-                 Last screen:\n{screen}"
+                "the failed scrape never reached the screen, so no frame here is known \
+                 to postdate the failure: {e}"
             )
         });
 }
@@ -1000,15 +1013,19 @@ async fn validity_window_elapsed(world: &mut E2eWorld) {
 /// kept the value: that daemon simply never clears it and this times out.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
-    wait_until_screen_lacks(world, "tok/s", default_timeout())
+    session(world)
+        .wait_for_screen_where(
+            "generation throughput leaves the screen",
+            |screen| !screen.contains("tok/s"),
+            default_timeout(),
+        )
         .await
-        .unwrap_or_else(|screen| {
+        .unwrap_or_else(|e| {
             panic!(
                 "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
-                 validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
-                 Expected the daemon to have cleared the held value and the TUI to \
-                 show the unavailable placeholder.\n\n\
-                 Last screen:\n{screen}"
+                 validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed. Expected \
+                 the daemon to have cleared the held value and the TUI to show the \
+                 unavailable placeholder: {e}"
             )
         });
 }
