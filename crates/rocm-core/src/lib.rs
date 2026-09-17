@@ -2883,9 +2883,10 @@ pub(crate) fn discover_rocm_installs() -> Vec<RocmInstall> {
 /// Reading `$ROCM_PATH` inside [`discover_rocm_installs`] is what forced its
 /// callers' tests to mutate the process environment, and two of them racing on
 /// that global is what made the Windows lane flake — that lane runs `cargo test`
-/// (threads in one process) where the Linux lanes run `cargo nextest` (a process
-/// per test), so only Windows could ever observe it. Passing the override in
-/// keeps those tests hermetic. Same seam as [`discover_rocm_installs_in`], but
+/// (threads in one process) where `Test (affected crates)` runs `cargo nextest`
+/// (a process per test), so only Windows observed it. Not every Linux lane uses
+/// nextest, so that is where it fired rather than where it could. Passing the
+/// override in keeps those tests hermetic. Same seam as [`discover_rocm_installs_in`], but
 /// keeps the host's layout so the caller under test is the real one.
 #[cfg(test)]
 pub(crate) fn discover_rocm_installs_on_host_in(

@@ -1435,18 +1435,28 @@ mod tests {
         let install = root.join("rocm-6.10.0");
         plant_install(&install);
 
+        // A second, older install reachable through the hardcoded search roots.
+        // Passing it alongside the override is what exercises the ordering the
+        // assertion below claims: with `&[]` the search loop never runs, so
+        // "the override outranks the search roots" would hold vacuously.
+        let searched = root.join("search");
+        let older = searched.join("rocm-6.2.0");
+        plant_install(&older);
+
         // The override goes in as an argument rather than through
         // `std::env::set_var`: the environment is process-global, so a sibling
         // test mutating $ROCM_PATH between this set and its read used to make
         // this assertion fail on whichever test lost the race.
-        let found = newest_rocm_install_dir_in(&[], Some(&install));
+        // `..._reads_rocm_path_from_the_environment` covers the real read.
+        let found = newest_rocm_install_dir_in(std::slice::from_ref(&searched), Some(&install));
 
         std::fs::remove_dir_all(&root).ok();
 
         assert_eq!(
             found,
             install.to_string_lossy(),
-            "fix-6-path must resolve installs the same way examine does"
+            "fix-6-path must resolve installs the same way examine does, and \
+             $ROCM_PATH must outrank the hardcoded search roots"
         );
     }
 

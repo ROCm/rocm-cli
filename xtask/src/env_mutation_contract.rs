@@ -10,13 +10,19 @@
 //! race — one reads the other's value and fails an assertion that has nothing
 //! to do with what it is testing.
 //!
-//! This is invisible on most of CI. `ci.yml` runs the Linux lanes under
-//! `cargo nextest` (a process per test, so the mutation cannot escape), but
-//! `windows-build-and-test` runs `cargo test --workspace --all-targets` — all
-//! tests as threads in ONE process. So the Windows lane, a required check, was
-//! the only place the race could fire, and it read as "your change broke
+//! This is invisible on most of CI. `ci.yml`'s `Test (affected crates)` job
+//! runs `cargo nextest` (a process per test, so the mutation cannot escape),
+//! but `windows-build-and-test` runs `cargo test --workspace --all-targets` —
+//! all tests as threads in ONE process. So the Windows lane, a required check,
+//! was the only place the race could fire, and it read as "your change broke
 //! Windows" on branches that never touched the crate. Nothing about the bug is
 //! Windows-specific; it is a property of the runner.
+//!
+//! "the Linux lanes use nextest" would be too strong: `coverage`
+//! (`cargo llvm-cov`, no `--nextest`) and `e2e` (`cargo test -p e2e-cucumber
+//! --lib`) are threaded single-process harnesses on `ubuntu-latest` too. They
+//! happen not to reach the crates that raced, which is luck rather than
+//! design — so this guard covers the whole tree rather than one crate.
 //!
 //! The repo already had two ways of handling this — `ScopedTestEnv` in
 //! `apps/rocm/src/main.rs` and `PROCESS_ENV_TEST_LOCK` in
