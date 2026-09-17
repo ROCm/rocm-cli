@@ -416,16 +416,36 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
+/// Record the Lemonade backend-alignment opt-out for this scenario's next
+/// `rocm` command. Mirrors `setup_torch_alignment_opt_out` above.
+#[given("the user has opted out of realigning Lemonade's backend")]
+async fn setup_lemonade_backend_alignment_opt_out(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT", "1".into()));
+}
+
 /// `--reinstall` re-extracts the packaged embeddable, which resets
 /// `backend_versions.json` to its pinned defaults -- so this fires the
 /// alignment's Tier 1/Tier 2/revert state machine deterministically every time,
 /// even against a shared runtime tree where an earlier scenario already left
 /// Lemonade's backend aligned (in which case a plain, non-forcing install would
 /// find nothing left to do and print no alignment line at all).
+///
+/// Goes through `run_rocm_with_scenario_env` (not `run_rocm_ok`) so a Given can
+/// attach the alignment opt-out to this invocation, and keeps stderr so a Then
+/// can read the opt-out's own explanation of why it skipped.
 #[when("the user reinstalls the lemonade engine")]
 async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
-    let stdout = crate::run_rocm_ok(world, &["engines", "install", "lemonade", "--reinstall"]);
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
     world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
 }
 
 /// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
@@ -443,6 +463,36 @@ async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
         output
             .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
         "expected the install to report the ROCm backend alignment outcome:\n{output}"
+    );
+}
+
+/// The opt-out was honoured, and named the variable that caused the skip -- not
+/// folded into silence the way the not-Linux/no-SDK-version/unreadable-pin skips
+/// are, which would leave a user who set the variable unable to tell it took
+/// effect.
+#[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
+async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().expect("no install stderr");
+    assert!(
+        stderr.contains("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT"),
+        "the skipped alignment does not name the variable that skipped it:\n{stderr}"
+    );
+}
+
+/// The packaged pin was not rewritten.
+///
+/// `--reinstall` (the When's own mechanism) re-extracts the packaged embeddable
+/// on every run, so the only way a rewritten pin could still show up here is the
+/// alignment itself running despite the opt-out -- which is exactly what the
+/// "Aligned ..." line reports when it fires. Its absence is the functional
+/// signal that the pin survived, the same way scenario 4 reads the torch
+/// alignment's verdict rather than re-reading a file the CLI already reports on.
+#[then("the packaged pin survives the install")]
+async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        !output.contains("Aligned Lemonade's ROCm llama.cpp backend"),
+        "the backend was realigned even though the user opted out:\n{output}"
     );
 }
 

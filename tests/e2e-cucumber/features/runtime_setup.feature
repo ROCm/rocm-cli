@@ -213,3 +213,19 @@ Feature: Runtime configuration
     Given a managed runtime is active
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+
+  # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
+  # `backend_versions.json` -- the alignment runs on every Lemonade install, so
+  # without the opt-out a manual pin is silently overwritten the next time the
+  # engine is installed. Mirrors the vLLM torch-alignment opt-out (scenario 4)
+  # and its reasoning: a gate honoured only by the unit tests looks identical to
+  # a working one from every surface a user can see, so this asserts it from the
+  # CLI's own output. Same lane as scenario 11 and for the same reason -- a real
+  # managed SDK and a real backend, on the serialized nightly GPU runners.
+  @id:runtime-lemonade-backend-alignment-opt-out @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-12 - Opting out of the Lemonade backend alignment keeps the packaged pin
+    Given a managed runtime is active
+    And the user has opted out of realigning Lemonade's backend
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's backend alignment was skipped by the opt-out
+    And the packaged pin survives the install
