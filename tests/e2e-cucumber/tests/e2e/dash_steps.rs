@@ -761,8 +761,10 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
 
 #[then("the dashboard menu is displayed")]
 async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
-    // "Options" only ever renders as one of the main menu's three items
-    // (Options/Help/Quit) — a stable, unique marker for `Modal::Menu`.
+    // "Options" is used here as a marker for `Modal::Menu`'s three items
+    // (Options/Help/Quit). Note: the Settings panel (`Modal::Options`) also
+    // headers with "Options", so this marker is not unique app-wide — it is
+    // safe only because no scenario today opens Settings before this step.
     session(world)
         .wait_for_screen("Options", default_timeout())
         .await
