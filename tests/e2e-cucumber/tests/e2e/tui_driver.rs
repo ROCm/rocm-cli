@@ -480,19 +480,29 @@ impl TuiSession {
     /// rather than as a timeout against the frozen last screen.
     ///
     /// The general form of `wait_for_screen`, for evidence a frame is current
-    /// that is not "it contains this string" — a cleared table cell, or a
-    /// marker the frame stopped showing. `describe` names the condition being
-    /// waited on and is quoted in every diagnostic.
+    /// that is not "it contains this string" — a table cell that changed or
+    /// cleared, or a marker the frame stopped showing. `describe` names the
+    /// condition being waited on and is quoted in every diagnostic.
     ///
     /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
-    /// and deliberately so. Every condition this general form exists to express
-    /// is satisfied by a frame that stopped showing something, and a dead
-    /// process leaves behind a final frame that shows almost nothing — so a
-    /// predicate evaluated first would accept a crashed child as success. The
-    /// positive form can keep checking the screen first, because a marker that
-    /// appeared as the child exited did genuinely appear (`wait_for_screen`
-    /// leans on exactly that, draining the final frame after `try_wait`); a
-    /// disappearance carries no such evidence.
+    /// and deliberately so. The order is only observable on the poll where the
+    /// child has already exited, and there the frame is final: a predicate that
+    /// rejects it would go on rejecting it until the deadline, so the only
+    /// outcome the ordering can change is a would-be success into a named
+    /// "process exited" error. That direction is the safe one whatever shape
+    /// the predicate has, and it is the necessary one for the conditions this
+    /// form mostly expresses — an absence, or a cleared cell, is satisfied by
+    /// accident by the near-empty frame a dead process leaves behind, so a
+    /// predicate checked first would report a crash as success.
+    ///
+    /// The cost falls on predicates that require something to be *present*
+    /// (a cell that must still be rendered, only with a different value): if
+    /// such a condition first holds in the frame the child left behind, this
+    /// reports the exit instead. The positive form can afford the opposite
+    /// order — and drains the final frame after `try_wait` — because a marker
+    /// that appeared as the child exited did genuinely appear. Here that
+    /// recovery is given up on purpose: a diagnosed exit is worth more than a
+    /// condition that only ever held in a dying process's last frame.
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,
