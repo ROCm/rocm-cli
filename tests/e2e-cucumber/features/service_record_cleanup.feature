@@ -68,3 +68,18 @@ Feature: Local server record cleanup
     When the user prunes with the default age rule
     Then every file belonging to that record is gone
     And the CLI does not claim it kept anything for being recent
+
+  # A bulk delete that hits an unremovable file must not pretend it succeeded,
+  # and must not throw away its own account of what it DID delete on the way
+  # out. So the failure is reported and the command exits non-zero, but only
+  # after the plan is printed and the removal is recorded in the audit log —
+  # the record of a destructive action is worth most exactly when one went
+  # wrong.
+  @id:service-cleanup-names-a-file-it-could-not-remove
+  Scenario: service-cleanup-06 - A file prune cannot remove is named and fails the command
+    Given a local server record that is no longer running
+    And that record's engine state file cannot be deleted
+    When the user prunes every record that is not running
+    Then the CLI names the file it could not remove and exits non-zero
+    And the record's other files are gone
+    And the prune is still recorded in the audit log

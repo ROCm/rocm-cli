@@ -169,6 +169,27 @@ async fn record_died_long_ago(world: &mut E2eWorld) {
     }
 }
 
+/// Put something `remove_file` refuses to delete where the engine state file
+/// belongs: a directory that is not empty.
+///
+/// The portable way to manufacture an unremovable path without root or
+/// filesystem attributes — `unlink` on a directory fails on Linux (EISDIR) and
+/// on Windows alike. The real-world shapes are a permission-locked path or a
+/// file another process holds open; what the CLI sees is the same errno either
+/// way.
+#[given("that record's engine state file cannot be deleted")]
+async fn engine_state_cannot_be_deleted(world: &mut E2eWorld) {
+    let stuck = engine_state_dir(world).join(format!("{SERVICE_ID}.json"));
+    std::fs::remove_file(&stuck).expect("failed to remove planted engine state");
+    std::fs::create_dir(&stuck).expect("failed to create directory in its place");
+    std::fs::write(stuck.join("held.json"), "{}").expect("failed to fill the directory");
+    assert!(
+        std::fs::remove_file(&stuck).is_err(),
+        "premise: {} must be undeletable",
+        stuck.display()
+    );
+}
+
 #[given("an engine state file whose local server record was deleted by hand")]
 async fn orphaned_engine_state(world: &mut E2eWorld) {
     let states = engine_state_dir(world);
@@ -351,6 +372,73 @@ async fn orphan_gone(world: &mut E2eWorld) {
         !orphan.exists(),
         "the leftover engine state file must be swept:\n{}",
         combined_output(world)
+    );
+}
+
+#[then("the CLI names the file it could not remove and exits non-zero")]
+async fn names_the_unremovable_file(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = combined_output(world);
+    assert!(
+        rc != 0,
+        "a prune that could not delete a file must fail the command, got rc=0:\n{combined}"
+    );
+    let stuck = engine_state_dir(world).join(format!("{SERVICE_ID}.json"));
+    assert!(
+        combined.contains("file(s) could not be removed"),
+        "the failure must be reported, not swallowed:\n{combined}"
+    );
+    assert!(
+        combined.contains(&stuck.display().to_string()),
+        "the report must name the path that survived:\n{combined}"
+    );
+    assert!(
+        combined.contains("Re-running is safe: everything already removed stays removed."),
+        "a half-done destructive run must say whether repeating it is safe:\n{combined}"
+    );
+    // The plan is printed before anything is deleted; a failure after that must
+    // not cost the user the account of what the run was going to do.
+    assert!(
+        combined.contains("local server record(s) would be removed"),
+        "the plan must still be on screen:\n{combined}"
+    );
+}
+
+/// Everything except the one stuck path: a single unremovable file must not
+/// strand the other three, which is the whole reason the removal collects
+/// failures instead of returning at the first one.
+#[then("the record's other files are gone")]
+async fn other_record_files_gone(world: &mut E2eWorld) {
+    let stuck = engine_state_dir(world).join(format!("{SERVICE_ID}.json"));
+    for path in record_files(world) {
+        if path == stuck {
+            continue;
+        }
+        assert!(
+            !path.exists(),
+            "{} should have been deleted despite the failure elsewhere:\n{}",
+            path.display(),
+            combined_output(world)
+        );
+    }
+}
+
+/// The audit line is written before the non-zero exit is raised. A refactor that
+/// bailed on the first failure instead would delete files and leave no record of
+/// having done so.
+#[then("the prune is still recorded in the audit log")]
+async fn prune_is_audited(world: &mut E2eWorld) {
+    let log = data_dir(world).join("logs").join("cli-lifecycle.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}\n{}",
+            log.display(),
+            combined_output(world)
+        )
+    });
+    assert!(
+        text.contains("action=prune_records"),
+        "a run that deleted files must be audited even when it exits non-zero, got:\n{text}"
     );
 }
 
