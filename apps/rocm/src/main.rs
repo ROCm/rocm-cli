@@ -16945,9 +16945,10 @@ fn apply_runtime_update(
     }
 
     // `activate` rather than a bare `true`: the update path is preapproved either
-    // way (there is no `--yes` on `rocm update`, and no terminal contract), but
-    // the approval line it prints must not promise an activation that only
-    // `--activate` performs below.
+    // way (its approval comes from the runtime the user selected, not from a
+    // flag, and `rocm update` has no terminal contract), but the approval line it
+    // prints must not promise an activation that only `--activate` performs
+    // below.
     let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,

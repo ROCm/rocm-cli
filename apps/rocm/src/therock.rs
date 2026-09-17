@@ -1875,9 +1875,12 @@ fn install_wheel_runtime(
     }
 
     // Installs with no active default runtime proceed with just an informational
-    // line. Any install that would displace the current active default — whatever
-    // its family or channel, because activation is global — asks for confirmation
-    // (and needs `--yes` when there is no terminal to answer the prompt).
+    // line. Only an install that would displace the current active default asks
+    // for confirmation, and it asks regardless of family or channel because
+    // activation is global. With no terminal to answer the prompt it refuses
+    // instead, naming `--approve-replacing-active-default` as the
+    // non-interactive approval — see `refuse_non_interactive_message` for why
+    // that flag and not `--yes`.
     let existing = active_default_runtime_relation(
         paths,
         channel,

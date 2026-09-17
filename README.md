@@ -321,25 +321,28 @@ which is also what the refusal itself recommends and what ROCm CLI's own
 non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
 approval *and* approves installing required system packages (such as OpenMPI for
 vLLM), which means `sudo`; reach for it only where something can answer a sudo
-password prompt, which an unattended job cannot. In the default managed install
-root, the root and its manifest are keyed by version, so an upgrade or downgrade
-keeps the previous install on disk and only a same-version reinstall reuses the
-same root. `--prefix` opts out of that: the folder you name is used verbatim for
-every version, so successive installs into one prefix replace each other in
-place. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it, or `--dry-run` to preview what `--apply` would do without changing
-anything (`--dry-run` does not require `--apply`). `--runtime` and `--activate`
-require `--apply` or `--dry-run` — pass one of those instead of naming a
-runtime or requesting activation on its own. `--json` prints the check
-result as a single line of JSON instead of text; `--timeout-secs` bounds its
-network calls (`--timeout-secs` requires `--json`; both `--json` and
-`--timeout-secs` conflict with `--apply`, and `--json` also conflicts with
-`--dry-run`). `update --apply` never prompts and needs no approval flag:
-selecting a runtime to update is itself the approval, and it leaves the active
-default alone unless you add `--activate`. `update` does accept `--yes`, for
-consistency with other mutating commands, but it grants nothing there — the
-approval line the update path prints never credits it.
+password prompt — which an unattended job cannot, unless it has passwordless sudo
+configured. In the default managed install root, the root and its manifest are
+keyed by version, so an upgrade or downgrade keeps the previous install on disk
+and only a same-version reinstall reuses the same root. `--prefix` opts out of
+that: the folder you name is used verbatim for every version, so successive
+installs into one prefix replace each other in place — and if the venv already
+there no longer runs its own Python, it is removed outright and rebuilt. The
+consent gate does not cover that: it asks about changing the active default
+runtime, not about what a named prefix loses. `install driver` installs the AMD
+kernel driver on Linux (DKMS or native package). `update` checks for a newer
+ROCm package; pass `--apply` to install it, or `--dry-run` to preview what
+`--apply` would do without changing anything (`--dry-run` does not require
+`--apply`). `--runtime` and `--activate` require `--apply` or `--dry-run` — pass
+one of those instead of naming a runtime or requesting activation on its own.
+`--json` prints the check result as a single line of JSON instead of text;
+`--timeout-secs` bounds its network calls (`--timeout-secs` requires `--json`;
+both `--json` and `--timeout-secs` conflict with `--apply`, and `--json` also
+conflicts with `--dry-run`). `update --apply` never prompts and needs no
+approval flag: selecting a runtime to update is itself the approval, and it
+leaves the active default alone unless you add `--activate`. `update` does
+accept `--yes`, for consistency with other mutating commands, but it grants
+nothing there — the approval line the update path prints never credits it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the

@@ -136,8 +136,11 @@ with `--approve-replacing-active-default`:
 rocm install sdk --channel release --format wheel --prefix .\.rocm-work\data\envs\default --approve-replacing-active-default
 ```
 
-Use `--yes` only if you also want to approve installing required system
-packages with `sudo`, which needs a terminal to answer a password prompt.
+On Linux and WSL, use `--yes` only if you also want to approve installing
+required system packages with `sudo`, which needs a terminal to answer a
+password prompt. On native Windows that second consent buys nothing — the
+system-package step returns early there — so `--approve-replacing-active-default`
+is the whole approval this gate needs either way.
 
 Expected result:
 
