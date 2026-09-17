@@ -257,7 +257,7 @@ fn visible_list_window(selected: usize, len: usize, max_height: usize) -> std::o
 /// The overlay lists only the live instances the daemon surfaces, so failed or
 /// stopped servers left no trace here at all. This names the command that shows
 /// them; it deliberately promises nothing the CLI cannot do today.
-pub fn past_attempts_note(past_attempts: usize) -> Option<String> {
+fn past_attempts_note(past_attempts: usize) -> Option<String> {
     (past_attempts > 0).then(|| {
         format!(
             "{past_attempts} local server record(s) are no longer running - see `rocm services list --all`"

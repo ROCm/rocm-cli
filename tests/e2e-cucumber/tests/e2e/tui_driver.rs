@@ -490,9 +490,10 @@ impl TuiSession {
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if !self.screen_text().contains(marker) {
-                return Ok(());
-            }
+            // The liveness checks come first, and deliberately so: a dead
+            // process leaves a final frame that almost never contains the
+            // marker, so an absence check placed ahead of them would report
+            // success for a child that had crashed.
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
                     "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
@@ -506,6 +507,9 @@ impl TuiSession {
                     "process exited ({status:?}) before {marker:?} disappeared.\n{}",
                     self.framed_screen()
                 ));
+            }
+            if !self.screen_text().contains(marker) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(

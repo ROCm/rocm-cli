@@ -465,8 +465,10 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         // by the launch site, `spawn_managed_engine_child` here in `main.rs` for
         // `rocm serve --managed` and `supervise_service` in `rocmd` on the
         // supervised/recovery path, both of which redirect the engine child's
-        // stdout/stderr into it; the engine adapter then appends the server's
-        // own output there through the `--log-path` it is handed. Nothing
+        // stdout/stderr into it. The `rocm serve --managed` path additionally
+        // hands the child a `--log-path` (see `builtin_engine_serve_http_args`),
+        // so the engine adapter appends the server's own output there too; the
+        // supervised path passes no such flag and gets only the redirect. Nothing
         // rotates that log, so on a host that has served real models the size
         // printed here is dominated by logs - a note promising only "small
         // files" would contradict the number beside it.

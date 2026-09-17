@@ -17390,8 +17390,9 @@ fn refresh_managed_service_runtime_liveness(
 /// Records that are neither ready nor starting used to be invisible here, so a
 /// host with three failed servers and nothing live read "none ready" - true of
 /// the live set, misleading about what is on disk. They now get their own
-/// clause. The ready/starting wording is unchanged, so the existing headers
-/// read exactly as before.
+/// clause. The ready/starting wording is unchanged, so a header with no past
+/// attempts reads exactly as before; one with past attempts gains a third
+/// clause ("1 ready, 1 starting, 1 not running").
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
     let mut parts = Vec::new();
     if counts.ready > 0 {

@@ -7,14 +7,19 @@ Feature: Local server records
   # had never mentioned the folder at all, and the dashboard's services overlay,
   # which rendered only the live instances the daemon scrapes.
   #
-  # Why a new feature file rather than `storage`/`dash` indexes: the naming guard
-  # (`tests/feature_naming.rs`) requires per-file indexes to be sequential in
-  # declaration order, so a scenario appended to an existing file must take that
-  # file's *next* index - there is no way to reserve a higher one. `dash-12` is
-  # already claimed by two open PRs and `serve-22` by two more, so appending here
-  # would collide with whichever lands first, and the guard would only notice
-  # after both had merged. A new file takes a new key and collides with nothing.
-  # The deletion half of EAI-8075 adds its scenarios here.
+  # Why a new feature file: these scenarios are about one behaviour area - the
+  # records a managed `rocm serve` leaves on disk - rather than about the
+  # commands that happen to display them, so they get their own `FEATURE_KEYS`
+  # key (`server-records`) and stay together under one prefix. There is no
+  # `storage.feature` to hold the report scenario, and filing the overlay
+  # scenario under `dash-NN` would bury a records assertion among scenarios
+  # about the dashboard itself. The deletion half of EAI-8075 adds its
+  # scenarios here for the same reason.
+  #
+  # Appending to an existing file is still the right call when a scenario
+  # belongs to that file's area: serve-22 tests `rocm services list`, a serve
+  # surface, so this change appends it to `model_serving.feature` rather than
+  # bringing it here.
   #
   # Both plant the record rather than failing a real serve: no GPU, so they run
   # on the mock lane every PR.

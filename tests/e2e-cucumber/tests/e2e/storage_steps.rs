@@ -30,9 +30,20 @@ async fn assert_local_server_records_row(world: &mut E2eWorld) {
     let stdout = report(world);
     // The row: label, and the real path under the scenario's isolated data dir
     // (so this cannot pass against some other host's services folder).
+    let lines: Vec<&str> = stdout.lines().collect();
+    let row_at = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("- local server records:"))
+        .unwrap_or_else(|| {
+            panic!("the report must name the local server records folder:\n{stdout}")
+        });
+    // The label, path and note all render whether or not a record exists - only
+    // the size field changes (`not present` for a missing folder). Pin that
+    // field, or the scenario's `Given a local server attempt has failed` is
+    // inert and every assertion below passes with no record on disk at all.
     assert!(
-        stdout.contains("local server records"),
-        "the report must name the local server records folder:\n{stdout}"
+        !lines[row_at].contains("not present"),
+        "the planted record must make the folder present, not `not present`:\n{stdout}"
     );
     let services = world
         .isolated_root
