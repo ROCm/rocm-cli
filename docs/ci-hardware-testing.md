@@ -86,12 +86,16 @@ exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
 
-`e2e-wsl` runs on the DevLab Dispatch pool, in the WSL2/Ubuntu-24.04 distro the
-job installs fresh (see above) rather than a persistent host, so it has no
-stray serve from a prior run to reclaim — unlike the sibling Linux lane, which
-does carry that step for exactly that reason. It otherwise mirrors that lane:
-GPU preflight, toolchain bootstrap, shared-runtime pre-warm, then the full
-suite with no hand filtering. It covers WSL host detection, the
+`e2e-wsl` runs on the DevLab Dispatch pool. Its WSL2/Ubuntu-24.04 distro is
+built fresh inside every job (see above), so there is nothing of its own for
+a reclaim step to clean up. The sibling Linux lane still carries a `Reclaim
+GPU from stray E2E processes` step, retained from when that lane ran on a
+static host rather than added for anything specific to the pool; both lanes
+now pin the same `devlab-dispatch` label, so whether that step still earns
+its place there is a separate, open question, not something this paragraph
+answers. Beyond that, `e2e-wsl` otherwise mirrors the Linux lane: GPU
+preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
+with no hand filtering. It covers WSL host detection, the
 Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
 machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
 what the lane is proving out: where it is unavailable the capability probe
