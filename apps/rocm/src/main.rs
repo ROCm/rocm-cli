@@ -7570,7 +7570,8 @@ fn apply_service_prune_plan(
         // `rocm services restart <id> --yes` landing in that window would have
         // its log and 0600 endpoint key deleted out from under a live process,
         // so re-read the record immediately before touching its files —
-        // `remove` closes the same window by loading the record it deletes.
+        // `remove` narrows the same window by loading the record it deletes.
+        // Neither closes it: the check and the delete are not atomic either way.
         if load_managed_service(paths, &entry.service_id)
             .is_ok_and(|record| managed_service_record_is_in_use(&record))
         {
@@ -26322,7 +26323,7 @@ install therock";
     }
 
     #[test]
-    fn services_prune_dry_run_reports_the_plan_and_changes_nothing() -> Result<()> {
+    fn services_prune_dry_run_reports_the_plan_and_removes_nothing() -> Result<()> {
         let (root, paths) = test_paths("services-prune-dry-run");
         paths.ensure()?;
         let record = plant_service_record(&paths, "svc-dry", "failed", 999_999_999)?;
