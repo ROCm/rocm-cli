@@ -3292,18 +3292,19 @@ fn build_driver_install_plan(
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
         //
-        // No Gherkin scenario covers this arm's output (AGENTS.md #3). That is
-        // not one of #3's two named exceptions (a gated lane, or a purely
-        // internal change) -- this is user-observable `rocm install driver`
-        // output on a real OS release, just one no CI lane or test host runs:
-        // `read_os_release()` reads `/etc/os-release` directly with no
-        // override, so nothing short of an actual Ubuntu 26.04 host can drive
-        // this branch. A prior commit message claimed #3 has a standing
-        // exception for this; it does not, and this comment corrects that.
-        // Closing the gap needs either a test-only `/etc/os-release` override
-        // hook (there is precedent for `#[cfg(feature = "e2e-test-hooks")]`
-        // seams elsewhere in this crate, e.g. `dash.rs`) plus a scenario built
-        // on it, or an actual Ubuntu 26.04 CI lane once one exists.
+        // No Gherkin/e2e scenario covers this arm's output (AGENTS.md #3),
+        // and that is not one of #3's two named exceptions (a gated lane, or
+        // a purely internal change) -- this is user-observable `rocm install
+        // driver` output on a real OS release. The unit level is NOT the gap:
+        // `build_driver_install_plan` takes `os_release_text: &str` as a
+        // plain parameter rather than calling `read_os_release()` itself, so
+        // this arm is already driven by a hand-written fixture in
+        // `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two
+        // neighbors below. The gap is only the e2e path: the real `rocm`
+        // binary's `read_os_release()` reads `/etc/os-release` with no
+        // override, so no lane or test host can reach this arm through the
+        // CLI itself. (A prior version of this comment overstated the gap to
+        // the unit level too; corrected here after review caught it.)
         ("ubuntu", "26.04") => {
             let sudo = escalation.prefix();
             DriverInstallPlan {
