@@ -19,6 +19,11 @@ use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 
+/// The services overlay's own panel title, drawn by `draw_services_manager` on
+/// the overlay's border row. It is on screen exactly while the overlay is, so
+/// it proves both that the overlay opened and - as an absence - that it closed.
+const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
+
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
     world
@@ -165,13 +170,26 @@ async fn open_observe_view(world: &mut E2eWorld) {
 
 #[when("the user opens the managed services overlay")]
 async fn open_services_overlay(world: &mut E2eWorld) {
-    // `s` opens the services overlay, but only from the Observe tab (the same
-    // key stops the selected server once the overlay has focus), so the step
-    // before this one is load-bearing. Retry until the overlay's own title is on
-    // screen, for the reason `open_observe_view` documents: a key can land
-    // before the event loop is reading.
-    session(world)
-        .send_until("s", "Services", default_timeout())
+    // `s` opens the services overlay, but only from the Observe tab, so the
+    // step before this one is load-bearing.
+    //
+    // Sent exactly once, never through `send_until`: once the overlay has focus
+    // the *same* key stages a stop approval for the selected row
+    // (`services_manager::on_key` -> `request_lifecycle`), so a second copy
+    // still queued in the terminal when the title appears would put a stop
+    // modal over the overlay in any scenario whose list is not empty.
+    // `send_until` says so itself - idempotent keys only.
+    //
+    // One send is enough here because the preceding step (`the user opens the
+    // Observe view`) returns only after the dashboard has *acted on* a key, so
+    // the event loop is provably reading by the time this runs. That startup
+    // race is the only thing the retry bought, and it is already closed. Any
+    // future ordering that drops that guarantee has to re-establish it before
+    // this step, not restore the retry.
+    let tui = session(world);
+    tui.send("s")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay key: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
 }
@@ -181,29 +199,46 @@ async fn services_overlay_reports_past_attempts(world: &mut E2eWorld) {
     // The overlay renders only the live instances the daemon scrapes, so the
     // failed record left no trace here at all. The count is read from the
     // registry at launch, so it survives the daemon never having seen it.
-    let tui = session(world);
-    tui.wait_for_screen(
-        "1 local server record(s) are no longer running",
-        default_timeout(),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("the overlay never counted the failed record: {e}"));
-    // And it points at a command that exists today - the overlay cannot show
-    // the record itself, so the note has to say where it can be seen.
-    tui.wait_for_screen("rocm services list --all", default_timeout())
+    //
+    // Asserted as the one note line the overlay renders, pointer included: the
+    // count is only useful attached to the command that can show the record,
+    // which the overlay itself cannot. Waiting for the pointer separately would
+    // also pass with it rendered anywhere else on screen, or detached from the
+    // count it belongs to.
+    session(world)
+        .wait_for_screen(
+            "1 local server record(s) are no longer running - see `rocm services list --all`",
+            default_timeout(),
+        )
         .await
-        .unwrap_or_else(|e| panic!("the overlay never named how to see the record: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("the overlay never counted the failed record and named how to see it: {e}")
+        });
 }
 
 #[when("the user closes the managed services overlay")]
 async fn close_services_overlay(world: &mut E2eWorld) {
     // An open overlay eats the quit key - it closes the overlay instead - so a
     // scenario that opened one has to close it before the quit step, or the
-    // dashboard is still running when that step gives up. Waiting for an Observe
-    // panel the overlay was covering proves the overlay is actually gone rather
-    // than assuming one Esc was enough.
-    session(world)
-        .send_until("\u{1b}", "Node efficiency", default_timeout())
+    // dashboard is still running when that step gives up.
+    //
+    // What proves it closed is the overlay's *own* title going away. A panel
+    // title the overlay was covering proves nothing on its own: which Observe
+    // rows the overlay's rectangle covers depends on that tab's layout - the
+    // no-live-data banner shifts the band down a row - so with live telemetry
+    // such a title moves out from under the overlay and is visible while the
+    // overlay is still up. This step would then return early and the quit key
+    // would be eaten after all. `SERVICES_OVERLAY_TITLE` is drawn by the
+    // overlay itself, so its absence cannot be satisfied while it is open.
+    //
+    // Sent exactly once, for the reason `open_services_overlay` gives: Esc past
+    // the overlay is not idempotent either - on the Observe tab it opens the
+    // launcher menu (`KeyAction::OpenMenu`) - and the event loop has provably
+    // been reading keys since the overlay opened.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay close key: {e}"));
+    tui.wait_for_screen_absent(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to close the services overlay: {e}"));
 }

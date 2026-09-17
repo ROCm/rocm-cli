@@ -474,6 +474,49 @@ impl TuiSession {
         }
     }
 
+    /// Poll the current screen until it no longer contains `marker`, or fail
+    /// with a deadline that includes the last screen for diagnosis.
+    ///
+    /// The mirror of [`wait_for_screen`](Self::wait_for_screen), for proving
+    /// that something went *away*. Only meaningful once the marker has been
+    /// seen on screen: an absence is trivially true of a marker that never
+    /// appeared, so the caller must have asserted its presence first. A child
+    /// that exits first is a failure rather than a success - the final frame a
+    /// dead process leaves behind would satisfy any absence.
+    pub async fn wait_for_screen_absent(
+        &mut self,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.screen_text().contains(marker) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).

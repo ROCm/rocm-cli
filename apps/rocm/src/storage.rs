@@ -458,8 +458,15 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         // Reported, never touched by any prune path here.
         //
         // The note names the engine log too, not just the record: `measure`
-        // walks the whole folder, and `ManagedServiceRecord::new` puts the
-        // engine's redirected stdout/stderr (`<service_id>.log`) in it. Nothing
+        // walks the whole folder, and every managed launch leaves the engine's
+        // redirected stdout/stderr (`<service_id>.log`) beside the manifest.
+        // `ManagedServiceRecord::new` only *computes* that path (via
+        // `AppPaths::service_log_path`) - it writes nothing. The file is created
+        // by the launch site, `spawn_managed_engine_child` here in `main.rs` for
+        // `rocm serve --managed` and `supervise_service` in `rocmd` on the
+        // supervised/recovery path, both of which redirect the engine child's
+        // stdout/stderr into it; the engine adapter then appends the server's
+        // own output there through the `--log-path` it is handed. Nothing
         // rotates that log, so on a host that has served real models the size
         // printed here is dominated by logs - a note promising only "small
         // files" would contradict the number beside it.
