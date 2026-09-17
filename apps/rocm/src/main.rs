@@ -15289,7 +15289,7 @@ fn parse_optional_lines(args: &[String]) -> Result<usize> {
 /// the flag stopped being forwarded here the install would silently go back to
 /// pulling the compiler toolchain and every other assertion would still pass.
 #[allow(clippy::too_many_arguments)]
-fn sdk_install_request<'a>(
+const fn sdk_install_request<'a>(
     channel: &'a str,
     format: &'a str,
     prefix: Option<PathBuf>,
