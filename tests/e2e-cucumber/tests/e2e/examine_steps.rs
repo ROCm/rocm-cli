@@ -428,27 +428,42 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
          interpreter's -- is the one the engines will load"
     );
 
-    // Only that the note NAMES an interpreter -- deliberately not that the path
-    // sits under `active_runtime_root`. `managed_therock_python_executable`
-    // prefers the interpreter the installer recorded precisely because an
-    // imported or read-only runtime can record one that is not under
-    // `install_root` at all, so a containment check would fail a correct build
-    // on a host holding such a runtime.
-    let names_interpreter = value
+    let named_interpreter = value
         .get("framework_notes")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|notes| {
+        .and_then(|notes| {
             notes
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .filter_map(|note| note.split_once("active managed runtime's interpreter: "))
-                .any(|(_, path)| !path.trim().is_empty())
+                .map(|(_, path)| path.trim().to_owned())
+                .find(|path| !path.is_empty())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the report must name the interpreter it used (runtime root here is \
+                 {root}): {:?}",
+                value.get("framework_notes")
+            )
         });
-    assert!(
-        names_interpreter,
-        "the report must name the interpreter it used (runtime root here is {root}): {:?}",
-        value.get("framework_notes")
-    );
+
+    // The containment check is restored where it holds rather than dropped
+    // outright. It was right for a runtime this CLI installed -- `install sdk`
+    // builds the venv under `install_root`, so an interpreter outside it means
+    // the report is describing some OTHER runtime than the active one -- and
+    // wrong only for an imported or adopted runtime, which records an
+    // interpreter that can sit anywhere. Those are exactly the runtimes the
+    // report calls `read-only`, so gating on the mode it already prints keeps
+    // the guard and drops the false-fail that made it go away. Absent mode:
+    // skip, rather than guess.
+    if human_states(human, "active_runtime_mode").as_deref() == Some("managed") {
+        assert!(
+            std::path::Path::new(&named_interpreter).starts_with(&root),
+            "a managed runtime keeps its interpreter under its own root, so naming \
+             {named_interpreter} instead of something under {root} means the framework \
+             report is describing a different runtime than the active one"
+        );
+    }
 }
 
 #[then("the machine-readable form states everything the readable one does")]
