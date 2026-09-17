@@ -126,6 +126,23 @@ async fn assert_version_returned(world: &mut E2eWorld) {
         !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "version hash is not hexadecimal: {output}"
     );
+
+    // `rocm version`'s own two lines beyond the build string. Both are printed
+    // unconditionally (either the detected value or a "not detected"/"unmanaged"
+    // variant), so their presence -- not their value, which depends on the host
+    // -- is what this surface promises.
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("ROCm SDK:")),
+        "`rocm version` did not report the ROCm SDK line:\n{version_output}"
+    );
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("GPU driver:")),
+        "`rocm version` did not report the GPU driver line:\n{version_output}"
+    );
 }
 
 #[then("the plan's repo version is a concrete version, not a shell placeholder")]
