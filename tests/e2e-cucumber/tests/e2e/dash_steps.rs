@@ -691,6 +691,51 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
         });
 }
 
+/// Roll the injected dashboard clock back so it reflects `world`'s
+/// `dash_clock_rollback_since` anchor plus a small residual, canceling out
+/// real time spent since that anchor was set. Called once after the failure
+/// poll in `metrics_endpoint_fails` and again after the render-lag wait in
+/// `gen_tps_held_after_failure`, both times recomputed from the *same*
+/// anchor — so the second call re-zeroes cumulative real time (poll + render
+/// lag), not just the time since the first call, giving
+/// `assert_screen_persists` a fresh validity window regardless of how long
+/// the render-lag wait took.
+///
+/// Deliberately under-corrects by one tick: `snapshot`'s freshness check
+/// (`crates/rocm-dash-core/src/observation.rs`) treats `observed_at == now`
+/// as `Fresh`, not `Held` — an *exact* cancellation of the elapsed time would
+/// make the rolled-back clock land precisely on top of the pre-failure
+/// observation's timestamp, spuriously reporting a brand-new fresh scrape
+/// (dropping `HELD_MARKER`) even though nothing was actually observed this
+/// cycle. Rounding the elapsed time up and then subtracting one extra tick
+/// guarantees the rollback always leaves a small positive residual age, so
+/// `now` is strictly after `observed_at` — genuinely `Held`, never an
+/// accidental `Fresh` collision. That residual costs at most ~1-2 s of the
+/// 6 s validity window, which is negligible next to the checks it leaves
+/// room for.
+///
+/// Clamped to non-negative: a near-zero elapsed time still rounds up to one
+/// tick before the `- 1`, and without the clamp that difference could reach
+/// `0` or go negative, writing a *positive* offset that advances the clock
+/// forward instead of rolling it back. `as i64` on a float saturates rather
+/// than overflowing, so this stays safe even for a pathologically long wait.
+fn roll_back_dash_clock(world: &E2eWorld) {
+    let since = world
+        .dash_clock_rollback_since
+        .expect("roll_back_dash_clock called before the rollback anchor was set");
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let elapsed_secs = (since.elapsed().as_secs_f64().ceil() as i64 - 1).max(0);
+    std::fs::write(
+        root.join(DASH_CLOCK_OFFSET_FILE),
+        (-elapsed_secs).to_string(),
+    )
+    .expect("failed to roll back dashboard test clock");
+}
+
 /// Switch the scripted mock to Failure mode, then poll the mock's own failure
 /// counter until the daemon delivers at least one 503 — confirming the failure
 /// scrape actually landed before the assertion checks the TUI. This avoids a
@@ -702,12 +747,15 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 /// cycle. Left uncorrected, that cost is subtracted from the 6 s validity
 /// window before `gen_tps_held_after_failure` even starts polling for the TUI
 /// to repaint, so a slow host can consume the window before the persistence
-/// check gets a chance to run. Roll the injected clock back by the real time
-/// spent in this function so the check downstream starts from a fresh window
-/// instead of racing whatever margin survived this wait.
+/// check gets a chance to run. Set the rollback anchor here and roll the
+/// clock back by the real time spent in this function, so the check
+/// downstream starts from a fresh window instead of racing whatever margin
+/// survived this wait. `gen_tps_held_after_failure` applies a second
+/// correction from this same anchor after its own render-lag wait, so this
+/// rollback only has to cover the time spent here, not the whole scenario.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
-    let poll_start = Instant::now();
+    world.dash_clock_rollback_since = Some(Instant::now());
     let mock = world.mock.as_ref().expect("no mock server running");
     mock.set_metrics_mode(MetricsMode::Failure);
 
@@ -727,32 +775,9 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    // Deliberately under-correct by one tick: `snapshot`'s freshness check
-    // (`crates/rocm-dash-core/src/observation.rs`) treats `observed_at == now`
-    // as `Fresh`, not `Held` — an *exact* cancellation of the elapsed time
-    // would make the rolled-back clock land precisely on top of the
-    // pre-failure observation's timestamp, spuriously reporting a brand-new
-    // fresh scrape (dropping `HELD_MARKER`) even though nothing was actually
-    // observed this cycle. Rounding the elapsed time up and then subtracting
-    // one extra tick guarantees the rollback always leaves a small positive
-    // residual age, so `now` is strictly after `observed_at` — genuinely
-    // `Held`, never an accidental `Fresh` collision. That residual costs at
-    // most ~1-2 s of the 6 s validity window, which is negligible next to the
-    // render-lag and persistence checks downstream. `as i64` on a float
-    // saturates rather than overflowing, so this stays safe even for a
-    // pathologically long poll.
-    let elapsed_secs = poll_start.elapsed().as_secs_f64().ceil() as i64 - 1;
-    std::fs::write(
-        root.join(DASH_CLOCK_OFFSET_FILE),
-        (-elapsed_secs).to_string(),
-    )
-    .expect("failed to roll back dashboard test clock");
+    roll_back_dash_clock(world);
 }
+
 /// EAI-7960 principal regression assertion.
 ///
 /// `cycle_timestamp` (`crates/rocm-dash-daemon/src/runner.rs`) derives the
@@ -762,11 +787,14 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 /// `MissedTickBehavior::Skip` only bounds the catch-up burst *after a stall*
 /// (collapsing any missed ticks into a single tick on resume); it does not
 /// cap the ticks a loop that is running normally accrues. That means a real
-/// wait anywhere in this scenario — including the poll in
-/// `metrics_endpoint_fails` above — consumes the validity window one-for-one,
-/// which is exactly why that step rolls the injected clock back by the real
-/// time it spent polling. The daemon's failed-scrape state is confirmed above; this step first waits
-/// for the TUI to actually render gen_tps as `Held` (`HELD_TPS_MARKER`), then
+/// wait anywhere in this scenario consumes the validity window one-for-one —
+/// including the render-lag wait below, not just the poll in
+/// `metrics_endpoint_fails` above. That step's rollback alone would leave
+/// this wait's own real time uncorrected, so once it succeeds this step
+/// applies a second `roll_back_dash_clock` from the same anchor, re-zeroing
+/// the *cumulative* real time spent before `assert_screen_persists` runs. The
+/// daemon's failed-scrape state is confirmed above; this step first waits for
+/// the TUI to actually render gen_tps as `Held` (`HELD_TPS_MARKER`), then
 /// asserts that held rendering *persists* across an `INSTANCE_TICK` window
 /// rather than merely appearing once.
 ///
@@ -788,8 +816,7 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 /// and do not shorten its window below `INSTANCE_TICK`.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
-    let session = session(world);
-    session
+    session(world)
         .wait_for_screen(HELD_TPS_MARKER, default_timeout())
         .await
         .unwrap_or_else(|e| {
@@ -801,7 +828,10 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
                  distinguishes render lag from a real regression, not this wait: {e}"
             )
         });
-    session
+
+    roll_back_dash_clock(world);
+
+    session(world)
         .assert_screen_persists(HELD_TPS_MARKER, INSTANCE_TICK)
         .await
         .unwrap_or_else(|e| {

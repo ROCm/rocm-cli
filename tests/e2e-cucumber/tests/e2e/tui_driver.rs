@@ -503,6 +503,34 @@ impl TuiSession {
         }
     }
 
+    /// Shared exit handling for `wait_for_screen_gone` and
+    /// `assert_screen_persists`: both treat the child exiting as a definite
+    /// failure (never a legitimate "gone"/"persisted" outcome), so both need
+    /// to record the exit, drain the final frame, and surface a reader panic
+    /// that landed during that drain — before deciding their own wording for
+    /// what the exit means for their specific check. Returns `Ok(None)`
+    /// while the child is still running (caller keeps polling), `Ok(Some(status))`
+    /// (pre-formatted via `{:?}`) once it has exited and the drain completed
+    /// cleanly, or `Err` if the drain itself surfaced a reader panic.
+    /// `wait_for_screen` isn't a candidate for this helper: it drains
+    /// differently, still polling for `marker` while draining since exit
+    /// there is not automatically a failure.
+    async fn exited_after_drain(&mut self, marker: &str) -> Result<Option<String>, String> {
+        let Ok(Some(status)) = self.child.try_wait() else {
+            return Ok(None);
+        };
+        self.finished = true;
+        self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+        self.drain_after_exit().await;
+        if let Some(panic_message) = self.take_reader_panic() {
+            return Err(format!(
+                "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
+                self.framed_screen()
+            ));
+        }
+        Ok(Some(format!("{status:?}")))
+    }
+
     /// Poll the current screen until it no longer contains `marker`, or fail
     /// with a deadline that includes the last screen for diagnosis.
     ///
@@ -540,26 +568,14 @@ impl TuiSession {
                     self.framed_screen()
                 ));
             }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.finished = true;
-                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                // The process exiting is never a legitimate "gone" outcome for
-                // this helper; drain briefly so the error reflects the final
-                // buffered frame rather than a stale mid-drain snapshot.
-                self.drain_after_exit().await;
-                if let Some(panic_message) = self.take_reader_panic() {
-                    return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                        self.framed_screen()
-                    ));
-                }
+            if let Some(status) = self.exited_after_drain(marker).await? {
                 let while_clause = if self.screen_text().contains(marker) {
                     format!("while {marker:?} was still on screen")
                 } else {
                     format!("before {marker:?} was confirmed gone")
                 };
                 return Err(format!(
-                    "process exited ({status:?}) {while_clause}.\n{}",
+                    "process exited ({status}) {while_clause}.\n{}",
                     self.framed_screen()
                 ));
             }
@@ -612,21 +628,9 @@ impl TuiSession {
                     self.framed_screen()
                 ));
             }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.finished = true;
-                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                // The process exiting is never a legitimate "persisted" outcome
-                // here; drain briefly so the error reflects the final buffered
-                // frame rather than a stale mid-drain snapshot.
-                self.drain_after_exit().await;
-                if let Some(panic_message) = self.take_reader_panic() {
-                    return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                        self.framed_screen()
-                    ));
-                }
+            if let Some(status) = self.exited_after_drain(marker).await? {
                 return Err(format!(
-                    "process exited ({status:?}) while asserting {marker:?} persists.\n{}",
+                    "process exited ({status}) while asserting {marker:?} persists.\n{}",
                     self.framed_screen()
                 ));
             }

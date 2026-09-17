@@ -1045,8 +1045,13 @@ mod tests {
 
         // Negative offsets roll the clock backward (e.g. dash-08's e2e clock
         // rollback, which compensates for real time spent polling for a
-        // scripted failure) — `checked_add_signed` must handle these the
-        // same as positive ones, not just avoid panicking on them.
+        // scripted failure). This pins down newly-added behavior, not a
+        // regression guard: dash-08 is the first caller to ever write a
+        // negative offset, so there is no prior negative-offset code path
+        // for this to regress against. What the assertion actually confirms
+        // is that `checked_add_signed` composes correctly with a negative
+        // delta — subtracting from the tick-based logical time — rather than
+        // just returning `None` (and falling back to `DateTime::MAX_UTC`).
         std::fs::write(&offset, "-5").unwrap();
         assert_eq!(
             cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),

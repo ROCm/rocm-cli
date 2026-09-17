@@ -9,6 +9,7 @@
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
@@ -95,6 +96,13 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Anchor set by `metrics_endpoint_fails` (`e2e::dash_steps`) at the start of
+    /// the scripted-failure poll. Both that step and `gen_tps_held_after_failure`
+    /// recompute the injected clock rollback from this same instant, so the
+    /// second correction re-zeroes real time spent in the first step's render-lag
+    /// wait too, not just the original failure poll. `None` outside the dash-08/09
+    /// scenarios.
+    pub dash_clock_rollback_since: Option<Instant>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -222,6 +230,7 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            dash_clock_rollback_since: None,
         }
     }
 }
