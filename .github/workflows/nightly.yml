@@ -764,11 +764,17 @@ jobs:
       - name: Reclaim GPU from stray E2E processes
         shell: powershell
         run: |
-          # Same rule as scripts/reclaim-gpu.sh, which is the source of truth for
-          # these markers: an E2E-owned root AND an engine process. Native Windows
-          # has no bash, so the rule is mirrored here rather than shared. Keep the
-          # root list in step with the script — `e2e-prewarm` is the shared runtime
-          # tree the engine binaries actually run from.
+          # Mirrors the SHAPE of scripts/reclaim-gpu.sh's rule — an E2E-owned root
+          # AND an engine process — but is not equivalent to it. Native Windows has
+          # no bash, so the rule is restated here rather than shared. Keep the root
+          # alternation in step with the script's E2E_ROOTS (`e2e-prewarm` is the
+          # shared runtime tree the engine binaries actually run from); xtask's
+          # reclaim_roots_are_mirrored_in_the_powershell_reclaims test pins that half.
+          #
+          # The engine half diverges in two pre-existing ways, tracked in EAI-8815:
+          # `rocm ` cannot match Windows' `rocm.exe daemon`, and `__engine-serve-http`
+          # sits in the root alternation rather than the engine one. Do not read this
+          # as "same markers as the script" until that is fixed.
           $leaked = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -match 'rocm-e2e|e2e-prewarm|e2e-shared|e2e-target|__engine-serve-http' -and $_.CommandLine -match 'llama-server|vllm|rocm ' }
           foreach ($p in $leaked) {

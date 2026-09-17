@@ -95,7 +95,10 @@ select_leaked() {
       continue
     fi
     # A process can exit between the glob and the read; that is not an error.
-    cmdline="$(tr '\0' ' ' <"${cmdline_file}" 2>/dev/null)" || continue
+    # Redirect stderr BEFORE the input redirection: the shell applies them left
+    # to right, so `<file 2>/dev/null` still lets the shell's own "No such file"
+    # reach the terminal when the open fails.
+    cmdline="$(tr '\0' ' ' 2>/dev/null <"${cmdline_file}")" || continue
     [[ -n "${cmdline}" ]] || continue
 
     if [[ -n "${SELFTEST_SCOPE}" ]]; then
@@ -138,7 +141,7 @@ select_leaked() {
 # nothing, and a silent no-op is how the original defect stayed hidden.
 reclaim() {
   local dry_run="$1"
-  local selected pid cmdline
+  local selected pid cmdline current
   local killed=0
   local waited=0
 
@@ -176,10 +179,19 @@ reclaim() {
   # by the kernel when the process dies, so this is what actually frees the card.
   while IFS=$'\t' read -r pid cmdline; do
     [[ -n "${pid}" ]] || continue
-    if process_alive "${pid}"; then
-      echo "reclaim: pid=${pid} ignored SIGTERM after ${TERM_GRACE_SECS}s, sending SIGKILL"
-      kill -KILL "${pid}" 2>/dev/null || true
+    process_alive "${pid}" || continue
+    # This loop walks the pre-TERM snapshot, and a pid freed during the grace
+    # window can be handed to an unrelated process. Escalating on the pid alone
+    # would SIGKILL that bystander, so require the command line to still be the
+    # one we selected. Not killing a genuine holder is recoverable — the next
+    # job's reclaim sees it again — where killing a bystander is not.
+    current="$(tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline")" || continue
+    if [[ "${current}" != "${cmdline}" ]]; then
+      echo "reclaim: pid=${pid} was recycled during the grace period, not escalating"
+      continue
     fi
+    echo "reclaim: pid=${pid} ignored SIGTERM after ${TERM_GRACE_SECS}s, sending SIGKILL"
+    kill -KILL "${pid}" 2>/dev/null || true
   done <<<"${selected}"
 
   echo "reclaim: ${killed} process(es) terminated"
@@ -216,8 +228,27 @@ spawn_decoy() {
   echo $!
 }
 
+# Spawn a decoy that IGNORES SIGTERM, so the TERM -> grace -> KILL escalation is
+# exercised. A plain `cp /bin/sleep` decoy dies on the first TERM and leaves the
+# escalation branch unreached, which is how it went untested.
+spawn_stubborn_decoy() {
+  local path="$1"
+  mkdir -p "$(dirname "${path}")"
+  # The foreground `sleep 1` children are short-lived and name no E2E root, so
+  # they are never selected and leave nothing behind once the parent is killed.
+  cat >"${path}" <<'DECOY'
+#!/usr/bin/env bash
+trap '' TERM
+while :; do sleep 1; done
+DECOY
+  chmod +x "${path}"
+  "${path}" >/dev/null 2>&1 &
+  echo $!
+}
+
 self_test() {
-  local tmp prewarm_decoy workload_decoy prewarm_pid workload_pid selected
+  local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
+  local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
   local failures=0
 
   # Deliberately NOT under /tmp/rocm-e2e: that prefix is one of the roots the
@@ -225,6 +256,9 @@ self_test() {
   tmp="$(mktemp -d /tmp/reclaim-selftest-XXXXXX)"
   export RECLAIM_SELFTEST_SCOPE="${tmp}"
   SELFTEST_SCOPE="${tmp}"
+  # The stubborn decoy never exits on its own, so the grace loop always runs to
+  # the ceiling. Keep it short: this is a unit-speed test, not a GPU lane.
+  TERM_GRACE_SECS=2
   # shellcheck disable=SC2064 # expand ${tmp} now, at trap definition time
   trap "rm -rf '${tmp}'" EXIT
 
@@ -232,10 +266,20 @@ self_test() {
   prewarm_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9752/llama-server"
   # A manual-testing serve on a shared runner: an engine, but no E2E root.
   workload_decoy="${tmp}/workload/manual-serve/llama-server"
+  # An E2E root with NO engine marker — the suite's own test binary under
+  # CARGO_TARGET_DIR. This is what the `has_engine` half exists to spare, and
+  # without it in the fixtures that half can be deleted with the test still green.
+  harness_decoy="${tmp}/e2e-target/release/deps/e2e-harness"
+  # Same shape as the pre-warm decoy but ignores SIGTERM, so the escalation this
+  # script adds is reached. Without it, TERM alone ends every decoy and both the
+  # SIGKILL block and the `kill -TERM` call can be removed with the test green.
+  stubborn_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9753/llama-server"
 
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
-  # Give both decoys a moment to appear in /proc with their full argv.
+  harness_pid="$(spawn_decoy "${harness_decoy}")"
+  stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
+  # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
   # 1. Regression guard: the patterns this script replaced could not see a
@@ -258,7 +302,7 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 3. A manual-testing serve is left alone.
+  # 3. A manual-testing serve is left alone (engine marker, but no E2E root).
   if grep -q "^${workload_pid}	" <<<"${selected}"; then
     echo "FAIL: /workload manual serve was selected; reclaim must not touch it"
     failures=$((failures + 1))
@@ -266,8 +310,25 @@ self_test() {
     echo "ok: /workload manual serve is not selected"
   fi
 
-  # 4. End to end: reclaim actually kills the leak and spares the bystander.
-  reclaim 0 >/dev/null
+  # 4. Both halves are required: an E2E root alone must not select. Deleting the
+  #    `has_engine` requirement makes exactly this check fail and nothing else.
+  if grep -q "^${harness_pid}	" <<<"${selected}"; then
+    echo "FAIL: E2E test binary was selected; the engine half of the rule is not enforced"
+    failures=$((failures + 1))
+  else
+    echo "ok: an E2E root without an engine marker is not selected"
+  fi
+
+  # 5. A process that ignores SIGTERM is still selected.
+  if grep -q "^${stubborn_pid}	" <<<"${selected}"; then
+    echo "ok: SIGTERM-ignoring pre-warm engine process is selected"
+  else
+    echo "FAIL: SIGTERM-ignoring pre-warm engine process was not selected"
+    failures=$((failures + 1))
+  fi
+
+  # 6. End to end: reclaim kills the leaks and spares both bystanders.
+  reclaim_out="$(reclaim 0)"
   sleep 1
   if process_alive "${prewarm_pid}"; then
     echo "FAIL: pre-warm engine process survived reclaim"
@@ -281,8 +342,37 @@ self_test() {
     echo "FAIL: /workload manual serve was killed by reclaim"
     failures=$((failures + 1))
   fi
+  if process_alive "${harness_pid}"; then
+    echo "ok: E2E test binary survived reclaim"
+  else
+    echo "FAIL: E2E test binary was killed by reclaim"
+    failures=$((failures + 1))
+  fi
 
-  kill -KILL "${workload_pid}" 2>/dev/null || true
+  # 7. The escalation ran, and ran only where it was needed. Asserting the
+  #    stubborn decoy died covers the SIGKILL block; asserting the ordinary
+  #    decoy did NOT reach escalation covers the `kill -TERM` that precedes it,
+  #    which would otherwise be silently replaceable by any no-op.
+  if process_alive "${stubborn_pid}"; then
+    echo "FAIL: SIGTERM-ignoring process survived reclaim; escalation to SIGKILL did not happen"
+    failures=$((failures + 1))
+  else
+    echo "ok: SIGTERM-ignoring process was escalated to SIGKILL"
+  fi
+  if grep -q "pid=${stubborn_pid} ignored SIGTERM" <<<"${reclaim_out}"; then
+    echo "ok: escalation was reported for the process that ignored SIGTERM"
+  else
+    echo "FAIL: no escalation reported for the SIGTERM-ignoring process"
+    failures=$((failures + 1))
+  fi
+  if grep -q "pid=${prewarm_pid} ignored SIGTERM" <<<"${reclaim_out}"; then
+    echo "FAIL: ordinary decoy reached SIGKILL escalation; SIGTERM is not being delivered"
+    failures=$((failures + 1))
+  else
+    echo "ok: ordinary decoy exited on SIGTERM without escalation"
+  fi
+
+  kill -KILL "${workload_pid}" "${harness_pid}" "${stubborn_pid}" 2>/dev/null || true
 
   if [[ "${failures}" -ne 0 ]]; then
     echo "reclaim-gpu self-test: ${failures} failure(s)"
