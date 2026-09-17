@@ -1,3 +1,7 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
 //! What rocm-cli does with untrusted terminal output: one ECMA-48 walk, and the
 //! decisions that rest on it.
 //!
