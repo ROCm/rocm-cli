@@ -91,3 +91,60 @@ async fn assert_no_removed_wsl_script_guidance(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no driver plan output");
     assert!(!output.contains("scripts/wsl_setup_rocdxg.sh"), "{output}");
 }
+
+#[then("the driver plan verifies the download before installing it")]
+async fn assert_driver_plan_verifies_download(world: &mut E2eWorld) {
+    // The package is handed to `apt-get install`, which runs its maintainer
+    // scripts as root, so the plan the user approves has to show the check.
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(output.contains("sha256sum -c -"), "{output}");
+    assert!(
+        !output.contains("skipping checksum verification"),
+        "verification must not be conditional on an unset variable:\n{output}"
+    );
+    let commands: Vec<&str> = output.lines().map(str::trim).collect();
+    let check = commands
+        .iter()
+        .position(|line| line.contains("sha256sum -c -"))
+        .expect("plan verifies the download");
+    let install = commands
+        .iter()
+        .position(|line| line.contains("apt-get install -y '/tmp/"))
+        .expect("plan installs the package");
+    assert!(
+        check < install,
+        "digest must be checked before the root install:\n{output}"
+    );
+}
+
+#[when("the user previews driver installation for a ROCDXG release with no known digest")]
+async fn preview_wsl_driver_install_unpinned(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["install", "driver", "--dry-run"],
+        &[
+            ("WSL_DISTRO_NAME", "Ubuntu"),
+            ("ROCM_CLI_ROCDXG_VERSION", "99.99.99"),
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the driver plan refuses rather than installing an unverified package")]
+async fn assert_driver_plan_refuses_unverified(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(output.contains("supported: false"), "{output}");
+    assert!(output.contains("mutating: false"), "{output}");
+    // The refusal has to name the way out, or it is just a dead end.
+    assert!(output.contains("ROCM_CLI_ROCDXG_SHA256"), "{output}");
+    assert!(
+        output.contains("ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("apt-get install"),
+        "a refusal must not offer install commands:\n{output}"
+    );
+}
