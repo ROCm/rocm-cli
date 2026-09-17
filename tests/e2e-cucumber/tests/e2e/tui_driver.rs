@@ -486,14 +486,14 @@ impl TuiSession {
     ///
     /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
     /// and deliberately so. The order is only observable on the poll where the
-    /// child has already exited, and there the frame is final: a predicate that
-    /// rejects it would go on rejecting it until the deadline, so the only
-    /// outcome the ordering can change is a would-be success into a named
-    /// "process exited" error. That direction is the safe one whatever shape
-    /// the predicate has, and it is the necessary one for the conditions this
-    /// form mostly expresses — an absence, or a cleared cell, is satisfied by
-    /// accident by the near-empty frame a dead process leaves behind, so a
-    /// predicate checked first would report a crash as success.
+    /// child has already exited, and there the liveness check returns before the
+    /// predicate is ever consulted — so the only outcome the ordering can change
+    /// is a would-be success into a named "process exited" error, never the
+    /// reverse. That direction is the safe one whatever shape the predicate has,
+    /// and it is the necessary one for the conditions this form mostly
+    /// expresses — an absence, or a cleared cell, is satisfied by accident by
+    /// the near-empty frame a dead process leaves behind, so a predicate checked
+    /// first would report a crash as success.
     ///
     /// The cost falls on predicates that require something to be *present*
     /// (a cell that must still be rendered, only with a different value): if
