@@ -540,21 +540,27 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Key("+/-", Some(KeyAction::ReplaySpeedUp)));
         segs.push(Seg::Sep(" speed  "));
     }
-    segs.push(Seg::Key("t", Some(KeyAction::OpenThemePicker)));
-    segs.push(Seg::Sep(" theme  "));
-    segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
-    segs.push(Seg::Sep(" help  "));
     if state.has_open_overlay() {
         // While a manager overlay is open it owns every key (the event loop
         // routes each keypress to its `on_key`, never falling through to
-        // `apply_action`), so a real `q` press can't reach `KeyAction::Quit`
-        // there — it cancels the approval, closes the job console, or backs
-        // the manager out instead, but it never tears down the app or kills
-        // a job the way `Quit` does. `None` keeps the chip non-clickable so a
-        // click can't do something the key never would.
+        // `apply_action`), so a real `t`/`?`/`q` press can't reach
+        // `OpenThemePicker`/`ToggleHelp`/`KeyAction::Quit` there — it cancels
+        // the approval, closes the job console, or backs the manager out
+        // instead, but it never opens the theme picker, toggles help, or
+        // tears down the app the way those actions do. `None` keeps the
+        // chips non-clickable so a click can't do something the key never
+        // would.
+        segs.push(Seg::Key("t", None));
+        segs.push(Seg::Sep(" theme  "));
+        segs.push(Seg::Key("?", None));
+        segs.push(Seg::Sep(" help  "));
         segs.push(Seg::Key("q", None));
         segs.push(Seg::Sep(" close"));
     } else {
+        segs.push(Seg::Key("t", Some(KeyAction::OpenThemePicker)));
+        segs.push(Seg::Sep(" theme  "));
+        segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
+        segs.push(Seg::Sep(" help  "));
         segs.push(Seg::Key("q", Some(KeyAction::Quit)));
         segs.push(Seg::Sep(" quit"));
     }
@@ -753,7 +759,7 @@ mod tests {
         );
         // Note: "close" legitimately appears elsewhere in this row (the `q`
         // chip always says "close" while any overlay is open, root or not —
-        // see `footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open`),
+        // see `footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open`),
         // so the Esc chip's own label must be checked specifically rather
         // than scanning the whole row for the substring.
         assert!(
@@ -856,7 +862,7 @@ mod tests {
         );
         // Note: "close" legitimately appears elsewhere in this row (the `q`
         // chip always says "close" while any overlay is open — see
-        // `footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open`),
+        // `footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open`),
         // so the Esc chip's own label must be checked specifically rather
         // than scanning the whole row for the substring.
         assert!(
@@ -866,14 +872,16 @@ mod tests {
     }
 
     #[test]
-    fn footer_q_chip_is_not_clickable_quit_when_a_manager_overlay_is_open() {
+    fn footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open() {
         // Regression: while any manager overlay is open it owns every key
         // (the event loop routes each keypress to the manager's own `on_key`,
-        // never falling through to `apply_action`), so a real `q` press can
-        // never reach `KeyAction::Quit` there — it only cancels/closes the
-        // overlay. A click on the footer chip must not diverge from that and
+        // never falling through to `apply_action`), so a real `q`/`t`/`?`
+        // press can never reach `KeyAction::Quit`/`OpenThemePicker`/
+        // `ToggleHelp` there — it only cancels/closes the overlay. A click on
+        // any of these footer chips must not diverge from that: it must not
         // tear down the app (killing a still-running job via `kill_on_drop`)
-        // when the key itself never would.
+        // or swap the theme / pop the help overlay on top of the manager when
+        // the key itself never would.
         use crate::ui::services_manager::ServicesManagerState;
         use crate::ui::theme::Theme;
         use ratatui::Terminal;
@@ -895,6 +903,16 @@ mod tests {
                 chip.action,
                 KeyAction::Quit,
                 "no chip may dispatch Quit while a manager overlay owns `q`"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenThemePicker,
+                "no chip may dispatch OpenThemePicker while a manager overlay owns `t`"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::ToggleHelp,
+                "no chip may dispatch ToggleHelp while a manager overlay owns `?`"
             );
         }
         let row: String = (0..90)
