@@ -1473,4 +1473,102 @@ permissions:
         let block = "    env:\n      VALID: one\n      MALFORMED\n    steps:\n";
         let _ = job_mapping(block, "env");
     }
+
+    /// The E2E-owned roots declared in `scripts/reclaim-gpu.sh`.
+    ///
+    /// Parsed rather than duplicated: a copy here would drift the same way the
+    /// PowerShell mirrors can, which is the defect this test exists to prevent.
+    fn reclaim_script_roots() -> Vec<String> {
+        let p = repo_root().join("scripts/reclaim-gpu.sh");
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n");
+        let body = text
+            .split_once("E2E_ROOTS=(")
+            .unwrap_or_else(|| panic!("{} must declare E2E_ROOTS=(", p.display()))
+            .1
+            .split_once(')')
+            .unwrap_or_else(|| panic!("{} has an unterminated E2E_ROOTS array", p.display()))
+            .0;
+        let roots: Vec<String> = body
+            .lines()
+            .filter_map(|l| {
+                let l = strip_comment(l).trim();
+                l.strip_prefix('\'')
+                    .and_then(|l| l.strip_suffix('\''))
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !roots.is_empty(),
+            "{} declared no E2E_ROOTS entries — the parser or the array shape changed",
+            p.display()
+        );
+        roots
+    }
+
+    /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
+    /// alternation on the `Where-Object` line.
+    ///
+    /// Extracted rather than substring-matched against the whole file for the
+    /// reason this module's header gives: every root ALSO appears in these
+    /// workflows as an env var and in prose, so a `text.contains(root)` check
+    /// passes even when the alternation itself has lost that root. Confirmed by
+    /// mutation — deleting `e2e-prewarm` from the alternation left the
+    /// whole-file form of this test green.
+    fn powershell_reclaim_root_alternations(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("Where-Object") && l.contains("-match"))
+            .map(|l| {
+                let after = l.split_once("-match").expect("filtered on -match").1;
+                let body = after
+                    .split_once('\'')
+                    .unwrap_or_else(|| panic!("no opening quote in matcher line: {l}"))
+                    .1;
+                body.split_once('\'')
+                    .unwrap_or_else(|| panic!("unterminated matcher literal: {l}"))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// EAI-8751: native Windows has no bash, so the two PowerShell reclaim steps
+    /// restate the bash rule instead of sharing it. Nothing else in CI compares
+    /// the two, so a root added to the script — as `e2e-prewarm` was, to fix a
+    /// leak that held the card for 16 consecutive jobs — can silently miss the
+    /// Windows lanes.
+    ///
+    /// Only the ROOT half is pinned. The engine half is knowingly divergent on
+    /// Windows (EAI-8815), so asserting parity there would fail on a difference
+    /// that is recorded rather than accidental.
+    #[test]
+    fn reclaim_roots_are_mirrored_in_the_powershell_reclaims() {
+        let roots = reclaim_script_roots();
+        for workflow in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let text = read_workflow(workflow);
+            assert!(
+                text.contains("Get-CimInstance Win32_Process"),
+                "{workflow} must keep a PowerShell reclaim step (EAI-8751)"
+            );
+            let alternations = powershell_reclaim_root_alternations(&text);
+            assert!(
+                !alternations.is_empty(),
+                "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
+                 — the step's shape changed and this guard went blind (EAI-8751)"
+            );
+            for alternation in &alternations {
+                for root in &roots {
+                    // `/tmp/rocm-e2e` is POSIX-only; the mirrors match the
+                    // `rocm-e2e` segment, the portable part of the same root.
+                    let needle = root.strip_prefix("/tmp/").unwrap_or(root);
+                    assert!(
+                        alternation.contains(needle),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` does not name \
+                         the E2E root `{needle}` declared in scripts/reclaim-gpu.sh (EAI-8751)"
+                    );
+                }
+            }
+        }
+    }
 }
