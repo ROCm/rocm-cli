@@ -466,10 +466,19 @@ async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
     );
 }
 
-/// The opt-out was honoured, and named the variable that caused the skip -- not
-/// folded into silence the way the not-Linux/no-SDK-version/unreadable-pin skips
-/// are, which would leave a user who set the variable unable to tell it took
-/// effect.
+/// The CLI names the variable whenever it is set, so a user can tell it was
+/// read -- this alone does not prove alignment was actually skipped.
+///
+/// The announcement now fires unconditionally as the first thing
+/// `prepare_llamacpp_backend_for_active_rocm` does when the variable is set,
+/// before any of the not-Linux/no-SDK-version/unreadable-pin/pin-matches
+/// skips run, so it can no longer distinguish "the opt-out was honoured"
+/// from "the variable was set and alignment ran anyway". That guarantee is
+/// proven elsewhere: `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
+/// (the crate's own unit test, gating the state machine on every lane) and
+/// the sibling `the packaged pin survives the install` step below (its
+/// `Aligned …` / `could not align …` absence checks, run on the gated e2e
+/// lane).
 #[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
 async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.as_deref().expect("no install stderr");
