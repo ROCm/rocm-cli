@@ -191,6 +191,24 @@ async fn user_hit_vllm_oom(world: &mut E2eWorld) {
     );
 }
 
+/// The separator is `ESC E` (`NEL`), deliberately, not `\n` or `\r`. Both of
+/// those were already split on by the time this scenario was written; `NEL` is
+/// what a `rich`/curses progress UI emits to advance a line, and it is what the
+/// two-character allowlist did not cover. The anchor (`vllm`) and the OOM are on
+/// different rendered lines, so no part of this paste is a vLLM fault.
+#[given(
+    "a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines"
+)]
+async fn user_pasted_a_capture_with_a_foreign_oom(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "Downloading shards:  10%\u{1b}Evllm serve starting up\u{1b}E\
+         Downloading shards:  90%\u{1b}E\
+         llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+         Tried to allocate 7.21 GiB.\u{1b}E"
+            .to_string(),
+    );
+}
+
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
@@ -514,6 +532,26 @@ fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_j
             })
         })
         .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"))
+}
+
+#[then("no vLLM startup OOM is reported")]
+async fn assert_no_vllm_oom_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    let matched = report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("report must carry a `matched` array:\n{output}"));
+    assert!(
+        !matched.iter().any(|diagnosis| {
+            diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+        }),
+        "another engine's OOM must not be attributed to vLLM:\n{output}"
+    );
 }
 
 #[then("the diagnosis identifies the vLLM startup OOM")]

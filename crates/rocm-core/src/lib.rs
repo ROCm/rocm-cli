@@ -34,6 +34,7 @@ pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
+pub mod terminal;
 pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,

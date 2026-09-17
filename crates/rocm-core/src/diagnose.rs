@@ -1503,22 +1503,48 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
 /// anchor and the error on one line by construction.
 ///
-/// The split is on `\r` as well as `\n`, not `str::lines()`. `lines()` treats a
-/// lone `\r` as ordinary text, and a bare CR is what every progress bar in this
-/// ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw terminal
-/// capture pasted into `rocm diagnose --symptom '...'` therefore collapses into
-/// one giant "line", the anchor matches anywhere in it, and every keyword in the
-/// paste scores -- which is exactly the whole-paste scoring this function exists
-/// to prevent, reinstated by one byte
-/// (`a_bare_carriage_return_is_a_line_boundary_not_scoreable_text`). Splitting on
-/// both makes the line boundary the one the terminal actually renders. `\r\n`
-/// yields an empty segment, which carries no anchor and is dropped.
+/// The split is [`crate::terminal::rendered_lines`], not `str::lines()` and not
+/// a set of separator characters. `lines()` splits on `\n` and `\r\n` only, so a
+/// lone `\r` was ordinary text to it — and a bare CR is what every progress bar
+/// in this ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw
+/// terminal capture pasted into `rocm diagnose --symptom '...'` therefore
+/// collapsed into one giant "line", the anchor matched somewhere in it, and
+/// every keyword in the paste scored — exactly the whole-paste scoring this
+/// function exists to prevent, reinstated by one byte
+/// (`any_line_advance_is_a_boundary_not_scoreable_text`).
+///
+/// Adding `\r` to the split fixed that one byte and nothing else, because a
+/// two-character allowlist is not the boundary a terminal renders. Every other
+/// way of starting a new line — `ESC E` (`NEL`), `ESC D` (`IND`), `CSI n B`
+/// (`CUD`), which are terminfo's `nel`/`ind`/`cud1` and ordinary output from
+/// curses- and `rich`-style progress UIs — collapsed the paste just as
+/// completely, as did `\x0b`, `\x0c`, `\u{85}`, `U+2028`/`U+2029` and any stray
+/// control byte. Each one scored a `llama.cpp` OOM at 95 against a `vllm` anchor
+/// from a different rendered line, past a `HIGH_CONFIDENCE` threshold of 75, and
+/// cited the other engine's tokens as its evidence.
+///
+/// What this is *not* is a terminal emulator; see
+/// [`crate::terminal::rendered_lines`] for the contract. It is a one-sided
+/// guarantee — two things drawn on different rows are never scored as one line,
+/// while one row may come back split — and the residual is exactly that second
+/// half: a capture whose cursor addressing this does not model loses a diagnosis
+/// rather than inventing one, and the canonical-symptom fallback already covers
+/// that. The misattribution is the failure mode with a user-visible cost, and it
+/// is the one closed here.
+///
+/// Sharing that walk with the vLLM engine's sanitizer is also what keeps the
+/// `SGR` exception right. A colourised logger emits `ESC [ 31 m` *inside* a
+/// line, so a splitter that treats every escape as a boundary cuts a genuine
+/// `vllm: ... torch.OutOfMemoryError` between its anchor and its error token and
+/// silently stops diagnosing it (measured: 95 → 0).
+///
+/// `\r\n` yields an empty segment, which carries no anchor and is dropped.
 fn vllm_anchored_lines(symptom: &str) -> String {
     let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
         return String::new();
     };
-    symptom
-        .split(['\n', '\r'])
+    crate::terminal::rendered_lines(symptom)
+        .into_iter()
         .filter(|line| anchor.is_match(&line.to_lowercase()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -4152,54 +4178,115 @@ mod tests {
         assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
     }
 
-    #[test]
-    fn a_bare_carriage_return_is_a_line_boundary_not_scoreable_text() {
-        // Regression: the anchored-lines filter used `str::lines()`, which
-        // splits only on `\n` and `\r\n` -- a lone `\r` is ordinary text to it.
-        // Every progress bar in this ecosystem (tqdm, pip, huggingface)
-        // repaints with a bare CR, and a pasted terminal capture is the
-        // expected way to use `--symptom`, so the whole capture collapsed into
-        // one "line": the vLLM anchor matched somewhere in it and another
-        // framework's OOM elsewhere in it scored at full weight. That is
-        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
-        // one byte, and neither existing guard saw it because both use
-        // `\n`-only fixtures.
-        let capture = "Downloading shards:  10%\rvllm serve starting up\r\
-                       Downloading shards:  90%\r\
-                       llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
-                       Tried to allocate 7.21 GiB.\n";
-        let report = diagnose(&linux_base(), capture);
-        assert!(
-            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
-            "a CR-separated llama.cpp OOM must not be attributed to vLLM: {:?}",
-            report.matched
-        );
-
-        // The same content with `\n` in place of `\r` is the already-covered
-        // shape; pinning both together is what makes the CR case a boundary
-        // question rather than a scoring question.
-        let newline_form = capture.replace('\r', "\n");
-        assert!(
-            diagnose(&linux_base(), &newline_form)
-                .matched
-                .iter()
-                .all(|d| d.id != "fix-16-vllm-oom"),
-            "the `\\n` form of the same capture must not match either"
-        );
-
-        // The control: a CR-separated capture whose *anchored* segment carries
-        // the OOM must still match, so splitting on CR did not simply blind the
-        // checker to carriage-returned input.
-        let anchored = diagnose(
-            &linux_base(),
-            "Downloading shards:  90%\rvllm: torch.OutOfMemoryError: HIP out of memory\r",
-        );
-        let oom = anchored
+    /// The `fix-16-vllm-oom` score for `symptom`, or 0 when it did not match.
+    fn vllm_oom_score(symptom: &str) -> i32 {
+        diagnose(&linux_base(), symptom)
             .matched
             .iter()
             .find(|d| d.id == "fix-16-vllm-oom")
-            .expect("an anchored OOM segment must still match across CRs");
-        assert!(oom.score >= MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+            .map_or(0, |d| d.score)
+    }
+
+    #[test]
+    fn any_line_advance_is_a_boundary_not_scoreable_text() {
+        // Regression, in two rounds.
+        //
+        // The filter first used `str::lines()`, which splits on `\n` and `\r\n`
+        // only -- a lone `\r` is ordinary text to it. Every progress bar in this
+        // ecosystem (tqdm, pip, huggingface) repaints with a bare CR, and a
+        // pasted terminal capture is the expected way to use `--symptom`, so the
+        // whole capture collapsed into one "line": the vLLM anchor matched
+        // somewhere in it and another framework's OOM elsewhere in it scored at
+        // full weight. That is
+        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
+        // one byte, and neither existing guard saw it because both use `\n`-only
+        // fixtures.
+        //
+        // Adding `\r` to the split fixed that byte and left the hole open for
+        // every other one. Measured on the round that did so: each separator
+        // below put the anchor and a llama.cpp OOM on genuinely separate
+        // rendered lines, and each scored 95 -- past a HIGH_CONFIDENCE of 75,
+        // citing the llama.cpp line's tokens as the evidence for a vLLM verdict.
+        // Hence a table rather than one test per byte: the property is "a line
+        // advance is a line advance", and enumerating it is what stops the next
+        // separator from reopening this.
+        for (label, sep) in [
+            ("LF", "\n"),
+            ("CR", "\r"),
+            ("CRLF", "\r\n"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("ESC D (IND)", "\u{1b}D"),
+            ("CSI 1 B (CUD)", "\u{1b}[1B"),
+            ("CSI H (CUP)", "\u{1b}[2;1H"),
+            ("VT", "\u{b}"),
+            ("FF", "\u{c}"),
+            ("C1 NEL", "\u{85}"),
+            ("U+2028 LINE SEPARATOR", "\u{2028}"),
+            ("U+2029 PARAGRAPH SEPARATOR", "\u{2029}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  10%{sep}vllm serve starting up{sep}\
+                 Downloading shards:  90%{sep}\
+                 llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+                 Tried to allocate 7.21 GiB.{sep}"
+            );
+            assert_eq!(
+                vllm_oom_score(&capture),
+                0,
+                "a {label}-separated llama.cpp OOM must not be attributed to vLLM"
+            );
+        }
+
+        // The control, per separator: a capture whose *anchored* segment carries
+        // the OOM must still match, so the boundary set did not simply blind the
+        // checker to every capture that contains one.
+        for (label, sep) in [
+            ("CR", "\r"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("VT", "\u{b}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  90%{sep}\
+                 vllm: torch.OutOfMemoryError: HIP out of memory{sep}"
+            );
+            let score = vllm_oom_score(&capture);
+            assert!(
+                score >= MIN_SCORE_FOR_MATCH,
+                "an anchored OOM segment must still match across {label}: score was {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_codes_inside_a_line_do_not_split_a_genuine_vllm_oom() {
+        // The other half of the boundary question, and the reason this is a
+        // grammar walk and not `char::is_control()`. A colourised logger emits
+        // SGR *inside* a line -- level name in colour, message plain -- so a
+        // splitter that treats every escape, or every control character, as a
+        // boundary cuts a real `vllm: ... torch.OutOfMemoryError` between its
+        // anchor and its error token. Measured on the one-line
+        // `is_control()`-split candidate: this case went from 95 to 0, trading
+        // the false positive above for a silent miss on the most ordinary real
+        // input there is.
+        let plain = "vllm: torch.OutOfMemoryError: HIP out of memory";
+        let coloured =
+            "\u{1b}[31mvllm: \u{1b}[1mtorch.OutOfMemoryError: HIP out of memory\u{1b}[0m";
+        assert_eq!(
+            vllm_oom_score(coloured),
+            vllm_oom_score(plain),
+            "SGR inside a line must not change the verdict"
+        );
+        let score = vllm_oom_score(coloured);
+        assert!(score >= HIGH_CONFIDENCE, "score was {score}");
+
+        // And the same line after a progress-bar repaint, which is how it
+        // actually arrives: the CR is a boundary, the SGR around it is not.
+        assert!(
+            vllm_oom_score(&format!("Loading:  90%\r{coloured}\n")) >= HIGH_CONFIDENCE,
+            "a colourised OOM after a CR repaint must still match"
+        );
     }
 
     #[test]
