@@ -460,13 +460,25 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         // A manager's job console is showing a still-running job — Esc fully
         // closes the overlay there (the job keeps running in the background),
         // matching the console's own footer hint ("Esc close (keeps
-        // running)"), not the generic sub-popup "cancel" below. Once the job
-        // finishes, `on_console_key` only dismisses the console back to the
-        // screen body (the overlay stays open), so that case falls through to
-        // the "cancel" arm below, which already describes it correctly. Shares
+        // running)"), not the generic sub-popup "cancel" below. Shares
         // `console_esc_closes` with `on_console_key` so the two can't drift.
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" close  "));
+    } else if state.has_open_overlay()
+        && state
+            .active_job_id()
+            .is_some_and(|id| !crate::ui::job_console::console_esc_closes(state.jobs.job(id)))
+    {
+        // The job console is showing a finished (or vanished) job —
+        // `on_console_key` only dismisses the console back to the screen body
+        // (the overlay itself stays open); nothing is left to cancel,
+        // matching the console's own reworded footer hint ("Enter/Esc
+        // dismiss", see `job_console::draw`). This must not fall through to
+        // the generic sub-popup "cancel" arm below, which would otherwise
+        // contradict that hint. Shares `console_esc_closes` with
+        // `on_console_key` (via negation) so the two can't drift.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" dismiss  "));
     } else if state.has_open_overlay() {
         // A manager is open but not at its root layer (sub-popup, picker, or
         // approval) — Esc is handled by that layer's own event-loop arm, not
@@ -821,13 +833,15 @@ mod tests {
     }
 
     #[test]
-    fn footer_esc_chip_labels_cancel_when_job_console_shows_a_finished_job() {
+    fn footer_esc_chip_labels_dismiss_when_job_console_shows_a_finished_job() {
         // Once the job console's job has finished, Esc only dismisses the
         // console back to the screen body (the overlay itself stays open) —
         // `on_console_key` never returns `Closed` for a terminal job. The
-        // footer chip must not claim "close" here; it falls through to the
-        // generic sub-popup "cancel" label, which already describes this
-        // case correctly.
+        // footer chip must not claim "close" here, and must not fall through
+        // to the generic sub-popup "cancel" label either — that would
+        // contradict the console's own reworded footer hint ("Enter/Esc
+        // dismiss", see `job_console::draw`). It gets a dedicated "dismiss"
+        // label instead.
         use crate::ui::theme::Theme;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -863,8 +877,8 @@ mod tests {
             .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
             .collect();
         assert!(
-            row.contains("Esc  cancel"),
-            "finished-job console Esc chip should say cancel: {row:?}"
+            row.contains("Esc  dismiss"),
+            "finished-job console Esc chip should say dismiss: {row:?}"
         );
         // Note: "close" legitimately appears elsewhere in this row (the `q`
         // chip always says "close" while any overlay is open — see
@@ -874,6 +888,10 @@ mod tests {
         assert!(
             !row.contains("Esc  close"),
             "finished-job console Esc chip should not say close: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  cancel"),
+            "finished-job console Esc chip should not say cancel: {row:?}"
         );
     }
 
