@@ -680,26 +680,30 @@ jobs:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
 
-  # WSL2 coverage on real hardware: the runner is an Ubuntu distro running under
-  # WSL2 on the Strix Halo Windows box, so this lane exercises the WSL host
-  # boundary AND whatever GPU access WSL exposes. Same suite as every other
-  # platform — scenarios the host cannot satisfy resolve to skip from the
-  # capability probe, so nothing is filtered out here. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner. Non-blocking while
-  # GPU-on-WSL is proven out.
+  # WSL2 coverage on real hardware: an Ubuntu-24.04 distro installed fresh
+  # inside WSL2 on a DevLab Dispatch pool Windows host — the SAME pool
+  # `e2e-gpu-strix-windows` already uses, not a separate `wsl`-labeled runner.
+  # #377 kept this lane on a static host because a `wsl`-labeled dispatch to
+  # the pool sat queued with zero pickup; #387's spike then proved the pool's
+  # plain Windows hosts support WSL2 installed on demand (no reboot needed, no
+  # Session 0 blocking, `/dev/dxg` present). The pool maintainer confirmed:
+  # WSL2 works on these hosts; pin `--id Microsoft.WSL` in the install step so
+  # a failed install can't report green; expect ~5min/job for distro install
+  # since distros are unregistered between jobs by design; static TA runners
+  # are not needed for WSL coverage. Same suite as every other platform —
+  # scenarios the host cannot satisfy resolve to skip from the capability
+  # probe, so nothing is filtered out here.
   e2e-wsl:
     name: E2E tests (Strix Halo, WSL2)
-    # A manual include_nightly dispatch runs the 2400s large-model readiness
-    # scenario, so match the dedicated nightly lane's cap and leave room for
-    # build, runtime pre-warm, the rest of the suite, and platform.json.
-    timeout-minutes: 90
-    # Tried devlab-dispatch here too (2026-09-10): a scoped dispatch sat queued
-    # for 3.5min+ with zero pickup, vs. ~85s for both the Ubuntu and Windows
-    # lanes on the same pool — no pool runner carries `wsl`. This lane isn't
-    # really "Strix Halo hardware," it's a WSL2 guest inside a specific
-    # pre-configured Windows box, which the pool doesn't appear to provide.
-    # Stays on the static runner until/unless that changes.
-    runs-on: [self-hosted, linux, strix-halo, wsl]
+    # 120min: like the native pool lanes, every job here is cold (fresh distro,
+    # fresh build, fresh prewarm) — plus the ~5min/job distro-install overhead
+    # the pool maintainer flagged. Conservative starting budget; tune down once
+    # a real dispatch shows the actual wall-clock, the same way
+    # e2e-gpu-strix-ubuntu's cap was set from a measured run rather than
+    # guessed up front. A manual include_nightly dispatch's 2400s large-model
+    # scenario still fits inside this.
+    timeout-minutes: 120
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
     # `serve` like the sibling lanes rather than the broader `heavy`: the
@@ -716,6 +720,11 @@ jobs:
       )
     continue-on-error: false
     env:
+      # wsl.exe emits UTF-16 by default; without this its own error/status text
+      # comes back mangled ("T h e   f i l e   c a n n o t ...") when captured
+      # through PowerShell, which is exactly what a genuine wsl.exe error looks
+      # like without it. Matches the ubuntu/WSL composite action's own env.
+      WSL_UTF8: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
       # WSL2's virtualization overhead can make a TUI frame that renders well
       # inside the 30s default on native hardware miss it here. Raise the wait
@@ -730,10 +739,80 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Fail fast and loudly if this job ever lands on a native Linux runner:
-      # every WSL-tagged scenario would silently resolve to skip instead.
-      - name: Verify the host really is WSL2
+      # `--id Microsoft.WSL --exact`, not the fuzzy `--name` match the
+      # `ubuntu/WSL` composite action's own install step uses (with its own
+      # `continue-on-error: true`) — that combination is exactly the "green
+      # over a failing step" the pool maintainer flagged. No
+      # continue-on-error here: a real install failure must fail this step —
+      # except winget's own well-known quirk where `install` on an
+      # already-installed-and-up-to-date package auto-retries as an upgrade
+      # and returns APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
+      # (0x8A15002B) instead of success (observed on run 34829625888, where
+      # the pool image already carries Microsoft.WSL). That specific code
+      # means "already present," which is exactly what this step wants; any
+      # other non-zero code still fails it.
+      - name: Install WSL (pinned Microsoft.WSL)
+        shell: powershell
         run: |
+          winget install --id Microsoft.WSL --exact --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+            Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          # GitHub's own PowerShell step wrapper fails the step on ANY non-zero
+          # $LASTEXITCODE left over at script end, regardless of whether our
+          # own `if` above already decided to tolerate it (observed on run
+          # 34831206409: the already-installed code above was correctly
+          # skipped, and the step still failed). Force it back to zero.
+          exit 0
+
+      - name: Install Ubuntu-24.04 distro
+        shell: powershell
+        run: |
+          # Best-effort: the pool already unregisters distros between jobs by
+          # design (confirmed by its maintainer), but a stale registration
+          # left by an image bake or a future policy change should not block
+          # a fresh install. `--shutdown` first, matching the ubuntu/WSL
+          # composite action: unregistering without it can hit wsl.exe's
+          # "the file cannot be accessed by the system" against a VM that is
+          # still mid-startup (observed on run 34829015535).
+          #
+          # `--shutdown` tears down every WSL VM on the host, not just this
+          # job's -- safe only because the pool hands out one fresh, exclusive
+          # host per job (see "a fresh runner is registered per job" in
+          # docs/ci-hardware-testing.md). If the pool ever starts packing
+          # concurrent jobs onto a shared host, this needs to scope down to
+          # `wsl --terminate Ubuntu-24.04` instead.
+          wsl --shutdown
+          wsl --unregister Ubuntu-24.04 2>$null | Out-Null
+          wsl --install Ubuntu-24.04 --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::wsl --install Ubuntu-24.04 failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          wsl -d Ubuntu-24.04 -u root -- echo ok
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::distro did not come up after install"
+            exit $LASTEXITCODE
+          }
+
+      # Fail fast and loudly if this job ever lands on a native Linux runner
+      # (or the distro above never really came up): every WSL-tagged scenario
+      # would silently resolve to skip instead. Bash body executed inside the
+      # guest via stdin — `bash -eo pipefail` mirrors the `-eo pipefail`
+      # GitHub's own default bash shell applies to a plain `run:` step, since
+      # invoking through `wsl.exe` opts out of that default.
+      - name: Verify the host really is WSL2
+        shell: powershell
+        run: |
+          # Windows PowerShell prepends a UTF-8 BOM when piping a string to a
+          # native process's stdin by default, which lands as the first bytes
+          # bash reads — breaking `proc_version=...`'s assignment syntax and
+          # making bash treat the whole line as a (nonexistent) command
+          # (observed on run 34832369689's re-run). BOM-less UTF8 fixes it.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          @'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
             && [ -z "${WSL_DISTRO_NAME+x}" ] \
@@ -742,48 +821,88 @@ jobs:
             exit 1
           fi
           printf 'WSL kernel: %s\n' "$(uname -r)"
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The native Strix runners come pre-provisioned; a WSL distro often does
-      # not. Install the native build deps only when something is missing, and
-      # only if passwordless sudo is available — otherwise say what is missing
-      # instead of hanging on a password prompt.
+      # A freshly installed distro has none of this; install unconditionally
+      # (idempotent) rather than gating on passwordless sudo like the old
+      # static-host step did — this guest always runs as root. `sudo` itself
+      # is included because scripts/wsl_setup_rocdxg.sh hard-requires the
+      # binary to exist even when the caller is already root.
       - name: Ensure native build deps
+        shell: powershell
         run: |
-          missing=""
-          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
-          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
-          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
-          if [ -z "$missing" ]; then
-            echo "native build deps present"
-          elif sudo -n true 2>/dev/null; then
-            echo "installing:$missing"
-            sudo -n apt-get update
-            # shellcheck disable=SC2086
-            sudo -n apt-get install -y $missing
-          else
-            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
-            exit 1
-          fi
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          @'
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config build-essential libcap-dev git ca-certificates curl sudo
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Reclaim GPU from stray E2E processes
+      # Building against the /mnt/<drive> DrvFs mount directly is a well-known
+      # major slowdown for compilation workloads under WSL2; clone the exact
+      # checked-out commit into the guest's native ext4 filesystem so cargo
+      # isn't paying that tax for the whole suite.
+      - name: Clone checkout into the WSL guest's native filesystem
+        shell: powershell
         run: |
-          # Reclaim from any serve leaked by a killed/timed-out prior run
-          # (see e2e-gpu). Scoped to e2e leftovers only.
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          $script = @"
+          set -eo pipefail
+          rm -rf /root/work
+          mkdir -p /root/work
+          git clone --local '$winPath' /root/work/rocm-cli
+          cd /root/work/rocm-cli
+          git checkout --quiet '$sha'
+          "@
+          $script | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # librocdxg is not part of a bare Ubuntu-24.04 image, so it needs
+      # installing every job (the per-job distro install is the ~5min/job cost
+      # the pool maintainer flagged — see the job header above; this step is
+      # not that estimate, just one of the things a freshly installed distro
+      # needs). Advisory, like the GPU preflight below — a distro without
+      # working passthrough still runs the non-GPU suite, the capability
+      # probe's `driver_status` check resolves @requires-gpu scenarios to skip
+      # rather than failing them on a premise the host can't meet.
+      - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
+        shell: powershell
+        run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          @'
+          set -eo pipefail
+          cd /root/work/rocm-cli
+          if bash scripts/wsl_setup_rocdxg.sh; then
+            echo "librocdxg installed"
+          else
+            echo "::warning::librocdxg install failed or was skipped -- @requires-gpu scenarios will resolve to skip"
+          fi
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
       # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results.
+      # that would corrupt the serve scenarios' results. `rocm-smi` itself isn't
+      # installed by any step above (the maintainer's ask covered `/dev/dxg` +
+      # `librocdxg.so`, not a full ROCm apt stack), so this step is expected to
+      # warn-and-skip rather than report a real reading — a deliberate scope
+      # cut, not an oversight.
       - name: GPU preflight (advisory bounded wait)
+        shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          @'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
@@ -815,28 +934,60 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
+          # No `-eo pipefail` here, unlike its siblings: this script's own
+          # empty-value guard above (`[ -z "$total" ] || [ -z "$used" ]`)
+          # relies on a non-matching `grep` in the pipeline being tolerated
+          # rather than aborting the script, so `rocm-smi` output this parser
+          # doesn't recognize retries instead of hard-failing the step.
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
-      # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
-      # the exact toolchain, installed on first cargo use. Idempotent.
+      # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile.
+      # rust-toolchain.toml pins the exact toolchain, installed on first cargo
+      # use. Idempotent. Every later step that needs cargo puts
+      # $HOME/.cargo/bin on PATH itself — each `wsl.exe` invocation is a fresh
+      # non-login shell, so a PATH change here would not carry over anyway,
+      # and --no-modify-path deliberately skips profile-file mutation.
       - name: Ensure Rust toolchain
+        shell: powershell
         run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          @'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run E2E tests on Strix Halo WSL2
+        shell: powershell
         run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
+          # does not share the calling process's environment unless a
+          # variable is named in WSLENV.
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE'
+          @'
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd /root/work/rocm-cli
+
+          # No RUNNER_WORKSPACE inside a WSL guest; use a sibling scratch dir
+          # under the same /root/work parent as the checkout, same role the
+          # real RUNNER_WORKSPACE plays for the native lanes. This lane is
+          # cold every job regardless (the distro itself is destroyed after),
+          # matching how the native pool lanes already treat RUNNER_WORKSPACE
+          # as fresh per job.
+          export CARGO_TARGET_DIR="/root/work/e2e-target"
+          export E2E_SHARED_CACHE_DIR="/root/work/e2e-shared"
           # Share ONE installed managed runtime across serve/chat scenarios and
           # PRE-WARM it in place (mirrors e2e-gpu-strix-ubuntu). Required for
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="/root/work/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build the rocm and rocmd binaries once; reuse them for pre-warm + suite.
@@ -861,6 +1012,37 @@ jobs:
           else
             cargo xtask e2e
           fi
+          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # actions/upload-artifact runs on the Windows host, not inside the WSL
+      # guest, so the results need copying out first. Best-effort: `if:
+      # always()` so a failed suite above still gets its partial results
+      # copied for the upload step to publish.
+      - name: Copy E2E results out of the WSL guest
+        if: always()
+        shell: powershell
+        run: |
+          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          @"
+          mkdir -p '$winPath/tests/e2e-cucumber/results'
+          if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then
+            cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
+          fi
+          "@ | wsl -d Ubuntu-24.04 -u root -- bash
+          # Best-effort per the step name: an earlier failure (e.g. the distro
+          # itself never came up) already failed the job through its own step,
+          # so this one must not also report red on the resulting "no such
+          # distribution" from the commands above. Still warn so a copy that
+          # failed for its own reason isn't silently indistinguishable from a
+          # clean run with an empty results dir -- the upload step below only
+          # catches that downstream, as a missing artifact.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::copy-out of E2E results exited $LASTEXITCODE (best-effort, not fatal)"
+          }
+          exit 0
 
       - name: Upload E2E report
         if: always()
@@ -868,6 +1050,17 @@ jobs:
         with:
           name: e2e-gpu-strix-wsl-report
           path: tests/e2e-cucumber/results/
+          # The copy-out step above is deliberately best-effort (it must not
+          # report red just because an earlier step already failed the job),
+          # so this is the only place left to catch a copy that failed for its
+          # own reason: default `warn` would upload nothing, and the
+          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
+          # omits any platform with no report.json rather than flagging it, so
+          # the lane would silently vanish from the report instead of showing
+          # as a failure. Only the WSL lanes need this: every other lane
+          # writes report.json directly in-job, with no extra guest-to-host
+          # copy step that can fail on its own.
+          if-no-files-found: error
 
   # Third AMD GPU target: the rad3 cluster's Radeon AI PRO R9700S (gfx1201, 32GB),
   # targeted by the `r9700` label. This runner is a KEDA-scaled pod (0<->1 off the
