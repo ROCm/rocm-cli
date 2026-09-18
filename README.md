@@ -502,7 +502,22 @@ rocm services list [--all]
 rocm services logs <service-id>
 rocm services stop <service-id> [--yes]
 rocm services restart <service-id> [--yes]
+rocm services remove <service-id> --yes
+rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`remove` deletes one record that is no longer running, together with its log,
+its engine state file, and its endpoint key file; a running server is refused,
+so stop it first. `prune` does the same in bulk, always leaves running servers
+alone, and additionally clears leftover files whose record is already gone.
+Removal destroys both the log and the `restart` option for the records it
+takes, so `prune` only considers records untouched for 24 hours. Age is
+measured from when the record file was last written, so a stop, a restart, or a
+status correction all count as touching it. Pass `--older-than-hours <n>` for a
+different threshold, or `--any-age` to take every record that is not running
+however recent — that is the flag `prune` names in its own summary when it
+reports how many records it kept for being too recent. The two cannot be
+combined.
 
 ### Dashboard
 
