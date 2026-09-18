@@ -1106,66 +1106,57 @@ mod tests {
 
     #[test]
     fn activity_feed_glyphs_match_shared_job_status_glyphs() {
-        use rocm_dash_core::state::StateEvent;
+        // The previous version of this test only asserted that each glyph
+        // appeared *somewhere* in the whole rendered frame via
+        // `out.contains(glyph)`. That's satisfied by the glyph key line
+        // alone (which always renders all five glyphs), so it would still
+        // pass even if every activity row used the wrong glyph. Assert
+        // instead that each job's own row pairs the *correct* glyph
+        // immediately before its command name, mirroring
+        // `activity_feed_colors_match_shared_job_status_color`'s per-row
+        // approach below.
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("ok".into(), job("ok-job", JobStatus::Done { code: 0 }));
+        s.jobs
+            .jobs
+            .insert("warn".into(), job("warn-job", JobStatus::Done { code: 7 }));
+        s.jobs.jobs.insert(
+            "failed".into(),
+            job(
+                "failed-job",
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+            ),
+        );
+        s.jobs.jobs.insert(
+            "cancelled".into(),
+            job("cancelled-job", JobStatus::Cancelled),
+        );
+        s.jobs
+            .jobs
+            .insert("running".into(), job("running-job", JobStatus::Running));
 
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Home;
-        s.jobs.apply(StateEvent::StartJob {
-            id: "a".into(),
-            cmd: "ok".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::JobDone {
-            id: "a".into(),
-            code: 0,
-        });
-        s.jobs.apply(StateEvent::StartJob {
-            id: "b".into(),
-            cmd: "bad".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::JobDone {
-            id: "b".into(),
-            code: 1,
-        });
-        s.jobs.apply(StateEvent::StartJob {
-            id: "c".into(),
-            cmd: "cancelled".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::CancelJob("c".into()));
-        s.jobs.apply(StateEvent::StartJob {
-            id: "d".into(),
-            cmd: "running".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::StartJob {
-            id: "e".into(),
-            cmd: "failing".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::JobErr {
-            id: "e".into(),
-            message: "boom".into(),
-        });
-
-        // Assert against `JobStatus::glyph()` itself rather than hardcoded
-        // glyph characters, so this test can't drift from the shared source
-        // of truth it's meant to guard.
         let out = render(&s, 160, 30);
-        for status in [
-            JobStatus::Done { code: 0 },
-            JobStatus::Done { code: 1 },
-            JobStatus::Cancelled,
-            JobStatus::Running,
-            JobStatus::Failed {
-                message: "boom".into(),
-            },
+        for (name, status) in [
+            ("ok-job", JobStatus::Done { code: 0 }),
+            ("warn-job", JobStatus::Done { code: 7 }),
+            (
+                "failed-job",
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+            ),
+            ("cancelled-job", JobStatus::Cancelled),
+            ("running-job", JobStatus::Running),
         ] {
             let glyph = status.glyph();
+            let expected = format!("{glyph} {name}");
             assert!(
-                out.contains(glyph),
-                "glyph for {status:?} ({glyph:?}) missing: {out:?}"
+                out.contains(&expected),
+                "expected glyph {glyph:?} immediately before {name}'s row, got: {out:?}"
             );
         }
     }
