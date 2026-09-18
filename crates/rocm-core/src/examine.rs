@@ -1136,6 +1136,42 @@ fn extract_lspci_name(line: &str) -> String {
     trimmed.trim().to_owned()
 }
 
+/// `(gfx target, marketing name)` for every GPU agent in `rocminfo` output,
+/// in agent order. Only the first `Name:` after an `Agent` header is the
+/// agent's name: a GPU agent's ISA entries are further `Name:` lines
+/// (`amdgcn-amd-amdhsa--gfx1100`) and must not replace it.
+fn parse_rocminfo_gpu_agents(out: &str) -> Vec<(String, String)> {
+    let mut gfx_targets: Vec<(String, String)> = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_marketing = String::new();
+    let mut cur_is_gpu = false;
+    for line in out.lines() {
+        let s = line.trim();
+        if s.starts_with("Agent ") {
+            if cur_is_gpu && cur_name.starts_with("gfx") {
+                gfx_targets.push((cur_name.clone(), cur_marketing.clone()));
+            }
+            cur_name.clear();
+            cur_marketing.clear();
+            cur_is_gpu = false;
+        } else if let Some(rest) = s.strip_prefix("Name:") {
+            if cur_name.is_empty() {
+                cur_name = rest.trim().to_owned();
+            }
+        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
+            if cur_marketing.is_empty() {
+                cur_marketing = rest.trim().to_owned();
+            }
+        } else if let Some(rest) = s.strip_prefix("Device Type:") {
+            cur_is_gpu = rest.contains("GPU");
+        }
+    }
+    if cur_is_gpu && cur_name.starts_with("gfx") {
+        gfx_targets.push((cur_name, cur_marketing));
+    }
+    gfx_targets
+}
+
 fn probe_gpus_rocminfo(e: &mut Examination) {
     if !which("rocminfo") {
         e.rocminfo_present = false;
@@ -1158,30 +1194,14 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
     }
     e.rocminfo_status = "ok".to_owned();
 
-    let mut gfx_targets: Vec<(String, String)> = Vec::new();
-    let mut cur_name = String::new();
-    let mut cur_marketing = String::new();
-    let mut cur_is_gpu = false;
-    for line in out.lines() {
-        let s = line.trim();
-        if s.starts_with("Agent ") {
-            if cur_is_gpu && cur_name.starts_with("gfx") {
-                gfx_targets.push((cur_name.clone(), cur_marketing.clone()));
-            }
-            cur_name.clear();
-            cur_marketing.clear();
-            cur_is_gpu = false;
-        } else if let Some(rest) = s.strip_prefix("Name:") {
-            cur_name = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
-            cur_marketing = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Device Type:") {
-            cur_is_gpu = rest.contains("GPU");
-        }
-    }
-    if cur_is_gpu && cur_name.starts_with("gfx") {
-        gfx_targets.push((cur_name, cur_marketing));
-    }
+    apply_rocminfo_gpu_agents(e, parse_rocminfo_gpu_agents(&out));
+}
+
+/// Map rocminfo's GPU agents onto the AMD GPUs `lspci` found, in order, and
+/// append any beyond that list as GPUs of their own. rocminfo is authoritative
+/// for `gfx_target`; `is_apu` is filled from the target's family only where no
+/// verdict exists yet, since the family table does not list every integrated part.
+fn apply_rocminfo_gpu_agents(e: &mut Examination, gfx_targets: Vec<(String, String)>) {
     if gfx_targets.is_empty() {
         return;
     }
@@ -1200,7 +1220,9 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
             if !marketing.is_empty() && gpu.name.is_empty() {
                 gpu.name = marketing;
             }
-            gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+            if gpu.is_apu.is_none() {
+                gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+            }
         } else {
             let is_apu = gfx_is_apu_family(&gfx);
             e.gpus.push(Gpu {
@@ -2917,6 +2939,168 @@ mod tests {
         assert_eq!((r, w), (Some(true), Some(true)));
         let (r, w) = mode_access("crw-rw----", "root", "render", "alice", &[]);
         assert_eq!((r, w), (Some(false), Some(false)));
+    }
+
+    /// Verbatim `rocminfo` shape: a GPU agent's ISAs follow as further `Name:` lines.
+    const ROCMINFO_APU_PLUS_DGPU: &str = "\
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 5 7500X3D 6-Core Processor
+  Uuid:                    CPU-XX
+  Marketing Name:          AMD Ryzen 5 7500X3D 6-Core Processor
+  Vendor Name:             CPU
+  Device Type:             CPU
+*******
+Agent 2
+*******
+  Name:                    gfx1100
+  Uuid:                    GPU-XX
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Vendor Name:             AMD
+  Device Type:             GPU
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1100
+      Machine Models:          HSA_MACHINE_MODEL_LARGE
+    ISA 2
+      Name:                    amdgcn-amd-amdhsa--gfx11-generic
+*******
+Agent 3
+*******
+  Name:                    gfx1036
+  Marketing Name:          AMD Ryzen 5 7500X3D 6-Core Processor
+  Vendor Name:             AMD
+  Device Type:             GPU
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1036
+    ISA 2
+      Name:                    amdgcn-amd-amdhsa--gfx10-3-generic
+*** Done ***
+";
+
+    #[test]
+    fn rocminfo_gpu_agents_survive_isa_name_lines() {
+        // #393: the ISA `Name:` lines used to overwrite the agent name and every GPU was dropped.
+        let agents = parse_rocminfo_gpu_agents(ROCMINFO_APU_PLUS_DGPU);
+        assert_eq!(
+            agents,
+            vec![
+                ("gfx1100".to_owned(), "AMD Radeon RX 7900 XT".to_owned()),
+                (
+                    "gfx1036".to_owned(),
+                    "AMD Ryzen 5 7500X3D 6-Core Processor".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rocminfo_last_agent_is_committed_at_end_of_input() {
+        // No following `Agent` header: the end-of-input commit must survive the ISA lines too.
+        let out = "\
+Agent 1
+  Name:                    gfx1100
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Device Type:             GPU
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1100
+";
+        assert_eq!(
+            parse_rocminfo_gpu_agents(out),
+            vec![("gfx1100".to_owned(), "AMD Radeon RX 7900 XT".to_owned())]
+        );
+    }
+
+    #[test]
+    fn rocminfo_cpu_only_host_yields_no_targets() {
+        let out = "\
+Agent 1
+  Name:                    AMD EPYC 9654 96-Core Processor
+  Marketing Name:          AMD EPYC 9654 96-Core Processor
+  Device Type:             CPU
+*** Done ***
+";
+        assert!(parse_rocminfo_gpu_agents(out).is_empty());
+    }
+
+    #[test]
+    fn rocminfo_agents_without_isa_lines_still_parse() {
+        // The shape the parser was written against: no nested ISA block.
+        let out = "\
+Agent 1
+  Name:                    AMD Ryzen 9 7950X 16-Core Processor
+  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx942
+  Marketing Name:          AMD Instinct MI300X
+  Device Type:             GPU
+Agent 3
+  Name:                    gfx942
+  Marketing Name:          AMD Instinct MI300X
+  Device Type:             GPU
+";
+        assert_eq!(
+            parse_rocminfo_gpu_agents(out),
+            vec![
+                ("gfx942".to_owned(), "AMD Instinct MI300X".to_owned()),
+                ("gfx942".to_owned(), "AMD Instinct MI300X".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rocminfo_targets_fill_lspci_gpus_without_changing_their_apu_verdict() {
+        // lspci already called Raphael an APU; the family table does not list gfx1036,
+        // so rocminfo must supply the target without overriding that verdict.
+        let mut e = Examination {
+            gpus: vec![
+                Gpu {
+                    name: "Navi 31 [Radeon RX 7900 XT]".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "Raphael".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(&mut e, parse_rocminfo_gpu_agents(ROCMINFO_APU_PLUS_DGPU));
+        assert_eq!(e.gpus[0].gfx_target, "gfx1100");
+        assert_eq!(e.gpus[0].is_apu, Some(false));
+        assert_eq!(e.gpus[1].gfx_target, "gfx1036");
+        assert_eq!(
+            e.gpus[1].is_apu,
+            Some(true),
+            "lspci's APU verdict must survive"
+        );
+        assert_eq!(
+            e.gpus.len(),
+            2,
+            "no extra GPUs appended when lspci listed both"
+        );
+    }
+
+    #[test]
+    fn rocminfo_agents_beyond_lspci_are_appended_with_a_family_verdict() {
+        // Without an lspci entry to fill, the agent becomes a GPU of its own and
+        // the family table decides `is_apu`.
+        let mut e = Examination::default();
+        apply_rocminfo_gpu_agents(&mut e, parse_rocminfo_gpu_agents(ROCMINFO_APU_PLUS_DGPU));
+        assert_eq!(e.gpus.len(), 2);
+        assert_eq!(e.gpus[0].gfx_target, "gfx1100");
+        assert_eq!(e.gpus[0].name, "AMD Radeon RX 7900 XT");
+        assert_eq!(e.gpus[0].is_apu, Some(false));
+        assert!(e.gpus[0].is_amd);
+        assert_eq!(e.gpus[1].gfx_target, "gfx1036");
     }
 
     #[test]
