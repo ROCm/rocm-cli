@@ -1582,7 +1582,18 @@ fn runtime_library_path_env(
     }
     let mut entries = library_paths.to_vec();
     if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
-        entries.extend(std::env::split_paths(&existing));
+        // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
+        // trims, drops empty entries and host-normalises each one, on top of the
+        // same quoting rules `split_paths` applies. The sibling composition in
+        // `probe_runtime_devices` (`apps/rocm/src/therock.rs`, a different crate)
+        // already uses it, and the two building the same variable differently is
+        // how they drift.
+        //
+        // The quoting is what keeps the `join_paths` below on its `Ok` arm: this
+        // variable is `PATH` on Windows, a quoted entry anywhere in the inherited
+        // one is legal, and a splitter that left the `"` in place would fail the
+        // join and cost the interpreter every library path rather than one.
+        entries.extend(crate::runtime_path_list_split(&existing));
     }
     match std::env::join_paths(entries) {
         Ok(joined) => vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)],
@@ -2066,6 +2077,53 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that read or replace the process-global
+    /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
+    /// thread, so a test that sets it and one that composes a child env from it
+    /// can otherwise see each other's value mid-test.
+    #[cfg(unix)]
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Replaces a process-global environment variable for as long as it lives,
+    /// putting the previous value back on drop.
+    ///
+    /// A scope guard rather than straight-line save/restore because the restore
+    /// has to survive a panic: an assertion firing between the two halves skips
+    /// the restore, and the mutated variable then leaks into every later test in
+    /// this binary. The lock above only serialises those tests -- it does not
+    /// undo the write, and recovering from its poison hands the next test the
+    /// leaked value.
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_unmeasurable_shared_memory_allowance_leaves_a_trace() {
         // The distinction the fields exist to preserve, tested at the layer that
@@ -2538,6 +2596,11 @@ mod tests {
         assert!(e.framework_notes.is_empty());
     }
 
+    /// What a healthy ROCm torch answers the probe, shared by the fakes below so
+    /// a change to the probe's contract lands in one place.
+    #[cfg(unix)]
+    const RUNTIME_TORCH_OK_JSON: &str = r#"{"ok":true,"version":"2.11.0+rocm7.14.1","hip":"7.14.60850","cuda":null,"is_available":true,"device_count":1,"arch_list":["gfx942"]}"#;
+
     /// A stand-in for a managed runtime's interpreter.
     ///
     /// It answers like a ROCm torch **only** when the runtime's library
@@ -2569,7 +2632,7 @@ mod tests {
                  esac\n",
                 env = RUNTIME_LIBRARY_PATH_ENV,
                 marker = libs.display(),
-                ok = r#"{"ok":true,"version":"2.11.0+rocm7.14.1","hip":"7.14.60850","cuda":null,"is_available":true,"device_count":1,"arch_list":["gfx942"]}"#,
+                ok = RUNTIME_TORCH_OK_JSON,
                 broken = r#"{"ok":false,"error":"ImportError: libroctx64.so.4: cannot open shared object file"}"#,
             ),
         )
@@ -2590,6 +2653,9 @@ mod tests {
         // The bug this pins: torch lives only inside the managed runtime, so a
         // probe that resolves its interpreter from PATH reports `unknown` for a
         // host that has a working one.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, interpreter) = plant_fake_runtime_interpreter("runtime-torch");
         let mut e = Examination::default();
         probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
@@ -2611,10 +2677,16 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn the_framework_probe_gives_the_runtimes_torch_its_library_path() {
-        // Dropping the library paths would turn "no torch" into "torch import
+    fn a_runtime_without_its_library_path_reports_the_import_failure() {
+        // Withholding the library paths turns "no torch" into "torch import
         // failed", which reads as a broken runtime -- a worse answer than the
-        // silence it replaced. Same interpreter, library paths withheld.
+        // silence it replaced. This pins how that case is REPORTED; the
+        // composition itself is pinned by
+        // `the_framework_probe_reads_the_active_runtimes_torch`, whose fake
+        // interpreter only answers when the loader path actually reached it.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, mut interpreter) = plant_fake_runtime_interpreter("runtime-no-libs");
         interpreter.library_paths.clear();
         let mut e = Examination::default();
@@ -2629,6 +2701,102 @@ mod tests {
                 .any(|note| note.contains("libroctx64.so.4")),
             "expected the loader failure to be reported: {:?}",
             e.framework_notes
+        );
+    }
+
+    /// A stand-in interpreter that records the loader path it was handed.
+    ///
+    /// `plant_fake_runtime_interpreter` only judges whether the runtime's own
+    /// directory arrived, which cannot see what became of the entries the host
+    /// already had. This one writes the whole variable out, so a test can assert
+    /// on both halves of the merge and on their ORDER -- which is what decides
+    /// whose ROCm the runtime's torch loads.
+    #[cfg(unix)]
+    fn plant_loader_path_recording_interpreter(
+        label: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, FrameworkInterpreter) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-{label}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let libs = root.join("lib");
+        std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
+        let recorded = root.join("loader-path");
+        let python = root.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"${env}\" > '{recorded}'\n\
+                 printf '%s' '{ok}'\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                recorded = recorded.display(),
+                ok = RUNTIME_TORCH_OK_JSON,
+            ),
+        )
+        .expect("plant the recording interpreter");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("make the recording interpreter executable");
+
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![libs],
+        };
+        (root, recorded, interpreter)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_runtime_loader_path_keeps_the_entries_the_host_already_had() {
+        // The merge branch neither sibling reaches: one clears `library_paths`
+        // and returns before the merge, the other never sets the variable, so on
+        // a host that leaves it unset `if let Some(existing)` is skipped and the
+        // extend below it never runs.
+        //
+        // What it guards is that PREPENDING the runtime's directories does not
+        // DISCARD the inherited ones. A runtime's torch still resolves its C++
+        // runtime and other system libraries from the host, so dropping them
+        // would fail the import and report a healthy runtime broken -- the same
+        // misdiagnosis `runtime_library_path_env` exists to avoid, reached by a
+        // different route.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, recorded, interpreter) =
+            plant_loader_path_recording_interpreter("runtime-loader-merge");
+        // Under `root` so teardown takes it too, and named so it cannot appear
+        // as a substring of the runtime's own `lib` entry.
+        let inherited = root.join("host-lib");
+
+        // Dropped before `_guard`, so the variable is restored while this test
+        // still holds the lock, and restored at all if an assertion below panics.
+        let _env = EnvVarGuard::set(RUNTIME_LIBRARY_PATH_ENV, &inherited);
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+
+        let seen = std::fs::read_to_string(&recorded)
+            .expect("the recording interpreter must have written its loader path");
+        let runtime_lib = interpreter.library_paths[0].display().to_string();
+        let inherited = inherited.display().to_string();
+        std::fs::remove_dir_all(&root).ok();
+
+        let runtime_at = seen.find(&runtime_lib);
+        let inherited_at = seen.find(&inherited);
+        assert!(
+            runtime_at.is_some(),
+            "the runtime's own library directory must reach the child: {seen:?}"
+        );
+        assert!(
+            inherited_at.is_some(),
+            "the inherited entry must survive the merge, or the runtime's torch \
+             loses the system libraries it still loads: {seen:?}"
+        );
+        assert!(
+            runtime_at < inherited_at,
+            "the runtime's ROCm must win over the host's, so its entries lead: {seen:?}"
         );
     }
 
