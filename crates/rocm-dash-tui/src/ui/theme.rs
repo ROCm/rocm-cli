@@ -14,6 +14,7 @@
 //! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
 
 use ratatui::style::{Color, Modifier, Style};
+use rocm_dash_core::state::JobStatus;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -244,6 +245,29 @@ impl Theme {
             StatusTone::Success => self.ok,
             StatusTone::Error | StatusTone::Alert => self.err,
         }
+    }
+
+    /// Color for a [`JobStatus`], via [`Self::tone_color`]. The single source
+    /// of truth for job-status color shared by the job console banner and the
+    /// Home tab activity feed (the LOGS dock uses this too, except it keeps
+    /// `Running` neutral rather than accent — see `dock::logs_dock` — since
+    /// accent would tint an entire streaming log body, not just a small
+    /// status badge). They must not each pick their own mapping.
+    pub const fn job_status_color(&self, status: &JobStatus) -> Color {
+        let tone = match status {
+            // Accent (cyan) rather than the warning/in-progress tone
+            // `docs/ux-guidelines.md` suggests for "work in progress": a
+            // running job is the thing the user's attention should be on
+            // right now, which is what accent means elsewhere in this app,
+            // and warn/orange is reserved for a job that finished with a
+            // nonzero exit code.
+            JobStatus::Running => StatusTone::Accent,
+            JobStatus::Done { code: 0 } => StatusTone::Success,
+            JobStatus::Done { .. } => StatusTone::Warning,
+            JobStatus::Failed { .. } => StatusTone::Error,
+            JobStatus::Cancelled => StatusTone::Muted,
+        };
+        self.tone_color(tone)
     }
 }
 
