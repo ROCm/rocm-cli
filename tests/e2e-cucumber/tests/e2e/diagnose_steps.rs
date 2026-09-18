@@ -920,7 +920,7 @@ async fn assert_describes_change(world: &mut E2eWorld) {
 async fn assert_preview_states_manual_only(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix preview output");
     assert!(
-        output.contains("Flags:      manual only (this command will NOT run it)"),
+        output.contains("Flags:      manual only (`rocm fix` will NOT run it automatically)"),
         "expected a bare manual-only Flags: line for {PREVIEW_FIX_ID}, with no \
          sudo/reboot/re-login flags ahead of it:\n{output}"
     );
