@@ -1146,6 +1146,15 @@ mod tests {
             cmd: "running".into(),
             args: vec![],
         });
+        s.jobs.apply(StateEvent::StartJob {
+            id: "e".into(),
+            cmd: "failing".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobErr {
+            id: "e".into(),
+            message: "boom".into(),
+        });
 
         // Assert against `JobStatus::glyph()` itself (trimmed of its trailing
         // space) rather than hardcoded glyph characters, so this test can't
@@ -1156,6 +1165,9 @@ mod tests {
             JobStatus::Done { code: 1 },
             JobStatus::Cancelled,
             JobStatus::Running,
+            JobStatus::Failed {
+                message: "boom".into(),
+            },
         ] {
             let glyph = status.glyph();
             assert!(
