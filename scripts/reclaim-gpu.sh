@@ -83,10 +83,72 @@ process_alive() {
   [[ "${state}" != "Z" ]]
 }
 
+# Read a process's command line, NUL-separated in /proc, as a single string.
+# Fails when the process is gone or its command line is empty (a kernel thread,
+# or a zombie whose argv has already been released).
+#
+# Redirect stderr BEFORE the input redirection: the shell applies them left to
+# right, so `<file 2>/dev/null` still lets the shell's own "No such file" reach
+# the terminal when the open fails.
+cmdline_of() {
+  local cmdline
+  cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${1}/cmdline")" || return 1
+  [[ -n "${cmdline}" ]] || return 1
+  printf '%s' "${cmdline}"
+}
+
+# True when a command line names an E2E root AND an engine marker.
+#
+# Split out of select_leaked so the self-test can drive every root and every
+# marker directly. Exercising them through spawned processes would need one
+# process per list entry; leaving them undriven is how `e2e-shared`, `vllm`,
+# `__engine-serve-http` and `rocm daemon` came to be removable with the
+# self-test still green.
+cmdline_matches_rule() {
+  local cmdline="$1"
+  local root engine
+  local has_root=0
+  local has_engine=0
+  for root in "${E2E_ROOTS[@]}"; do
+    case "${cmdline}" in
+      *"${root}"*)
+        has_root=1
+        break
+        ;;
+      *) ;;
+    esac
+  done
+  [[ "${has_root}" == 1 ]] || return 1
+  for engine in "${ENGINE_MARKERS[@]}"; do
+    case "${cmdline}" in
+      *"${engine}"*)
+        has_engine=1
+        break
+        ;;
+      *) ;;
+    esac
+  done
+  [[ "${has_engine}" == 1 ]]
+}
+
+# Whether <pid> is still running the command line it was selected with.
+#   0  same process
+#   1  a DIFFERENT command line — the pid was recycled
+#   2  gone: exited between the liveness check and this read
+# The 1/2 split matters because they are not the same event, and reporting a
+# process that simply exited as "recycled" misdescribes a benign race.
+same_selected_process() {
+  local pid="$1"
+  local expected="$2"
+  local current
+  current="$(cmdline_of "${pid}")" || return 2
+  [[ "${current}" == "${expected}" ]]
+}
+
 # Print "pid<TAB>command line" for every process whose command line names both
 # an E2E root and an engine marker.
 select_leaked() {
-  local cmdline_file pid cmdline root engine has_root has_engine
+  local cmdline_file pid cmdline
   for cmdline_file in /proc/[0-9]*/cmdline; do
     pid="${cmdline_file#/proc/}"
     pid="${pid%/cmdline}"
@@ -95,11 +157,7 @@ select_leaked() {
       continue
     fi
     # A process can exit between the glob and the read; that is not an error.
-    # Redirect stderr BEFORE the input redirection: the shell applies them left
-    # to right, so `<file 2>/dev/null` still lets the shell's own "No such file"
-    # reach the terminal when the open fails.
-    cmdline="$(tr '\0' ' ' 2>/dev/null <"${cmdline_file}")" || continue
-    [[ -n "${cmdline}" ]] || continue
+    cmdline="$(cmdline_of "${pid}")" || continue
 
     if [[ -n "${SELFTEST_SCOPE}" ]]; then
       case "${cmdline}" in
@@ -108,29 +166,7 @@ select_leaked() {
       esac
     fi
 
-    has_root=0
-    for root in "${E2E_ROOTS[@]}"; do
-      case "${cmdline}" in
-        *"${root}"*)
-          has_root=1
-          break
-          ;;
-        *) ;;
-      esac
-    done
-    [[ "${has_root}" == 1 ]] || continue
-
-    has_engine=0
-    for engine in "${ENGINE_MARKERS[@]}"; do
-      case "${cmdline}" in
-        *"${engine}"*)
-          has_engine=1
-          break
-          ;;
-        *) ;;
-      esac
-    done
-    [[ "${has_engine}" == 1 ]] || continue
+    cmdline_matches_rule "${cmdline}" || continue
 
     printf '%s\t%s\n' "${pid}" "${cmdline}"
   done
@@ -141,7 +177,7 @@ select_leaked() {
 # nothing, and a silent no-op is how the original defect stayed hidden.
 reclaim() {
   local dry_run="$1"
-  local selected pid cmdline current
+  local selected pid cmdline rc
   local killed=0
   local waited=0
 
@@ -185,13 +221,16 @@ reclaim() {
     # would SIGKILL that bystander, so require the command line to still be the
     # one we selected. Not killing a genuine holder is recoverable — the next
     # job's reclaim sees it again — where killing a bystander is not.
-    current="$(tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline")" || continue
-    if [[ "${current}" != "${cmdline}" ]]; then
-      echo "reclaim: pid=${pid} was recycled during the grace period, not escalating"
-      continue
-    fi
-    echo "reclaim: pid=${pid} ignored SIGTERM after ${TERM_GRACE_SECS}s, sending SIGKILL"
-    kill -KILL "${pid}" 2>/dev/null || true
+    rc=0
+    same_selected_process "${pid}" "${cmdline}" || rc=$?
+    case "${rc}" in
+      0)
+        echo "reclaim: pid=${pid} ignored SIGTERM after ${TERM_GRACE_SECS}s, sending SIGKILL"
+        kill -KILL "${pid}" 2>/dev/null || true
+        ;;
+      2) echo "reclaim: pid=${pid} exited during the grace period" ;;
+      *) echo "reclaim: pid=${pid} was recycled during the grace period, not escalating" ;;
+    esac
   done <<<"${selected}"
 
   echo "reclaim: ${killed} process(es) terminated"
@@ -246,10 +285,70 @@ DECOY
   echo $!
 }
 
+# Every root and every marker, asserted individually against the rule.
+#
+# The expectation is written out rather than derived from the arrays: a loop
+# over E2E_ROOTS cannot notice a root DELETED from E2E_ROOTS, which is exactly
+# the drift that left `e2e-shared`, `vllm`, `__engine-serve-http` and
+# `rocm daemon` removable with the self-test green. The duplication is the
+# point — changing either list must be a deliberate edit in two places, one of
+# which names the PowerShell mirrors that also have to move.
+assert_rule_covers_every_list_entry() {
+  local failures=0
+  local root engine
+  local expected_roots=('/tmp/rocm-e2e' 'e2e-shared' 'e2e-prewarm' 'e2e-target')
+  local expected_markers=('llama-server' 'vllm' '__engine-serve-http' 'rocm daemon')
+
+  if [[ "$(printf '%s\n' "${E2E_ROOTS[@]}")" != "$(printf '%s\n' "${expected_roots[@]}")" ]]; then
+    echo "FAIL: E2E_ROOTS changed — update this expectation AND both PowerShell mirrors"
+    echo "      script:   ${E2E_ROOTS[*]}"
+    echo "      expected: ${expected_roots[*]}"
+    failures=$((failures + 1))
+  fi
+  if [[ "$(printf '%s\n' "${ENGINE_MARKERS[@]}")" != "$(printf '%s\n' "${expected_markers[@]}")" ]]; then
+    echo "FAIL: ENGINE_MARKERS changed — update this expectation AND both PowerShell mirrors"
+    echo "      script:   ${ENGINE_MARKERS[*]}"
+    echo "      expected: ${expected_markers[*]}"
+    failures=$((failures + 1))
+  fi
+
+  for root in "${expected_roots[@]}"; do
+    if ! cmdline_matches_rule "${root}/bin/llama-server --model m"; then
+      echo "FAIL: root '${root}' with an engine marker does not match the rule"
+      failures=$((failures + 1))
+    fi
+    if cmdline_matches_rule "${root}/bin/e2e-harness --exact"; then
+      echo "FAIL: root '${root}' matched with NO engine marker; the AND rule is broken"
+      failures=$((failures + 1))
+    fi
+  done
+
+  for engine in "${expected_markers[@]}"; do
+    if ! cmdline_matches_rule "e2e-prewarm/bin/${engine} --serve"; then
+      echo "FAIL: marker '${engine}' under an E2E root does not match the rule"
+      failures=$((failures + 1))
+    fi
+    if cmdline_matches_rule "workload/bin/${engine} --serve"; then
+      echo "FAIL: marker '${engine}' matched with NO E2E root; a manual serve is not safe"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if [[ "${failures}" -eq 0 ]]; then
+    echo "ok: every E2E root and every engine marker is individually enforced"
+  fi
+  return "${failures}"
+}
+
 self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
+  local escapee_pid escapee_cmd guard_rc
+  local list_failures=0
   local failures=0
+
+  assert_rule_covers_every_list_entry || list_failures=$?
+  failures=$((failures + list_failures))
 
   # Deliberately NOT under /tmp/rocm-e2e: that prefix is one of the roots the
   # old patterns did match, which would mask the regression this guards.
@@ -327,7 +426,56 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 6. End to end: reclaim kills the leaks and spares both bystanders.
+  # 6. Containment: self_test issues REAL kills, and SELFTEST_SCOPE is the only
+  #    thing keeping them inside the scratch tree. Assert that before killing
+  #    rather than trusting it — this step runs on a hosted ephemeral lane
+  #    today, but nothing in the script stops it being run anywhere else.
+  while IFS=$'\t' read -r escapee_pid escapee_cmd; do
+    [[ -n "${escapee_pid}" ]] || continue
+    case "${escapee_cmd}" in
+      *"${tmp}"*) ;;
+      *)
+        echo "FAIL: selection escaped the scratch tree: pid=${escapee_pid} cmd=${escapee_cmd}"
+        failures=$((failures + 1))
+        ;;
+    esac
+  done <<<"${selected}"
+  if [[ "${failures}" -eq "${list_failures}" ]]; then
+    echo "ok: every selected process lies inside the self-test scratch tree"
+  fi
+
+  # 7. The escalation guard's comparison, in all three directions.
+  #
+  #    NOTE: only the COMPARISON is covered. The guard's call site is exercised
+  #    solely in the always-escalate direction, because making a pid be reused
+  #    by a different process on demand is not reproducible in a test — so
+  #    deleting the call site still passes the self-test. Said plainly rather
+  #    than implied by a green run.
+  if same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")"; then
+    echo "ok: escalation guard accepts an unchanged command line"
+  else
+    echo "FAIL: escalation guard rejected an unchanged command line; nothing would escalate"
+    failures=$((failures + 1))
+  fi
+  guard_rc=0
+  same_selected_process "${stubborn_pid}" "/some/other/process --unrelated" || guard_rc=$?
+  if [[ "${guard_rc}" == 1 ]]; then
+    echo "ok: escalation guard rejects a recycled pid"
+  else
+    echo "FAIL: escalation guard did not report a changed command line as recycled (rc=${guard_rc})"
+    failures=$((failures + 1))
+  fi
+  guard_rc=0
+  # A pid above /proc/sys/kernel/pid_max cannot exist, so this is the "gone" arm.
+  same_selected_process 2147483647 "anything" || guard_rc=$?
+  if [[ "${guard_rc}" == 2 ]]; then
+    echo "ok: escalation guard reports a departed process as gone, not recycled"
+  else
+    echo "FAIL: escalation guard conflated a departed process with a recycled one (rc=${guard_rc})"
+    failures=$((failures + 1))
+  fi
+
+  # 8. End to end: reclaim kills the leaks and spares both bystanders.
   reclaim_out="$(reclaim 0)"
   sleep 1
   if process_alive "${prewarm_pid}"; then
