@@ -6,6 +6,7 @@ mod automations;
 mod bootstrap;
 mod chat_host_facts;
 mod cli_progress;
+mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -295,10 +296,12 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     },
     /// Check for a newer ROCm package and optionally install it.
     ///
-    /// Without --apply, only reports whether an update is available. Pass --apply to
-    /// install it, and add --activate to make the new install the default afterward.
+    /// Without --apply or --dry-run, only reports whether an update is available.
+    /// Pass --dry-run to preview what --apply would do, --apply to install it, and
+    /// add --activate to make the new install the default afterward.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
+rocm update --dry-run\n  \
 rocm update --apply --activate\n  \
 rocm update --apply --dry-run\n  \
 rocm update --json")]
@@ -307,22 +310,25 @@ rocm update --json")]
         #[arg(long)]
         apply: bool,
         /// Runtime key to update.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         runtime: Option<String>,
         /// Use the updated ROCm install as the default after installing it.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         activate: bool,
         /// Show what would happen without changing files.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; applying never prompts.
+        #[arg(long)]
+        yes: bool,
         /// Print the check result as a single line of JSON instead of text.
-        #[arg(long, conflicts_with = "apply")]
+        #[arg(long, conflicts_with_all = ["apply", "dry_run"])]
         json: bool,
         /// Bound the version-check network calls to this many seconds each.
         #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
-    /// List, choose, add, or remove ROCm installs (runtimes).
+    /// List, choose, add, or remove ROCm runtimes.
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
@@ -617,9 +623,23 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        /// Approve replacing the current active default ROCm runtime (and
+        /// required system-package installs such as OpenMPI for vLLM) without
+        /// prompting; required outside an interactive terminal whenever a
+        /// managed runtime is already the active default — including when this
+        /// install targets a different GPU family or channel, which takes over
+        /// the active default just the same. An install with no active default
+        /// runtime never prompts.
         #[arg(long)]
         yes: bool,
+        /// Approve replacing the current active default ROCm runtime, and only
+        /// that: unlike --yes it does not approve system-package installs, so it
+        /// never runs sudo. ROCm CLI's own non-interactive surfaces (chat, MCP,
+        /// the dashboard) pass this, because they spawn `rocm` with no terminal
+        /// and so have no way to answer a sudo password prompt; a missing system
+        /// package stays a warning there, as it was before. --yes implies this.
+        #[arg(long)]
+        approve_replacing_active_default: bool,
     },
     /// Preview or install Linux AMD driver support.
     Driver {
@@ -682,26 +702,32 @@ rocm engines install vllm --reinstall")]
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
-    /// Show ROCm installs known to ROCm CLI.
+    /// Show ROCm runtimes known to ROCm CLI.
     List,
-    /// Use the selected ROCm install by default.
+    /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Switch back to the previously selected ROCm install.
+    /// Switch back to the previously selected ROCm runtime.
     #[command(
         after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
     Rollback,
-    /// Remove a ROCm install from ROCm CLI.
+    /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Do not ask for interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Show what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Add a ROCm install from a saved manifest file.
+    /// Add a ROCm runtime from a saved manifest file.
     Import {
         /// Manifest file path.
         manifest: PathBuf,
@@ -785,7 +811,7 @@ enum ComfyuiCommand {
     },
     /// Install ComfyUI into ROCm CLI's app folder.
     Install {
-        /// ROCm runtime key to use.
+        /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
         /// Reinstall even if ComfyUI already exists.
@@ -794,6 +820,9 @@ enum ComfyuiCommand {
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; installing never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Start ComfyUI and print its local URL.
     Start {
@@ -806,9 +835,16 @@ enum ComfyuiCommand {
         /// Do not try to open a browser window.
         #[arg(long)]
         no_open_browser: bool,
+        /// Accepted for consistency with other mutating commands; starting never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
-    Stop,
+    Stop {
+        /// Accepted for consistency with other mutating commands; stopping never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -938,8 +974,15 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Reset setup so the next TUI launch shows first-time setup again.
-    Reset,
+    /// Clear recorded setup completion/dismissal state.
+    ///
+    /// Does not by itself re-trigger onboarding in the TUI; open it manually
+    /// from `rocm dash`'s Observe tab with `n`.
+    Reset {
+        /// Accepted for consistency with other mutating commands; resetting never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Which framework `rocm examine` should probe.
@@ -1433,7 +1476,7 @@ fn setup(command: Option<SetupCommand>) -> Result<()> {
         SetupCommand::Status => {
             print!("{}", render_setup_status_text(&paths, &config)?);
         }
-        SetupCommand::Reset => {
+        SetupCommand::Reset { yes: _ } => {
             print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
         }
     }
@@ -1461,7 +1504,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup will show"
+        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1495,7 +1538,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Setup will show again the next time you run `rocm`.",
+        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -1539,15 +1582,108 @@ fn execute_freeform_next_action(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<()> {
-    let action = freeform_plan_next_action_with_context(request, paths, config)
-        .context("natural-language plan did not produce a structured tool call")?;
-    validate_freeform_execution_action(&action)?;
-    print!("{}", render_freeform_execution_header(&action));
+    let execution = prepare_freeform_execution(request, paths, config)?;
+    print!("{}", render_freeform_execution_header(&execution));
 
     let mut argv = vec!["rocm".to_owned()];
-    argv.extend(action.args);
+    argv.extend(execution.action.args);
     let cli = Cli::try_parse_from(argv)?;
     dispatch(cli)
+}
+
+/// The argv `execute_freeform_next_action` is about to dispatch, plus whether
+/// [`apply_freeform_execution_consent`] added a flag to it.
+///
+/// The flag is tracked rather than re-detected from `action.args` because the
+/// execution header uses it to tell the operator *why* its `tool_call:` differs
+/// from the one in the request plan above. Looking for the flag in the final
+/// argv would report "added here" for a plan that already carried it.
+pub(crate) struct FreeformExecution {
+    pub action: FreeformPlanAction,
+    pub consent_added: bool,
+}
+
+/// Everything `execute_freeform_next_action` decides before it hands the argv to
+/// clap: plan, refuse what must not run unattended, and grant the consent the
+/// outer `--yes` already carries.
+///
+/// Split out so the consent injection is reachable from a test without
+/// dispatching a real install — the header render and the `dispatch` call are
+/// all that is left above it.
+fn prepare_freeform_execution(
+    request: &str,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<FreeformExecution> {
+    let mut action = freeform_plan_next_action_with_context(request, paths, config)
+        .context("natural-language plan did not produce a structured tool call")?;
+    validate_freeform_execution_action(&action)?;
+    let consent_added = apply_freeform_execution_consent(&mut action.args);
+    Ok(FreeformExecution {
+        action,
+        consent_added,
+    })
+}
+
+/// Grant the generated tool call the consent the operator already gave on the
+/// outer command line.
+///
+/// Only ever reached from `run_freeform` with `approve` set, i.e. from
+/// `rocm --yes <natural-language request>`. The planner builds a bare
+/// `install sdk ...` argv and `execute_freeform_next_action` re-parses and
+/// dispatches it **in process**, so `install()` would otherwise run with
+/// `yes = false, approve_replacing_active_default = false` no matter what the
+/// outer invocation said. That made this surface print `approval: granted by
+/// --yes` and then, with an active default runtime, refuse with "re-run with
+/// `--approve-replacing-active-default`" — a flag this surface offers no way to
+/// pass — or prompt on a terminal it had just said it did not need to ask.
+///
+/// Not `--yes`, for the same reason every other internal caller picks the narrow
+/// flag: `--yes` on `install sdk` carries a second, unrelated consent for
+/// system-package installs that run `sudo`, and the outer `--yes` here means
+/// "execute the plan you were just shown", not "install system packages".
+///
+/// Injected before the execution header renders, so the printed `tool_call:` is
+/// the argv that actually runs, and skipped under `--dry-run`, which returns
+/// before the gate and needs no consent — matching the dry-run-aware arms in
+/// `chat_rocm_command_action_from_args`, `rocmd` and dash-tui. The plan
+/// rendering path is deliberately untouched: `rocm <request>` without `--yes`
+/// prints a command for a human to review, and it must not hand them a
+/// pre-approved one.
+///
+/// That leaves `rocm --yes <request>` printing two `tool_call:` lines that
+/// differ — `run_freeform` renders the plan section before calling
+/// `execute_freeform_next_action`, and the flag is injected between them — and
+/// that is also deliberate. The two sections report different things: "request
+/// plan" is what the planner derived from the request, and "execution" is the
+/// argv handed to clap, so the added consent showing up only under the
+/// `execution` header is how this surface discloses that it granted it. Nothing
+/// is being solicited in between; under `--yes` the operator already approved
+/// on the outer command line, and under no `--yes` the execution section is
+/// never reached, so neither line is an approval prompt whose subject could
+/// drift from what runs. Injecting into the plan render instead would have to
+/// reach `render_structured_request_plan`, which the no-`--yes` review path
+/// shares, and would print a pre-approved command to a human being asked to
+/// review it — the case the paragraph above rules out.
+///
+/// So the difference stays deliberate but stops being unexplained: this returns
+/// whether it actually added the flag, and the execution section says so in
+/// words. A doc comment reaches the next reader of this file; the operator
+/// looking at two `tool_call:` lines that disagree is the one who needs it.
+///
+/// Returns `true` only when the flag was not already present, so the disclosure
+/// is about a flag this function added and not one the argv arrived with.
+fn apply_freeform_execution_consent(args: &mut Vec<String>) -> bool {
+    let is_install_sdk = args.first().is_some_and(|arg| arg == "install")
+        && args.get(1).is_some_and(|arg| arg == "sdk");
+    if !is_install_sdk || args.iter().any(|arg| arg == "--dry-run") {
+        return false;
+    }
+    let already_present = args
+        .iter()
+        .any(|arg| arg == "--approve-replacing-active-default");
+    ensure_flag(args, "--approve-replacing-active-default");
+    !already_present
 }
 
 fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()> {
@@ -1565,7 +1701,8 @@ fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()>
     Ok(())
 }
 
-fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
+fn render_freeform_execution_header(execution: &FreeformExecution) -> String {
+    let action = &execution.action;
     let mut output = String::new();
     let _ = writeln!(output);
     let _ = writeln!(output, "execution");
@@ -1583,6 +1720,20 @@ fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
         "  tool_call: {}",
         format_structured_tool_call("rocm", &action.args)
     );
+    // Printed only when the two `tool_call:` lines actually disagree, and
+    // immediately under the one that runs. Without it the operator sees a
+    // consent flag on the executed command that the request plan above never
+    // showed, with nothing on screen saying where it came from — the natural
+    // reading being that something was approved behind their back rather than
+    // that their own `--yes` was carried through.
+    if execution.consent_added {
+        let _ = writeln!(
+            output,
+            "  note: --approve-replacing-active-default was added here from your --yes, so this \
+             tool_call differs from the one under `request plan` above; nothing was approved \
+             between them."
+        );
+    }
     output
 }
 
@@ -1931,11 +2082,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            yes: _,
             json,
             timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
-            if apply {
+            if !apply && !dry_run && (runtime.is_some() || activate) {
+                bail!(
+                    "--runtime and --activate require --apply or --dry-run; \
+                     run `rocm update --dry-run` to preview or add --apply to update"
+                );
+            }
+            if update_should_preview_or_apply(apply, dry_run) {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
                     &paths,
@@ -2368,7 +2526,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     if json {
-        let examination = rocm_core::Examination::probe(framework);
+        // Prefer the active runtime's interpreter: in the managed configuration
+        // torch lives only in its site-packages, so probing PATH would report
+        // `unknown` for a host that has one.
+        let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
+        let examination =
+            rocm_core::Examination::probe_with_interpreter(framework, interpreter.as_ref());
         // `gather` rather than `examine_human_report`: the latter first runs
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
@@ -2407,13 +2570,25 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
     // `--distro` is the exception that still errors: the user named a machine to
     // inspect, and silently reporting on a different one would be worse than
     // failing. `--distro` with no value means "the only one installed".
-    let examination = match distro {
-        Some(name) => {
-            let selected = (!name.is_empty()).then_some(name);
-            rocm_core::probe_wsl_distro_from_host(selected.as_deref())
-                .map_err(|reason| anyhow::anyhow!("{reason}"))?
-        }
-        None => rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto),
+    let examination = if let Some(name) = distro {
+        let selected = (!name.is_empty()).then_some(name);
+        rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+    } else {
+        // Same reasoning as `examine --json`: the catalog reasons over the torch
+        // the engines will load, which is the active runtime's.
+        //
+        // Best-effort, unlike `examine`'s copy: this command already promises to
+        // answer on a degraded host, so a path-discovery failure must cost only
+        // the managed-runtime lookup, never the diagnosis.
+        let interpreter = AppPaths::discover().ok().and_then(|paths| {
+            let config = RocmCliConfig::load(&paths).unwrap_or_default();
+            rocm_core::active_managed_framework_interpreter(&paths, &config)
+        });
+        rocm_core::Examination::probe_with_interpreter(
+            rocm_core::FrameworkProbe::Auto,
+            interpreter.as_ref(),
+        )
     };
     let inspected_remotely = examination
         .wsl
@@ -2595,7 +2770,9 @@ fn install(target: InstallTarget) -> Result<()> {
             family,
             dry_run,
             yes,
+            approve_replacing_active_default,
         } => {
+            let consents = SdkInstallConsents::resolve(yes, approve_replacing_active_default);
             let format_name = match format {
                 InstallFormat::Wheel => "wheel",
                 InstallFormat::Tarball => "tarball",
@@ -2616,12 +2793,14 @@ fn install(target: InstallTarget) -> Result<()> {
                 version_selector,
                 family.as_deref(),
                 dry_run,
+                consents.replace_active_default,
             ) {
-                Ok(output) => {
-                    let finalized = if dry_run {
-                        None
-                    } else {
+                Ok(result) => {
+                    let therock::SdkInstallResult { output, mutated } = result;
+                    let finalized = if mutated {
                         finalize_successful_sdk_install(&paths)?
+                    } else {
+                        None
                     };
                     print!("{output}");
                     if let Some(finalized) = &finalized {
@@ -2631,8 +2810,8 @@ fn install(target: InstallTarget) -> Result<()> {
                         // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
                         // present for every SDK install, independent of which
                         // engine (if any) is auto-installed below.
-                        ensure_libatomic_for_torch(yes);
-                        ensure_libnuma_for_torch(yes);
+                        ensure_libatomic_for_torch(consents.system_packages);
+                        ensure_libnuma_for_torch(consents.system_packages);
                     }
                     finish_sdk_install(
                         &paths,
@@ -2642,11 +2821,26 @@ fn install(target: InstallTarget) -> Result<()> {
                         } else {
                             "install_sdk"
                         },
-                        format!(
-                            "sdk install completed channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
-                        ),
+                        {
+                            // A real install that did not mutate the system was
+                            // declined at the approval prompt; recording it as
+                            // "completed" would lie in the audit trail. Dry-run
+                            // never mutates but legitimately completes a preview.
+                            let status = if dry_run || mutated {
+                                "completed"
+                            } else {
+                                "cancelled"
+                            };
+                            format!(
+                                "sdk install {status} channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
+                            )
+                        },
                         |paths, finalized| {
-                            maybe_auto_install_sdk_preferred_engine(paths, finalized, yes)
+                            maybe_auto_install_sdk_preferred_engine(
+                                paths,
+                                finalized,
+                                consents.system_packages,
+                            )
                         },
                     )?;
                 }
@@ -2807,14 +3001,10 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, true))?;
 
-    let _ = writeln!(output, "execution:");
-    let _ = writeln!(output, "  status: completed");
-    let _ = writeln!(output, "  reboot_required: true");
-    let _ = writeln!(
-        output,
-        "  state: {}",
-        driver_install_state_path(paths).display()
-    );
+    let report = cli_report::ActionReport::new("driver install completed")
+        .detail("reboot_required", true)
+        .detail("state", driver_install_state_path(paths).display());
+    output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
@@ -6729,6 +6919,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             runtime_id,
             reinstall,
             dry_run,
+            yes: _,
         } => {
             match comfyui::install(
                 &paths,
@@ -6786,6 +6977,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             host,
             port,
             no_open_browser,
+            yes: _,
         } => match comfyui::start(
             &paths,
             comfyui::ComfyUiStartOptions {
@@ -6818,7 +7010,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
                 Err(error)
             }
         },
-        ComfyuiCommand::Stop => match comfyui::stop(&paths) {
+        ComfyuiCommand::Stop { yes: _ } => match comfyui::stop(&paths) {
             Ok(text) => {
                 print!("{text}");
                 record_cli_audit_event(
@@ -6973,38 +7165,89 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall { runtime } => {
-            let result = uninstall_runtime(&paths, &mut config, &runtime)?;
-            println!("runtime removed");
-            println!("  runtime_id: {}", result.runtime_id);
-            println!("  runtime_key: {}", result.runtime_key);
-            println!("  registry_removed: {}", result.registry_path.display());
-            match result.removed_install_root.as_ref() {
-                Some(path) => println!("  folder_removed: {}", path.display()),
-                None if result.read_only => {
-                    println!("  folder_removed: no");
-                    println!("  note: existing external runtime folder was left untouched");
+        RuntimesCommand::Uninstall {
+            runtime,
+            yes,
+            dry_run,
+        } => {
+            let plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
+            print_runtime_uninstall_plan(&plan);
+
+            if dry_run {
+                println!("dry run: no changes made");
+                return Ok(());
+            }
+
+            let plan = if yes {
+                plan
+            } else {
+                if !interactive_terminal() {
+                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
                 }
-                None => println!("  folder_removed: no"),
+                match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
+                    RuntimeUninstallConfirmation::Cancelled => {
+                        println!("runtime uninstall cancelled");
+                        return Ok(());
+                    }
+                    RuntimeUninstallConfirmation::Confirmed {
+                        plan: revalidated,
+                        config: reloaded,
+                    } => {
+                        config = *reloaded;
+                        *revalidated
+                    }
+                }
+            };
+            let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
+
+            let mut report = cli_report::ActionReport::new("runtime removed")
+                .detail("runtime_id", &result.runtime_id)
+                .detail("runtime_key", &result.runtime_key)
+                .detail("registry_removed", result.registry_path.display());
+            match result.removed_install_root.as_ref() {
+                Some(path) => {
+                    report = report.detail("folder_removed", path.display());
+                }
+                None if result.read_only => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "existing external runtime folder was left untouched",
+                    );
+                }
+                None if result.manifest_mismatch => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "local runtime manifest did not match the registry; the folder was \
+                         left in place to avoid deleting the wrong install",
+                    );
+                }
+                None => {
+                    report = report.detail("folder_removed", "no");
+                }
             }
-            if result.was_active {
-                println!("  default_runtime: cleared");
-                println!("  next step: rocm runtimes activate <runtime_key>");
+            if result.default_runtime_cleared {
+                report = report
+                    .detail("default_runtime", "cleared")
+                    .detail("next step", "rocm runtimes activate <runtime_key>");
             }
-            println!("  config: {}", paths.config_path().display());
+            report = report.detail("config", paths.config_path().display());
+            print!("{}", report.render());
             record_cli_audit_event(
                 &paths,
                 "runtime",
                 "runtime_uninstall",
                 "info",
                 format!(
-                    "removed runtime_key={} runtime_id={} removed_install_root={}",
+                    "removed runtime_key={} runtime_id={} removed_install_root={} \
+                     was_active={} default_runtime_cleared={}",
                     result.runtime_key,
                     result.runtime_id,
                     result
                         .removed_install_root
                         .as_ref()
-                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+                    result.was_active,
+                    result.default_runtime_cleared,
                 ),
                 None,
             );
@@ -7118,7 +7361,9 @@ struct RuntimeUninstallResult {
     registry_path: PathBuf,
     removed_install_root: Option<PathBuf>,
     read_only: bool,
+    manifest_mismatch: bool,
     was_active: bool,
+    default_runtime_cleared: bool,
 }
 
 /// Marker shown beside the active runtime in `rocm runtimes list`. Every
@@ -7344,23 +7589,191 @@ fn rollback_runtime(
     })
 }
 
-fn uninstall_runtime(
+/// A runtime's install folder is only ever removed when ROCm CLI is confident
+/// it owns that folder; `ReadOnly` and `ManifestMismatch` are distinct reasons
+/// for leaving it alone, surfaced separately so a real problem (a stale or
+/// corrupt local manifest) doesn't look identical to an intentional no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallRootDecision {
+    Remove,
+    ReadOnly,
+    ManifestMismatch,
+}
+
+impl InstallRootDecision {
+    const fn should_remove(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeUninstallPlan {
+    manifest: therock::InstalledRuntimeManifest,
+    registry_path: PathBuf,
+    was_active: bool,
+    /// Whether applying this plan will clear `config.default_runtime_id`.
+    /// This is true when the config's default still points at this
+    /// manifest's `runtime_id` and either this manifest was the active one,
+    /// or it is the last remaining install sharing that `runtime_id` (the
+    /// id is shared across side-by-side installs, so removing one sibling
+    /// does not by itself orphan the default while others remain).
+    clears_default_runtime: bool,
+    install_root_decision: InstallRootDecision,
+}
+
+impl RuntimeUninstallPlan {
+    fn will_remove_install_root(&self) -> bool {
+        self.install_root_decision.should_remove() && self.manifest.install_root.exists()
+    }
+}
+
+fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
+    let install_folder = if plan.will_remove_install_root() {
+        format!(
+            "{} (would be removed)",
+            plan.manifest.install_root.display()
+        )
+    } else {
+        match plan.install_root_decision {
+            InstallRootDecision::Remove => "not present, nothing to remove".to_owned(),
+            InstallRootDecision::ReadOnly => {
+                "left untouched (external/read-only runtime)".to_owned()
+            }
+            InstallRootDecision::ManifestMismatch => {
+                "left untouched (local runtime manifest did not match the registry)".to_owned()
+            }
+        }
+    };
+
+    let mut report = cli_report::ActionReport::new("runtime uninstall plan")
+        .detail("runtime_id", &plan.manifest.runtime_id)
+        .detail("runtime_key", &plan.manifest.runtime_key)
+        .detail("registry_entry", plan.registry_path.display())
+        .detail("install_folder", install_folder);
+    if plan.clears_default_runtime {
+        report = report.detail("default_runtime", "would be cleared");
+    }
+    print!("{}", report.render());
+}
+
+fn plan_runtime_uninstall(
     paths: &AppPaths,
-    config: &mut RocmCliConfig,
+    config: &RocmCliConfig,
     selector: &str,
-) -> Result<RuntimeUninstallResult> {
+) -> Result<RuntimeUninstallPlan> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, selector)?.clone();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
     let was_active = current_runtime_manifest(config, &manifests)
         .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let remove_install_root = should_remove_runtime_install_root(&manifest)?;
+    let clears_default_runtime = config
+        .default_runtime_id
+        .as_deref()
+        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
+        && (was_active
+            || !manifests.iter().any(|other| {
+                other.runtime_key != manifest.runtime_key
+                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
+            }));
+    let install_root_decision = should_remove_runtime_install_root(&manifest)?;
+    Ok(RuntimeUninstallPlan {
+        manifest,
+        registry_path,
+        was_active,
+        clears_default_runtime,
+        install_root_decision,
+    })
+}
+
+/// Re-derives the uninstall plan from disk and refuses to proceed if it no
+/// longer matches what the user approved. The interactive confirmation this
+/// guards can wait indefinitely; if another process activates a different
+/// runtime or replaces the install folder while the prompt is open, applying
+/// the stale plan could clear the wrong `active_runtime_key` or recursively
+/// delete a folder that is no longer the one that was vetted as safe to
+/// remove.
+fn revalidate_runtime_uninstall_plan(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallPlan> {
+    let fresh = plan_runtime_uninstall(paths, config, &plan.manifest.runtime_key)?;
+    if fresh.manifest.runtime_id != plan.manifest.runtime_id
+        || fresh.manifest.install_root != plan.manifest.install_root
+        || fresh.was_active != plan.was_active
+        || fresh.clears_default_runtime != plan.clears_default_runtime
+        || fresh.install_root_decision != plan.install_root_decision
+    {
+        bail!(
+            "runtime state for {} changed while waiting for confirmation; re-run `rocm runtimes uninstall {}` to review the current plan before approving it",
+            plan.manifest.runtime_key,
+            plan.manifest.runtime_key
+        );
+    }
+    Ok(fresh)
+}
+
+enum RuntimeUninstallConfirmation {
+    Cancelled,
+    // `RuntimeUninstallPlan`/`RocmCliConfig` are large; box them so the two
+    // variants stay a similar size (clippy::large_enum_variant).
+    Confirmed {
+        plan: Box<RuntimeUninstallPlan>,
+        config: Box<RocmCliConfig>,
+    },
+}
+
+/// Runs the confirm-then-revalidate sequence used by an interactive
+/// `runtimes uninstall`: waits for the caller-supplied confirmation, then
+/// reloads config from disk and re-derives the plan against it, so a state
+/// change that happened while the (potentially indefinite) prompt was open
+/// cannot be applied against stale data.
+fn confirm_and_revalidate_runtime_uninstall(
+    paths: &AppPaths,
+    plan: RuntimeUninstallPlan,
+    confirm: impl FnOnce() -> Result<bool>,
+) -> Result<RuntimeUninstallConfirmation> {
+    if !confirm()? {
+        return Ok(RuntimeUninstallConfirmation::Cancelled);
+    }
+    let config = RocmCliConfig::load(paths)?;
+    let plan = revalidate_runtime_uninstall_plan(paths, &config, plan)?;
+    Ok(RuntimeUninstallConfirmation::Confirmed {
+        plan: Box::new(plan),
+        config: Box::new(config),
+    })
+}
+
+fn uninstall_runtime(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    selector: &str,
+) -> Result<RuntimeUninstallResult> {
+    let plan = plan_runtime_uninstall(paths, config, selector)?;
+    apply_runtime_uninstall(paths, config, plan)
+}
+
+fn apply_runtime_uninstall(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallResult> {
+    let RuntimeUninstallPlan {
+        manifest,
+        registry_path,
+        was_active,
+        clears_default_runtime,
+        install_root_decision,
+    } = plan;
 
     let mut removed_install_root = None;
-    if remove_install_root && manifest.install_root.exists() {
+    if install_root_decision.should_remove() && manifest.install_root.exists() {
         fs::remove_dir_all(&manifest.install_root).with_context(|| {
             format!(
-                "failed to remove runtime folder {}",
+                "failed to remove runtime folder {} — the runtime registry entry has not \
+                 been removed yet, so `rocm runtimes list` will still show this runtime as \
+                 installed and pointing at this (now possibly partially deleted) folder \
+                 until the removal succeeds",
                 manifest.install_root.display()
             )
         })?;
@@ -7393,16 +7806,7 @@ fn uninstall_runtime(
         config.previous_runtime_key = None;
         config_changed = true;
     }
-    if config
-        .default_runtime_id
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
-        && (was_active
-            || !manifests.iter().any(|other| {
-                other.runtime_key != manifest.runtime_key
-                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
-            }))
-    {
+    if clears_default_runtime {
         config.default_runtime_id = None;
         config_changed = true;
     }
@@ -7439,21 +7843,23 @@ fn uninstall_runtime(
         registry_path,
         removed_install_root,
         read_only: manifest.read_only,
+        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
         was_active,
+        default_runtime_cleared: clears_default_runtime,
     })
 }
 
 fn should_remove_runtime_install_root(
     manifest: &therock::InstalledRuntimeManifest,
-) -> Result<bool> {
+) -> Result<InstallRootDecision> {
     if manifest.read_only || manifest.imported_from.is_some() {
-        return Ok(false);
+        return Ok(InstallRootDecision::ReadOnly);
     }
     if !local_runtime_manifest_matches(manifest)? {
-        return Ok(false);
+        return Ok(InstallRootDecision::ManifestMismatch);
     }
     ensure_runtime_install_root_is_safe_to_remove(&manifest.install_root)?;
-    Ok(true)
+    Ok(InstallRootDecision::Remove)
 }
 
 fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) -> Result<bool> {
@@ -7474,6 +7880,19 @@ fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
         bail!(
             "refusing to remove unsafe runtime folder {}",
+            path.display()
+        );
+    }
+    // Belt and braces: a hand-edited or corrupted registry entry could point
+    // `install_root` at a protected system location while still carrying a
+    // matching in-tree `.rocm-cli-runtime.json`, slipping past
+    // `local_runtime_manifest_matches`. `prune` already refuses these before
+    // ever calling this function (see storage.rs); check it here too so the
+    // single source of truth for "may ROCm CLI delete this folder?" refuses
+    // it for every caller, including a direct `runtimes uninstall <key>`.
+    if runtime_install_root_is_protected(path) {
+        bail!(
+            "refusing to remove runtime folder {} in a protected system location",
             path.display()
         );
     }
@@ -7570,6 +7989,93 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
     preferred_serve_engine_for_host_gpu_summary(&summary)
 }
 
+/// The two unrelated consents `rocm install sdk` can be given.
+///
+/// They are separate because they authorize different things and are answerable
+/// in different places. Replacing the active default runtime is a decision, and
+/// an argv can express it fully. Approving a system-package install means
+/// approving `sudo`, which — unless the host is root or has passwordless sudo —
+/// needs a human at a terminal to type a password.
+///
+/// `--yes` grants both, which is what a user typing it at a terminal means.
+/// ROCm CLI's own non-interactive surfaces need only the first: they spawn
+/// `rocm` with null stdin, so a sudo password prompt there can never be
+/// answered, and treating their approval as covering it would run sudo they
+/// cannot complete — and, for the vLLM/OpenMPI plan, abort the engine
+/// auto-install that used to warn and continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdkInstallConsents {
+    /// Approve replacing whatever runtime is currently the active default, and
+    /// which flag granted it. The source is carried rather than flattened to a
+    /// bool because the install log names it: crediting `--yes` on a surface
+    /// that only ever passed the narrow flag would tell the reader that consent
+    /// to run `sudo` had been given when it had not.
+    replace_active_default: therock::SdkInstallConsent,
+    /// Approve installing required system packages (OpenMPI, libatomic,
+    /// libnuma) through the system package manager, which means `sudo`.
+    system_packages: bool,
+}
+
+impl SdkInstallConsents {
+    const fn resolve(yes: bool, approve_replacing_active_default: bool) -> Self {
+        let replace_active_default = if yes {
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes)
+        } else if approve_replacing_active_default {
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            )
+        } else {
+            therock::SdkInstallConsent::Ask
+        };
+        Self {
+            replace_active_default,
+            system_packages: yes,
+        }
+    }
+}
+
+/// What to do with a distro-aware system-package install plan, given the caller's
+/// approval and what this host lets us do without a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemPackageInstallAction {
+    /// Print the commands (and the preflight checks) and continue without them.
+    /// Nothing privileged is run, so nothing can block on a password prompt.
+    PrintManualCommands,
+    /// Run the plan. `run_system_package_install_plan` inherits stdin so an
+    /// interactive `sudo` password prompt can be answered.
+    RunPlan {
+        /// The `approval:` line explaining why this was allowed to run.
+        approval: &'static str,
+        /// Whether a failed command is an error rather than a warning. Only an
+        /// explicit approval escalates: the automatic (root/passwordless) path
+        /// must never let a missing system package fail an unattended install.
+        escalate_failure: bool,
+    },
+}
+
+/// Decide between the two, given whether the *system-package* consent was granted
+/// and whether the host can install without prompting.
+///
+/// Split out from the two callers below so the decision is testable without a
+/// package manager, and so the "approved but no way to answer a password prompt"
+/// case has one place to be reasoned about.
+const fn system_package_install_action(
+    approved: bool,
+    can_autoinstall: bool,
+) -> SystemPackageInstallAction {
+    if !approved && !can_autoinstall {
+        return SystemPackageInstallAction::PrintManualCommands;
+    }
+    SystemPackageInstallAction::RunPlan {
+        approval: if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        },
+        escalate_failure: approved,
+    }
+}
+
 /// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
 /// is installed. On Linux/WSL, when OpenMPI is missing, this installs it through
 /// the system package manager.
@@ -7620,7 +8126,11 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    let SystemPackageInstallAction::RunPlan {
+        approval,
+        escalate_failure,
+    } = system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -7629,16 +8139,9 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return Ok(());
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if rocm_core::openmpi::detect_openmpi().present {
@@ -7656,7 +8159,15 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             // past something the user asked for. The auto (unapproved) path keeps
             // the warn-and-continue behavior so a missing OpenMPI never blocks an
             // otherwise-unattended install.
-            if approved {
+            //
+            // "Surface" is the exact claim, and it is not the same as failing the
+            // command: this error propagates out of the engine auto-install, and
+            // `finish_sdk_install` routes it through
+            // `engine_auto_install_failure_is_fatal`, which matches only
+            // `UnusableRuntimeAfterInstall`. So `rocm install sdk` still prints
+            // the failure and exits 0. Said here because the downgrade happens
+            // far away and reads as a non-zero exit from this site alone.
+            if escalate_failure {
                 return Err(error.context(
                     "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
                 ));
@@ -7767,7 +8278,11 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    // `escalate_failure` is deliberately ignored here: a missing libatomic/libnuma
+    // only warns, whatever approved the attempt.
+    let SystemPackageInstallAction::RunPlan { approval, .. } =
+        system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -7779,16 +8294,9 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return;
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if (dep.present)() {
@@ -9697,7 +10205,7 @@ fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
-fn current_runtime_manifest<'a>(
+pub(crate) fn current_runtime_manifest<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
@@ -12108,6 +12616,42 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("install") if second.as_deref() == Some("sdk") => {
+            // The chat/MCP surfaces spawn `rocm` with null stdin, so
+            // `interactive_terminal()` is false and the consent prompt would
+            // refuse with a "re-run with `--approve-replacing-active-default`"
+            // error, which the schema-constrained `install_sdk` tool gives the
+            // user no way to answer.
+            //
+            // Not `--yes`: that flag also approves system-package installs, and
+            // this spawn has no terminal on which to answer the `sudo` password
+            // prompt such an install can raise. Granting it here would make the
+            // vLLM/OpenMPI step run a sudo it cannot complete and abort the
+            // engine auto-install that previously warned and continued. The
+            // narrow flag grants exactly the consent the prompt is asking for.
+            //
+            // `--yes` is stripped rather than merely not added, because the
+            // generic `rocm_command` tool takes a model-supplied argv: a
+            // model-emitted `--yes` would otherwise reach this null-stdin spawn
+            // and re-grant the system-package consent `76c6aa3c` removed. The
+            // strip runs before the argv is rendered for human approval, so what
+            // is shown is still what runs.
+            //
+            // The `--yes=...` form is stripped too. Clap rejects an attached
+            // value on this flag today, so an exact-match strip happens to be
+            // airtight — but only by borrowing a property of clap's error
+            // taxonomy that nothing here owns. Giving `--yes` `num_args`, or a
+            // clap release that starts accepting `--yes=true` on a bare `bool`,
+            // would silently restore the sudo consent this strip exists to
+            // remove. Matching the prefix keeps the guarantee local to this
+            // function.
+            args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
+            // Withheld on `--dry-run`, which returns before the consent gate and
+            // so needs no consent: `rocmd` and dash-tui omit it there for the
+            // same reason, and a preview should not be recorded as carrying an
+            // approval it never used.
+            if !args.iter().any(|arg| arg == "--dry-run") {
+                ensure_flag(&mut args, "--approve-replacing-active-default");
+            }
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ROCm".to_owned(),
@@ -12123,15 +12667,36 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Apply ROCm update".to_owned(),
                 command_title: "Update".to_owned(),
             })
         }
+        Some("runtimes")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove")
+                && args.iter().any(|arg| arg == "--dry-run") =>
+        {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("runtimes")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove") =>
+        {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Remove ROCm install".to_owned(),
+                command_title: "Runtimes".to_owned(),
+            })
+        }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
             args,
-            pending_title: "Change ROCm install".to_owned(),
+            pending_title: "Change ROCm runtime".to_owned(),
             command_title: "Runtimes".to_owned(),
         }),
         Some("engines") if second.as_deref() == Some("install") => {
@@ -12200,6 +12765,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("install") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ComfyUI".to_owned(),
@@ -12207,6 +12773,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("start") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Start ComfyUI".to_owned(),
@@ -12214,6 +12781,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("stop") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Stop ComfyUI".to_owned(),
@@ -12224,6 +12792,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("setup") if second.as_deref() == Some("reset") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Reset first-time setup".to_owned(),
@@ -13556,7 +14125,23 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    // Dry run, so nothing is displaced and the consent gate is never reached;
+    // the narrow consent is what this chat surface would pass for a real
+    // install, and passing `--yes`'s source here would be a lie waiting to be
+    // printed if the preview ever grew a gate.
+    Ok(therock::install_sdk(
+        paths,
+        channel,
+        format,
+        prefix,
+        selector,
+        None,
+        true,
+        therock::SdkInstallConsent::Preapproved(
+            therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+        ),
+    )?
+    .output)
 }
 
 fn run_command_with_timeout(
@@ -13924,6 +14509,12 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
                 json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
+                // The MCP surface runs `rocm` with null stdin, so the consent
+                // prompt would refuse. This keeps the tool non-interactive,
+                // matching the chat `install sdk` arm. Deliberately not `--yes`:
+                // that would additionally approve a `sudo` system-package
+                // install this spawn has no terminal to answer.
+                "--approve-replacing-active-default".to_owned(),
             ];
             if let Some(prefix) = json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
@@ -16300,6 +16891,16 @@ fn append_update_surfaces(output: &mut String) {
     );
 }
 
+/// Whether `rocm update` should route into the runtime update path
+/// (`apply_runtime_update`) instead of the read-only status report.
+///
+/// `--dry-run` alone must take this path too, since `apply_runtime_update`
+/// only mutates anything when `dry_run` is false — a plain status report
+/// would silently ignore `--dry-run` and never show what `--apply` would do.
+const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
+    apply || dry_run
+}
+
 fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -16345,14 +16946,20 @@ fn apply_runtime_update(
             plan.device_target.as_deref(),
             plan.source_layout_generation.as_deref(),
             true,
+            activate,
         )?;
         let _ = writeln!(output, "  install_plan:");
-        for line in install_plan.lines() {
+        for line in install_plan.output.lines() {
             let _ = writeln!(output, "    {line}");
         }
         return Ok(output);
     }
 
+    // `activate` rather than a bare `true`: the update path is preapproved either
+    // way (its approval comes from the runtime the user selected, not from a
+    // flag, and `rocm update` has no terminal contract), but the approval line it
+    // prints must not promise an activation that only `--activate` performs
+    // below.
     let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
@@ -16361,6 +16968,7 @@ fn apply_runtime_update(
         plan.device_target.as_deref(),
         plan.source_layout_generation.as_deref(),
         false,
+        activate,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
     // By exact key, never by version: a same-version repair installs a sibling
@@ -16392,7 +17000,7 @@ fn apply_runtime_update(
         );
     }
     let _ = writeln!(output, "  install_output:");
-    for line in install_output.lines() {
+    for line in install_output.output.lines() {
         let _ = writeln!(output, "    {line}");
     }
     Ok(output)
@@ -20413,6 +21021,153 @@ mod tests {
     }
 
     #[test]
+    fn install_sdk_help_describes_the_gate_as_replacing_the_active_default() {
+        // `rocm install sdk --help` is the most-read description of the `--yes`
+        // gate, and it is the one surface a "reword every site" pass can miss —
+        // this branch's own history has it being missed once and corrected in a
+        // follow-up. So the assertions read the `yes` argument's own help text
+        // rather than the whole rendered page: the sibling
+        // `--approve-replacing-active-default` doc independently satisfies a
+        // page-wide "active default" match, which would keep a reverted `--yes`
+        // doc green.
+        //
+        // The effect is a displacement, not a deletion: in the default managed
+        // install root `runtime_key` embeds the resolved version, so an upgrade
+        // or downgrade lands in its own install root and the previous install
+        // stays on disk — only the active default moves. Claiming an overwrite
+        // here would promise a deletion that does not happen and contradict the
+        // prompt and the README.
+        let mut command = Cli::command();
+        let sdk = command
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand");
+        let yes = sdk
+            .get_arguments()
+            .find(|arg| arg.get_id() == "yes")
+            .expect("`install sdk` must offer --yes");
+        let yes_help = yes
+            .get_long_help()
+            .or_else(|| yes.get_help())
+            .expect("--yes must be documented")
+            .to_string();
+
+        assert!(
+            yes_help.contains("active default"),
+            "`--yes` must document itself as approving a replacement of the \
+             active default:\n{yes_help}"
+        );
+        assert!(
+            !yes_help.to_lowercase().contains("overwrit"),
+            "`--yes` must not claim an overwrite; an upgrade or downgrade leaves \
+             the previous install on disk:\n{yes_help}"
+        );
+    }
+
+    #[test]
+    fn install_sdk_help_separates_the_two_consents_yes_carries() {
+        // `--yes` approves two unrelated things: replacing the active default
+        // runtime, and running `sudo` for required system packages. The whole
+        // point of the narrow flag is that a caller with no terminal can grant
+        // the first without the second, so the help has to say so — a reader who
+        // believes it is a synonym for `--yes` will reach for `--yes` from a
+        // script and get a sudo prompt nothing can answer.
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--approve-replacing-active-default"),
+            "`rocm install sdk --help` must document the narrow consent flag:\n{help}"
+        );
+        assert!(
+            help.contains("does not approve system-package installs"),
+            "`rocm install sdk --help` must say the narrow flag excludes \
+             system-package installs:\n{help}"
+        );
+    }
+
+    #[test]
+    fn update_apply_approval_never_credits_the_inert_yes_flag() {
+        // Pins `SdkInstallApprovalSource::UpdateApply`: the update path is
+        // preapproved, but it must never print a line crediting `--yes`.
+        //
+        // `rocm update` now *does* take a `--yes` flag, added for consistency
+        // with the other mutating commands, and the deliberate decision the
+        // flag's arrival called for has been made: the behaviour does not
+        // change. That flag is inert by its own doc comment — applying never
+        // prompts — and the dispatch above discards it (`yes: _`), so it grants
+        // nothing. Crediting it would claim an approval the user never gave,
+        // and on `rocm install sdk` `--yes` additionally approves running
+        // `sudo`, so the claim would be doubly wrong.
+        //
+        // This replaces an assertion that `rocm update --help` contained no
+        // `--yes` at all: a proxy for the invariant that only held while the
+        // flag was absent. Pin the invariant itself so this still fails if the
+        // update path is ever made to credit the flag.
+        for activates in [true, false] {
+            let line = therock::preapproved_install_line(
+                therock::SdkInstallApprovalSource::UpdateApply { activates },
+                "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+                "7.14.0",
+            );
+            assert!(
+                !line.contains("--yes"),
+                "`rocm update --apply` (activates={activates}) credited --yes, \
+                 but that flag grants it nothing: {line}"
+            );
+            assert!(
+                line.starts_with("Requested by `rocm update --apply"),
+                "the update path must name itself as the approval source: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime".
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+
+        // The help is not the only `runtimes` string a user reads: running a
+        // mutating `rocm runtimes …` from chat raises an approval modal whose
+        // title is written here, not by clap, so the help assertions above
+        // cannot reach it. It said "Change ROCm install" until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
+        );
+    }
+
+    #[test]
     fn out_of_scope_commands_are_marked_preview_in_help() {
         let help = Cli::command().render_long_help().to_string();
         for command in ["chat", "comfyui", "automations"] {
@@ -22255,17 +23010,149 @@ mod tests {
     }
 
     #[test]
+    fn freeform_execution_grants_the_narrow_consent_the_outer_yes_already_gave() {
+        // `rocm --yes <request>` dispatches the generated argv **in process**, so
+        // nothing carries the outer `--yes` into `install()` unless this does.
+        // Without it the surface prints `approval: granted by --yes` and then
+        // either refuses non-interactively, asking for a flag it offers no way to
+        // pass, or prompts on a terminal it just said it would not need to ask.
+        let request =
+            "install the latest TheRock nightly for this GPU into D:\\ROCm\\therock_venvs";
+        let config = RocmCliConfig::default();
+
+        let planned = freeform_plan_next_action(request, &config)
+            .expect("install request should have next action");
+        assert!(
+            !planned
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--yes") || arg.starts_with("--approve-")),
+            "the plan itself must stay unapproved so `rocm <request>` shows a \
+             reviewable command: {:?}",
+            planned.args
+        );
+
+        // Through the real pre-dispatch path, not the injector in isolation:
+        // `execute_freeform_next_action` is this plus the header render and
+        // `dispatch`, so dropping the injection from the pipeline fails here.
+        let execution = prepare_freeform_execution(request, &test_app_paths(), &config)
+            .expect("install request should prepare for execution");
+        let action = &execution.action;
+
+        assert_eq!(
+            format_structured_tool_call("rocm", &action.args),
+            "rocm install sdk --channel nightly --format wheel --prefix \
+             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
+        );
+        // The narrow flag, never `--yes`: this surface has no terminal promise to
+        // make about a sudo password prompt for system packages.
+        assert!(!action.args.iter().any(|arg| arg == "--yes"));
+        // The header renders after injection, so the printed tool call is the
+        // argv that actually runs.
+        let rendered = render_freeform_execution_header(&execution);
+        assert!(rendered.contains("--approve-replacing-active-default"));
+        // And the operator is told why this `tool_call:` carries a consent flag
+        // the `request plan` section above it did not show. The plan assertion at
+        // the top of this test is what makes the two lines differ here, so the
+        // disclosure and the difference are pinned by the same test.
+        assert!(
+            execution.consent_added,
+            "the plan arrived unapproved, so the injector must report adding the flag"
+        );
+        assert!(
+            rendered.contains("was added here from your --yes"),
+            "the execution section must explain the differing tool_call: {rendered}"
+        );
+        // Re-parsing must reach `install()` with the consent actually set.
+        let mut argv = vec!["rocm".to_owned()];
+        argv.extend(execution.action.args);
+        let cli = Cli::try_parse_from(argv).expect("generated argv should parse");
+        match cli.command {
+            Some(Command::Install {
+                target:
+                    InstallTarget::Sdk {
+                        yes,
+                        approve_replacing_active_default,
+                        ..
+                    },
+            }) => {
+                assert!(approve_replacing_active_default);
+                assert!(!yes);
+            }
+            other => panic!("expected `install sdk`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeform_execution_consent_is_scoped_to_mutating_sdk_installs() {
+        // Dry runs return before the consent gate, and the sibling dry-run-aware
+        // arms in chat, rocmd and dash-tui all withhold the flag there.
+        let mut dry_run = vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--dry-run".to_owned(),
+        ];
+        assert!(!apply_freeform_execution_consent(&mut dry_run));
+        assert_eq!(
+            dry_run,
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--dry-run".to_owned()
+            ]
+        );
+
+        // Nothing else the planner can emit takes this flag; injecting it would
+        // not even parse.
+        for mut args in [
+            vec!["install".to_owned(), "driver".to_owned()],
+            vec!["serve".to_owned(), "qwen".to_owned()],
+            vec!["comfyui".to_owned(), "install".to_owned()],
+        ] {
+            let before = args.clone();
+            assert!(!apply_freeform_execution_consent(&mut args));
+            assert_eq!(args, before);
+        }
+
+        // Idempotent: a plan that already carries the flag is not given it twice,
+        // and reports that it added nothing — the execution section must not
+        // claim to have added a flag the argv arrived with.
+        let mut already = vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--approve-replacing-active-default".to_owned(),
+        ];
+        assert!(!apply_freeform_execution_consent(&mut already));
+        assert_eq!(
+            already
+                .iter()
+                .filter(|arg| *arg == "--approve-replacing-active-default")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn freeform_execution_header_surfaces_explicit_approval_and_tool_call() {
         let action =
             freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
-        let rendered = render_freeform_execution_header(&action);
+        let rendered = render_freeform_execution_header(&FreeformExecution {
+            action,
+            consent_added: false,
+        });
 
         assert!(rendered.contains("execution"));
         assert!(rendered.contains("approval: granted by --yes"));
         assert!(rendered.contains(
             "tool_call: rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
         ));
+        // Nothing was injected on this path, so the two `tool_call:` lines agree
+        // and the disclosure would be noise that contradicts the plan above.
+        assert!(
+            !rendered.contains("was added here"),
+            "the note must be scoped to an argv this surface actually changed: {rendered}"
+        );
     }
 
     #[test]
@@ -22596,7 +23483,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -22619,10 +23506,165 @@ mod tests {
                 "release".to_owned(),
                 "--format".to_owned(),
                 "wheel".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\ROCm\\therock_venvs".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn chat_install_sdk_strips_model_supplied_yes_and_skips_consent_on_dry_run() {
+        // `rocm_command` carries a model-supplied argv that nothing else filters,
+        // so `--yes` can arrive here. This arm exists to grant the narrow consent
+        // only; letting `--yes` through would re-grant the system-package/sudo
+        // consent on a spawn with no terminal to answer a password prompt.
+        let classify = |args: &[&str]| -> Vec<String> {
+            let action = chat_rocm_command_action_from_args(
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+            .expect("install sdk should classify");
+            let ChatRocmCommandAction::Approval { args, .. } = action else {
+                panic!("install sdk is a mutating command");
+            };
+            args
+        };
+
+        assert_eq!(
+            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--yes"]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
+            ]
+        );
+
+        // A dry run returns before the consent gate, so it is not given a consent
+        // it never uses — matching the dry-run-aware sibling arms.
+        assert_eq!(
+            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--dry-run"]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--dry-run".to_owned(),
+            ]
+        );
+
+        // Both together: the strip is unconditional, so `--yes` still does not
+        // survive into a preview spawn, and the dry run still gains no consent.
+        // A model that emits both must not end up with either flag.
+        assert_eq!(
+            classify(&[
+                "install",
+                "sdk",
+                "--prefix",
+                "/tmp/therock",
+                "--yes",
+                "--dry-run",
+            ]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--dry-run".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_install_sdk_strips_a_model_supplied_yes_in_both_its_bare_and_attached_forms() {
+        // `--yes` and `--yes=true` are both model-supplied argv that reach the
+        // chat arm intact: neither `canonicalize_chat_rocm_command` nor
+        // `validate_chat_rocm_command_safety` splits or rejects either. Whichever
+        // form survives re-grants into a null-stdin spawn the system-package/sudo
+        // consent `76c6aa3c` removed, with no terminal to answer the password
+        // prompt, so the strip has to catch both.
+        let classify = |args: &[&str]| -> Vec<String> {
+            let action = chat_rocm_command_action_from_args(
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+            .expect("install sdk should classify");
+            let ChatRocmCommandAction::Approval { args, .. } = action else {
+                panic!("install sdk is a mutating command");
+            };
+            args
+        };
+
+        // Both terms of `arg != "--yes" && !arg.starts_with("--yes=")` are driven
+        // here, and each alone: the bare form is caught only by the first, the
+        // `=` forms only by the second, so dropping either term reddens this test
+        // on its own rather than leaving one half to a sibling.
+        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
+            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", supplied]);
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--yes")),
+                "`{supplied}` must not survive the chat strip, got {args:?}"
+            );
+            assert_eq!(
+                args,
+                vec![
+                    "install".to_owned(),
+                    "sdk".to_owned(),
+                    "--prefix".to_owned(),
+                    "/tmp/therock".to_owned(),
+                    "--approve-replacing-active-default".to_owned(),
+                ],
+                "stripping `{supplied}` must leave the rest of the argv and the narrow consent alone"
+            );
+        }
+
+        // Future-proofing, not a guard on the `--yes=` term this test's other
+        // assertions pin: `--yes-not-a-flag` survives both the exact-match strip
+        // that preceded that term and the two-term strip that replaced it, so it
+        // would pass on either. What it does catch is the next edit — widening
+        // the second term to `starts_with("--yes")` to "simplify" it would start
+        // eating every argv token that merely begins the same way, silently
+        // dropping arguments the model legitimately sent.
+        let args = classify(&[
+            "install",
+            "sdk",
+            "--prefix",
+            "/tmp/therock",
+            "--yes-not-a-flag",
+        ]);
+        assert!(
+            args.iter().any(|arg| arg == "--yes-not-a-flag"),
+            "the strip must match `--yes` and `--yes=…`, not every token starting with \
+             `--yes`, got {args:?}"
+        );
+
+        // Second layer, and only the second: clap also refuses an attached value
+        // on this flag, so even an unstripped `--yes=true` would not parse today.
+        // That is what the strip above deliberately stops depending on — pinned
+        // here so a later `num_args` on `--yes` shows up as a failure of the
+        // backstop rather than passing unnoticed.
+        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
+            let error = match Cli::try_parse_from(["rocm", "install", "sdk", attached]) {
+                Ok(cli) => panic!("`{attached}` must not parse, got {cli:?}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::TooManyValues,
+                "expected clap to reject the attached value on {attached}: {error}"
+            );
+        }
+
+        // Control: the bare form does parse, so the assertions above are about
+        // the `=`-form and not about `--yes` being rejected outright.
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--yes"])
+            .expect("the bare flag is the form the chat arm strips");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { yes, .. },
+            }) => assert!(yes),
+            other => panic!("expected `install sdk`, got {other:?}"),
+        }
     }
 
     #[test]
@@ -22641,7 +23683,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
             )
         );
         let approval =
@@ -22661,6 +23703,7 @@ mod tests {
                 "D:\\ROCm\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
                 "06052026".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
             ]
         );
     }
@@ -23118,7 +24161,7 @@ model recipes
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
                 ),
                 false,
             ),
@@ -23128,7 +24171,7 @@ model recipes
                     name: "rocm_command".to_owned(),
                     arguments: serde_json::json!({ "args": ["comfyui", "install"] }),
                 },
-                Some("rocm comfyui install"),
+                Some("rocm comfyui install --yes"),
                 false,
             ),
             (
@@ -23175,7 +24218,7 @@ model recipes
         assert!(!chat_tool_call_is_read_only(&comfy_install));
         assert_eq!(
             rocm_chat_tool_requested_command(&comfy_install).as_deref(),
-            Some("rocm comfyui install")
+            Some("rocm comfyui install --yes")
         );
         let approval = chat_tool_approval_request(&comfy_install, Some("Install ComfyUI now."))
             .expect("approval should be built");
@@ -23183,7 +24226,11 @@ model recipes
         assert_eq!(approval.command_title, "ComfyUI");
         assert_eq!(
             approval.args,
-            vec!["comfyui".to_owned(), "install".to_owned()]
+            vec![
+                "comfyui".to_owned(),
+                "install".to_owned(),
+                "--yes".to_owned()
+            ]
         );
 
         let lemonade = providers::ChatToolCall {
@@ -23619,6 +24666,18 @@ model recipes
             vec!["comfyui".to_owned(), "logs".to_owned()],
             vec!["uninstall".to_owned(), "--dry-run".to_owned()],
             vec!["setup".to_owned(), "status".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -23636,15 +24695,169 @@ model recipes
             vec!["comfyui".to_owned(), "stop".to_owned()],
             vec!["uninstall".to_owned()],
             vec!["setup".to_owned(), "reset".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+            ],
         ];
         for args in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            assert!(
-                matches!(action, ChatRocmCommandAction::Approval { .. }),
-                "{args:?} should require approval, got {action:?}"
+            match &action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "{args:?} should have --yes injected for the approval path"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("{args:?} should require approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Resolve the argv a non-interactive surface produces the way `install()`
+    /// does, so a test can assert what that argv actually consents to rather
+    /// than which flag string it happens to contain.
+    fn consents_for_install_sdk_argv(args: &[String]) -> SdkInstallConsents {
+        let cli =
+            Cli::try_parse_from(std::iter::once("rocm".to_owned()).chain(args.iter().cloned()))
+                .unwrap_or_else(|error| {
+                    panic!("{args:?} must parse as a `rocm` invocation: {error}")
+                });
+        let Some(Command::Install {
+            target:
+                InstallTarget::Sdk {
+                    yes,
+                    approve_replacing_active_default,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("{args:?} is not an `install sdk` invocation");
+        };
+        SdkInstallConsents::resolve(yes, approve_replacing_active_default)
+    }
+
+    #[test]
+    fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
+        // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
+        // prompt would refuse with "re-run with
+        // `--approve-replacing-active-default`" — a flag the user has no way to
+        // supply from chat or the dashboard. Both the chat classifier
+        // arm and the MCP tool-args builder must inject the consent so an
+        // install over the active default runtime is not silently refused.
+        let action = chat_rocm_command_action_from_args(vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--channel".to_owned(),
+            "release".to_owned(),
+            // The classifier requires a user-chosen (non-system) install folder.
+            "--prefix".to_owned(),
+            "/home/tester/rocm-managed".to_owned(),
+        ])
+        .expect("install sdk classifies");
+        let chat_args = match action {
+            ChatRocmCommandAction::Approval { args, .. } => args,
+            other @ ChatRocmCommandAction::ReadOnly(_) => {
+                panic!("install sdk must require approval, got {other:?}")
+            }
+        };
+
+        // The MCP `install_sdk` tool builds its own argv (it does not route
+        // through the classifier above), so it must add the flag independently.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let mcp_args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
+
+        for args in [&chat_args, &mcp_args] {
+            assert_eq!(
+                consents_for_install_sdk_argv(args).replace_active_default,
+                therock::SdkInstallConsent::Preapproved(
+                    therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+                ),
+                "the spawn must approve replacing the active default, and be credited \
+                 to the flag it actually passed rather than to --yes, got {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_injected_consent_does_not_approve_privileged_package_installs() {
+        // The worked regression: Linux, a vLLM-preferred GPU family, OpenMPI
+        // absent, and neither root nor passwordless sudo. The chat, MCP and
+        // daemon surfaces spawn `rocm` with null stdin, so there is no terminal
+        // on which a `sudo` password prompt could ever be answered. Injecting
+        // `--yes` to clear the runtime-replacement prompt used to grant the
+        // second, unrelated consent that flag carries, which made
+        // `ensure_openmpi_for_vllm` run a sudo it cannot complete and then
+        // escalate the failure — aborting `maybe_auto_install_sdk_preferred_engine`
+        // before the vLLM engine install that previously warned and continued.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let injected = consents_for_install_sdk_argv(
+            &rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args"),
+        );
+        assert_eq!(
+            injected.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+            )
+        );
+        assert!(
+            !injected.system_packages,
+            "an injected consent must not approve a privileged package install"
+        );
+        assert_eq!(
+            system_package_install_action(injected.system_packages, false),
+            SystemPackageInstallAction::PrintManualCommands,
+            "on a host without passwordless sudo the spawn must print the commands, not run sudo"
+        );
+
+        // And the other half of the property: a `--yes` the user actually typed
+        // still approves both, and a failure of the install it asked for is
+        // still an error rather than a warning.
+        let typed = consents_for_install_sdk_argv(&[
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--yes".to_owned(),
+        ]);
+        assert_eq!(
+            typed.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes),
+            "a --yes the user typed must still be credited to --yes"
+        );
+        assert!(typed.system_packages);
+        assert_eq!(
+            system_package_install_action(typed.system_packages, false),
+            SystemPackageInstallAction::RunPlan {
+                approval: "granted by --yes",
+                escalate_failure: true,
+            },
+        );
+
+        // Root or passwordless sudo installs without any approval, as before —
+        // the consent split must not have made the automatic path conditional.
+        assert_eq!(
+            system_package_install_action(injected.system_packages, true),
+            SystemPackageInstallAction::RunPlan {
+                approval: "auto (root or passwordless sudo available)",
+                escalate_failure: false,
+            },
+        );
     }
 
     #[test]
@@ -25475,6 +26688,44 @@ install therock";
     }
 
     #[test]
+    fn update_dry_run_does_not_require_apply() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run"])
+            .expect("update --dry-run should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
+            .expect("update --apply --dry-run should still parse");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
+            .expect("update --dry-run --runtime should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
+            .expect("update --dry-run --activate should parse without --apply");
+    }
+
+    #[test]
+    fn update_dry_run_conflicts_with_json() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--json"]).expect_err(
+            "update --dry-run --json should be rejected instead of silently dropping --json",
+        );
+    }
+
+    // This only pins the free predicate's truth table. The actual dispatch
+    // wiring — that `rocm update --dry-run` really does reach the preview
+    // path without requiring --apply — is covered by e2e scenario
+    // `update-dry-run-reaches-preview-path-without-apply`
+    // (tests/e2e-cucumber/features/update.feature).
+    #[test]
+    fn update_should_preview_or_apply_includes_dry_run() {
+        assert!(
+            !update_should_preview_or_apply(false, false),
+            "plain `rocm update` should stay on the read-only status report"
+        );
+        assert!(
+            update_should_preview_or_apply(false, true),
+            "the predicate must say dry-run alone should preview"
+        );
+        assert!(update_should_preview_or_apply(true, false));
+        assert!(update_should_preview_or_apply(true, true));
+    }
+
+    #[test]
     fn install_sdk_accepts_family_override() {
         Cli::try_parse_from([
             "rocm",
@@ -25579,7 +26830,13 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
-        assert!(rendered.contains("Setup will show again"));
+        // The claim itself (onboarding only opens via an explicit `n` on the
+        // Observe tab, never automatically) is proven by
+        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
+        // test and the `onboarding.rs` module doc — this assertion only
+        // guards the string, not the behavior.
+        assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
         assert!(!rendered.contains("request plan"));
@@ -25650,7 +26907,10 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
-        assert!(rendered.contains("status: first-time setup will show"));
+        // See the pointer comment in
+        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
+        // above: this only guards the string, not the underlying behavior.
+        assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
@@ -29126,6 +30386,432 @@ ID_LIKE="suse opensuse"
         );
         assert!(!prefix_root.exists());
         assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_leaves_folder_on_local_manifest_mismatch() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        let mut config = RocmCliConfig::default();
+
+        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
+
+        assert!(removed.manifest_mismatch);
+        assert!(!removed.read_only);
+        assert_eq!(removed.removed_install_root, None);
+        assert!(manifest.install_root.exists());
+        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_runtime_install_root_rejects_protected_system_path() {
+        // `prune` (storage.rs) refuses a runtime whose folder sits in a
+        // protected system location before it ever calls
+        // `should_remove_runtime_install_root`. A hand-edited or corrupted
+        // registry entry could point a direct `runtimes uninstall <key>`
+        // manifest's `install_root` at the same kind of path while still
+        // carrying a matching in-tree `.rocm-cli-runtime.json`, slipping past
+        // `local_runtime_manifest_matches`. The single source of truth for
+        // "may ROCm CLI delete this folder?" must refuse it too, regardless
+        // of caller.
+        let protected = if cfg!(windows) {
+            PathBuf::from("C:/Windows/rocm-cli-test-runtime")
+        } else {
+            PathBuf::from("/etc/rocm-cli-test-runtime")
+        };
+
+        let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
+            .expect_err("protected system path must be refused");
+        assert!(err.to_string().contains("protected system location"));
+    }
+
+    #[test]
+    fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+
+        assert!(plan.will_remove_install_root());
+        assert!(manifest.install_root.exists());
+        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process relocating this runtime's install root
+        // while the uninstall confirmation prompt was waiting on the user.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        fs::rename(&manifest.install_root, &relocated_root)?;
+        let mut relocated_manifest = manifest.clone();
+        relocated_manifest.install_root = relocated_root.clone();
+        fs::write(
+            relocated_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root moved since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_runtime_id_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-runtime-id");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process re-registering this runtime_key under a
+        // different runtime_id while the uninstall confirmation prompt was
+        // waiting on the user. Both the registry entry and the local marker
+        // are updated together so `install_root_decision` stays `Remove` and
+        // only `runtime_id` differs from the plan the user approved.
+        let mut relabeled_manifest = manifest.clone();
+        relabeled_manifest.runtime_id = "therock-release:gfx120X-all-relabeled".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose runtime_id changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_was_active_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-was-active");
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+
+        // Simulate another process activating the target runtime while the
+        // uninstall confirmation prompt was waiting on the user.
+        config.active_runtime_key = Some(target.runtime_key);
+        config.save(&paths)?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose was_active changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_clears_default_runtime_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-clears-default");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+        assert!(
+            plan.clears_default_runtime,
+            "target is the only install with the stale default runtime_id"
+        );
+
+        // Simulate another process installing a sibling that shares the
+        // target's runtime_id while the uninstall confirmation prompt was
+        // waiting on the user; the default would then survive on that
+        // sibling instead of being cleared.
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-1",
+            shared_runtime_id,
+            "7.13.1",
+            30,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose clears_default_runtime changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_decision_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root-decision");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert_eq!(plan.install_root_decision, InstallRootDecision::Remove);
+
+        // Simulate another process overwriting the in-tree marker with one
+        // for a different install while the uninstall confirmation prompt
+        // was waiting on the user; the registry entry (and thus runtime_id
+        // and install_root) is left untouched, so only install_root_decision
+        // should differ from the plan the user approved.
+        let mut mismatched_marker = manifest.clone();
+        mismatched_marker.runtime_key = "some-other-runtime-key".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&mismatched_marker)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root_decision changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_and_revalidate_runtime_uninstall_refuses_state_changed_during_confirmation()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-confirm-and-revalidate-wiring");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+        config.save(&paths)?;
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // The injected "confirm" closure plays the role of the user
+        // approving the prompt; it relocates the install root before
+        // returning, simulating another process racing the confirmation
+        // exactly as `runtime_uninstall_revalidation_detects_install_root_change`
+        // does for the leaf function. This exercises the actual
+        // confirm -> reload-config -> revalidate wiring, not just the
+        // revalidation function in isolation: if the reload/revalidate
+        // calls were ever dropped from `confirm_and_revalidate_runtime_uninstall`,
+        // the call would silently succeed on the stale plan and this
+        // test's `result.is_err()` assertion below would fail, catching
+        // the regression.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        let install_root = manifest.install_root.clone();
+        let runtime_key = manifest.runtime_key.clone();
+        let paths_for_confirm = paths.clone();
+        let result = confirm_and_revalidate_runtime_uninstall(&paths, plan, move || {
+            fs::rename(&install_root, &relocated_root)?;
+            let mut relocated_manifest = manifest.clone();
+            relocated_manifest.install_root = relocated_root.clone();
+            fs::write(
+                relocated_root.join(".rocm-cli-runtime.json"),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            fs::write(
+                runtime_manifest_path(&paths_for_confirm, &runtime_key),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            Ok(true)
+        });
+
+        assert!(
+            result.is_err(),
+            "confirm_and_revalidate_runtime_uninstall must refuse to proceed when the runtime \
+             state changed while the confirmation callback was running"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_clears_default_runtime_id_for_last_sibling_even_when_not_active()
+    -> Result<()> {
+        // `runtime_id` is shared across side-by-side installs of the same
+        // release, while `runtime_key` is unique per install and
+        // `config.default_runtime_id` tracks by the shared `runtime_id`,
+        // independently of `config.active_runtime_key`. A stale
+        // `default_runtime_id` left over from before a *different* runtime
+        // was activated must still be cleared once its last remaining
+        // sibling is uninstalled — even though that sibling is not, and
+        // never was, the active runtime (`was_active` is pinned to the
+        // unrelated active runtime and never falls back to the
+        // default-id-uniqueness check while that active runtime is still
+        // installed).
+        let (root, paths) = test_paths("runtime-uninstall-shared-default-id");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let manifest_a = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-a",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let manifest_b = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-b",
+            shared_runtime_id,
+            "7.13.0",
+            21,
+        )?;
+        let active_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-0",
+            "therock-release:gfx1151",
+            "7.14.0",
+            22,
+        )?;
+        // `default_runtime_id` is stale, left over from before
+        // `active_manifest` was activated; `active_runtime_key` now points
+        // at a manifest with a completely different `runtime_id`.
+        let mut config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(active_manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+
+        // Removing the first sibling leaves the other one behind, so the
+        // stale default (which still resolves to a real, remaining install)
+        // must not be cleared.
+        let plan_b = plan_runtime_uninstall(&paths, &config, &manifest_b.runtime_key)?;
+        assert!(!plan_b.was_active);
+        assert!(!plan_b.clears_default_runtime);
+        let removed_b = uninstall_runtime(&paths, &mut config, &manifest_b.runtime_key)?;
+        assert!(!removed_b.was_active);
+        assert!(!removed_b.default_runtime_cleared);
+        assert_eq!(
+            config.default_runtime_id.as_deref(),
+            Some(shared_runtime_id)
+        );
+
+        // Removing the last remaining sibling must clear the stale default
+        // even though this install was never the active one, and
+        // `active_runtime_key` still points at the unrelated, still-installed
+        // `active_manifest` throughout.
+        let plan_a = plan_runtime_uninstall(&paths, &config, &manifest_a.runtime_key)?;
+        assert!(!plan_a.was_active);
+        assert!(plan_a.clears_default_runtime);
+        let removed_a = uninstall_runtime(&paths, &mut config, &manifest_a.runtime_key)?;
+        assert!(!removed_a.was_active);
+        assert!(removed_a.default_runtime_cleared);
+        assert_eq!(config.default_runtime_id, None);
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(active_manifest.runtime_key.as_str())
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())

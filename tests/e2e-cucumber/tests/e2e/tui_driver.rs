@@ -82,6 +82,33 @@ pub fn default_timeout() -> Duration {
     )
 }
 
+/// A termination signal a scenario can deliver to the live TUI, paired with the
+/// conventional `128 + signo` exit code the dashboard's signal handler reports
+/// after restoring the terminal (SIGINT → 130, SIGTERM → 143).
+#[derive(Debug, Clone, Copy)]
+pub enum TermSignal {
+    /// SIGTERM — a supervisor stopping the dashboard (`kill <pid>`).
+    Term,
+    /// SIGINT — an externally delivered `kill -INT` from another process.
+    ///
+    /// Deliberately NOT described as "the Ctrl-C gesture": while the TUI holds
+    /// the terminal in raw mode the driver's `ISIG` translation is off, so a
+    /// typed Ctrl-C never becomes a SIGINT. That gesture is a different code
+    /// path and is covered by [`TuiSession::press_ctrl_c_and_wait`].
+    Int,
+}
+
+impl TermSignal {
+    /// The `kill(1)` name (`TERM`/`INT`), used to deliver the signal to the
+    /// child by pid.
+    const fn kill_name(self) -> &'static str {
+        match self {
+            Self::Term => "TERM",
+            Self::Int => "INT",
+        }
+    }
+}
+
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
     child: Box<dyn Child + Send + Sync>,
@@ -107,6 +134,9 @@ pub struct TuiSession {
     is_chat: bool,
     scenario: Option<String>,
     argv: Vec<String>,
+    /// Exit code observed by [`deliver_signal_and_wait`], read back by the
+    /// signal scenarios' `Then` steps once the child has been reaped.
+    observed_exit_code: Option<i32>,
 }
 
 impl std::fmt::Debug for TuiSession {
@@ -256,6 +286,7 @@ impl TuiSession {
             is_chat: args.first() == Some(&"chat"),
             scenario: world.current_scenario.clone(),
             argv: args.iter().map(|s| (*s).to_string()).collect(),
+            observed_exit_code: None,
         })
     }
 
@@ -425,41 +456,8 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-                while Instant::now() < drain_deadline {
-                    if self.screen_text().contains(marker) {
-                        return Ok(());
-                    }
-                    if let Some(panic_message) = self.take_reader_panic() {
-                        return Err(format!(
-                            "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                            self.framed_screen()
-                        ));
-                    }
-                    if self
-                        .reader
-                        .as_ref()
-                        .is_some_and(std::thread::JoinHandle::is_finished)
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                // Final check after the drain window closes: the reader may have
-                // committed the last frame between the loop's screen check and the
-                // `is_finished`/deadline exit, so re-read before declaring failure.
-                if self.screen_text().contains(marker) {
+                if self.drain_final_frame(Some(marker)).await? {
                     return Ok(());
-                }
-                // A reader panic landing exactly on the drain deadline would
-                // otherwise be masked by the generic "process exited" error below
-                // (and then swallowed entirely if `Drop` runs during another
-                // unwind). Surface it here so the real cause wins.
-                if let Some(panic_message) = self.take_reader_panic() {
-                    return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                        self.framed_screen()
-                    ));
                 }
                 return Err(format!(
                     "process exited ({status:?}) before {marker:?} appeared.\n{}",
@@ -469,6 +467,50 @@ impl TuiSession {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for {marker:?}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Poll the current screen until `is_ready` accepts it, with the same
+    /// fail-fast diagnostics as [`wait_for_screen`](Self::wait_for_screen): a
+    /// reader-thread panic or a child that exits mid-wait is reported as itself
+    /// rather than as a timeout against the frozen last screen.
+    ///
+    /// The general form of `wait_for_screen`, for evidence a frame is current
+    /// that is not "it contains this string" — a cleared table cell, or a
+    /// marker the frame stopped showing. `describe` names the condition being
+    /// waited on and is quoted in every diagnostic.
+    pub async fn wait_for_screen_where(
+        &mut self,
+        describe: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if is_ready(&self.screen_text()) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
                     self.framed_screen()
                 ));
             }
@@ -497,55 +539,6 @@ impl TuiSession {
                 self.framed_screen()
             )),
         }
-    }
-
-    /// Poll until the child exits, returning its raw exit code regardless of
-    /// whether it is zero. Used by journeys (e.g. a declined confirmation
-    /// prompt) whose success case is a specific *nonzero* code, where
-    /// [`wait_for_exit`](Self::wait_for_exit)'s built-in zero-only assertion
-    /// would reject the very outcome under test.
-    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
-                    self.finished = true;
-                    self.record_once(code);
-                    return Ok(code);
-                }
-                Ok(None) => {}
-                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
-            }
-            // A reader panic doesn't affect whether the child itself has exited,
-            // but it does mean the screen in any resulting error/diagnostic is
-            // stale, so surface it rather than let this poll silently continue.
-            if let Some(panic_message) = self.take_reader_panic() {
-                return Err(format!(
-                    "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
-    /// Whether the emulated terminal is currently in the alternate screen — the
-    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
-    /// refusal that never takes over the terminal this must stay `false`.
-    #[must_use]
-    pub fn in_alternate_screen(&self) -> bool {
-        self.parser
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .screen()
-            .alternate_screen()
     }
 
     /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
@@ -620,6 +613,232 @@ impl TuiSession {
         self.recorded = true;
         let argv: Vec<&str> = self.argv.iter().map(String::as_str).collect();
         crate::record_command(self.scenario.as_deref(), &argv, rc, "");
+    }
+
+    /// Deliver `signal` to the child, then wait for it to exit and stash the
+    /// observed exit code for the scenario's `Then` steps. Only harness faults
+    /// (no pid, a failed `kill`, a reader panic, or a timeout) are surfaced as
+    /// `Err`; asserting the exit *value* and terminal restoration is left to the
+    /// scenario's `Then` steps, which read the code back via
+    /// [`observed_exit_code`](Self::observed_exit_code) and call
+    /// [`expect_terminal_restored`](Self::expect_terminal_restored).
+    pub async fn deliver_signal_and_wait(
+        &mut self,
+        signal: TermSignal,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let pid = self
+            .child
+            .process_id()
+            .ok_or_else(|| "the TUI child has no pid; cannot deliver a signal".to_string())?;
+        // The signal scenarios are `@requires-os:linux`, so shelling out to
+        // `kill(1)` avoids pulling a `libc`/`nix` dependency into the harness
+        // just to reach `kill(2)`.
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{}", signal.kill_name()))
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("failed to run `kill -{} {pid}`: {e}", signal.kill_name()))?;
+        if !status.success() {
+            return Err(format!(
+                "`kill -{} {pid}` exited unsuccessfully ({status})",
+                signal.kill_name()
+            ));
+        }
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
+    /// Type a literal Ctrl-C at the TUI and wait for it to exit, stashing the
+    /// observed code for the scenario's `Then` steps.
+    ///
+    /// Sends the raw byte `0x03` — what a terminal actually transmits for the
+    /// keystroke — rather than a signal. While the TUI holds the terminal in raw
+    /// mode, `ISIG` is off (and `ENABLE_PROCESSED_INPUT` on Windows), so the
+    /// driver does not translate the keystroke into SIGINT and the byte arrives
+    /// as an ordinary key event. That is the gesture a user performs;
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) covers the
+    /// externally delivered signal.
+    ///
+    /// What the scenario's assertions do and do not distinguish, stated plainly
+    /// because the two paths converge:
+    ///
+    /// - The *outcome* assertions (exit code 130, terminal restored) are
+    ///   byte-identical to the SIGINT scenario's, and cannot tell the paths
+    ///   apart on their own.
+    /// - The discrimination comes from the input plus the fact that the process
+    ///   exits **at all**. Delete the key-event arm and no signal is ever
+    ///   raised, so nothing ends the process and this call fails on its timeout.
+    ///   That is the regression the step is here to catch, and it catches it.
+    /// - It does **not** independently prove no signal was involved. That rests
+    ///   on the product's own raw mode: a build that failed to enter raw mode
+    ///   would leave `ISIG` on, the tty would turn `0x03` into a SIGINT, and
+    ///   these same assertions would still pass via the signal handler. Probing
+    ///   the pty's termios from the master side would need `libc`/`nix` in the
+    ///   harness, which this module deliberately avoids (see
+    ///   [`deliver_signal_and_wait`](Self::deliver_signal_and_wait), which shells
+    ///   out to `kill(1)` for the same reason).
+    ///
+    /// As with the signal path, only harness faults are `Err`; the exit *value*
+    /// and terminal restoration are asserted by the scenario's `Then` steps.
+    pub async fn press_ctrl_c_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        self.send("\u{3}")?;
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
+    /// The exit code recorded by the most recent
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) or
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait), read back by the
+    /// scenario's `Then` step to assert the expected `128 + signo` value.
+    #[must_use]
+    pub const fn observed_exit_code(&self) -> Option<i32> {
+        self.observed_exit_code
+    }
+
+    /// Assert the terminal was restored on exit: the child left the alternate
+    /// screen and made the cursor visible again. A TUI that dies on a signal
+    /// without running its restore path leaves both inverted (still on the
+    /// alt-screen, cursor hidden) — the broken state that needs a `reset`.
+    ///
+    /// Reuses the public [`in_alternate_screen`](Self::in_alternate_screen)
+    /// rather than carrying a second, byte-identical alt-screen probe.
+    pub fn expect_terminal_restored(&self) -> Result<(), String> {
+        let on_alt = self.in_alternate_screen();
+        let cursor_hidden = self.cursor_hidden();
+        if on_alt || cursor_hidden {
+            return Err(format!(
+                "terminal was not restored on exit (alternate_screen={on_alt}, cursor_hidden={cursor_hidden}); expected the process under test to leave the alt-screen and show the cursor.\n{}",
+                self.framed_screen()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the emulated cursor is currently hidden.
+    fn cursor_hidden(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .hide_cursor()
+    }
+
+    /// Whether the emulated terminal is currently in the alternate screen — the
+    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
+    /// refusal that never takes over the terminal this must stay `false`.
+    #[must_use]
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero — journeys whose success case is a specific *nonzero*
+    /// code (a declined confirmation, a signal exit) need the code rather than
+    /// [`wait_for_exit`](Self::wait_for_exit)'s zero-only assertion.
+    ///
+    /// The reader gets a bounded window to consume the final frame first: the
+    /// terminal-restore sequences a signal handler emits arrive immediately
+    /// before the process exits, so the parser must see them before restoration
+    /// is asserted.
+    ///
+    /// That drain runs on *every* path through here, including callers that
+    /// predate the signal scenarios ([`wait_for_exit`](Self::wait_for_exit), and
+    /// through it [`quit_and_wait`](Self::quit_and_wait)). It is not gated on the
+    /// caller needing it, because the frame is just as buffered after a `q` as
+    /// after a signal. It ends the moment the reader thread sees EOF — the usual
+    /// case, costing about one [`POLL_INTERVAL`] — with [`DRAIN_TIMEOUT`] as the
+    /// ceiling a wedged PTY can impose.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finished = true;
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                    self.record_once(code);
+                    self.drain_final_frame(None).await?;
+                    return Ok(code);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for the TUI to exit.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Let the reader thread consume any bytes still buffered after the child
+    /// exits (its final restore sequences) for a short bounded window, so the
+    /// emulated screen reflects the terminal's final state before it is read. A
+    /// single poll is not enough when a large frame is still buffered behind the
+    /// process exit notification.
+    ///
+    /// The one drain loop for both exit paths, so they cannot drift: pass
+    /// `stop_on: Some(marker)` to also return as soon as `marker` appears (that
+    /// caller is racing the drain against a screen assertion), or `None` to just
+    /// wait out the window. Returns whether `stop_on` was found; `Err` if the
+    /// reader thread panicked, which must win over the caller's generic timeout
+    /// or "process exited" message (and would otherwise be swallowed entirely
+    /// when `Drop` runs during another unwind).
+    async fn drain_final_frame(&mut self, stop_on: Option<&str>) -> Result<bool, String> {
+        let found =
+            |session: &Self| stop_on.is_some_and(|marker| session.screen_text().contains(marker));
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        loop {
+            if found(self) {
+                return Ok(true);
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(self.drain_panic_message(stop_on, &panic_message));
+            }
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                || Instant::now() >= drain_deadline
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        // Final checks after the drain window closes: the reader may have
+        // committed the last frame — or panicked — between the loop's checks and
+        // the `is_finished`/deadline exit, so re-read before declaring failure.
+        if found(self) {
+            return Ok(true);
+        }
+        if let Some(panic_message) = self.take_reader_panic() {
+            return Err(self.drain_panic_message(stop_on, &panic_message));
+        }
+        Ok(false)
+    }
+
+    /// Reader-panic diagnostic for [`drain_final_frame`], naming the marker the
+    /// drain was racing when there was one.
+    fn drain_panic_message(&self, stop_on: Option<&str>, panic_message: &str) -> String {
+        let context = stop_on.map_or_else(String::new, |marker| format!(" for {marker:?}"));
+        format!(
+            "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
+            self.framed_screen()
+        )
     }
 }
 

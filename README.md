@@ -155,9 +155,13 @@ small front-door menu that gets you to the common tasks:
 - **Chat** — talk to a local or API-backed model
 - **Open full dashboard →** — escalate into the live dashboard (`rocm dash`)
 
-Pick a row with the arrow keys and `Enter`; press `q` to quit. On a
-non-interactive terminal (or piped output), `rocm` prints a one-shot status
-summary instead of opening the launcher.
+Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which quits
+from the launcher and the dashboard alike and restores your terminal — to quit.
+The one exception is the dashboard's console for a **running** job, where
+`Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
+that job finishes, `Ctrl-C` quits there too. On a non-interactive terminal (or
+piped output), `rocm` prints a one-shot status summary instead of opening the
+launcher.
 
 ## Interactive interfaces
 
@@ -199,7 +203,11 @@ rocm install sdk
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it.
+creates a separate managed runtime alongside it. Running the command when a
+managed runtime is already the active default asks first, because the new
+install takes over as the active default; see
+[ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
+for that gate and the flags that approve it without a prompt.
 
 Then serve a model:
 
@@ -218,10 +226,13 @@ form works depends on the engine your GPU selects.
 |---|---|
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
+| `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
+| `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm dash` | Open the full-screen telemetry dashboard |
+| `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
 | `rocm version` | Print the rocm-cli version |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
@@ -245,25 +256,93 @@ that framework; `skip` runs no framework probe at all, which is fastest and
 still enough to answer GPU and driver questions. `--framework` only affects
 the JSON report, not the human-readable one.
 
+### Diagnose and fix
+
+```
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
+```
+
+`diagnose` matches this machine against a fixed catalog of known
+ROCm/PyTorch/llama.cpp misconfigurations and ranks what it finds. It can only
+recognise failure modes that are in the catalog: no match means "not
+recognised", not "nothing is wrong" — in that case it points you at where to
+report the symptom. Each result prints an `id:` and an `apply with:` command;
+the leading `#1`, `#2` are ranking positions for reading order only — `rocm
+fix` takes the id, not the position.
+
+- `--symptom` takes raw error text to sharpen keyword scoring.
+- `--top` caps how many matches are shown in the human-readable output
+  (default 5) — `--json` always emits the full, untruncated report.
+- `--distro` diagnoses a WSL distribution from the Windows host instead of
+  this machine (nothing needs to be installed inside the distribution — name
+  it only when more than one is installed). Inspecting remotely this way
+  skips checks that need to read the distribution's own environment
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
+  `rocm diagnose` inside the distribution for those.
+
+`fix` applies a known fix by the `id:` that `diagnose` reported — not the
+ranking position noted above, which isn't a stable name. Run it with no id
+to list the whole catalog. Each fix is marked AUTO (this command carries out
+the change) or PRINT-ONLY (it prints the steps for you to run yourself —
+usually because the right command depends on a choice only you can make,
+sometimes because it also needs sudo or a reboot).
+
+- `--dry-run` shows any fix's plan without changing anything.
+- `--yes` skips the interactive confirmation once you've reviewed it.
+- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`;
+  without it, that fix only prints the `rocminfo` (Linux) or `hipInfo.exe`
+  (Windows) query needed to find the index and makes no change, despite
+  being marked AUTO.
+
 ### ROCm installation
 
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
 rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
-                    [--json] [--timeout-secs SECS]
+                    [--json] [--timeout-secs SECS] [--yes]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it. `--json` prints the check result as a single line of JSON instead
-of text; `--timeout-secs` bounds its network calls (`--timeout-secs` requires
-`--json`; both conflict with `--apply`).
+by rocm-cli. An install with no active default runtime never prompts, but once a
+managed runtime is the active default every `install sdk` asks first, because
+the new install takes over as the active default. That gate is not scoped to the
+family or channel you are installing: a `--family` or `--channel` you have never
+installed before takes over the active default just as a same-family upgrade
+does, so it asks too. To approve that non-interactively — in scripts or CI, where
+the prompt would otherwise refuse — pass `--approve-replacing-active-default`,
+which is also what the refusal itself recommends and what ROCm CLI's own
+non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
+approval *and* approves installing required system packages (such as OpenMPI for
+vLLM), which means `sudo`; reach for it only where something can answer a sudo
+password prompt — which an unattended job cannot, unless it has passwordless sudo
+configured. In the default managed install root, the root and its manifest are
+keyed by version, so an upgrade or downgrade keeps the previous install on disk
+and only a same-version reinstall reuses the same root. `--prefix` opts out of
+that: the folder you name is used verbatim for every version, so successive
+installs into one prefix replace each other in place — and if the venv already
+there no longer runs its own Python, it is removed outright and rebuilt. The
+consent gate does not cover that: it asks about changing the active default
+runtime, not about what a named prefix loses. `install driver` installs the AMD
+kernel driver on Linux (DKMS or native package). `update` checks for a newer
+ROCm package; pass `--apply` to install it, or `--dry-run` to preview what
+`--apply` would do without changing anything (`--dry-run` does not require
+`--apply`). `--runtime` and `--activate` require `--apply` or `--dry-run` — pass
+one of those instead of naming a runtime or requesting activation on its own.
+`--json` prints the check result as a single line of JSON instead of text;
+`--timeout-secs` bounds its network calls (`--timeout-secs` requires `--json`;
+both `--json` and `--timeout-secs` conflict with `--apply`, and `--json` also
+conflicts with `--dry-run`). `update --apply` never prompts and needs no
+approval flag: selecting a runtime to update is itself the approval, and it
+leaves the active default alone unless you add `--activate`. `update` does
+accept `--yes`, for consistency with other mutating commands, but it grants
+nothing there — the approval line the update path prints never credits it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
@@ -290,17 +369,21 @@ empty — it tells you what it could not find instead.
 
 ### Runtime management
 
-Manage multiple side-by-side ROCm installs:
+Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
 rocm runtimes activate <runtime-key>
 rocm runtimes rollback
-rocm runtimes uninstall <runtime-key>
+rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`uninstall` prompts for confirmation unless `--yes` is passed; outside an
+interactive terminal `--yes` is required. `--dry-run` prints the plan and
+exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
 runtime. It does not work with standard ROCm package installs (for example,
@@ -308,7 +391,7 @@ runtime. It does not work with standard ROCm package installs (for example,
 
 ### Disk space
 
-Each ROCm install keeps its own multi-gigabyte folder, so installing or
+Each ROCm runtime keeps its own multi-gigabyte folder, so installing or
 updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
@@ -438,6 +521,38 @@ and a chat tab backed by any configured provider. See
 - `--replay <file>` replays a recorded NDJSON session.
 - Live mode requires Unix domain sockets (Linux and WSL only).
 
+### Bench
+
+```
+rocm bench load --endpoint URL [--model NAME] [--concurrency N,N,...]
+                [--isl N] [--osl N] [--requests N] [--out FILE] [--auto-ramp]
+```
+
+Saturates a local OpenAI-compatible endpoint and reports rough client-side
+throughput — a local smoke test, **not** an official ROCm/AMD benchmark.
+`load` measures raw serving throughput with synthetic single-shot requests
+(the vLLM `benchmark_serving` shape); it does not reproduce agent-shaped,
+multi-turn, long-context tool traffic and isn't comparable to `*-agent-bench`
+quality harnesses.
+
+- `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
+  plain host address without `/v1` also works); only `http://` is accepted —
+  `https://` endpoints are rejected outright, since the load generator has no
+  TLS backend compiled in.
+- `--concurrency` sweeps a comma-separated list of levels (default
+  `1,8,32,64`, each 1-128); `--auto-ramp` ignores `--concurrency` and instead
+  ramps `1,2,4,8,16,32,64,128` automatically, stopping early once generation
+  throughput plateaus or the request queue backs up.
+- `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
+  1-32768, and `--requests` (default 128) accepts 1-10000.
+- Results are written to `--out` (default `<data-dir>/bench/results.csv`,
+  where `<data-dir>` is `~/.rocm` unless overridden), intended to match the
+  path the daemon tails to feed the dashboard's **Observe** tab. The CLI's
+  default output path and the daemon's tailed path are computed
+  independently, so if either the CLI's data dir or the daemon's
+  `bench_results_dir` config has been customized, confirm they still point
+  at the same file.
+
 ### Chat
 
 ```
@@ -455,13 +570,17 @@ use the provider's default.
 Install and manage ComfyUI for image generation (alias: `rocm comfy`):
 
 ```
-rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run]
-rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser]
-rocm comfyui stop
+rocm comfyui install    [--runtime-id KEY] [--reinstall] [--dry-run] [--yes]
+rocm comfyui start      [--host HOST] [--port PORT] [--no-open-browser] [--yes]
+rocm comfyui stop       [--yes]
 rocm comfyui status
 rocm comfyui logs       [--lines N]
 rocm comfyui models-path
 ```
+
+None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
+accepted on each for consistency with other mutating commands but currently
+has no effect.
 
 ### Automations
 
@@ -495,6 +614,19 @@ rocm config disable-provider <provider>
 rocm config set-provider-key <provider>
 rocm config clear-provider-key <provider>
 ```
+
+### Setup
+
+```
+rocm setup status
+rocm setup reset
+```
+
+Manage first-time setup state. `status` shows whether first-time setup has
+completed; `reset` clears the recorded completed/dismissed state (nothing
+auto-triggers onboarding from this alone — open it manually from the
+dashboard, `rocm dash`: switch to the **Observe** tab, then press `n`). ROCm
+installs, API keys, and provider settings are left untouched.
 
 ### Logs and cleanup
 
