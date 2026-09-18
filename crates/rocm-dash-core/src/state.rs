@@ -41,18 +41,19 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    /// Single glyph (with trailing space) used everywhere a job's status is
-    /// shown as an icon: the job console banner and the Home tab activity
-    /// feed (both the per-job row and its hardcoded legend, so the legend
-    /// can't drift from the glyphs it's explaining). Centralized so those
-    /// renderers can't drift apart on which glyph means what.
+    /// Single glyph (no trailing space — callers add their own spacing) used
+    /// everywhere a job's status is shown as an icon: the job console banner
+    /// and the Home tab activity feed (both the per-job row and its legend
+    /// via [`Self::legend_glyphs`], so the legend can't drift from the glyphs
+    /// it's explaining). Centralized so those renderers can't drift apart on
+    /// which glyph means what.
     pub const fn glyph(&self) -> &'static str {
         match self {
-            Self::Running => "⋯ ",
-            Self::Done { code: 0 } => "✓ ",
-            Self::Done { .. } => "! ",
-            Self::Failed { .. } => "✗ ",
-            Self::Cancelled => "○ ",
+            Self::Running => "⋯",
+            Self::Done { code: 0 } => "✓",
+            Self::Done { .. } => "!",
+            Self::Failed { .. } => "✗",
+            Self::Cancelled => "○",
         }
     }
 
@@ -65,6 +66,23 @@ impl JobStatus {
             Self::Failed { message } => format!("failed: {message}"),
             Self::Cancelled => "cancelled".to_string(),
         }
+    }
+
+    /// Representative glyphs for a status legend, in display order
+    /// done/warn/failed/running/cancelled. Derived from real `JobStatus`
+    /// values via [`Self::glyph`] (rather than a second hardcoded copy of the
+    /// glyph table) so the legend can't drift from what real jobs render.
+    pub fn legend_glyphs() -> [&'static str; 5] {
+        [
+            Self::Done { code: 0 }.glyph(),
+            Self::Done { code: 1 }.glyph(),
+            Self::Failed {
+                message: String::new(),
+            }
+            .glyph(),
+            Self::Running.glyph(),
+            Self::Cancelled.glyph(),
+        ]
     }
 }
 
@@ -300,17 +318,33 @@ mod tests {
 
     #[test]
     fn job_status_glyph_covers_all_variants() {
-        assert_eq!(JobStatus::Running.glyph(), "⋯ ");
-        assert_eq!(JobStatus::Done { code: 0 }.glyph(), "✓ ");
-        assert_eq!(JobStatus::Done { code: 1 }.glyph(), "! ");
+        assert_eq!(JobStatus::Running.glyph(), "⋯");
+        assert_eq!(JobStatus::Done { code: 0 }.glyph(), "✓");
+        assert_eq!(JobStatus::Done { code: 1 }.glyph(), "!");
         assert_eq!(
             JobStatus::Failed {
                 message: "boom".into()
             }
             .glyph(),
-            "✗ "
+            "✗"
         );
-        assert_eq!(JobStatus::Cancelled.glyph(), "○ ");
+        assert_eq!(JobStatus::Cancelled.glyph(), "○");
+    }
+
+    #[test]
+    fn job_status_legend_glyphs_match_glyph() {
+        let [done, warn, failed, running, cancelled] = JobStatus::legend_glyphs();
+        assert_eq!(done, JobStatus::Done { code: 0 }.glyph());
+        assert_eq!(warn, JobStatus::Done { code: 1 }.glyph());
+        assert_eq!(
+            failed,
+            JobStatus::Failed {
+                message: "anything".into()
+            }
+            .glyph()
+        );
+        assert_eq!(running, JobStatus::Running.glyph());
+        assert_eq!(cancelled, JobStatus::Cancelled.glyph());
     }
 
     #[test]
