@@ -1038,7 +1038,10 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: false,
+            // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
+            // true, runner: run_hip_visible_devices) -- `rocm fix` can already
+            // carry this out on Linux, so the report must not claim otherwise.
+            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
