@@ -83,3 +83,23 @@ Feature: Local server record cleanup
     Then the CLI names the file it could not remove and exits non-zero
     And the record's other files are gone
     And the prune is still recorded in the audit log
+
+  # `rocm serve` writes the 0600 endpoint key file *before* it writes the
+  # record, so a server that is still coming up has a key with no record beside
+  # it — exactly what the leftover sweep above looks for. Sweeping on that shape
+  # alone let a concurrent `--any-age` prune delete a live server's key. So a
+  # leftover written in the last minute is kept whatever age was asked for,
+  # while the records `--any-age` exists to remove are untouched by that floor:
+  # a record file on disk is what makes its companions not-leftovers in the
+  # first place. This scenario asserts both halves in one run.
+  #
+  # Planted as on-disk state rather than raced against a real launch: that file
+  # is all the sweep decides on, and racing it would only make the scenario
+  # flaky.
+  @id:service-cleanup-keeps-a-key-a-launch-is-still-writing
+  Scenario: service-cleanup-07 - A key file written moments ago with no record survives --any-age
+    Given a local server record that is no longer running
+    And an endpoint key file written moments ago whose record does not exist yet
+    When the user prunes every record whatever its age
+    Then every file belonging to that record is gone
+    And the endpoint key file of the starting server is still there

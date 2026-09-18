@@ -25,6 +25,10 @@ const ENGINE: &str = "vllm";
 /// A record whose manifest a user already deleted by hand, leaving its engine
 /// state file stranded — the state this feature has to be able to clean up.
 const ORPHAN_ID: &str = "vllm-e2e-hand-deleted";
+/// A service whose `rocm serve` has written its 0600 endpoint key but not yet
+/// its record — the launch-in-progress shape the leftover sweep must not
+/// mistake for something to delete.
+const STARTING_ID: &str = "vllm-e2e-still-starting";
 
 fn data_dir(world: &E2eWorld) -> PathBuf {
     world
@@ -157,15 +161,8 @@ async fn record_still_running(world: &mut E2eWorld) {
 #[given("a local server record whose server died long ago and was never listed since")]
 async fn record_died_long_ago(world: &mut E2eWorld) {
     plant_record(world, "ready");
-    let month_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(24 * 30);
     for path in record_files(world) {
-        let handle = std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap_or_else(|error| panic!("failed to open {} : {error}", path.display()));
-        handle
-            .set_modified(month_ago)
-            .unwrap_or_else(|error| panic!("failed to backdate {} : {error}", path.display()));
+        backdate(&path, std::time::Duration::from_hours(24 * 30));
     }
 }
 
@@ -190,15 +187,45 @@ async fn engine_state_cannot_be_deleted(world: &mut E2eWorld) {
     );
 }
 
+/// A leftover from a record the user deleted by hand — and therefore one that
+/// has been sitting there a while.
+///
+/// Backdated deliberately: a file with no record beside it is also what a launch
+/// looks like in the moment between `rocm serve` writing the key and writing the
+/// record, so the sweep keeps such files for their first minute. An hour is past
+/// that floor and still far inside the 24-hour default, so the scenario keeps
+/// exercising the sweep and not the default age rule.
 #[given("an engine state file whose local server record was deleted by hand")]
 async fn orphaned_engine_state(world: &mut E2eWorld) {
     let states = engine_state_dir(world);
     std::fs::create_dir_all(&states).expect("failed to create engine state dir");
+    let orphan = states.join(format!("{ORPHAN_ID}.json"));
     std::fs::write(
-        states.join(format!("{ORPHAN_ID}.json")),
+        &orphan,
         serde_json::json!({ "status": "failed" }).to_string(),
     )
     .expect("failed to write orphaned engine state");
+    backdate(&orphan, std::time::Duration::from_hours(1));
+}
+
+/// The 0600 key file and nothing else — exactly what is on disk after `rocm
+/// serve` stores the endpoint key and before the record is written.
+///
+/// Not backdated, and that is the point: its freshness is the only thing
+/// distinguishing a launch under way from a leftover.
+#[given("an endpoint key file written moments ago whose record does not exist yet")]
+async fn key_of_a_starting_server(world: &mut E2eWorld) {
+    let services = services_dir(world);
+    std::fs::create_dir_all(&services).expect("failed to create services dir");
+    std::fs::write(
+        services.join(format!("{STARTING_ID}.endpoint-key")),
+        "live-endpoint-key",
+    )
+    .expect("failed to write endpoint key");
+    assert!(
+        !services.join(format!("{STARTING_ID}.json")).exists(),
+        "premise: the record must not be written yet"
+    );
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -365,6 +392,23 @@ async fn preview_lists_both(world: &mut E2eWorld) {
     );
 }
 
+#[then("the endpoint key file of the starting server is still there")]
+async fn starting_key_present(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let key = services_dir(world).join(format!("{STARTING_ID}.endpoint-key"));
+    assert!(
+        key.exists(),
+        "a key file written moments ago with no record beside it is a launch in \
+         progress, not a leftover:\n{}",
+        combined_output(world)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key).expect("failed to read the endpoint key back"),
+        "live-endpoint-key",
+        "the key the starting server is about to need must survive intact"
+    );
+}
+
 #[then("the leftover engine state file is gone")]
 async fn orphan_gone(world: &mut E2eWorld) {
     let orphan = engine_state_dir(world).join(format!("{ORPHAN_ID}.json"));
@@ -448,6 +492,17 @@ fn record(world: &mut E2eWorld, stdout: String, stderr: String, rc: i32) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// Stamp `path`'s modification time `ago` into the past, so a scenario can put a
+/// fixture on either side of an age gate without sleeping.
+fn backdate(path: &std::path::Path, ago: std::time::Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("failed to open {} : {error}", path.display()))
+        .set_modified(std::time::SystemTime::now() - ago)
+        .unwrap_or_else(|error| panic!("failed to backdate {} : {error}", path.display()));
 }
 
 fn combined_output(world: &E2eWorld) -> String {

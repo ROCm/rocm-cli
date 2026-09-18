@@ -264,6 +264,12 @@ Expected result:
 - A record whose server died long ago but has not been listed since is still
   removed by a plain `rocm services prune --yes`: age is read from the record
   file as it was before the command refreshed it, not after.
+- Leftover files are kept for their first minute even under `--any-age`: drop a
+  `<data>/services/zz-not-a-record.endpoint-key` with no matching `.json` beside
+  it and `rocm services prune --any-age --yes` leaves it alone, while still
+  removing every record and every leftover older than that. `rocm serve` writes
+  the endpoint key before the record, so without that floor a prune running
+  during a launch could delete a live server's key.
 
 ## 5. ComfyUI Verification
 
