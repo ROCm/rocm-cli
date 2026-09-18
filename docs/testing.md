@@ -153,8 +153,35 @@ rocm install sdk --channel release --format wheel --dry-run
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
 
 ```bash
-rocm install sdk --channel release --format wheel
+rocm install sdk --channel release --format wheel --yes
 ```
+
+`--yes` approves replacing whatever managed runtime is currently the active
+default without prompting, which keeps the command non-interactive when the test
+root is reused across runs (a root with no active default runtime never
+prompts). The gate is not scoped to the family or channel being installed, so
+`--yes` is needed on a reused root even when the install targets a family that
+root has never held. It matches the invocation in
+`scripts/therock_sdk_install_test.py`.
+
+`--yes` is used here because this test also wants the second approval it
+carries: installing required system packages with `sudo`. When all you need is
+to clear the active-default gate — the usual case for a script or a CI job —
+pass the narrower `--approve-replacing-active-default` instead. That is the flag
+the refusal message itself recommends, and the only one ROCm CLI's own
+terminal-less surfaces pass. Without either flag, the same command on a reused
+root prompts when a terminal is attached and fails outright when one is not; the
+failure names the flag to add, so read the message before treating it as a
+regression. Check both routes by hand after changing the gate:
+
+```bash
+rocm install sdk --channel release --format wheel --approve-replacing-active-default
+rocm install sdk --channel release --format wheel < /dev/null   # expect the refusal
+```
+
+The preview path is unaffected: `--dry-run` returns before the gate is
+consulted, so `rocm install sdk --channel release --format wheel --dry-run`
+never prompts and never refuses, whatever the active default is.
 
 Then it verifies:
 

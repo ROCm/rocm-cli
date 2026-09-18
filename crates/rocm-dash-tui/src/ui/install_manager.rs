@@ -153,6 +153,18 @@ impl InstallManagerState {
         }
         if self.dry_run {
             args.push("--dry-run".to_string());
+        } else {
+            // The dashboard spawns `rocm` with null stdin, so a real install
+            // that would displace the active default runtime cannot answer the
+            // confirmation prompt and would refuse. Approve the replacement so
+            // the dashboard install proceeds; the dry-run preview never mutates,
+            // so it needs no flag.
+            //
+            // Not `--yes`: that also approves running `sudo` for required system
+            // packages. This child has no stdin to answer a password prompt
+            // with, and the dashboard owns the terminal in raw mode, so a sudo
+            // prompt reaching `/dev/tty` would stall behind the TUI.
+            args.push("--approve-replacing-active-default".to_string());
         }
         Ok(args)
     }
@@ -478,6 +490,13 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--format", "tarball"]));
         assert!(args.windows(2).any(|p| p == ["--prefix", "/opt/rocm-sdk"]));
         assert!(!args.contains(&"--dry-run".to_string()));
+        // A real (non-dry-run) install must carry
+        // --approve-replacing-active-default so the null-stdin dashboard spawn
+        // is not refused at the consent prompt. Deliberately not --yes, which
+        // would also approve a `sudo` system-package install this spawn has no
+        // terminal to answer a password prompt on.
+        assert!(args.contains(&"--approve-replacing-active-default".to_string()));
+        assert!(!args.contains(&"--yes".to_string()));
     }
 
     #[test]
