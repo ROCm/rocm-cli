@@ -504,6 +504,64 @@ mod tests {
     }
 
     #[test]
+    fn logs_dock_tints_cancelled_as_muted() {
+        // Regression guard for the other intentional color change in this
+        // PR: `logs_dock` now maps `Cancelled` to `theme.muted` instead of
+        // the previous neutral `theme.fg`. Render through the real
+        // `logs_dock` path so a reintroduced hand-rolled match here would
+        // fail this test, not just the cross-file helper-comparison test.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "cancelled line".into(),
+        });
+        s.jobs.apply(StateEvent::CancelJob("build".into()));
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let row = buf
+            .content()
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("cancelled line")
+            })
+            .expect("rendered log line not found");
+        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let joined = symbols.concat();
+        let byte_offset = joined
+            .find("cancelled line")
+            .expect("log line text not found in row");
+        let mut acc = 0;
+        let col = symbols
+            .iter()
+            .position(|s| {
+                let start = acc;
+                acc += s.len();
+                byte_offset >= start && byte_offset < acc
+            })
+            .expect("start of log line text not found in row");
+        let fg = row[col].fg;
+        assert_eq!(fg, theme.muted, "cancelled job line should be theme.muted");
+        assert_ne!(
+            fg, theme.fg,
+            "cancelled job line must not stay the old neutral theme.fg"
+        );
+    }
+
+    #[test]
     fn context_rail_shows_sections() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.instances.insert(
