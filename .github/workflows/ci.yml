@@ -363,6 +363,13 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
 
+      # Runs here, on the GitHub-hosted lane, rather than on the GPU runners the
+      # reclaim protects: the matching rules are what regress, and they are
+      # provable against decoy processes with no GPU present.
+      - name: GPU reclaim self-test
+        if: needs.changes.outputs.heavy == 'true'
+        run: bash scripts/reclaim-gpu.sh --self-test
+
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
