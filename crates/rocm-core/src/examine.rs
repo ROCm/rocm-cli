@@ -583,7 +583,7 @@ pub(crate) fn which(program: &str) -> bool {
     false
 }
 
-const SHORT: Duration = Duration::from_secs(5);
+pub(crate) const SHORT: Duration = Duration::from_secs(5);
 const MEDIUM: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------

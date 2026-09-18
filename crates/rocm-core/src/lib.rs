@@ -2709,6 +2709,52 @@ fn detect_driver_summary() -> DriverSummary {
     }
 }
 
+/// The amdgpu kernel module's version on Linux, if it reports one.
+///
+/// Prefers the sysfs attribute (a plain file read, no subprocess) that DKMS
+/// builds of amdgpu expose. Falls back to `modinfo`, which is the only source
+/// for the in-tree kernel module -- it doesn't populate
+/// `/sys/module/amdgpu/version` at all.
+fn detect_linux_amdgpu_driver_version() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+        let version = text.trim();
+        if !version.is_empty() {
+            return Some(version.to_owned());
+        }
+    }
+    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    if rc != 0 {
+        return None;
+    }
+    out.lines()
+        .find_map(|line| line.strip_prefix("version:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPU driver version for this machine.
+///
+/// Sourced however the current platform exposes it: the amdgpu kernel module
+/// on Linux, the AMD display driver on Windows, or -- inside WSL -- the
+/// Windows host's display driver, since that's the driver a WSL guest's GPU
+/// workloads actually depend on, not its own (driver-less) amdgpu module.
+pub fn detect_gpu_driver_version() -> Option<String> {
+    if is_wsl_host() {
+        return match detect_wsl_host_driver() {
+            WslHostDriverProbe::Version(version) => Some(version),
+            WslHostDriverProbe::Unreachable | WslHostDriverProbe::NoAmdDisplay => None,
+        };
+    }
+    if runtime_is_windows() {
+        return detect_windows_amd_display_driver();
+    }
+    if runtime_is_linux() {
+        return detect_linux_amdgpu_driver_version();
+    }
+    None
+}
+
 impl WslSummary {
     /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
     ///
@@ -2986,6 +3032,18 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         detail,
         version,
     }
+}
+
+/// The best unmanaged ("legacy") ROCm install on this host, if any.
+///
+/// [`detect_legacy_rocm_summary`] resolves the same thing but as part of the
+/// full [`ExamineSummary`] probe; this is the standalone version+path for a
+/// caller like `rocm version` that wants just the SDK identity as a fallback
+/// once it's already established no managed TheRock runtime is active.
+pub fn detect_legacy_rocm_sdk() -> Option<(String, PathBuf)> {
+    let install = discover_rocm_installs().into_iter().next()?;
+    let version = install.version?;
+    Some((version, install.path))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // ROCm installs the runtime DLL as lowercase `amdhip64.dll`

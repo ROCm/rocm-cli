@@ -100,10 +100,20 @@ jobs:
 
           # Build as the runner user so cached Cargo/rustup files are owned by
           # the runner (the host-side cache save step must be able to read them).
+          #
+          # ROCM_CLI_RELEASE_REF is forwarded explicitly: this container sees
+          # none of GitHub's own GITHUB_REF_* env, which `apps/rocm/build.rs`
+          # would otherwise fall back to (and which isn't set at all for a
+          # workflow_dispatch release, since the tag is an input, not a ref).
+          # The "Determine version" step above already resolved the one true
+          # release version; every version-reporting surface must embed that
+          # same value, not re-derive it from ambient context this container
+          # doesn't have.
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
+            -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -203,6 +213,12 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
+        # See the Linux job's "Build release binaries" step: the release ref
+        # must come from the resolved `release` job output, not ambient
+        # GITHUB_REF_* context (unset for a workflow_dispatch release, since
+        # the tag is an input there, not a ref) or local git state.
+        env:
+          ROCM_CLI_RELEASE_REF: ${{ needs.release.outputs.version }}
         run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle
