@@ -221,6 +221,22 @@ async fn open_instance_detail(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("instance detail did not open: {e}"));
 }
 
+#[when("the user shrinks the terminal until the detail body overflows")]
+async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
+    // The demo fixtures' `launch_args`/`env_vars` are too few to overflow the
+    // detail popup at either the default or the enlarged (`use_detail_size`)
+    // geometry — this is the only terminal size small enough to force it.
+    let tui = session(world);
+    tui.use_overflow_size()
+        .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
+    // The resize alone doesn't prove the app redrew at the new geometry yet;
+    // the popup title reappearing at the smaller size is that proof, ahead of
+    // the `Then` step's specific scroll-hint assertion.
+    tui.wait_for_screen("Instance · ", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("instance detail did not redraw after shrinking: {e}"));
+}
+
 #[when("the user opens the services manager")]
 async fn open_services_manager(world: &mut E2eWorld) {
     // Bound to `s` only on the Observe tab (`OpenServices`) — a manager opened
@@ -814,6 +830,16 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Instance · ", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("instance details did not appear: {e}"));
+}
+
+#[then("the instance detail footer shows the scroll hint")]
+async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
+    let tui = session(world);
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("↑/↓ scroll"),
+        "footer did not show the scroll hint once the detail body overflowed:\n{screen}"
+    );
 }
 
 #[then("the backdrop behind the popup is dimmed")]

@@ -273,3 +273,17 @@ Feature: Interactive dashboard
     When the user presses Ctrl-C in the launcher
     Then the launcher exits from the keystroke with code 130
     And the terminal is restored to the normal screen
+
+  @id:dash-instance-detail-scroll-hint @requires-os:linux
+  Scenario: dash-22 - Instance detail shows a scroll hint when content overflows
+    # The demo fixtures' launch_args/env_vars are too few to overflow the detail
+    # popup at the default or enlarged terminal size, so this shrinks the
+    # terminal until the args/env panes can't fit them, exercising the one path
+    # (render_footer's scrollable branch) unit tests can't reach end to end.
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens instance detail
+    And the user shrinks the terminal until the detail body overflows
+    Then the instance detail footer shows the scroll hint
+    When the user quits the dashboard
+    Then the dashboard exits successfully

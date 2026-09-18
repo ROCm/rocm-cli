@@ -44,6 +44,15 @@ const COLS: u16 = 80;
 /// cards (managed instances and live serving metrics).
 const DETAIL_ROWS: u16 = 40;
 const DETAIL_COLS: u16 = 120;
+/// Short enough that the instance-detail popup's `launch_args`/`env_vars`
+/// panes can't fit even the demo fixtures' handful of entries, forcing
+/// `render_body` to report a nonzero max scroll and the footer's `↑/↓ scroll`
+/// hint to appear — the only way to exercise that hint end to end, since the
+/// demo containers (`rocm-dash-daemon`'s `CONTAINERS`) don't carry enough
+/// launch_args/env_vars to overflow the popup at `ROWS`/`COLS` or
+/// `DETAIL_ROWS`/`DETAIL_COLS`, both of which only ever *enlarge* it.
+const OVERFLOW_ROWS: u16 = 20;
+const OVERFLOW_COLS: u16 = 90;
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -366,13 +375,13 @@ impl TuiSession {
         self.reader_failure.take_message()
     }
 
-    /// Resize both the real PTY and the emulated screen. The application receives
-    /// the normal terminal resize event; assertions continue to inspect exactly
-    /// what a user would see at the new geometry.
-    pub fn use_detail_size(&mut self) -> Result<(), String> {
+    /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
+    /// application receives the normal terminal resize event; assertions
+    /// continue to inspect exactly what a user would see at the new geometry.
+    fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
         let size = PtySize {
-            rows: DETAIL_ROWS,
-            cols: DETAIL_COLS,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -386,8 +395,21 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
-            .set_size(DETAIL_ROWS, DETAIL_COLS);
+            .set_size(rows, cols);
         Ok(())
+    }
+
+    /// Enlarge to [`DETAIL_ROWS`]x[`DETAIL_COLS`], for journeys that assert
+    /// rows below the dashboard's summary cards.
+    pub fn use_detail_size(&mut self) -> Result<(), String> {
+        self.resize_to(DETAIL_ROWS, DETAIL_COLS)
+    }
+
+    /// Shrink to [`OVERFLOW_ROWS`]x[`OVERFLOW_COLS`] — small enough that the
+    /// instance-detail popup's `launch_args`/`env_vars` panes can't fit the
+    /// demo fixtures' entries, forcing a scrollable body.
+    pub fn use_overflow_size(&mut self) -> Result<(), String> {
+        self.resize_to(OVERFLOW_ROWS, OVERFLOW_COLS)
     }
 
     /// Write raw bytes to the terminal (keystrokes/text). `Enter` is `"\r"`.
