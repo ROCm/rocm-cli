@@ -113,7 +113,6 @@ fn upstream_tracker(target: &str) -> &'static str {
         "lemonade" => "https://github.com/lemonade-sdk/lemonade/issues",
         "ollama" => "https://github.com/ollama/ollama/issues",
         "lm-studio" => "https://lmstudio.ai/docs/app  (use in-app support; no public repo)",
-        "amdgpu-install" => "https://repo.radeon.com  (raise via your AMD support contact)",
         _ => "https://github.com/ROCm/ROCm/issues",
     }
 }
@@ -605,7 +604,7 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# Compare to the live AMD matrix:".to_owned(),
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
             "# If your kernel is above the supported range, install the HWE".to_owned(),
-            "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
+            "# kernel that matches ROCm, then rerun `rocm install driver --dkms`.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
         auto_applicable: false,
@@ -858,11 +857,8 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         ));
     }
     commands.push("sudo apt update".to_owned());
-    commands.push("# If apt now resolves, reinstall via the correct method only:".to_owned());
-    commands.push(
-        "#   amdgpu-install --usecase=rocm,hip --no-dkms   # if you want amdgpu-install".to_owned(),
-    );
-    commands.push("#   or use the distro packages exclusively".to_owned());
+    commands.push("# If apt now resolves, reinstall via the repo-native flow only:".to_owned());
+    commands.push("#   rocm install driver".to_owned());
     let fix = Fix {
         summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve apt before re-running any installer.".to_owned(),
         commands,
@@ -1162,44 +1158,118 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
-fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
+/// Best-effort package-manager family for this host: prefer the family
+/// implied by the repo dir the marker files live under, since that's the
+/// config these commands act on, and fall back to the same `ID_LIKE`-aware
+/// resolver `openmpi` uses only when no repo file was found -- restricted to
+/// apt/dnf/zypper, the only families this check has remediation for: a
+/// pacman host (which `openmpi`'s resolver can return, for its own,
+/// unrelated library installers) falls back to `"apt"` like any other
+/// unrecognized family, rather than the remediation commands mismatching a
+/// real "pacman" answer.
+fn repo_pkg_family(e: &Examination) -> &'static str {
+    if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/apt/")) {
+        return "apt";
+    }
+    if e.rocm_repos_seen
+        .iter()
+        .any(|r| r.contains("/etc/yum.repos.d/"))
+    {
+        return "dnf";
+    }
+    if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/zypp/")) {
+        return "zypper";
+    }
+    // The two `match family` sites below only implement apt/dnf/zypper
+    // remediation (this check has no pacman-based repo-native ROCm install to
+    // recover, unlike `openmpi`'s library installers) -- filter the resolver's
+    // fourth possible answer out here, rather than let it silently fall
+    // through both matches' `_` arms and print an apt command on a pacman
+    // host.
+    crate::openmpi::resolve_package_manager(
+        &e.distro_id.to_ascii_lowercase(),
+        &e.distro_id_like.to_ascii_lowercase(),
+    )
+    .filter(|pm| {
+        matches!(
+            pm,
+            crate::openmpi::PackageManager::Apt
+                | crate::openmpi::PackageManager::Dnf
+                | crate::openmpi::PackageManager::Zypper
+        )
+    })
+    .map_or("apt", crate::openmpi::PackageManager::as_str)
+}
+
+fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let method = &e.rocm_install_method;
-    if method == "amdgpu-install" {
-        evidence.push("ROCm was installed via amdgpu-install".to_owned());
+    if method == "repo-native" {
+        evidence.push("ROCm was installed via the repo-native package-manager flow".to_owned());
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_DPKG_BROKEN);
     score += kw_score;
     evidence.extend(kw_ev);
-    if method == "amdgpu-install" && kw_score > 0 {
+    if method == "repo-native" && kw_score > 0 {
         score += 20;
     }
 
     if score <= 0 {
-        return zero("fix-12-installer", "amdgpu-install broken state");
+        return zero("fix-12-installer", "repo-native install broken state");
     }
+    let family = repo_pkg_family(e);
+    let mut commands = vec!["# Clear the half-configured package/DKMS state first.".to_owned()];
+    match family {
+        "apt" => {
+            commands.push("sudo dpkg --configure -a".to_owned());
+            commands.push("sudo apt-get install -f".to_owned());
+            commands.push("sudo apt-get purge -y amdgpu-dkms".to_owned());
+        }
+        "dnf" => commands.push("sudo dnf remove -y amdgpu-dkms".to_owned()),
+        "zypper" => commands.push("sudo zypper remove -y amdgpu-dkms".to_owned()),
+        _ => {}
+    }
+    commands.push(
+        "# Quarantine (do not delete) the repo files, then let the package manager".to_owned(),
+    );
+    commands.push("# forget the broken state before reinstalling.".to_owned());
+    if e.rocm_repos_seen.is_empty() {
+        commands.push(
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak   # or the yum/zypp equivalent".to_owned(),
+        );
+    } else {
+        for r in &e.rocm_repos_seen {
+            commands.push(format!(
+                "# sudo mv {r} {r}.bak     # quarantine, do not delete yet"
+            ));
+        }
+    }
+    commands.push(
+        match family {
+            "dnf" => "sudo dnf clean all",
+            "zypper" => "sudo zypper refresh",
+            _ => "sudo apt update",
+        }
+        .to_owned(),
+    );
+    commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
+    commands.push("rocm install driver --dkms --yes".to_owned());
+
     let fix = Fix {
-        summary: "Run amdgpu-install's documented uninstall sequence to clear the half-configured state, THEN reinstall without the flag that broke it.".to_owned(),
-        commands: vec![
-            "sudo amdgpu-install --uninstall".to_owned(),
-            "sudo apt autoremove --purge -y".to_owned(),
-            "sudo apt update".to_owned(),
-            "# Reinstall. Drop --accept-eula if you used it previously; the".to_owned(),
-            "# newer installer rejects it and leaves a half-configured repo.".to_owned(),
-            "sudo amdgpu-install --usecase=rocm,hip".to_owned(),
-        ],
+        summary: "Clear the half-configured package/DKMS state, quarantine the repo-native install's repo files, THEN reinstall via `rocm install driver --dkms --yes`.".to_owned(),
+        commands,
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
         auto_applicable: false,
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
-        notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
+        verify: "rocm examine --json | grep -q '\"rocm_install_method\": \"repo-native\"' && rocminfo | head -n 5".to_owned(),
+        notes: vec!["If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-12-installer",
-        "amdgpu-install left a broken state (repo regression / partial DKMS)",
+        "Repo-native install left a broken state (repo regression / partial DKMS)",
         score,
         evidence,
         fix,
@@ -2002,7 +2072,7 @@ const CHECKERS: &[Checker] = &[
     (check_9_igpu_dgpu_collision, &["linux", "windows"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
-    (check_12_amdgpu_install_broken, &["linux"]),
+    (check_12_repo_native_broken, &["linux"]),
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
@@ -3579,5 +3649,154 @@ mod tests {
         }
         assert_eq!(v["min_score_for_match"], 50);
         assert_eq!(v["high_confidence_threshold"], 75);
+    }
+
+    #[test]
+    fn repo_pkg_family_prefers_seen_repos_over_distro_id() {
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "apt");
+    }
+
+    #[test]
+    fn repo_pkg_family_detects_dnf_and_zypper_from_seen_repos() {
+        let mut e = linux_base();
+        e.rocm_repos_seen = vec!["/etc/yum.repos.d/amdgpu.repo".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        e.rocm_repos_seen = vec!["/etc/zypp/repos.d/amdgpu.repo".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "zypper");
+    }
+
+    #[test]
+    fn repo_pkg_family_falls_back_to_distro_id_when_no_repo_seen() {
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        assert_eq!(repo_pkg_family(&e), "zypper");
+
+        e.distro_id = "rocky".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        e.distro_id = "ubuntu".to_owned();
+        assert_eq!(repo_pkg_family(&e), "apt");
+    }
+
+    #[test]
+    fn repo_pkg_family_fallback_is_id_like_aware() {
+        // Amazon Linux has no ROCm repo file in this scenario and isn't in
+        // the old hardcoded list; it must not default to "apt".
+        let mut e = linux_base();
+        e.distro_id = "amzn".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        // A RHEL rebuild with an unrecognized ID must still resolve via
+        // ID_LIKE, same as openmpi's resolver.
+        let mut e = linux_base();
+        e.distro_id = "some-rhel-rebuild".to_owned();
+        e.distro_id_like = "rhel fedora".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+    }
+
+    #[test]
+    fn repo_pkg_family_falls_back_to_apt_on_pacman_hosts() {
+        // openmpi's resolver can answer "pacman" (it has its own, unrelated
+        // library installers for Arch et al.), but this check has no pacman
+        // remediation -- it must degrade to the same "apt" default as any
+        // other unhandled family, not surface "pacman" and hit both match
+        // arms' silently-wrong `_` cases downstream in check_12.
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        assert_eq!(repo_pkg_family(&e), "apt");
+    }
+
+    #[test]
+    fn repo_native_broken_fires_and_clears_state_before_reinstall() {
+        let mut e = linux_base();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
+        );
+        assert!(fix.verify.contains("repo-native"));
+        assert!(
+            hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "positive control: the repo-native evidence line must appear when the method really is repo-native: {:?}",
+            hit.evidence
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_does_not_claim_repo_native_evidence_for_other_install_methods() {
+        // Regression test: an empty symptom would short-circuit keyword_score to
+        // 0 before the install-method gate is ever reached, making this pass
+        // vacuously regardless of whether the gate works. Pass a real dpkg
+        // symptom instead, matching the positive-control test above, so fix-12
+        // still fires (kw_score alone clears MIN_SCORE_FOR_MATCH) but must not
+        // claim repo-native evidence for a non-repo-native install.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("dpkg keyword evidence alone should still surface fix-12");
+        assert!(
+            !hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "must not claim repo-native evidence for a non-repo-native install: {:?}",
+            hit.evidence
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_fires_on_dpkg_symptom_regardless_of_install_method() {
+        // The keyword score alone (half-configured + generic dpkg error = 75)
+        // clears MIN_SCORE_FOR_MATCH without the +20 repo-native bonus, so
+        // fix-12 still fires even when rocm_install_method isn't
+        // "repo-native" -- the method only adds confidence, it doesn't gate
+        // whether the check fires at all. See the sibling test above for the
+        // repo-native-evidence-line assertion this used to also make.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        assert!(
+            report.matched.iter().any(|d| d.id == "fix-12-installer"),
+            "dpkg keyword evidence alone should still surface fix-12"
+        );
     }
 }

@@ -61,6 +61,13 @@ async fn user_inspects_system(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user inspects the system as machine-readable JSON")]
+async fn user_inspects_system_as_json(world: &mut E2eWorld) {
+    let (stdout, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user asks for help")]
 async fn user_asks_help(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["help"]);
@@ -94,11 +101,16 @@ async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
         !repo_version.contains("${"),
         "repo_version still shows an unresolved shell placeholder: {repo_version:?}\n{output}"
     );
+    // The default, unoverridden value is the literal "latest" (ROCM_CLI_AMDGPU_DRIVER_VERSION
+    // is unset on a normal test host) -- not a numeric ROCm version -- so only
+    // non-empty and metacharacter-safe are asserted here, matching the same
+    // filter build_driver_install_plan applies before this value ever reaches
+    // a single-quoted shell command.
+    assert!(!repo_version.is_empty(), "repo_version is empty:\n{output}");
     assert!(
         repo_version
             .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_digit()),
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
         "repo_version is not a concrete version string: {repo_version:?}\n{output}"
     );
 }
@@ -323,6 +335,32 @@ fn parsed_json(world: &E2eWorld) -> serde_json::Value {
     let output = world.cli_output.as_ref().expect("no command was run");
     serde_json::from_str(output)
         .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{output}"))
+}
+
+#[then("the inspection reports a current install-method name")]
+async fn assert_install_method_is_current(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let method = json
+        .get("rocm_install_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // `probe_rocm_install` used to name these "amdgpu-install" and
+    // "tarball-or-other"; a whitelist (rather than pinning one value) is what
+    // keeps this hermetic across hosts -- which branch actually fires here
+    // depends on this machine's real /etc/apt (etc.) ROCm repo markers, not
+    // just on the CLI-managed install this scenario plants, so a host that
+    // happens to have a real ROCm repo configured (this includes some
+    // developer machines and self-hosted GPU runners, not just a clean mock
+    // lane) legitimately resolves to "repo-native" instead of
+    // "runfile-or-tarball". Either current name passing and either retired
+    // name failing is exactly the coverage a revert of the rename needs.
+    assert!(
+        matches!(
+            method,
+            "apt" | "dnf" | "zypper" | "repo-native" | "runfile-or-tarball" | "none"
+        ),
+        "expected a current rocm_install_method name, got {method:?}: {json}"
+    );
 }
 
 #[when("the user inspects the system both for reading and for scripting")]
