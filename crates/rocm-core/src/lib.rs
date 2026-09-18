@@ -6,9 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-#[cfg(windows)]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IsTerminal, Read, Write, stdin, stdout};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -51,7 +49,7 @@ pub use examine::{
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
-    process_start_ticks, terminate_verified,
+    identity_state_with_observed, process_start_ticks, terminate_verified,
 };
 use runtime::env_path_override;
 pub use runtime::{
@@ -608,6 +606,27 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let parts = http_get_with_auth(endpoint_url, path, endpoint_api_key, timeout)?;
+    if parts.status != 200 {
+        bail!("HTTP endpoint returned HTTP {}", parts.status);
+    }
+    Ok(parts.body)
+}
+
+/// GET `path` and return the response status alongside the body.
+///
+/// The GET sibling of [`http_post_json_with_auth`], and it exists for the same
+/// reason: a caller probing an endpoint has to tell "the server answered, with a
+/// refusal" apart from "the server never answered", and only the former proves
+/// something is alive on that port. [`http_get_text_with_auth`] collapses both
+/// into `Err` — correct for callers that only want a 200's body, wrong for
+/// anything deciding whether a port is still held.
+pub fn http_get_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
     let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
@@ -628,10 +647,12 @@ pub fn http_get_text_with_auth(
         .split_once("\r\n\r\n")
         .context("HTTP response was missing a body")?;
     let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("HTTP endpoint returned {status_line}");
-    }
-    Ok(body.to_owned())
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
 }
 
 /// POST a JSON body and return the response status line plus body.
@@ -864,19 +885,59 @@ pub fn openai_models_endpoint_has_model(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
+    Ok(
+        openai_models_endpoint_identity(endpoint_url, expected_model, endpoint_api_key, timeout)?
+            == EndpointIdentity::ServesExpectedModel,
+    )
+}
+
+/// What a listener said when asked which models it serves.
+///
+/// The distinction [`openai_models_endpoint_has_model`] cannot draw: it answers
+/// `false` both for "this is someone else's service" and for "this endpoint
+/// answered, but listed nothing". For a readiness poll those are the same — not
+/// ready either way — but for a caller deciding whether something still holds a
+/// port they are opposites. An engine that is up but has not populated its model
+/// list yet, or is mid-unload, lists nothing while very much holding the GPU.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointIdentity {
+    /// Listed a model matching the one asked about (or listed models when no
+    /// particular one was asked for).
+    ServesExpectedModel,
+    /// Listed models, none of which match — a different service on this port.
+    ServesOtherModels,
+    /// Answered `/v1/models` with an empty list. Says nothing either way about
+    /// whose service this is.
+    ListsNoModels,
+}
+
+/// Ask a listener which models it serves, keeping "listed nothing" distinct.
+pub fn openai_models_endpoint_identity(
+    endpoint_url: &str,
+    expected_model: Option<&str>,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
     let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
     let value = serde_json::from_str::<serde_json::Value>(body.trim())
         .context("failed to parse /v1/models JSON")?;
     let loaded_models = openai_loaded_model_ids(&value);
     if loaded_models.is_empty() {
-        return Ok(false);
+        return Ok(EndpointIdentity::ListsNoModels);
     }
     let Some(expected_model) = expected_model.filter(|value| !value.trim().is_empty()) else {
-        return Ok(true);
+        return Ok(EndpointIdentity::ServesExpectedModel);
     };
-    Ok(loaded_models
-        .iter()
-        .any(|loaded| model_refs_match(loaded, expected_model)))
+    Ok(
+        if loaded_models
+            .iter()
+            .any(|loaded| model_refs_match(loaded, expected_model))
+        {
+            EndpointIdentity::ServesExpectedModel
+        } else {
+            EndpointIdentity::ServesOtherModels
+        },
+    )
 }
 
 pub fn managed_service_endpoint_model_ready(
@@ -895,6 +956,29 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// [`managed_service_endpoint_model_ready`] without collapsing "listed nothing"
+/// into "not ours".
+///
+/// An empty `endpoint_url` is the one case with no listener to ask about at all,
+/// so it stays an error rather than being reported as an identity.
+pub fn managed_service_endpoint_identity(
+    record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
+    if record.endpoint_url.trim().is_empty() {
+        bail!("service record has no endpoint URL to identify");
+    }
+    let expected = if !record.canonical_model_id.trim().is_empty() {
+        Some(record.canonical_model_id.as_str())
+    } else if !record.model_ref.trim().is_empty() {
+        Some(record.model_ref.as_str())
+    } else {
+        None
+    };
+    openai_models_endpoint_identity(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
 /// How far along a managed service's endpoint is.
@@ -6241,6 +6325,28 @@ pub struct AutomationRuntimeState {
     pub running: bool,
     pub automations_enabled: bool,
     pub daemon_pid: u32,
+    /// The daemon's kernel start-time, captured at spawn, so `daemon_pid` can be
+    /// checked for PID recycling before anything signals it.
+    ///
+    /// `daemon_pid` alone is not safe to kill: this file survives a crash,
+    /// OOM-kill or reboot with `running` still true, after which the OS can
+    /// reissue that PID to an unrelated process. Pairing the PID with its
+    /// start-time makes a recycled PID detectable ([`identity_state`]).
+    ///
+    /// `None` on two very different occasions, which callers must not conflate:
+    /// a state file written before this field existed, and a platform without
+    /// `/proc` where [`process_start_ticks`] can never return anything.
+    ///
+    /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
+    /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm
+    /// — so **no recycling check happens at all** and a caller that signals on
+    /// that verdict is killing on a bare pid. Tell the two apart by asking the
+    /// platform: if [`process_start_ticks`] returns `Some` for a live pid while
+    /// this is `None`, the record predates the field and the pid is unverifiable;
+    /// if it returns `None`, no identity is obtainable here and best-effort is
+    /// the only option (macOS and Windows, permanently).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
     pub last_tick_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6262,15 +6368,21 @@ impl AutomationRuntimeState {
         Ok(Some(state))
     }
 
+    /// Publish the runtime state atomically.
+    ///
+    /// Written on every daemon tick, and read by `rocm uninstall` to decide
+    /// whether a background helper is still up. A plain `fs::write` leaves a
+    /// truncated file if the daemon dies mid-write, and uninstall has to treat an
+    /// unreadable state file as "cannot confirm the helper is stopped" — so a
+    /// crash at the wrong moment would block uninstall until the operator
+    /// repaired the file by hand.
     pub fn write(&self, paths: &AppPaths) -> Result<()> {
         paths.ensure()?;
         let path = paths.automation_state_path();
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self)
-                .context("failed to serialize automation runtime state")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .context("failed to serialize automation runtime state")?;
+        write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -7687,23 +7799,25 @@ impl ManagedServiceRecord {
         record
     }
 
+    /// Persist the record, atomically.
+    ///
+    /// Staged next to the manifest and published over it, so a concurrent reader
+    /// sees either the old record or the new one, never a half-written file. A
+    /// plain overwrite left a window in which a reader (`load_managed_services`,
+    /// or the uninstall gate that treats an unparseable manifest as a live server
+    /// it cannot account for) could observe a truncated record and act on it.
+    ///
+    /// Uses the workspace's one [`write_file_atomically`] rather than a local
+    /// rename: this runs on every status transition, including the ones the
+    /// uninstall stop pass performs, where a failed publish aborts the uninstall.
     pub fn write(&self) -> Result<()> {
         let mut host_record = self.clone();
         host_record.normalize_paths_for_host();
-        let parent = host_record
-            .manifest_path
-            .parent()
-            .context("service manifest path must have a parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
         let storage_record = host_record.with_storage_paths();
-        fs::write(
-            &host_record.manifest_path,
-            serde_json::to_vec_pretty(&storage_record)
-                .context("failed to serialize service record")?,
-        )
-        .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))?;
-        Ok(())
+        let bytes = serde_json::to_vec_pretty(&storage_record)
+            .context("failed to serialize service record")?;
+        write_file_atomically(&host_record.manifest_path, &bytes)
+            .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))
     }
 }
 
@@ -7975,6 +8089,178 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
+/// How many temp names to try before giving up on staging an atomic write.
+const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let mut file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_os_string();
+    file_name.push(".tmp-");
+    file_name.push(suffix);
+    Ok(parent.join(file_name))
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
+///
+/// The single implementation of the publish step for the whole workspace. It
+/// lives here rather than in each caller because the Windows half is not
+/// something to re-derive: a plain `rename` over an existing file is not
+/// reliable while another process holds the destination open (an antivirus or
+/// indexer scanning a file this CLI just wrote is enough), so an existing
+/// destination goes through `ReplaceFileW`. Callers that got this wrong would
+/// fail in the direction that matters — `ManagedServiceRecord::write` is on the
+/// uninstall stop path, where a failed publish is reported as a service that
+/// could not be stopped and aborts the whole uninstall.
+#[cfg(not(windows))]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
+///
+/// See the non-Windows twin for why this is centralized.
+#[cfg(windows)]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if path.try_exists()? {
+        return replace_file_windows(path, tmp);
+    }
+
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            // The destination can appear between the check and the rename.
+            if path.try_exists()? {
+                replace_file_windows(path, tmp)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement_wide: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
+    // remain alive for the duration of the synchronous Windows API call. The
+    // optional backup, exclude, and reserved pointers are intentionally null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Write `bytes` to `path` so a concurrent reader sees either the old contents
+/// or the new ones, never a half-written file.
+///
+/// Staged under a unique sibling name reserved with `create_new` — so two
+/// writers cannot pick the same scratch file — and published with
+/// [`publish_temp_file`]. A failed publish takes the scratch file with it.
+///
+/// Two limits worth knowing before reaching for this:
+///
+/// * **Atomic, not durable.** The staged bytes are `sync_all`ed before the
+///   publish, so a crash cannot leave a half-written or zero-length file. The
+///   containing *directory* is never fsynced, so the rename itself can still be
+///   lost by a power failure — the guarantee is that readers only ever see one
+///   complete version, not that the newest one survives a crash. That flush is
+///   held by construction, not by test: deleting it leaves every test green,
+///   because reproducing what it prevents needs a real crash between the write
+///   and the rename. Do not read a green suite as evidence it is still there.
+/// * **Permissions are not carried over.** This replaces the target inode with
+///   a freshly created file, so an existing file's mode does not survive (a
+///   difference from the `fs::write` it usually replaces), and the new file gets
+///   whatever the umask allows. What makes that acceptable today is only that
+///   every current caller writes non-sensitive state — *not* the containing
+///   directory, which `AppPaths::ensure` creates with plain `create_dir_all` and
+///   no mode of its own. A caller with something sensitive to write must set the
+///   mode explicitly here; it cannot lean on the directory.
+/// * **A symlink at `path` is replaced, not written through.** The publish is a
+///   rename onto `path` itself, so a symlink there is what gets replaced — where
+///   `fs::write` would have followed it and overwritten the target. That is the
+///   safer direction for state files (it cannot be aimed somewhere else by
+///   planting a link) but it is a behaviour change, so a caller that means to
+///   write through a link must resolve it first.
+pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    let mut reserved = None;
+    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+        let tmp = temp_sibling_path(path, &OsString::from(format!("{temp_id}-{attempt}")))?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                reserved = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
+    }
+    let Some((tmp, mut file)) = reserved else {
+        bail!(
+            "failed to reserve a temporary file next to {} after {ATOMIC_WRITE_TEMP_ATTEMPTS} \
+             attempts",
+            path.display()
+        );
+    };
+
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    // Flush before publishing. Without this the rename can reach the disk while
+    // the bytes have not, leaving a zero-length file after a crash — which for a
+    // service record is not a lost update but an unparseable manifest, and the
+    // uninstall gate refuses to remove anything while one of those exists.
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    drop(file);
+
+    publish_temp_file(&tmp, path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("failed to publish {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7982,6 +8268,266 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+
+    /// A private root for one test, removed on the way out.
+    fn atomic_write_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-atomic-write-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("failed to create the test root");
+        root
+    }
+
+    /// The scratch files `write_file_atomically` stages under, if any survived.
+    ///
+    /// `temp_sibling_path` names them `<file>.tmp-<pid>-<millis>-<attempt>`, so
+    /// a leftover is visible as a sibling containing `.tmp-`.
+    fn leftover_scratch_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("failed to read the test root")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect()
+    }
+
+    /// Linux/unix: relies on a rename replacing the directory entry while an
+    /// already-open descriptor keeps reading the previous inode. Windows
+    /// publishes through `ReplaceFileW` and does not offer the same observation.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_record_write_never_shows_a_reader_a_truncated_manifest() {
+        // `ManagedServiceRecord::write` runs on the uninstall stop path, where a
+        // torn manifest is not a lost update but an unparseable record that makes
+        // the gate refuse to remove anything.
+        //
+        // Asserting "the bytes landed" would not pin that: a plain `fs::write`
+        // also leaves correct final bytes and creates no scratch file, so such a
+        // test passes either way. The property only the atomic path has is what a
+        // *concurrent reader* sees — `fs::write` truncates the existing inode in
+        // place, so a reader holding it open watches the record disappear and
+        // come back, while the publish swaps in a new inode and leaves the old
+        // one whole. Hold the manifest open across a rewrite and require the old
+        // view to still be a complete, parseable record.
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = atomic_write_root("service-record-reader-safety");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-reader-safety",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().expect("seed the manifest");
+
+        // A reader that opened the manifest before the rewrite began.
+        let mut reader = fs::File::open(&record.manifest_path).expect("open the manifest");
+
+        record.status = "stopped".to_owned();
+        record.write().expect("rewrite the manifest");
+
+        reader.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut seen = Vec::new();
+        reader
+            .read_to_end(&mut seen)
+            .expect("read the open manifest");
+        let parsed: ManagedServiceRecord = serde_json::from_slice(&seen)
+            .expect("a reader holding the manifest open must never see a truncated document");
+        assert_eq!(
+            parsed.status, "ready",
+            "the open descriptor must still see the pre-write record, not a rewritten inode"
+        );
+
+        // And the published file is the new one.
+        let published: ManagedServiceRecord =
+            serde_json::from_slice(&fs::read(&record.manifest_path).expect("read back"))
+                .expect("the published manifest must parse");
+        assert_eq!(published.status, "stopped", "the rewrite must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_service_record_write_leaves_no_scratch_sibling() {
+        // This pins scratch-file hygiene, NOT atomic publishing: a plain
+        // `fs::write` creates no scratch file at all and would pass too. The
+        // atomicity property is pinned next door, by
+        // `a_service_record_write_never_shows_a_reader_a_truncated_manifest`,
+        // which fails against an in-place write.
+        //
+        // It still earns its place, but for a smaller reason than uninstall:
+        // scratch siblings are named `<record>.json.tmp-<pid>-<millis>-<attempt>`,
+        // whose extension is `tmp-…`, and both `unreadable_service_manifests`
+        // and the record loader filter on `extension == "json"` — so a leaked
+        // one is skipped, not mistaken for a corrupt record, and cannot abort
+        // uninstall. What this guards is directory hygiene: a publish that
+        // aborts between staging and rename leaves litter that accumulates
+        // silently, one file per failed write, in a directory an operator reads
+        // by hand.
+        let root = atomic_write_root("service-record-publish");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-atomic-publish",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write().expect("first publish");
+        record.status = "stopped".to_owned();
+        record
+            .write()
+            .expect("republish over the existing manifest");
+
+        let services_dir = paths.services_dir();
+        let stray = fs::read_dir(&services_dir)
+            .expect("read the services directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stray.is_empty(),
+            "publishing a record must leave no scratch manifest: {stray:?}"
+        );
+        let written = fs::read(&record.manifest_path).expect("read the manifest back");
+        let parsed: ManagedServiceRecord =
+            serde_json::from_slice(&written).expect("the published manifest must always parse");
+        assert_eq!(parsed.status, "stopped", "the republish must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_replaces_contents_and_leaves_no_scratch_file() {
+        // The publish must land the new bytes and take its staging file with it;
+        // a leaked scratch sibling in `services_dir` would be a file the uninstall
+        // gate has to reason about.
+        let root = atomic_write_root("replaces");
+        let target = root.join("record.json");
+        fs::write(&target, b"old contents").expect("seed the file");
+
+        write_file_atomically(&target, b"new contents").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&target).expect("read back"),
+            b"new contents",
+            "the published file must hold the new bytes"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a successful publish must leave no scratch file: {:?}",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Unix: needs a real symlink.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_replaces_a_symlink_instead_of_writing_through_it() {
+        // Documented behaviour, and a change from the `fs::write` this replaced:
+        // that followed a symlink and overwrote whatever it pointed at, while
+        // the publish here renames onto the path itself. Security-relevant in
+        // the safe direction — planting a link next to a state file can no
+        // longer redirect the write somewhere else — but a change, so it is
+        // pinned rather than left as prose.
+        let root = atomic_write_root("symlink-target");
+        let elsewhere = root.join("elsewhere");
+        fs::write(&elsewhere, b"must not be touched").expect("seed the link target");
+        let target = root.join("state.json");
+        std::os::unix::fs::symlink(&elsewhere, &target).expect("plant a symlink at the target");
+
+        write_file_atomically(&target, b"published").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&elsewhere).expect("read the link target"),
+            b"must not be touched",
+            "the write must not follow the symlink to its target"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read the published file"),
+            b"published",
+            "the published bytes must land at the path itself"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .expect("stat the published path")
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a regular file"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "no scratch file may survive a successful publish"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_creates_the_parent_directory() {
+        // `ManagedServiceRecord::write` targets a services dir that may not exist
+        // yet on a first write.
+        let root = atomic_write_root("creates-parent");
+        let target = root.join("nested").join("deeper").join("record.json");
+
+        write_file_atomically(&target, b"contents").expect("the write must succeed");
+
+        assert_eq!(fs::read(&target).expect("read back"), b"contents");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_cleans_up_when_publishing_fails() {
+        // A failed publish must not strand its staging file. The destination is a
+        // non-empty directory, which no platform will let a file replace, so the
+        // failure happens at the publish step with the scratch file already
+        // written — exactly the path that has to clean up after itself.
+        let root = atomic_write_root("publish-fails");
+        let target = root.join("record.json");
+        fs::create_dir_all(&target).expect("seed a directory where the file goes");
+        fs::write(target.join("occupant"), b"x").expect("make it non-empty");
+
+        let error = write_file_atomically(&target, b"contents")
+            .expect_err("replacing a non-empty directory must fail");
+
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a failed publish must remove its scratch file, got {:?} ({error:#})",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn file_lock_creates_missing_parent_dirs_and_lock_file() {
@@ -8289,6 +8835,145 @@ mod tests {
         )?);
 
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_model_list_is_not_reported_as_somebody_elses_service() -> Result<()> {
+        // `openai_models_endpoint_has_model` answers `false` both for "these are
+        // someone else's models" and for "this endpoint listed nothing". For a
+        // readiness poll that is fine — not ready either way. For a caller
+        // deciding whether something still holds a port they are opposites: an
+        // engine that is up but has not populated its list yet, or is
+        // mid-unload, lists nothing while holding the port and the GPU, and
+        // reading that as "not ours" removes the tooling out from under it.
+        //
+        // Four connections: an empty list and a stranger's list, asked twice —
+        // once through the enum, once through the bool wrapper. The wrapper is
+        // where the three-way answer collapses back to the readiness contract
+        // every existing caller depends on, and that single comparison is not
+        // pinned by asserting on the enum alone.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let empty = r#"{"data":[]}"#;
+            let stranger = r#"{"data":[{"id":"someone/else"}]}"#;
+            for body in [empty, stranger, empty, stranger] {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ListsNoModels,
+            "an empty list says nothing about whose service this is"
+        );
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ServesOtherModels,
+            "a list that names other models is the only real evidence of a stranger"
+        );
+
+        // Across the wrapper. Only `ServesExpectedModel` may read as ready:
+        // mapping either of the other two arms to `true` would tell every
+        // readiness caller that an endpoint listing nothing, or listing a
+        // stranger's model, is serving theirs.
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint listing nothing is not serving our model"
+        );
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint serving a stranger's model is not serving ours"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_reports_a_refusal_as_an_answer_not_as_a_failure() -> Result<()> {
+        // The distinction `http_get_text_with_auth` cannot make. Its `Err` means
+        // "no 200", which lumps a 401 from a live server together with a dead
+        // port — and a caller deciding whether something still holds a port has
+        // to tell those apart: only the refusal proves the port is held.
+        //
+        // Two connections: the same 401 read both ways.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let parts = http_get_with_auth(&endpoint, "/models", None, Duration::from_secs(2))?;
+        assert_eq!(
+            parts.status, 401,
+            "a refusal is an answer, and its status has to survive"
+        );
+        assert!(
+            http_get_text_with_auth(&endpoint, "/models", None, Duration::from_secs(2)).is_err(),
+            "the text helper still collapses every non-200 into an error"
+        );
+
+        server.join().expect("server thread should not panic")?;
+
+        // And an unreachable port is an error either way — the two must not
+        // collapse in the other direction.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let dead_port = dead.local_addr()?.port();
+        drop(dead);
+        assert!(
+            http_get_with_auth(
+                &format!("http://127.0.0.1:{dead_port}/v1"),
+                "/models",
+                None,
+                Duration::from_millis(500),
+            )
+            .is_err(),
+            "nothing answered, so there is no status to report"
+        );
         Ok(())
     }
 
