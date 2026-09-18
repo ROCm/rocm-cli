@@ -119,6 +119,26 @@ fn plant_record(world: &E2eWorld, status: &str) {
     std::fs::write(services.join("launch.lock"), "").expect("failed to write launch lock");
 }
 
+/// Does the default `services list` output carry a *live server row* for the
+/// planted record?
+///
+/// Both premise guards below mean "the CLI considers this server to be
+/// running", and the default view states that by listing the record among its
+/// rows — each of which opens with `- <service id>` on a line of its own.
+///
+/// Searching the whole output for the id instead would answer a different
+/// question. The default view also *mentions* records it is hiding: its "Past
+/// attempts" footer names the newest non-live record in a pasteable
+/// `Read the newest: rocm services logs <id>` line. A substring search reads
+/// that mention as "listed", which inverts both guards — the negative one fires
+/// on a record the list correctly hid, and the positive one would pass on a
+/// record the list refused to show.
+fn lists_live_server_row(listed: &str) -> bool {
+    listed
+        .lines()
+        .any(|line| line.trim_end().strip_prefix("- ") == Some(SERVICE_ID))
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("a local server record that is no longer running")]
@@ -128,7 +148,7 @@ async fn record_not_running(world: &mut E2eWorld) {
     // scenario would be exercising the running branch without saying so.
     let listed = crate::run_rocm_ok(world, &["services", "list"]);
     assert!(
-        !listed.contains(SERVICE_ID),
+        !lists_live_server_row(&listed),
         "premise: the planted record must read as not running:\n{listed}"
     );
 }
@@ -141,7 +161,7 @@ async fn record_still_running(world: &mut E2eWorld) {
     // considers this server to be running.
     let listed = crate::run_rocm_ok(world, &["services", "list"]);
     assert!(
-        listed.contains(SERVICE_ID),
+        lists_live_server_row(&listed),
         "premise: the planted record must read as running:\n{listed}"
     );
 }
