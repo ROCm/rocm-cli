@@ -34,6 +34,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod serving_steps;
+    pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;
     pub mod update_steps;

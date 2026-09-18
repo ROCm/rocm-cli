@@ -452,6 +452,34 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         ),
         PathUsage::measure("ROCm CLI cache folder", paths.cache_dir.clone(), None),
         PathUsage::measure("ROCm CLI data folder", paths.data_dir.clone(), None),
+        // One JSON record per `rocm serve --managed` launch, kept after the
+        // server exits. Never mentioned anywhere and nothing ever removed them,
+        // so the folder was invisible to a user asking what is on disk.
+        // Reported, never touched by any prune path here.
+        //
+        // The note names the engine log too, not just the record: `measure`
+        // walks the whole folder, and every managed launch leaves the engine's
+        // redirected stdout/stderr (`<service_id>.log`) beside the manifest.
+        // `ManagedServiceRecord::new` only *computes* that path (via
+        // `AppPaths::service_log_path`) - it writes nothing. The file is created
+        // by the launch site, `spawn_managed_engine_child` here in `main.rs` for
+        // `rocm serve --managed` and `supervise_service` in `rocmd` on the
+        // supervised/recovery path, both of which redirect the engine child's
+        // stdout/stderr into it. The `rocm serve --managed` path additionally
+        // hands the child a `--log-path` (see `builtin_engine_serve_http_args`),
+        // so the engine adapter appends the server's own output there too; the
+        // supervised path passes no such flag and gets only the redirect. Nothing
+        // rotates that log, so on a host that has served real models the size
+        // printed here is dominated by logs - a note promising only "small
+        // files" would contradict the number beside it.
+        PathUsage::measure(
+            "local server records",
+            paths.services_dir(),
+            Some(
+                "one record plus the engine log per local server launch, kept after it stops; list them with `rocm services list --all`"
+                    .to_owned(),
+            ),
+        ),
     ];
 
     let mut shared_with_other_tools = vec![PathUsage::measure(
@@ -535,6 +563,9 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
             usage.size_text(),
             usage.path.display()
         );
+        if let Some(note) = usage.note.as_deref() {
+            let _ = writeln!(output, "      note: {note}");
+        }
     }
 
     let _ = writeln!(output);
@@ -1323,6 +1354,71 @@ mod tests {
         assert!(rendered.contains("status: in use"));
         assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
         assert!(rendered.contains("downloaded models"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `rocm serve --managed` leaves one JSON record per launch, kept after the
+    /// server exits, and nothing ever removed them. The report never named the
+    /// folder, so a user asking what is on disk could not see it existed.
+    #[test]
+    fn report_lists_the_local_server_records_folder() -> Result<()> {
+        let (root, paths) = test_paths("report-services");
+        std::fs::create_dir_all(paths.services_dir())?;
+        std::fs::write(paths.services_dir().join("svc.json"), b"{}")?;
+
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+        assert!(rendered.contains("local server records"), "{rendered}");
+        assert!(
+            rendered.contains(paths.services_dir().display().to_string().as_str()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("list them with `rocm services list --all`"),
+            "{rendered}"
+        );
+        // The folder holds the engine's unrotated log as well as the record, and
+        // `measure` sums the whole tree - so the note has to name the log, or it
+        // contradicts the size printed next to it on a host that has served.
+        assert!(
+            rendered.contains("one record plus the engine log per local server launch"),
+            "{rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Rendering notes in the `ROCm CLI folders` loop was needed for the row
+    /// above, and it also made the two archive rows print the note they have
+    /// always carried in the data and in `--json`. That is the most actionable
+    /// line in the report - `rocm storage remove-downloads` acts on it - so pin
+    /// it rather than leaving it as an unwitnessed side effect a refactor could
+    /// drop again. Asserted against the row rather than anywhere in the output
+    /// because the note is per-row and the two rows carry the *same* string:
+    /// a `contains` check passes on either row alone, so dropping the note from
+    /// `downloaded helper tools` would stay green. Anchoring also pins what the
+    /// user reads - the `note: ` line directly under its own row - so a loop
+    /// that emitted the notes detached from the rows they describe, or beside
+    /// the wrong label, would be caught here instead of shipping.
+    #[test]
+    fn report_marks_the_re_downloadable_folders_as_safe_to_remove() -> Result<()> {
+        let (root, paths) = test_paths("report-download-notes");
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+
+        for label in ["downloaded ROCm archives", "downloaded helper tools"] {
+            let lines: Vec<&str> = rendered.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(&format!("- {label}:")))
+                .unwrap_or_else(|| panic!("no `{label}` row in:\n{rendered}"));
+            assert_eq!(
+                lines.get(at + 1).map(|line| line.trim()),
+                Some("note: can be downloaded again; safe to remove"),
+                "`{label}` must carry its note:\n{rendered}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
