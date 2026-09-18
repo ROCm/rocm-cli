@@ -208,7 +208,7 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let glyph = job.status.glyph();
         let color = theme.job_status_color(&job.status);
         lines.push(Line::from(vec![
-            Span::styled(glyph, Style::default().fg(color)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(job.cmd.clone(), Style::default().fg(theme.fg)),
         ]));
     }
@@ -220,20 +220,13 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     // Glyph key, appended last: `truncate` below already drops it whenever
     // there's no spare room, so it never displaces real activity on a
-    // squeezed card — no separate room check needed. Built from the same
-    // `JobStatus::glyph()` used above so the key can't drift from the real
+    // squeezed card — no separate room check needed. Built from
+    // `JobStatus::legend_glyphs()` so the key can't drift from the real
     // glyphs.
-    let done = JobStatus::Done { code: 0 }.glyph();
-    let warn = JobStatus::Done { code: 1 }.glyph();
-    let failed = JobStatus::Failed {
-        message: String::new(),
-    }
-    .glyph();
-    let running = JobStatus::Running.glyph();
-    let cancelled = JobStatus::Cancelled.glyph();
+    let [done, warn, failed, running, cancelled] = JobStatus::legend_glyphs();
     lines.push(Line::from(Span::styled(
         format!(
-            "● live  {done}done  {warn}warn  {failed}failed  {running}running  {cancelled}cancelled"
+            "● live  {done} done  {warn} warn  {failed} failed  {running} running  {cancelled} cancelled"
         ),
         Style::default().fg(theme.muted),
     )));
@@ -1156,9 +1149,9 @@ mod tests {
             message: "boom".into(),
         });
 
-        // Assert against `JobStatus::glyph()` itself (trimmed of its trailing
-        // space) rather than hardcoded glyph characters, so this test can't
-        // drift from the shared source of truth it's meant to guard.
+        // Assert against `JobStatus::glyph()` itself rather than hardcoded
+        // glyph characters, so this test can't drift from the shared source
+        // of truth it's meant to guard.
         let out = render(&s, 160, 30);
         for status in [
             JobStatus::Done { code: 0 },
@@ -1171,7 +1164,7 @@ mod tests {
         ] {
             let glyph = status.glyph();
             assert!(
-                out.contains(glyph.trim()),
+                out.contains(glyph),
                 "glyph for {status:?} ({glyph:?}) missing: {out:?}"
             );
         }
@@ -1213,13 +1206,12 @@ mod tests {
         let width = buf.area().width as usize;
         let theme = s.theme;
 
-        // The glyph is rendered as its own span immediately before the job
-        // name, as `"<glyph char><space>"` (see `JobStatus::glyph()`), with
-        // no separator in between — so the glyph cell sits exactly two cells
-        // before the job name's own starting cell. Locate that starting cell
-        // by byte offset (not by matching a specific character, which could
-        // land on unrelated chrome like panel borders).
-        let glyph_color_for = |name: &str| {
+        // Locate the row containing the job's name, then find the glyph cell
+        // within that row by its actual rendered symbol (from
+        // `JobStatus::glyph()`) rather than a fixed column offset from the
+        // name — so this test doesn't silently break if the spacing between
+        // the glyph and the job name ever changes.
+        let glyph_color_for = |name: &str, status: &JobStatus| {
             let row = buf
                 .content()
                 .chunks(width)
@@ -1230,30 +1222,38 @@ mod tests {
                         .contains(name)
                 })
                 .unwrap_or_else(|| panic!("row for {name} not found"));
-            let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
-            let joined = symbols.concat();
-            let byte_offset = joined
-                .find(name)
-                .unwrap_or_else(|| panic!("{name} not found in its own row"));
-            let mut acc = 0;
-            let name_col = symbols
+            let glyph = status.glyph();
+            let glyph_col = row
                 .iter()
-                .position(|s| {
-                    let start = acc;
-                    acc += s.len();
-                    byte_offset >= start && byte_offset < acc
-                })
-                .unwrap_or_else(|| panic!("start of {name} not found in row"));
-            let glyph_col = name_col
-                .checked_sub(2)
-                .unwrap_or_else(|| panic!("no room for a glyph before {name}"));
+                .position(|cell| cell.symbol() == glyph)
+                .unwrap_or_else(|| panic!("glyph {glyph:?} not found in {name}'s row"));
             row[glyph_col].fg
         };
 
-        assert_eq!(glyph_color_for("ok-job"), theme.ok);
-        assert_eq!(glyph_color_for("warn-job"), theme.warn);
-        assert_eq!(glyph_color_for("failed-job"), theme.err);
-        assert_eq!(glyph_color_for("cancelled-job"), theme.muted);
-        assert_eq!(glyph_color_for("running-job"), theme.accent);
+        assert_eq!(
+            glyph_color_for("ok-job", &JobStatus::Done { code: 0 }),
+            theme.ok
+        );
+        assert_eq!(
+            glyph_color_for("warn-job", &JobStatus::Done { code: 7 }),
+            theme.warn
+        );
+        assert_eq!(
+            glyph_color_for(
+                "failed-job",
+                &JobStatus::Failed {
+                    message: "boom".into()
+                }
+            ),
+            theme.err
+        );
+        assert_eq!(
+            glyph_color_for("cancelled-job", &JobStatus::Cancelled),
+            theme.muted
+        );
+        assert_eq!(
+            glyph_color_for("running-job", &JobStatus::Running),
+            theme.accent
+        );
     }
 }

@@ -70,7 +70,7 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
 }
 
 /// Human-readable status label + the color it should render in.
-pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
+fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
     (job.status.label(), theme.job_status_color(&job.status))
 }
 
@@ -112,9 +112,13 @@ pub fn draw_job_console(
     let is_terminal = !matches!(job.status, JobStatus::Running);
     let mut header = Vec::new();
     if is_terminal {
+        debug_assert!(
+            !matches!(job.status, JobStatus::Running),
+            "terminal banner only renders for finished jobs"
+        );
         let glyph = job.status.glyph();
         header.push(Span::styled(
-            format!(" {glyph}{label} "),
+            format!(" {glyph} {label} "),
             Style::default()
                 .fg(readable_text_on(color))
                 .add_modifier(Modifier::BOLD),
