@@ -117,4 +117,26 @@ Feature: TheRock "next" ROCm 10 install layout
     Given a canonical release pip index fixture and a ROCm 10 pip index fixture
     And a registered ROCm 10 wheel runtime with a grouped family
     When the user previews applying the pending update to that runtime
-    Then the preview requests the gfx1200 device extras
+    # With the toolchain because that runtime's recorded specs have it: an
+    # update must reinstall what was installed, not the current default.
+    Then the preview requests the gfx1200 device extras with the toolchain
+
+  # The opt-in half of therock-next-02, which covers the default.
+  #
+  # `@nightly` for the reason runtime-06 documents: one more index-resolving
+  # scenario on the no-GPU mock lane is enough to push
+  # `dash-gen-tps-held-after-scrape-failure` and `dash-gen-tps-expiry-boundary`
+  # past the validity window they assert on. Measured here too — both failed
+  # 2/2 mock-lane runs with this scenario ungated, and the lane is green with
+  # it on the nightly one.
+  #
+  # The per-PR guard that matters is unaffected: therock-next-02 still pins the
+  # DEFAULT on the mock lane, which is the direction a regression would take,
+  # and `wheel_composition_requests_the_toolchain_only_when_asked` pins both
+  # polarities as a unit test on every PR.
+  @id:therock-next-09-wheel-devel-adds-the-toolchain @nightly
+  Scenario: therock-next-09 - A pinned ROCm 10 wheel install adds the toolchain when asked
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
+    Then the preview resolves the ROCm 10 pip index
+    And the preview requests the gfx1200 device extras with the toolchain

@@ -625,7 +625,7 @@ async fn assert_release_device_payload(world: &mut E2eWorld) {
     );
     assert_eq!(
         requested_rocm_extras(preview_rocm_spec(output)),
-        format!("libraries,devel,device-{detected}"),
+        format!("libraries,device-{detected}"),
         "the install does not request exactly this host's device payload:\n{output}"
     );
 
@@ -686,6 +686,97 @@ async fn assert_runtime_has_stack(world: &mut E2eWorld) {
     assert!(
         stdout.contains("torch") || stdout.contains("vllm"),
         "no inference stack found in runtime:\n{stdout}"
+    );
+}
+
+#[then("the runtime excludes the compiler toolchain")]
+async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated state root")
+        .path();
+    let registry = root.join("data/runtimes/registry");
+    let entries = std::fs::read_dir(&registry).unwrap_or_else(|error| {
+        panic!(
+            "failed to read runtime registry {}: {error}",
+            registry.display()
+        )
+    });
+    let manifests = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "expected one freshly installed runtime manifest in {}: {manifests:?}",
+        registry.display()
+    );
+
+    let manifest_path = &manifests[0];
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    assert_eq!(
+        manifest.get("devel").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default SDK install recorded the compiler toolchain as present: {manifest}"
+    );
+
+    // The specs are the authoritative record — they are what `uv` was handed,
+    // and `InstalledRuntimeManifest::includes_devel` reads the answer back out
+    // of them. Asserting the `devel` field alone would miss the install args
+    // and the manifest disagreeing, which is the drift this guards.
+    let specs = manifest
+        .get("wheel_composition")
+        .and_then(|composition| composition.get("package_specs"))
+        .and_then(serde_json::Value::as_array)
+        .expect("wheel runtime manifest has no recorded package_specs");
+    let rocm_spec = specs
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find(|spec| spec.starts_with("rocm["))
+        .expect("no rocm requirement in the recorded package_specs");
+    let extras = rocm_spec
+        .strip_prefix("rocm[")
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(extras, _)| extras)
+        .expect("malformed rocm requirement in the recorded package_specs");
+    assert!(
+        !extras
+            .split(',')
+            .map(str::trim)
+            .any(|extra| extra == "devel"),
+        "default SDK install requested the toolchain: {rocm_spec}"
+    );
+
+    let python = manifest
+        .get("python_executable")
+        .and_then(serde_json::Value::as_str)
+        .expect("wheel runtime manifest has no python_executable");
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print('present' if any(d.metadata['Name'].lower() == 'rocm-sdk-devel' for d in m.distributions()) else 'absent')",
+        ])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to inspect the installed runtime with {python}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "failed to enumerate installed runtime packages:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "absent",
+        "default SDK install pulled rocm-sdk-devel back transitively"
     );
 }
 

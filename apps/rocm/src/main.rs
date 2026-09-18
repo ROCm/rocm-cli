@@ -600,7 +600,8 @@ enum InstallTarget {
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
-rocm install sdk --family gfx110X-all --dry-run")]
+rocm install sdk --family gfx110X-all --dry-run\n  \
+rocm install sdk --devel")]
     Sdk {
         /// Package channel to install, such as release or nightly.
         #[arg(long, default_value = "release")]
@@ -620,6 +621,11 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// TheRock GPU package family to install, such as gfx110X-all.
         #[arg(long)]
         family: Option<String>,
+        /// Also install the ROCm compiler, headers, and static libraries for
+        /// building GPU code. Roughly doubles the wheel download; already
+        /// included by `--format tarball`.
+        #[arg(long)]
+        devel: bool,
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
@@ -2643,6 +2649,7 @@ fn install(target: InstallTarget) -> Result<()> {
             channel,
             format,
             prefix,
+            devel,
             version,
             build_date,
             family,
@@ -2663,12 +2670,15 @@ fn install(target: InstallTarget) -> Result<()> {
                 .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
             match therock::install_sdk(
                 &paths,
-                &channel,
-                format_name,
-                prefix,
-                version_selector,
-                family.as_deref(),
-                dry_run,
+                sdk_install_request(
+                    &channel,
+                    format_name,
+                    prefix,
+                    version_selector,
+                    family.as_deref(),
+                    dry_run,
+                    devel,
+                ),
             ) {
                 Ok(output) => {
                     let finalized = if dry_run {
@@ -7329,16 +7339,25 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         } else {
             "managed"
         };
+        // `toolchain` is the only runtime property a user cannot otherwise
+        // see: the compiler is opt-in, and `rocm update` reinstalls whatever
+        // this says, so an install missing it should not be silent about that.
+        let toolchain = if manifest.includes_devel() {
+            "included"
+        } else {
+            "excluded"
+        };
         let _ = writeln!(
             output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={}",
+            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
             manifest.runtime_key,
             manifest.runtime_id,
             therock::runtime_version_display(&manifest.version),
             manifest.format,
             manifest.family,
             mode,
-            status
+            status,
+            toolchain
         );
         let _ = writeln!(
             output,
@@ -9831,6 +9850,9 @@ fn adopt_runtime_from_probe(
         python_launcher: None,
         python_executable: Some(python_executable.display().to_string()),
         pip_cache_dir: None,
+        // The probe only reports a CMake path when the `devel` packages are
+        // present, so it tells us what this pre-existing environment has.
+        devel: probe.cmake_path.is_some(),
         rocm_sdk: Some(probe),
         // Adoption does not install torch, so the build is derived from the SDK
         // version instead.
@@ -13841,6 +13863,32 @@ fn parse_optional_lines(args: &[String]) -> Result<usize> {
     Ok(DEFAULT_LOG_TAIL_LINES)
 }
 
+/// Map the parsed `install sdk` arguments onto the install request.
+///
+/// Extracted from the command arm so this mapping has a seam. `include_devel`
+/// is the field that most needs one: nothing downstream re-derives it, so if
+/// the flag stopped being forwarded here the install would silently go back to
+/// pulling the compiler toolchain and every other assertion would still pass.
+const fn sdk_install_request<'a>(
+    channel: &'a str,
+    format: &'a str,
+    prefix: Option<PathBuf>,
+    version_selector: Option<therock::RuntimeVersionSelector>,
+    family_override: Option<&'a str>,
+    dry_run: bool,
+    devel: bool,
+) -> therock::SdkInstallRequest<'a> {
+    therock::SdkInstallRequest {
+        channel,
+        format,
+        prefix,
+        version_selector,
+        family_override,
+        dry_run,
+        include_devel: devel,
+    }
+}
+
 fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Result<String> {
     let channel = chat_cli_arg_value(args, "--channel").unwrap_or("release");
     let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
@@ -13848,7 +13896,19 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    let devel = chat_cli_has_flag(args, "--devel");
+    therock::install_sdk(
+        paths,
+        therock::SdkInstallRequest {
+            channel,
+            format,
+            prefix,
+            version_selector: selector,
+            dry_run: true,
+            include_devel: devel,
+            ..therock::SdkInstallRequest::default()
+        },
+    )
 }
 
 fn run_command_with_timeout(
@@ -16646,6 +16706,7 @@ fn apply_runtime_update(
             &source.family,
             plan.device_target.as_deref(),
             plan.source_layout_generation.as_deref(),
+            source.includes_devel(),
             true,
         )?;
         let _ = writeln!(output, "  install_plan:");
@@ -16662,6 +16723,9 @@ fn apply_runtime_update(
         &source.family,
         plan.device_target.as_deref(),
         plan.source_layout_generation.as_deref(),
+        // Reinstall what the user originally chose rather than silently
+        // adding or dropping the compiler toolchain on update.
+        source.includes_devel(),
         false,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
@@ -25702,6 +25766,74 @@ install therock";
     }
 
     #[test]
+    fn install_sdk_devel_flag_defaults_off_and_wires_through_when_passed() {
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk"])
+            .expect("install sdk should parse with no flags");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(!devel, "--devel should default to false"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--devel"])
+            .expect("install sdk should accept --devel");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) => assert!(devel, "--devel should set the flag to true"),
+            other => panic!("expected an install sdk target, got {other:?}"),
+        }
+    }
+
+    /// The half the parse test above cannot reach: that the parsed flag is what
+    /// the install request carries.
+    ///
+    /// `install()` is not callable here — it needs `uv`, a live index and a real
+    /// probe — so the mapping is extracted into `sdk_install_request` and pinned
+    /// directly. Hardcoding `include_devel` at that mapping is the change this
+    /// catches and the clap test does not.
+    #[test]
+    fn install_sdk_request_forwards_the_parsed_devel_flag() {
+        for devel in [false, true] {
+            let request = sdk_install_request("release", "wheel", None, None, None, false, devel);
+            assert_eq!(
+                request.include_devel, devel,
+                "the parsed --devel flag must reach the install request"
+            );
+        }
+
+        // And the flag must not be confused with the neighbouring bool.
+        let dry_run_only = sdk_install_request("release", "wheel", None, None, None, true, false);
+        assert!(dry_run_only.dry_run);
+        assert!(!dry_run_only.include_devel);
+    }
+
+    /// End to end across the two seams a `rocm install sdk --devel` traverses:
+    /// clap parse, then the request mapping. Neither alone proves the flag
+    /// survives the trip.
+    #[test]
+    fn parsed_install_sdk_arguments_reach_the_request_with_devel_intact() {
+        for (args, expected) in [
+            (vec!["rocm", "install", "sdk"], false),
+            (vec!["rocm", "install", "sdk", "--devel"], true),
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("install sdk should parse");
+            let Some(Command::Install {
+                target: InstallTarget::Sdk { devel, .. },
+            }) = cli.command
+            else {
+                panic!("expected an install sdk target for {args:?}");
+            };
+            let request = sdk_install_request("release", "wheel", None, None, None, false, devel);
+            assert_eq!(
+                request.include_devel, expected,
+                "--devel did not survive parse -> request for {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn top_level_cli_commands_are_not_treated_as_freeform() {
         for command in [
             "examine",
@@ -28490,6 +28622,57 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    /// Whether a runtime carries the compiler toolchain is otherwise invisible:
+    /// nothing else in the CLI reports it, and `rocm update` reinstalls whatever
+    /// the runtime recorded — so a user who installed without it has no way to
+    /// see that, or to understand why a later build step fails.
+    #[test]
+    fn runtime_list_reports_whether_the_toolchain_is_installed() -> Result<()> {
+        let (root, paths) = test_paths("runtime-list-toolchain");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        // The fixture records `devel: true` with no composition.
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=included"),
+            "a toolchain install must say so:\n{rendered}"
+        );
+
+        // A runtime-only install reports the other way. Written through the
+        // recorded specs, which is what `includes_devel` actually reads.
+        let runtime_only = therock::InstalledRuntimeManifest {
+            devel: false,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "canonical".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..manifest
+        };
+        fs::write(
+            runtime_manifest_path(&paths, &runtime_only.runtime_key),
+            serde_json::to_vec_pretty(&runtime_only)?,
+        )?;
+        let rendered = render_runtimes_text(&paths, &config)?;
+        assert!(
+            rendered.contains("toolchain=excluded"),
+            "a runtime-only install must say so:\n{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[test]
     fn runtime_lists_display_build_date_from_version_string() -> Result<()> {
         let (root, paths) = test_paths("runtime-build-date-display");
@@ -28801,6 +28984,13 @@ ID_LIKE="suse opensuse"
         );
         assert!(!external_root.join(".rocm-cli-runtime.json").exists());
         assert!(runtime_manifest_path(&paths, &adopted.runtime_key).is_file());
+        // No CMake path in the probe means no compiler toolchain in that
+        // environment. `rocm update` reinstalls from this field, so recording
+        // it wrongly would add a toolchain the user never had.
+        assert!(
+            !adopted.devel,
+            "a probe without a CMake path must not claim the toolchain"
+        );
 
         let mut config = RocmCliConfig::default();
         activate_runtime(&paths, &mut config, &adopted.runtime_key)?;
@@ -28812,6 +29002,84 @@ ID_LIKE="suse opensuse"
         let rendered = render_runtimes_text(&paths, &config)?;
         assert!(rendered.contains("* adopted-release-pip-gfx120x-all-7-13-0"));
         assert!(rendered.contains("mode=read-only"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// The other half of the same derivation: an adopted environment that does
+    /// expose a CMake path has the toolchain, and the manifest must say so or
+    /// the next `rocm update` would quietly reinstall without it.
+    #[test]
+    fn runtime_adopt_records_devel_when_the_probe_finds_cmake() -> Result<()> {
+        let (root, paths) = test_paths("runtime-adopt-devel");
+        let external_root = root.join("external-therock-venv");
+        let scripts_dir = external_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let python_executable = scripts_dir.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        let sdk_root = external_root
+            .join("Lib")
+            .join("site-packages")
+            .join("rocm_sdk");
+        let sdk_bin = sdk_root.join("bin");
+        let cmake_path = sdk_root.join("lib").join("cmake");
+        fs::create_dir_all(&scripts_dir)?;
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&cmake_path)?;
+        let amdhip = sdk_bin.join(if cfg!(windows) {
+            "amdhip64_7.dll"
+        } else {
+            "libamdhip64.so"
+        });
+        let hipblas = sdk_bin.join(if cfg!(windows) {
+            "hipblas.dll"
+        } else {
+            "libhipblas.so"
+        });
+        fs::write(&python_executable, "python")?;
+        fs::write(&amdhip, "amdhip")?;
+        fs::write(&hipblas, "hipblas")?;
+
+        let adopted = adopt_runtime_from_probe(
+            &paths,
+            AdoptRuntimeRequest {
+                python_executable,
+                install_root: external_root,
+                runtime_id: "therock-release:gfx120X-all".to_owned(),
+                runtime_key: "adopted-release-pip-gfx120x-all-7-13-0".to_owned(),
+                replace: false,
+            },
+            therock::RocmSdkPythonProbe {
+                import_ok: true,
+                rocm_sdk_version: Some("7.13.0".to_owned()),
+                root_path: Some(sdk_root.clone()),
+                bin_path: Some(sdk_bin.clone()),
+                cmake_path: Some(cmake_path),
+                runtime_roots: vec![sdk_root],
+                bin_paths: vec![sdk_bin.clone()],
+                library_paths: vec![sdk_bin],
+                resolved_libraries: vec![
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "amdhip64".to_owned(),
+                        paths: vec![amdhip],
+                    },
+                    therock::RocmSdkLibraryProbe {
+                        shortname: "hipblas".to_owned(),
+                        paths: vec![hipblas],
+                    },
+                ],
+                resolved_target_family: Some("gfx120X-all".to_owned()),
+                ..therock::RocmSdkPythonProbe::default()
+            },
+        )?;
+
+        assert!(
+            adopted.devel,
+            "a probe reporting a CMake path must record the toolchain"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -32097,6 +32365,7 @@ ID_LIKE="suse opensuse"
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         };
         fs::create_dir_all(runtime_registry_dir(paths))?;
@@ -32138,6 +32407,7 @@ ID_LIKE="suse opensuse"
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms: 1,
         }
     }
