@@ -18,9 +18,11 @@
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
 //! first-run auto-trigger + `onboarding_dismissed` persistence, and the frozen
 //! flow's post-install `reconcile_onboarding_engine_preference` are documented
-//! fast-follows — this overlay is additive and key-triggered (`n`), so it never
-//! touches the frozen tui.rs first-run gate. Both paths run through the approval
-//! gate and the job-bridge — zero `std::thread::spawn`/`try_recv`.
+//! fast-follows — this overlay is additive and opens only via the explicit
+//! `n` key on the Observe tab (or explicit `Focus::Setup` selection); no
+//! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
+//! it. Both paths run through the approval gate and the job-bridge — zero
+//! `std::thread::spawn`/`try_recv`.
 
 use std::path::Path;
 
@@ -190,6 +192,12 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         cfg.channel.as_arg().to_string(),
         "--format".to_string(),
         "wheel".to_string(),
+        // Onboarding installs are spawned with null stdin, so a would-be
+        // consent prompt cannot be answered and the install would refuse. This
+        // keeps the first-run install non-interactive. Deliberately not `--yes`,
+        // which would also approve a `sudo` system-package install this spawn
+        // has no terminal to answer.
+        "--approve-replacing-active-default".to_string(),
     ];
     let pin = cfg.pin_value.trim();
     if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
@@ -671,7 +679,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "default Release path must stay byte-identical to the pre-toggle args"
         );
@@ -918,7 +927,8 @@ mod tests {
                 "--channel",
                 "nightly",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ]
         );
     }
@@ -948,6 +958,7 @@ mod tests {
                 "nightly",
                 "--format",
                 "wheel",
+                "--approve-replacing-active-default",
                 "--build-date",
                 "2026-06-05"
             ]
@@ -983,7 +994,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "an empty pin must not add a flag"
         );

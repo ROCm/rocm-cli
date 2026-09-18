@@ -587,9 +587,7 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         fix_id: "fix-1-arch".to_owned(),
         auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
-        notes: vec![
-            "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
-        ],
+        notes: notes_1_arch(e),
         ..Fix::default()
     };
     finalize(
@@ -599,6 +597,24 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// The arch-list evidence this checker reads can now come from a managed
+/// runtime's torch, which the bare `pip` commands above would not touch — they
+/// resolve against whatever interpreter is on `PATH`, a different environment.
+/// Say which one the evidence describes rather than letting the commands imply
+/// it.
+fn notes_1_arch(e: &Examination) -> Vec<String> {
+    let mut notes = vec![
+        "TheRock (rocm/TheRock) ships nightly per-gfx wheels and is the preferred fallback when the official pytorch wheel index does not yet cover your gfx target.".to_owned(),
+    ];
+    if e.framework_source == "managed-runtime" {
+        notes.push(
+            "This host's torch was read from the active managed runtime, not from `PATH`. Run the commands above against that runtime's own interpreter -- `rocm examine --json` names it under framework_notes -- or a bare `pip` will change a different environment and leave this unfixed."
+                .to_owned(),
+        );
+    }
+    notes
 }
 
 fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
@@ -999,8 +1015,14 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
 
     let fw_major = major_version(fw_rocm);
     let sys_major = major_version(sys_rocm);
+    // Only meaningful when the framework resolves its HIP from the system. A
+    // managed runtime's torch loads it from a sibling `_rocm_sdk_core` package
+    // inside the runtime, so its HIP major is free to differ from the system's
+    // on a completely healthy host — and "reinstall torch" would be wrong there.
+    let framework_uses_system_rocm = e.framework_source != "managed-runtime";
     if let (Some(fw), Some(sys)) = (&fw_major, &sys_major)
         && fw != sys
+        && framework_uses_system_rocm
     {
         score += 50;
         let runtime = if windows { "HIP SDK" } else { "ROCm" };
@@ -1321,7 +1343,14 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
         ));
     }
-    if e.has_amd_gpu && e.framework == "pytorch" && e.framework_rocm_version.starts_with("hip=") {
+    // Skipped for a managed runtime for the reason this checker's own note
+    // already gives: those wheels bring their own HIP runtime, so a missing
+    // system HIP SDK is not evidence against them.
+    if e.has_amd_gpu
+        && e.framework == "pytorch"
+        && e.framework_rocm_version.starts_with("hip=")
+        && e.framework_source != "managed-runtime"
+    {
         score += 25;
         evidence
             .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
@@ -1523,14 +1552,18 @@ pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP 
 /// from a different rendered line, past a `HIGH_CONFIDENCE` threshold of 75, and
 /// cited the other engine's tokens as its evidence.
 ///
-/// What this is *not* is a terminal emulator; see
-/// [`crate::terminal::rendered_lines`] for the contract. It is a one-sided
-/// guarantee — two things drawn on different rows are never scored as one line,
-/// while one row may come back split — and the residual is exactly that second
-/// half: a capture whose cursor addressing this does not model loses a diagnosis
-/// rather than inventing one, and the canonical-symptom fallback already covers
-/// that. The misattribution is the failure mode with a user-visible cost, and it
-/// is the one closed here.
+/// What this is *not* is a terminal emulator. The contract is one-sided, and
+/// [`crate::terminal::rendered_lines`] is where to read it — that doc carries
+/// the contract itself and points on to the module section holding the detail
+/// behind it, including the single shape in which two rendered rows still come
+/// back as one segment. It is deliberately not restated here: a second copy is
+/// a stale copy waiting to happen, and this function is where a stale one would
+/// do the damage. What matters at this call site is the direction of the error
+/// that remains: a capture whose cursor addressing that walk does not model
+/// loses a diagnosis rather than inventing one, and the canonical-symptom
+/// fallback already covers that. The misattribution is the failure mode with a
+/// user-visible cost, and this is what narrows it to the one shape that
+/// contract calls out.
 ///
 /// Sharing that walk with the vLLM engine's sanitizer is also what keeps the
 /// `SGR` exception right. A colourised logger emits `ESC [ 31 m` *inside* a
@@ -2531,6 +2564,81 @@ mod tests {
             os_family: "linux".to_owned(),
             ..Examination::default()
         }
+    }
+
+    /// A host whose framework HIP major differs from its system ROCm: torch on
+    /// HIP 7, a system ROCm 6 beside it.
+    fn hip_major_differs_from_system_rocm(framework_source: &str) -> Examination {
+        Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: framework_source.to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            ..linux_base()
+        }
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_is_not_measured_against_the_system_rocm() {
+        // A managed runtime's torch loads HIP from a sibling `_rocm_sdk_core`
+        // package inside the runtime, never from the system install, so the two
+        // majors are free to differ on a perfectly healthy host. Before
+        // `examine` probed the runtime this could not fire, because the field it
+        // reads was always empty; now that it is populated, the comparison has
+        // to be told when it is meaningless -- or fixing the probe would hand
+        // every such host a spurious "reinstall torch".
+        let managed = diagnose(&hip_major_differs_from_system_rocm("managed-runtime"), "");
+        assert!(
+            !managed.matched.iter().any(|d| d.id == "fix-8-wheel-rocm"),
+            "a managed runtime must not be told to reinstall torch: {:?}",
+            managed
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+
+        // The same host, same versions, with torch coming from the ambient
+        // interpreter: there the comparison is exactly right, and the checker
+        // must keep its full strength.
+        let ambient = diagnose(&hip_major_differs_from_system_rocm("path"), "");
+        let finding = ambient
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-8-wheel-rocm")
+            .expect("an ambient torch built against a different ROCm major is a real mismatch");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "the version evidence alone has to establish it: {}",
+            finding.score
+        );
+    }
+
+    #[test]
+    fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
+        // The Windows-shaped sibling of the check_8 gate, and the reason
+        // check_13's own note already gives: TheRock wheels bring their own HIP
+        // runtime, so a HIP-build torch on a host with no system HIP SDK says
+        // nothing when that torch came from a managed runtime.
+        let windows = |source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+
+        let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        let ambient = check_13_hip_sdk_missing(&windows("path"), "");
+        assert_eq!(
+            ambient.score - managed.score,
+            25,
+            "the HIP-build clause must apply to the ambient torch and only to it \
+             (managed {}, ambient {})",
+            managed.score,
+            ambient.score
+        );
     }
 
     fn shm_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
