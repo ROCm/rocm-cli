@@ -2704,11 +2704,13 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             None => { /* cursor moved or key ignored — modal stays open */ }
                         }
                     }
-                    // De-modal back-out: on ROCm/Serving, an inline manager is
-                    // shown in the Details pane. Esc closes it and returns focus
+                    // De-modal back-out: on any tab, when an inline manager is
+                    // open at its root screen, Esc closes it and returns focus
                     // to the Actions list — intercepted BEFORE the per-manager
                     // key arms so the manager doesn't eat Esc first. `←` is left
-                    // to the manager (some use it to cycle options).
+                    // to the manager (some use it to cycle options). See
+                    // `should_pane_back_out`'s doc comment for why this is no
+                    // longer gated to ROCm/Serving.
                     Some(Ok(CtEvent::Key(k))) if state.should_pane_back_out(k.code) => {
                         state.close_overlays();
                         state.pane_focus = PaneFocus::Actions;
@@ -3537,11 +3539,15 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
         }
-        // While an operational manager is open it owns the body — swallow body
-        // clicks so they can't fall THROUGH the inline manager to the obscured
-        // Actions/Details list (which would silently change the selection or
-        // re-open a verb). Tab-bar and footer-chip clicks above still work.
-        if state.has_open_overlay() {
+        // While an operational manager is open — or a chat tool-call approval
+        // is pending — it owns the body: swallow body clicks so they can't
+        // fall THROUGH to the obscured Actions/Details list (which would
+        // silently change the selection, re-open a verb, or switch tabs
+        // underneath the approval modal). Tab-bar and footer-chip clicks
+        // above still work, matching the manager-overlay swallow this
+        // mirrors (see the analogous `state.approval.is_some()` check next
+        // to `has_open_overlay()` in ui/mod.rs's footer-chip gating).
+        if state.has_open_overlay() || state.approval.is_some() {
             return KeyAction::Nothing;
         }
         if state.modal == Modal::None
@@ -5053,6 +5059,35 @@ mod tests {
         assert_ne!(resolve_mouse(click, &s), KeyAction::Nothing);
         // Manager open → the body click is swallowed (no click-through).
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn body_clicks_are_swallowed_while_an_approval_is_pending() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 90,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        // No approval pending → the click resolves against the tab's hit-test.
+        assert_ne!(resolve_mouse(click, &s), KeyAction::Nothing);
+        // `open_approval` clears every manager overlay (so `has_open_overlay()`
+        // is false) but never touches `modal` — the body click must still be
+        // swallowed instead of falling through to the obscured Actions/Details
+        // list underneath the approval modal.
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!s.has_open_overlay());
+        assert_eq!(s.modal, Modal::None);
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
     }
 
