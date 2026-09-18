@@ -851,7 +851,10 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
         ));
     }
     spans.push(Span::styled("log: ", Style::default().fg(theme.muted)));
-    spans.push(Span::styled(log.to_string(), Style::default().fg(theme.muted)));
+    spans.push(Span::styled(
+        log.to_string(),
+        Style::default().fg(theme.muted),
+    ));
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
