@@ -154,6 +154,9 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         // job's streamed output in saturated cyan for as long as it runs —
         // the common case while a user is actually reading LOGS. Terminal
         // statuses (done/warn/failed/cancelled) still take the shared color.
+        // Unlike `glyph`/`label`/`job_status_color`, this `matches!` isn't an
+        // exhaustive match the compiler checks, so a future `JobStatus`
+        // variant that should also stay neutral here needs a human to add it.
         let color = if matches!(job.status, JobStatus::Running) {
             theme.fg
         } else {
