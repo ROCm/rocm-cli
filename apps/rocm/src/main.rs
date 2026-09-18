@@ -7494,10 +7494,14 @@ fn describe_hours(hours: u64) -> String {
 /// — and "seconds old with no manifest" is far likelier to be a launch under way
 /// than an orphan that has to go this second.
 ///
-/// A minute clears the real gap between the two writes with room to spare: what
-/// sits between them is a directory scan plus one liveness refresh per existing
-/// record, each bounded by [`SERVICE_LIVENESS_CHECK_TIMEOUT`] (750ms), i.e. a
-/// couple of seconds even on a host carrying many stale records. It is also
+/// A minute clears the gap between the two writes for any plausible host, but
+/// it is a margin rather than a proof. What sits between them is a directory
+/// scan plus one liveness refresh per existing record, refreshed sequentially.
+/// [`SERVICE_LIVENESS_CHECK_TIMEOUT`] (750ms) is a ceiling per record, not a
+/// cost: a dead pid answers immediately, and the ceiling binds only on a probe
+/// that hangs. So the usual gap is milliseconds, and reaching a minute takes on
+/// the order of eighty records whose probes all hang at once — at which point
+/// the user has a much louder problem than a pruned key. It is also
 /// 1/1440 of [`DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`], so it cannot meaningfully
 /// delay real cleanup: anything genuinely orphaned is minutes to days old, and a
 /// user who wants it gone a minute later only has to run the command again.
