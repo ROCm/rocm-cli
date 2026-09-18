@@ -517,7 +517,9 @@ status correction all count as touching it. Pass `--older-than-hours <n>` for a
 different threshold, or `--any-age` to take every record that is not running
 however recent — that is the flag `prune` names in its own summary when it
 reports how many records it kept for being too recent. The two cannot be
-combined.
+combined. `--any-age` applies to records; leftover files are always kept for
+their first minute, because a file whose record has not been written *yet* is a
+server still starting up rather than something left behind.
 
 ### Dashboard
 

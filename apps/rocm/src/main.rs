@@ -7472,6 +7472,41 @@ fn describe_hours(hours: u64) -> String {
     }
 }
 
+/// Floor under the orphan sweep's age gate, applied even when the caller asked
+/// for every age.
+///
+/// "No `<id>.json` beside it" is not only what an orphan looks like — it is also
+/// what a *launch in progress* looks like. `serve` writes the 0600
+/// `<id>.endpoint-key` before [`spawn_managed_engine_child`] writes the first
+/// `<id>.json`, so between those two writes the key of a live, still-starting
+/// server is indistinguishable from a leftover. Under `--any-age`
+/// ([`service_prune_min_age_hours`] collapses it to zero) the age gate
+/// short-circuits in [`prunable_by_modified`] and takes everything, so a
+/// concurrent `rocm services prune --any-age --yes` could delete that secret out
+/// from under the server that needs it. The shared launch lock does not close
+/// this: [`start_managed_service`] releases it as soon as the record is
+/// persisted, and it is held for GPU selection, not for these two writes.
+///
+/// The floor is scoped to the orphan sweep and never touches records: a manifest
+/// on disk is exactly what makes its siblings non-orphans, so `--any-age` stays
+/// fully effective for the records users reach for it to remove. All it costs is
+/// that a leftover file written in the last minute survives one `--any-age` run
+/// — and "seconds old with no manifest" is far likelier to be a launch under way
+/// than an orphan that has to go this second.
+///
+/// A minute clears the gap between the two writes for any plausible host, but
+/// it is a margin rather than a proof. What sits between them is a directory
+/// scan plus one liveness refresh per existing record, refreshed sequentially.
+/// [`SERVICE_LIVENESS_CHECK_TIMEOUT`] (750ms) is a ceiling per record, not a
+/// cost: a dead pid answers immediately, and the ceiling binds only on a probe
+/// that hangs. So the usual gap is milliseconds, and reaching a minute takes on
+/// the order of eighty records whose probes all hang at once — at which point
+/// the user has a much louder problem than a pruned key. It is also
+/// 1/1440 of [`DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`], so it cannot meaningfully
+/// delay real cleanup: anything genuinely orphaned is minutes to days old, and a
+/// user who wants it gone a minute later only has to run the command again.
+const SERVICE_ORPHAN_PRUNE_MIN_AGE: Duration = Duration::from_mins(1);
+
 /// Files in `services_dir` and the engine state dirs that no longer belong to
 /// any record.
 ///
@@ -7482,12 +7517,24 @@ fn describe_hours(hours: u64) -> String {
 /// investigate. The corrupt manifest itself is never removed for the same
 /// reason.
 ///
+/// Orphan candidates are additionally floored at [`SERVICE_ORPHAN_PRUNE_MIN_AGE`]
+/// regardless of `min_age`, because a file that has no manifest *yet* is a launch
+/// in progress rather than a leftover. Records are gated on the caller's
+/// `min_age` as asked, in [`build_service_prune_plan`].
+///
 /// `services_dir` also holds `launch.lock`, which is shared by every managed
 /// launch rather than owned by one service (see
 /// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
 /// extensions are considered, so the lock is never a candidate.
 fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
     let services_dir = paths.services_dir();
+    // Raised, never lowered: a caller asking for a longer threshold still gets
+    // it. The floor only removes the zero case, which is also the case that
+    // makes `prunable_by_modified` return `true` without looking at any time at
+    // all — so past this line an orphan whose modification time cannot be read,
+    // or that claims to be from the future, fails closed and is kept, exactly as
+    // a record with such a time already does.
+    let min_age = min_age.max(SERVICE_ORPHAN_PRUNE_MIN_AGE);
     let mut orphans = Vec::new();
 
     let push_if_orphaned = |path: &Path, orphans: &mut Vec<PathBuf>| {
@@ -26938,6 +26985,24 @@ install therock";
         Ok(record)
     }
 
+    /// Stamp every path with one modification time, so a test can place a
+    /// fixture on either side of an age gate instead of sleeping.
+    fn set_modified_times<P: AsRef<Path>>(
+        paths: impl IntoIterator<Item = P>,
+        to: SystemTime,
+    ) -> Result<()> {
+        for path in paths {
+            let path = path.as_ref();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .with_context(|| format!("failed to open {}", path.display()))?
+                .set_modified(to)
+                .with_context(|| format!("failed to backdate {}", path.display()))?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn services_remove_deletes_every_artifact_and_leaves_the_shared_lock() -> Result<()> {
         let (root, paths) = test_paths("services-remove-artifacts");
@@ -27123,6 +27188,14 @@ install therock";
         let orphan_state = record.engine_state_path;
         let orphan_log = record.log_path;
         let orphan_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-orphaned");
+        // Past `SERVICE_ORPHAN_PRUNE_MIN_AGE`, which keeps manifest-less files
+        // that may be a launch in progress. These are leftovers of a record the
+        // user deleted by hand, not a launch, and the sweep is what this test is
+        // about — so stamp them at an age no launch could still be inside.
+        set_modified_times(
+            [&orphan_state, &orphan_log, &orphan_key],
+            SystemTime::now() - Duration::from_hours(1),
+        )?;
 
         let outcome = prune_managed_service_records(&paths, 0, false, true);
         let outcome = match outcome {
@@ -27146,6 +27219,110 @@ install therock";
         assert!(!key_exists, "the orphaned endpoint key must be swept");
         assert_eq!(outcome.removed_records, 0);
         assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    /// The window `SERVICE_ORPHAN_PRUNE_MIN_AGE` exists to close: `serve` writes
+    /// the 0600 endpoint key *before* the first manifest, so a server that is
+    /// still starting has a key with no `<id>.json` beside it — the exact shape
+    /// the sweep calls an orphan. `--any-age` maps to a zero threshold, which
+    /// short-circuits the age gate, so before the floor a concurrent
+    /// `rocm services prune --any-age --yes` deleted that live server's secret.
+    ///
+    /// The race itself is not reproducible from a test, so the fixture is its
+    /// on-disk state: the key file exactly as `store_endpoint_api_key` writes it
+    /// and no manifest yet. Driven through the real flag, not `hours = 0`, since
+    /// `--any-age` is the only way a user reaches this.
+    #[test]
+    fn services_prune_any_age_keeps_a_manifest_less_file_a_launch_may_still_be_writing()
+    -> Result<()> {
+        let (root, paths) = test_paths("services-prune-launch-window");
+        paths.ensure()?;
+        // What `serve` has written by the time `spawn_managed_engine_child` is
+        // still deciding whether to spawn: the key, and nothing else.
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-launching", "live-secret")?;
+        let key_path = endpoint_keys::endpoint_key_file_path(&paths, "svc-launching");
+        assert!(
+            !paths.service_manifest_path("svc-launching").exists(),
+            "premise: the manifest must not be written yet"
+        );
+
+        let outcome =
+            parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                .and_then(|(hours, dry_run, yes)| {
+                    assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                    prune_managed_service_records(&paths, hours, dry_run, yes)
+                });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let key_exists = key_path.exists();
+        let key_value = endpoint_keys::endpoint_api_key(&paths, "svc-launching");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            key_exists,
+            "a seconds-old endpoint key with no manifest is a launch in \
+             progress, not an orphan:\n{}",
+            outcome.text
+        );
+        assert_eq!(
+            key_value.as_deref(),
+            Some("live-secret"),
+            "the key the starting server needs must survive intact"
+        );
+        assert_eq!(
+            outcome.removed_files, 0,
+            "nothing was old enough to sweep:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The other half of the floor, and the reason it is a minute rather than
+    /// something open-ended: `--any-age` must still sweep real leftovers. A floor
+    /// that swallowed them would disable orphan cleanup outright and the test
+    /// above — which only asserts a keep — would stay green through it.
+    #[test]
+    fn services_prune_any_age_still_sweeps_an_old_manifest_less_file() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-old-orphan");
+        paths.ensure()?;
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-abandoned", "stale-secret")?;
+        let key_path = endpoint_keys::endpoint_key_file_path(&paths, "svc-abandoned");
+        // An hour: past the floor, but still far inside the 24-hour default, so
+        // this asserts the floor rather than the default threshold.
+        set_modified_times([&key_path], SystemTime::now() - Duration::from_hours(1))?;
+
+        let outcome =
+            parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                .and_then(|(hours, dry_run, yes)| {
+                    prune_managed_service_records(&paths, hours, dry_run, yes)
+                });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let key_exists = key_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !key_exists,
+            "a manifest-less file older than the floor is a real leftover and \
+             must still be swept:\n{}",
+            outcome.text
+        );
+        assert_eq!(
+            outcome.removed_files, 1,
+            "the sweep must report what it took:\n{}",
+            outcome.text
+        );
         Ok(())
     }
 

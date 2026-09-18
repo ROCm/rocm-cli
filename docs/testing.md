@@ -503,6 +503,16 @@ asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
 
+`prune`'s leftover sweep carries a second, unrelated race: a file with no record
+beside it is also what a *launch in progress* looks like, because `rocm serve`
+writes the 0600 endpoint key before it writes the record. Leftovers are
+therefore never swept in their first minute, whatever age was asked for — the
+one thing `--any-age` does not override. `service-cleanup-07` covers it by
+planting that on-disk shape rather than racing a real launch, and the
+`services_prune_any_age_*` unit tests in `apps/rocm/src/main.rs` assert both
+directions of the floor: a floor that kept everything would disable leftover
+cleanup outright, and a keep-only test would stay green through it.
+
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
