@@ -46,6 +46,7 @@ Feature: Interactive dashboard
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
+    And the backdrop behind the popup is dimmed
     When the user closes dashboard help
     And the user quits the dashboard
     Then the dashboard exits successfully

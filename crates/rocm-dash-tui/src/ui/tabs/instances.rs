@@ -837,18 +837,21 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
 
 fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scrollable: bool) {
     let log = inst.log_file.as_deref().unwrap_or("-");
-    let mut spans = vec![
-        Span::styled("log: ", Style::default().fg(theme.muted)),
-        Span::styled(log.to_string(), Style::default().fg(theme.muted)),
-    ];
+    let mut spans = Vec::new();
     if scrollable {
         // Only shown once `render_body` reports overflow — the launch_args/
         // env_vars panes otherwise give no hint that ↑/↓ do anything here.
+        // Rendered first (not appended after the log path) so the hint
+        // stays visible even when a long log path gets clipped by the
+        // footer's width — Paragraph here isn't wrapped, so anything past
+        // `area.width` is silently dropped rather than truncated in place.
         spans.push(Span::styled(
-            "  ·  ↑/↓ scroll",
+            "↑/↓ scroll  ·  ",
             Style::default().fg(theme.muted),
         ));
     }
+    spans.push(Span::styled("log: ", Style::default().fg(theme.muted)));
+    spans.push(Span::styled(log.to_string(), Style::default().fg(theme.muted)));
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
@@ -1355,6 +1358,57 @@ mod tests {
         assert!(
             text_scrolled.contains("--flag-59=value59"),
             "fully scrolled body must show the last launch_args line; got:\n{text_scrolled}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_footer_shows_scroll_hint_only_when_scrollable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Overflow the body pane (same recipe as the scroll test above) so
+        // `draw_detail` computes a nonzero max_scroll and passes
+        // `scrollable = true` into `render_footer`.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let mut max_scroll = 0u16;
+        term.draw(|f| {
+            max_scroll = draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        assert!(
+            max_scroll > 0,
+            "60 launch_args must overflow the body pane, giving a nonzero max_scroll; got {max_scroll}"
+        );
+        let scrollable_text = buffer_text(&term);
+        assert!(
+            scrollable_text.contains("↑/↓ scroll"),
+            "footer must show the scroll hint once the body overflows; got:\n{scrollable_text}"
+        );
+
+        // A non-overflowing instance (no launch_args/env_vars) yields
+        // max_scroll == 0, so `scrollable` is false and the hint must be
+        // absent from the footer.
+        let inst_small = mk_inst("small");
+        let mut m2 = HashMap::new();
+        m2.insert(inst_small.container_id.clone(), inst_small);
+        let state_small = mk_state(m2, 0);
+
+        let mut term2 = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term2
+            .draw(|f| {
+                draw_detail(f, f.area(), &state_small, &state_small.theme);
+            })
+            .unwrap();
+        let non_scrollable_text = buffer_text(&term2);
+        assert!(
+            !non_scrollable_text.contains("↑/↓ scroll"),
+            "footer must not show the scroll hint when the body does not overflow; got:\n{non_scrollable_text}"
         );
     }
 

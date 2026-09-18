@@ -8,14 +8,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::ui::panel::{self, BoxRole};
 
 use rocm_dash_core::bench_rollup::{PassNRollup, rollup_pass_n, row_verdict};
 use rocm_dash_core::bench_schema::{BenchmarkRow, PassFail};
 
-use crate::app::{AppState, KeyAction};
+use crate::app::AppState;
 use crate::ui::format;
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
@@ -339,86 +339,6 @@ fn draw_sparkline(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     f.render_widget(spark, inner);
 }
 
-/// Pure helper: given the rows-table's *inner* (post-border) area and the
-/// currently visible window `[start, end)`, resolve a click at `(x, y)` to
-/// a bench-row index, or `None` if the click misses a data line.
-///
-/// Row 0 of `rows_table_inner` is the header; rows 1..=visible are data
-/// lines mapped to `[start, end)` in order.
-const fn row_hit(
-    rows_table_inner: Rect,
-    start: usize,
-    end: usize,
-    x: u16,
-    y: u16,
-) -> Option<usize> {
-    if rows_table_inner.width == 0 || rows_table_inner.height == 0 {
-        return None;
-    }
-    if x < rows_table_inner.x || x >= rows_table_inner.x + rows_table_inner.width {
-        return None;
-    }
-    if y < rows_table_inner.y || y >= rows_table_inner.y + rows_table_inner.height {
-        return None;
-    }
-    let row_offset = y - rows_table_inner.y;
-    if row_offset == 0 {
-        // Header line.
-        return None;
-    }
-    let visible = end.saturating_sub(start);
-    let data_idx = (row_offset - 1) as usize;
-    if data_idx >= visible {
-        return None;
-    }
-    Some(start + data_idx)
-}
-
-/// Resolve a click at `(x, y)` inside the Bench Observe sub-panel body. Returns a
-/// `KeyAction` to dispatch, or `None` when the click misses everything
-/// actionable.
-pub fn hit_test(area: Rect, x: u16, y: u16, state: &AppState) -> Option<KeyAction> {
-    if state.bench_rows.is_empty() {
-        return None;
-    }
-    // Recompute the same vertical layout as `draw`.
-    let rollup_rows = rollup_pass_n(state.bench_rows.iter());
-    let rollup_height = compute_rollup_height(rollup_rows.len());
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(rollup_height),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
-        .split(area);
-    let rows_outer = chunks[1];
-    // Mirror panel::bento's inner rect: rounded full border + the same adaptive
-    // padding it applies, so click mapping matches the drawn table exactly.
-    let rows_inner = Block::default()
-        .borders(Borders::ALL)
-        .padding(panel::padding_for(rows_outer))
-        .inner(rows_outer);
-
-    let total = state.bench_rows.len();
-    let avail = (rows_inner.height as usize).saturating_sub(1);
-    if avail == 0 {
-        return None;
-    }
-    let sel = state.bench_sel.min(total.saturating_sub(1));
-    let (start, end) = visible_window(total, avail, sel);
-
-    let target = row_hit(rows_inner, start, end, x, y)?;
-    if target == state.bench_sel {
-        // No bench detail view exists any more (folded into Observe by the P3
-        // IA redesign) — clicking the already-selected row has nothing to open.
-        None
-    } else {
-        let delta = target.cast_signed() - state.bench_sel.cast_signed();
-        Some(KeyAction::Move(delta))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,45 +427,5 @@ mod tests {
         let (s, e) = visible_window(20, 3, 10);
         assert!(s <= 10 && 10 < e);
         assert_eq!(e - s, 3);
-    }
-
-    #[test]
-    fn row_hit_returns_none_for_header_or_out_of_bounds() {
-        // 30 cols wide, 10 rows tall, anchored at (5, 2).
-        let inner = Rect::new(5, 2, 30, 10);
-        // Header row at y=2.
-        assert_eq!(row_hit(inner, 0, 5, 10, 2), None);
-        // Outside x range.
-        assert_eq!(row_hit(inner, 0, 5, 4, 3), None);
-        assert_eq!(row_hit(inner, 0, 5, 35, 3), None);
-        // Outside y range.
-        assert_eq!(row_hit(inner, 0, 5, 10, 1), None);
-        assert_eq!(row_hit(inner, 0, 5, 10, 12), None);
-    }
-
-    #[test]
-    fn row_hit_maps_data_lines_to_window_indices() {
-        let inner = Rect::new(0, 0, 20, 10);
-        // Window [10, 15): 5 data rows starting at y=1.
-        assert_eq!(row_hit(inner, 10, 15, 5, 1), Some(10));
-        assert_eq!(row_hit(inner, 10, 15, 5, 2), Some(11));
-        assert_eq!(row_hit(inner, 10, 15, 5, 5), Some(14));
-        // y=6 lands past the visible window (only 5 data rows shown).
-        assert_eq!(row_hit(inner, 10, 15, 5, 6), None);
-    }
-
-    #[test]
-    fn row_hit_handles_zero_dim_area() {
-        let zero_w = Rect::new(0, 0, 0, 10);
-        assert_eq!(row_hit(zero_w, 0, 5, 0, 1), None);
-        let zero_h = Rect::new(0, 0, 10, 0);
-        assert_eq!(row_hit(zero_h, 0, 5, 0, 0), None);
-    }
-
-    #[test]
-    fn row_hit_handles_empty_window() {
-        let inner = Rect::new(0, 0, 10, 5);
-        // start == end → no data lines.
-        assert_eq!(row_hit(inner, 3, 3, 5, 1), None);
     }
 }

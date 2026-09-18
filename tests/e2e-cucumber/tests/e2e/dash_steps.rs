@@ -841,12 +841,11 @@ async fn dashboard_destinations_displayed(world: &mut E2eWorld) {
 
 #[then("the dashboard menu is displayed")]
 async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
-    // "Options" is used here as a marker for `Modal::Menu`'s three items
-    // (Options/Help/Quit). Note: the Settings panel (`Modal::Options`) also
-    // headers with "Options", so this marker is not unique app-wide — it is
-    // safe only because no scenario today opens Settings before this step.
+    // "Quit" is used here as a marker for `Modal::Menu`'s three items
+    // (Options/Help/Quit). Unlike "Options", "Quit" appears nowhere else in
+    // the TUI's rendered chrome, so it unambiguously identifies the menu.
     session(world)
-        .wait_for_screen("Options", default_timeout())
+        .wait_for_screen("Quit", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
