@@ -32,6 +32,41 @@ The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
 unsupported. rocm-cli does not use a CPU fallback for this path.
 
+## Lemonade backend alignment on engine install
+
+Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
+`llamacpp:rocm` backend downloads. On Linux/WSL, `rocm engines install
+lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
+backend it installs is paired with the SDK actually in use, rather than
+whatever version Lemonade shipped pinned to. The attempt is skipped outright
+on native Windows, and left alone when the active SDK reports a nightly
+version rather than a plain `X.Y.Z` the alignment can match against. An
+attempt that cannot be verified against the installed backend's shared
+libraries reverts to the packaged pin instead of being kept.
+
+The rewrite tries two builds in order. The first keeps Lemonade's own pinned
+llama.cpp release and just repoints it at the active ROCm version — a
+deliberate, reproducible pin. If that release never shipped an asset for that
+ROCm version, the second queries GitHub's `releases/latest` for
+`lemonade-sdk/llama.cpp` (an unauthenticated `api.github.com` call, subject to
+GitHub's public rate limit) and installs whatever build is newest at that
+moment. That second build is a moving target, not a pin: which llama.cpp
+commit actually gets installed depends on when the install ran, and the
+version installed is not recorded anywhere `rocm examine`/`rocm version`
+report.
+
+Set `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` to keep whatever
+`backend_versions.json` already pins and skip the rewrite — any value works,
+including an empty one, since the variable being set is the signal:
+
+```bash
+ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT=1 rocm engines install lemonade --yes
+```
+
+Use it if you have hand-edited `backend_versions.json` to pin a specific
+version, matching that file's own documented use as a first-party
+customization point.
+
 ## Pinned runtime versions
 
 The versions of the third-party runtimes rocm-cli downloads are pinned in

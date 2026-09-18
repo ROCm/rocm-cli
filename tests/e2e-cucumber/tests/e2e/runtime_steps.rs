@@ -416,6 +416,158 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
     }
 }
 
+/// Record the Lemonade backend-alignment opt-out for this scenario's next
+/// `rocm` command. Mirrors `setup_torch_alignment_opt_out` above.
+#[given("the user has opted out of realigning Lemonade's backend")]
+async fn setup_lemonade_backend_alignment_opt_out(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT", "1".into()));
+}
+
+/// `--reinstall` re-extracts the packaged embeddable, which resets
+/// `backend_versions.json` to its pinned defaults -- so this fires the
+/// alignment's Tier 1/Tier 2/revert state machine deterministically every time,
+/// even against a shared runtime tree where an earlier scenario already left
+/// Lemonade's backend aligned (in which case a plain, non-forcing install would
+/// find nothing left to do and print no alignment line at all).
+///
+/// Goes through `run_rocm_with_scenario_env` (not `run_rocm_ok`) so a Given can
+/// attach the alignment opt-out to this invocation, and keeps stderr so a Then
+/// can read the opt-out's own explanation of why it skipped.
+#[when("the user reinstalls the lemonade engine")]
+async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+}
+
+/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
+/// install's version does not match Lemonade's packaged pin, Tier 1's install
+/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
+/// build succeeds -- producing exactly this line. This is the one part of the
+/// alignment path with no other e2e coverage: the unit tests exercise the
+/// Tier 1/Tier 2/revert state machine directly (against injected install/align
+/// steps), but nothing else asserts that `rocm engines install lemonade`
+/// actually surfaces the outcome to the user.
+#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
+async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output
+            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
+        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+    );
+}
+
+/// The CLI names the variable whenever it is set, so a user can tell it was
+/// read -- this alone does not prove alignment was actually skipped.
+///
+/// The announcement now fires unconditionally as the first thing
+/// `prepare_llamacpp_backend_for_active_rocm` does when the variable is set,
+/// before any of the not-Linux/no-SDK-version/unreadable-pin/pin-matches
+/// skips run, so it can no longer distinguish "the opt-out was honoured"
+/// from "the variable was set and alignment ran anyway". That guarantee is
+/// proven elsewhere: `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
+/// (the crate's own unit test, gating the state machine on every lane) and
+/// the sibling `the packaged pin survives the install` step below (its
+/// `Aligned …` / `could not align …` absence checks, run on the gated e2e
+/// lane).
+#[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
+async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().expect("no install stderr");
+    assert!(
+        stderr.contains("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT"),
+        "the skipped alignment does not name the variable that skipped it:\n{stderr}"
+    );
+}
+
+/// The `version=` field on the active runtime's line in `rocm runtimes list`
+/// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
+///
+/// Read independently of Lemonade's own reporting, on purpose: this is the
+/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
+/// rewritten to match it, so it must not come from anything alignment itself
+/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// branch -- that surface is a different, later change).
+fn active_runtime_version(world: &E2eWorld) -> String {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .and_then(|line| line.split_once("version="))
+        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default())
+        .unwrap_or_else(|| panic!("no active runtime line with a version= field:\n{stdout}"))
+        .to_owned()
+}
+
+/// The packaged pin was not rewritten.
+///
+/// Reads `resources/backend_versions.json` inside the runtime tree the install
+/// itself reports (`env_path:`) and compares it against the active runtime's
+/// own version (from `rocm runtimes list`, not from anything Lemonade's
+/// alignment reports), rather than inferring the outcome from an absent log
+/// line alone. Both checks matter: the revert path can fail to restore the
+/// pin (best-effort, matching its sibling warnings) while still printing no
+/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// failed-restore from an honestly untouched pin -- hence also checking for
+/// the revert path's own "could not align ... reverting" warning, which does
+/// fire whenever a restore was attempted. `--reinstall` (the When's own
+/// mechanism) always re-extracts the packaged embeddable first, and the
+/// disabled gate returns before any write to `backend_versions.json` at all
+/// (see `align_llamacpp_backend_to_version`), so the llama.cpp tag limb of
+/// the same file is provably untouched whenever both checks below hold --
+/// Tier 2 is the only code that writes it, and reaching Tier 2 requires
+/// passing the same gate.
+#[then("the packaged pin survives the install")]
+async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        !output.contains("Aligned Lemonade's ROCm") && !stderr.contains("Aligned Lemonade's ROCm"),
+        "the backend was realigned even though the user opted out:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("could not align Lemonade's ROCm backend to"),
+        "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
+    );
+
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let pinned_version = parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
+
+    let active_version = active_runtime_version(world);
+    assert_ne!(
+        pinned_version, active_version,
+        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
+         opted out"
+    );
+}
+
 /// The engine inventory reports a usable engine runtime.
 ///
 /// A precondition only. It deliberately has no Then counterpart: `engines list`
