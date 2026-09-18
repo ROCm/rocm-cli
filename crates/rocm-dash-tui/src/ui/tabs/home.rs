@@ -1186,9 +1186,10 @@ mod tests {
                 },
             ),
         );
-        s.jobs
-            .jobs
-            .insert("cancelled".into(), job("cancelled-job", JobStatus::Cancelled));
+        s.jobs.jobs.insert(
+            "cancelled".into(),
+            job("cancelled-job", JobStatus::Cancelled),
+        );
         s.jobs
             .jobs
             .insert("running".into(), job("running-job", JobStatus::Running));
