@@ -20,6 +20,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom
     Then the CLI reports a likely cause with a suggested fix
     And every reported cause comes with a command that applies it
+    And every reported cause states its remediation flags
 
   @id:diagnose-always-offers-a-way-forward
   Scenario: diagnose-02 - Diagnosing any failure always gives the user a way to escalate
@@ -40,6 +41,10 @@ Feature: Diagnosing failures and listing fixes
     And each fix indicates whether the CLI can apply it automatically
     And the listing explains what those indicators mean
 
+  # This scenario exercises `rocm fix <id> --dry-run` (print_recipe's `Flags:`
+  # line), not the `rocm diagnose` report itself -- see diagnose-01's "states
+  # its remediation flags" step for the equivalent `flags:` line on that
+  # surface.
   @id:diagnose-fix-dry-run-changes-nothing
   Scenario: diagnose-05 - Previewing a fix explains the change without making it
     Given a user who has chosen a known fix

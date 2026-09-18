@@ -426,6 +426,36 @@ async fn assert_every_cause_has_a_command(world: &mut E2eWorld) {
     );
 }
 
+#[then("every reported cause states its remediation flags")]
+async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    // `flags:` is the line `render_report_text` builds from
+    // `crate::fix::format_flags` -- the same helper `rocm fix <id>`'s `Flags:`
+    // line uses, so a fix-id reads identically from either command. This is the
+    // only scenario that exercises that line through the real `rocm diagnose`
+    // rendering surface rather than through `rocm fix <id> --dry-run`. Assert
+    // the shape (present once per cause, ending in the always-on auto/manual
+    // marker) rather than a specific fix-id's exact flags, since the top match
+    // is environment-dependent.
+    let causes = output.lines().filter(|l| l.contains("score=")).count();
+    let flag_lines: Vec<&str> = output
+        .lines()
+        .filter(|l| l.trim_start().starts_with("flags:"))
+        .collect();
+    assert_eq!(
+        flag_lines.len(),
+        causes,
+        "each of the {causes} causes needs its own flags: line:\n{output}"
+    );
+    for line in &flag_lines {
+        assert!(
+            line.contains("rocm fix can run it")
+                || line.contains("manual only (`rocm fix` will NOT run it automatically)"),
+            "expected the auto/manual marker on the flags: line:\n{line}"
+        );
+    }
+}
+
 #[then("the listing explains what those indicators mean")]
 async fn assert_markers_explained(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
