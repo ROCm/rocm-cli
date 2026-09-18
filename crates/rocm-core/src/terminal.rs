@@ -2,13 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! One ECMA-48 walk over untrusted terminal output, shared by the two callers
-//! that need it.
+//! What rocm-cli does with untrusted terminal output: one ECMA-48 walk, and the
+//! decisions that rest on it.
 //!
-//! Both callers are handling the same input — a raw terminal capture from a
-//! subprocess, pasted or quoted back at the user — and both need the same
-//! question answered: *what would a terminal have rendered here?* They use the
-//! answer differently.
+//! Every caller here is handling the same input — a raw terminal capture from a
+//! subprocess, pasted or quoted back at the user — and needs the same question
+//! answered: *what would a terminal have rendered here?* They use the answer
+//! differently.
 //!
 //! * The vLLM engine strips the sequences out, so a colourised or bell-bearing
 //!   log line cannot repaint the user's terminal from inside rocm-cli's own
@@ -16,11 +16,17 @@
 //! * The vLLM-OOM diagnostic needs the *line boundaries*, so that two things the
 //!   terminal drew on separate rows are not scored as one line
 //!   ([`rendered_lines`]) — with the single exception documented below.
+//! * The surfaces that render such a line back inside a command the user is
+//!   invited to paste reject it rather than rewrite it
+//!   ([`quotable_in_single_quotes`]).
 //!
 //! A second, independent scan for the second caller would have been a second
 //! grammar to get wrong, and the first one took three rounds to get right. So
 //! the grammar lives here once, in one private stepping function, and each
-//! caller interprets the classified tokens it yields.
+//! caller interprets the classified tokens it yields. The third needs no walk
+//! at all, only the character classification ([`is_control_or_format`]) the
+//! other two end on — which is why it lives here rather than beside either of
+//! its two callers.
 //!
 //! # Line breaks inside a string body: merging and losing rows
 //!
@@ -150,6 +156,42 @@ pub fn is_control_or_format(c: char) -> bool {
             | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0001}'
             | '\u{e0020}'..='\u{e007f}')
+}
+
+/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
+///
+/// The value is untrusted subprocess output (the vLLM startup log tail) and the
+/// messages it lands in invite the user to paste the command into a shell, so a
+/// bare `'` would close the quote and let text nobody vetted become shell
+/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
+/// `model 'foo'`), and a line only has to look like an allocation failure to be
+/// selected, so this is an ordinary case rather than an exotic one.
+///
+/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
+/// the exact bytes but yields a command a reader cannot check by eye, and a
+/// wrong escape is *runnable* and misleading rather than obviously broken;
+/// control bytes would still reach the terminal. The canonical fallback is the
+/// branch that already exists for "this line cannot be used", and it is
+/// guaranteed to report a cause. The user's own line stays visible in the
+/// human-readable sentence beside the command (and in the log tail printed with
+/// it), so nothing is lost but the copy-paste convenience.
+///
+/// This is the counterpart of [`strip_terminal_control_sequences`], not a
+/// duplicate of it: text rocm-cli merely *echoes* is stripped, while text it
+/// renders into a command the user is told to run is rejected, because a
+/// stripped line is a lookalike of the user's error that is also *runnable*.
+///
+/// It is shared rather than per-engine because two surfaces build that command
+/// from the same untrusted text — the vLLM engine's startup-failure hint and the
+/// `rocm serve` summary's OOM note — and a guard that protects only one of them
+/// is the bug it was written to prevent.
+///
+/// The character test is [`is_control_or_format`], not `char::is_control`: the
+/// latter is Unicode `Cc` only, so a bidi override in the failing line survived
+/// into the printed command and reordered how it renders.
+#[must_use]
+pub fn quotable_in_single_quotes(symptom: &str) -> bool {
+    !symptom.contains('\'') && !symptom.chars().any(is_control_or_format)
 }
 
 /// Consumes one glyph, control character or escape sequence and says which of
@@ -411,6 +453,152 @@ pub fn rendered_lines(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms() {
+        // The ordinary case the guard exists for: Python error text with an
+        // apostrophe, which would close the shell quote in the printed command.
+        assert!(!quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: GPU 0 can't allocate the model's weights"
+        ));
+        assert!(!quotable_in_single_quotes(
+            "vllm: failed to load model 'foo/bar'"
+        ));
+        // Terminal control bytes from vLLM's colourised logger.
+        assert!(!quotable_in_single_quotes(
+            "vllm: \u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m"
+        ));
+        assert!(!quotable_in_single_quotes("vllm: out of memory\u{7}"));
+        assert!(!quotable_in_single_quotes("vllm: out of\nmemory"));
+        // The canonical fallback must always be usable, or the rejection branch
+        // would have nowhere to go.
+        assert!(quotable_in_single_quotes(crate::VLLM_OOM_CANONICAL_SYMPTOM));
+        assert!(quotable_in_single_quotes(
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
+        ));
+        // Cf characters must also be inadmissible in the quoted command, not
+        // merely stripped from the echoed sentence: the two guards are separate
+        // because they are separate call sites and only one of them used
+        // `char::is_control`.
+        assert!(
+            !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
+            "a bidi override must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            quotable_in_single_quotes("vllm: HIP out of memory"),
+            "the rejection must not be so broad that ordinary lines stop qualifying"
+        );
+    }
+
+    #[test]
+    fn strip_terminal_control_sequences_removes_whole_escape_sequences() {
+        // Pin the exact rendering, not the absence of fragments: a stripper that
+        // dropped only the escape byte and the `[` it introduces would leave
+        // `31m`/`0m` behind, which carries no control byte and contains neither
+        // `[31m` nor `[0m`, so every absence check would still pass.
+        assert_eq!(
+            strip_terminal_control_sequences(
+                "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}"
+            ),
+            "RuntimeError: HIP out of memory"
+        );
+        // A non-CSI escape takes the byte it introduces with it.
+        assert_eq!(strip_terminal_control_sequences("a\u{1b}Bc"), "ac");
+        // Text with nothing to strip is returned unchanged.
+        assert_eq!(
+            strip_terminal_control_sequences(crate::VLLM_OOM_CANONICAL_SYMPTOM),
+            crate::VLLM_OOM_CANONICAL_SYMPTOM
+        );
+    }
+
+    #[test]
+    fn the_stripper_follows_the_escape_grammar_not_just_the_colour_case() {
+        // The `'m'`-terminated SGR case above is the *easy* one, and on its own
+        // it pins almost nothing: narrowing the CSI final-byte range from
+        // `0x40..=0x7E` to just `'m'` leaves it green. These cases pin the
+        // range, the parameter/intermediate classes, and the introducers.
+        //
+        // They are not academic. This input is a *killed* process's output, so
+        // truncated and interleaved sequences are the normal case on this code
+        // path, and every one of them used to corrupt the message the user
+        // reads -- the failures are quoted per case below.
+        for (raw, expected, defect) in [
+            // Non-`m` CSI finals: `K` (erase-in-line) and `A` (cursor-up) are
+            // ordinary logger output, and narrowing the final-byte range to
+            // `'m'` leaves them in the message verbatim.
+            (
+                "\u{1b}[2KRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            (
+                "\u{1b}[1ARuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a non-`m` CSI final must terminate the sequence",
+            ),
+            // Truncated CSI immediately followed by a well-formed one: the old
+            // scan consumed the second sequence's `ESC [` as the first one's
+            // parameters and stopped at `0`, yielding "0mKilled: out of memory".
+            (
+                "\u{1b}[1;2\u{1b}[0mKilled: out of memory",
+                "Killed: out of memory",
+                "a truncated CSI must not swallow the next sequence's introducer",
+            ),
+            // A multi-byte scalar can never be in `0x40..=0x7E`, so the old scan
+            // ran past it and ate to the next byte that happened to land in
+            // range -- this yielded "ut of memory", losing the `o`.
+            (
+                "\u{1b}[12\u{e9} out of memory",
+                "\u{e9} out of memory",
+                "an invalid CSI byte must end the sequence, not be scanned past",
+            ),
+            // `ESC ESC`: the old code dropped the second `ESC` as the first
+            // one's argument, then emitted `[0m` as literal text.
+            (
+                "\u{1b}\u{1b}[0mRuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a stray ESC must not consume the next sequence's introducer",
+            ),
+            // OSC: the old code took the `else` branch on `]`, so the window
+            // title leaked into the message as "0;titleRuntimeError: ...".
+            (
+                "\u{1b}]0;title\u{7}RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC body must not be emitted as text",
+            ),
+            // ...and with the ST terminator (`ESC \`) rather than BEL.
+            (
+                "\u{1b}]0;title\u{1b}\\RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "an OSC terminated by ST must be consumed whole",
+            ),
+            // A two-character escape with no CSI at all.
+            (
+                "\u{1b}7RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a simple escape must consume exactly its final byte",
+            ),
+            // Cf format characters: `char::is_control` is category Cc only, so
+            // U+202E survived and reversed how the rest of the line renders.
+            (
+                "RuntimeError: \u{202e}HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a bidi override must not survive into the message",
+            ),
+            // The text-only control: nothing is removed from a clean line.
+            (
+                "RuntimeError: HIP out of memory",
+                "RuntimeError: HIP out of memory",
+                "a clean line must pass through untouched",
+            ),
+        ] {
+            assert_eq!(
+                strip_terminal_control_sequences(raw),
+                expected,
+                "{defect}: {raw:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_line_advance_of_any_form_is_a_boundary_and_sgr_is_not() {
