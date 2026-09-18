@@ -771,10 +771,14 @@ jobs:
           # shared runtime tree the engine binaries actually run from); xtask's
           # reclaim_roots_are_mirrored_in_the_powershell_reclaims test pins that half.
           #
-          # The engine half diverges in two pre-existing ways, tracked in EAI-8815:
-          # `rocm ` cannot match Windows' `rocm.exe daemon`, and `__engine-serve-http`
-          # sits in the root alternation rather than the engine one. Do not read this
-          # as "same markers as the script" until that is fixed.
+          # The engine half diverges in two pre-existing ways, tracked in EAI-8815.
+          # They fail in OPPOSITE directions, and only one can cost a bystander:
+          #   - a MISS: `rocm ` (literal trailing space) cannot match Windows'
+          #     `rocm.exe daemon`, so such a leak is not reclaimed here;
+          #   - an OVER-MATCH: `__engine-serve-http` sits in the root alternation
+          #     rather than the engine one, so on Windows a non-E2E managed serve
+          #     satisfies the root half from that marker alone and can be killed.
+          # Do not read this as "same markers as the script" until that is fixed.
           $leaked = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -match 'rocm-e2e|e2e-prewarm|e2e-shared|e2e-target|__engine-serve-http' -and $_.CommandLine -match 'llama-server|vllm|rocm ' }
           foreach ($p in $leaked) {

@@ -1422,15 +1422,41 @@ permissions:
                 "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
                  — the step's shape changed and this guard went blind (EAI-8751)"
             );
+            // `/tmp/rocm-e2e` is POSIX-only; the mirrors match the `rocm-e2e`
+            // segment, the portable part of the same root.
+            let expected: Vec<&str> = roots
+                .iter()
+                .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
+                .collect();
+
             for alternation in &alternations {
-                for root in &roots {
-                    // `/tmp/rocm-e2e` is POSIX-only; the mirrors match the
-                    // `rocm-e2e` segment, the portable part of the same root.
-                    let needle = root.strip_prefix("/tmp/").unwrap_or(root);
+                let present: Vec<&str> = alternation.split('|').collect();
+
+                // Script -> mirror: a root added to the script must reach Windows.
+                for needle in &expected {
                     assert!(
-                        alternation.contains(needle),
+                        present.contains(needle),
                         "{workflow}'s PowerShell reclaim matcher `{alternation}` does not name \
                          the E2E root `{needle}` declared in scripts/reclaim-gpu.sh (EAI-8751)"
+                    );
+                }
+
+                // Mirror -> script: and a root REMOVED from the script must not be
+                // left behind here. Without this direction the guard is one-way,
+                // which is how the lists drifted in the first place.
+                for token in &present {
+                    // Known divergence, not drift: `__engine-serve-http` is an
+                    // ENGINE marker that sits in this root alternation, so on
+                    // Windows it over-matches. Tracked in EAI-8815 — when that is
+                    // fixed, delete this arm and the assertion below will hold.
+                    if *token == "__engine-serve-http" {
+                        continue;
+                    }
+                    assert!(
+                        expected.contains(token),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` names `{token}`, \
+                         which is not an E2E root in scripts/reclaim-gpu.sh — remove it here too, \
+                         or add it there (EAI-8751)"
                     );
                 }
             }
