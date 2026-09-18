@@ -1038,7 +1038,10 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: false,
+            // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
+            // true, runner: run_hip_visible_devices) -- `rocm fix` can already
+            // carry this out on Linux, so the report must not claim otherwise.
+            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
@@ -2184,22 +2187,13 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             for c in &fix.commands {
                 let _ = writeln!(out, "     $ {c}");
             }
-            let mut flags = Vec::new();
-            if fix.needs_sudo {
-                flags.push("sudo");
-            }
-            if fix.needs_reboot {
-                flags.push("reboot required");
-            }
-            if fix.needs_relogin {
-                flags.push("re-login required");
-            }
-            if fix.auto_applicable {
-                flags.push("rocm fix can run it");
-            }
-            if !flags.is_empty() {
-                let _ = writeln!(out, "   flags: {}", flags.join(", "));
-            }
+            let flags = crate::fix::format_flags(
+                fix.needs_sudo,
+                fix.needs_reboot,
+                fix.needs_relogin,
+                fix.auto_applicable,
+            );
+            let _ = writeln!(out, "   flags: {}", flags.join(", "));
             for n in &fix.notes {
                 let _ = writeln!(out, "   note: {n}");
             }
@@ -2868,6 +2862,65 @@ mod tests {
         assert!(
             !note.contains("usually the higher-numbered"),
             "note must not repeat the old wrong gfx-number heuristic: {note}"
+        );
+    }
+
+    #[test]
+    fn fix_9_igpu_dgpu_is_auto_applicable_on_linux() {
+        // `check_9_igpu_dgpu_collision`'s Linux/else branch sets
+        // `auto_applicable: true` to match the `fix-9-igpu-dgpu` FixRecipe in
+        // fix.rs (`run_hip_visible_devices` already handles it on Linux). This
+        // is a behavioural change, not text-only: it flips both the `Fix`
+        // struct field that `rocm diagnose --json` serialises and the
+        // `flags:` line `render_report_text` prints. Pin it directly so a
+        // regression back to `false` (the pre-fix value) fails here instead of
+        // only being visible by eyeballing output.
+        let mut e = linux_base();
+        e.has_apu = true;
+        e.has_discrete_amd = true;
+        e.gpus = vec![
+            Gpu {
+                gfx_target: "gfx1103".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+        ];
+        let report = diagnose(&e, "torch crashes with a segfault");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-9-igpu-dgpu")
+            .expect("iGPU+dGPU collision should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        assert!(
+            fix.auto_applicable,
+            "fix-9-igpu-dgpu must be auto_applicable on Linux, matching the fix.rs catalog"
+        );
+
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-9-igpu-dgpu")
+            .expect("fix-9-igpu-dgpu should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-9-igpu-dgpu should have a flags: line");
+        assert!(
+            flags_line.contains("rocm fix can run it"),
+            "rendered flags: line must say fix-9-igpu-dgpu is auto-applicable, not manual only: {flags_line}"
+        );
+        assert!(
+            !flags_line.contains("manual only"),
+            "rendered flags: line must not claim fix-9-igpu-dgpu is manual only: {flags_line}"
         );
     }
 

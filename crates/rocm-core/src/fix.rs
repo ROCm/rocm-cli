@@ -762,6 +762,35 @@ pub fn list_recipes() -> String {
     out
 }
 
+/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>` and
+/// `rocm diagnose` so the same fix-id reads identically from either command.
+// These mirror the `FixRecipe`/`Fix` struct fields (`struct_excessive_bools` is
+// already allowed workspace-wide for that reason); this fn just forwards them.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn format_flags(
+    needs_sudo: bool,
+    needs_reboot: bool,
+    needs_relogin: bool,
+    auto_applicable: bool,
+) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if needs_sudo {
+        flags.push("requires sudo");
+    }
+    if needs_reboot {
+        flags.push("requires reboot");
+    }
+    if needs_relogin {
+        flags.push("requires re-login");
+    }
+    flags.push(if auto_applicable {
+        "rocm fix can run it"
+    } else {
+        "manual only (`rocm fix` will NOT run it automatically)"
+    });
+    flags
+}
+
 fn print_recipe(r: &FixRecipe) {
     println!("Fix:        {}  -- {}", r.fix_id, r.title);
     println!("OS scope:   {}", r.applies_on.join(", "));
@@ -772,22 +801,13 @@ fn print_recipe(r: &FixRecipe) {
             println!("  $ {c}");
         }
     }
-    let mut flags = Vec::new();
-    if r.needs_sudo {
-        flags.push("requires sudo");
-    }
-    if r.needs_reboot {
-        flags.push("requires reboot");
-    }
-    if r.needs_relogin {
-        flags.push("requires re-login");
-    }
-    if !r.auto_applicable {
-        flags.push("manual only (this command will NOT run it)");
-    }
-    if !flags.is_empty() {
-        println!("Flags:      {}", flags.join(", "));
-    }
+    let flags = format_flags(
+        r.needs_sudo,
+        r.needs_reboot,
+        r.needs_relogin,
+        r.auto_applicable,
+    );
+    println!("Flags:      {}", flags.join(", "));
     for n in r.notes {
         println!("Note:       {n}");
     }
@@ -1643,5 +1663,42 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+    }
+
+    #[test]
+    fn format_flags_covers_every_flag_combination_and_both_auto_states() {
+        // Exhaustive over all 2^4 = 16 combinations of the 3 optional flags
+        // (sudo/reboot/relogin) x both auto_applicable states, so a wording
+        // regression on any one flag, or on the always-present auto/manual
+        // marker, fails here rather than only being visible by eyeballing
+        // `rocm fix`/`rocm diagnose` output.
+        for bits in 0..16u8 {
+            let needs_sudo = bits & 1 != 0;
+            let needs_reboot = bits & 2 != 0;
+            let needs_relogin = bits & 4 != 0;
+            let auto_applicable = bits & 8 != 0;
+
+            let mut expected = Vec::new();
+            if needs_sudo {
+                expected.push("requires sudo");
+            }
+            if needs_reboot {
+                expected.push("requires reboot");
+            }
+            if needs_relogin {
+                expected.push("requires re-login");
+            }
+            expected.push(if auto_applicable {
+                "rocm fix can run it"
+            } else {
+                "manual only (`rocm fix` will NOT run it automatically)"
+            });
+
+            let flags = format_flags(needs_sudo, needs_reboot, needs_relogin, auto_applicable);
+            assert_eq!(
+                flags, expected,
+                "sudo={needs_sudo} reboot={needs_reboot} relogin={needs_relogin} auto={auto_applicable}"
+            );
+        }
     }
 }
