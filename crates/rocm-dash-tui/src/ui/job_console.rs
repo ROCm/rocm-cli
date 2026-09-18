@@ -40,6 +40,16 @@ pub enum ConsoleOutcome {
     Unhandled,
 }
 
+/// Whether Esc on `job` fully closes the owning overlay, rather than merely
+/// dismissing the console back to the screen body.
+///
+/// `true` when the job is still running; `false` once it's finished or
+/// missing. Shared by [`on_console_key`] and the dashboard footer's Esc-chip
+/// label so the two can't drift out of sync.
+pub fn console_esc_closes(job: Option<&JobState>) -> bool {
+    job.is_some_and(|j| !j.is_terminal())
+}
+
 /// Interpret a key while a job console is showing `job_id`. Pure except for the
 /// `CancelJob` reducer apply (which only mutates the in-memory job model).
 pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleOutcome {
@@ -53,16 +63,10 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         // Esc on a still-running job leaves the overlay (the job keeps running in
         // the background) — the conventional "get me out" key, so the user is
         // never trapped during a long step (e.g. a managed serve readiness wait).
-        KeyCode::Esc if jobs.job(job_id).is_some_and(|j| !j.is_terminal()) => {
-            ConsoleOutcome::Closed
-        }
+        KeyCode::Esc if console_esc_closes(jobs.job(job_id)) => ConsoleOutcome::Closed,
         // On a finished (or vanished) job, Esc/Enter dismiss the console back to
         // the screen body.
-        KeyCode::Esc | KeyCode::Enter
-            if jobs
-                .job(job_id)
-                .is_none_or(rocm_dash_core::state::JobState::is_terminal) =>
-        {
+        KeyCode::Esc | KeyCode::Enter if !console_esc_closes(jobs.job(job_id)) => {
             ConsoleOutcome::Dismissed
         }
         _ => ConsoleOutcome::Unhandled,
@@ -231,7 +235,7 @@ pub fn draw_job_console(
     let hints = if matches!(job.status, JobStatus::Running) {
         "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
     } else {
-        "Enter/Esc close · wheel / PgUp·PgDn scroll"
+        "Enter/Esc dismiss · wheel / PgUp·PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -307,6 +311,26 @@ mod tests {
             on_console_key("gone", &mut s2, k(KeyCode::Enter)),
             ConsoleOutcome::Dismissed
         ));
+    }
+
+    #[test]
+    fn console_esc_closes_tracks_job_terminality() {
+        // Direct coverage for the seam itself: `on_console_key` and the
+        // footer's Esc-chip label both call through `console_esc_closes`, so
+        // a regression here would silently desync the two without this test.
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "x".into(),
+            args: vec![],
+        });
+        assert!(console_esc_closes(s.job("j")));
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        assert!(!console_esc_closes(s.job("j")));
+        assert!(!console_esc_closes(None));
     }
 
     #[test]

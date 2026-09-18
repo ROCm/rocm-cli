@@ -1569,12 +1569,25 @@ impl AgentClient for AnthropicAgentClient {
     }
 }
 
+/// When the last user turn contains `phrase` (case-insensitive), the mock
+/// surfaces `intent` for approval over `tx` — mirroring what a real
+/// `rocm_mutating_tool!`'s `call()` does from inside the rig tool loop — instead
+/// of returning the normal canned reply. Lets `--chat-mock` drive e2e coverage
+/// of the deny-by-default approval modal without a live model or a real
+/// [`crate::tool_exec::RocmToolExecutor`].
+struct MockApprovalTrigger {
+    phrase: String,
+    intent: crate::tool_exec::ApprovalIntent,
+    tx: UnboundedSender<ClientMsg>,
+}
+
 /// Deterministic in-memory client for tests and the offline demo. Never touches
 /// the network. Can emit a canned tool-calling-style answer (cites a Skill).
 pub struct MockAgentClient {
     reply: String,
     fail: bool,
     cited: Vec<String>,
+    approval: Option<MockApprovalTrigger>,
 }
 
 impl MockAgentClient {
@@ -1584,6 +1597,7 @@ impl MockAgentClient {
             reply: reply.into(),
             fail: false,
             cited: Vec::new(),
+            approval: None,
         }
     }
 
@@ -1594,6 +1608,30 @@ impl MockAgentClient {
             reply: reply.into(),
             fail: false,
             cited: vec![tool_name.into()],
+            approval: None,
+        }
+    }
+
+    /// Like [`Self::with_tool_call`], but when the last user message contains
+    /// `phrase` (case-insensitive) the mock instead sends `intent` over
+    /// `approval_tx` as a `ClientMsg::ChatApprovalRequired` and replies with a
+    /// "surfaced for approval" note — no tool actually executes.
+    pub fn with_tool_call_and_approval_trigger(
+        reply: impl Into<String>,
+        tool_name: impl Into<String>,
+        phrase: impl Into<String>,
+        intent: crate::tool_exec::ApprovalIntent,
+        approval_tx: UnboundedSender<ClientMsg>,
+    ) -> Self {
+        Self {
+            reply: reply.into(),
+            fail: false,
+            cited: vec![tool_name.into()],
+            approval: Some(MockApprovalTrigger {
+                phrase: phrase.into().to_lowercase(),
+                intent,
+                tx: approval_tx,
+            }),
         }
     }
 
@@ -1603,6 +1641,7 @@ impl MockAgentClient {
             reply: String::new(),
             fail: true,
             cited: Vec::new(),
+            approval: None,
         }
     }
 }
@@ -1619,6 +1658,25 @@ impl AgentClient for MockAgentClient {
         }
         if history.is_empty() {
             return Err(AgentError::Empty);
+        }
+        if let Some(trigger) = &self.approval {
+            let fires = matches!(
+                history.last(),
+                Some(t) if t.role == ChatRole::User
+                    && t.content.to_lowercase().contains(&trigger.phrase)
+            );
+            if fires {
+                if let Err(e) = trigger.tx.send(ClientMsg::ChatApprovalRequired {
+                    intent: trigger.intent.clone(),
+                }) {
+                    warn!(error = %e, "mock approval trigger dropped: receiver gone");
+                }
+                return Ok(
+                    "This action needs operator approval; it has been surfaced to \
+                           the operator."
+                        .to_string(),
+                );
+            }
         }
         Ok(annotate_reply(self.reply.clone(), &self.cited))
     }
@@ -2136,6 +2194,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Empty));
+    }
+
+    #[tokio::test]
+    async fn approval_trigger_does_not_refire_on_follow_up() {
+        // `on_approval_result` appends the approved-action result as an Agent
+        // turn (not a new User turn) before raising the one-shot automatic
+        // follow-up. The trigger must key off the *last* turn only, so that
+        // follow-up call sees `[User(trigger), Agent(result)]` and does not
+        // re-surface approval a second time.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
+        let agent = MockAgentClient::with_tool_call_and_approval_trigger(
+            "all good",
+            "gpu_status",
+            "install the sdk",
+            crate::tool_exec::ApprovalIntent {
+                title: "Install TheRock ROCm SDK?".to_string(),
+                body: vec!["install_sdk".to_string()],
+                name: "install_sdk".to_string(),
+                arguments: json!({}),
+            },
+            tx,
+        );
+
+        let first = vec![ChatTurn::user("please install the sdk")];
+        let reply = agent
+            .complete(&first, fixture_snapshot())
+            .await
+            .expect("mock reply");
+        assert!(reply.contains("surfaced to"));
+
+        let follow_up = vec![
+            ChatTurn::user("please install the sdk"),
+            ChatTurn::agent("Installed successfully."),
+        ];
+        let reply = agent
+            .complete(&follow_up, fixture_snapshot())
+            .await
+            .expect("mock reply");
+        assert!(
+            !reply.contains("surfaced to"),
+            "approval trigger re-fired on the automatic follow-up: {reply}"
+        );
     }
 
     #[test]

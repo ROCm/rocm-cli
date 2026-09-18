@@ -46,7 +46,9 @@ impl AppState {
             // --- Group A: nav / session (deterministic, no executor) ---
             "home" => self.active_tab = ActiveTab::Home,
             "gpu" => self.active_tab = ActiveTab::Observe,
-            "help" | "?" => self.modal = Modal::Help,
+            "help" | "?" => {
+                self.modal = Modal::Help;
+            }
             "clear" => self.chat.clear(),
             "quit" | "exit" => self.should_quit = true,
             // --- Group B: read-only overlays (mirror the keybind handlers) ---
