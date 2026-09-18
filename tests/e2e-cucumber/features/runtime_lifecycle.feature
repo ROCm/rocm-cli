@@ -31,8 +31,20 @@ Feature: Runtime lifecycle state machine
     Then its registry entry is removed
     And its external folder is left in place
 
+  @id:runtime-lifecycle-uninstall-requires-yes-noninteractive
+  Scenario: runtime-lifecycle-04 - Uninstalling without --yes is refused outside a terminal
+    Given a registered read-only runtime
+    When the user tries to uninstall that runtime without confirming
+    Then the CLI refuses and requires --yes
+
+  @id:runtime-lifecycle-uninstall-dry-run
+  Scenario: runtime-lifecycle-05 - Dry-running an uninstall makes no changes
+    Given a registered read-only runtime
+    When the user dry-runs an uninstall of that runtime
+    Then the dry run reports the plan without confirming or changing anything
+
   @id:runtime-lifecycle-import-rejects-duplicate-unless-replacing
-  Scenario: runtime-lifecycle-04 - Importing a runtime, then rejecting a duplicate unless replacing
+  Scenario: runtime-lifecycle-06 - Importing a runtime, then rejecting a duplicate unless replacing
     Given a runtime manifest to import
     When the user imports the runtime
     Then the runtime is registered as read-only
@@ -46,7 +58,7 @@ Feature: Runtime lifecycle state machine
   # they mean. This asserts the printed legend actually names both glyphs, so the
   # rendered marker and its explanation can't drift apart silently.
   @id:runtime-lifecycle-list-shows-marker-legend
-  Scenario: runtime-lifecycle-05 - Listing runtimes explains the active and rollback markers
+  Scenario: runtime-lifecycle-07 - Listing runtimes explains the active and rollback markers
     Given two registered runtimes with the second active after the first
     When the user rolls back
     And the user lists the registered runtimes

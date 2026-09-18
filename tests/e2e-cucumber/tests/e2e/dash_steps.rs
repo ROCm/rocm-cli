@@ -12,13 +12,35 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{TuiSession, default_timeout};
-
+use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
+/// File the daemon's test-only logical clock reads every cycle (see
+/// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
 const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
+
+/// The Observe instances table's TTFT cell while the scripted mock is serving:
+/// its histogram pins time-to-first-token at exactly 50 ms
+/// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
+/// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
+/// (`runner.rs`), so this cell changing is the screen's own proof that the
+/// frame on display was assembled after the failure — the only frame the
+/// held-throughput assertion is about.
+const SCRIPTED_TTFT_CELL: &str = "50ms";
+
+/// Zero-based index of the TTFT cell within an Observe instances row, counting
+/// from the model id: `MODEL TOK/S TOK/W TTFT TPOT POWER QUEUE KV%`
+/// (`instances.rs`).
+///
+/// The cell is read by position on the scripted instance's own row rather than
+/// matched as a substring of the whole screen. A bare substring cannot tell a
+/// cleared cell from a surviving one: any future ms-suffixed value that merely
+/// *contains* the scripted one (`150ms`, `250ms`), or a second row whose TTFT
+/// is also 50 ms, would keep the marker on screen and time this step out for a
+/// reason that has nothing to do with the scrape it synchronises on.
+const TTFT_COLUMN: usize = 3;
 
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
@@ -259,6 +281,87 @@ async fn quit_interactive_chat(world: &mut E2eWorld) {
 #[when("the user quits the launcher")]
 async fn quit_launcher(world: &mut E2eWorld) {
     quit_tui(world, "the launcher").await;
+}
+
+/// Deliver a termination signal to the TUI under test and wait for it to exit,
+/// stashing the observed exit code for the `Then` steps. Shared by the
+/// SIGTERM/SIGINT `When` steps so the two cannot drift.
+///
+/// Deliberately not named for the dashboard: the process under test is the
+/// launcher in the hub round-trip scenario, and the signal handling being
+/// asserted is process-wide, not dashboard-specific.
+async fn signal_tui(world: &mut E2eWorld, signal: TermSignal) {
+    session(world)
+        .deliver_signal_and_wait(signal, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the process under test did not exit after {signal:?}: {e}"));
+}
+
+#[when("the user opens the dashboard from the launcher")]
+async fn open_dashboard_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the launcher front door before sending a key, so `d` is not
+    // swallowed before the launcher's synchronous event loop is reading input.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // `d` escalates straight into the full dashboard (LauncherChoice::OpenDashboard),
+    // which builds and then, on quit, drops its own Tokio runtime.
+    tui.send("d")
+        .unwrap_or_else(|e| panic!("failed to open the dashboard from the launcher: {e}"));
+    tui.wait_for_screen("Updates", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the dashboard did not open from the launcher: {e}"));
+}
+
+#[when("the user quits back to the launcher")]
+async fn quit_back_to_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // `q` quits the dashboard; the hub loop drops the session runtime and
+    // redraws the launcher front door — the exact "back at the menu after a
+    // session" state where a per-session signal watcher would have gone deaf.
+    tui.send("q")
+        .unwrap_or_else(|e| panic!("failed to quit the dashboard: {e}"));
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the launcher front door did not return after the session: {e}")
+        });
+}
+
+#[when("the launcher receives a SIGTERM")]
+async fn launcher_receives_sigterm(world: &mut E2eWorld) {
+    signal_tui(world, TermSignal::Term).await;
+}
+
+#[when("the dashboard receives a SIGTERM")]
+async fn dashboard_receives_sigterm(world: &mut E2eWorld) {
+    signal_tui(world, TermSignal::Term).await;
+}
+
+#[when("the dashboard receives a SIGINT")]
+async fn dashboard_receives_sigint(world: &mut E2eWorld) {
+    signal_tui(world, TermSignal::Int).await;
+}
+
+/// Type a literal Ctrl-C at the running TUI and wait for it to exit. Shared by
+/// the dashboard and launcher wordings, which press the same key at the two
+/// separate key loops the process runs.
+async fn press_ctrl_c(world: &mut E2eWorld, subject: &str) {
+    session(world)
+        .press_ctrl_c_and_wait(default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("{subject} did not exit after Ctrl-C: {e}"));
+}
+
+#[when("the user presses Ctrl-C in the dashboard")]
+async fn dashboard_ctrl_c(world: &mut E2eWorld) {
+    press_ctrl_c(world, "the dashboard").await;
+}
+
+#[when("the user presses Ctrl-C in the launcher")]
+async fn launcher_ctrl_c(world: &mut E2eWorld) {
+    press_ctrl_c(world, "the launcher").await;
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -599,6 +702,69 @@ async fn dashboard_exited(world: &mut E2eWorld) {
     assert_tui_opened(world);
 }
 
+/// Assert the exit code stashed by the terminating `When` step. Shared by the
+/// dashboard and launcher wordings — the assertion is identical, only the
+/// process under test differs, and `subject` keeps the failure message honest
+/// about which one it was. `gesture` names how the exit was requested, so a
+/// failure says whether the signal path or the keystroke path is broken.
+fn assert_exited_with(world: &mut E2eWorld, subject: &str, gesture: &str, expected: i32) {
+    let observed = session(world)
+        .observed_exit_code()
+        .expect("no exit code was recorded; terminate the session first");
+    assert_eq!(
+        observed, expected,
+        "{subject} exited with {observed} after {gesture}, expected {expected}"
+    );
+}
+
+#[then(expr = "the dashboard exits from the signal with code {int}")]
+async fn dashboard_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the dashboard", "the signal", expected);
+}
+
+// The launcher hub is a different process shape from a dashboard session (it
+// outlives each session's runtime), so scenarios that signal the hub say so
+// rather than borrowing the dashboard's wording.
+#[then(expr = "the launcher exits from the signal with code {int}")]
+async fn launcher_exited_from_signal(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the launcher", "the signal", expected);
+}
+
+// Separate wording from the signal steps on purpose: a typed Ctrl-C never
+// becomes a signal while the terminal is in raw mode, so a scenario that says
+// "from the signal" here would assert the wrong thing about how the exit
+// happened, even though the code it lands on is the same 130.
+#[then(expr = "the dashboard exits from the keystroke with code {int}")]
+async fn dashboard_exited_from_keystroke(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the dashboard", "the keystroke", expected);
+}
+
+#[then(expr = "the launcher exits from the keystroke with code {int}")]
+async fn launcher_exited_from_keystroke(world: &mut E2eWorld, expected: i32) {
+    assert_exited_with(world, "the launcher", "the keystroke", expected);
+}
+
+#[then("the launcher front door is displayed")]
+async fn launcher_front_door_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    // "Set up this system" is the front door's first menu entry, drawn at any
+    // size. Waiting (rather than reading the screen once) synchronises on the
+    // first paint after a launch or after a session hands control back.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door was not displayed: {e}"));
+}
+
+#[then("the terminal is restored to the normal screen")]
+async fn terminal_restored(world: &mut E2eWorld) {
+    // The dashboard's signal handler must leave the alternate screen and show
+    // the cursor before exiting; otherwise the shell is left in the broken
+    // raw/alt-screen state that needs a `reset`.
+    session(world)
+        .expect_terminal_restored()
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 #[then("the launcher shows the model serving")]
 async fn launcher_shows_serving(world: &mut E2eWorld) {
     let model = world
@@ -682,17 +848,47 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
 
 #[given("dashboard observation time is deterministic")]
 async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    let path = root.join(DASH_CLOCK_OFFSET_FILE);
-    std::fs::write(&path, "0").expect("failed to initialize dashboard test clock");
+    let path = dash_clock_path(world);
+    write_dash_clock(&path, "0");
     world.command_env.push((
         "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
         path.into_os_string(),
     ));
+}
+
+/// Path of this scenario's test-clock file, inside its isolated root.
+fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join(DASH_CLOCK_OFFSET_FILE)
+}
+
+/// Publish a clock directive atomically (write a sibling temp file, then
+/// rename). The daemon re-reads this file every cycle, so a plain truncating
+/// write can be observed mid-update as an empty file; rename makes each
+/// directive visible all-at-once instead.
+fn write_dash_clock(path: &std::path::Path, directive: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, directive).expect("failed to stage the dashboard test clock");
+    std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
+}
+
+/// The TTFT cell `model`'s row is currently rendering, or `None` while that row
+/// is not on screen at all.
+///
+/// Cells are whitespace-separated and a model id carries no spaces, so counting
+/// fields from the id yields one field per column — including the `—`
+/// placeholder a cleared cell renders, which keeps the columns aligned.
+fn scripted_ttft_cell<'a>(screen: &'a str, model: &str) -> Option<&'a str> {
+    screen
+        .lines()
+        .find(|line| line.contains(model))?
+        .split_whitespace()
+        .skip_while(|field| *field != model)
+        .nth(TTFT_COLUMN)
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -708,10 +904,36 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
         });
 }
 
-/// Switch the scripted mock to Failure mode, then poll the mock's own failure
-/// counter until the daemon delivers at least one 503 — confirming the failure
-/// scrape actually landed before the assertion checks the TUI. This avoids a
-/// fixed wall-time sleep while remaining deterministic.
+/// Stop the daemon's logical observation clock where it stands.
+///
+/// Free-running, that clock advances one `gpu_tick` per daemon cycle and the
+/// cycles are paced by a wall-clock interval — so it tracks wall time, and a
+/// scenario descheduled between the failure below and its assertion spends
+/// validity budget it never meant to. That is not hypothetical: on the
+/// 64-concurrent-scenario mock lane this step's successor was reached four
+/// failed scrapes (8 logical seconds) late, past the 6 s window, and the
+/// scenario reported a regression the daemon had not committed.
+///
+/// Held, the clock cannot be moved by anything except this scenario rewriting
+/// the file, so the assertions below hold at any later moment, and only the
+/// explicit advance in `validity_window_elapsed` crosses the boundary.
+///
+/// Held *before* the failure, deliberately: the daemon adopts the directive
+/// within one cycle of the write, independently of how the harness is
+/// scheduled, so the last successful observation is at most
+/// `instance_tick + gpu_tick` (3 s) older than the frozen instant — inside the
+/// 6 s window with margin, and it stays there.
+#[when("dashboard observation time is held")]
+async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
+    write_dash_clock(&dash_clock_path(world), "hold");
+}
+
+/// Switch the scripted mock to Failure mode and wait for the failure to reach
+/// the screen: first the mock's own counter proves the daemon was served a 503,
+/// then the cleared TTFT cell proves the frame on display is one the daemon
+/// assembled after that scrape. Both waits are synchronizations on observed
+/// events, not fixed sleeps, and — the clock being held — neither can consume
+/// the validity window they precede.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
     let mock = world.mock.as_ref().expect("no mock server running");
@@ -733,14 +955,33 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Allow one TUI render cycle (50 ms >> 20 ms poll) so the failure
-    // snapshot is painted before the assertion reads the screen.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let model = world
+        .model_name
+        .clone()
+        .expect("the scripted-metrics Given records the model this row belongs to");
+    session(world)
+        .wait_for_screen_where(
+            &format!("the scripted instance's TTFT cell leaves {SCRIPTED_TTFT_CELL:?}"),
+            |screen| {
+                scripted_ttft_cell(screen, &model).is_some_and(|cell| cell != SCRIPTED_TTFT_CELL)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the failed scrape never reached the screen, so no frame here is known \
+                 to postdate the failure: {e}"
+            )
+        });
 }
+
 /// EAI-7960 principal regression assertion.
 ///
-/// The scenario's injected logical clock cannot cross the validity boundary
-/// because the host was descheduled; only an explicit scenario advance can.
+/// The frame under assertion is provably post-failure (the TTFT cell it used to
+/// show is gone) and the logical clock is held, so the only way "tok/s" can be
+/// missing here is the regression itself: the daemon clearing a held rate on a
+/// failed scrape instead of keeping it for the validity window.
 #[then("generation throughput remains visible within the validity window")]
 async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
     let screen = session(world).screen_text();
@@ -755,43 +996,36 @@ async fn gen_tps_held_after_failure(world: &mut E2eWorld) {
 
 // ── EAI-7960: expiry boundary helpers ───────────────────────────────────────
 
-/// Advance the test-only logical clock beyond the six-second validity window,
-/// then synchronize on the next failed scrape that publishes the expired value.
+/// Step the held clock 7 s past where it was held — one second beyond the 6 s
+/// window, from an observation at most 3 s older than the hold point, so the
+/// held value is unambiguously expired and stays expired. Nothing else moves
+/// this clock, so the assertion below is about the daemon's arithmetic alone.
 #[when("the validity window has elapsed")]
 async fn validity_window_elapsed(world: &mut E2eWorld) {
-    let mock = world.mock.as_ref().expect("no mock server running");
-    let prior_failures = mock.metrics_failure_count();
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    std::fs::write(root.join(DASH_CLOCK_OFFSET_FILE), "7")
-        .expect("failed to advance dashboard test clock");
-
-    let budget = default_timeout();
-    let deadline = Instant::now() + budget;
-    while mock.metrics_failure_count() == prior_failures {
-        assert!(
-            Instant::now() < deadline,
-            "no metrics scrape observed after advancing the dashboard clock"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    write_dash_clock(&dash_clock_path(world), "hold 7");
 }
 
-/// Assert that gen_tps is no longer rendered after the scenario advances the
-/// injected clock beyond the validity boundary and observes the next scrape.
+/// Assert that gen_tps is no longer rendered after the scenario steps the held
+/// clock past the validity boundary.
+///
+/// The expired state is published every cycle and, the clock being held, it is
+/// permanent — so waiting for it to reach the screen cannot mask a daemon that
+/// kept the value: that daemon simply never clears it and this times out.
 #[then("generation throughput is no longer displayed")]
 async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
-    assert!(
-        !screen.contains("tok/s"),
-        "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
-         validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed.\n\
-         Expected the daemon to have cleared the held value and the TUI to \
-         show the unavailable placeholder.\n\n\
-         Last screen:\n{screen}"
-    );
+    session(world)
+        .wait_for_screen_where(
+            "generation throughput leaves the screen",
+            |screen| !screen.contains("tok/s"),
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "EAI-7960 BOUNDARY-2: gen_tps (\"tok/s\") is still visible after the \
+                 validity window clamp(3 × instance_tick, 6 s, 30 s) elapsed. Expected \
+                 the daemon to have cleared the held value and the TUI to show the \
+                 unavailable placeholder: {e}"
+            )
+        });
 }

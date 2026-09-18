@@ -152,3 +152,25 @@ Feature: GPU detection and system inspection
     When the user inspects the system
     Then the inspection explains the default-engine marker
     And the host's default engine is marked in the inspection's engine inventory
+
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # `Given a managed runtime is active` is what lets this scenario fail. Without
+  # it the world's `<data>/runtimes` stays isolated and empty by design (see
+  # `E2eWorld::default`), no interpreter resolves, and any assertion would land
+  # on the `PATH` fallback — holding whether the fix is present or reverted.
+  # That precondition is also why this is `@requires-gpu`: the step installs the
+  # SDK, so only a GPU lane exercises it.
+  #
+  # `framework_source` is what check_8 reads to decide whether comparing this
+  # torch against the *system* ROCm means anything, so it is the field worth
+  # pinning rather than the versions themselves.
+  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    Given a managed runtime is active
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the runtime's interpreter
