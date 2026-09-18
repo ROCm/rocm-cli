@@ -18,6 +18,7 @@ use ratatui::widgets::Paragraph;
 
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
+use rocm_dash_core::state::JobStatus;
 
 use crate::app::{ActiveTab, AppState};
 use crate::ui::format;
@@ -147,7 +148,17 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     jobs.sort_by(|a, b| a.0.cmp(b.0));
     let mut lines: Vec<Line> = Vec::new();
     for (_, job) in jobs {
-        let color = theme.job_status_color(&job.status);
+        // `Running` deliberately stays neutral here: unlike the small status
+        // badges in the console header and Home's activity feed,
+        // `job_status_color`'s accent tone would wash an entire in-flight
+        // job's streamed output in saturated cyan for as long as it runs —
+        // the common case while a user is actually reading LOGS. Terminal
+        // statuses (done/warn/failed/cancelled) still take the shared color.
+        let color = if matches!(job.status, JobStatus::Running) {
+            theme.fg
+        } else {
+            theme.job_status_color(&job.status)
+        };
         for l in &job.output {
             lines.push(Line::from(Span::styled(
                 l.clone(),
@@ -407,13 +418,86 @@ mod tests {
                     .contains("warned line")
             })
             .expect("rendered log line not found");
-        let col = row
+        // Locate the exact cell the log text starts at by mapping the
+        // substring's byte offset back through each cell's symbol length,
+        // rather than matching a single character (which could land on an
+        // unrelated "w" earlier in the row, e.g. in surrounding chrome).
+        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let joined = symbols.concat();
+        let byte_offset = joined
+            .find("warned line")
+            .expect("log line text not found in row");
+        let mut acc = 0;
+        let col = symbols
             .iter()
-            .position(|cell| cell.symbol() == "w")
+            .position(|s| {
+                let start = acc;
+                acc += s.len();
+                byte_offset >= start && byte_offset < acc
+            })
             .expect("start of log line text not found in row");
         let fg = row[col].fg;
         assert_eq!(fg, theme.warn, "nonzero-exit job line should be theme.warn");
         assert_ne!(fg, theme.ok, "nonzero-exit job line must not be theme.ok");
+    }
+
+    #[test]
+    fn logs_dock_keeps_running_job_neutral_not_accent() {
+        // `Running` is deliberately special-cased to `theme.fg` in `logs_dock`
+        // (unlike the small status badges in the console header and Home's
+        // activity feed, which use the shared `job_status_color()` accent):
+        // washing an entire streamed log body in saturated cyan for the whole
+        // duration a job runs — the common case while LOGS is actually being
+        // read — would hurt readability. Lock in that choice so a future
+        // switch back to the shared helper here doesn't silently regress it.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "still running line".into(),
+        });
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let row = buf
+            .content()
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains("still running line")
+            })
+            .expect("rendered log line not found");
+        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let joined = symbols.concat();
+        let byte_offset = joined
+            .find("still running line")
+            .expect("log line text not found in row");
+        let mut acc = 0;
+        let col = symbols
+            .iter()
+            .position(|s| {
+                let start = acc;
+                acc += s.len();
+                byte_offset >= start && byte_offset < acc
+            })
+            .expect("start of log line text not found in row");
+        let fg = row[col].fg;
+        assert_eq!(fg, theme.fg, "in-flight job line should stay neutral");
+        assert_ne!(
+            fg, theme.accent,
+            "in-flight job line must not use the shared accent tone"
+        );
     }
 
     #[test]

@@ -314,32 +314,38 @@ mod tests {
     }
 
     #[test]
-    fn status_label_glyph_and_color_match_shared_job_status_helpers() {
-        // Guards against `job_console`, `tabs/home`, and `dock` re-diverging on
-        // what a `JobStatus` looks like: all three must render the glyph/color
-        // that come from `JobStatus::glyph()`/`Theme::job_status_color()`, not
-        // a hand-rolled match of their own.
+    fn status_label_delegates_to_shared_job_status_helpers() {
+        // Guards `job_console::status_label` specifically: it must return the
+        // literal label/color the shared `JobStatus`/`Theme` helpers define,
+        // not a hand-rolled match of its own. This does not exercise
+        // `tabs/home` or `dock` — those have their own render-level
+        // regression tests (`activity_feed_colors_match_shared_job_status_color`,
+        // `logs_dock_tints_nonzero_exit_as_warn_not_ok`).
         let t = theme();
-        let statuses = [
-            JobStatus::Running,
-            JobStatus::Done { code: 0 },
-            JobStatus::Done { code: 7 },
-            JobStatus::Failed {
-                message: "boom".into(),
-            },
-            JobStatus::Cancelled,
+        let cases: [(JobStatus, &str, ratatui::style::Color); 5] = [
+            (JobStatus::Running, "running", t.accent),
+            (JobStatus::Done { code: 0 }, "done", t.ok),
+            (JobStatus::Done { code: 7 }, "exited (7)", t.warn),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                "failed: boom",
+                t.err,
+            ),
+            (JobStatus::Cancelled, "cancelled", t.muted),
         ];
-        for status in statuses {
+        for (status, expected_label, expected_color) in cases {
             let job = JobState {
                 cmd: "x".into(),
                 args: Vec::new(),
-                status: status.clone(),
+                status,
                 output: std::collections::VecDeque::default(),
                 cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             let (label, color) = status_label(&job, &t);
-            assert_eq!(label, status.label());
-            assert_eq!(color, t.job_status_color(&status));
+            assert_eq!(label, expected_label);
+            assert_eq!(color, expected_color);
         }
     }
 
