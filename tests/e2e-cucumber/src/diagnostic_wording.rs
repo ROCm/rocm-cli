@@ -106,6 +106,13 @@ fn arg(name: &str) -> String {
 /// standing example: its label arrives through a `{context}` built by a
 /// separate function, and pinning only the outer template left that function
 /// free to reword the label into a shape the doc denies.
+///
+/// `templates` must be looked for in CODE ONLY, never the raw file. Both sides
+/// of this check live in the same source, and a doc rendering is often the
+/// template spelled out — so a file-wide `contains` lets the prose vouch for
+/// itself and the code side stops testing anything. That is not hypothetical:
+/// adding a period to the third rendering, to match its `documented_as`, did
+/// exactly this and went unnoticed for a commit.
 struct Documented {
     templates: Vec<String>,
     documented_as: String,
@@ -159,8 +166,19 @@ fn marker_diagnostics() -> Vec<Documented> {
     ]
 }
 
+/// The driver with every comment line removed — the only text a code-side
+/// assertion may be made against. See [`Documented`] for why.
+fn code_text(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn assert_both_sides(source: &str, documented: &[Documented], owner: &str) {
     let docs = doc_block_of(source, owner);
+    let code = code_text(source);
     for Documented {
         templates,
         documented_as,
@@ -168,7 +186,7 @@ fn assert_both_sides(source: &str, documented: &[Documented], owner: &str) {
     {
         for template in templates {
             assert!(
-                source.contains(template.as_str()),
+                code.contains(template.as_str()),
                 "{DRIVER} no longer contains the fragment {template:?}, but `{owner}`'s doc \
                  comment still describes the message it builds as {documented_as:?} — update \
                  the doc with this change"
@@ -284,6 +302,23 @@ fn the_documented_count_of_marker_diagnostics_is_the_real_one() {
         emitted, expected,
         "{DRIVER} emits {emitted} messages quoting a bare marker, but \
          `terminal_state_after_wait` documents {expected}"
+    );
+}
+
+/// The drain message is the one diagnostic whose clause is optional at the
+/// call: `drain_final_frame_where` takes an `Option`, and passing `None` would
+/// leave every template above intact while the message silently stopped
+/// carrying the caller's text. The doc counts it among the four, so the call
+/// that makes that true is pinned too.
+#[test]
+fn the_drain_is_still_reached_with_the_callers_clause() {
+    let code = code_text(&read(DRIVER));
+    let describe = arg("describe");
+    assert!(
+        code.contains("drain_final_frame_where(Some(describe),"),
+        "`wait_for_screen_where` no longer hands its clause to the drain, but its doc still \
+         counts `draining the final frame, waiting until {describe}` among the four \
+         diagnostics that carry it"
     );
 }
 
