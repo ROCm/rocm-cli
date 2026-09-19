@@ -528,8 +528,11 @@ fn human_states(human: &str, label: &str) -> Option<String> {
 
 #[then("the framework report names the runtime's interpreter")]
 async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
+    // `cli_other_output`, not `cli_stderr`: the human form is a second command's
+    // STDOUT, and the `When` above moved it out of the stderr slot it used to
+    // borrow. Reading the old slot found `None` on every GPU lane.
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     // Read the runtime from the human form: `examine --json` carries no runtime
