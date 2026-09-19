@@ -1695,4 +1695,138 @@ flaky = true
         assert!(!glob_match("gfx94*", "gfx1151"));
         assert!(glob_match("gfx1151", "gfx1151"));
     }
+
+    /// `is_wsl` is what tells a WSL2 host from bare metal — `os_family` is
+    /// `linux` on both. A row conditioned on it must hold on one and not the
+    /// other, in both polarities, or the key is decorative.
+    #[test]
+    fn a_row_conditioned_on_wsl_holds_only_there() {
+        let d = decl(&["id:x"]);
+        for (value, xfails_on) in [(true, "wsl2"), (false, "strix-ubuntu")] {
+            let m = Expectations::parse(&format!(
+                "[[\"x\"]]\nwhen = {{ is_wsl = {value} }}\nbug = \"EAI-1\"\n\
+                 reason = \"r\"\n"
+            ))
+            .unwrap();
+            let other = if value { "strix-ubuntu" } else { "wsl2" };
+            assert!(
+                matches!(
+                    resolve(&d, &cap(xfails_on), &m, false, false, false),
+                    Expectation::ExpectXfail { .. }
+                ),
+                "is_wsl = {value} should hold on {xfails_on}"
+            );
+            assert_eq!(
+                resolve(&d, &cap(other), &m, false, false, false),
+                Expectation::ExpectPass,
+                "is_wsl = {value} should not hold on {other}"
+            );
+        }
+    }
+
+    /// The typo this guards against is the one the `Condition` doc describes: a
+    /// misspelled key parses to an all-`None` condition, which matches every
+    /// host, turning one row into a permanent suite-wide xfail. Asserted on both
+    /// structs, since `XfailEntry` carries the row's own keys.
+    #[test]
+    fn a_misspelled_key_is_rejected_rather_than_matching_everything() {
+        let typo_in_condition = Expectations::parse(
+            "[[\"x\"]]\nwhen = { engine = \"vllm\" }\nbug = \"EAI-1\"\nreason = \"r\"\n",
+        );
+        assert!(
+            typo_in_condition.is_err(),
+            "`engine` is not `effective_engine`; accepting it would xfail every platform"
+        );
+        let typo_in_entry = Expectations::parse(
+            "[[\"x\"]]\nwhen = { os = \"linux\" }\nbug = \"EAI-1\"\nreason = \"r\"\n\
+             flakey = true\n",
+        );
+        assert!(
+            typo_in_entry.is_err(),
+            "`flakey` is not `flaky`; accepting it would silently drop the tolerance it asks for"
+        );
+    }
+
+    /// The engine gate is deliberately conjoined with `requires_gpu`: a scenario
+    /// that never serves must not be skipped because some engine cannot start.
+    /// Both sides are asserted on the same host and the same unstartable engine
+    /// — vLLM on Windows, which is the real case — so dropping the conjunct
+    /// changes exactly one of them.
+    #[test]
+    fn only_gpu_scenarios_are_gated_on_the_engine_starting() {
+        let m = Expectations::parse("").unwrap();
+        let host = cap("strix-windows");
+        assert!(
+            !host.engine_available("vllm"),
+            "this test needs an engine that cannot start here"
+        );
+        let gpu = decl(&["id:x", "requires-gpu", "requires-engine:vllm"]);
+        assert!(
+            matches!(
+                resolve(&gpu, &host, &m, false, false, false),
+                Expectation::Skip { .. }
+            ),
+            "a GPU scenario cannot run where its engine will not start"
+        );
+        let no_gpu = decl(&["id:x", "requires-engine:vllm"]);
+        assert_eq!(
+            resolve(&no_gpu, &host, &m, false, false, false),
+            Expectation::ExpectPass,
+            "a scenario that never serves has no stake in whether the engine starts"
+        );
+    }
+
+    /// `ResolvedScenario` is what the platform report is built from, so a row
+    /// that loses its bug id or its flaky flag here loses it in the artifact a
+    /// reader uses to tell an expected failure from a real one.
+    #[test]
+    fn the_report_row_carries_each_expectations_own_metadata() {
+        let xfail = ResolvedScenario::new(
+            "x",
+            "f",
+            "s",
+            "vllm",
+            &Expectation::ExpectXfail {
+                bug: "EAI-1".into(),
+                reason: "r".into(),
+                flaky: true,
+            },
+        );
+        assert_eq!(xfail.bug.as_deref(), Some("EAI-1"));
+        assert_eq!(xfail.reason.as_deref(), Some("r"));
+        assert!(xfail.flaky);
+        assert_eq!(
+            xfail.expected,
+            Expectation::ExpectXfail {
+                bug: "EAI-1".into(),
+                reason: "r".into(),
+                flaky: true,
+            }
+            .label()
+        );
+        assert_eq!(xfail.id, "x");
+        assert_eq!(xfail.feature, "f");
+        assert_eq!(xfail.scenario, "s");
+        assert_eq!(xfail.effective_engine, "vllm");
+
+        // A skip keeps its reason but has no bug, and a pass has neither — the
+        // two `None`s a reader distinguishes an expected failure by.
+        let skipped = ResolvedScenario::new(
+            "x",
+            "f",
+            "s",
+            "vllm",
+            &Expectation::Skip {
+                reason: "no gpu".into(),
+            },
+        );
+        assert_eq!(skipped.bug, None);
+        assert_eq!(skipped.reason.as_deref(), Some("no gpu"));
+        assert!(!skipped.flaky);
+
+        let passing = ResolvedScenario::new("x", "f", "s", "vllm", &Expectation::ExpectPass);
+        assert_eq!(passing.bug, None);
+        assert_eq!(passing.reason, None);
+        assert!(!passing.flaky);
+    }
 }
