@@ -55,6 +55,26 @@ pub struct E2eWorld {
     pub cli_output: Option<String>,
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
+    /// Output of a SECOND command, for a scenario whose whole point is that two
+    /// commands agree — a diagnosis against a fix preview, help examples against
+    /// the model listing, the human `examine` report against its `--json` form.
+    /// Usually that command's stdout; where a scenario does not care which
+    /// stream carried a line, it may hold both concatenated (the fix preview
+    /// does).
+    ///
+    /// Put it HERE rather than in `cli_stderr`. The rule that slot keeps is
+    /// "this is what the command wrote to stderr", and a reader settles it with
+    /// `grep -rnE '^\s*world\.cli_stderr = ' tests/e2e-cucumber/` — anchored to
+    /// the assignment so this comment is not itself a hit. Every result should
+    /// be storing a stderr capture. Borrowing that slot for a second command's
+    /// output breaks the rule at a distance: the step reading it back looks like
+    /// it is making a claim about stderr. This field exists so nothing has to.
+    ///
+    /// Readability only — NOT a bug fix. Every assertion that moved here would
+    /// pass unchanged if the same strings went back into `cli_stderr`; what
+    /// changes is whether a reader of those steps is misled about which stream
+    /// they are asserting on.
+    pub cli_other_output: Option<String>,
     pub cli_rc: Option<i32>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
@@ -97,6 +117,82 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// An address a scenario is deliberately holding, so a serve started without
+    /// one meets an address that is already in use. Released with the World.
+    pub occupied_address: Option<std::net::TcpListener>,
+    /// A `PATH` a scenario prepared for the `rocm` invocations that follow (see
+    /// [`stat_shim_path`]). Carried on the World because the situation it sets up
+    /// belongs to the Given, while the invocations that must see it are in later
+    /// steps.
+    pub path_override: Option<String>,
+    /// Plain child processes a scenario spawned itself and registered with the
+    /// CLI as managed services, so a step can assert the PRODUCT stopped them.
+    ///
+    /// Killed in `Drop` as a panic-path backstop only — never as the thing under
+    /// test. The scenarios that use these assert the child is gone *before*
+    /// teardown runs, because a `Drop` that cleans up after the product failed
+    /// would turn the very defect being pinned into a pass.
+    pub owned_processes: Vec<OwnedProcess>,
+}
+
+/// A child process this scenario owns, kept alive until the product is asked to
+/// stop it (or teardown reaps it).
+#[derive(Debug)]
+pub struct OwnedProcess {
+    pub child: std::process::Child,
+}
+
+impl OwnedProcess {
+    /// The child's PID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Whether the process is still running.
+    ///
+    /// This handle is the child's parent, so reaping it is what turns "signalled
+    /// and gone" into an observable exit — a terminated child stays a zombie
+    /// until then, and asking the OS whether the PID exists would still say yes.
+    /// Polls briefly: the product signals the process and this only has to
+    /// outlast the moment between the signal landing and the kernel finishing
+    /// with it, not any grace period the product itself waits out.
+    pub fn is_running(&mut self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return false,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Ok(None) => return true,
+                // Not treated as "stopped". The only caller asserts that the
+                // product stopped this process, so answering `false` here is
+                // answering "the product did its job" — which would turn a wait
+                // this harness could not perform into a pass for the very defect
+                // the scenario exists to catch. `Child` caches the status once
+                // it has reaped, so a repeated call returns `Ok(Some(_))` rather
+                // than an error and there is no benign case left to absorb.
+                //
+                // Panicking is safe here specifically: nothing calls this from
+                // `Drop` (the only caller is the step behind
+                // `@id:serve-uninstall-stops-what-it-manages`), so there is no
+                // unwind-during-drop abort to worry about, and cucumber catches
+                // a step panic per scenario — the failure is reported and this
+                // handle's `Drop` still runs its kill/wait cleanup.
+                Err(error) => panic!(
+                    "could not determine whether pid {} is still running: {error}",
+                    self.pid()
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -217,6 +313,7 @@ impl Default for E2eWorld {
             cli_output: None,
             cli_outputs: None,
             cli_stderr: None,
+            cli_other_output: None,
             cli_rc: None,
             current_scenario: None,
             isolated_root: Some(root),
@@ -227,6 +324,9 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            occupied_address: None,
+            path_override: None,
+            owned_processes: Vec::new(),
         }
     }
 }
@@ -491,6 +591,52 @@ impl E2eWorld {
         self.register_mock_service_with(ServiceRecordOptions::default());
     }
 
+    /// Spawn a plain, long-lived child process and register it with the CLI as a
+    /// ready managed service, exactly as a real `rocm serve --managed` would
+    /// record its own processes. Returns the child's PID.
+    ///
+    /// The child is a sleeper rather than a server: every scenario that uses
+    /// this asks whether the CLI *stopped the process it recorded*, and a
+    /// listening socket would add a second thing to get wrong without making
+    /// that question any easier to answer. Both PID fields point at the child so
+    /// the record looks like one the CLI itself wrote.
+    ///
+    /// Unix only — Windows has no equivalent one-liner sleeper on PATH, and the
+    /// scenarios that call this are `@requires-os:linux`.
+    pub fn start_managed_service_process(&mut self, service_id: &'static str, model: &str) -> u32 {
+        use std::process::Stdio;
+
+        let root = self.isolated_root.as_ref().expect("no isolated root");
+        let services = root.path().join("data").join("services");
+        // Long enough to outlive any scenario, short enough that a leaked child
+        // on a persistent runner reaps itself rather than lingering forever.
+        let child = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn the scenario's managed-service process");
+        let pid = child.id();
+        self.owned_processes.push(OwnedProcess { child });
+
+        // The port is never connected to; it only has to be a plausible value in
+        // a well-formed record.
+        write_service_record_with(
+            &services,
+            model,
+            18_765,
+            ServiceRecordOptions {
+                service_id,
+                status: "ready",
+                startup_phase: None,
+                supervisor_pid: pid,
+                engine_pid: Some(pid),
+            },
+        );
+        pid
+    }
+
     pub fn register_mock_service_with(&self, options: ServiceRecordOptions) {
         let root = self.isolated_root.as_ref().expect("no isolated root");
         let mock = self.mock.as_ref().expect("no mock server running");
@@ -539,8 +685,9 @@ impl Drop for E2eWorld {
         // failure is ignored rather than panicking (which would abort the run) —
         // hence the returned status is discarded here. The serve retry, where a
         // failed stop changes the next attempt's meaning, does read it.
+        let env = self.isolate_env();
         if let Some(root) = &self.isolated_root {
-            stop_managed_services(root.path());
+            stop_managed_services(root.path(), &env);
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -557,7 +704,10 @@ impl Drop for E2eWorld {
 /// record existed yet, or the stop failed, the next attempt runs against a device
 /// the previous one still owns, and the run must say so rather than let it look
 /// like a genuinely broken serve.
-fn stop_managed_services(root: &std::path::Path) -> String {
+fn stop_managed_services(
+    root: &std::path::Path,
+    env: &[(&'static str, std::ffi::OsString)],
+) -> String {
     let services_dir = root.join("data").join("services");
     let entries = match std::fs::read_dir(&services_dir) {
         Ok(entries) => entries,
@@ -589,9 +739,14 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         }
         let mut cmd = std::process::Command::new(rocm_binary());
         cmd.args(["services", "stop", service_id, "--yes"]);
-        cmd.env("ROCM_CLI_CONFIG_DIR", root.join("config"));
-        cmd.env("ROCM_CLI_DATA_DIR", root.join("data"));
-        cmd.env("ROCM_CLI_CACHE_DIR", root.join("cache"));
+        // The scenario's own environment, not a hand-rolled subset of it. The
+        // three directory variables were previously rebuilt here, which quietly
+        // dropped everything else `isolate_env` sets — including the shared
+        // cache redirection a CI lane exports — so this teardown was talking to
+        // a slightly different machine than the scenario it is cleaning up after.
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         outcomes.push(match cmd.output() {
             Ok(out) if out.status.success() => format!("{service_id}: stopped"),
             Ok(out) => format!(
@@ -759,6 +914,134 @@ pub fn run_rocm_with_env(
         String::from_utf8_lossy(&output.stderr).to_string(),
         rc,
     )
+}
+
+/// Install a `stat` shim on the front of `PATH` that answers for ONE device path
+/// and delegates every other invocation to the real binary, and return the `PATH`
+/// value to hand the child.
+///
+/// The CLI learns a device's mode and owning group by shelling out to `stat`, and
+/// several contracts are about what it then does with unusual answers — an owning
+/// group the machine cannot name, or one that is not the conventional default.
+/// Those states are properties of a machine's device nodes, not something a test
+/// can arrange on a shared runner, so the answer is substituted instead.
+///
+/// What this proves and what it does not: it exercises how the CLI HANDLES such
+/// an answer, not that any particular host produces one. `stat` really does print
+/// `UNKNOWN` for an id with no entry in the group database, which is where the
+/// substituted answer comes from.
+///
+/// Scoped as tightly as possible: only the named path is answered for, so every
+/// other `stat` the CLI makes still reads the real filesystem.
+///
+/// Unix only — panics elsewhere. Every scenario that reaches it is
+/// `@requires-os:linux`, so the panic is unreachable rather than a limitation.
+#[cfg(unix)]
+pub fn stat_shim_path(
+    world: &E2eWorld,
+    device: &str,
+    mode: &str,
+    owner: &str,
+    group: &str,
+) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the stat shim directory");
+
+    let real = ["/usr/bin/stat", "/bin/stat", "/usr/local/bin/stat"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `stat` binary to delegate to");
+    // Answers only the one call this scenario is substituting: the CLI's
+    // `stat -c %A|%U|%G <device>` in `stat_device` (crates/rocm-core/src/examine.rs).
+    // Both the format AND the path must match — keying on the path alone would
+    // hand this `mode|owner|group` line to any other `stat` of the same device
+    // added later, in whatever format it asked for, and the caller would parse
+    // the wrong shape without anything saying so. Anything else is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nfmt=\nwant=\nfor arg in \"$@\"; do\n  \
+         if [ \"$arg\" = '%A|%U|%G' ]; then fmt=1; fi\n  \
+         if [ \"$arg\" = \"{device}\" ]; then want=1; fi\ndone\n\
+         if [ -n \"$fmt\" ] && [ -n \"$want\" ]; then\n  \
+         printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n  exit 0\nfi\nexec {real} \"$@\"\n"
+    );
+    let shim = bin.join("stat");
+    std::fs::write(&shim, script).expect("failed to write the stat shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the stat shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn stat_shim_path(
+    _world: &E2eWorld,
+    _device: &str,
+    _mode: &str,
+    _owner: &str,
+    _group: &str,
+) -> String {
+    unreachable!("the stat shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Add an `id` shim to the same directory [`stat_shim_path`] uses, reporting the
+/// current user as belonging to `groups` instead of their real ones, and return
+/// the `PATH` carrying both shims.
+///
+/// The CLI reads group membership by shelling out to `id -Gn`. Whether the user
+/// running the suite belongs to a device group is a property of the runner, and
+/// on the GPU runner they already do — so a contract about what the CLI concludes
+/// for a user who does NOT can only be measured by substituting the answer. Call
+/// after [`stat_shim_path`], whose directory this reuses.
+#[cfg(unix)]
+pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let bin = root.path().join("stat-shim");
+    std::fs::create_dir_all(&bin).expect("failed to create the shim directory");
+
+    let real = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .expect("no real `id` binary to delegate to");
+    // `-Gn` is the only form the CLI asks for; every other invocation is the real
+    // binary's business.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-Gn\" ]; then\n  echo '{}'\n  exit 0\nfi\nexec {real} \"$@\"\n",
+        groups.join(" ")
+    );
+    let shim = bin.join("id");
+    std::fs::write(&shim, script).expect("failed to write the id shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .expect("failed to mark the id shim executable");
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
+#[cfg(not(unix))]
+pub fn id_shim_path(_world: &E2eWorld, _groups: &[&str]) -> String {
+    unreachable!("the id shim is only reached by @requires-os:linux scenarios")
+}
+
+/// Every group name the machine's own group database knows.
+///
+/// Read from `/etc/group` rather than asked of a tool, so the check does not
+/// depend on `getent` being installed. Unix only, for the same reason as
+/// [`stat_shim_path`].
+pub fn machine_group_names() -> Vec<String> {
+    std::fs::read_to_string("/etc/group")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split(':').next())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Run `rocm` with the behavioral fixture established by a Given step, then
@@ -1174,6 +1457,15 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
+    //
+    // The mock lane's 64 is deliberately left as main has it. Bounding it to the
+    // core count was tried on this branch and reverted: dash-08/dash-09 measure a
+    // validity window whose elapsed time advances with DAEMON CYCLES (the logical
+    // clock added in #380), so a less-loaded lane burns that window faster and
+    // clears the held value before the assertion looks. Both scenarios pass on
+    // main at 64-way and failed here at 2..=6 — a suite-wide scheduling knob
+    // changing two unrelated scenarios' verdicts is reason enough for a
+    // contract-pinning change not to touch it.
     let max_concurrent =
         if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
             1

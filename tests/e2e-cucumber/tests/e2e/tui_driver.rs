@@ -364,6 +364,22 @@ impl TuiSession {
 
     /// Retrieve a terminal failure that landed after a wait's final poll but
     /// before the retry loop decides whether another key is safe to send.
+    ///
+    /// Takes a bare marker and quotes it here, so both of its marker-bearing
+    /// messages read as nouns — deliberately NOT the clause convention
+    /// `wait_for_screen_where` documents. There are two messages, and for
+    /// `send_until`'s marker they read
+    /// `panicked while waiting for "● Observe"` and
+    /// `before "● Observe" appeared.`; a third path
+    /// reports a poll failure and names no marker at all.
+    ///
+    /// Reached only through [`send_until`](Self::send_until), whose own
+    /// signature takes the marker rather than a description of a condition, so
+    /// there is nothing for a caller to phrase.
+    ///
+    /// `src/diagnostic_wording.rs` holds this comment and these templates
+    /// together in both directions, so reword one there too — including the
+    /// example marker, which it reads from the caller.
     fn terminal_state_after_wait(&mut self, marker: &str) -> TerminalState {
         let reader_finished = self
             .reader
@@ -439,39 +455,12 @@ impl TuiSession {
     /// deadline that includes the last screen for diagnosis. Also fails fast if
     /// the child exits before the marker appears.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.screen_text().contains(marker) {
-                return Ok(());
-            }
-            if let Some(panic_message) = self.take_reader_panic() {
-                return Err(format!(
-                    "pty reader thread panicked while waiting for {marker:?}: {panic_message}\n{}",
-                    self.framed_screen()
-                ));
-            }
-            // If the process is gone, let the reader drain the final frame for a
-            // short bounded window. A single poll is not enough when a large frame
-            // is still buffered behind the process exit notification.
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.finished = true;
-                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                if self.drain_final_frame(Some(marker)).await? {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "process exited ({status:?}) before {marker:?} appeared.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for {marker:?}.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
+        // A phrase, not the bare marker: the general helper reads its label as
+        // "waiting until {describe}", so a lone `"Ready"` would land as
+        // `waiting until "Ready"`.
+        let wanted = format!("the screen shows {marker:?}");
+        self.wait_for_screen_where(&wanted, |screen| screen.contains(marker), timeout)
+            .await
     }
 
     /// Poll the current screen until `is_ready` accepts it, with the same
@@ -481,8 +470,27 @@ impl TuiSession {
     ///
     /// The general form of `wait_for_screen`, for evidence a frame is current
     /// that is not "it contains this string" — a cleared table cell, or a
-    /// marker the frame stopped showing. `describe` names the condition being
-    /// waited on and is quoted in every diagnostic.
+    /// marker the frame stopped showing.
+    ///
+    /// `describe` is interpolated verbatim — no quoting, no rewording — into
+    /// four diagnostics, which read `panicked while waiting until {describe}`,
+    /// `timed out … waiting until {describe}`, `before {describe}.`, and `…
+    /// draining the final frame, waiting until {describe}`. The last of those
+    /// is assembled from two fragments in two functions, and both carry the
+    /// clause. So it must be a clause that
+    /// fits all four ("the screen shows X", "generation throughput leaves
+    /// the screen"), not a bare noun; and it carries whatever quoting the
+    /// caller puts in it, since none is added here.
+    ///
+    /// `src/diagnostic_wording.rs` pins this list against the templates below
+    /// — both that each one still exists and that this comment still names it,
+    /// and that there are no more of them than it claims. Change a message and
+    /// that file is where the failure points.
+    ///
+    /// A child that has exited does not end the wait on its own: the reader is
+    /// given a bounded window to commit whatever was still buffered behind the
+    /// exit notification, because the frame that satisfies `is_ready` is often
+    /// in it. Only then is the exit reported.
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,
@@ -503,6 +511,12 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                if self
+                    .drain_final_frame_where(Some(describe), &mut is_ready)
+                    .await?
+                {
+                    return Ok(());
+                }
                 return Err(format!(
                     "process exited ({status:?}) before {describe}.\n{}",
                     self.framed_screen()
@@ -763,7 +777,7 @@ impl TuiSession {
                     self.finished = true;
                     let code = i32::try_from(status.exit_code()).unwrap_or(-1);
                     self.record_once(code);
-                    self.drain_final_frame(None).await?;
+                    self.drain_final_frame().await?;
                     return Ok(code);
                 }
                 Ok(None) => {}
@@ -791,23 +805,44 @@ impl TuiSession {
     /// single poll is not enough when a large frame is still buffered behind the
     /// process exit notification.
     ///
-    /// The one drain loop for both exit paths, so they cannot drift: pass
-    /// `stop_on: Some(marker)` to also return as soon as `marker` appears (that
-    /// caller is racing the drain against a screen assertion), or `None` to just
-    /// wait out the window. Returns whether `stop_on` was found; `Err` if the
-    /// reader thread panicked, which must win over the caller's generic timeout
-    /// or "process exited" message (and would otherwise be swallowed entirely
-    /// when `Drop` runs during another unwind).
-    async fn drain_final_frame(&mut self, stop_on: Option<&str>) -> Result<bool, String> {
-        let found =
-            |session: &Self| stop_on.is_some_and(|marker| session.screen_text().contains(marker));
+    /// This path has nothing to watch for: it waits the window out and returns.
+    /// `wait_for_screen_where` races its own drain against a screen predicate
+    /// and so calls [`Self::drain_final_frame_where`] directly; the two share
+    /// that one loop rather than keeping a copy each.
+    ///
+    /// `Err` if the reader thread panicked, which must win over the caller's
+    /// generic timeout or "process exited" message (and would otherwise be
+    /// swallowed entirely when `Drop` runs during another unwind).
+    async fn drain_final_frame(&mut self) -> Result<(), String> {
+        // `|_| false` never short-circuits, so the loop runs to its deadline.
+        // Nothing is being looked for, so the `bool` is uninformative here and
+        // `None` keeps the absent label out of the reader-panic message.
+        self.drain_final_frame_where(None, &mut |_: &str| false)
+            .await
+            .map(|_| ())
+    }
+
+    /// The drain loop itself, against a predicate. Two callers:
+    /// `wait_for_screen_where`, which races the drain against a screen
+    /// assertion, and [`Self::drain_final_frame`] directly above, which passes
+    /// a predicate that never matches and waits the window out.
+    ///
+    /// `wanted` names what is being waited for and is read back in the
+    /// diagnostics; `None` means "nothing in particular", which is what the
+    /// exit drain passes — unrepresentable as a label rather than spelled with
+    /// one, so no caller can supply it by accident.
+    async fn drain_final_frame_where(
+        &mut self,
+        wanted: Option<&str>,
+        is_ready: &mut (impl FnMut(&str) -> bool + ?Sized),
+    ) -> Result<bool, String> {
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         loop {
-            if found(self) {
+            if is_ready(&self.screen_text()) {
                 return Ok(true);
             }
             if let Some(panic_message) = self.take_reader_panic() {
-                return Err(self.drain_panic_message(stop_on, &panic_message));
+                return Err(self.drain_panic_message(wanted, &panic_message));
             }
             if self
                 .reader
@@ -822,19 +857,23 @@ impl TuiSession {
         // Final checks after the drain window closes: the reader may have
         // committed the last frame — or panicked — between the loop's checks and
         // the `is_finished`/deadline exit, so re-read before declaring failure.
-        if found(self) {
+        if is_ready(&self.screen_text()) {
             return Ok(true);
         }
         if let Some(panic_message) = self.take_reader_panic() {
-            return Err(self.drain_panic_message(stop_on, &panic_message));
+            return Err(self.drain_panic_message(wanted, &panic_message));
         }
         Ok(false)
     }
 
-    /// Reader-panic diagnostic for [`drain_final_frame`], naming the marker the
-    /// drain was racing when there was one.
-    fn drain_panic_message(&self, stop_on: Option<&str>, panic_message: &str) -> String {
-        let context = stop_on.map_or_else(String::new, |marker| format!(" for {marker:?}"));
+    /// Reader-panic diagnostic for [`drain_final_frame_where`], naming what the
+    /// drain was racing.
+    fn drain_panic_message(&self, wanted: Option<&str>, panic_message: &str) -> String {
+        // Clause-shaped, like the three templates in `wait_for_screen_where`:
+        // `describe` is a clause, and " for <clause>" does not parse. The exit
+        // drain waits for nothing and adds no context at all, so it reads as it
+        // did before this loop was shared.
+        let context = wanted.map_or_else(String::new, |wanted| format!(", waiting until {wanted}"));
         format!(
             "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
             self.framed_screen()
