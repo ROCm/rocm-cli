@@ -1115,6 +1115,8 @@ mod tests {
         // immediately before its command name, mirroring
         // `activity_feed_colors_match_shared_job_status_color`'s per-row
         // approach below.
+        use rocm_dash_core::state::StateEvent;
+
         let mut s = state_with_gpu();
         s.jobs
             .jobs
@@ -1122,15 +1124,20 @@ mod tests {
         s.jobs
             .jobs
             .insert("warn".into(), job("warn-job", JobStatus::Done { code: 7 }));
-        s.jobs.jobs.insert(
-            "failed".into(),
-            job(
-                "failed-job",
-                JobStatus::Failed {
-                    message: "boom".into(),
-                },
-            ),
-        );
+        // Driven through the real state machine (unlike the other jobs in
+        // this test, which are hand-built `JobState` values) so this test
+        // still proves `StateEvent::JobErr` actually produces the `Failed`
+        // status it asserts against, not just that the renderer paints a
+        // pre-built `Failed` status correctly.
+        s.jobs.apply(StateEvent::StartJob {
+            id: "failed".into(),
+            cmd: "failed-job".into(),
+            args: vec![],
+        });
+        s.jobs.apply(StateEvent::JobErr {
+            id: "failed".into(),
+            message: "boom".into(),
+        });
         s.jobs.jobs.insert(
             "cancelled".into(),
             job("cancelled-job", JobStatus::Cancelled),
