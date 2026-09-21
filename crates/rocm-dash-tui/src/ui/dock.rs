@@ -316,6 +316,10 @@ mod tests {
     /// back through each cell's symbol length, rather than matching a single
     /// character (which could land on an unrelated cell earlier in the row,
     /// e.g. in surrounding chrome).
+    ///
+    /// Takes the *first* row containing `needle`; safe as long as callers use
+    /// a needle unique to one row in the rendered buffer (true of every
+    /// current call site).
     fn fg_at_substring(term: &Terminal<TestBackend>, needle: &str) -> ratatui::style::Color {
         let buf = term.backend().buffer();
         let width = buf.area().width as usize;

@@ -31,7 +31,7 @@ pub struct Theme {
     pub border: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
     Neutral,
     Muted,
@@ -727,5 +727,48 @@ mod tests {
             fixed_color, old_trick_color,
             "the fix should pick a different (and better-contrasting) color than the old bg-based trick"
         );
+    }
+
+    #[test]
+    fn job_status_tone_covers_all_variants() {
+        let cases = [
+            (JobStatus::Running, StatusTone::Accent),
+            (JobStatus::Done { code: 0 }, StatusTone::Success),
+            (JobStatus::Done { code: 7 }, StatusTone::Warning),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                StatusTone::Error,
+            ),
+            (JobStatus::Cancelled, StatusTone::Muted),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(job_status_tone(&status), expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn log_body_tone_matches_job_status_tone_except_running() {
+        // `log_body_tone` exists solely to keep `Running` neutral in the LOGS
+        // dock (see `dock::logs_dock`'s doc comment); every other variant
+        // must stay identical to the shared `job_status_tone` mapping.
+        let cases = [
+            JobStatus::Done { code: 0 },
+            JobStatus::Done { code: 7 },
+            JobStatus::Failed {
+                message: "boom".into(),
+            },
+            JobStatus::Cancelled,
+        ];
+        for status in cases {
+            assert_eq!(
+                log_body_tone(&status),
+                job_status_tone(&status),
+                "{status:?}"
+            );
+        }
+        assert_eq!(log_body_tone(&JobStatus::Running), StatusTone::Neutral);
+        assert_ne!(job_status_tone(&JobStatus::Running), StatusTone::Neutral);
     }
 }
