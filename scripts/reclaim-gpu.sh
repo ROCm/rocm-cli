@@ -640,7 +640,8 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 8. End to end: reclaim kills the leaks and spares both bystanders.
+  # 8. End to end: reclaim kills the leaks and spares all three bystanders —
+  #    the manual serve, the harness binary, and the out-of-scope decoy.
   reclaim_out="$(reclaim 0)"
   sleep 1
   if process_alive "${prewarm_pid}"; then
