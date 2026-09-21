@@ -93,10 +93,36 @@ pub fn xorshift_payload(len: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Builds a real gzip tarball and returns its bytes.
+///
+/// Packages the single top-level directory `build_dir.join(dir_name)` into
+/// `build_dir.join(archive_name)`. Shared by the TheRock tarball and ComfyUI
+/// source-archive fixtures, which each need a genuine archive for their
+/// installer's real `tar` extraction to unpack once the paced download
+/// completes.
+pub fn build_gzip_tarball(build_dir: &Path, archive_name: &str, dir_name: &str) -> Vec<u8> {
+    let archive_path = build_dir.join(archive_name);
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(build_dir)
+        .arg(dir_name)
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("tar exited with {status} while building {archive_name}"),
+        Err(error) => panic!("tar is required to build {archive_name}: {error}"),
+    }
+    std::fs::read(&archive_path)
+        .unwrap_or_else(|error| panic!("failed to read built archive {archive_name}: {error}"))
+}
+
 /// Stream `contents` as an HTTP response with an explicit `Content-Length`,
 /// in `chunk_size`-byte pieces, sleeping `delay` before every chunk after the
 /// first.
 fn paced_response(contents: Arc<Vec<u8>>, chunk_size: usize, delay: Duration) -> Response {
+    debug_assert!(chunk_size > 0, "chunk_size must be at least 1 byte");
     let total_len = contents.len();
     let chunk_size = chunk_size.max(1);
     let body = Body::from_stream(stream::unfold(0_usize, move |offset| {
