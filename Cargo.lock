@@ -1269,6 +1269,7 @@ dependencies = [
  "axum",
  "cucumber",
  "e2e-report",
+ "futures",
  "portable-pty",
  "reqwest 0.13.4",
  "serde",

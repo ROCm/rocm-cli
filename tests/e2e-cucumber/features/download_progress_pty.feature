@@ -8,10 +8,11 @@ Feature: Download-progress spinner under a real terminal
   # intermediate progress frame, and confirms the spinner line is gone once
   # the process exits.
 
-  @id:download-progress-pty-01-therock-tarball-spinner-renders @requires-os:linux
-  Scenario: download-progress-pty-01 - The tarball download spinner renders progress and clears on completion
+  @id:download-progress-linux-tarball-install-shows-live-progress @requires-os:linux
+  Scenario: download-progress-01 - The tarball download spinner renders progress and clears on completion
     Given a paced canonical release tarball fixture
     When the user installs the tarball SDK for family gfx120X-all under a real terminal
     Then the terminal shows an intermediate download progress frame
+    And the terminal shows the archive being extracted
     And the tarball install exits cleanly
     And the final terminal screen shows neither spinner line
