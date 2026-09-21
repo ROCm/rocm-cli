@@ -30,8 +30,9 @@ use tower_http::services::ServeDir;
 
 use crate::http_server::{self, ServerHandle};
 
-/// A loopback HTTP server that serves one named file in paced chunks and
-/// falls back to serving `root` normally (via `ServeDir`) for every other
+/// A loopback HTTP server that serves one named file in paced chunks.
+///
+/// Falls back to serving `root` normally (via `ServeDir`) for every other
 /// path. Shuts down on drop, like [`crate::loopback_http::LoopbackServer`].
 #[derive(Debug)]
 pub struct PacedDownloadServer {
@@ -57,7 +58,7 @@ impl PacedDownloadServer {
         let app = Router::new()
             .route(
                 &route,
-                get(move || paced_response(contents, chunk_size, delay)),
+                get(move || std::future::ready(paced_response(contents, chunk_size, delay))),
             )
             .fallback_service(ServeDir::new(root));
         Self {
@@ -72,10 +73,30 @@ impl PacedDownloadServer {
     }
 }
 
+/// High-entropy filler bytes for a paced-fixture payload.
+///
+/// A naive multiplicative-hash sequence looked pseudo-random but gzip still
+/// compressed it by over 99%, collapsing a paced transfer into a single
+/// unpaced chunk. A fixed seed keeps the fixture (and therefore the archive's
+/// compressed size) deterministic across runs. Shared by both the TheRock
+/// tarball and ComfyUI source-archive fixtures, which each need enough
+/// incompressible bytes to stream in more than one paced chunk.
+pub fn xorshift_payload(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
 /// Stream `contents` as an HTTP response with an explicit `Content-Length`,
 /// in `chunk_size`-byte pieces, sleeping `delay` before every chunk after the
 /// first.
-async fn paced_response(contents: Arc<Vec<u8>>, chunk_size: usize, delay: Duration) -> Response {
+fn paced_response(contents: Arc<Vec<u8>>, chunk_size: usize, delay: Duration) -> Response {
     let total_len = contents.len();
     let chunk_size = chunk_size.max(1);
     let body = Body::from_stream(stream::unfold(0_usize, move |offset| {

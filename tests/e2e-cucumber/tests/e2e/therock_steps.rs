@@ -28,7 +28,7 @@ use std::time::Duration;
 use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
-use e2e_cucumber::paced_download::PacedDownloadServer;
+use e2e_cucumber::paced_download::{PacedDownloadServer, xorshift_payload};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::TuiSession;
@@ -334,24 +334,6 @@ const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
 /// Wait budget for the PTY-driven download scenario below, mirroring
 /// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
 const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// High-entropy filler bytes for the paced tarball fixture's payload.
-///
-/// Deliberately not just "looks scrambled" — see the comment at its call
-/// site: an earlier multiplicative-hash sequence looked pseudo-random but
-/// gzip still compressed it by over 99%. A fixed seed keeps the fixture
-/// (and therefore the archive's compressed size) deterministic across runs.
-fn xorshift_payload(len: usize) -> Vec<u8> {
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 56) as u8
-        })
-        .collect()
-}
 
 #[given("a paced canonical release tarball fixture")]
 async fn paced_tarball_fixture(world: &mut E2eWorld) {

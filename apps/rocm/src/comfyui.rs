@@ -2100,7 +2100,7 @@ mod tests {
                 runtime_version: runtime.version.clone(),
                 runtime_root: runtime.install_root.clone(),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
-                source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
+                source_url: comfyui_source_archive_url(),
                 source_path: source_path(&paths),
                 requirements_path: source_path(&paths).join("requirements.txt"),
                 pip_cache_dir: None,
