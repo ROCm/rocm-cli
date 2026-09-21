@@ -176,7 +176,8 @@ enum Command {
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -1342,7 +1343,8 @@ fn run() -> Result<()> {
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and `-V`/`--version` reporting
+/// the same traceable string as `rocm version` (see [`cli_version_string`]).
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1354,14 +1356,23 @@ fn run() -> Result<()> {
 /// subcommand *after* this runs and leaves it at that default, so matching the
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
+///
+/// `display_name` only changes what `-V`/`--version` prints ahead of the
+/// version string — verified against `--help`'s `Usage:` line and `completions`
+/// output, both of which are generated from `Cli::command()` directly and so
+/// bypass this override.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
-/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version` print
+/// the traceable version string. Mirrors the derived `Cli::parse()`, which
+/// builds from `Cli::command()` directly and therefore cannot pick up either
+/// override.
 ///
 /// Returns a [`ClapExitCode`]-carrying error instead of calling
 /// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
@@ -1372,6 +1383,60 @@ fn cli_command() -> clap::Command {
 fn parse_cli() -> Result<Cli> {
     let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
     Cli::from_arg_matches(&matches).map_err(clap_exit_code)
+}
+
+/// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
+/// the MCP in-process handler) prints: the semantic version Cargo built, plus
+/// the git ref and commit hash [`build.rs`] embedded, additively — never a
+/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
+/// still reports a real version number rather than none at all.
+fn cli_version_string() -> String {
+    format!(
+        "{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
+}
+
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1971,10 +2036,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
@@ -2435,6 +2497,9 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     }
     if let Some(long_version) = cmd.get_long_version() {
         bare = bare.long_version(long_version.to_owned());
+    }
+    if let Some(display_name) = cmd.get_display_name() {
+        bare = bare.display_name(display_name.to_owned());
     }
     for alias in cmd.get_visible_aliases() {
         bare = bare.visible_alias(alias.to_owned());
@@ -14674,7 +14739,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
