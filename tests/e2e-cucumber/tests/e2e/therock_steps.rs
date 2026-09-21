@@ -321,8 +321,15 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
 /// observable progress frames — land before the transfer completes, and slow
 /// enough per chunk that the PTY's 20ms poll cadence reliably samples an
 /// intermediate, sub-100% frame rather than racing straight to completion.
-const PACED_TARBALL_PAYLOAD_BYTES: usize = 400_000;
-const PACED_TARBALL_CHUNK_BYTES: usize = 32_768;
+///
+/// The payload is tens of MB, not a few hundred KB, so that `tar -xf`
+/// (spawned synchronously once the download completes — see
+/// `extract_tarball`) takes long enough for the PTY's 20ms poll cadence to
+/// reliably catch the "Extracting …" spinner frame before the process moves
+/// on. The chunk size scales with it, so the number of paced chunks — and
+/// therefore the download's observed wall time — stays the same as before.
+const PACED_TARBALL_PAYLOAD_BYTES: usize = 20_000_000;
+const PACED_TARBALL_CHUNK_BYTES: usize = 1_600_000;
 const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
 /// Wait budget for the PTY-driven download scenario below, mirroring
 /// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
@@ -460,6 +467,18 @@ async fn assert_intermediate_download_progress_frame(world: &mut E2eWorld) {
         "expected an intermediate (sub-100%) download progress frame, but the \
          first observed percent frame was already complete:\n{screen}"
     );
+}
+
+#[then("the terminal shows the archive being extracted")]
+async fn assert_extraction_frame_is_shown(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .wait_for_screen(&format!("Extracting {CURRENT_TARBALL}"), PTY_SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("extraction spinner frame never appeared: {e}"));
 }
 
 #[then("the tarball install exits cleanly")]

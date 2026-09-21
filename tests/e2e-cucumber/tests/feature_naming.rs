@@ -30,6 +30,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("dash.feature", "dash"),
     ("dependency_guard.feature", "deps-guard"),
     ("diagnose.feature", "diagnose"),
+    ("download_progress_pty.feature", "download-progress"),
     ("driver_install.feature", "driver-install"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
