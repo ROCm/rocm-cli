@@ -763,6 +763,43 @@ fn render_summary(
     f.render_widget(p, area);
 }
 
+/// Renders `p` (already wrapped) into `inner`, reserving a vertical scrollbar
+/// column when the wrapped content overflows the viewport, and returns the
+/// pane's max scroll offset.
+///
+/// The overflow decision and the final wrap both measure at the same width:
+/// measuring at the pre-reservation width and then rendering into the
+/// (narrower) post-reservation area would let the two disagree, silently
+/// mis-scrolling — the class of bug a scrollbar column shrinking the content
+/// width by one can introduce if the wrap isn't re-measured after reserving it.
+fn render_scrollable_pane(
+    f: &mut Frame,
+    inner: Rect,
+    p: Paragraph<'_>,
+    scroll: u16,
+    theme: &Theme,
+) -> u16 {
+    let full_len = p.line_count(inner.width);
+    let content = panel::vertical_scrollbar(
+        f,
+        inner,
+        full_len,
+        inner.height as usize,
+        scroll as usize,
+        theme,
+    );
+    let len = if content.width == inner.width {
+        full_len
+    } else {
+        p.line_count(content.width)
+    };
+    let max = u16::try_from(len)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(content.height);
+    f.render_widget(p.scroll((scroll.min(max), 0)), content);
+    max
+}
+
 /// Renders the launch_args/env_vars panes, applying `scroll` (in lines) to
 /// both, and returns the larger of the two panes' max scroll offsets so the
 /// caller can clamp future scroll input (see `AppState::scroll_instance_detail`).
@@ -794,10 +831,7 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
             .collect()
     };
     let args_p = Paragraph::new(args_lines).wrap(Wrap { trim: false });
-    let args_max = u16::try_from(args_p.line_count(args_inner.width))
-        .unwrap_or(u16::MAX)
-        .saturating_sub(args_inner.height);
-    f.render_widget(args_p.scroll((scroll.min(args_max), 0)), args_inner);
+    let args_max = render_scrollable_pane(f, args_inner, args_p, scroll, theme);
 
     // env_vars (right). BTreeMap iterates sorted by key.
     let env_inner = panel::bento(
@@ -827,10 +861,7 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
             .collect()
     };
     let env_p = Paragraph::new(env_lines).wrap(Wrap { trim: false });
-    let env_max = u16::try_from(env_p.line_count(env_inner.width))
-        .unwrap_or(u16::MAX)
-        .saturating_sub(env_inner.height);
-    f.render_widget(env_p.scroll((scroll.min(env_max), 0)), env_inner);
+    let env_max = render_scrollable_pane(f, env_inner, env_p, scroll, theme);
 
     args_max.max(env_max)
 }
@@ -1412,6 +1443,54 @@ mod tests {
         assert!(
             !non_scrollable_text.contains("↑/↓ scroll"),
             "footer must not show the scroll hint when the body does not overflow; got:\n{non_scrollable_text}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_body_shows_scrollbar_only_when_overflowing() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `render_scrollable_pane` draws a `║`/`█` scrollbar (see
+        // `panel::vertical_scrollbar`) once the pane's wrapped content
+        // overflows the viewport — the footer's `↑/↓ scroll` text hint is not
+        // this app's only scrollable-content affordance, and every other
+        // scrollable surface (job console, managers, chat, dock) gets one.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains('║') && text.contains('█'),
+            "overflowing body must render a scrollbar track and thumb; got:\n{text}"
+        );
+
+        // A non-overflowing instance must not draw a scrollbar at all —
+        // otherwise the reserved column would needlessly narrow content that
+        // already fits.
+        let inst_small = mk_inst("small");
+        let mut m2 = HashMap::new();
+        m2.insert(inst_small.container_id.clone(), inst_small);
+        let state_small = mk_state(m2, 0);
+
+        let mut term2 = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term2
+            .draw(|f| {
+                draw_detail(f, f.area(), &state_small, &state_small.theme);
+            })
+            .unwrap();
+        let non_scrollable_text = buffer_text(&term2);
+        assert!(
+            !non_scrollable_text.contains('║') && !non_scrollable_text.contains('█'),
+            "non-overflowing body must not draw a scrollbar; got:\n{non_scrollable_text}"
         );
     }
 
