@@ -229,12 +229,13 @@ async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
     let tui = session(world);
     tui.use_overflow_size()
         .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
-    // The resize alone doesn't prove the app redrew at the new geometry yet;
-    // the popup title reappearing at the smaller size is that proof, ahead of
-    // the `Then` step's specific scroll-hint assertion.
-    tui.wait_for_screen("Instance · ", default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("instance detail did not redraw after shrinking: {e}"));
+    // The resize is synchronous in the emulator but the app only learns of it
+    // asynchronously via SIGWINCH, so this step does not itself prove a
+    // redraw at the new geometry happened — `"Instance · "` was already on
+    // screen before the resize (see `open_instance_detail`), so waiting on it
+    // here is satisfied immediately regardless of whether the app redrew.
+    // The `Then` step's own `wait_for_screen` on the scroll hint is what
+    // actually gates on the post-resize render.
 }
 
 #[when("the user opens the services manager")]
@@ -834,12 +835,12 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
 
 #[then("the instance detail footer shows the scroll hint")]
 async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
-    let tui = session(world);
-    let screen = tui.screen_text();
-    assert!(
-        screen.contains("↑/↓ scroll"),
-        "footer did not show the scroll hint once the detail body overflowed:\n{screen}"
-    );
+    session(world)
+        .wait_for_screen("↑/↓ scroll", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!("footer did not show the scroll hint once the detail body overflowed: {e}")
+        });
 }
 
 #[then("the backdrop behind the popup is dimmed")]
