@@ -1510,6 +1510,11 @@ permissions:
     /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
     /// alternation on the `Where-Object` line.
     ///
+    /// This cannot tell the reclaim's own matcher from any other
+    /// `Where-Object … -match` line. Each of these workflows has exactly one
+    /// today, so every alternation returned IS a reclaim matcher; add a second,
+    /// unrelated one and the caller's assertions would be applied to it too.
+    ///
     /// Extracted rather than substring-matched against the whole file for the
     /// reason this module's header gives: every root ALSO appears in these
     /// workflows as an env var and in prose, so a `text.contains(root)` check
@@ -1566,6 +1571,7 @@ permissions:
 
             for alternation in &alternations {
                 let present: Vec<&str> = alternation.split('|').collect();
+                let mut divergence_seen = false;
 
                 // Script -> mirror: a root added to the script must reach Windows.
                 for needle in &expected {
@@ -1585,6 +1591,7 @@ permissions:
                     // Windows it over-matches. Tracked in EAI-8815 — when that is
                     // fixed, delete this arm and the assertion below will hold.
                     if *token == "__engine-serve-http" {
+                        divergence_seen = true;
                         continue;
                     }
                     assert!(
@@ -1594,6 +1601,18 @@ permissions:
                          or add it there (EAI-8751)"
                     );
                 }
+
+                // An exemption nothing asserts is an exemption that rots: once
+                // EAI-8815 moves `__engine-serve-http` out of the root
+                // alternation, the arm above stops firing and would sit here
+                // forever as dead code exempting nothing. Fail instead, so the
+                // fix is told to finish the job.
+                assert!(
+                    divergence_seen,
+                    "{workflow}'s PowerShell reclaim matcher `{alternation}` no longer names \
+                     `__engine-serve-http`, so the EAI-8815 divergence looks fixed — delete the \
+                     exemption arm in this test, which is now dead code (EAI-8751)"
+                );
             }
         }
     }
