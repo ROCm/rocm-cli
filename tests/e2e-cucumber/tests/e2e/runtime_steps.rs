@@ -570,8 +570,10 @@ fn active_runtime_version(world: &E2eWorld) -> String {
         .lines()
         .find(|line| line.trim_start().starts_with('*'))
         .and_then(|line| line.split_once("version="))
-        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default())
-        .unwrap_or_else(|| panic!("no active runtime line with a version= field:\n{stdout}"))
+        .map_or_else(
+            || panic!("no active runtime line with a version= field:\n{stdout}"),
+            |(_, rest)| rest.split_whitespace().next().unwrap_or_default(),
+        )
         .to_owned()
 }
 
