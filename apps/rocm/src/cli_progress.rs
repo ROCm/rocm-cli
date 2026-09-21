@@ -183,6 +183,12 @@ fn truncate_to_width(line: &str, max_width: usize) -> String {
 /// into `"1.5 MiB"`) can push a line that fit at 0% past the terminal width,
 /// and a blind tail-truncation would silently drop the percentage for the
 /// rest of the transfer.
+///
+/// If `frame` and `suffix` alone already exceed `max_width` (an extremely
+/// narrow terminal, or a suffix wider than the terminal), there is no
+/// longer room to keep `suffix` intact either — falls back to truncating
+/// `"{frame} {suffix}"` as a whole, same as the no-suffix case below, so the
+/// result never exceeds `max_width` regardless of how narrow it is.
 fn assemble_status_line(
     frame: &str,
     label: &str,
@@ -193,7 +199,10 @@ fn assemble_status_line(
         return truncate_to_width(&format!("{frame} {label}"), max_width);
     };
     let reserved = frame.width() + 1 + suffix.width();
-    let label_budget = max_width.saturating_sub(reserved);
+    if reserved > max_width {
+        return truncate_to_width(&format!("{frame} {suffix}"), max_width);
+    }
+    let label_budget = max_width - reserved;
     format!("{frame} {}{suffix}", truncate_to_width(label, label_budget))
 }
 
@@ -404,6 +413,24 @@ mod tests {
         assert!(
             line.width() <= 79,
             "the assembled line must still respect the terminal width: {line:?} (width {})",
+            line.width()
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_never_exceeds_max_width_when_suffix_alone_overflows() {
+        // Regression test: when the terminal is narrower than `frame + " " +
+        // suffix` alone, the label truncates to "" and an earlier version
+        // fell back to printing the untruncated suffix anyway, silently
+        // exceeding `max_width` — the same bug class this module exists to
+        // eliminate, just past the point where the suffix can stay intact.
+        let suffix = format_progress_suffix(1_608_192, Some(20_003_341));
+        assert!(suffix.width() > 10, "test needs an overlong suffix");
+        let line = assemble_status_line("⠋", "Downloading a file…", Some(&suffix), 10);
+        assert!(
+            line.width() <= 10,
+            "the assembled line must never exceed max_width, even when the \
+             suffix alone doesn't fit: {line:?} (width {})",
             line.width()
         );
     }
