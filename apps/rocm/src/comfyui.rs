@@ -31,6 +31,18 @@ const COMFYUI_SOURCE_ARCHIVE_NAME: &str = "ComfyUI-master.tar.gz";
 const COMFYUI_DEFAULT_HOST: &str = "127.0.0.1";
 const COMFYUI_DEFAULT_PORT: u16 = 8188;
 
+/// The ComfyUI source archive URL, overridable only in `e2e-test-hooks`
+/// builds so a fixture server can exercise the real download path.
+#[cfg(feature = "e2e-test-hooks")]
+fn comfyui_source_archive_url() -> String {
+    std::env::var("ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE")
+        .unwrap_or_else(|_| COMFYUI_SOURCE_ARCHIVE_URL.to_owned())
+}
+#[cfg(not(feature = "e2e-test-hooks"))]
+fn comfyui_source_archive_url() -> String {
+    COMFYUI_SOURCE_ARCHIVE_URL.to_owned()
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ComfyUiInstallOptions {
     pub runtime_id: Option<String>,
@@ -384,7 +396,7 @@ pub(crate) fn install(
         runtime_version: runtime.manifest.version.clone(),
         runtime_root: runtime.manifest.install_root.clone(),
         python_executable: runtime.python.clone(),
-        source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
+        source_url: comfyui_source_archive_url(),
         source_path: source_path.clone(),
         requirements_path,
         pip_cache_dir: None,
@@ -1396,11 +1408,12 @@ fn download_and_extract_source(
             archive_path.display()
         )?;
     } else {
-        writeln!(log, "Downloading {COMFYUI_SOURCE_ARCHIVE_URL}.")?;
+        let source_url = comfyui_source_archive_url();
+        writeln!(log, "Downloading {source_url}.")?;
         let download_label = "Fetching ComfyUI source archive…";
         let spinner = AnimatedSpinner::start(download_label);
         let download_result = download_file(
-            COMFYUI_SOURCE_ARCHIVE_URL,
+            &source_url,
             &archive_path,
             &mut |bytes, total| {
                 spinner.set_progress(download_label, bytes, total);
@@ -2174,7 +2187,7 @@ mod tests {
                 runtime_version: "7.13.0a20260511".to_owned(),
                 runtime_root: paths.data_dir.join("runtimes").join("runtime"),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
-                source_url: COMFYUI_SOURCE_ARCHIVE_URL.to_owned(),
+                source_url: comfyui_source_archive_url(),
                 source_path: source_path(&paths),
                 requirements_path: source_path(&paths).join("requirements.txt"),
                 pip_cache_dir: None,
