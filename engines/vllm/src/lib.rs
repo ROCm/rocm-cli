@@ -1392,26 +1392,16 @@ fn install_vllm_with_uv(
     }
 }
 
-/// The version segment of a wheel filename, per the PEP 427 naming scheme
-/// `{distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform
-/// tag}.whl`. Used to recover the exact version `uv pip download` resolved
-/// for a rotating-dev-tag package so it can be pinned for the real install.
-fn wheel_filename_version(filename: &str) -> Option<String> {
-    let stem = filename.strip_suffix(".whl")?;
-    let mut parts = stem.split('-');
-    let _distribution = parts.next()?;
-    let version = parts.next()?;
-    (!version.is_empty()).then(|| version.to_owned())
-}
-
-/// Downloads the single wheel matching `{pkg}=={version_prefix}.*` from
-/// `index_url` into a scratch directory and returns the exact
-/// `{pkg}=={version}` requirement it resolved to.
+/// Resolves the exact requirement `uv` would install for
+/// `{pkg}=={version_prefix}.*` from `index_url`, without installing anything.
 ///
-/// Bails if discovery finds anything other than exactly one wheel: zero means
-/// no compatible build is published (never fall back to unpinned PyPI), and
-/// more than one means the prefix is ambiguous and a silent pick would be a
-/// guess.
+/// `uv` has no `pip download` command (and never has — it's a declined
+/// upstream feature request, astral-sh/uv#3163), so this uses `uv pip
+/// install --dry-run` instead: it runs the real resolver against `python`'s
+/// platform/interpreter tags and reports the version it would install on a
+/// ` + {pkg}==<version>` line, which is parsed back out by
+/// [`dry_run_resolved_pin`]. A prefix with no compatible build published
+/// surfaces as a resolver failure (never fall back to unpinned PyPI).
 fn discover_pinned_requirement(
     uv: &Path,
     paths: &AppPaths,
@@ -1420,72 +1410,46 @@ fn discover_pinned_requirement(
     pkg: &str,
     version_prefix: &str,
 ) -> Result<String> {
-    let tmp = tempfile::Builder::new()
-        .prefix("rocm-cli-vllm-discover-")
-        .tempdir()
-        .context("failed to create scratch directory for vLLM wheel discovery")?;
     let requirement_prefix = format!("{pkg}=={version_prefix}.*");
     let output = ProcessCommand::new(uv)
-        .args([
-            "pip",
-            "download",
-            "--no-deps",
-            "--no-index",
-            "--find-links",
-            index_url,
-            "--prerelease",
-            "allow",
-            "--python",
-        ])
+        .args(["pip", "install", "--dry-run", "--no-deps", "--index-url"])
+        .arg(index_url)
+        .args(["--prerelease", "allow", "--python"])
         .arg(python)
-        .args(["-d"])
-        .arg(tmp.path())
         .arg(&requirement_prefix)
         .envs(uv_command_env(paths))
         .output()
-        .with_context(|| format!("failed to launch uv pip download for {pkg}"))?;
+        .with_context(|| format!("failed to launch uv pip install --dry-run for {pkg}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let detail = if !stderr.is_empty() {
             stderr
-        } else if !stdout.is_empty() {
-            stdout
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_owned()
         } else {
             "no output".to_owned()
         };
-        bail!("`uv pip download {requirement_prefix}` from {index_url} failed: {detail}");
+        bail!("`uv pip install --dry-run {requirement_prefix}` from {index_url} failed: {detail}");
     }
-    let mut wheels = fs::read_dir(tmp.path())
-        .with_context(|| format!("failed to read {}", tmp.path().display()))?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| {
-            Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("whl"))
-        })
-        .collect::<Vec<_>>();
-    wheels.sort();
-    match wheels.len() {
-        1 => {
-            let filename = wheels.remove(0);
-            let version = wheel_filename_version(&filename).ok_or_else(|| {
-                anyhow!("downloaded wheel `{filename}` for {pkg} has an unparseable filename")
-            })?;
-            Ok(format!("{pkg}=={version}"))
-        }
-        0 => bail!(
-            "no wheel found for `{requirement_prefix}` at {index_url}: AMD has not published a \
-             matching build, or the version prefix `{version_prefix}` is stale. Check {index_url} \
-             directly for the current version."
-        ),
-        n => bail!(
-            "found {n} wheels matching `{requirement_prefix}` at {index_url}, expected exactly \
-             one: {}",
-            wheels.join(", ")
-        ),
-    }
+    dry_run_resolved_pin(&stdout, pkg).ok_or_else(|| {
+        anyhow!(
+            "`uv pip install --dry-run {requirement_prefix}` from {index_url} did not report a \
+             resolved version for {pkg}: {}",
+            stdout.trim()
+        )
+    })
+}
+
+/// Parses the ` + {pkg}==<version>` line `uv pip install --dry-run` prints
+/// for each package it would install, returning it as a `{pkg}==<version>`
+/// requirement.
+fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
+    let prefix = format!("+ {pkg}==");
+    stdout.lines().find_map(|line| {
+        let version = line.trim_start().strip_prefix(&prefix)?;
+        (!version.is_empty()).then(|| format!("{pkg}=={version}"))
+    })
 }
 
 /// Builds the `uv pip install` argv for a ROCm 10.x discovery install: the
@@ -4175,27 +4139,28 @@ mod tests {
     }
 
     #[test]
-    fn wheel_filename_version_parses_a_rotated_dev_tag() {
-        let filename =
-            "vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl";
+    fn dry_run_resolved_pin_parses_a_rotated_dev_tag() {
+        let stdout = "Resolved 1 package in 601ms\nWould download 1 package\nWould install 1 package\n + vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826\n";
         assert_eq!(
-            wheel_filename_version(filename),
-            Some("0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826".to_owned())
+            dry_run_resolved_pin(stdout, "vllm"),
+            Some("vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826".to_owned())
         );
     }
 
     #[test]
-    fn wheel_filename_version_parses_a_simple_wheel() {
+    fn dry_run_resolved_pin_parses_a_simple_version() {
+        let stdout = "Resolved 1 package in 553ms\n + flash-attn==2.8.3\n";
         assert_eq!(
-            wheel_filename_version("flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl"),
-            Some("2.8.3".to_owned())
+            dry_run_resolved_pin(stdout, "flash-attn"),
+            Some("flash-attn==2.8.3".to_owned())
         );
     }
 
     #[test]
-    fn wheel_filename_version_rejects_non_wheel_and_malformed_names() {
-        assert_eq!(wheel_filename_version("vllm-0.27.1.tar.gz"), None);
-        assert_eq!(wheel_filename_version("vllm.whl"), None);
+    fn dry_run_resolved_pin_ignores_other_packages_and_missing_lines() {
+        let stdout = "Resolved 1 package in 553ms\n + amd-aiter==0.1.20.post1\n";
+        assert_eq!(dry_run_resolved_pin(stdout, "vllm"), None);
+        assert_eq!(dry_run_resolved_pin("no solution found", "vllm"), None);
     }
 
     #[test]
