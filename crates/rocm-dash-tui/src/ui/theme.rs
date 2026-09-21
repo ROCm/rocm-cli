@@ -254,20 +254,38 @@ impl Theme {
     /// accent would tint an entire streaming log body, not just a small
     /// status badge). They must not each pick their own mapping.
     pub const fn job_status_color(&self, status: &JobStatus) -> Color {
-        let tone = match status {
-            // Accent (cyan) rather than the warning/in-progress tone
-            // `docs/ux-guidelines.md` suggests for "work in progress": a
-            // running job is the thing the user's attention should be on
-            // right now, which is what accent means elsewhere in this app,
-            // and warn/orange is reserved for a job that finished with a
-            // nonzero exit code.
-            JobStatus::Running => StatusTone::Accent,
-            JobStatus::Done { code: 0 } => StatusTone::Success,
-            JobStatus::Done { .. } => StatusTone::Warning,
-            JobStatus::Failed { .. } => StatusTone::Error,
-            JobStatus::Cancelled => StatusTone::Muted,
-        };
-        self.tone_color(tone)
+        self.tone_color(job_status_tone(status))
+    }
+}
+
+/// Tone for a [`JobStatus`], shared by [`Theme::job_status_color`] and
+/// [`log_body_tone`]. Kept as a plain exhaustive `match` (not a method on
+/// `JobStatus` itself) since `StatusTone` lives here in `rocm-dash-tui`, not
+/// in `rocm-dash-core` where `JobStatus` is defined.
+const fn job_status_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        // Accent (cyan) rather than the warning/in-progress tone
+        // `docs/ux-guidelines.md` suggests for "work in progress": a
+        // running job is the thing the user's attention should be on
+        // right now, which is what accent means elsewhere in this app,
+        // and warn/orange is reserved for a job that finished with a
+        // nonzero exit code.
+        JobStatus::Running => StatusTone::Accent,
+        JobStatus::Done { code: 0 } => StatusTone::Success,
+        JobStatus::Done { .. } => StatusTone::Warning,
+        JobStatus::Failed { .. } => StatusTone::Error,
+        JobStatus::Cancelled => StatusTone::Muted,
+    }
+}
+
+/// Like [`job_status_tone`], except `Running` stays neutral — see
+/// `dock::logs_dock`'s doc comment for why a saturated accent tone doesn't
+/// belong on an entire streamed log body. Exhaustive, so a new `JobStatus`
+/// variant forces a decision here instead of silently defaulting to accent.
+pub(crate) const fn log_body_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        JobStatus::Running => StatusTone::Neutral,
+        other => job_status_tone(other),
     }
 }
 

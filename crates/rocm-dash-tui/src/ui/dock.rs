@@ -18,14 +18,13 @@ use ratatui::widgets::Paragraph;
 
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
-use rocm_dash_core::state::JobStatus;
 
 use crate::app::{ActiveTab, AppState};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, log_body_tone};
 
 /// Minimum terminal size for the wide triptych. Below this the dash stays
 /// single-column (byte-for-byte the pre-Phase-6 layout).
@@ -154,14 +153,7 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         // job's streamed output in saturated cyan for as long as it runs —
         // the common case while a user is actually reading LOGS. Terminal
         // statuses (done/warn/failed/cancelled) still take the shared color.
-        // Unlike `glyph`/`label`/`job_status_color`, this `matches!` isn't an
-        // exhaustive match the compiler checks, so a future `JobStatus`
-        // variant that should also stay neutral here needs a human to add it.
-        let color = if matches!(job.status, JobStatus::Running) {
-            theme.fg
-        } else {
-            theme.job_status_color(&job.status)
-        };
+        let color = theme.tone_color(log_body_tone(&job.status));
         for l in &job.output {
             lines.push(Line::from(Span::styled(
                 l.clone(),
@@ -319,6 +311,39 @@ mod tests {
             .collect()
     }
 
+    /// Foreground color of the cell where `needle` starts, in the row that
+    /// contains it. Locates the exact cell by mapping `needle`'s byte offset
+    /// back through each cell's symbol length, rather than matching a single
+    /// character (which could land on an unrelated cell earlier in the row,
+    /// e.g. in surrounding chrome).
+    fn fg_at_substring(term: &Terminal<TestBackend>, needle: &str) -> ratatui::style::Color {
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let row = buf
+            .content()
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .expect("rendered log line not found");
+        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let joined = symbols.concat();
+        let byte_offset = joined.find(needle).expect("log line text not found in row");
+        let mut acc = 0;
+        let col = symbols
+            .iter()
+            .position(|s| {
+                let start = acc;
+                acc += s.len();
+                byte_offset >= start && byte_offset < acc
+            })
+            .expect("start of log line text not found in row");
+        row[col].fg
+    }
+
     #[test]
     fn is_wide_and_triptych_extents() {
         assert!(!is_wide(160, 44));
@@ -409,37 +434,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
 
-        let buf = term.backend().buffer();
-        let width = buf.area().width as usize;
-        let row = buf
-            .content()
-            .chunks(width)
-            .find(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-                    .contains("warned line")
-            })
-            .expect("rendered log line not found");
-        // Locate the exact cell the log text starts at by mapping the
-        // substring's byte offset back through each cell's symbol length,
-        // rather than matching a single character (which could land on an
-        // unrelated "w" earlier in the row, e.g. in surrounding chrome).
-        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
-        let joined = symbols.concat();
-        let byte_offset = joined
-            .find("warned line")
-            .expect("log line text not found in row");
-        let mut acc = 0;
-        let col = symbols
-            .iter()
-            .position(|s| {
-                let start = acc;
-                acc += s.len();
-                byte_offset >= start && byte_offset < acc
-            })
-            .expect("start of log line text not found in row");
-        let fg = row[col].fg;
+        let fg = fg_at_substring(&term, "warned line");
         assert_eq!(fg, theme.warn, "nonzero-exit job line should be theme.warn");
         assert_ne!(fg, theme.ok, "nonzero-exit job line must not be theme.ok");
     }
@@ -469,33 +464,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
 
-        let buf = term.backend().buffer();
-        let width = buf.area().width as usize;
-        let row = buf
-            .content()
-            .chunks(width)
-            .find(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-                    .contains("still running line")
-            })
-            .expect("rendered log line not found");
-        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
-        let joined = symbols.concat();
-        let byte_offset = joined
-            .find("still running line")
-            .expect("log line text not found in row");
-        let mut acc = 0;
-        let col = symbols
-            .iter()
-            .position(|s| {
-                let start = acc;
-                acc += s.len();
-                byte_offset >= start && byte_offset < acc
-            })
-            .expect("start of log line text not found in row");
-        let fg = row[col].fg;
+        let fg = fg_at_substring(&term, "still running line");
         assert_eq!(fg, theme.fg, "in-flight job line should stay neutral");
         assert_ne!(
             fg, theme.accent,
@@ -527,33 +496,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
 
-        let buf = term.backend().buffer();
-        let width = buf.area().width as usize;
-        let row = buf
-            .content()
-            .chunks(width)
-            .find(|row| {
-                row.iter()
-                    .map(ratatui::buffer::Cell::symbol)
-                    .collect::<String>()
-                    .contains("cancelled line")
-            })
-            .expect("rendered log line not found");
-        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
-        let joined = symbols.concat();
-        let byte_offset = joined
-            .find("cancelled line")
-            .expect("log line text not found in row");
-        let mut acc = 0;
-        let col = symbols
-            .iter()
-            .position(|s| {
-                let start = acc;
-                acc += s.len();
-                byte_offset >= start && byte_offset < acc
-            })
-            .expect("start of log line text not found in row");
-        let fg = row[col].fg;
+        let fg = fg_at_substring(&term, "cancelled line");
         assert_eq!(fg, theme.muted, "cancelled job line should be theme.muted");
         assert_ne!(
             fg, theme.fg,

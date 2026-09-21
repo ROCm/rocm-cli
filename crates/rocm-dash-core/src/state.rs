@@ -72,6 +72,11 @@ impl JobStatus {
     /// done/warn/failed/running/cancelled. Derived from real `JobStatus`
     /// values via [`Self::glyph`] (rather than a second hardcoded copy of the
     /// glyph table) so the legend can't drift from what real jobs render.
+    ///
+    /// The `code: 1` and empty `message` below are throwaway placeholders —
+    /// safe only because `glyph()` never branches on the exact code value
+    /// (only `code == 0` vs not) or on message content. If `glyph()` ever
+    /// starts branching on either, these placeholders need revisiting too.
     pub fn legend_glyphs() -> [&'static str; 5] {
         [
             Self::Done { code: 0 }.glyph(),
