@@ -521,16 +521,22 @@ async fn assert_intermediate_comfyui_download_progress_frame(world: &mut E2eWorl
         .tui
         .as_mut()
         .expect("no pty session for the ComfyUI install");
+    // `download_file_streaming_with_progress` reports once, unthrottled,
+    // before the transfer starts (an immediate "(0%)" frame) and once per
+    // chunk after — so waiting for any "%)" frame while only excluding
+    // "(100%)" would pass on that very first callback even if pacing never
+    // let a real in-transfer frame render. Requiring a percentage strictly
+    // between 0 and 100 proves an actual mid-transfer frame was observed.
     session
-        .wait_for_screen("%)", PTY_SCREEN_TIMEOUT)
+        .wait_for_screen_where(
+            "an intermediate (neither 0% nor 100%) download progress frame",
+            |screen| {
+                screen.contains("%)") && !screen.contains("(0%)") && !screen.contains("(100%)")
+            },
+            PTY_SCREEN_TIMEOUT,
+        )
         .await
-        .unwrap_or_else(|e| panic!("download progress frame never appeared: {e}"));
-    let screen = session.screen_text();
-    assert!(
-        !screen.contains("(100%)"),
-        "expected an intermediate (sub-100%) download progress frame, but the \
-         first observed percent frame was already complete:\n{screen}"
-    );
+        .unwrap_or_else(|e| panic!("intermediate download progress frame never appeared: {e}"));
 }
 
 #[then("the ComfyUI install exits cleanly")]
