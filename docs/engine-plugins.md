@@ -40,20 +40,23 @@ lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
 backend it installs is paired with the SDK actually in use, rather than
 whatever version Lemonade shipped pinned to. The attempt is skipped outright
 on native Windows, and left alone when the active SDK reports a nightly
-version rather than a plain `X.Y.Z` the alignment can match against. An
-attempt that cannot be verified against the installed backend's shared
-libraries reverts to the packaged pin instead of being kept.
+version rather than a plain `X.Y.Z` the alignment can match against.
 
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
 llama.cpp release and just repoints it at the active ROCm version — a
-deliberate, reproducible pin. If that release never shipped an asset for that
-ROCm version, the second queries GitHub's `releases/latest` for
-`lemonade-sdk/llama.cpp` (an unauthenticated `api.github.com` call, subject to
-GitHub's public rate limit) and installs whatever build is newest at that
-moment. That second build is a moving target, not a pin: which llama.cpp
-commit actually gets installed depends on when the install ran, and the
-version installed is not recorded anywhere `rocm examine`/`rocm version`
-report.
+deliberate, reproducible pin. If that attempt fails to resolve against the
+installed backend's shared libraries — for example because that release never
+shipped an asset for the active ROCm version — the second queries GitHub's
+`releases/latest` for `lemonade-sdk/llama.cpp` (an unauthenticated
+`api.github.com` call, subject to GitHub's public rate limit) and installs
+whatever build is newest at that moment. That second build is a moving
+target, not a pin: which llama.cpp commit actually gets installed depends on
+when the install ran, and the version installed is not recorded anywhere
+`rocm examine`/`rocm version` report. An attempt that cannot be verified
+against the installed backend's shared libraries reverts to whichever version
+was pinned before the attempt — the packaged pin on a fresh install or after
+`--reinstall`, but whatever alignment last wrote otherwise — rather than
+being kept.
 
 Set `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` to keep whatever
 `backend_versions.json` already pins and skip the rewrite — any value works,

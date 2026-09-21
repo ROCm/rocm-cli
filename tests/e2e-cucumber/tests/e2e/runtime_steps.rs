@@ -591,8 +591,8 @@ fn active_runtime_version(world: &E2eWorld) -> String {
 /// disabled gate returns before any write to `backend_versions.json` at all
 /// (see `align_llamacpp_backend_to_version`), so the llama.cpp tag limb of
 /// the same file is provably untouched whenever both checks below hold --
-/// Tier 2 is the only code that writes it, and reaching Tier 2 requires
-/// passing the same gate.
+/// both Tier 2 and the revert path's own restore write sit behind that same
+/// gate.
 #[then("the packaged pin survives the install")]
 async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");

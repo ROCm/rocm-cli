@@ -1367,9 +1367,10 @@ fn align_llamacpp_backend_to_version(
     // Neither tier produced a verified GPU backend. Revert everything — including
     // the llama.cpp build tag, so the fallback install below isn't itself
     // misdirected — and retry once more with Lemonade's original pinned defaults.
-    // Never a regression relative to today's behavior: every step below is
-    // best-effort, matching its sibling warnings, so a failure to restore the pin
-    // still lets the fallback install run rather than hard-failing the whole install.
+    // Every step below is best-effort, matching its sibling warnings: a failure to
+    // restore the pin still lets the fallback install run rather than hard-failing
+    // the whole install, though it does leave the pin holding the unverified
+    // target version until a later run corrects it.
     eprintln!(
         "Warning: could not align Lemonade's ROCm backend to {target_version}; reverting to the \
          default pinned version."
