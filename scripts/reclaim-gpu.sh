@@ -267,6 +267,46 @@ spawn_decoy() {
   echo $!
 }
 
+# Spawn a process that becomes a ZOMBIE and stays one, plus the keeper holding
+# it in that state. Echoes "<zombie pid> <keeper pid>"; the zombie pid is empty
+# if it could not be produced.
+#
+# A zombie is the second way into cmdline_of's failure path and the only one
+# that reaches its emptiness check: /proc/<pid>/cmdline still OPENS for a
+# zombie, it just reads zero bytes, because the kernel has released the argv
+# while the process table entry remains.
+spawn_zombie() {
+  local dir="$1"
+  local keeper_pid zombie_pid state
+  local waited=0
+  mkdir -p "${dir}"
+  # The subshell starts a short-lived child and then `exec`s a long sleep, so
+  # the parent that would reap it is replaced by a process that never calls
+  # wait(). The child therefore stays a zombie for as long as the keeper lives.
+  # Bash reaps its OWN background children, which is why this needs the exec.
+  (
+    sleep 0.1 &
+    echo $! >"${dir}/zombie.pid"
+    exec sleep 300
+  ) >/dev/null 2>&1 &
+  keeper_pid=$!
+  # Wait for the child to actually reach state Z rather than assuming it has.
+  while [[ "${waited}" -lt 50 ]]; do
+    if [[ -s "${dir}/zombie.pid" ]]; then
+      zombie_pid="$(cat "${dir}/zombie.pid")"
+      state="$(sed 's/.*) //' "/proc/${zombie_pid}/stat" 2>/dev/null | cut -d' ' -f1)" || state=''
+      [[ "${state}" == "Z" ]] && break
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # Sentinel, not an empty field: `read` skips leading whitespace, so echoing an
+  # empty first field would shift the KEEPER's pid into the caller's zombie_pid
+  # and make the "could not produce one" branch unreachable.
+  [[ "${state:-}" == "Z" ]] || zombie_pid='none'
+  echo "${zombie_pid} ${keeper_pid}"
+}
+
 # Spawn a decoy that IGNORES SIGTERM, so the TERM -> grace -> KILL escalation is
 # exercised. A plain `cp /bin/sleep` decoy dies on the first TERM and leaves the
 # escalation branch unreached, which is how it went untested.
@@ -343,7 +383,11 @@ assert_rule_covers_every_list_entry() {
 self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
-  local escapee_pid escapee_cmd guard_rc
+  local escapee_pid escapee_cmd guard_rc probe_cmd
+  local zombie_pid zombie_keeper_pid
+  local superseded_hit=0
+  local probe_failures=0
+  local containment_failures=0
   local list_failures=0
   local failures=0
 
@@ -378,17 +422,39 @@ self_test() {
   workload_pid="$(spawn_decoy "${workload_decoy}")"
   harness_pid="$(spawn_decoy "${harness_decoy}")"
   stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
+  read -r zombie_pid zombie_keeper_pid <<<"$(spawn_zombie "${tmp}/zombie")"
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
   # 1. Regression guard: the patterns this script replaced could not see a
   #    pre-warm engine process. If this ever matches, the decoy stopped being
   #    representative and the rest of the self-test proves nothing.
-  if pgrep -f '/tmp/rocm-e2e.*llama-server' >/dev/null 2>&1 ||
-    pgrep -f 'e2e-shared.*llama-server' >/dev/null 2>&1; then
+  #
+  #    Asked of the decoys' own command lines, not of the machine. The obvious
+  #    `pgrep -f '<pattern>'` also matches the shell that INVOKED it whenever
+  #    that shell's own command line contains the pattern, so it reports a
+  #    match with no such process alive; on a shared self-hosted runner an
+  #    unrelated process would fail it too. Both are false FAILs in the check
+  #    whose entire job is to say "the decoy is unrepresentative".
+  for probe_cmd in "$(cmdline_of "${prewarm_pid}")" "$(cmdline_of "${stubborn_pid}")"; do
+    # An unreadable probe would leave every pattern unmatched and print "ok"
+    # having tested nothing. Same reason the zombie arm below fails loudly
+    # rather than skipping: a check that cannot run must not report a pass.
+    if [[ -z "${probe_cmd}" ]]; then
+      echo "FAIL: could not read a decoy's command line; the regression guard tested nothing"
+      probe_failures=$((probe_failures + 1))
+      continue
+    fi
+    if [[ "${probe_cmd}" =~ /tmp/rocm-e2e.*llama-server ]] ||
+      [[ "${probe_cmd}" =~ e2e-shared.*llama-server ]]; then
+      superseded_hit=1
+    fi
+  done
+  failures=$((failures + probe_failures))
+  if [[ "${superseded_hit}" == 1 ]]; then
     echo "FAIL: superseded patterns matched the pre-warm decoy; decoy is unrepresentative"
     failures=$((failures + 1))
-  else
+  elif [[ "${probe_failures}" -eq 0 ]]; then
     echo "ok: superseded patterns do not match a pre-warm engine process (the defect)"
   fi
 
@@ -436,15 +502,20 @@ self_test() {
       *"${tmp}"*) ;;
       *)
         echo "FAIL: selection escaped the scratch tree: pid=${escapee_pid} cmd=${escapee_cmd}"
-        failures=$((failures + 1))
+        containment_failures=$((containment_failures + 1))
         ;;
     esac
   done <<<"${selected}"
-  if [[ "${failures}" -eq "${list_failures}" ]]; then
+  failures=$((failures + containment_failures))
+  # Counted on its own rather than off the running total: gating this line on
+  # the total suppressed it whenever an EARLIER check had failed — which is
+  # precisely the run whose output someone is reading.
+  if [[ "${containment_failures}" -eq 0 ]]; then
     echo "ok: every selected process lies inside the self-test scratch tree"
   fi
 
-  # 7. The escalation guard's comparison, in all three directions.
+  # 7. The escalation guard's comparison, in all three directions — and for
+  #    "gone", by BOTH routes into it.
   #
   #    NOTE: only the COMPARISON is covered. The guard's call site is exercised
   #    solely in the always-escalate direction, because making a pid be reused
@@ -474,6 +545,26 @@ self_test() {
     echo "FAIL: escalation guard conflated a departed process with a recycled one (rc=${guard_rc})"
     failures=$((failures + 1))
   fi
+  # The other route into "gone": the open SUCCEEDS and reads nothing. The arm
+  # above exercises only a failed OPEN, so without this one `cmdline_of`'s
+  # emptiness check can be deleted with the self-test still green — restoring
+  # the "was recycled" mislabel for a process that merely exited, which is the
+  # race the guard exists to describe correctly.
+  if [[ "${zombie_pid}" != "none" ]]; then
+    guard_rc=0
+    same_selected_process "${zombie_pid}" "anything" || guard_rc=$?
+    if [[ "${guard_rc}" == 2 ]]; then
+      echo "ok: escalation guard reports an argv-less zombie as gone, not recycled"
+    else
+      echo "FAIL: zombie with an empty command line was not reported as gone (rc=${guard_rc})"
+      failures=$((failures + 1))
+    fi
+  else
+    # Failing rather than skipping: an arm that silently does not run is the
+    # exact defect this check was added to close.
+    echo "FAIL: could not produce a zombie decoy; the empty-cmdline arm went untested"
+    failures=$((failures + 1))
+  fi
 
   # 8. End to end: reclaim kills the leaks and spares both bystanders.
   reclaim_out="$(reclaim 0)"
@@ -497,7 +588,7 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 7. The escalation ran, and ran only where it was needed. Asserting the
+  # 9. The escalation ran, and ran only where it was needed. Asserting the
   #    stubborn decoy died covers the SIGKILL block; asserting the ordinary
   #    decoy did NOT reach escalation covers the `kill -TERM` that precedes it,
   #    which would otherwise be silently replaceable by any no-op.
@@ -520,7 +611,12 @@ self_test() {
     echo "ok: ordinary decoy exited on SIGTERM without escalation"
   fi
 
-  kill -KILL "${workload_pid}" "${harness_pid}" "${stubborn_pid}" 2>/dev/null || true
+  # Includes prewarm_pid: on a GREEN run reclaim has already killed it, but on a
+  # FAILED run it was not selected, and it would otherwise outlive the scratch
+  # tree for its full 300s as an orphan. Killing the zombie's keeper lets init
+  # reap the zombie itself.
+  kill -KILL "${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}" \
+    "${zombie_keeper_pid}" 2>/dev/null || true
 
   if [[ "${failures}" -ne 0 ]]; then
     echo "reclaim-gpu self-test: ${failures} failure(s)"
