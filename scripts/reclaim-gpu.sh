@@ -192,6 +192,24 @@ reclaim() {
     if [[ "${dry_run}" == 1 ]]; then
       echo "reclaim: would terminate pid=${pid} cmd=${cmdline}"
     else
+      # Same guard as the escalation below, and for the same reason. The window
+      # is shorter here — no grace period — but it is not zero: select_leaked
+      # walks the whole of /proc, so a pid can be freed and reissued between
+      # the scan that selected it and this signal. A bystander is just as dead
+      # from TERM as from KILL, so the check cannot be reserved for the latter.
+      rc=0
+      same_selected_process "${pid}" "${cmdline}" || rc=$?
+      case "${rc}" in
+        0) ;;
+        2)
+          echo "reclaim: pid=${pid} exited before it could be terminated"
+          continue
+          ;;
+        *)
+          echo "reclaim: pid=${pid} was recycled before it could be terminated, not signalling"
+          continue
+          ;;
+      esac
       echo "reclaim: terminating pid=${pid} cmd=${cmdline}"
       kill -TERM "${pid}" 2>/dev/null || true
     fi
@@ -385,6 +403,7 @@ self_test() {
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
+  local decoy_pids
   local superseded_hit=0
   local probe_failures=0
   local containment_failures=0
@@ -423,6 +442,11 @@ self_test() {
   harness_pid="$(spawn_decoy "${harness_decoy}")"
   stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
   read -r zombie_pid zombie_keeper_pid <<<"$(spawn_zombie "${tmp}/zombie")"
+  # Every process this function spawned that can still be signalled, so cleanup
+  # is one list rather than a line kept in step at each early return. The zombie
+  # itself is absent deliberately: it is already dead, and killing its keeper is
+  # what lets init reap it.
+  decoy_pids=("${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}" "${zombie_keeper_pid}")
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
@@ -512,6 +536,17 @@ self_test() {
   # precisely the run whose output someone is reading.
   if [[ "${containment_failures}" -eq 0 ]]; then
     echo "ok: every selected process lies inside the self-test scratch tree"
+  else
+    # A GATE, not a score. Check 8 below calls the real `reclaim 0`, which
+    # sends real signals to whatever select_leaked returns at that moment. If
+    # containment has just failed, that selection reaches outside this scratch
+    # tree — the exact accident this check exists to prevent — so scoring it
+    # and carrying on would let the self-test do the damage it is guarding
+    # against. Stop here instead, while nothing has been signalled yet.
+    echo "FAIL: containment breached; refusing to run the real reclaim"
+    kill -KILL "${decoy_pids[@]}" 2>/dev/null || true
+    echo "reclaim-gpu self-test: ${failures} failure(s)"
+    return 1
   fi
 
   # 7. The escalation guard's comparison, in all three directions — and for
@@ -615,8 +650,7 @@ self_test() {
   # FAILED run it was not selected, and it would otherwise outlive the scratch
   # tree for its full 300s as an orphan. Killing the zombie's keeper lets init
   # reap the zombie itself.
-  kill -KILL "${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}" \
-    "${zombie_keeper_pid}" 2>/dev/null || true
+  kill -KILL "${decoy_pids[@]}" 2>/dev/null || true
 
   if [[ "${failures}" -ne 0 ]]; then
     echo "reclaim-gpu self-test: ${failures} failure(s)"
