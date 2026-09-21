@@ -1412,13 +1412,9 @@ fn download_and_extract_source(
         writeln!(log, "Downloading {source_url}.")?;
         let download_label = "Fetching ComfyUI source archive…";
         let spinner = AnimatedSpinner::start(download_label);
-        let download_result = download_file(
-            &source_url,
-            &archive_path,
-            &mut |bytes, total| {
-                spinner.set_progress(download_label, bytes, total);
-            },
-        );
+        let download_result = download_file(&source_url, &archive_path, &mut |bytes, total| {
+            spinner.set_progress(download_label, bytes, total);
+        });
         drop(spinner);
         download_result?;
     }

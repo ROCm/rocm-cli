@@ -397,10 +397,9 @@ async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
     // package manager whenever the test host happens to lack it. That is slow,
     // network-dependent, and mutates host state, none of which this scenario
     // should depend on, so disable it here.
-    world.command_env.push((
-        "ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS",
-        "1".into(),
-    ));
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS", "1".into()));
     let session = TuiSession::spawn(
         world,
         &[

@@ -195,8 +195,7 @@ mod tests {
         // full transfer should take at least 2 delays.
         let contents = vec![0_u8; 30];
         let delay = Duration::from_millis(50);
-        let server =
-            PacedDownloadServer::start(dir.path(), "paced.bin", contents, 10, delay);
+        let server = PacedDownloadServer::start(dir.path(), "paced.bin", contents, 10, delay);
 
         let started = Instant::now();
         let response = get(&server, "paced.bin").await;
@@ -216,22 +215,29 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         std::fs::write(dir.path().join("index.html"), b"<html></html>")
             .expect("failed to write fallback file");
-        let server =
-            PacedDownloadServer::start(dir.path(), "archive.tar.gz", vec![1, 2, 3], 1, Duration::ZERO);
+        let server = PacedDownloadServer::start(
+            dir.path(),
+            "archive.tar.gz",
+            vec![1, 2, 3],
+            1,
+            Duration::ZERO,
+        );
 
         let response = get(&server, "index.html").await;
         assert!(response.status().is_success());
-        assert_eq!(
-            response.text().await.expect("no body"),
-            "<html></html>"
-        );
+        assert_eq!(response.text().await.expect("no body"), "<html></html>");
     }
 
     #[tokio::test]
     async fn missing_file_is_a_404() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let server =
-            PacedDownloadServer::start(dir.path(), "archive.tar.gz", vec![1, 2, 3], 1, Duration::ZERO);
+        let server = PacedDownloadServer::start(
+            dir.path(),
+            "archive.tar.gz",
+            vec![1, 2, 3],
+            1,
+            Duration::ZERO,
+        );
 
         let response = get(&server, "absent.zip").await;
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
