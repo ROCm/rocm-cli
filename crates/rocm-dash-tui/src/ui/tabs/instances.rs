@@ -764,8 +764,13 @@ fn render_summary(
 }
 
 /// Renders `p` (already wrapped) into `inner`, reserving a vertical scrollbar
-/// column when the wrapped content overflows the viewport, and returns the
-/// pane's max scroll offset.
+/// column when `reserve` is set, and returns the pane's max scroll offset.
+///
+/// `reserve` is decided by the caller (see `render_body`) rather than by this
+/// pane's own content, because the launch_args/env_vars panes share one
+/// scroll position and must stay the same width — gating each pane's column
+/// on its own overflow independently would let one reserve a column while its
+/// sibling doesn't, purely because one has slightly less content.
 ///
 /// The overflow decision and the final wrap both measure at the same width:
 /// measuring at the pre-reservation width and then rendering into the
@@ -776,18 +781,23 @@ fn render_scrollable_pane(
     f: &mut Frame,
     inner: Rect,
     p: Paragraph<'_>,
+    full_len: usize,
     scroll: u16,
+    reserve: bool,
     theme: &Theme,
 ) -> u16 {
-    let full_len = p.line_count(inner.width);
-    let content = panel::vertical_scrollbar(
-        f,
-        inner,
-        full_len,
-        inner.height as usize,
-        scroll as usize,
-        theme,
-    );
+    let content = if reserve {
+        panel::vertical_scrollbar_forced(
+            f,
+            inner,
+            full_len,
+            inner.height as usize,
+            scroll as usize,
+            theme,
+        )
+    } else {
+        inner
+    };
     let len = if content.width == inner.width {
         full_len
     } else {
@@ -831,7 +841,6 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
             .collect()
     };
     let args_p = Paragraph::new(args_lines).wrap(Wrap { trim: false });
-    let args_max = render_scrollable_pane(f, args_inner, args_p, scroll, theme);
 
     // env_vars (right). BTreeMap iterates sorted by key.
     let env_inner = panel::bento(
@@ -861,7 +870,19 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
             .collect()
     };
     let env_p = Paragraph::new(env_lines).wrap(Wrap { trim: false });
-    let env_max = render_scrollable_pane(f, env_inner, env_p, scroll, theme);
+
+    // Decide reservation once, from both panes' pre-reservation overflow, so
+    // a scrollbar in either pane reserves the column in *both* — the two
+    // share one scroll position and would otherwise end up different widths
+    // whenever only one pane's content happened to overflow.
+    let args_full_len = args_p.line_count(args_inner.width);
+    let env_full_len = env_p.line_count(env_inner.width);
+    let reserve = args_full_len > usize::from(args_inner.height)
+        || env_full_len > usize::from(env_inner.height);
+
+    let args_max =
+        render_scrollable_pane(f, args_inner, args_p, args_full_len, scroll, reserve, theme);
+    let env_max = render_scrollable_pane(f, env_inner, env_p, env_full_len, scroll, reserve, theme);
 
     args_max.max(env_max)
 }
@@ -1491,6 +1512,87 @@ mod tests {
         assert!(
             !non_scrollable_text.contains('║') && !non_scrollable_text.contains('█'),
             "non-overflowing body must not draw a scrollbar; got:\n{non_scrollable_text}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_reserves_scrollbar_symmetrically_when_only_one_pane_overflows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // launch_args overflows; env_vars is default-empty ("(none)", one
+        // line) and would never overflow on its own. The two panes share one
+        // scroll position (see `render_body`), so both must reserve the
+        // column — otherwise env_vars would render one column wider than
+        // launch_args purely because it happens to have less content, an
+        // alignment wobble with no functional meaning.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        let mut bar_columns = std::collections::BTreeSet::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let sym = buf.cell((x, y)).unwrap().symbol();
+                if sym == "║" || sym == "█" {
+                    bar_columns.insert(x);
+                }
+            }
+        }
+        assert_eq!(
+            bar_columns.len(),
+            2,
+            "launch_args and env_vars must each reserve exactly one scrollbar \
+             column, even though only launch_args overflows on its own; got \
+             columns {bar_columns:?}"
+        );
+    }
+
+    #[test]
+    fn render_scrollable_pane_remeasures_wrap_at_post_reservation_width() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `reserve` can be forced true by the *other* pane overflowing (see
+        // `render_body`) even when this pane's own content fits at the
+        // pre-reservation width — exactly the case this test sets up. A
+        // 20-char line fits one row at width 20 but wraps to two at width 19
+        // (the width `vertical_scrollbar_forced` leaves after reserving its
+        // column), so re-measuring after reservation is what makes the
+        // second row reachable at all: measuring only at the pre-reservation
+        // width would silently under-report `max_scroll` by exactly that row.
+        let inner = Rect::new(0, 0, 20, 3);
+        let lines: Vec<Line> = vec![Line::raw("a"), Line::raw("b"), Line::raw("x".repeat(20))];
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let full_len = p.line_count(inner.width);
+        assert_eq!(
+            full_len, 3,
+            "the 20-char line must fit in one row at the pre-reservation width 20"
+        );
+
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let mut max = 0u16;
+        term.draw(|f| {
+            max = render_scrollable_pane(f, inner, p, full_len, 0, true, &theme);
+        })
+        .unwrap();
+
+        assert_eq!(
+            max, 1,
+            "the 20-char line wraps to 2 rows at the post-reservation width \
+             19, so max_scroll must be 1 (4 wrapped rows - 3 visible), not 0 \
+             as a stale pre-reservation measurement would report"
         );
     }
 
