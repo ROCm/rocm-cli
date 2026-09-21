@@ -336,10 +336,10 @@ Feature: Runtime configuration
   # CLI's own output -- the second Then does the enforcement proving (it reads
   # the packaged pin and checks for the alignment/revert log lines); the first
   # Then only proves the CLI read the variable and named it, which is a weaker
-  # claim on its own. Same lane as scenario 11 and for the same reason -- a real
+  # claim on its own. Same lane as scenario 16 and for the same reason -- a real
   # managed SDK and a real backend, on the serialized nightly GPU runners.
   @id:runtime-lemonade-backend-alignment-opt-out @requires-gpu @requires-engine:lemonade @nightly
-  Scenario: runtime-12 - Opting out of the Lemonade backend alignment keeps the packaged pin
+  Scenario: runtime-17 - Opting out of the Lemonade backend alignment keeps the packaged pin
     Given a managed runtime is active
     And the user has opted out of realigning Lemonade's backend
     When the user reinstalls the lemonade engine
