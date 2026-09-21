@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cucumber::{given, then, when};
-use e2e_cucumber::paced_download::PacedDownloadServer;
+use e2e_cucumber::paced_download::{PacedDownloadServer, xorshift_payload};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::TuiSession;
@@ -437,23 +437,6 @@ const PACED_ARCHIVE_CHUNK_DELAY: Duration = Duration::from_millis(150);
 /// Wait budget for this scenario's PTY assertions, matching
 /// `therock_steps.rs`'s file-local `PTY_SCREEN_TIMEOUT` convention.
 const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// High-entropy filler bytes padding the paced archive fixture. A naive
-/// multiplicative-hash sequence looked pseudo-random but gzip still crushed it
-/// by over 99%, collapsing the paced transfer into a single unpaced chunk —
-/// see `therock_steps.rs::xorshift_payload`, duplicated here rather than
-/// shared since the two step files are separate private modules.
-fn xorshift_payload(len: usize) -> Vec<u8> {
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 56) as u8
-        })
-        .collect()
-}
 
 #[given("a paced ComfyUI source archive fixture")]
 async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
