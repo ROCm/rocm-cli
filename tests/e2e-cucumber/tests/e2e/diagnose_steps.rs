@@ -438,6 +438,7 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // marker) rather than a specific fix-id's exact flags, since the top match
     // is environment-dependent.
     let causes = output.lines().filter(|l| l.contains("score=")).count();
+    assert!(causes > 0, "no scored causes to check:\n{output}");
     let flag_lines: Vec<&str> = output
         .lines()
         .filter(|l| l.trim_start().starts_with("flags:"))

@@ -2914,13 +2914,54 @@ mod tests {
             .iter()
             .find(|l| l.trim_start().starts_with("flags:"))
             .expect("fix-9-igpu-dgpu should have a flags: line");
-        assert!(
-            flags_line.contains("rocm fix can run it"),
-            "rendered flags: line must say fix-9-igpu-dgpu is auto-applicable, not manual only: {flags_line}"
+        // Exact match, not `contains`: fix-9 carries only the auto flag, so a
+        // revert of the `render_report_text` call site to its pre-PR inline
+        // logic would still print a line containing "rocm fix can run it" and
+        // not "manual only" -- `contains` can't tell the two implementations
+        // apart. See `fix_11_iommu_rendered_flags_line_is_exact` for a fix-id
+        // whose optional flags actually differ between old and new wording.
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: rocm fix can run it",
+            "rendered flags: line for fix-9-igpu-dgpu: {flags_line}"
         );
-        assert!(
-            !flags_line.contains("manual only"),
-            "rendered flags: line must not claim fix-9-igpu-dgpu is manual only: {flags_line}"
+    }
+
+    #[test]
+    fn fix_11_iommu_rendered_flags_line_is_exact() {
+        // Companion to `fix_9_igpu_dgpu_is_auto_applicable_on_linux`: that test
+        // only pins a fix-id with just the auto flag set, which an exact-match
+        // assertion can't distinguish from the pre-PR `render_report_text`
+        // inline logic (both print "rocm fix can run it" for it). fix-11-iommu
+        // carries sudo+reboot+manual, so this pins the full comma-joined,
+        // reworded `flags:` line through the real render call site.
+        let mut e = linux_base();
+        e.iommu_kernel_param = "on".to_owned();
+        e.gpus = vec![
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+        ];
+        let report = diagnose(&e, "");
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-11-iommu")
+            .expect("fix-11-iommu should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-11-iommu should have a flags: line");
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
+            "rendered flags: line for fix-11-iommu: {flags_line}"
         );
     }
 

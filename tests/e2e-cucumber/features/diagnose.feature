@@ -284,7 +284,7 @@ Feature: Diagnosing failures and listing fixes
   # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
   # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
   @id:diagnose-fix-preview-states-required-flags
-  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
     Given a user who has chosen a fix that needs sudo and a re-login
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
