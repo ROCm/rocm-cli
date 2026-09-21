@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cucumber::{given, then, when};
-use e2e_cucumber::paced_download::{PacedDownloadServer, xorshift_payload};
+use e2e_cucumber::paced_download::{PacedDownloadServer, build_gzip_tarball, xorshift_payload};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::TuiSession;
@@ -476,6 +476,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     // chunk.
     let build_dir = root(world).join("comfyui-fixture").join("archive-build");
     let source_dir = build_dir.join("ComfyUI-master");
+    std::fs::create_dir_all(&source_dir).expect("failed to create ComfyUI source directory");
     write_fixture(
         &source_dir.join("requirements.txt"),
         "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
@@ -485,20 +486,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
         xorshift_payload(PACED_ARCHIVE_PAYLOAD_BYTES),
     )
     .expect("failed to write archive filler payload");
-    let archive_path = build_dir.join("comfyui-source.tar.gz");
-    let status = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(&build_dir)
-        .arg("ComfyUI-master")
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => panic!("tar exited with {status} while building the paced archive fixture"),
-        Err(error) => panic!("tar is required to build the paced archive fixture: {error}"),
-    }
-    let contents = std::fs::read(&archive_path).expect("failed to read the built archive");
+    let contents = build_gzip_tarball(&build_dir, "comfyui-source.tar.gz", "ComfyUI-master");
 
     let served = root(world).join("comfyui-fixture").join("archive-serve");
     std::fs::create_dir_all(&served).expect("failed to create the archive fixture serve root");

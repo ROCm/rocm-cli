@@ -28,7 +28,7 @@ use std::time::Duration;
 use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
-use e2e_cucumber::paced_download::{PacedDownloadServer, xorshift_payload};
+use e2e_cucumber::paced_download::{PacedDownloadServer, build_gzip_tarball, xorshift_payload};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::TuiSession;
@@ -319,15 +319,18 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
 /// Size and pacing for the paced tarball fixture below: large enough (versus
 /// the chunk size) that several chunk boundaries — and therefore several
 /// observable progress frames — land before the transfer completes, and slow
-/// enough per chunk that the PTY's 20ms poll cadence reliably samples an
+/// enough per chunk that the PTY's poll cadence reliably samples an
 /// intermediate, sub-100% frame rather than racing straight to completion.
 ///
 /// The payload is tens of MB, not a few hundred KB, so that `tar -xf`
 /// (spawned synchronously once the download completes — see
-/// `extract_tarball`) takes long enough for the PTY's 20ms poll cadence to
-/// reliably catch the "Extracting …" spinner frame before the process moves
-/// on. The chunk size scales with it, so the number of paced chunks — and
-/// therefore the download's observed wall time — stays the same as before.
+/// `extract_tarball`) takes long enough, via its own subprocess-spawn and
+/// real disk I/O over a ~20MB archive, for the "Extracting …" spinner frame
+/// to still be on screen the next time the PTY's poll checks it — the poll
+/// cadence only governs how often the already-rendered screen is sampled, not
+/// how fast extraction itself runs. The chunk size scales with the payload,
+/// so the number of paced chunks — and therefore the download's observed
+/// wall time — stays the same as before.
 const PACED_TARBALL_PAYLOAD_BYTES: usize = 20_000_000;
 const PACED_TARBALL_CHUNK_BYTES: usize = 1_600_000;
 const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
@@ -358,20 +361,7 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
     let payload = xorshift_payload(PACED_TARBALL_PAYLOAD_BYTES);
     std::fs::write(payload_dir.join("payload.bin"), &payload)
         .expect("failed to write tarball payload");
-    let archive_path = build_dir.join(CURRENT_TARBALL);
-    let status = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(&build_dir)
-        .arg("payload")
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => panic!("tar exited with {status} while building the paced tarball fixture"),
-        Err(error) => panic!("tar is required to build the paced tarball fixture: {error}"),
-    }
-    let contents = std::fs::read(&archive_path).expect("failed to read the built tarball archive");
+    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload");
 
     world.paced_download_server = Some(PacedDownloadServer::start(
         &served,
