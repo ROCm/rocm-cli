@@ -401,6 +401,7 @@ assert_rule_covers_every_list_entry() {
 self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
+  local outside outside_decoy outside_pid outside_cmd
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
   local decoy_pids
@@ -416,13 +417,23 @@ self_test() {
   # Deliberately NOT under /tmp/rocm-e2e: that prefix is one of the roots the
   # old patterns did match, which would mask the regression this guards.
   tmp="$(mktemp -d /tmp/reclaim-selftest-XXXXXX)"
+  # Armed the moment there is something to remove, and widened below once the
+  # second tree exists. The `mktemp` that follows can fail, and under `set -e`
+  # that aborts the function — with `tmp` already on disk and, if the trap were
+  # installed only afterwards, nothing left to clean it up.
+  # shellcheck disable=SC2064 # expand ${tmp} now, at trap definition time
+  trap "rm -rf '${tmp}'" EXIT
+  # A SECOND tree, outside the scope, for the bystander decoy below. Everything
+  # reachable through SELFTEST_SCOPE is inside `tmp` by construction, so a
+  # negative case for the scope filter cannot live there.
+  outside="$(mktemp -d /tmp/reclaim-selftest-out-XXXXXX)"
   export RECLAIM_SELFTEST_SCOPE="${tmp}"
   SELFTEST_SCOPE="${tmp}"
   # The stubborn decoy never exits on its own, so the grace loop always runs to
   # the ceiling. Keep it short: this is a unit-speed test, not a GPU lane.
   TERM_GRACE_SECS=2
-  # shellcheck disable=SC2064 # expand ${tmp} now, at trap definition time
-  trap "rm -rf '${tmp}'" EXIT
+  # shellcheck disable=SC2064 # expand the paths now, at trap definition time
+  trap "rm -rf '${tmp}' '${outside}'" EXIT
 
   # The real shape: lemonade's engine binary inside the shared pre-warm runtime.
   prewarm_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9752/llama-server"
@@ -436,17 +447,23 @@ self_test() {
   # script adds is reached. Without it, TERM alone ends every decoy and both the
   # SIGKILL block and the `kill -TERM` call can be removed with the test green.
   stubborn_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9753/llama-server"
+  # Matches the rule in full — an E2E root AND an engine marker — but lies
+  # OUTSIDE the scope. It is the only fixture the SELFTEST_SCOPE filter can be
+  # observed doing anything to, and therefore the only reason check 6 can fail.
+  outside_decoy="${outside}/e2e-prewarm-bystander/bin/llama-server"
 
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
   harness_pid="$(spawn_decoy "${harness_decoy}")"
   stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
+  outside_pid="$(spawn_decoy "${outside_decoy}")"
   read -r zombie_pid zombie_keeper_pid <<<"$(spawn_zombie "${tmp}/zombie")"
   # Every process this function spawned that can still be signalled, so cleanup
   # is one list rather than a line kept in step at each early return. The zombie
   # itself is absent deliberately: it is already dead, and killing its keeper is
   # what lets init reap it.
-  decoy_pids=("${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}" "${zombie_keeper_pid}")
+  decoy_pids=("${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}"
+    "${outside_pid}" "${zombie_keeper_pid}")
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
@@ -520,6 +537,27 @@ self_test() {
   #    thing keeping them inside the scratch tree. Assert that before killing
   #    rather than trusting it — this step runs on a hosted ephemeral lane
   #    today, but nothing in the script stops it being run anywhere else.
+  # The bystander decoy is what gives this check teeth. select_leaked filters
+  # every candidate against SELFTEST_SCOPE, and SELFTEST_SCOPE *is* ${tmp}, so
+  # the loop below — "is every selected entry inside ${tmp}?" — re-derives its
+  # answer from the very filter it claims to be checking, and cannot fail on
+  # any fixture that lives inside the scope. Deleting the filter outright left
+  # this check green. A rule-matching process OUTSIDE the scope is the only
+  # thing the filter can be caught NOT doing its job on.
+  outside_cmd="$(cmdline_of "${outside_pid}")" || outside_cmd=''
+  if [[ -z "${outside_cmd}" ]]; then
+    echo "FAIL: bystander decoy is not running; containment has no negative case"
+    containment_failures=$((containment_failures + 1))
+  elif ! cmdline_matches_rule "${outside_cmd}"; then
+    # Asserted, not assumed: if the bystander stopped matching the rule it
+    # would be excluded for that reason instead of by the scope filter, and
+    # the negative case below would pass while proving nothing.
+    echo "FAIL: bystander decoy no longer matches the rule; containment proves nothing"
+    containment_failures=$((containment_failures + 1))
+  elif grep -q "^${outside_pid}	" <<<"${selected}"; then
+    echo "FAIL: a rule-matching process outside the scratch tree was selected"
+    containment_failures=$((containment_failures + 1))
+  fi
   while IFS=$'\t' read -r escapee_pid escapee_cmd; do
     [[ -n "${escapee_pid}" ]] || continue
     case "${escapee_cmd}" in
@@ -552,11 +590,12 @@ self_test() {
   # 7. The escalation guard's comparison, in all three directions — and for
   #    "gone", by BOTH routes into it.
   #
-  #    NOTE: only the COMPARISON is covered. The guard's call site is exercised
-  #    solely in the always-escalate direction, because making a pid be reused
-  #    by a different process on demand is not reproducible in a test — so
-  #    deleting the call site still passes the self-test. Said plainly rather
-  #    than implied by a green run.
+  #    NOTE: only the COMPARISON is covered. The guard now has TWO call sites —
+  #    the pre-TERM check and the pre-KILL escalation — and both are exercised
+  #    solely in the always-proceed direction, because making a pid be reused by
+  #    a different process on demand is not reproducible in a test. Deleting
+  #    either call site still passes the self-test. Said plainly rather than
+  #    implied by a green run.
   if same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")"; then
     echo "ok: escalation guard accepts an unchanged command line"
   else
@@ -620,6 +659,14 @@ self_test() {
     echo "ok: E2E test binary survived reclaim"
   else
     echo "FAIL: E2E test binary was killed by reclaim"
+    failures=$((failures + 1))
+  fi
+  # The bystander matches the rule in full, so only the scope kept it out of the
+  # selection. Its survival is the end-to-end form of check 6.
+  if process_alive "${outside_pid}"; then
+    echo "ok: rule-matching process outside the scratch tree survived reclaim"
+  else
+    echo "FAIL: reclaim killed a rule-matching process outside the scratch tree"
     failures=$((failures + 1))
   fi
 
