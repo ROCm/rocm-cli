@@ -577,10 +577,12 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             .notes
             .into_iter()
             .chain(vllm_runtime_warnings(&runtime))
-            .chain(
-                (!discover_pins.is_empty())
-                    .then(|| format!("vLLM ROCm 10.x discovery pinned: {}", discover_pins.join(", "))),
-            )
+            .chain((!discover_pins.is_empty()).then(|| {
+                format!(
+                    "vLLM ROCm 10.x discovery pinned: {}",
+                    discover_pins.join(", ")
+                )
+            }))
             .collect(),
     })
 }
@@ -1256,16 +1258,16 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
         .map(PathBuf::from)
         .filter(|path| path.is_file())
     {
-        return runtime_from_python(
-            python,
-            runtime_id.unwrap_or("external-vllm-python"),
-            "environment python",
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
+        return runtime_from_python(ManagedRuntimeCandidate {
+            runtime_id: runtime_id.unwrap_or("external-vllm-python").to_owned(),
+            source: "environment python".to_owned(),
+            python_executable: python,
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        });
     }
 
     if let Some(runtime) = resolve_managed_runtime(runtime_id)? {
@@ -1295,31 +1297,26 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
     }
 }
 
-fn runtime_from_python(
-    python: PathBuf,
-    runtime_id: &str,
-    source: &str,
-    sdk_root: Option<PathBuf>,
-    sdk_bin: Option<PathBuf>,
-    sdk_bin_paths: Vec<PathBuf>,
-    sdk_library_paths: Vec<PathBuf>,
-    rocm_sdk_version: Option<String>,
-) -> Result<VllmRuntime> {
+fn runtime_from_python(candidate: ManagedRuntimeCandidate) -> Result<VllmRuntime> {
+    let python = candidate.python_executable;
     let command = vllm_command_from_python(&python)
         .with_context(|| format!("vLLM command not found beside {}", python.display()))?;
     let version = probe_vllm_version(&python).ok().flatten();
     Ok(VllmRuntime {
-        runtime_id: runtime_id.to_owned(),
-        env_id: format!("external-vllm-{}", stable_id_component(runtime_id)),
+        env_id: format!(
+            "external-vllm-{}",
+            stable_id_component(&candidate.runtime_id)
+        ),
+        runtime_id: candidate.runtime_id,
         command,
         python_executable: Some(python),
         version,
-        source: source.to_owned(),
-        sdk_root,
-        sdk_bin,
-        sdk_bin_paths,
-        sdk_library_paths,
-        rocm_sdk_version,
+        source: candidate.source,
+        sdk_root: candidate.sdk_root,
+        sdk_bin: candidate.sdk_bin,
+        sdk_bin_paths: candidate.sdk_bin_paths,
+        sdk_library_paths: candidate.sdk_library_paths,
+        rocm_sdk_version: candidate.rocm_sdk_version,
     })
 }
 
@@ -1461,9 +1458,13 @@ fn discover_pinned_requirement(
     }
     let mut wheels = fs::read_dir(tmp.path())
         .with_context(|| format!("failed to read {}", tmp.path().display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".whl"))
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("whl"))
+        })
         .collect::<Vec<_>>();
     wheels.sort();
     match wheels.len() {
@@ -1489,7 +1490,11 @@ fn discover_pinned_requirement(
 
 /// Builds the `uv pip install` argv for a ROCm 10.x discovery install: the
 /// resolved `pins` plus `--prerelease allow` and both discovery indexes.
-fn vllm_rocm10_discover_install_args(python: &Path, reinstall: bool, pins: &[String]) -> Vec<String> {
+fn vllm_rocm10_discover_install_args(
+    python: &Path,
+    reinstall: bool,
+    pins: &[String],
+) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
     if reinstall {
         args.push("--reinstall".to_owned());
@@ -1577,16 +1582,7 @@ fn install_vllm_rocm10_discover(
 fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntime>> {
     let candidates = collect_managed_runtime_candidates(runtime_id)?;
     for candidate in candidates {
-        if let Ok(runtime) = runtime_from_python(
-            candidate.python_executable,
-            &candidate.runtime_id,
-            &candidate.source,
-            candidate.sdk_root,
-            candidate.sdk_bin,
-            candidate.sdk_bin_paths,
-            candidate.sdk_library_paths,
-            candidate.rocm_sdk_version,
-        ) {
+        if let Ok(runtime) = runtime_from_python(candidate) {
             return Ok(Some(runtime));
         }
     }
@@ -2059,7 +2055,7 @@ fn venv_site_packages_dir(venv: &Path) -> Result<PathBuf> {
     let lib_dir = venv.join("lib");
     let mut python_dirs = fs::read_dir(&lib_dir)
         .with_context(|| format!("failed to read {}", lib_dir.display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
             path.is_dir()
@@ -2083,7 +2079,10 @@ fn venv_site_packages_dir(venv: &Path) -> Result<PathBuf> {
 /// TheRock env `apply_therock_env` already sets: `amd_smi` lives under the
 /// venv's own site-packages rather than the SDK tree, and Triton's ROCm
 /// flash-attention backend needs to be opted into explicitly.
-fn apply_vllm_rocm10_discover_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+fn apply_vllm_rocm10_discover_env(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+) -> Result<()> {
     let venv = vllm_venv_root(runtime)?;
     let site_packages = venv_site_packages_dir(&venv)?;
     command.env(
@@ -3874,8 +3873,7 @@ mod tests {
                 "https://wheels.vllm.ai/rocm/0.27.0/rocm730/",
             ),
         ] {
-            let target =
-                install_target(Some(index), None).expect("published index shape resolves");
+            let target = install_target(Some(index), None).expect("published index shape resolves");
             assert_eq!(target.index_url, expected_url);
             assert_eq!(target.requirement, "vllm==0.27.0+rocm730");
         }
@@ -4231,7 +4229,10 @@ mod tests {
         assert_eq!(vllm_install_route(None, None), VllmInstallRoute::Static);
     }
 
-    fn test_vllm_runtime(python_executable: Option<PathBuf>, rocm_sdk_version: Option<String>) -> VllmRuntime {
+    fn test_vllm_runtime(
+        python_executable: Option<PathBuf>,
+        rocm_sdk_version: Option<String>,
+    ) -> VllmRuntime {
         VllmRuntime {
             runtime_id: "test".to_owned(),
             env_id: "test".to_owned(),
@@ -4268,7 +4269,12 @@ mod tests {
     #[test]
     fn venv_site_packages_dir_finds_the_single_python3_dir() -> Result<()> {
         let venv = tempfile::tempdir()?;
-        fs::create_dir_all(venv.path().join("lib").join("python3.12").join("site-packages"))?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
         let site_packages = venv_site_packages_dir(venv.path())?;
         assert_eq!(
             site_packages,
@@ -4301,7 +4307,12 @@ mod tests {
     #[test]
     fn apply_vllm_rocm10_discover_env_sets_pythonpath_and_flash_attention_flag() -> Result<()> {
         let venv = tempfile::tempdir()?;
-        fs::create_dir_all(venv.path().join("lib").join("python3.12").join("site-packages"))?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
         let runtime = test_vllm_runtime(
             Some(venv.path().join("bin").join("python")),
             Some("10.0.0".to_owned()),
@@ -4336,9 +4347,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_therock_env_dispatches_to_discover_env_for_a_discover_rocm_sdk_version() -> Result<()> {
+    fn apply_therock_env_dispatches_to_discover_env_for_a_discover_rocm_sdk_version() -> Result<()>
+    {
         let venv = tempfile::tempdir()?;
-        fs::create_dir_all(venv.path().join("lib").join("python3.12").join("site-packages"))?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
         let runtime = test_vllm_runtime(
             Some(venv.path().join("bin").join("python")),
             Some("10.0.0".to_owned()),
