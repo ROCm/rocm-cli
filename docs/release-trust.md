@@ -228,6 +228,22 @@ Set the gate and the specific base variable together, and only in tests or
 deliberate manual QA against a fixture server. The `therock-next` E2E scenarios
 use exactly this pairing to exercise next-layout dispatch hermetically.
 
+## ComfyUI Source Archive Override
+
+rocm-cli hardcodes the URL it downloads the ComfyUI source archive from. It
+can be overridden, for fixture-server testing only, and only in builds
+compiled with the `e2e-test-hooks` Cargo feature:
+
+```text
+ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE
+```
+
+Unlike the TheRock base overrides above, this needs no separate "allow" gate:
+the override accessor does not exist at all in a build without
+`e2e-test-hooks`, so a stray environment variable can never redirect a
+production install. A production build always resolves the hardcoded default
+URL.
+
 ## Remaining Owner Step
 
 The repo still needs a real project-owned public signing key and matching

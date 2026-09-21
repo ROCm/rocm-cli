@@ -23,12 +23,15 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
+use e2e_cucumber::paced_download::PacedDownloadServer;
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::TuiSession;
 
 /// The exact GFX arch the next layout needs. Not a group label: the aggregate
 /// source publishes one `rocm-sdk-device-<arch>` payload per arch, and
@@ -311,6 +314,181 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+}
+
+/// Size and pacing for the paced tarball fixture below: large enough (versus
+/// the chunk size) that several chunk boundaries — and therefore several
+/// observable progress frames — land before the transfer completes, and slow
+/// enough per chunk that the PTY's 20ms poll cadence reliably samples an
+/// intermediate, sub-100% frame rather than racing straight to completion.
+const PACED_TARBALL_PAYLOAD_BYTES: usize = 400_000;
+const PACED_TARBALL_CHUNK_BYTES: usize = 32_768;
+const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
+/// Wait budget for the PTY-driven download scenario below, mirroring
+/// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
+const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// High-entropy filler bytes for the paced tarball fixture's payload.
+///
+/// Deliberately not just "looks scrambled" — see the comment at its call
+/// site: an earlier multiplicative-hash sequence looked pseudo-random but
+/// gzip still compressed it by over 99%. A fixed seed keeps the fixture
+/// (and therefore the archive's compressed size) deterministic across runs.
+fn xorshift_payload(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+#[given("a paced canonical release tarball fixture")]
+async fn paced_tarball_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-paced-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+
+    // Build a real gzip tarball so `extract_tarball` (auto-detecting `-xf`) has
+    // a genuine archive to unpack once the paced download completes. The
+    // payload bytes come from a small xorshift PRNG rather than a simple
+    // multiplicative-hash sequence: the latter looked scrambled but gzip still
+    // crushed it down to under 2 KB (well under one paced chunk), collapsing
+    // the whole "transfer" into a single unpaced chunk and defeating the
+    // pacing entirely. Xorshift output is high-entropy enough that gzip
+    // cannot shrink it, keeping the wire transfer close to
+    // `PACED_TARBALL_PAYLOAD_BYTES`.
+    let build_dir = root(world).join("therock-paced-tarball-build");
+    let payload_dir = build_dir.join("payload");
+    std::fs::create_dir_all(&payload_dir).expect("failed to create tarball payload directory");
+    let payload = xorshift_payload(PACED_TARBALL_PAYLOAD_BYTES);
+    std::fs::write(payload_dir.join("payload.bin"), &payload)
+        .expect("failed to write tarball payload");
+    let archive_path = build_dir.join(CURRENT_TARBALL);
+    let status = std::process::Command::new("tar")
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&build_dir)
+        .arg("payload")
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("tar exited with {status} while building the paced tarball fixture"),
+        Err(error) => panic!("tar is required to build the paced tarball fixture: {error}"),
+    }
+    let contents = std::fs::read(&archive_path).expect("failed to read the built tarball archive");
+
+    world.paced_download_server = Some(PacedDownloadServer::start(
+        &served,
+        &format!("tarball/current/{CURRENT_TARBALL}"),
+        contents,
+        PACED_TARBALL_CHUNK_BYTES,
+        PACED_TARBALL_CHUNK_DELAY,
+    ));
+    allow_base_overrides(world);
+    let base = world
+        .paced_download_server
+        .as_ref()
+        .expect("paced download server was just started")
+        .base_url();
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+}
+
+#[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
+async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
+    // No `--version`: tarball installs only accept an explicit version pin for
+    // a stable ROCm 10+ selector (see `resolve_tarball_artifact_with_timeout`'s
+    // rejection message), so an unpinned request is what reaches the canonical
+    // release catalog here — which the given-step populated with exactly one
+    // candidate, `CURRENT_TARBALL`.
+    //
+    // This scenario is testing the download spinner, not the post-install
+    // torch-runtime-dependency setup — but a real SDK install completing
+    // successfully triggers `ensure_libatomic_for_torch`/`ensure_libnuma_for_torch`,
+    // which install a missing PyTorch runtime library through the real system
+    // package manager whenever the test host happens to lack it. That is slow,
+    // network-dependent, and mutates host state, none of which this scenario
+    // should depend on, so disable it here.
+    world.command_env.push((
+        "ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS",
+        "1".into(),
+    ));
+    let session = TuiSession::spawn(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            GROUP_FAMILY,
+            "--yes",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to spawn `rocm install sdk` under a pty: {e}"));
+    world.tui = Some(session);
+}
+
+#[then("the terminal shows an intermediate download progress frame")]
+async fn assert_intermediate_download_progress_frame(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    // Any progress-bearing frame contains "%)"; the label prefix alone
+    // (`Downloading {file}…`) can render before the first byte count does, so
+    // waiting on the percent marker is what actually proves a progress frame
+    // — not just the spinner — was observed.
+    session
+        .wait_for_screen("%)", PTY_SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("download progress frame never appeared: {e}"));
+    let screen = session.screen_text();
+    assert!(
+        !screen.contains("(100%)"),
+        "expected an intermediate (sub-100%) download progress frame, but the \
+         first observed percent frame was already complete:\n{screen}"
+    );
+}
+
+#[then("the tarball install exits cleanly")]
+async fn assert_tarball_install_exits_cleanly(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .wait_for_exit(PTY_SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("tarball install did not exit cleanly: {e}"));
+}
+
+#[then("the final terminal screen shows neither spinner line")]
+async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_ref()
+        .expect("no pty session for the tarball install");
+    let screen = session.screen_text();
+    assert!(
+        !screen.contains(&format!("Downloading {CURRENT_TARBALL}")),
+        "download spinner line was not cleared on completion:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&format!("Extracting {CURRENT_TARBALL}")),
+        "extract spinner line was not cleared on completion:\n{screen}"
+    );
 }
 
 fn preview(world: &mut E2eWorld, args: &[&str]) -> i32 {
