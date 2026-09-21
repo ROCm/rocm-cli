@@ -473,8 +473,17 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
         .as_ref()
         .expect("no pty session for the tarball install");
     let screen = session.screen_text();
+    // A live progress suffix (kept intact by `assemble_status_line`) can
+    // truncate this label to a fraction of its length on an 80-column
+    // terminal, so the download line never actually contains the full
+    // "Downloading {CURRENT_TARBALL}" string while it's showing — checking
+    // for that full string here would pass trivially whether or not the line
+    // was cleared. Truncation always keeps the label's head intact and cuts
+    // its tail, so a short prefix is present whenever the line is live and
+    // gone once `Spinner::clear` erases it.
+    let downloading_prefix = &format!("Downloading {CURRENT_TARBALL}")[..30];
     assert!(
-        !screen.contains(&format!("Downloading {CURRENT_TARBALL}")),
+        !screen.contains(downloading_prefix),
         "download spinner line was not cleared on completion:\n{screen}"
     );
     assert!(
