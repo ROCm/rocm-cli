@@ -416,6 +416,19 @@ async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
     )
     .unwrap_or_else(|e| panic!("failed to spawn `rocm install sdk` under a pty: {e}"));
     world.tui = Some(session);
+    // A successful install's summary is ~20 lines; on the default 24-row
+    // screen (no scrollback) it would scroll the download/extraction spinner
+    // rows off the top before `assert_spinner_lines_cleared` ever reads them,
+    // turning that assertion into a tautology regardless of whether
+    // `Spinner::clear` actually ran. Grow rows only — not `use_detail_size`,
+    // which also widens the terminal and would stop the label from
+    // truncating, defeating the whole point of this scenario.
+    world
+        .tui
+        .as_mut()
+        .expect("tui session was just set")
+        .grow_rows(60)
+        .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
 }
 
 #[then("the terminal shows an intermediate download progress frame")]
