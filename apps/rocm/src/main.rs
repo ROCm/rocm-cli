@@ -8542,8 +8542,25 @@ struct ActivationSnapshot {
     default_runtime_id: Option<String>,
     active_runtime_key: Option<String>,
     previous_runtime_key: Option<String>,
-    /// The marker file's bytes, or `None` when there was no readable marker.
-    marker: Option<Vec<u8>>,
+    marker: MarkerSnapshot,
+}
+
+/// What stood at the active-runtime marker path before an activation wrote it.
+///
+/// "No marker" and "a marker this process could not read" are deliberately
+/// distinct. Collapsing them — which `fs::read(..).ok()` does — makes the
+/// restore treat an unreadable marker as one it is entitled to delete, so a
+/// permissions or IO fault on a marker whose bytes were never captured would
+/// be destroyed by the very path that exists to put state back.
+enum MarkerSnapshot {
+    /// The marker's bytes, to be written back verbatim.
+    Contents(Vec<u8>),
+    /// There was no marker, so restoring means removing the one that was
+    /// written over it.
+    Absent,
+    /// A marker was there but could not be read. Its bytes are not held, so
+    /// the only honest restore is to leave whatever is there alone.
+    Unreadable,
 }
 
 impl ActivationSnapshot {
@@ -8552,18 +8569,41 @@ impl ActivationSnapshot {
             default_runtime_id: config.default_runtime_id.clone(),
             active_runtime_key: config.active_runtime_key.clone(),
             previous_runtime_key: config.previous_runtime_key.clone(),
-            marker: fs::read(active_runtime_marker_path(paths)).ok(),
+            marker: match fs::read(active_runtime_marker_path(paths)) {
+                Ok(bytes) => MarkerSnapshot::Contents(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    MarkerSnapshot::Absent
+                }
+                Err(_) => MarkerSnapshot::Unreadable,
+            },
         }
     }
 
+    /// Put the caller's in-memory config back, without touching disk.
+    ///
+    /// Split out because the first write an activation makes is
+    /// `config.save`: when that is what failed, nothing reached disk and
+    /// saving again would only produce a second failure to explain, but the
+    /// caller still holds a config describing a runtime that was never
+    /// activated.
+    fn restore_in_memory(&self, config: &mut RocmCliConfig) {
+        config
+            .default_runtime_id
+            .clone_from(&self.default_runtime_id);
+        config
+            .active_runtime_key
+            .clone_from(&self.active_runtime_key);
+        config
+            .previous_runtime_key
+            .clone_from(&self.previous_runtime_key);
+    }
+
     fn restore(self, paths: &AppPaths, config: &mut RocmCliConfig) -> Result<()> {
-        config.default_runtime_id = self.default_runtime_id;
-        config.active_runtime_key = self.active_runtime_key;
-        config.previous_runtime_key = self.previous_runtime_key;
+        self.restore_in_memory(config);
         config.save(paths)?;
         let path = active_runtime_marker_path(paths);
         match self.marker {
-            Some(bytes) => {
+            MarkerSnapshot::Contents(bytes) => {
                 let parent = path
                     .parent()
                     .context("active runtime marker path has no parent directory")?;
@@ -8575,12 +8615,34 @@ impl ActivationSnapshot {
             // Only a regular file is removed: whatever else may sit at that
             // path was there before this activation, so leaving it is what
             // "restore the previous state" means.
-            None if path.is_file() => fs::remove_file(&path)
+            MarkerSnapshot::Absent if path.is_file() => fs::remove_file(&path)
                 .with_context(|| format!("failed to remove {}", path.display()))?,
-            None => {}
+            MarkerSnapshot::Absent | MarkerSnapshot::Unreadable => {}
         }
         Ok(())
     }
+}
+
+/// Persist the config an activation just mutated, putting the caller's
+/// in-memory copy back if that write fails.
+///
+/// `config.save` is the FIRST of an activation's two writes, so a failure here
+/// leaves disk untouched — but not the caller's struct, which already names the
+/// runtime that was not activated. Callers keep using it: `rocm update --apply
+/// --activate` saves the same config again straight after, so an unrestored
+/// struct is a route to persisting an activation that was refused.
+fn save_activated_config(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    snapshot: &ActivationSnapshot,
+) -> Result<()> {
+    config.save(paths).map_err(|error| {
+        snapshot.restore_in_memory(config);
+        error.context(
+            "failed to record the active ROCm runtime; the previously active runtime is still \
+             active and nothing changed",
+        )
+    })
 }
 
 /// Undo a half-applied activation and describe what the user is left with.
@@ -8782,7 +8844,7 @@ pub(crate) fn activate_runtime(
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
     config.previous_runtime_key = previous_runtime_key.clone();
-    config.save(paths)?;
+    save_activated_config(paths, config, &snapshot)?;
     if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
@@ -8835,7 +8897,7 @@ fn rollback_runtime(
     config.default_runtime_id = Some(previous.runtime_id.clone());
     config.active_runtime_key = Some(previous.runtime_key.clone());
     config.previous_runtime_key = new_previous_key.clone();
-    config.save(paths)?;
+    save_activated_config(paths, config, &snapshot)?;
     if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
@@ -11662,13 +11724,21 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // file on both supported platforms, and removing it would leave a window
     // with no marker at all — which runtime resolution and the storage
     // retention holds both read as "nothing is active".
-    fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "failed to move active runtime marker {} into {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    fs::rename(&tmp_path, &path)
+        .with_context(|| {
+            format!(
+                "failed to move active runtime marker {} into {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })
+        // A rename that failed left the temp file behind. Activation recovers
+        // from that failure and the user retries, so without this every retry
+        // strands another marker beside the real one — in the folder
+        // `rocm runtimes` reads. Mirrors `RocmCliConfig::save`.
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
     Ok(())
 }
 
@@ -31662,6 +31732,93 @@ ID_LIKE="suse opensuse"
         Ok(sentinel)
     }
 
+    /// Names of any `active.json.tmp-*` files left beside the marker.
+    fn marker_temp_file_names(paths: &AppPaths) -> Result<Vec<String>> {
+        let marker = active_runtime_marker_path(paths);
+        let dir = marker
+            .parent()
+            .context("active runtime marker path has no parent directory")?;
+        Ok(fs::read_dir(dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect())
+    }
+
+    #[test]
+    fn a_failed_activation_leaves_an_unreadable_marker_alone() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-unreadable-marker");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let marker_path = active_runtime_marker_path(&paths);
+        // A marker the snapshot cannot read. A directory is the portable way to
+        // make `fs::read` fail with something other than NotFound on both
+        // supported platforms; a permission-denied file would do the same, and
+        // is what this stands in for.
+        fs::remove_file(&marker_path)?;
+        fs::create_dir_all(&marker_path)?;
+
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        assert!(
+            matches!(snapshot.marker, MarkerSnapshot::Unreadable),
+            "a marker that is there but unreadable is not an absent marker"
+        );
+        // Whatever the failed activation is being rolled back from, the restore
+        // must not act on bytes it never captured.
+        fs::remove_dir_all(&marker_path)?;
+        fs::write(
+            &marker_path,
+            b"{\"runtime_key\":\"written-by-someone-else\"}",
+        )?;
+
+        snapshot.restore(&paths, &mut config)?;
+
+        let survived = fs::read(&marker_path)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            survived,
+            b"{\"runtime_key\":\"written-by-someone-else\"}".to_vec(),
+            "the snapshot holds no bytes for this marker, so deleting it would \
+             destroy state on the very path that exists to put state back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_config_save_leaves_the_caller_holding_the_old_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-config-save-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // Same trick as `break_active_runtime_marker`, aimed at the config: the
+        // save's final rename onto a non-empty directory fails, which is the
+        // FIRST of an activation's two writes and so never reaches the
+        // marker-failure recovery path.
+        let config_path = paths.config_path();
+        fs::remove_file(&config_path)?;
+        fs::create_dir_all(&config_path)?;
+        fs::write(config_path.join("occupied.txt"), "not a config")?;
+
+        let error = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)
+            .expect_err("a failed config save must fail the activation");
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("nothing changed"),
+            "nothing reached disk, so the error must say so:\n{error}"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the caller goes on using this struct — `rocm update --apply \
+             --activate` saves it again right after — so a config left naming \
+             the runtime that was NOT activated is a route to persisting it"
+        );
+        assert_eq!(config.previous_runtime_key, None);
+        Ok(())
+    }
+
     #[test]
     fn runtime_activation_reports_live_service_on_previous_runtime() -> Result<()> {
         let (root, paths) = test_paths("runtime-activation-live-service");
@@ -31803,12 +31960,19 @@ ID_LIKE="suse opensuse"
 
         let persisted = RocmCliConfig::load(&paths)?;
         let sentinel_survived = sentinel.is_file();
+        let stranded_temp_files = marker_temp_file_names(&paths)?;
         let _ = fs::remove_dir_all(&root);
 
         let error = format!("{error:#}");
         assert!(
             error.contains("nothing changed"),
             "the error must say the activation did not take effect:\n{error}"
+        );
+        assert!(
+            stranded_temp_files.is_empty(),
+            "the activation is recoverable and the user retries it, so a marker \
+             write that failed must not strand its temp file in the folder \
+             `rocm runtimes` reads: {stranded_temp_files:?}"
         );
         assert_eq!(
             persisted.active_runtime_key.as_deref(),
