@@ -772,11 +772,15 @@ fn render_summary(
 /// on its own overflow independently would let one reserve a column while its
 /// sibling doesn't, purely because one has slightly less content.
 ///
-/// The overflow decision and the final wrap both measure at the same width:
-/// measuring at the pre-reservation width and then rendering into the
-/// (narrower) post-reservation area would let the two disagree, silently
-/// mis-scrolling — the class of bug a scrollbar column shrinking the content
-/// width by one can introduce if the wrap isn't re-measured after reserving it.
+/// `len` — the wrapped line count the scrollbar's thumb and `max_scroll` are
+/// both derived from — is measured once, at the width the pane will actually
+/// render at (`inner.width - 1` when reserving, `inner.width` otherwise),
+/// *before* drawing the bar. Measuring the bar at the pre-reservation width
+/// and `max_scroll` at the post-reservation width (two different measurements
+/// of the same pane) let them disagree whenever reserving the column changes
+/// how the content wraps: the bar can render "nothing to scroll" in the same
+/// frame the footer says `max_scroll > 0`. Deriving both from one `len`
+/// makes that impossible by construction.
 fn render_scrollable_pane(
     f: &mut Frame,
     inner: Rect,
@@ -786,22 +790,22 @@ fn render_scrollable_pane(
     reserve: bool,
     theme: &Theme,
 ) -> u16 {
+    let len = if reserve {
+        p.line_count(inner.width.saturating_sub(1))
+    } else {
+        full_len
+    };
     let content = if reserve {
         panel::vertical_scrollbar_forced(
             f,
             inner,
-            full_len,
+            len,
             inner.height as usize,
             scroll as usize,
             theme,
         )
     } else {
         inner
-    };
-    let len = if content.width == inner.width {
-        full_len
-    } else {
-        p.line_count(content.width)
     };
     let max = u16::try_from(len)
         .unwrap_or(u16::MAX)
@@ -1559,6 +1563,36 @@ mod tests {
     }
 
     #[test]
+    fn detail_modal_footer_keeps_scroll_hint_visible_with_long_log_path() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `render_footer` renders the hint before the log path specifically
+        // so a long log path can't push it out of view — its Paragraph
+        // isn't wrapped, so anything past the footer's width is silently
+        // dropped rather than truncated in place. That ordering had no
+        // test: reverting it left the whole suite green.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        inst.log_file = Some("x".repeat(300));
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("↑/↓ scroll"),
+            "a 300-char log path must not push the scroll hint out of the \
+             footer; got:\n{text}"
+        );
+    }
+
+    #[test]
     fn render_scrollable_pane_remeasures_wrap_at_post_reservation_width() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1593,6 +1627,23 @@ mod tests {
             "the 20-char line wraps to 2 rows at the post-reservation width \
              19, so max_scroll must be 1 (4 wrapped rows - 3 visible), not 0 \
              as a stale pre-reservation measurement would report"
+        );
+
+        // The bar must agree with `max`: if the scrollbar were still measured
+        // at the pre-reservation width (full_len=3, which reads as "fits"),
+        // it would render a solid "nothing to scroll" thumb in the same
+        // frame `max_scroll == 1` says otherwise — the two affordances must
+        // be derived from the same measurement, not just each be correct in
+        // isolation.
+        let buf = term.backend().buffer();
+        let bar_column: Vec<&str> = (0..3)
+            .map(|y| buf.cell((inner.width - 1, y)).unwrap().symbol())
+            .collect();
+        assert_ne!(
+            bar_column,
+            ["█", "█", "█"],
+            "the bar must not render as a full 'nothing to scroll' thumb \
+             when max_scroll is nonzero; got {bar_column:?}"
         );
     }
 
