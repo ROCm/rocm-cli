@@ -762,10 +762,16 @@ pub fn list_recipes() -> String {
     out
 }
 
-/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>` and
-/// `rocm diagnose` so the same fix-id reads identically from either command.
-// These mirror the `FixRecipe`/`Fix` struct fields (`struct_excessive_bools` is
-// already allowed workspace-wide for that reason); this fn just forwards them.
+/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>`
+/// and `rocm diagnose` so a fix-id's flags read identically whichever of
+/// those two commands renders them. Scoped to those two only: the bare
+/// `rocm fix` catalog listing (`list_recipes`) describes the same
+/// `auto_applicable` property with a separate, untouched AUTO/PRINT-ONLY
+/// vocabulary.
+// These mirror the `FixRecipe`/`Fix` struct fields, where
+// `clippy::struct_excessive_bools` is already allowed workspace-wide; that
+// allow doesn't reach this free function's parameters, so
+// `clippy::fn_params_excessive_bools` is separately allowed below.
 #[allow(clippy::fn_params_excessive_bools)]
 pub(crate) fn format_flags(
     needs_sudo: bool,

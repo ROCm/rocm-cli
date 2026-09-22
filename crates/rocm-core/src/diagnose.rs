@@ -1011,6 +1011,13 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
+    // Marked auto_applicable below, but `rocm fix fix-9-igpu-dgpu` still needs
+    // --device-index to actually make the change: without it, both the Linux
+    // and Windows runners only print the query that finds the index and
+    // change nothing (see README's --device-index caveat).
+    let note = format!(
+        "{note} Without --device-index, `rocm fix` only prints this query and makes no change, despite being marked AUTO."
+    );
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -2862,6 +2869,10 @@ mod tests {
         assert!(
             !note.contains("usually the higher-numbered"),
             "note must not repeat the old wrong gfx-number heuristic: {note}"
+        );
+        assert!(
+            note.contains("Without --device-index") && note.contains("despite being marked AUTO"),
+            "note must warn that fix-9 is a no-op without --device-index: {note}"
         );
     }
 
