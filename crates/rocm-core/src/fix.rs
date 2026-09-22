@@ -763,8 +763,12 @@ pub fn list_recipes() -> String {
 }
 
 /// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>`
-/// and `rocm diagnose` so a fix-id's flags read identically whichever of
-/// those two commands renders them. Scoped to those two only: the bare
+/// and `rocm diagnose` so the same `(sudo, reboot, relogin, auto_applicable)`
+/// values render as the same text from either command. This only
+/// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
+/// diagnose's `Fix` still supply those independently, so a fix-id's rendered
+/// flags can still differ if the two disagree on a value (known example:
+/// `fix-5-amdgpu-load`'s `needs_reboot`). Also out of scope: the bare
 /// `rocm fix` catalog listing (`list_recipes`) describes the same
 /// `auto_applicable` property with a separate, untouched AUTO/PRINT-ONLY
 /// vocabulary.

@@ -431,12 +431,15 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     // `flags:` is the line `render_report_text` builds from
     // `crate::fix::format_flags` -- the same helper `rocm fix <id>`'s `Flags:`
-    // line uses, so a fix-id reads identically from either command. This is the
-    // only scenario that exercises that line through the real `rocm diagnose`
-    // rendering surface rather than through `rocm fix <id> --dry-run`. Assert
-    // the shape (present once per cause, ending in the always-on auto/manual
-    // marker) rather than a specific fix-id's exact flags, since the top match
-    // is environment-dependent.
+    // line uses, so the same flag values render as the same text from either
+    // command. This is the only scenario that exercises that line through the
+    // real `rocm diagnose` rendering surface rather than through `rocm fix
+    // <id> --dry-run`. Assert the shape (present once per cause, ending in
+    // the always-on auto/manual marker) rather than a specific fix-id's exact
+    // flags: the top match is environment-dependent, and a shared vocabulary
+    // doesn't guarantee diagnose and the fix.rs catalog agree on the
+    // underlying values for a given fix-id (known drift: fix-5-amdgpu-load's
+    // needs_reboot).
     let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
     let flag_lines: Vec<&str> = output
