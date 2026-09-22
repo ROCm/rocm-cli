@@ -1008,9 +1008,12 @@ ROCDXG install inside WSL:
 ```bash
 rocm install driver            # review the plan
 rocm install driver --yes      # run it
+rocm examine                   # expect driver_status: wsl_rocdxg_ready
 rocm diagnose
-python scripts/wsl_preflight.py --require-ready
 ```
+
+The last two are the plan's own `post_install_checks`, so running them is what
+confirms the install took rather than merely that the commands exited zero.
 
 The `.deb` is verified against a digest pinned per ROCDXG release, so the
 default path needs nothing set. To exercise a release rocm-cli has no digest
