@@ -11,6 +11,7 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod crate_edges;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
@@ -95,6 +96,10 @@ enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Fail if any first-party crate has gained a normal/build dependency
+    /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
+    /// Dev-dependency edges are exempt (Cargo permits those to cycle).
+    CheckCrateEdges,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -241,6 +246,7 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::CheckCrateEdges => crate_edges::run()?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,
