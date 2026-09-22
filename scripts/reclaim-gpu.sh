@@ -286,8 +286,9 @@ spawn_decoy() {
 }
 
 # Spawn a process that becomes a ZOMBIE and stays one, plus the keeper holding
-# it in that state. Echoes "<zombie pid> <keeper pid>"; the zombie pid is empty
-# if it could not be produced.
+# it in that state. Echoes "<zombie pid> <keeper pid>"; the zombie pid is the
+# literal string `none` if one could not be produced — NOT an empty field, for
+# the reason given at the sentinel itself. Test `!= "none"`, never `-z`.
 #
 # A zombie is the second way into cmdline_of's failure path and the only one
 # that reaches its emptiness check: /proc/<pid>/cmdline still OPENS for a
@@ -402,6 +403,7 @@ self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
   local outside outside_decoy outside_pid outside_cmd
+  local forced_out guard_pid
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
   local decoy_pids
@@ -427,13 +429,16 @@ self_test() {
   # reachable through SELFTEST_SCOPE is inside `tmp` by construction, so a
   # negative case for the scope filter cannot live there.
   outside="$(mktemp -d /tmp/reclaim-selftest-out-XXXXXX)"
+  # Widened in the statement immediately after the one that created it, for the
+  # same reason the narrow trap above exists: anything fallible in between is a
+  # window where a tree is on disk with nothing arranged to remove it.
+  # shellcheck disable=SC2064 # expand both paths now, at trap definition time
+  trap "rm -rf '${tmp}' '${outside}'" EXIT
   export RECLAIM_SELFTEST_SCOPE="${tmp}"
   SELFTEST_SCOPE="${tmp}"
   # The stubborn decoy never exits on its own, so the grace loop always runs to
   # the ceiling. Keep it short: this is a unit-speed test, not a GPU lane.
   TERM_GRACE_SECS=2
-  # shellcheck disable=SC2064 # expand the paths now, at trap definition time
-  trap "rm -rf '${tmp}' '${outside}'" EXIT
 
   # The real shape: lemonade's engine binary inside the shared pre-warm runtime.
   prewarm_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9752/llama-server"
@@ -544,6 +549,20 @@ self_test() {
   # any fixture that lives inside the scope. Deleting the filter outright left
   # this check green. A rule-matching process OUTSIDE the scope is the only
   # thing the filter can be caught NOT doing its job on.
+  # An empty selection satisfies the loop below trivially, so without this the
+  # "ok:" line would report containment verified on a run where nothing was
+  # examined. Checks 2 and 5 already fail such a run, so this is not a false
+  # green — but the evidence line is read by whoever is diagnosing that run.
+  #
+  #    Counted apart from containment_failures on purpose: that counter arms the
+  #    gate below, whose message and early return are specifically about a
+  #    selection reaching OUTSIDE the scratch tree. An empty selection is the
+  #    opposite failure and signals nothing at all, so routing it through that
+  #    gate would report a false cause and cut the run short of checks 7-10.
+  if [[ -z "${selected}" ]]; then
+    echo "FAIL: selection was empty; containment had nothing to examine"
+    failures=$((failures + 1))
+  fi
   outside_cmd="$(cmdline_of "${outside_pid}")" || outside_cmd=''
   if [[ -z "${outside_cmd}" ]]; then
     echo "FAIL: bystander decoy is not running; containment has no negative case"
@@ -590,12 +609,9 @@ self_test() {
   # 7. The escalation guard's comparison, in all three directions — and for
   #    "gone", by BOTH routes into it.
   #
-  #    NOTE: only the COMPARISON is covered. The guard now has TWO call sites —
-  #    the pre-TERM check and the pre-KILL escalation — and both are exercised
-  #    solely in the always-proceed direction, because making a pid be reused by
-  #    a different process on demand is not reproducible in a test. Deleting
-  #    either call site still passes the self-test. Said plainly rather than
-  #    implied by a green run.
+  #    The COMPARISON is covered here; check 8 covers the two CALL SITES by
+  #    forcing the verdict, because a pid cannot be made to be reused by a
+  #    different process on demand.
   if same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")"; then
     echo "ok: escalation guard accepts an unchanged command line"
   else
@@ -640,7 +656,44 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 8. End to end: reclaim kills the leaks and spares all three bystanders —
+  # 8. The guard's two CALL SITES, by forcing the verdict they act on.
+  #
+  #    A pid cannot be made to be reused by a different process on demand, so
+  #    until now both call sites were exercised only in the always-proceed
+  #    direction and either could be deleted with the self-test green. Overriding
+  #    the comparison for one real `reclaim` run reaches them: with every verdict
+  #    "recycled", a correct reclaim signals NOTHING, so deleting EITHER call
+  #    site kills decoys here and fails the survival loop below.
+  #
+  #    The override is declared INSIDE the command substitution, which bash runs
+  #    in a subshell, so it cannot outlive this one call — no save/restore to get
+  #    wrong, and no seam in the production path. The kills a broken guard would
+  #    issue are still real, which is what makes the survival loop meaningful.
+  forced_out="$(
+    same_selected_process() { return 1; }
+    reclaim 0
+  )"
+  sleep 1
+  if grep -q "pid=${prewarm_pid} was recycled before it could be terminated" <<<"${forced_out}"; then
+    echo "ok: pre-TERM guard refused to signal a pid whose identity changed"
+  else
+    echo "FAIL: pre-TERM guard did not act on a recycled verdict"
+    failures=$((failures + 1))
+  fi
+  if grep -q "was recycled during the grace period, not escalating" <<<"${forced_out}"; then
+    echo "ok: pre-KILL guard refused to escalate onto a recycled pid"
+  else
+    echo "FAIL: pre-KILL guard did not act on a recycled verdict"
+    failures=$((failures + 1))
+  fi
+  # The point of both guards: a forced-recycled run must leave every process alive.
+  for guard_pid in "${decoy_pids[@]}"; do
+    if ! process_alive "${guard_pid}"; then
+      echo "FAIL: pid=${guard_pid} was signalled despite a recycled verdict"
+      failures=$((failures + 1))
+    fi
+  done
+  # 9. End to end: reclaim kills the leaks and spares all three bystanders —
   #    the manual serve, the harness binary, and the out-of-scope decoy.
   reclaim_out="$(reclaim 0)"
   sleep 1
@@ -671,10 +724,10 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 9. The escalation ran, and ran only where it was needed. Asserting the
-  #    stubborn decoy died covers the SIGKILL block; asserting the ordinary
-  #    decoy did NOT reach escalation covers the `kill -TERM` that precedes it,
-  #    which would otherwise be silently replaceable by any no-op.
+  # 10. The escalation ran, and ran only where it was needed. Asserting the
+  #     stubborn decoy died covers the SIGKILL block; asserting the ordinary
+  #     decoy did NOT reach escalation covers the `kill -TERM` that precedes it,
+  #     which would otherwise be silently replaceable by any no-op.
   if process_alive "${stubborn_pid}"; then
     echo "FAIL: SIGTERM-ignoring process survived reclaim; escalation to SIGKILL did not happen"
     failures=$((failures + 1))

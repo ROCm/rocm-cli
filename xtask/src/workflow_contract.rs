@@ -1569,9 +1569,15 @@ permissions:
                 .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
                 .collect();
 
+            // Tracked per WORKFLOW, not per alternation: requiring every
+            // alternation to name the exempted marker would fail spuriously the
+            // moment an unrelated `Where-Object … -match` line is added — the
+            // very case `powershell_reclaim_root_alternations` warns it cannot
+            // distinguish. One mirror still naming it is what keeps the
+            // exemption live.
+            let mut divergence_seen = false;
             for alternation in &alternations {
                 let present: Vec<&str> = alternation.split('|').collect();
-                let mut divergence_seen = false;
 
                 // Script -> mirror: a root added to the script must reach Windows.
                 for needle in &expected {
@@ -1601,19 +1607,19 @@ permissions:
                          or add it there (EAI-8751)"
                     );
                 }
-
-                // An exemption nothing asserts is an exemption that rots: once
-                // EAI-8815 moves `__engine-serve-http` out of the root
-                // alternation, the arm above stops firing and would sit here
-                // forever as dead code exempting nothing. Fail instead, so the
-                // fix is told to finish the job.
-                assert!(
-                    divergence_seen,
-                    "{workflow}'s PowerShell reclaim matcher `{alternation}` no longer names \
-                     `__engine-serve-http`, so the EAI-8815 divergence looks fixed — delete the \
-                     exemption arm in this test, which is now dead code (EAI-8751)"
-                );
             }
+
+            // An exemption nothing asserts is an exemption that rots: once
+            // EAI-8815 moves `__engine-serve-http` out of the root alternation,
+            // the arm above stops firing and would sit here forever as dead
+            // code exempting nothing. Fail instead, so the fix is told to
+            // finish the job.
+            assert!(
+                divergence_seen,
+                "no PowerShell reclaim matcher in {workflow} names `__engine-serve-http`, so the \
+                 EAI-8815 divergence looks fixed — delete the exemption arm in this test, which \
+                 is now dead code (EAI-8751)"
+            );
         }
     }
 }
