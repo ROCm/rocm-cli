@@ -1228,12 +1228,66 @@ fn prepare_llamacpp_backend_for_active_rocm(
     paths: &AppPaths,
     manifest: &mut LemonadeInstallManifest,
 ) -> Result<Option<String>> {
-    // Announced here, unconditionally, rather than only where `align_llamacpp_backend_to_version`
-    // happens to be reached: that function is the enforcement point (it decides whether to
-    // skip the write), but every one of the skip branches below -- not Linux, no active SDK
-    // version, unreadable pin, pin already matches -- would otherwise leave a user who set the
-    // variable unable to tell it took effect, exactly the silence this message exists to avoid.
-    let disabled = lemonade_backend_alignment_disabled();
+    prepare_llamacpp_backend_for_active_rocm_impl(
+        manifest,
+        lemonade_backend_alignment_disabled(),
+        || active_rocm_sdk_version_for_alignment(paths),
+        read_backend_versions_therock_version,
+        best_llamacpp_backend_for_host,
+        install_best_llamacpp_backend,
+        |manifest, backend_versions_path, target_version, pinned_version, disabled| {
+            align_llamacpp_backend_to_version(
+                manifest,
+                backend_versions_path,
+                target_version,
+                pinned_version,
+                disabled,
+                try_llamacpp_backend_alignment,
+                install_best_llamacpp_backend,
+                latest_llamacpp_rocm_stable_tag,
+            )
+        },
+    )
+}
+
+/// The gate and lookup chain behind [`prepare_llamacpp_backend_for_active_rocm`],
+/// isolated from its real dependencies (the active-SDK/config lookup, the packaged
+/// pin file, and the `lemond`-spawning backend probe) so this crate's own unit tests
+/// can drive the disabled early return and the probe-error fallback -- the two
+/// branches that decide whether any alignment is even attempted, and previously had
+/// no coverage outside a `@nightly @requires-gpu` e2e lane. `disabled` is
+/// [`lemonade_backend_alignment_disabled`]'s resolved value, passed in for the same
+/// reason `align` (below) takes it as a parameter: a test can drive both branches
+/// without touching process environment.
+///
+/// This function, not `align`, is the real production enforcement point for the
+/// opt-out: the single production call site passes `disabled` straight through to
+/// `align`, but every one of *this* function's own skip branches returns before
+/// `align` is ever reached, so `align`'s production call always sees `disabled ==
+/// false` here as well as there. `align`'s own `if disabled` branch exists only so
+/// its unit tests can pin the state machine's half of the contract (the pin and
+/// llama.cpp tag staying untouched) without duplicating this whole call chain.
+#[allow(clippy::too_many_arguments)]
+fn prepare_llamacpp_backend_for_active_rocm_impl(
+    manifest: &mut LemonadeInstallManifest,
+    disabled: bool,
+    mut active_rocm_sdk_version: impl FnMut() -> Result<Option<String>>,
+    mut pinned_version_lookup: impl FnMut(&Path) -> Option<String>,
+    mut selected_backend_lookup: impl FnMut(&LemonadeInstallManifest) -> Result<Option<String>>,
+    mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
+    mut align: impl FnMut(
+        &mut LemonadeInstallManifest,
+        &Path,
+        &str,
+        &str,
+        bool,
+    ) -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    // Announced here, unconditionally, rather than only where `align` happens to be
+    // reached: every one of the skip branches below -- not Linux, no active SDK
+    // version, unreadable pin, pin already matches, the vulkan-fallback probe --
+    // would otherwise leave a user who set the variable unable to tell it took
+    // effect, exactly the silence this message exists to avoid.
     if disabled {
         eprintln!(
             "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
@@ -1242,7 +1296,7 @@ fn prepare_llamacpp_backend_for_active_rocm(
         // Checked earliest, before even the cheap version/pin lookups below, let alone
         // the vulkan-gate probe (a real `lemond` spawn) -- none of that work is worth
         // doing when the opt-out means its result can't change what happens next.
-        install_best_llamacpp_backend(manifest, false)?;
+        fallback_install(manifest, false)?;
         return Ok(None);
     }
     // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
@@ -1250,11 +1304,11 @@ fn prepare_llamacpp_backend_for_active_rocm(
     // three multi-GB backend installs and a network round-trip for a guaranteed-futile
     // outcome. Skip straight to the ordinary pinned-version install.
     if !runtime_is_linux() {
-        install_best_llamacpp_backend(manifest, false)?;
+        fallback_install(manifest, false)?;
         return Ok(None);
     }
 
-    let target_version = active_rocm_sdk_version_for_alignment(paths).unwrap_or_else(|error| {
+    let target_version = active_rocm_sdk_version().unwrap_or_else(|error| {
         eprintln!(
             "Warning: could not determine the active ROCm SDK version to align Lemonade's \
              backend with: {error:#}"
@@ -1262,17 +1316,17 @@ fn prepare_llamacpp_backend_for_active_rocm(
         None
     });
     let Some(target_version) = target_version else {
-        install_best_llamacpp_backend(manifest, false)?;
+        fallback_install(manifest, false)?;
         return Ok(None);
     };
 
     let backend_versions_path = manifest.runtime_dir.join(BACKEND_VERSIONS_RESOURCE);
-    let Some(pinned_version) = read_backend_versions_therock_version(&backend_versions_path) else {
-        install_best_llamacpp_backend(manifest, false)?;
+    let Some(pinned_version) = pinned_version_lookup(&backend_versions_path) else {
+        fallback_install(manifest, false)?;
         return Ok(None);
     };
     if pinned_version == target_version {
-        install_best_llamacpp_backend(manifest, false)?;
+        fallback_install(manifest, false)?;
         return Ok(None);
     }
 
@@ -1284,31 +1338,28 @@ fn prepare_llamacpp_backend_for_active_rocm(
     // same guaranteed-futile case already short-circuited for Windows above: otherwise
     // every install on such a host burns two forced reinstalls plus a GitHub round-trip
     // discovering what this cheap query already knows.
-    let selected_backend = match best_llamacpp_backend_for_host(manifest) {
+    let selected_backend = match selected_backend_lookup(manifest) {
         Ok(selected_backend) => selected_backend,
         Err(error) => {
             eprintln!(
                 "Warning: could not determine which llama.cpp backend this host would select; \
                  skipping ROCm backend alignment: {error:#}"
             );
-            install_best_llamacpp_backend(manifest, false)?;
+            fallback_install(manifest, false)?;
             return Ok(None);
         }
     };
     if !should_attempt_llamacpp_backend_alignment(selected_backend.as_deref()) {
-        install_best_llamacpp_backend(manifest, false)?;
+        fallback_install(manifest, false)?;
         return Ok(None);
     }
 
-    align_llamacpp_backend_to_version(
+    align(
         manifest,
         &backend_versions_path,
         &target_version,
         &pinned_version,
         disabled,
-        try_llamacpp_backend_alignment,
-        install_best_llamacpp_backend,
-        latest_llamacpp_rocm_stable_tag,
     )
 }
 
@@ -1319,15 +1370,16 @@ fn prepare_llamacpp_backend_for_active_rocm(
 ///
 /// `disabled` is the resolved value of [`lemonade_backend_alignment_disabled`], passed
 /// in rather than read here so a test can drive both branches without touching process
-/// environment (mirrors vLLM's `torch_alignment_disabled` parameter). Checked first,
-/// before any `backend_versions.json` write, so the opt-out really does leave the pin
-/// untouched -- and because that check now lives on the one function this crate's own
-/// unit tests already exercise with every install/align/tag step injected, a test can
-/// assert `align`/`latest_tag` are never called and `fallback_install` runs unforced,
-/// covering the gate on every lane instead of only the nightly GPU one. The user-facing
-/// announcement lives in the caller ([`prepare_llamacpp_backend_for_active_rocm`])
-/// instead of here, so it fires on every skip path the opt-out affects, not only the
-/// one this function's own gate reaches.
+/// environment (mirrors vLLM's `torch_alignment_disabled` parameter). The real
+/// production enforcement of the opt-out lives one level up, in
+/// [`prepare_llamacpp_backend_for_active_rocm_impl`]: its own early return skips
+/// every lookup this function depends on, so its single production call site always
+/// passes `disabled == false` here. This function's own `if disabled` branch exists
+/// only so its unit tests can pin this half of the contract (the pin and llama.cpp
+/// tag staying untouched when the flag is set) without spinning up the whole call
+/// chain above it. The user-facing announcement lives in
+/// [`prepare_llamacpp_backend_for_active_rocm_impl`] as well, so it fires on every
+/// skip path the opt-out affects, not only the one this function's own gate reaches.
 #[allow(clippy::too_many_arguments)]
 fn align_llamacpp_backend_to_version(
     manifest: &mut LemonadeInstallManifest,
@@ -1431,13 +1483,13 @@ fn align_llamacpp_backend_to_version(
     let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(manifest);
     match fallback_install(manifest, true) {
         Ok(()) => {
-            resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, true);
+            resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, true);
             Ok(None)
         }
         Err(error) => {
             // Restore the pre-alignment backend before propagating: a failed
             // fallback install must not leave the host with no ROCm backend at all.
-            resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, false);
+            resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, false);
             Err(error)
         }
     }
@@ -1478,7 +1530,7 @@ fn try_llamacpp_backend_alignment(
                 .is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
         });
     let succeeded = llamacpp_backend_alignment_succeeded(&install_result, has_usable_binary);
-    resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, succeeded);
+    resolve_rocm_llamacpp_backend_dirs_aside(manifest, &aside_dirs, succeeded);
     if !succeeded {
         match install_result {
             Ok(()) => eprintln!(
@@ -3847,27 +3899,48 @@ fn set_aside_rocm_llamacpp_backend_dirs(
             // A leftover aside path from an earlier, interrupted attempt must not
             // block this rename.
             let _ = fs::remove_dir_all(&aside);
-            fs::rename(&original, &aside)
-                .ok()
-                .map(|()| (original, aside))
+            match fs::rename(&original, &aside) {
+                Ok(()) => Some((original, aside)),
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not move {} aside before backend alignment: {error:#}",
+                        original.display()
+                    );
+                    None
+                }
+            }
         })
         .collect()
 }
 
 /// Resolve the aside directories from [`set_aside_rocm_llamacpp_backend_dirs`]: on
 /// success, discard them -- the fresh install replaced what they held. On failure,
-/// remove whatever the failed install left at `original` and move `aside` back into
-/// place, so the host is never left with zero ROCm backend directories. Best-effort:
-/// a failure here just risks the same stale-directory ambiguity the aside exists to
-/// prevent, not the reinstall itself.
-fn resolve_rocm_llamacpp_backend_dirs_aside(aside_dirs: &[(PathBuf, PathBuf)], success: bool) {
-    for (original, aside) in aside_dirs {
-        if success {
+/// clear every [`ROCM_LLAMACPP_BACKEND_DIRS`] name (not just the ones that were
+/// actually asided) before moving each `aside` back into place: a failed install can
+/// land its output under a *different* ROCm-family name than the one that was
+/// asided (Lemonade extracts each release into its own build-numbered directory
+/// rather than replacing one in place), and [`find_binary_in`]'s priority-ordered
+/// lookup would otherwise let that stray, unverified directory shadow the good
+/// build this function just restored. Best-effort: a failure here just risks the
+/// same stale-directory ambiguity the aside exists to prevent, not the reinstall
+/// itself.
+fn resolve_rocm_llamacpp_backend_dirs_aside(
+    manifest: &LemonadeInstallManifest,
+    aside_dirs: &[(PathBuf, PathBuf)],
+    success: bool,
+) {
+    if success {
+        for (_, aside) in aside_dirs {
             let _ = fs::remove_dir_all(aside);
-        } else {
-            let _ = fs::remove_dir_all(original);
-            let _ = fs::rename(aside, original);
         }
+        return;
+    }
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    for backend in ROCM_LLAMACPP_BACKEND_DIRS {
+        let _ = fs::remove_dir_all(llamacpp_dir.join(backend));
+    }
+    for (original, aside) in aside_dirs {
+        let _ = fs::rename(aside, original);
     }
 }
 
@@ -5403,7 +5476,7 @@ mod tests {
                 "{backend} should have been moved aside"
             );
         }
-        resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, true);
+        resolve_rocm_llamacpp_backend_dirs_aside(&manifest, &aside_dirs, true);
 
         for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
             assert!(
@@ -5445,7 +5518,7 @@ mod tests {
             "the original must be moved aside before the install is attempted"
         );
         // Simulate a failed install leaving nothing behind at the original path.
-        resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, false);
+        resolve_rocm_llamacpp_backend_dirs_aside(&manifest, &aside_dirs, false);
 
         assert_eq!(
             fs::read(rocm_dir.join(&server)).unwrap(),
@@ -5457,6 +5530,45 @@ mod tests {
                 .join(format!("rocm{BACKEND_DIR_ASIDE_SUFFIX}"))
                 .exists(),
             "the aside copy must be moved back, not left behind"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_rocm_llamacpp_backend_dirs_aside_removes_a_failed_installs_stray_residue() {
+        // The bug this guards: a failed install can land its (broken) output under a
+        // DIFFERENT ROCm-family name than the one that was asided -- Lemonade
+        // extracts each release into its own build-numbered directory rather than
+        // replacing one in place. Only cleaning up the asided name left that stray
+        // directory on disk, where `find_binary_in`'s priority order
+        // (rocm-stable > rocm-nightly > rocm) could shadow the just-restored good
+        // build with it.
+        let dir = scratch_dir("aside-removes-stray-residue-in-different-dir");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        let rocm_dir = llamacpp.join("rocm");
+        fs::create_dir_all(&rocm_dir).unwrap();
+        fs::write(rocm_dir.join(&server), b"original").unwrap();
+        let manifest = test_manifest(runtime_dir);
+
+        let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(&manifest);
+        // Simulate a failed install that landed its (unverified) output in
+        // `rocm-stable` instead of `rocm`, the name that was actually asided.
+        let stray_dir = llamacpp.join("rocm-stable");
+        fs::create_dir_all(&stray_dir).unwrap();
+        fs::write(stray_dir.join(&server), b"stray").unwrap();
+
+        resolve_rocm_llamacpp_backend_dirs_aside(&manifest, &aside_dirs, false);
+
+        assert!(
+            !stray_dir.exists(),
+            "the failed install's residue in a different backend dir must be removed"
+        );
+        assert_eq!(
+            fs::read(rocm_dir.join(&server)).unwrap(),
+            b"original",
+            "the pre-existing backend must still be restored"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -5494,12 +5606,13 @@ mod tests {
 
     #[test]
     fn align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps() {
-        // The fast-lane regression guard for the opt-out: previously this gate was
-        // covered only by a @nightly @requires-gpu e2e scenario, which every per-PR
-        // and merge-queue lane skips -- so a regression that silently re-enabled the
-        // alignment shipped green everywhere that actually gates a merge. `align`
-        // and `latest_tag` panicking if called is the falsifiable half; the pin
-        // staying byte-identical is the other.
+        // This pins `align`'s own half of the opt-out contract in isolation: the pin
+        // and llama.cpp tag stay byte-identical and `align`/`latest_tag` are never
+        // called. The real production gate -- whether this function is even reached
+        // with `disabled == true` in the first place -- lives one level up, in
+        // `prepare_llamacpp_backend_for_active_rocm_impl`; see
+        // `prepare_disabled_early_return_skips_every_lookup_and_installs_unforced`
+        // below for that half.
         let dir = scratch_dir("align-disabled");
         let path = dir.join("backend_versions.json");
         write_backend_versions_fixture(&path, "7.13.0", "b9752");
@@ -5536,6 +5649,67 @@ mod tests {
             "the packaged llama.cpp tag must survive untouched when alignment is disabled"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prepare_disabled_early_return_skips_every_lookup_and_installs_unforced() {
+        // The real production gate for the opt-out: previously this was covered only
+        // by a @nightly @requires-gpu e2e scenario, which every per-PR and
+        // merge-queue lane skips -- so a regression that silently re-enabled
+        // alignment here shipped green everywhere that actually gates a merge. Every
+        // lookup the disabled path is supposed to skip panics if reached; the
+        // unforced install is the falsifiable positive.
+        let mut manifest = test_manifest(PathBuf::from("unused-runtime-dir"));
+
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            true,
+            || panic!("disabled means the active SDK version must never be probed"),
+            |_path| panic!("disabled means the packaged pin must never be read"),
+            |_manifest| panic!("disabled means the vulkan-fallback probe must never run"),
+            |_manifest, force_reinstall| {
+                assert!(
+                    !force_reinstall,
+                    "the disabled path installs whatever is already pinned, not a fresh reinstall"
+                );
+                Ok(())
+            },
+            |_manifest, _path, _target, _pinned, _disabled| {
+                panic!("disabled means align must never be reached")
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn prepare_probe_error_falls_back_to_an_unforced_install_without_reaching_align() {
+        // The bug this guards: a host where the vulkan-fallback probe itself errors
+        // (e.g. `lemond` failing to start) must degrade to an ordinary install
+        // rather than propagating the error or attempting alignment blind -- the
+        // same "skip, don't fail" contract every other probe/lookup failure in this
+        // gate already gets.
+        let mut manifest = test_manifest(PathBuf::from("unused-runtime-dir"));
+
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            || Ok(Some("10.0.0".to_owned())),
+            |_path| Some("7.13.0".to_owned()),
+            |_manifest| Err(anyhow!("lemond failed to start")),
+            |_manifest, force_reinstall| {
+                assert!(
+                    !force_reinstall,
+                    "a probe error falls back to an unforced install, not a reinstall"
+                );
+                Ok(())
+            },
+            |_manifest, _path, _target, _pinned, _disabled| {
+                panic!("a probe error must skip align entirely")
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
     }
 
     #[test]

@@ -542,11 +542,13 @@ async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
 /// before any of the not-Linux/no-SDK-version/unreadable-pin/pin-matches
 /// skips run, so it can no longer distinguish "the opt-out was honoured"
 /// from "the variable was set and alignment ran anyway". That guarantee is
-/// proven elsewhere: `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
-/// (the crate's own unit test, gating the state machine on every lane) and
-/// the sibling `the packaged pin survives the install` step below (its
-/// `Aligned …` / `could not align …` absence checks, run on the gated e2e
-/// lane).
+/// proven elsewhere: the crate's own unit tests --
+/// `prepare_disabled_early_return_skips_every_lookup_and_installs_unforced`
+/// gates the real production early return on every per-PR and merge-queue
+/// lane, and `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
+/// pins the state machine's own half of the contract -- and the sibling
+/// `the packaged pin survives the install` step below (its `Aligned …` /
+/// `could not align …` absence checks, run on the gated e2e lane).
 #[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
 async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.as_deref().expect("no install stderr");
@@ -591,10 +593,10 @@ fn active_runtime_version(world: &E2eWorld) -> String {
 /// fire whenever a restore was attempted. `--reinstall` (the When's own
 /// mechanism) always re-extracts the packaged embeddable first, and the
 /// disabled gate returns before any write to `backend_versions.json` at all
-/// (see `align_llamacpp_backend_to_version`), so the llama.cpp tag limb of
-/// the same file is provably untouched whenever both checks below hold --
-/// both Tier 2 and the revert path's own restore write sit behind that same
-/// gate.
+/// (see `prepare_llamacpp_backend_for_active_rocm_impl`'s early return, the
+/// real production enforcement point), so the llama.cpp tag limb of the same
+/// file is provably untouched whenever both checks below hold -- both Tier 2
+/// and the revert path's own restore write sit behind that same gate.
 #[then("the packaged pin survives the install")]
 async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
