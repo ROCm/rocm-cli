@@ -972,6 +972,7 @@ impl AppState {
             ScrollTarget::ConsoleH => self.console_hscroll = p,
             ScrollTarget::Chat => self.set_chat_scroll(position),
             ScrollTarget::DockLogs => self.dock_logs_scroll = p,
+            ScrollTarget::InstanceDetail => self.instance_detail_scroll = p,
         }
     }
 
@@ -3475,6 +3476,7 @@ fn target_position(state: &AppState, h: &ScrollbarHandle) -> usize {
         ScrollTarget::DockLogs => h
             .max_position()
             .saturating_sub(usize::from(state.dock_logs_scroll)),
+        ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
     };
     position.min(h.max_position())
 }
@@ -3525,9 +3527,15 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     }
 
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
-        // Scrollbar tracks win over everything (incl. an open overlay's console
-        // bar), so a click on the bar grabs it instead of falling through.
-        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
+        // Scrollbar tracks win over a plain open overlay (incl. its console
+        // bar), so a click on the bar grabs it instead of falling through —
+        // but NOT over a pending approval: nothing registers a scrollbar for
+        // the approval modal itself, so any handle on screen while one is
+        // pending belongs to content underneath it, which the swallow below
+        // must still catch rather than let a scrollbar drag bypass it.
+        if state.approval.is_none()
+            && let Some(a) = scrollbar_hit(state, me.column, me.row)
+        {
             return a;
         }
         if let Some(area) = state.last_tab_bar_area
@@ -3583,6 +3591,12 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         _ => return KeyAction::Nothing,
     };
 
+    // A pending approval owns the body with no exception (mirrors the click
+    // swallow a few lines above) — unlike a plain manager overlay, it never
+    // has its own console to pan, so there is nothing to fall through to.
+    if state.approval.is_some() {
+        return KeyAction::Nothing;
+    }
     // An open manager owns the body. When it is showing its job console, the
     // wheel pans that log (bigger vertical step, wider horizontal step so long
     // command lines come into view). On a form screen there is nothing to pan —
@@ -3679,6 +3693,8 @@ pub enum ScrollTarget {
     DockLogs,
     /// Chat transcript (`chat_scroll`).
     Chat,
+    /// Instance detail modal's launch_args/env_vars panes (`instance_detail_scroll`).
+    InstanceDetail,
 }
 
 /// A scrollbar drawn this frame, recorded so a mouse click/drag can hit-test it.
@@ -5154,6 +5170,36 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_hit_is_swallowed_while_an_approval_is_pending() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        // No approval pending → the scrollbar still wins, same as
+        // `scrollbar_click_grabs_drag_scrolls_then_releases`.
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::ScrollGrab(ScrollTarget::Console, 90, 0)
+        );
+        // Nothing registers a scrollbar for the approval modal itself, so a
+        // handle on screen while one is pending belongs to content
+        // underneath it — the click must be swallowed like every other body
+        // click, not resolve to a drag on the obscured bar.
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
     fn rendered_thumb_cells_are_grabbable() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5402,6 +5448,42 @@ mod tests {
     }
 
     #[test]
+    fn instance_detail_scrollbar_click_grabs_drag_scrolls_then_releases() {
+        // Mirrors `scrollbar_click_grabs_drag_scrolls_then_releases` for the
+        // instance Detail modal's scrollbar (`instances.rs::render_body`
+        // registers one for each of its two panes) — proves the
+        // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
+        // actually moves `instance_detail_scroll`, not just that the bar
+        // renders.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::InstanceDetail,
+        });
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        assert_eq!(
+            a,
+            KeyAction::ScrollGrab(ScrollTarget::InstanceDetail, 90, 0)
+        );
+        apply_action(&mut s, a);
+        assert_eq!(s.instance_detail_scroll, 90);
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(drag, &s);
+        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::InstanceDetail, 0, 0));
+        apply_action(&mut s, a);
+        assert_eq!(s.instance_detail_scroll, 0);
+        let up = wheel(MouseEventKind::Up(MouseButton::Left), 40, 0);
+        let a = resolve_mouse(up, &s);
+        assert_eq!(a, KeyAction::ScrollRelease);
+        apply_action(&mut s, a);
+        assert_eq!(s.scroll_drag, None);
+    }
+
+    #[test]
     fn wheel_over_form_screen_overlay_is_swallowed() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
@@ -5409,6 +5491,29 @@ mod tests {
         // Overlay open but on its form (no active_job) → nothing to pan, and the
         // obscured Actions list must NOT move.
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
+            KeyAction::Nothing
+        );
+    }
+
+    #[test]
+    fn wheel_is_swallowed_while_an_approval_is_pending() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+        // `open_approval` clears every manager overlay (`has_open_overlay()` is
+        // false) but never touches `modal` — the wheel must still be swallowed
+        // instead of falling through to whatever's obscured underneath, the
+        // same gap the click path was already fixed for (see
+        // `body_clicks_are_swallowed_while_an_approval_is_pending`).
+        assert!(!s.has_open_overlay());
         assert_eq!(
             resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
             KeyAction::Nothing

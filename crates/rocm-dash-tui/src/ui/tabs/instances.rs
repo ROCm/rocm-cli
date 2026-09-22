@@ -14,7 +14,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
-use crate::app::{AppState, ConnState, KeyAction};
+use crate::app::{AppState, ConnState, KeyAction, ScrollTarget};
 use crate::ui::format;
 use crate::ui::modal::{centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::panel::{self, BoxRole};
@@ -663,7 +663,7 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
         .split(inner);
 
     render_summary(f, chunks[0], inst, snap_ts, theme);
-    let max_scroll = render_body(f, chunks[1], inst, theme, state.instance_detail_scroll);
+    let max_scroll = render_body(f, chunks[1], inst, state, theme);
     render_footer(f, chunks[2], inst, theme, max_scroll > 0);
     max_scroll
 }
@@ -764,7 +764,9 @@ fn render_summary(
 }
 
 /// Renders `p` (already wrapped) into `inner`, reserving a vertical scrollbar
-/// column when `reserve` is set, and returns the pane's max scroll offset.
+/// column when `reserve` is set, and returns the pane's max scroll offset
+/// plus the final content rect (so the caller can register it for mouse
+/// hit-testing — see `AppState::record_scrollbar`).
 ///
 /// `reserve` is decided by the caller (see `render_body`) rather than by this
 /// pane's own content, because the launch_args/env_vars panes share one
@@ -789,7 +791,7 @@ fn render_scrollable_pane(
     scroll: u16,
     reserve: bool,
     theme: &Theme,
-) -> u16 {
+) -> (u16, Rect) {
     let len = if reserve {
         p.line_count(inner.width.saturating_sub(1))
     } else {
@@ -811,13 +813,14 @@ fn render_scrollable_pane(
         .unwrap_or(u16::MAX)
         .saturating_sub(content.height);
     f.render_widget(p.scroll((scroll.min(max), 0)), content);
-    max
+    (max, content)
 }
 
-/// Renders the launch_args/env_vars panes, applying `scroll` (in lines) to
-/// both, and returns the larger of the two panes' max scroll offsets so the
+/// Renders the launch_args/env_vars panes, applying `state.instance_detail_scroll`
+/// to both, and returns the larger of the two panes' max scroll offsets so the
 /// caller can clamp future scroll input (see `AppState::scroll_instance_detail`).
-fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll: u16) -> u16 {
+fn render_body(f: &mut Frame, area: Rect, inst: &Instance, state: &AppState, theme: &Theme) -> u16 {
+    let scroll = state.instance_detail_scroll;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
@@ -884,11 +887,39 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scroll
     let reserve = args_full_len > usize::from(args_inner.height)
         || env_full_len > usize::from(env_inner.height);
 
-    let args_max =
+    let (args_max, args_content) =
         render_scrollable_pane(f, args_inner, args_p, args_full_len, scroll, reserve, theme);
-    let env_max = render_scrollable_pane(f, env_inner, env_p, env_full_len, scroll, reserve, theme);
+    let (env_max, env_content) =
+        render_scrollable_pane(f, env_inner, env_p, env_full_len, scroll, reserve, theme);
 
-    args_max.max(env_max)
+    // Register both panes' bars for mouse drag using the *shared* max — the
+    // authoritative clamp both keyboard scrolling (`instance_detail_max_scroll`)
+    // and the other pane use — rather than each pane's own, possibly smaller,
+    // local max. Using a pane's own max here would let dragging the shorter
+    // pane's bar (e.g. env_vars, often just "(none)") clamp against its own
+    // near-zero range instead of the real shared one, even though its thumb's
+    // *visual* size/position (already handled above) correctly reflects its
+    // own content.
+    let shared_max = args_max.max(env_max);
+    let content_len = usize::from(shared_max) + usize::from(args_inner.height);
+    state.record_scrollbar(
+        args_inner,
+        args_content,
+        false,
+        content_len,
+        usize::from(args_inner.height),
+        ScrollTarget::InstanceDetail,
+    );
+    state.record_scrollbar(
+        env_inner,
+        env_content,
+        false,
+        content_len,
+        usize::from(env_inner.height),
+        ScrollTarget::InstanceDetail,
+    );
+
+    shared_max
 }
 
 fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scrollable: bool) {
@@ -1520,6 +1551,37 @@ mod tests {
     }
 
     #[test]
+    fn detail_modal_registers_scrollbar_for_mouse_drag() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `render_body` draws the bar via `panel::vertical_scrollbar_forced`
+        // but that alone doesn't make it mouse-draggable — proves
+        // `state.record_scrollbar` actually fires from the real draw path
+        // (not just a synthetic-handle unit test on the mouse-routing side),
+        // and that it's reachable through `state.scrollbars`, which is what
+        // `scrollbar_hit` reads at click time.
+        let mut inst = mk_inst("overflow");
+        inst.launch_args = (0..60).map(|i| format!("--flag-{i}=value{i}")).collect();
+        let mut m = HashMap::new();
+        m.insert(inst.container_id.clone(), inst);
+        let state = mk_state(m, 0);
+
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+
+        let bars = state.scrollbars.borrow();
+        assert!(
+            bars.iter()
+                .any(|h| h.target == ScrollTarget::InstanceDetail),
+            "draw_detail must register a scrollbar for ScrollTarget::InstanceDetail"
+        );
+    }
+
+    #[test]
     fn detail_modal_reserves_scrollbar_symmetrically_when_only_one_pane_overflows() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1618,7 +1680,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(20, 3)).unwrap();
         let mut max = 0u16;
         term.draw(|f| {
-            max = render_scrollable_pane(f, inner, p, full_len, 0, true, &theme);
+            (max, _) = render_scrollable_pane(f, inner, p, full_len, 0, true, &theme);
         })
         .unwrap();
 
