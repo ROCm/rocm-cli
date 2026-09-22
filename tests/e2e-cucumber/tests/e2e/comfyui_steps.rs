@@ -537,7 +537,7 @@ async fn assert_intermediate_comfyui_download_progress_frame(world: &mut E2eWorl
     session
         .wait_for_screen_where(
             "an intermediate (neither 0% nor 100%) download progress frame",
-            |screen| is_intermediate_download_progress_frame(screen),
+            is_intermediate_download_progress_frame,
             PTY_SCREEN_TIMEOUT,
         )
         .await
