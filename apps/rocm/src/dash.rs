@@ -69,18 +69,32 @@ pub fn runner_options(
         // Production always runs the real `/dev/kfd` pre-flight; only daemon
         // integration tests with a fake binary skip it.
         amd_smi_skip_kfd_preflight: false,
-        test_clock_offset_path: dash_test_clock_offset_path(),
+        test_clock_offset_path: dash_test_clock_offset_path(paths),
     }
 }
 
-#[cfg(feature = "e2e-test-hooks")]
-fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH").map(Into::into)
-}
+/// Name of the logical-clock directive file, read from the telemetry state dir.
+const DASH_TEST_CLOCK_FILE: &str = "test-clock-offset";
 
-#[cfg(not(feature = "e2e-test-hooks"))]
-const fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    None
+/// Path of the daemon's logical observation clock, or `None` to use wall time.
+///
+/// State-based, not compile-time-gated: the file simply does not exist on a
+/// user's machine, and nothing in `rocm` ever creates it — only the E2E harness
+/// plants one, in the isolated data root it hands this process via
+/// `ROCM_CLI_DATA_DIR`. That keeps the binary under test byte-identical to the
+/// binary that ships, the same way the Lemonade recovery scenario plants a
+/// runtime manifest that production code reads through its normal path. A
+/// `#[cfg(feature = ...)]` seam cannot make that claim: it makes the tested
+/// binary a different binary.
+///
+/// The existence check is load-bearing, not an optimisation. `RunnerOptions::
+/// test_clock_offset_path` selects wall time *only* on `None`; a `Some(path)`
+/// whose file is absent leaves the daemon on its default
+/// `TestClockDirective::FreeRunning(0)` logical clock. Returning the path
+/// unconditionally would therefore take production off `Utc::now()`.
+fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
+    let path = paths.telemetry_state_dir().join(DASH_TEST_CLOCK_FILE);
+    path.is_file().then_some(path)
 }
 
 /// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
