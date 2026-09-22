@@ -56,6 +56,14 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
 
+/// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
+/// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
+/// label budget `assemble_status_line` leaves on an 80-column terminal even at
+/// the widest realistic progress suffix (see that assertion's comment) — the
+/// full string would never fully render while the line is live, so a prefix
+/// this short is what actually needs to disappear on clear.
+const DOWNLOADING_PREFIX_LEN: usize = 30;
+
 /// The `current/` fixture's served base, i.e. what the canonical release
 /// overrides are pointed at.
 fn current_pip_base(world: &E2eWorld) -> String {
@@ -494,7 +502,10 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
     // was cleared. Truncation always keeps the label's head intact and cuts
     // its tail, so a short prefix is present whenever the line is live and
     // gone once `Spinner::clear` erases it.
-    let downloading_prefix = &format!("Downloading {CURRENT_TARBALL}")[..30];
+    let downloading = format!("Downloading {CURRENT_TARBALL}");
+    let downloading_prefix = downloading
+        .get(..DOWNLOADING_PREFIX_LEN)
+        .unwrap_or(&downloading);
     assert!(
         !screen.contains(downloading_prefix),
         "download spinner line was not cleared on completion:\n{screen}"

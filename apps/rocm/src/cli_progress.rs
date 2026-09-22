@@ -396,6 +396,22 @@ mod tests {
     }
 
     #[test]
+    fn set_label_clears_a_stale_progress_suffix() {
+        // A caller that moves on to a plain (non-byte-progress) message must
+        // not have a previous transfer's byte count still glued to it —
+        // `render_current` would otherwise render an unrelated message with a
+        // stale suffix appended.
+        let mut spinner = Spinner::new("Downloading…");
+        spinner.set_progress("Downloading…", 900, Some(1000));
+        assert!(spinner.progress_suffix.is_some());
+        spinner.set_label("Checking AMD GPU access…");
+        assert!(
+            spinner.progress_suffix.is_none(),
+            "set_label must clear any progress suffix left over from a prior set_progress call"
+        );
+    }
+
+    #[test]
     fn assemble_status_line_keeps_the_progress_suffix_intact_when_the_label_would_overflow() {
         // Regression test: an early version truncated the whole assembled
         // line from the tail, which — once the byte count grew past a couple
