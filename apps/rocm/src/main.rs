@@ -11561,15 +11561,23 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
         path.parent()
             .context("active runtime marker path has no parent directory")?,
     )?;
-    let tmp_path = path.with_extension(format!("json.tmp-{}", rocm_core::unix_time_millis()));
+    // Timestamp plus pid: the timestamp keeps successive writes apart, the pid
+    // keeps two `rocm` processes writing in the same millisecond from clobbering
+    // each other's temp file.
+    let tmp_path = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        rocm_core::unix_time_millis(),
+        std::process::id()
+    ));
     fs::write(
         &tmp_path,
         serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
     )
     .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
+    // The destination is NOT removed first: `fs::rename` replaces an existing
+    // file on both supported platforms, and removing it would leave a window
+    // with no marker at all — which runtime resolution and the storage
+    // retention holds both read as "nothing is active".
     fs::rename(&tmp_path, &path).with_context(|| {
         format!(
             "failed to move active runtime marker {} into {}",
@@ -31558,10 +31566,9 @@ ID_LIKE="suse opensuse"
 
     /// Replace the active-runtime marker with a NON-EMPTY directory, so the
     /// next `write_active_runtime_marker` fails at a predictable point: its
-    /// `create_dir_all` of the parent succeeds, its `remove_file` of the
-    /// destination fails harmlessly, and the final `fs::rename` of the temp
-    /// file onto a non-empty directory fails on both supported platforms
-    /// without needing privileges or a real full disk.
+    /// `create_dir_all` of the parent succeeds, and the final `fs::rename` of
+    /// the temp file onto a non-empty directory fails on both supported
+    /// platforms without needing privileges or a real full disk.
     fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
         let marker = active_runtime_marker_path(paths);
         let _ = fs::remove_file(&marker);
