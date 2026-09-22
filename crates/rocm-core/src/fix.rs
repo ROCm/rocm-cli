@@ -1390,6 +1390,12 @@ mod tests {
     // Serializes tests that replace the process-global `ROCM_PATH` env var while
     // they run. Because env is shared across all test threads, two such tests
     // running concurrently can otherwise see each other's value mid-test.
+    //
+    // Deliberately kept alongside the seam rather than instead of it, and the
+    // split is not arbitrary: tests about resolution semantics take the seam
+    // and never touch the environment, and exactly one test — the one whose
+    // subject IS the `$ROCM_PATH` read — takes this lock. Anything provable
+    // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
