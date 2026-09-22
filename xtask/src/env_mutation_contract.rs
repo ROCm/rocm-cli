@@ -359,6 +359,10 @@ mod tests {
                 pending_test_attr = false;
             }
 
+            // Saturating purely so a file this scan misreads cannot panic the
+            // build. With literals tokenized away the count is balanced on any
+            // file that compiles, so the saturation is unreachable in practice
+            // — it is a backstop, not part of the logic.
             depth = (depth + opens).saturating_sub(closes);
 
             if let Some((open_depth, body, hits)) = current.as_ref()
@@ -373,6 +377,18 @@ mod tests {
                 current = None;
             }
         }
+
+        // A test body still open when the file ends means the brace bookkeeping
+        // lost track of something. Report what it collected instead of dropping
+        // it on the floor: over-reporting is visible and gets fixed, whereas a
+        // silently discarded hit is the failure mode this guard exists to
+        // prevent.
+        if let Some((_, body, hits)) = current
+            && !serializes(&body)
+        {
+            offenses.extend(hits);
+        }
+
         offenses
     }
 
@@ -568,13 +584,20 @@ mod tests {
         );
     }
 
-    /// The mirror failure: an unbalanced `{{` in a literal inflates the depth and
+    /// The mirror failure: unbalanced `{{` in a literal inflates the depth and
     /// keeps the scan inside a test long after it ended, so PRODUCTION code
     /// downstream gets flagged and the build fails for nothing.
+    ///
+    /// Two braces rather than one on purpose. One is swallowed by the enclosing
+    /// `mod tests` close, which would leave this passing for a reason unrelated
+    /// to the defect; two keep the scan open past the end of the file, where the
+    /// EOF flush turns the leak into a reported offense — so this fails against
+    /// a scanner that does not tokenize literals. `{{model=...}}` in a
+    /// Prometheus format string is the real shape of it.
     #[test]
     fn an_opening_brace_in_a_literal_does_not_drag_in_production_code() {
         let source = format!(
-            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        let _s = \"{{\";\n    }}\n}}\n\
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        let _s = \"{{{{\";\n    }}\n}}\n\
              fn later_production() {{\n    {}\n}}\n",
             mutation_call("set_var")
         );
