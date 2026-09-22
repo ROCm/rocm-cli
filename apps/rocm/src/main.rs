@@ -8251,6 +8251,15 @@ fn classify_service_runtime_state(
         // is resolved before calling the service stale, or a server already on
         // the runtime being activated is named as left behind and
         // `--restart-services` stops and respawns it for nothing.
+        //
+        // The resolution is only as exact as the recorded value: a family form
+        // shared by two installed versions resolves to neither, so such a
+        // record falls through to `Stale` and is reported (and, with
+        // `--restart-services`, moved) even when the server is already on the
+        // runtime being activated. That is the conservative direction — the
+        // record genuinely does not say which version — and it shrinks as
+        // records are rewritten, since `refresh_from_engine_state` now prefers
+        // the engine's exact `requested_runtime_id` over the family form.
         Some(recorded)
             if runtime_manifest_for_selector(manifests, recorded)
                 .is_some_and(|manifest| manifest.runtime_key == runtime_key) =>
@@ -8361,7 +8370,9 @@ fn render_runtime_service_reconciliation(services: &RuntimeServiceReconciliation
             let _ = writeln!(output, "    - {}: {}", failure.service_id, failure.error);
         }
     }
-    if !services.stale.is_empty() && services.restarted.is_empty() && services.failed.is_empty() {
+    // `restart_stale_runtime_services` drains `stale` into `restarted`/`failed`,
+    // so anything still listed here was left where it was and the advice holds.
+    if !services.stale.is_empty() {
         let _ = writeln!(
             output,
             "  note: those keep serving on their recorded runtime until they are restarted; \
@@ -8392,19 +8403,23 @@ fn restart_stale_runtime_services(
     runtime_key: &str,
     services: &mut RuntimeServiceReconciliation,
 ) {
-    // Taken out and put back so the report still lists what was found while the
-    // restarted/failed vectors beside it are appended to.
-    let stale = std::mem::take(&mut services.stale);
-    for entry in &stale {
+    // Every entry LEAVES `stale` for `restarted` or `failed`, and is not put
+    // back. `services_on_previous_runtime` counts `stale`, so a service that
+    // was moved — or that the attempt stopped — must not still be counted as a
+    // live server serving from the previous runtime: that is the same
+    // report-contradicts-reality failure this whole path exists to end. The
+    // `restarted`/`failed` lists name them instead, with what actually
+    // happened. An entry no attempt reached would stay, so the count can only
+    // undercount if a restart is silently skipped.
+    for entry in std::mem::take(&mut services.stale) {
         match restart_service_onto_runtime(paths, &entry.service_id, runtime_key) {
-            Ok(()) => services.restarted.push(entry.service_id.clone()),
+            Ok(()) => services.restarted.push(entry.service_id),
             Err(error) => services.failed.push(FailedServiceRestart {
-                service_id: entry.service_id.clone(),
+                service_id: entry.service_id,
                 error: format!("{error:#}"),
             }),
         }
     }
-    services.stale = stale;
 }
 
 /// Rewrite the service record onto `runtime_key`, THEN restart it.
@@ -32062,6 +32077,117 @@ ID_LIKE="suse opensuse"
              never loaded"
         );
         assert_eq!(after.env_id.as_deref(), Some("custom-env"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_restart_that_fails_after_the_stop_leaves_the_server_stopped_and_repinned() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-fails-after-stop");
+        paths.ensure()?;
+        let mut record = plant_service_record_on_runtime(
+            &paths,
+            "svc-cpu-policy",
+            "vllm",
+            "starting",
+            // Skipped by `terminate_recorded_service_pids`, which never
+            // signals this process — so the stop runs for real without the
+            // test killing itself.
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        // A device policy the managed serve path refuses. It is parsed AFTER
+        // `restart_internal_managed_service` has already stopped the service,
+        // which is the failure the report's "stopped by the attempt" claim and
+        // the pin restore are both written for — and which the pre-stop
+        // refusal test deliberately does not reach.
+        record.device_policy = Some("cpu_only".to_owned());
+        record.write()?;
+
+        let error = restart_service_onto_runtime(&paths, "svc-cpu-policy", NEW_RUNTIME_KEY)
+            .expect_err("a refused device policy must fail the move");
+        let after = load_managed_service(&paths, "svc-cpu-policy")?;
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("CPU mode is not a fallback path"),
+            "moving a server onto a new runtime goes through the same managed \
+             serve path as a fresh launch, so it must refuse CPU execution \
+             exactly as that path does:\n{error}"
+        );
+        assert_eq!(
+            after.runtime_id.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the restart got past the stop but never came back up, so the \
+             record must not describe a runtime the server never loaded"
+        );
+        assert_eq!(
+            after.status, "stopped",
+            "the report and the docs both tell the user a failed restart left \
+             the server down; if the stop had not happened that sends them \
+             away from a server that is still serving"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn restarting_services_stops_counting_them_as_left_on_the_previous_runtime() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-clears-stale");
+        paths.ensure()?;
+        let mut record = plant_service_record_on_runtime(
+            &paths,
+            "svc-public",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        // Same refusal the test above uses: it reaches the failure branch
+        // without spawning anything, and a FAILED restart is the harder case
+        // for the count — the service is not on the new runtime either, so it
+        // is tempting to leave it counted.
+        record.host = "0.0.0.0".to_owned();
+        record.write()?;
+        endpoint_keys::clear_endpoint_api_key(&paths, "svc-public");
+        let mut services = RuntimeServiceReconciliation {
+            stale: vec![RuntimeServiceEntry {
+                service_id: "svc-public".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+            }],
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        restart_stale_runtime_services(&paths, NEW_RUNTIME_KEY, &mut services);
+        let rendered = render_runtime_service_reconciliation(&services);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(services.failed.len(), 1, "{services:?}");
+        assert!(
+            services.stale.is_empty(),
+            "an attempted service is reported by what the attempt did to it, not \
+             counted a second time as a live server still serving from the \
+             previous runtime: {services:?}"
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "the count must not contradict the failure listed beneath it:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("recorded_runtime="),
+            "naming the service as still on its recorded runtime is exactly the \
+             stale claim the restart attempt invalidated:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_restart_failed: 1"),
+            "the failure still has to be reported:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("add --restart-services --yes"),
+            "advising a flag the user just passed is advice that cannot help:\n{rendered}"
+        );
         Ok(())
     }
 
