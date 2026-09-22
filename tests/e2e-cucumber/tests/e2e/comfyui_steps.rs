@@ -510,8 +510,18 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
 
 #[when("the user installs ComfyUI under a real terminal")]
 async fn install_comfyui_under_pty(world: &mut E2eWorld) {
-    let session = TuiSession::spawn(world, &["comfyui", "install", "--runtime-id", RUNTIME_KEY])
-        .unwrap_or_else(|e| panic!("failed to spawn `rocm comfyui install` under a pty: {e}"));
+    let mut session =
+        TuiSession::spawn(world, &["comfyui", "install", "--runtime-id", RUNTIME_KEY])
+            .unwrap_or_else(|e| panic!("failed to spawn `rocm comfyui install` under a pty: {e}"));
+    // The completion report is only ~10 lines today, safely inside the default
+    // 24-row screen (0 lines of scrollback) — but nothing guards against that
+    // growing and silently turning `assert_comfyui_spinner_line_cleared`'s
+    // negative check into a tautology, the same trap `therock_steps.rs`'s
+    // identical check hit once its own (much longer) summary was added. Grow
+    // rows now, matching that fix, rather than waiting for it to recur here.
+    session
+        .grow_rows(60)
+        .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
     world.tui = Some(session);
 }
 
