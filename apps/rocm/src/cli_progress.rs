@@ -200,7 +200,10 @@ fn assemble_status_line(
     };
     let reserved = frame.width() + 1 + suffix.width();
     if reserved > max_width {
-        return truncate_to_width(&format!("{frame} {suffix}"), max_width);
+        // No literal space here: `suffix` (from `format_progress_suffix`)
+        // already carries its own leading space, matching the spacing the
+        // label_budget branch below produces between `frame` and `suffix`.
+        return truncate_to_width(&format!("{frame}{suffix}"), max_width);
     }
     let label_budget = max_width - reserved;
     format!("{frame} {}{suffix}", truncate_to_width(label, label_budget))
@@ -448,6 +451,22 @@ mod tests {
             "the assembled line must never exceed max_width, even when the \
              suffix alone doesn't fit: {line:?} (width {})",
             line.width()
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_fallback_does_not_double_the_space_before_suffix() {
+        // Regression test: `format_progress_suffix` already returns a string
+        // with its own leading space (e.g. " 883.1 MiB"). The narrow-terminal
+        // fallback used to insert another literal space before it, wasting a
+        // column of already-scarce width on a doubled-up gap.
+        let suffix = format_progress_suffix(883_147_264, None);
+        let max_width = 1 + suffix.width();
+        let line = assemble_status_line("⠋", "irrelevant label", Some(&suffix), max_width);
+        assert_eq!(
+            line,
+            format!("⠋{suffix}"),
+            "the suffix's own leading space must not be doubled up: {line:?}"
         );
     }
 

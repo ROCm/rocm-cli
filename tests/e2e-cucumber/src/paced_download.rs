@@ -118,6 +118,20 @@ pub fn build_gzip_tarball(build_dir: &Path, archive_name: &str, dir_name: &str) 
         .unwrap_or_else(|error| panic!("failed to read built archive {archive_name}: {error}"))
 }
 
+/// Whether `screen` shows a genuine in-transfer download progress frame: a
+/// percentage strictly between 0% and 100%.
+///
+/// `download_file_streaming_with_progress` reports once, unthrottled, before
+/// the transfer starts (an immediate "(0%)" frame) and once per chunk after —
+/// so a caller that only excluded "(100%)" would pass on that very first
+/// callback even if pacing never let a real in-transfer frame render.
+/// Requiring a percentage strictly between 0 and 100 proves an actual
+/// mid-transfer frame was observed. Shared by every paced-download PTY
+/// scenario so this heuristic can't drift between per-scenario copies.
+pub fn is_intermediate_download_progress_frame(screen: &str) -> bool {
+    screen.contains("%)") && !screen.contains("(0%)") && !screen.contains("(100%)")
+}
+
 /// Stream `contents` as an HTTP response with an explicit `Content-Length`,
 /// in `chunk_size`-byte pieces, sleeping `delay` before every chunk after the
 /// first.
