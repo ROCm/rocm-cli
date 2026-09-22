@@ -39,8 +39,11 @@ Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
 lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
 backend it installs is paired with the SDK actually in use, rather than
 whatever version Lemonade shipped pinned to. The attempt is skipped outright
-on native Windows, and left alone when the active SDK reports a nightly
-version rather than a plain `X.Y.Z` the alignment can match against.
+on native Windows, left alone when the active SDK reports a nightly version
+rather than a plain `X.Y.Z` the alignment can match against, and skipped on a
+host where Lemonade would select `llamacpp:vulkan` instead of `llamacpp:rocm`
+regardless (WSL2 being the documented case), since no rewrite can make an
+unsupported ROCm build resolve there.
 
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
 llama.cpp release and just repoints it at the active ROCm version — a

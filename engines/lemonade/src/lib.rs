@@ -1239,6 +1239,11 @@ fn prepare_llamacpp_backend_for_active_rocm(
             "Lemonade backend alignment is disabled by {LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV}; \
              using whatever backend_versions.json already pins."
         );
+        // Checked earliest, before even the cheap version/pin lookups below, let alone
+        // the vulkan-gate probe (a real `lemond` spawn) -- none of that work is worth
+        // doing when the opt-out means its result can't change what happens next.
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
     }
     // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
     // reports unresolved elsewhere), so attempting it on Windows can only burn up to
@@ -1279,8 +1284,18 @@ fn prepare_llamacpp_backend_for_active_rocm(
     // same guaranteed-futile case already short-circuited for Windows above: otherwise
     // every install on such a host burns two forced reinstalls plus a GitHub round-trip
     // discovering what this cheap query already knows.
-    let selected_backend = best_llamacpp_backend_for_host(manifest)?;
-    if selected_backend.as_deref() != Some(ROCM_BACKEND_NAME) {
+    let selected_backend = match best_llamacpp_backend_for_host(manifest) {
+        Ok(selected_backend) => selected_backend,
+        Err(error) => {
+            eprintln!(
+                "Warning: could not determine which llama.cpp backend this host would select; \
+                 skipping ROCm backend alignment: {error:#}"
+            );
+            install_best_llamacpp_backend(manifest, false)?;
+            return Ok(None);
+        }
+    };
+    if !should_attempt_llamacpp_backend_alignment(selected_backend.as_deref()) {
         install_best_llamacpp_backend(manifest, false)?;
         return Ok(None);
     }
@@ -1413,9 +1428,19 @@ fn align_llamacpp_backend_to_version(
             );
         }
     }
-    clear_rocm_llamacpp_backend_dirs(manifest);
-    fallback_install(manifest, true)?;
-    Ok(None)
+    let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(manifest);
+    match fallback_install(manifest, true) {
+        Ok(()) => {
+            resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, true);
+            Ok(None)
+        }
+        Err(error) => {
+            // Restore the pre-alignment backend before propagating: a failed
+            // fallback install must not leave the host with no ROCm backend at all.
+            resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, false);
+            Err(error)
+        }
+    }
 }
 
 /// Attempt one llama.cpp backend install aligned to `target_version`'s ROCm pairing
@@ -1438,7 +1463,7 @@ fn try_llamacpp_backend_alignment(
         force_reinstall,
         "every alignment attempt must force a reinstall; see the doc comment above"
     );
-    clear_rocm_llamacpp_backend_dirs(manifest);
+    let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(manifest);
     let install_result = install_best_llamacpp_backend(manifest, force_reinstall);
     // `ensure_best_llamacpp_backend` records the backend it attempted into
     // `manifest.backend_name` before the fallible install step runs, so this is accurate
@@ -1452,7 +1477,9 @@ fn try_llamacpp_backend_alignment(
             find_llama_server_binary_for_backend(manifest, &backend_name)
                 .is_some_and(|binary| rocm_backend_resolves(&binary, &process_env))
         });
-    if !llamacpp_backend_alignment_succeeded(&install_result, has_usable_binary) {
+    let succeeded = llamacpp_backend_alignment_succeeded(&install_result, has_usable_binary);
+    resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, succeeded);
+    if !succeeded {
         match install_result {
             Ok(()) => eprintln!(
                 "Warning: {attempt_label} installed for ROCm {target_version}, but its GPU \
@@ -1718,6 +1745,20 @@ fn install_best_llamacpp_backend(
     let _ = child.wait();
     manifest.backend_name = result?;
     Ok(())
+}
+
+/// Whether the vulkan-gate probe's result means alignment could possibly succeed --
+/// only when the host would select Lemonade's `rocm` backend by itself. Any other
+/// selection (including the probe itself failing to determine one) means every
+/// alignment tier is guaranteed to fail ([`try_llamacpp_backend_alignment`]'s
+/// `has_usable_binary` gate requires the `rocm` backend specifically), so callers
+/// should skip straight to an ordinary install instead of patching
+/// `backend_versions.json` and burning two forced reinstalls plus a GitHub round-trip
+/// discovering what this decision already knows. A pure function so this gate is
+/// unit-testable without spawning the real `lemond` process
+/// [`best_llamacpp_backend_for_host`] needs.
+fn should_attempt_llamacpp_backend_alignment(selected_backend: Option<&str>) -> bool {
+    selected_backend == Some(ROCM_BACKEND_NAME)
 }
 
 /// Which llama.cpp backend Lemonade would select on this host
@@ -3761,7 +3802,7 @@ fn find_llama_server_binary_for_backend(
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
     let binary = platform_binary_name("llama-server");
     let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &["rocm-stable", "rocm-nightly", "rocm"]
+        &ROCM_LLAMACPP_BACKEND_DIRS
     } else {
         &["vulkan"]
     };
@@ -3770,19 +3811,63 @@ fn find_llama_server_binary_for_backend(
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
-/// Remove every ROCm-family llama.cpp backend directory (`rocm-stable`, `rocm-nightly`,
-/// `rocm`) before a forced alignment reinstall. Lemonade's installer extracts each
+/// The ROCm-family llama.cpp backend directory names under `bin/llamacpp/`. Lemonade's
+/// installer extracts each build into its own build-numbered subdirectory rather than
+/// replacing one in place, so all three names can accumulate across attempts.
+const ROCM_LLAMACPP_BACKEND_DIRS: [&str; 3] = ["rocm-stable", "rocm-nightly", "rocm"];
+
+/// Suffix appended to a ROCm-family backend directory moved aside by
+/// [`set_aside_rocm_llamacpp_backend_dirs`].
+const BACKEND_DIR_ASIDE_SUFFIX: &str = ".pre-alignment";
+
+/// Move every existing ROCm-family llama.cpp backend directory aside (rather than
+/// deleting it outright) before a forced alignment reinstall, so a failed install can
+/// be recovered from via [`resolve_rocm_llamacpp_backend_dirs_aside`] instead of
+/// leaving the host with no ROCm backend at all. Lemonade's installer extracts each
 /// build into its own build-numbered subdirectory rather than replacing one in place,
 /// so a tier that installs a different `therock.version`/llama.cpp tag than a prior
 /// attempt (or the pinned default) can otherwise leave two builds side by side --
 /// after which [`find_binary_in`]'s directory-order fallback, used by both alignment
 /// verification and `rocm serve`, may resolve to whichever build a rejected tier
-/// installed instead of the one just verified. Best-effort: a failure here just risks
-/// the same stale-directory ambiguity this exists to prevent, not the reinstall itself.
-fn clear_rocm_llamacpp_backend_dirs(manifest: &LemonadeInstallManifest) {
+/// installed instead of the one just verified.
+///
+/// Returns the `(original, aside)` pairs actually moved; only those need resolving.
+fn set_aside_rocm_llamacpp_backend_dirs(
+    manifest: &LemonadeInstallManifest,
+) -> Vec<(PathBuf, PathBuf)> {
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
-    for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
-        let _ = fs::remove_dir_all(llamacpp_dir.join(backend));
+    ROCM_LLAMACPP_BACKEND_DIRS
+        .iter()
+        .filter_map(|backend| {
+            let original = llamacpp_dir.join(backend);
+            if !original.exists() {
+                return None;
+            }
+            let aside = llamacpp_dir.join(format!("{backend}{BACKEND_DIR_ASIDE_SUFFIX}"));
+            // A leftover aside path from an earlier, interrupted attempt must not
+            // block this rename.
+            let _ = fs::remove_dir_all(&aside);
+            fs::rename(&original, &aside)
+                .ok()
+                .map(|()| (original, aside))
+        })
+        .collect()
+}
+
+/// Resolve the aside directories from [`set_aside_rocm_llamacpp_backend_dirs`]: on
+/// success, discard them -- the fresh install replaced what they held. On failure,
+/// remove whatever the failed install left at `original` and move `aside` back into
+/// place, so the host is never left with zero ROCm backend directories. Best-effort:
+/// a failure here just risks the same stale-directory ambiguity the aside exists to
+/// prevent, not the reinstall itself.
+fn resolve_rocm_llamacpp_backend_dirs_aside(aside_dirs: &[(PathBuf, PathBuf)], success: bool) {
+    for (original, aside) in aside_dirs {
+        if success {
+            let _ = fs::remove_dir_all(aside);
+        } else {
+            let _ = fs::remove_dir_all(original);
+            let _ = fs::rename(aside, original);
+        }
     }
 }
 
@@ -5295,12 +5380,12 @@ mod tests {
     }
 
     #[test]
-    fn clear_rocm_llamacpp_backend_dirs_removes_every_rocm_family_dir_but_not_vulkan() {
+    fn set_aside_then_discard_removes_every_rocm_family_dir_but_not_vulkan() {
         // The bug this guards: Tier 2 installing a different llama.cpp tag than a
         // prior attempt left two build directories side by side, and the
         // directory-order lookup in `find_binary_in` could resolve to whichever one
         // a rejected tier installed instead of the one alignment just verified.
-        let dir = scratch_dir("clear-rocm-backend-dirs");
+        let dir = scratch_dir("aside-then-discard-rocm-backend-dirs");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
         let server = platform_binary_name("llama-server");
@@ -5311,17 +5396,67 @@ mod tests {
         }
         let manifest = test_manifest(runtime_dir);
 
-        clear_rocm_llamacpp_backend_dirs(&manifest);
+        let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(&manifest);
+        for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
+            assert!(
+                !llamacpp.join(backend).exists(),
+                "{backend} should have been moved aside"
+            );
+        }
+        resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, true);
 
         for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
             assert!(
                 !llamacpp.join(backend).exists(),
-                "{backend} should have been removed"
+                "{backend} should still be gone after a discard"
+            );
+            assert!(
+                !llamacpp
+                    .join(format!("{backend}{BACKEND_DIR_ASIDE_SUFFIX}"))
+                    .exists(),
+                "{backend}'s aside copy should have been discarded on success"
             );
         }
         assert!(
             llamacpp.join("vulkan").join(&server).is_file(),
             "vulkan is untouched by ROCm alignment and must survive"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_rocm_llamacpp_backend_dirs_aside_restores_on_failure() {
+        // The bug this guards: a failed final install (e.g. the revert branch's
+        // fallback_install erroring out) must never leave the host with zero ROCm
+        // backend directories -- the whole reason to set builds aside instead of
+        // deleting them outright.
+        let dir = scratch_dir("aside-restores-on-failure");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        let rocm_dir = llamacpp.join("rocm");
+        fs::create_dir_all(&rocm_dir).unwrap();
+        fs::write(rocm_dir.join(&server), b"original").unwrap();
+        let manifest = test_manifest(runtime_dir);
+
+        let aside_dirs = set_aside_rocm_llamacpp_backend_dirs(&manifest);
+        assert!(
+            !rocm_dir.exists(),
+            "the original must be moved aside before the install is attempted"
+        );
+        // Simulate a failed install leaving nothing behind at the original path.
+        resolve_rocm_llamacpp_backend_dirs_aside(&aside_dirs, false);
+
+        assert_eq!(
+            fs::read(rocm_dir.join(&server)).unwrap(),
+            b"original",
+            "the pre-existing backend must be restored after a failed install"
+        );
+        assert!(
+            !llamacpp
+                .join(format!("rocm{BACKEND_DIR_ASIDE_SUFFIX}"))
+                .exists(),
+            "the aside copy must be moved back, not left behind"
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -5342,6 +5477,19 @@ mod tests {
             &Err(anyhow!("boom")),
             false
         ));
+    }
+
+    #[test]
+    fn should_attempt_llamacpp_backend_alignment_requires_the_rocm_backend_specifically() {
+        // The bug this guards: alignment is guaranteed to fail on a host that falls
+        // back to vulkan (WSL2 being the documented case), so it must be skipped for
+        // any selection other than exactly `rocm` -- including the probe itself
+        // failing to determine one at all.
+        assert!(should_attempt_llamacpp_backend_alignment(Some(
+            ROCM_BACKEND_NAME
+        )));
+        assert!(!should_attempt_llamacpp_backend_alignment(Some("vulkan")));
+        assert!(!should_attempt_llamacpp_backend_alignment(None));
     }
 
     #[test]
@@ -5625,6 +5773,49 @@ mod tests {
             "never propagates the restore-write failure"
         );
         assert!(fallback_called, "the fallback reinstall still ran");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn align_revert_restores_the_backend_dir_when_the_fallback_install_fails() {
+        // The bug this guards: the revert branch used to delete the ROCm backend
+        // directories before the fallback install, with no recovery if that install
+        // then failed -- leaving the host with no ROCm backend at all. Both tiers
+        // fail here (forcing the revert), and the fallback install also fails, so
+        // the pre-existing backend must come back rather than staying deleted.
+        let dir = scratch_dir("align-revert-fallback-install-fails");
+        let path = dir.join("backend_versions.json");
+        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        let mut manifest = test_manifest(dir.clone());
+        let llamacpp = dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        let rocm_dir = llamacpp.join("rocm");
+        fs::create_dir_all(&rocm_dir).unwrap();
+        fs::write(rocm_dir.join(&server), b"pre-existing").unwrap();
+
+        let result = align_llamacpp_backend_to_version(
+            &mut manifest,
+            &path,
+            "10.0.0",
+            "7.13.0",
+            false,
+            |_manifest, _target, _force_reinstall, _label| false,
+            |_manifest, force_reinstall| {
+                assert!(force_reinstall);
+                bail!("network unavailable")
+            },
+            || Ok("b10952".to_owned()),
+        );
+
+        assert!(
+            result.is_err(),
+            "the fallback install's failure must be propagated"
+        );
+        assert_eq!(
+            fs::read(rocm_dir.join(&server)).unwrap(),
+            b"pre-existing",
+            "the pre-existing backend must be restored, not left deleted"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
