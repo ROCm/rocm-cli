@@ -41,7 +41,7 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
 /// Known-good `(ROCm SDK version, vLLM version, ABI tag)` combinations for
 /// `uv pip install vllm`, keyed by the ROCm SDK version recorded in the
-/// runtime manifest (see [`recorded_rocm_sdk_version`]).
+/// runtime manifest (see [`rocm_sdk_version_from_manifest`]).
 ///
 /// Add a row only once wheels.vllm.ai actually publishes a build for that
 /// ROCm SDK version — see `docs/vllm.md` for AMD's current ROCm X guidance
@@ -98,7 +98,31 @@ const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/ro
 fn vllm_rocm_discover_build(rocm_sdk_version: &str) -> Option<&'static VllmRocmDiscoverBuild> {
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
-        .find(|build| build.rocm_sdk_version == rocm_sdk_version)
+        .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
+}
+
+/// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
+/// is the same release as `table_key` (a literal key in [`VLLM_ROCM_BUILD_TABLE`]
+/// or [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]), ignoring any dev/pre-release suffix.
+///
+/// Real probes routinely carry a suffix the table keys never do (e.g.
+/// `7.13.0a20260423`), and that suffix is not valid semver pre-release syntax
+/// (no leading `-`), so comparing by exact string, or even by a semver parse,
+/// would reject a matching release. Comparing by leading `major.minor.patch`
+/// instead matches the release the table row actually covers.
+fn rocm_sdk_version_matches(recorded: &str, table_key: &str) -> bool {
+    fn release_triple(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor, patch.parse().ok()?))
+    }
+    release_triple(recorded).is_some_and(|version| Some(version) == release_triple(table_key))
 }
 
 /// How [`install_vllm_with_uv`] should install vLLM for a given target.
@@ -258,6 +282,12 @@ struct ServiceFiles {
 struct ManagedRuntimePython {
     runtime_id: String,
     python_executable: PathBuf,
+    /// ROCm SDK version recorded for the specific manifest this Python came
+    /// from. `runtime_id` is the GPU-family identifier shared by every
+    /// installed version, so it cannot be used to look this back up: re-deriving
+    /// it from `runtime_id` picks whichever version was installed most recently,
+    /// not the one this Python executable actually belongs to.
+    rocm_sdk_version: Option<String>,
 }
 
 pub fn run_cli() -> Result<()> {
@@ -537,7 +567,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         discover_pins = install_vllm_with_uv(
             &managed.python_executable,
             request.reinstall,
-            recorded_rocm_sdk_version(&managed.runtime_id).as_deref(),
+            managed.rocm_sdk_version.as_deref(),
         )?;
         resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
@@ -604,6 +634,7 @@ fn assessed_python_for_repair(runtime: &VllmRuntime) -> Option<ManagedRuntimePyt
     Some(ManagedRuntimePython {
         runtime_id: runtime.runtime_id.clone(),
         python_executable: runtime.python_executable.clone()?,
+        rocm_sdk_version: runtime.rocm_sdk_version.clone(),
     })
 }
 
@@ -1402,6 +1433,12 @@ fn install_vllm_with_uv(
 /// ` + {pkg}==<version>` line, which is parsed back out by
 /// [`dry_run_resolved_pin`]. A prefix with no compatible build published
 /// surfaces as a resolver failure (never fall back to unpinned PyPI).
+///
+/// `--reinstall` is always passed here (independent of the caller's own
+/// `reinstall` request, which governs the *real* install below): without it,
+/// a dry-run against a package already present in `python` prints `Would
+/// make no changes` with no ` + {pkg}==<version>` line at all, so a
+/// discovery pin could never be resolved for an environment being repaired.
 fn discover_pinned_requirement(
     uv: &Path,
     paths: &AppPaths,
@@ -1412,7 +1449,14 @@ fn discover_pinned_requirement(
 ) -> Result<String> {
     let requirement_prefix = format!("{pkg}=={version_prefix}.*");
     let output = ProcessCommand::new(uv)
-        .args(["pip", "install", "--dry-run", "--no-deps", "--index-url"])
+        .args([
+            "pip",
+            "install",
+            "--dry-run",
+            "--reinstall",
+            "--no-deps",
+            "--index-url",
+        ])
         .arg(index_url)
         .args(["--prerelease", "allow", "--python"])
         .arg(python)
@@ -1420,11 +1464,16 @@ fn discover_pinned_requirement(
         .envs(uv_command_env(paths))
         .output()
         .with_context(|| format!("failed to launch uv pip install --dry-run for {pkg}"))?;
+    // `uv pip install --dry-run` writes its whole human-readable resolution
+    // report — including the ` + {pkg}==<version>` line this parses — to
+    // stderr; stdout is empty on both success and failure. Check both so a
+    // future `uv` that moves the report back to stdout keeps working too.
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let detail = if !stderr.is_empty() {
-            stderr
+        let stderr_trimmed = stderr.trim();
+        let detail = if !stderr_trimmed.is_empty() {
+            stderr_trimmed.to_owned()
         } else if !stdout.trim().is_empty() {
             stdout.trim().to_owned()
         } else {
@@ -1432,13 +1481,19 @@ fn discover_pinned_requirement(
         };
         bail!("`uv pip install --dry-run {requirement_prefix}` from {index_url} failed: {detail}");
     }
-    dry_run_resolved_pin(&stdout, pkg).ok_or_else(|| {
-        anyhow!(
-            "`uv pip install --dry-run {requirement_prefix}` from {index_url} did not report a \
-             resolved version for {pkg}: {}",
-            stdout.trim()
-        )
-    })
+    dry_run_resolved_pin(&stderr, pkg)
+        .or_else(|| dry_run_resolved_pin(&stdout, pkg))
+        .ok_or_else(|| {
+            let reported = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            anyhow!(
+                "`uv pip install --dry-run {requirement_prefix}` from {index_url} did not report a \
+                 resolved version for {pkg}: {reported}"
+            )
+        })
 }
 
 /// Parses the ` + {pkg}==<version>` line `uv pip install --dry-run` prints
@@ -1563,6 +1618,7 @@ fn resolve_managed_runtime_python(
     Ok(Some(ManagedRuntimePython {
         runtime_id: candidate.runtime_id,
         python_executable: candidate.python_executable,
+        rocm_sdk_version: candidate.rocm_sdk_version,
     }))
 }
 
@@ -1640,19 +1696,6 @@ fn sdk_torch_build_from_manifest(manifest: &TheRockRuntimeManifest) -> Option<St
         .and_then(|probe| probe.rocm_sdk_version.clone())
         .or_else(|| manifest.version.clone())?;
     (!version.trim().is_empty()).then(|| format!("rocm{version}"))
-}
-
-/// The ROCm SDK version installed into this runtime, as its manifest records it.
-///
-/// Read from the manifest, never from the environment, for the same reason as
-/// [`recorded_sdk_torch_build`]. This is what [`resolve_vllm_install_target`] looks
-/// up in [`VLLM_ROCM_BUILD_TABLE`] to pick a compatible vLLM build.
-fn recorded_rocm_sdk_version(runtime_id: &str) -> Option<String> {
-    let manifest = load_runtime_manifests(Some(runtime_id))
-        .ok()?
-        .into_iter()
-        .next()?;
-    rocm_sdk_version_from_manifest(&manifest)
 }
 
 /// The bare ROCm SDK version a manifest records (e.g. `7.2.3`), unlike
@@ -2192,7 +2235,7 @@ fn resolve_vllm_install_target(
 
     let build = VLLM_ROCM_BUILD_TABLE
         .iter()
-        .find(|build| build.rocm_sdk_version == rocm_sdk_version)
+        .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
         .ok_or_else(|| {
             let known = VLLM_ROCM_BUILD_TABLE
                 .iter()
@@ -4167,6 +4210,15 @@ mod tests {
     fn vllm_rocm_discover_build_looks_up_known_and_unknown_versions() {
         assert!(vllm_rocm_discover_build("10.0.0").is_some());
         assert!(vllm_rocm_discover_build("999.0.0").is_none());
+    }
+
+    #[test]
+    fn rocm_sdk_version_matches_ignores_dev_suffixes_and_rejects_other_releases() {
+        assert!(rocm_sdk_version_matches("10.0.0", "10.0.0"));
+        assert!(rocm_sdk_version_matches("7.13.0a20260423", "7.13.0"));
+        assert!(rocm_sdk_version_matches("7.2.3.dev0+abc", "7.2.3"));
+        assert!(!rocm_sdk_version_matches("7.14.1", "7.2.3"));
+        assert!(!rocm_sdk_version_matches("garbage", "7.2.3"));
     }
 
     #[test]
