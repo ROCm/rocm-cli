@@ -7717,10 +7717,19 @@ impl ManagedServiceRecord {
         {
             endpoint_url.clone_into(&mut self.endpoint_url);
         }
-        if let Some(runtime_id) = state
-            .get("runtime_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+        // `requested_runtime_id` is the selector the launch actually pinned —
+        // an exact runtime key. `runtime_id` is only what the engine resolved
+        // that to, which for a TheRock runtime is the manifest's family id
+        // (`therock-release:gfx120X-all`), shared by every installed version of
+        // that family. Adopting the resolved form would throw away the version
+        // the service is really on, and the record is what a restart re-pins
+        // and what runtime activation compares against. Prefer the requested
+        // value, falling back to the resolved one for engines that record only
+        // that.
+        if let Some(runtime_id) = ["requested_runtime_id", "runtime_id"]
+            .into_iter()
+            .filter_map(|key| state.get(key).and_then(serde_json::Value::as_str))
+            .find(|value| !value.trim().is_empty())
         {
             self.runtime_id = Some(runtime_id.to_owned());
         }
@@ -12651,6 +12660,99 @@ last_installed_runtime_id = "therock-release"
         assert!(
             leftovers.is_empty(),
             "a completed save must leave no temp file in the config folder: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_keeps_the_exact_runtime_key_the_launch_pinned() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-pin");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-pin",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            Some("release-pip-gfx120x-all-7-13-0".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // What a vLLM server writes: `runtime_id` is the manifest's family id,
+        // shared by every installed version of that family, while
+        // `requested_runtime_id` is the exact key the launch pinned.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "therock-release:gfx120X-all",
+                "requested_runtime_id": "release-pip-gfx120x-all-7-13-0",
+            }))?,
+        )?;
+
+        let refreshed = record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(refreshed);
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("release-pip-gfx120x-all-7-13-0"),
+            "adopting the resolved family id would throw away which installed \
+             version the service is actually on — the record is what a restart \
+             re-pins and what runtime activation compares against"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_falls_back_to_the_resolved_runtime_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-fallback");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-fallback",
+            "lemonade",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // An engine that records only the resolved runtime must still be read:
+        // preferring `requested_runtime_id` must not mean ignoring `runtime_id`.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "lemonade-embeddable-8.1.11",
+                "requested_runtime_id": serde_json::Value::Null,
+            }))?,
+        )?;
+
+        record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("lemonade-embeddable-8.1.11")
         );
         Ok(())
     }
