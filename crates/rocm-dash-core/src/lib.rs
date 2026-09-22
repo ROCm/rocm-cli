@@ -7,7 +7,9 @@
 //! Pure types, traits, schemas, and the reducer for rocm-dash.
 //! No rendering deps. No async deps at the type boundary.
 //!
-//! See `../wiki/concepts/tea-reducer-pattern.md` for the architectural pattern.
+//! The reducer is Elm-style: `state::State::apply` folds a `StateEvent` into
+//! `State` and returns the `SideEffect`s the async layer performs, so every
+//! state transition stays pure and testable.
 
 pub mod bench_rollup;
 pub mod bench_schema;

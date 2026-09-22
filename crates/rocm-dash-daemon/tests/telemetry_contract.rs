@@ -513,8 +513,8 @@ async fn counter_reset_invalidates_baseline_immediately() {
 /// event on the next discovery tick and the instance is absent from subsequent
 /// Snapshots.
 ///
-/// GREEN: runner.rs:446-460 computes `known_services.difference(&disc.seen)`
-/// and fires `InstanceGone` for each absent id.
+/// GREEN: `runner.rs` computes `known_services.difference(&disc.seen)` and
+/// fires `InstanceGone` for each absent id.
 #[tokio::test]
 async fn service_removal_fires_instance_gone() {
     let tmp = tempfile::TempDir::new().unwrap();
