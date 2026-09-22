@@ -268,10 +268,13 @@ Expected result:
 - A server that fails to restart is named under
   `services_restart_failed: <n>`, its record is put back on the runtime it last
   ran on, and the command exits with an error instead of reporting success. The
-  error names the servers the attempt stopped separately from the ones it never
-  reached: a stopped one shows as stopped in `rocm services` and drops out of
-  `services_on_previous_runtime`, while one whose restart was refused before the
-  stop keeps serving and stays counted there. Verify whichever the error names.
+  error names the servers read back as stopped separately from the ones read
+  back as still live: a stopped one shows as stopped in `rocm services` and
+  drops out of `services_on_previous_runtime`, while a live one keeps serving
+  and stays counted there. These steps can only produce the stopped branch —
+  the live branch needs a running server bound to a public host whose endpoint
+  key is gone, which nothing here creates, and it is covered by the unit tests.
+  Verify the stopped branch against `rocm services`.
 
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:

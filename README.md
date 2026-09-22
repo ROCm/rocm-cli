@@ -409,11 +409,11 @@ it requires `--yes` and never prompts, the same as
 `rocm services restart <service-id> --yes`. Servers are handled one at a time
 and a failure does not stop the rest: every failure is named in the summary, its
 record is put back on the runtime it last ran on, and the command exits with an
-error. The restart stops a server before respawning it, so a failure normally
-leaves it down; a restart refused before anything was stopped instead leaves it
-serving, and it stays counted under `services_on_previous_runtime`. The error
-says which is which. Start a stopped server again with
-`rocm services restart <service-id> --yes` once the cause is fixed.
+error. After a failure the server is read back: one that is still live stays
+counted under `services_on_previous_runtime`, and one that is not is reported
+as stopped by the attempt. The error says which is which. Start a stopped
+server again with `rocm services restart <service-id> --yes` once the cause is
+fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and

@@ -8449,8 +8449,13 @@ fn restart_stale_runtime_services(
 /// before it stops anything, and `restart_service_onto_runtime` can fail earlier
 /// still while rewriting the record. `load_managed_service` refreshes the record
 /// against the real processes, so this is read from the world rather than
-/// inferred from how far the code got. A record that cannot be read back cannot
-/// be claimed to be serving, so it counts as neither.
+/// inferred from how far the code got. A record that cannot be read back
+/// returns `None` here, and the report is a bi-state rather than a tri-state:
+/// [`bail_on_failed_service_restarts`] derives "stopped" as the complement of
+/// "still serving", so such a service is named as stopped by the attempt. That
+/// is acceptable because reaching it takes a double fault — the record
+/// vanishing or corrupting between the reconciliation that read it and this
+/// retry — and the restart failure itself is named in the error either way.
 fn service_still_serving(paths: &AppPaths, service_id: &str) -> Option<ManagedServiceRecord> {
     load_managed_service(paths, service_id)
         .ok()
@@ -8477,8 +8482,11 @@ fn service_still_serving(paths: &AppPaths, service_id: &str) -> Option<ManagedSe
 /// state on the next launch, so nothing is lost by dropping it here.
 ///
 /// On failure the record is put back on the runtime it last actually ran on.
-/// The service itself is NOT left running: `restart_internal_managed_service`
-/// stops it before respawning it, so a failure leaves it stopped.
+/// What a failure leaves behind is not decided here: the attempt may be refused
+/// before anything is stopped (leaving the service up on the runtime it
+/// recorded) or fail after the stop (leaving it down). That is why the caller
+/// reads the outcome back with [`service_still_serving`] instead of inferring
+/// it from how far the attempt got.
 fn restart_service_onto_runtime(
     paths: &AppPaths,
     service_id: &str,
@@ -32412,6 +32420,12 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(services.failed.len(), 2, "{services:?}");
+        assert!(
+            services.restarted.is_empty(),
+            "a server that never came back up on the new runtime must not be \
+             counted as restarted; `services_restarted` is what the report \
+             offers as the good news: {services:?}"
+        );
         assert_eq!(
             services.stale,
             vec![stale_entry("svc-public")],
@@ -32452,7 +32466,10 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn a_failed_restart_report_says_the_server_was_stopped() {
+    fn a_failed_restart_with_nothing_left_serving_is_reported_as_stopped() {
+        // No entry survives in `stale`, i.e. the failure left no server read
+        // back as live. That input — not a failed restart in general — is what
+        // makes "stopped by the attempt" the right thing to say here.
         let services = RuntimeServiceReconciliation {
             failed: vec![FailedServiceRestart {
                 service_id: "svc-a".to_owned(),
@@ -32468,9 +32485,15 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("svc-a"), "{error}");
         assert!(
             error.contains("stopped by the attempt"),
-            "the restart stops the service before respawning it, so a failure \
-             leaves it down — a report that says it keeps serving sends the \
+            "nothing was read back as still serving, so this failure is one the \
+             attempt left down — a report that says it keeps serving sends the \
              user away from an outage:\n{error}"
+        );
+        assert!(
+            !error.contains("still serving"),
+            "the still-serving clause describes servers read back as live; \
+             naming one when none was read back would count the same failure \
+             twice and point the user at a server that is not there:\n{error}"
         );
         assert!(
             error.contains("rocm services restart svc-a --yes")
