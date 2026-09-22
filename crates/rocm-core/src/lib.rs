@@ -6150,24 +6150,35 @@ impl RocmCliConfig {
     /// A bare `fs::write` truncates the existing config first, so a failure
     /// partway through (full disk, crash, killed process) leaves a truncated or
     /// empty `config.json` — and `load` hard-errors on a file it cannot parse,
-    /// which loses every setting the user has. The rename is atomic on both
-    /// supported platforms, so a reader sees either the old config or the new
-    /// one, never a half-written one. Mirrors the active-runtime marker write.
+    /// which loses every setting the user has. A rename over the destination
+    /// replaces it in one step on both supported platforms, so a concurrent
+    /// reader sees either the old config or the new one, never a half-written
+    /// one. (That is replacement atomicity, not durability: the bytes are not
+    /// fsynced before the rename, so a power loss can still surface the new
+    /// name with unflushed contents.) Mirrors the active-runtime marker write.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
-        let tmp_path = path.with_extension(format!("json.tmp-{}", unix_time_millis()));
+        // Both halves of the suffix matter: the timestamp keeps successive saves
+        // apart, and the pid keeps two `rocm` processes saving in the same
+        // millisecond from writing each other's temp file and losing one of the
+        // two updates.
+        let tmp_path = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            unix_time_millis(),
+            std::process::id()
+        ));
         fs::write(&tmp_path, bytes)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        // Windows `rename` fails when the destination exists; removing it first
-        // keeps the temp file as the only copy for an instant, which is still
-        // strictly better than truncating the real file and writing into it.
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
+        // The destination is NOT removed first: `fs::rename` replaces an
+        // existing file on both supported platforms (it is `MoveFileEx` with
+        // `MOVEFILE_REPLACE_EXISTING` on Windows), and removing it would open a
+        // window with no `config.json` at all — which `load` reads as "no
+        // config" and silently answers with defaults, losing every setting
+        // without so much as an error.
         fs::rename(&tmp_path, &path)
             .with_context(|| {
                 format!(
