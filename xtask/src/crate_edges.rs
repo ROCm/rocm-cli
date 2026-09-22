@@ -19,8 +19,12 @@
 //! entirely in the **allowlist**: every first-party normal/build edge must be
 //! declared in [`ALLOWLIST`], so *any* new first-party coupling — not just
 //! the three named invariants — requires a conscious, reviewed addition to
-//! this file. This file is the only written record of these rules; keep this
-//! comment and [`ALLOWLIST`] in sync with reality.
+//! this file. The check is bidirectional: an edge missing from
+//! [`ALLOWLIST`] fails, and so does an [`ALLOWLIST`] entry with no
+//! matching edge — a removed dependency must have its entry removed too,
+//! or it could be silently reintroduced later without the review this
+//! guard exists to force. This file is the only written record of these
+//! rules; keep this comment and [`ALLOWLIST`] in sync with reality.
 //!
 //! Dev-dependencies are exempt: Cargo permits dev-dependency cycles (e.g.
 //! `rocm-dash-daemon` dev-depends on `rocm-core` for a test-only contract
@@ -178,34 +182,56 @@ fn invariant_for(source: &str, target: &str) -> String {
     }
 }
 
-/// Check a set of edges against [`ALLOWLIST`], returning every violation
-/// found. Dev-dependency edges are always skipped.
+/// Check a set of edges against [`ALLOWLIST`] in both directions, returning
+/// every violation found. Dev-dependency edges are always skipped.
+///
+/// Bidirectional: an enforced edge with no matching [`ALLOWLIST`] entry is a
+/// new undeclared edge; an [`ALLOWLIST`] entry with no matching enforced edge
+/// is stale (the dependency was removed but its allowlist entry wasn't) —
+/// left unchecked, that entry would let the same edge reappear later without
+/// the conscious review this guard exists to force.
 fn check(edges: &[(String, String, Kind)]) -> Vec<String> {
-    edges
+    let enforced: Vec<(&str, &str)> = edges
         .iter()
         .filter(|(_, _, kind)| *kind == Kind::Enforced)
-        .filter(|(source, target, _)| {
-            !ALLOWLIST
-                .iter()
-                .any(|(a, b)| *a == source.as_str() && *b == target.as_str())
-        })
-        .map(|(source, target, _)| {
+        .map(|(source, target, _)| (source.as_str(), target.as_str()))
+        .collect();
+
+    let undeclared = enforced
+        .iter()
+        .filter(|(source, target)| !ALLOWLIST.iter().any(|(a, b)| a == source && b == target));
+    let stale = ALLOWLIST.iter().filter(|(a, b)| {
+        !enforced
+            .iter()
+            .any(|(source, target)| source == a && target == b)
+    });
+
+    undeclared
+        .map(|(source, target)| {
             format!(
                 "first-party dependency edge `{source} -> {target}` violates a layering rule: {}",
                 invariant_for(source, target)
             )
         })
+        .chain(stale.map(|(source, target)| {
+            format!(
+                "ALLOWLIST entry `{source} -> {target}` is stale: no such first-party dependency \
+                 exists anymore; remove it from ALLOWLIST in xtask/src/crate_edges.rs so a future \
+                 re-addition requires a conscious review"
+            )
+        }))
         .collect()
 }
 
-/// Fetch the current first-party crate dependency graph and fail if any
-/// normal/build edge is not in [`ALLOWLIST`].
+/// Fetch the current first-party crate dependency graph and fail if it
+/// doesn't exactly match [`ALLOWLIST`] — either a new normal/build edge
+/// outside it, or a stale entry with no matching edge.
 pub fn run() -> Result<()> {
     let edges = load_edges()?;
     let violations = check(&edges);
     if !violations.is_empty() {
         bail!(
-            "first-party crate dependency graph has {} disallowed edge(s):\n{}",
+            "first-party crate dependency graph has {} allowlist violation(s):\n{}",
             violations.len(),
             violations.join("\n")
         );
@@ -276,6 +302,19 @@ mod tests {
         let violations = check(&edges);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("not in the declared allowlist"));
+    }
+
+    #[test]
+    fn stale_allowlist_entry_fails() {
+        // A dependency that's been removed from the real graph must have its
+        // ALLOWLIST entry removed too — otherwise it could be silently
+        // reintroduced later without the review this guard exists to force.
+        let mut edges = allowlisted_edges();
+        let removed = edges.remove(0);
+        let violations = check(&edges);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains(&format!("{} -> {}", removed.0, removed.1)));
+        assert!(violations[0].contains("is stale"));
     }
 
     #[test]
