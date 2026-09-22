@@ -1271,6 +1271,20 @@ fn prepare_llamacpp_backend_for_active_rocm(
         return Ok(None);
     }
 
+    // Verification below requires the backend Lemonade selects to be `rocm`
+    // specifically ([`try_llamacpp_backend_alignment`]'s `has_usable_binary` gate) --
+    // it falls back to `vulkan` on hosts where Lemonade's ROCm build is unsupported
+    // (WSL2 being the documented case), and no tier can ever pass there. Check which
+    // backend this host actually gets *before* patching `backend_versions.json`, the
+    // same guaranteed-futile case already short-circuited for Windows above: otherwise
+    // every install on such a host burns two forced reinstalls plus a GitHub round-trip
+    // discovering what this cheap query already knows.
+    let selected_backend = best_llamacpp_backend_for_host(manifest)?;
+    if selected_backend.as_deref() != Some(ROCM_BACKEND_NAME) {
+        install_best_llamacpp_backend(manifest, false)?;
+        return Ok(None);
+    }
+
     align_llamacpp_backend_to_version(
         manifest,
         &backend_versions_path,
@@ -1399,6 +1413,7 @@ fn align_llamacpp_backend_to_version(
             );
         }
     }
+    clear_rocm_llamacpp_backend_dirs(manifest);
     fallback_install(manifest, true)?;
     Ok(None)
 }
@@ -1423,6 +1438,7 @@ fn try_llamacpp_backend_alignment(
         force_reinstall,
         "every alignment attempt must force a reinstall; see the doc comment above"
     );
+    clear_rocm_llamacpp_backend_dirs(manifest);
     let install_result = install_best_llamacpp_backend(manifest, force_reinstall);
     // `ensure_best_llamacpp_backend` records the backend it attempted into
     // `manifest.backend_name` before the fallible install step runs, so this is accurate
@@ -1702,6 +1718,35 @@ fn install_best_llamacpp_backend(
     let _ = child.wait();
     manifest.backend_name = result?;
     Ok(())
+}
+
+/// Which llama.cpp backend Lemonade would select on this host
+/// (`LLAMACPP_BACKEND_PRIORITY`), without installing anything -- mirrors
+/// [`install_best_llamacpp_backend`]'s spawn/query steps but stops short of the
+/// install, so the ROCm backend alignment dance can check whether it is even
+/// reachable before patching `backend_versions.json` or forcing a single reinstall.
+fn best_llamacpp_backend_for_host(manifest: &LemonadeInstallManifest) -> Result<Option<String>> {
+    let port = free_local_port()?;
+    let log_path_buf = manifest.runtime_dir.join("install-lemond.log");
+    let log_path = Some(log_path_buf.as_path());
+    let process_env = lemonade_process_environment()?;
+    let mut child = spawn_lemond(manifest, DEFAULT_HOST, port, log_path, &process_env)?;
+    let result = (|| -> Result<Option<String>> {
+        wait_for_lemonade_cli_status(
+            manifest,
+            DEFAULT_HOST,
+            port,
+            Duration::from_secs(30),
+            log_path,
+            &process_env,
+        )?;
+        let listing = run_lemonade_backends_list(manifest, &process_env)?;
+        let backends = parse_llamacpp_backend_statuses(&listing);
+        Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
+    })();
+    let _ = terminate_pid(child.id(), true);
+    let _ = child.wait();
+    result
 }
 
 /// Ask Lemonade which llama.cpp backends it supports on this GPU, choose the best
@@ -3725,6 +3770,22 @@ fn find_llama_server_binary_for_backend(
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
+/// Remove every ROCm-family llama.cpp backend directory (`rocm-stable`, `rocm-nightly`,
+/// `rocm`) before a forced alignment reinstall. Lemonade's installer extracts each
+/// build into its own build-numbered subdirectory rather than replacing one in place,
+/// so a tier that installs a different `therock.version`/llama.cpp tag than a prior
+/// attempt (or the pinned default) can otherwise leave two builds side by side --
+/// after which [`find_binary_in`]'s directory-order fallback, used by both alignment
+/// verification and `rocm serve`, may resolve to whichever build a rejected tier
+/// installed instead of the one just verified. Best-effort: a failure here just risks
+/// the same stale-directory ambiguity this exists to prevent, not the reinstall itself.
+fn clear_rocm_llamacpp_backend_dirs(manifest: &LemonadeInstallManifest) {
+    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
+    for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
+        let _ = fs::remove_dir_all(llamacpp_dir.join(backend));
+    }
+}
+
 /// Look for `binary` directly in `dir`, then one level down in each subdirectory.
 fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     let direct = dir.join(binary);
@@ -5229,6 +5290,38 @@ mod tests {
         assert_eq!(
             find_llama_server_binary_for_backend(&manifest, "vulkan"),
             Some(vulkan_dir.join(&server))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_rocm_llamacpp_backend_dirs_removes_every_rocm_family_dir_but_not_vulkan() {
+        // The bug this guards: Tier 2 installing a different llama.cpp tag than a
+        // prior attempt left two build directories side by side, and the
+        // directory-order lookup in `find_binary_in` could resolve to whichever one
+        // a rejected tier installed instead of the one alignment just verified.
+        let dir = scratch_dir("clear-rocm-backend-dirs");
+        let runtime_dir = dir.join("runtime");
+        let llamacpp = runtime_dir.join("bin").join("llamacpp");
+        let server = platform_binary_name("llama-server");
+        for backend in ["rocm-stable", "rocm-nightly", "rocm", "vulkan"] {
+            let backend_dir = llamacpp.join(backend);
+            fs::create_dir_all(&backend_dir).unwrap();
+            fs::write(backend_dir.join(&server), b"x").unwrap();
+        }
+        let manifest = test_manifest(runtime_dir);
+
+        clear_rocm_llamacpp_backend_dirs(&manifest);
+
+        for backend in ["rocm-stable", "rocm-nightly", "rocm"] {
+            assert!(
+                !llamacpp.join(backend).exists(),
+                "{backend} should have been removed"
+            );
+        }
+        assert!(
+            llamacpp.join("vulkan").join(&server).is_file(),
+            "vulkan is untouched by ROCm alignment and must survive"
         );
         fs::remove_dir_all(&dir).ok();
     }
