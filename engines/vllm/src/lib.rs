@@ -2198,8 +2198,9 @@ fn vllm_install_target(rocm_sdk_version: Option<&str>) -> Result<VllmInstallTarg
 ///
 /// Without an override, `rocm_sdk_version` (the ROCm SDK version recorded in
 /// the target runtime's manifest) is looked up in [`VLLM_ROCM_BUILD_TABLE`].
-/// A missing or unrecognized version fails closed rather than falling back to
-/// an unpinned install.
+/// A version with no row falls back to the table's first (default) row,
+/// matching the single unconditional pin `rocm-cli` used before per-version
+/// rows existed, rather than leaving an unrecognized version uninstallable.
 fn resolve_vllm_install_target(
     index_override: Option<String>,
     rocm_sdk_version: Option<&str>,
@@ -2236,18 +2237,8 @@ fn resolve_vllm_install_target(
     let build = VLLM_ROCM_BUILD_TABLE
         .iter()
         .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
-        .ok_or_else(|| {
-            let known = VLLM_ROCM_BUILD_TABLE
-                .iter()
-                .map(|build| build.rocm_sdk_version)
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow!(
-                "no known vLLM build for ROCm SDK version `{rocm_sdk_version}` (known versions: \
-                 {known}). Build vLLM from source against this ROCm SDK, or set \
-                 ROCM_CLI_VLLM_ROCM_INDEX_URL to a published release index that supports it."
-            )
-        })?;
+        .or_else(|| VLLM_ROCM_BUILD_TABLE.first())
+        .ok_or_else(|| anyhow!("VLLM_ROCM_BUILD_TABLE has no default row"))?;
 
     Ok(VllmInstallTarget {
         index_url: format!(
@@ -3853,11 +3844,19 @@ mod tests {
     }
 
     #[test]
-    fn vllm_install_target_fails_for_an_unknown_rocm_sdk_version() {
-        let error = install_target(None, Some("999.0.0"))
-            .expect_err("no build is known for this version")
-            .to_string();
-        assert!(error.contains("999.0.0"), "{error}");
+    fn vllm_install_target_falls_back_to_the_default_row_for_an_unknown_rocm_sdk_version() {
+        let default_build = VLLM_ROCM_BUILD_TABLE
+            .first()
+            .expect("build table has at least one row for this test to check");
+
+        for unknown_version in ["999.0.0", "7.13.0a20260326", "10.1.0a20260822"] {
+            let target = install_target(None, Some(unknown_version))
+                .expect("an unrecognized version still resolves to the default pin");
+            assert_eq!(
+                target.requirement,
+                format!("vllm=={}+{}", default_build.vllm_version, default_build.abi)
+            );
+        }
     }
 
     #[test]
