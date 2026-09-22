@@ -65,3 +65,29 @@ Feature: Runtime lifecycle state machine
     Then the listing explains the active and rollback markers
     And the first runtime is marked active
     And the second runtime is marked as the rollback target
+
+  # Activating used to close its report with one fixed sentence — "running
+  # services keep their recorded runtime until they are restarted" — printed
+  # whether or not a single local server existed, so it could neither name a
+  # server that was really left behind nor stay quiet when none was. The report
+  # is now derived from the on-disk service records: the same planted server is
+  # silent (`services_on_previous_runtime: 0`) while the runtime it recorded is
+  # the one being activated, and is named once activating moves past it.
+  @id:runtime-lifecycle-activate-names-services-left-behind
+  Scenario: runtime-lifecycle-08 - Activating names the local servers left on the previous runtime
+    Given two registered runtimes and a local server recorded on the first
+    When the user activates the first runtime
+    Then the activation reports no local server left on a previous runtime
+    When the user activates the second runtime
+    Then the activation names the local server left on the first runtime
+    And the activation does not print the old fixed note about running services
+
+  # `--restart-services` stops and respawns live local servers, so it needs the
+  # same explicit approval every other service mutation takes — and the refusal
+  # has to land before the switch, or the user gets the new runtime without the
+  # restarts they asked for in the same breath.
+  @id:runtime-lifecycle-activate-restart-services-requires-yes
+  Scenario: runtime-lifecycle-09 - Activating with --restart-services is refused without --yes
+    Given two registered runtimes with the second active after the first
+    When the user tries to activate the first runtime restarting services without confirming
+    Then the CLI refuses the restart and the second runtime stays active
