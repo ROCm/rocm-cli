@@ -6144,15 +6144,41 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Persist the config atomically: write a sibling temp file, then rename it
+    /// over the real one.
+    ///
+    /// A bare `fs::write` truncates the existing config first, so a failure
+    /// partway through (full disk, crash, killed process) leaves a truncated or
+    /// empty `config.json` — and `load` hard-errors on a file it cannot parse,
+    /// which loses every setting the user has. The rename is atomic on both
+    /// supported platforms, so a reader sees either the old config or the new
+    /// one, never a half-written one. Mirrors the active-runtime marker write.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes =
+            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
+        let tmp_path = path.with_extension(format!("json.tmp-{}", unix_time_millis()));
+        fs::write(&tmp_path, bytes)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        // Windows `rename` fails when the destination exists; removing it first
+        // keeps the temp file as the only copy for an instant, which is still
+        // strictly better than truncating the real file and writing into it.
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        fs::rename(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to move rocm-cli config {} into {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp_path);
+            })?;
         Ok(())
     }
 
@@ -12596,6 +12622,36 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(migrated, None);
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn saving_the_config_replaces_it_without_leaving_a_temp_file_behind() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-atomic");
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        // Overwriting is the interesting case: the save goes through a temp file
+        // and a rename rather than truncating the live config, so an interrupted
+        // save can never leave a half-written file that `load` refuses to parse.
+        config.default_engine = Some("lemonade".to_owned());
+        config.save(&paths)?;
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let leftovers = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect::<Vec<_>>();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        assert!(
+            leftovers.is_empty(),
+            "a completed save must leave no temp file in the config folder: {leftovers:?}"
+        );
         Ok(())
     }
 
