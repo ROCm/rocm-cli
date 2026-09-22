@@ -407,9 +407,11 @@ rather than leave them behind; each one is put on the new runtime and then
 restarted, so it comes back serving from it. That restarts running servers, so
 it requires `--yes` and never prompts, the same as
 `rocm services restart <service-id> --yes`. Servers are handled one at a time
-and a failure does not stop the rest: a server that fails to come back is left
-on the runtime it was actually running, every failure is named in the summary,
-and the command exits with an error.
+and a failure does not stop the rest: a server that fails to restart is stopped
+by the attempt — only its record is put back on the runtime it last ran on,
+every failure is named in the summary, and the command exits with an error.
+Start it again with `rocm services restart <service-id> --yes` once the cause
+is fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and

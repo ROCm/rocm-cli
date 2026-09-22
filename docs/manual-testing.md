@@ -265,9 +265,11 @@ Expected result:
 - The rollback switches back and restarts each counted server onto the runtime
   it restored, listing them under `services_restarted: <n>`; `rocm services`
   shows them running again.
-- A server that fails to come back is named under
-  `services_restart_failed: <n>`, is left on the runtime it was actually
-  running, and the command exits with an error instead of reporting success.
+- A server that fails to restart is named under
+  `services_restart_failed: <n>`; it is stopped by the attempt — only its
+  record is put back on the runtime it last ran on — and the command exits
+  with an error instead of reporting success. Verify with `rocm services`
+  that the server shows as stopped, not running.
 
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:
