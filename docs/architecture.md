@@ -14,14 +14,14 @@ This is the living module map for rocm-cli. It's a contributor-facing reference 
 
 New subcommands and subsystems default to their own file from day one — they should not grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. Two extraction patterns already exist in the codebase; use whichever fits:
 
-- **Full domain extraction** — a self-contained subsystem gets its own file with its own types and a `pub mod x;` + re-export. This is the default for new subsystems. Examples: `apps/rocm/src/therock.rs`, `comfyui.rs`, `providers.rs`; `crates/rocm-core`'s `diagnose.rs`/`examine.rs`.
+- **Full domain extraction** — a subsystem's domain implementation (types, logic) moves into its own file. In binary crates (`apps/rocm`) it's a private `mod x;`, accessed via qualified paths (e.g. `comfyui::render_status(...)`) — the clap command enum (e.g. `ComfyuiCommand`) and its dispatch function stay in `main.rs`. In library crates (`crates/rocm-core`) it's `pub mod x;` plus a `pub use x::{...};` re-export, since the module is part of the crate's public API. This is the default for new subsystems. Examples: `apps/rocm/src/therock.rs`, `comfyui.rs`, `providers.rs`; `crates/rocm-core`'s `diagnose.rs`/`examine.rs`.
 - **Mechanical relocation** — a `pub(crate) fn` moves out verbatim, with shared types/config staying at the crate root and reached via `crate::`. Used for dispatch-adjacent clusters where a minimal, easy-to-review diff matters more than full extraction. Examples: `apps/rocm/src/automations.rs`, `uninstall.rs`.
 
 There is no file-line-count CI gate enforcing this — `too_many_lines = "allow"` in the workspace `Cargo.toml` is a deliberate, function-level choice, not an oversight. This convention is the guardrail instead.
 
 ## Module map
 
-Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surface. Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber`) are out of scope here — they're not part of the modularization effort's inventory.
+Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surface, plus `crates/e2e-report` (a shared exception: it's HTML/markdown reporting consumed only by `xtask` and `tests/e2e-cucumber`, but it's still one of the modularization effort's target files, so it's mapped below). Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber` themselves) are otherwise out of scope — they're not part of the modularization effort's inventory.
 
 ### `apps/rocm` — main CLI binary
 
