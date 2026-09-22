@@ -8447,6 +8447,83 @@ fn bail_on_failed_service_restarts(services: &RuntimeServiceReconciliation) -> R
     );
 }
 
+/// The persisted state an activation replaces, captured before the first
+/// write so a half-applied activation can be undone.
+///
+/// Activation writes two independent files — the config and the active-runtime
+/// marker. Without this, a marker write that fails leaves the config naming the
+/// new runtime while the marker still names the old one, and the marker feeds
+/// both runtime resolution and the storage retention holds.
+struct ActivationSnapshot {
+    default_runtime_id: Option<String>,
+    active_runtime_key: Option<String>,
+    previous_runtime_key: Option<String>,
+    /// The marker file's bytes, or `None` when there was no readable marker.
+    marker: Option<Vec<u8>>,
+}
+
+impl ActivationSnapshot {
+    fn capture(paths: &AppPaths, config: &RocmCliConfig) -> Self {
+        Self {
+            default_runtime_id: config.default_runtime_id.clone(),
+            active_runtime_key: config.active_runtime_key.clone(),
+            previous_runtime_key: config.previous_runtime_key.clone(),
+            marker: fs::read(active_runtime_marker_path(paths)).ok(),
+        }
+    }
+
+    fn restore(self, paths: &AppPaths, config: &mut RocmCliConfig) -> Result<()> {
+        config.default_runtime_id = self.default_runtime_id;
+        config.active_runtime_key = self.active_runtime_key;
+        config.previous_runtime_key = self.previous_runtime_key;
+        config.save(paths)?;
+        let path = active_runtime_marker_path(paths);
+        match self.marker {
+            Some(bytes) => {
+                let parent = path
+                    .parent()
+                    .context("active runtime marker path has no parent directory")?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+                fs::write(&path, bytes)
+                    .with_context(|| format!("failed to restore {}", path.display()))?;
+            }
+            // Only a regular file is removed: whatever else may sit at that
+            // path was there before this activation, so leaving it is what
+            // "restore the previous state" means.
+            None if path.is_file() => fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?,
+            None => {}
+        }
+        Ok(())
+    }
+}
+
+/// Undo a half-applied activation and describe what the user is left with.
+///
+/// Mirrors the shape of `revalidate_runtime_uninstall_plan`: refuse the
+/// operation with a message that says exactly which state is on disk and which
+/// command puts it right.
+fn restore_after_failed_activation(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    snapshot: ActivationSnapshot,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match snapshot.restore(paths, config) {
+        Ok(()) => error.context(
+            "failed to record the active ROCm runtime; the previously active runtime is still \
+             active and nothing changed",
+        ),
+        Err(restore_error) => error.context(format!(
+            "failed to record the active ROCm runtime, and restoring the previous state failed \
+             too ({restore_error:#}); the ROCm CLI config and the active runtime marker may now \
+             disagree. Run `rocm runtimes list` to see both, then re-run `rocm runtimes activate \
+             <runtime_key>` for the runtime you want to write them again"
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeUninstallResult {
     runtime_id: String,
@@ -8616,12 +8693,13 @@ pub(crate) fn activate_runtime(
     // Read the live services before anything is written, so an unreadable
     // services folder refuses the activation instead of half-applying it.
     let services = reconcile_services_for_runtime(paths, &manifest.runtime_key)?;
+    let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
     config.previous_runtime_key = previous_runtime_key.clone();
     config.save(paths)?;
-    write_active_runtime_marker(
+    if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
             runtime_id: manifest.runtime_id.clone(),
@@ -8632,7 +8710,11 @@ pub(crate) fn activate_runtime(
             previous_runtime_key: previous_runtime_key.clone(),
             activated_at_unix_ms: rocm_core::unix_time_millis(),
         },
-    )?;
+    ) {
+        return Err(restore_after_failed_activation(
+            paths, config, snapshot, error,
+        ));
+    }
 
     Ok(RuntimeActivationResult {
         runtime_id: manifest.runtime_id.clone(),
@@ -8664,12 +8746,13 @@ fn rollback_runtime(
         .filter(|_| new_previous_key.is_some());
 
     let services = reconcile_services_for_runtime(paths, &previous.runtime_key)?;
+    let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(previous.runtime_id.clone());
     config.active_runtime_key = Some(previous.runtime_key.clone());
     config.previous_runtime_key = new_previous_key.clone();
     config.save(paths)?;
-    write_active_runtime_marker(
+    if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
             runtime_id: previous.runtime_id.clone(),
@@ -8680,7 +8763,11 @@ fn rollback_runtime(
             previous_runtime_key: new_previous_key.clone(),
             activated_at_unix_ms: rocm_core::unix_time_millis(),
         },
-    )?;
+    ) {
+        return Err(restore_after_failed_activation(
+            paths, config, snapshot, error,
+        ));
+    }
 
     Ok(RuntimeActivationResult {
         runtime_id: previous.runtime_id.clone(),
@@ -31469,6 +31556,21 @@ ID_LIKE="suse opensuse"
         Ok(config)
     }
 
+    /// Replace the active-runtime marker with a NON-EMPTY directory, so the
+    /// next `write_active_runtime_marker` fails at a predictable point: its
+    /// `create_dir_all` of the parent succeeds, its `remove_file` of the
+    /// destination fails harmlessly, and the final `fs::rename` of the temp
+    /// file onto a non-empty directory fails on both supported platforms
+    /// without needing privileges or a real full disk.
+    fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
+        let marker = active_runtime_marker_path(paths);
+        let _ = fs::remove_file(&marker);
+        fs::create_dir_all(&marker)?;
+        let sentinel = marker.join("occupied.txt");
+        fs::write(&sentinel, "not a marker")?;
+        Ok(sentinel)
+    }
+
     #[test]
     fn runtime_activation_reports_live_service_on_previous_runtime() -> Result<()> {
         let (root, paths) = test_paths("runtime-activation-live-service");
@@ -31599,6 +31701,50 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn runtime_activation_rolls_back_when_marker_write_fails() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-marker-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let sentinel = break_active_runtime_marker(&paths)?;
+
+        let error = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)
+            .expect_err("a failed marker write must fail the activation");
+
+        let persisted = RocmCliConfig::load(&paths)?;
+        let sentinel_survived = sentinel.is_file();
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("nothing changed"),
+            "the error must say the activation did not take effect:\n{error}"
+        );
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the config on disk must still name the runtime the marker names; \
+             a torn write here also changes storage GC hold decisions"
+        );
+        assert_eq!(
+            persisted.default_runtime_id.as_deref(),
+            Some("therock-release:gfx120X-all")
+        );
+        assert_eq!(persisted.previous_runtime_key, None);
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the caller's in-memory config must be restored too, or the next \
+             `config.save` on this path writes the state the restore just undid"
+        );
+        assert!(
+            sentinel_survived,
+            "whatever occupied the marker path predates this activation, so \
+             restoring must leave it exactly as it was"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_activation_restart_services_requires_yes() {
         let error = ensure_service_restart_approved(true, false, "activate <runtime_key>")
             .expect_err("restarting local servers must not happen without --yes")
@@ -31661,6 +31807,42 @@ ID_LIKE="suse opensuse"
             )),
             "rollback reports live services the same way activate does:\n{rendered}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_rollback_rolls_back_when_marker_write_fails() -> Result<()> {
+        let (root, paths) = test_paths("runtime-rollback-marker-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let sentinel = break_active_runtime_marker(&paths)?;
+
+        let error = rollback_runtime(&paths, &mut config)
+            .expect_err("a failed marker write must fail the rollback");
+
+        let persisted = RocmCliConfig::load(&paths)?;
+        let sentinel_survived = sentinel.is_file();
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("nothing changed"),
+            "the error must say the rollback did not take effect:\n{error}"
+        );
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(NEW_RUNTIME_KEY),
+            "a failed rollback must leave the runtime it failed to leave active"
+        );
+        assert_eq!(
+            persisted.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the rollback target must survive a failed rollback, or the user \
+             loses the only state that makes a retry possible"
+        );
+        assert_eq!(config.active_runtime_key.as_deref(), Some(NEW_RUNTIME_KEY));
+        assert!(sentinel_survived);
         Ok(())
     }
 
