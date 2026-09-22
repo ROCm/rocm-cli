@@ -3506,9 +3506,10 @@ const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.0}";
 /// Required when installing a version this build has no digest for.
 const ROCDXG_SHA256_ENV: &str = "ROCM_CLI_ROCDXG_SHA256";
 
-/// Opts out of digest verification entirely. Named explicitly so that shipping
-/// an unverified root install is a deliberate act with an audit trail in the
-/// plan, rather than what happens when a variable is simply unset.
+/// Opts out of digest verification entirely, when set to an affirmative value.
+/// Named explicitly so that shipping an unverified root install is a deliberate
+/// act with an audit trail in the plan, rather than what happens when a variable
+/// is simply unset.
 const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
 
 /// SHA-256 digests of the `rocdxg-roct` package shipped with each published
@@ -3525,7 +3526,16 @@ const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
 /// A version absent from this table is not installed unless the caller supplies
 /// a digest via `ROCM_CLI_ROCDXG_SHA256` or opts out via
 /// `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`; see [`resolve_rocdxg_verification`].
-/// Add the new pair here when pinning a newer release.
+/// Add the new pair here when pinning a newer release. Nothing in the tree
+/// checks a row against the published artifact, so a mistyped digest surfaces
+/// only as a failed install on a WSL host — fail-closed, but confusing. Take
+/// the value from the release's own asset metadata, or recompute it:
+///
+/// ```text
+/// curl -L --fail \
+///   https://github.com/ROCm/librocdxg/releases/download/v<version>/rocdxg-roct_<version>_amd64.deb \
+///   | sha256sum
+/// ```
 const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
     (
         "1.0.0",
@@ -3601,7 +3611,8 @@ enum RocdxgVerification {
 ///
 /// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
 /// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
-/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, which opts out.
+/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
+///    (`1`, `true`, `yes`, `on`), which opts out. `0` and `false` do not.
 ///
 /// Nothing left means refusal. Verification is therefore opt-*out*: the failure
 /// mode of an unset variable is a plan that will not run, not a root install of
@@ -3627,7 +3638,11 @@ fn resolve_rocdxg_verification(version: &str) -> Result<RocdxgVerification, Stri
         return Ok(RocdxgVerification::Digest(pinned.to_owned()));
     }
 
-    if std::env::var_os(ROCDXG_ALLOW_UNVERIFIED_ENV).is_some_and(|value| !value.is_empty()) {
+    // An allowlist of affirmative values, not "set to anything non-empty":
+    // otherwise `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=0` — which every reader takes
+    // for "off" — would turn digest checking off for a package installed as
+    // root. Anything this does not recognise leaves verification on.
+    if crate::therock::truthy_env(ROCDXG_ALLOW_UNVERIFIED_ENV) {
         return Ok(RocdxgVerification::OptedOut);
     }
 
@@ -3673,7 +3688,14 @@ fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan 
     let version = resolve_shell_default_template(ROCDXG_VERSION_EXPR);
     if !rocdxg_version_is_well_formed(&version) {
         return wsl_rocdxg_refusal_plan(
-            version,
+            // The rejected value is still rendered into the plan's
+            // `repo_version:` line so the user can see what was refused — but
+            // that line is part of a plan a human reads to decide, and a raw
+            // value containing a newline could forge further lines in it. The
+            // debug form escapes newlines and makes trailing space visible,
+            // which is exactly what is wanted for a value being shown as
+            // rejected.
+            format!("{version:?}"),
             "ROCM_CLI_ROCDXG_VERSION is not a well-formed package version. It is interpolated into privileged shell commands, so only letters, digits, and `. + - ~` are accepted.".to_owned(),
         );
     }
@@ -30879,6 +30901,10 @@ VERSION_ID="41"
 
     #[test]
     fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        // Asserts on the default plan, so it has to take the same guard as the
+        // mutating tests in this binary: a concurrent test exporting
+        // `ROCM_CLI_ROCDXG_VERSION` would otherwise steer this one's plan.
+        let _env = scoped_rocdxg_env();
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
         let commands = plan.execution_commands().join("\n");
 
@@ -30907,6 +30933,7 @@ VERSION_ID="41"
         // /dev/dxg and dxcore come from the Windows side. If they are missing,
         // installing the bridge library accomplishes nothing, so the plan must
         // stop rather than report a successful install of something inert.
+        let _env = scoped_rocdxg_env();
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
         let prepare = plan
             .commands
@@ -31054,6 +31081,43 @@ VERSION_ID="41"
     }
 
     #[test]
+    fn wsl_rocdxg_opt_out_reads_negative_values_as_off() {
+        // The opt-out is a boolean, not a presence check. Reading "set to
+        // anything" as yes would turn digest verification off for a package
+        // installed as root on the strength of `=0` — the one value a reader
+        // writes when they mean the opposite.
+        for negative in ["0", "false", "no", "off", ""] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, negative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                !plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} disabled verification"
+            );
+            assert!(
+                plan.commands.is_empty(),
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} built an unverified install"
+            );
+        }
+
+        // The affirmative spellings still work, so this is a narrowing of what
+        // counts as yes rather than a removal of the escape hatch.
+        for affirmative in ["1", "true", "yes", "on"] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, affirmative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={affirmative:?} was not honoured"
+            );
+        }
+    }
+
+    #[test]
     fn wsl_rocdxg_refuses_a_version_that_could_escape_the_shell() {
         // `ROCM_CLI_ROCDXG_VERSION` is interpolated into commands executed via
         // `sh -c` after `apt-get update` has primed the sudo credential cache,
@@ -31079,6 +31143,17 @@ VERSION_ID="41"
                 plan.commands.is_empty(),
                 "built commands from hostile version {hostile:?}"
             );
+            // The refused value is echoed back in the plan a human reads, so it
+            // must not be able to forge lines there. Every line the renderer
+            // emits after the header is indented, so an unindented one came
+            // from the value.
+            let rendered = render_driver_install_plan(&plan, false, false);
+            for line in rendered.lines().skip(1) {
+                assert!(
+                    line.starts_with("  "),
+                    "hostile version {hostile:?} forged plan line {line:?} in:\n{rendered}"
+                );
+            }
         }
     }
 
@@ -31178,9 +31253,19 @@ VERSION_ID="41"
     fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
         // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
         // bare-metal DKMS path is the one that needs a reboot.
+        let _env = scoped_rocdxg_env();
         let wsl = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
         assert!(!wsl.reboot_required);
         let rendered = render_driver_install_plan(&wsl, false, false);
+        // Anchor on the install step first: a refusal plan also reports
+        // `reboot_required: false`, renders `post_install_checks:` from its
+        // non-empty `checks`, and contains no `post_reboot` — so the three
+        // assertions below hold against a plan that installs nothing at all.
+        // Only a real install plan carries this command.
+        assert!(
+            rendered.contains("apt-get install -y '/tmp/"),
+            "expected a real install plan, got:\n{rendered}"
+        );
         assert!(rendered.contains("post_install_checks:"));
         assert!(!rendered.contains("post_reboot"));
 
@@ -31206,11 +31291,12 @@ VERSION_ID="41"
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
         assert_eq!(plan.repo_version, "1.2.0");
         let commands = plan.execution_commands().join("\n");
-        // The VERSION is resolved here, not deferred to the shell. The opt-in
-        // `${ROCM_CLI_ROCDXG_SHA256:-}` expansion is deliberately left intact:
-        // that one is read at execution time so a digest supplied then is
-        // honoured, whereas the version has to be concrete in the plan the user
-        // approves.
+        // The version is resolved here, not deferred to the shell: the plan the
+        // user approves has to name the build the install will actually fetch.
+        // No `${...}` expansion survives into the commands at all — the digest
+        // is resolved at plan-build time too, which
+        // `wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default`
+        // asserts by name.
         assert!(
             !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
             "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
