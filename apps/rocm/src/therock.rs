@@ -511,6 +511,13 @@ struct PipRuntimeResolution {
     /// installed (no wheels) and we warn about it. `None` when a specific version
     /// was requested (the "latest" concept does not apply).
     newest_repo_version: Option<String>,
+    /// The exact requirement lines handed to `uv pip compile` to choose this
+    /// version set. This is the value that was sent, not a re-derivation of it,
+    /// so the preview can show what resolution actually asked for and an
+    /// acceptance test can hold it to the same extras the install plan names.
+    /// `None` on the canonical layout, which picks versions by scraping each
+    /// package's simple index rather than by resolving a requirement set.
+    version_resolution_specs: Option<Vec<String>>,
     package_versions: TheRockPipPackageVersions,
     /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
@@ -1498,6 +1505,9 @@ fn resolve_latest_for_manifest(
                 &wheel_compatibility,
                 None,
                 Some(layout),
+                // An update re-resolves for the install it will reinstall, so it
+                // must resolve against the extras that runtime already has.
+                manifest.includes_devel(),
                 download_timeout_secs,
             )?;
             // Prefer the device payload this runtime was actually built with over
@@ -1755,6 +1765,7 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
     )?;
     let device_target = device_target_override.map_or_else(
         || resolution.device_target.clone(),
@@ -1850,6 +1861,15 @@ fn install_wheel_runtime(
         "  platform_wheel_tags: {}",
         wheel_compatibility.platform_tags.join(",")
     );
+    // What resolution asked for, printed beside what the install will ask for.
+    // The two are produced by different code paths from the same `include_devel`
+    // and must name the same extras; showing only the second would hide a
+    // resolve that constrained the version choice by a toolchain the user
+    // declined. Absent on the canonical layout, which resolves by scraping each
+    // package's index instead of compiling a requirement set.
+    if let Some(specs) = resolution.version_resolution_specs.as_ref() {
+        let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
+    }
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -2021,7 +2041,10 @@ fn install_wheel_runtime(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        if include_devel {
+        // Read back out of the specs `uv` is being handed on this very call
+        // rather than off `include_devel` a second time, so the line a user
+        // watches cannot name a toolchain the install is not requesting.
+        if wheel_composition_includes_devel(Some(&wheel_composition)).unwrap_or(include_devel) {
             "install TheRock SDK with the compiler toolchain, torch stack, and resolved dependencies"
         } else {
             "install TheRock SDK, torch stack, and resolved dependencies"
@@ -2098,14 +2121,52 @@ fn install_wheel_runtime(
 /// the download — and is only needed to *build* GPU code. Running models needs
 /// `libraries` alone, so the toolchain is installed only when asked for.
 ///
-/// Shared so the install plan, the progress text, and the resolution failure all
-/// name the same extras instead of drifting apart.
+/// Two callers, and they are the two that must agree:
+///
+/// - [`therock_pip_package_specs`], which produces the specs `uv` installs and
+///   the specs recorded in the manifest, and
+/// - [`published_pip_requirements`], the requirement set `uv pip compile` is
+///   asked to resolve versions against on the ROCm 10 (`next`) layout.
+///
+/// Version resolution and install composition are separate code paths —
+/// resolution runs first and decides which versions exist, composition runs
+/// second and decides what is installed — so a flag threaded correctly through
+/// one says nothing about the other. Both go through this helper for that
+/// reason. Everything else that names the toolchain (the install progress line,
+/// `runtimes list`, `InstalledRuntimeManifest::includes_devel`) reads it back
+/// out of the composed specs rather than re-deciding it.
 const fn therock_sdk_extras(include_devel: bool) -> &'static str {
     if include_devel {
         "libraries,devel"
     } else {
         "libraries"
     }
+}
+
+/// The requirement lines handed to `uv pip compile` to pick a mutually
+/// installable version set on the ROCm 10 (`next`) layout.
+///
+/// Unversioned for torch/torchvision/torchaudio on purpose: choosing those
+/// versions is what the resolve is for. The `rocm` extras, though, must match
+/// the ones [`therock_pip_package_specs`] will install — resolving against
+/// `devel` for someone who did not ask for it constrains the chosen versions by
+/// a toolchain they declined, and can fail the whole install with a
+/// toolchain-resolution error on a default `rocm install sdk`.
+fn published_pip_requirements(
+    rocm_version: &str,
+    device_target: &str,
+    include_devel: bool,
+) -> Vec<String> {
+    let device_extra = format!("device-{device_target}");
+    vec![
+        format!(
+            "rocm[{},{device_extra}]=={rocm_version}",
+            therock_sdk_extras(include_devel)
+        ),
+        format!("torch[{device_extra}]"),
+        format!("torchvision[{device_extra}]"),
+        "torchaudio".to_owned(),
+    ]
 }
 
 /// Package specs for a wheel SDK install.
@@ -2866,6 +2927,7 @@ fn resolve_pip_runtime(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
 ) -> Result<PipRuntimeResolution> {
     resolve_pip_runtime_with_timeout(
         paths,
@@ -2874,6 +2936,7 @@ fn resolve_pip_runtime(
         wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
         None,
     )
 }
@@ -2888,6 +2951,7 @@ fn resolve_pip_runtime_with_timeout(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
@@ -2939,6 +3003,7 @@ fn resolve_pip_runtime_with_timeout(
         &source,
         wheel_compatibility,
         version_selector,
+        include_devel,
         download_timeout_secs,
     )
     .with_context(|| {
@@ -2951,6 +3016,10 @@ fn resolve_pip_runtime_with_timeout(
     })
 }
 
+/// `include_devel` reaches this far because version resolution, not only install
+/// composition, has to ask for the extras the caller actually requested — see
+/// [`published_pip_requirements`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
@@ -2958,9 +3027,11 @@ fn resolve_pip_runtime_from_index(
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let index_url = source.index_url.as_str();
+    let mut version_resolution_specs = None;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -2997,14 +3068,16 @@ fn resolve_pip_runtime_from_index(
         // budget, not the single-fetch one — reusing the bare per-fetch value
         // here would make a startup check that budgets 2s per fetch reliably
         // time out a call doing 4 fetches' worth of work.
-        resolve_published_pip_package_versions(
+        let requirements = published_pip_requirements(&rocm_version, device_target, include_devel);
+        let versions = resolve_published_pip_package_versions(
             paths,
             index_url,
-            &rocm_version,
-            device_target,
+            &requirements,
             wheel_compatibility,
             download_timeout_secs.map(|secs| secs.saturating_mul(4)),
-        )?
+        )?;
+        version_resolution_specs = Some(requirements);
+        versions
     } else {
         let torch_versions = load_simple_index_versions(
             paths,
@@ -3063,6 +3136,7 @@ fn resolve_pip_runtime_from_index(
         layout: source.layout,
         latest_version,
         newest_repo_version,
+        version_resolution_specs,
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
@@ -3450,11 +3524,13 @@ fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Resu
     }
 }
 
+/// `requirements` is passed in rather than composed here so that the lines sent
+/// to `uv` and the lines the resolution reports back (and the preview prints)
+/// are one value, not two that can disagree.
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
     index_url: &str,
-    rocm_version: &str,
-    device_target: &str,
+    requirements: &[String],
     compatibility: &WheelCompatibility,
     download_timeout_secs: Option<u64>,
 ) -> Result<TheRockPipPackageVersions> {
@@ -3462,10 +3538,7 @@ fn resolve_published_pip_package_versions(
         ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
     let python_version = uv_python_version(compatibility)?;
     let python_platform = uv_python_platform(compatibility)?;
-    let device_extra = format!("device-{device_target}");
-    let requirements = format!(
-        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
-    );
+    let requirements = format!("{}\n", requirements.join("\n"));
     let mut child = Command::new(&uv)
         .args([
             "pip",
@@ -8095,6 +8168,7 @@ mod tests {
             layout: SourceLayout::Canonical,
             latest_version: "7.13.0".to_owned(),
             newest_repo_version: None,
+            version_resolution_specs: None,
             package_versions: TheRockPipPackageVersions {
                 rocm: "7.13.0".to_owned(),
                 torch: "2.11.0+rocm7.13.0".to_owned(),
