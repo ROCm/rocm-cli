@@ -8217,6 +8217,83 @@ mod tests {
         assert_eq!(runtime_only.rocm_sdk_target, with_devel.rocm_sdk_target);
     }
 
+    /// The other half of the same claim, on the *resolution* path.
+    ///
+    /// `uv pip compile` decides which versions exist before anything is
+    /// composed, so asking it for `devel` on a default install constrains the
+    /// version choice by a toolchain the user declined — and fails the install
+    /// outright when no version can satisfy it. That is a separate code path
+    /// from `wheel_runtime_composition` above, and the two must name the same
+    /// extras.
+    #[test]
+    fn version_resolution_requests_the_toolchain_only_when_asked() {
+        let runtime_only = published_pip_requirements("10.0.0", "gfx1200", false);
+        assert_eq!(
+            runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
+            "a default install must not resolve against the toolchain: {runtime_only:?}"
+        );
+
+        let with_devel = published_pip_requirements("10.0.0", "gfx1200", true);
+        assert_eq!(
+            with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
+            "--devel must reach the resolved requirements: {with_devel:?}"
+        );
+
+        // Only the `rocm` requirement carries the toolchain axis; the torch
+        // stack is unversioned here because choosing those versions is what the
+        // resolve is for.
+        assert_eq!(
+            runtime_only[1..],
+            with_devel[1..],
+            "devel must only affect the rocm requirement"
+        );
+        assert_eq!(
+            runtime_only[1..],
+            [
+                "torch[device-gfx1200]".to_owned(),
+                "torchvision[device-gfx1200]".to_owned(),
+                "torchaudio".to_owned(),
+            ]
+        );
+    }
+
+    /// Resolution and composition are two code paths reading one flag, and the
+    /// bug this pins is them disagreeing: the requirements handed to `uv` were
+    /// hardcoded to `devel` while the plan printed and installed `libraries`.
+    /// Asserting each in isolation cannot catch that; asserting they agree can.
+    #[test]
+    fn resolution_and_install_name_the_same_rocm_extras() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let requirements = published_pip_requirements(
+                &resolution.package_versions.rocm,
+                "gfx942",
+                include_devel,
+            );
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                rocm_requirement_extras(&requirements[0]),
+                rocm_requirement_extras(&composition.package_specs[0]),
+                "resolution and install must request the same rocm extras for \
+                 include_devel={include_devel}: {requirements:?} vs {:?}",
+                composition.package_specs
+            );
+        }
+    }
+
+    /// The `...` of a `rocm[...]==version` requirement.
+    fn rocm_requirement_extras(requirement: &str) -> &str {
+        requirement
+            .strip_prefix("rocm[")
+            .and_then(|rest| rest.split_once(']'))
+            .map_or_else(
+                || panic!("not a rocm extras requirement: {requirement}"),
+                |(extras, _)| extras,
+            )
+    }
+
     /// The manifest answer is derived from the specs that were installed, so a
     /// recorded composition and the `devel` field can never disagree.
     #[test]
