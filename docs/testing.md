@@ -337,10 +337,12 @@ never counted as stale.
 `--restart-services` moves those services: it rewrites each service record onto
 the newly active runtime and then restarts it. It requires `--yes` and never
 prompts, the same idiom as `rocm services restart <id> --yes` and
-`rocm runtimes uninstall --yes`. Restart is best effort per service — a service
-that fails to restart is stopped by the attempt; only its record is put back
-on the runtime it actually ran on, every failure is named, and the command
-exits non-zero.
+`rocm runtimes uninstall --yes`. Restart is best effort per service — every
+failure is named, its record is put back on the runtime it actually ran on, and
+the command exits non-zero. The restart stops a service before respawning it,
+so a failure normally leaves it down; a restart refused before anything was
+stopped instead leaves the service running and still counted under
+`services_on_previous_runtime`. The error says which is which.
 
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.

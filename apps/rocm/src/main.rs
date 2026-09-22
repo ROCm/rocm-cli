@@ -8215,10 +8215,16 @@ struct RuntimeServiceReconciliation {
     unknown: Vec<RuntimeServiceEntry>,
     /// Stale services successfully moved onto the new runtime.
     restarted: Vec<String>,
-    /// Stale services that could not be moved. The restart stops a service
-    /// before respawning it, so each of these is stopped, with its record put
-    /// back on the runtime it recorded before the attempt.
+    /// Stale services that could not be moved. Their records are put back on
+    /// the runtime they recorded before the attempt. Whether the service itself
+    /// is still up depends on how far the attempt got, so each one that is
+    /// still serving stays listed in `stale` too.
     failed: Vec<FailedServiceRestart>,
+    /// Whether `restart_stale_runtime_services` ran. Read only to decide
+    /// whether offering `--restart-services` is advice the user can still act
+    /// on: a service left in `stale` by a failed attempt is not one that flag
+    /// would move, because it was just tried.
+    restart_attempted: bool,
 }
 
 /// Classify one record against the runtime key being activated.
@@ -8370,9 +8376,12 @@ fn render_runtime_service_reconciliation(services: &RuntimeServiceReconciliation
             let _ = writeln!(output, "    - {}: {}", failure.service_id, failure.error);
         }
     }
-    // `restart_stale_runtime_services` drains `stale` into `restarted`/`failed`,
-    // so anything still listed here was left where it was and the advice holds.
-    if !services.stale.is_empty() {
+    // Only offered when no restart was attempted. `restart_stale_runtime_services`
+    // leaves an entry in `stale` only when the attempt failed AND the service is
+    // still up, and telling that user to add the flag they just passed is advice
+    // that cannot help — `bail_on_failed_service_restarts` names the real next
+    // step for them instead.
+    if !services.stale.is_empty() && !services.restart_attempted {
         let _ = writeln!(
             output,
             "  note: those keep serving on their recorded runtime until they are restarted; \
@@ -8403,23 +8412,49 @@ fn restart_stale_runtime_services(
     runtime_key: &str,
     services: &mut RuntimeServiceReconciliation,
 ) {
-    // Every entry LEAVES `stale` for `restarted` or `failed`, and is not put
-    // back. `services_on_previous_runtime` counts `stale`, so a service that
-    // was moved — or that the attempt stopped — must not still be counted as a
-    // live server serving from the previous runtime: that is the same
-    // report-contradicts-reality failure this whole path exists to end. The
-    // `restarted`/`failed` lists name them instead, with what actually
-    // happened. An entry no attempt reached would stay, so the count can only
-    // undercount if a restart is silently skipped.
-    for entry in std::mem::take(&mut services.stale) {
+    // `services_on_previous_runtime` counts `stale`, so an entry stays there
+    // only while the claim it makes is still true. A service that was moved, or
+    // that the attempt took down, is no longer a live server serving from the
+    // previous runtime and must not be counted as one — but neither is the
+    // converse safe to assume: a restart refused BEFORE the stop leaves the
+    // server up, and dropping it would under-report a live server on the old
+    // runtime just as badly. So each entry is drained, and only put back when
+    // the service is read back as still running.
+    for mut entry in std::mem::take(&mut services.stale) {
         match restart_service_onto_runtime(paths, &entry.service_id, runtime_key) {
             Ok(()) => services.restarted.push(entry.service_id),
-            Err(error) => services.failed.push(FailedServiceRestart {
-                service_id: entry.service_id,
-                error: format!("{error:#}"),
-            }),
+            Err(error) => {
+                services.failed.push(FailedServiceRestart {
+                    service_id: entry.service_id.clone(),
+                    error: format!("{error:#}"),
+                });
+                if let Some(record) = service_still_serving(paths, &entry.service_id) {
+                    // Re-read rather than reused: `restart_service_onto_runtime`
+                    // restores the record's pin on failure and that restore is
+                    // itself fallible, so the runtime this names is taken from
+                    // the record as it now stands.
+                    entry.recorded_runtime = record.runtime_id;
+                    services.stale.push(entry);
+                }
+            }
         }
     }
+    services.restart_attempted = true;
+}
+
+/// The service's record if it is still running, having failed to restart.
+///
+/// A failed restart does NOT imply a stopped server:
+/// `restart_internal_managed_service` refuses a public bind with no endpoint key
+/// before it stops anything, and `restart_service_onto_runtime` can fail earlier
+/// still while rewriting the record. `load_managed_service` refreshes the record
+/// against the real processes, so this is read from the world rather than
+/// inferred from how far the code got. A record that cannot be read back cannot
+/// be claimed to be serving, so it counts as neither.
+fn service_still_serving(paths: &AppPaths, service_id: &str) -> Option<ManagedServiceRecord> {
+    load_managed_service(paths, service_id)
+        .ok()
+        .filter(managed_service_is_live)
 }
 
 /// Rewrite the service record onto `runtime_key`, THEN restart it.
@@ -8512,23 +8547,55 @@ fn restore_service_record_pin(
 /// Fail the command when any requested restart did not happen, naming every
 /// service that was left behind. The report has already been printed, so this
 /// only has to make the exit code match what the report says.
+///
+/// What a failure left behind is split out per service rather than asserted for
+/// all of them: the restart stops a server before respawning it, so most
+/// failures leave it down — but one refused before the stop leaves it serving,
+/// and telling that user their server is down sends them away from a live
+/// server on the runtime they just switched off.
 fn bail_on_failed_service_restarts(services: &RuntimeServiceReconciliation) -> Result<()> {
     if services.failed.is_empty() {
         return Ok(());
     }
-    let names = services
+    let still_serving = services
+        .stale
+        .iter()
+        .map(|entry| entry.service_id.as_str())
+        .collect::<Vec<_>>();
+    let stopped = services
         .failed
         .iter()
         .map(|failure| failure.service_id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!(
-        "the runtime was switched, but {} local server(s) could not be restarted onto it: {names}. \
-         Each was stopped by the attempt and is no longer serving; its record was put back on the \
-         runtime it last ran on. Check `rocm services logs <id>`, then \
-         `rocm services restart <id> --yes` once the cause is fixed.",
+        .filter(|service_id| !still_serving.contains(service_id))
+        .collect::<Vec<_>>();
+    // Every failure lands in exactly one of the two lists below, so the ids are
+    // named there rather than up front as well.
+    let mut message = format!(
+        "the runtime was switched, but {} local server(s) could not be restarted onto it. Each \
+         record was put back on the runtime it last ran on.",
         services.failed.len()
     );
+    if !stopped.is_empty() {
+        let _ = write!(
+            message,
+            " These were stopped by the attempt and are no longer serving: {}.",
+            stopped.join(", ")
+        );
+    }
+    if !still_serving.is_empty() {
+        let _ = write!(
+            message,
+            " These are still serving from the runtime they recorded, and stay counted under \
+             services_on_previous_runtime: {}.",
+            still_serving.join(", ")
+        );
+    }
+    let _ = write!(
+        message,
+        " Check `rocm services logs <id>`, then `rocm services restart <id> --yes` once the cause \
+         is fixed."
+    );
+    bail!(message);
 }
 
 /// The persisted state an activation replaces, captured before the first
@@ -32296,10 +32363,12 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn restarting_services_stops_counting_them_as_left_on_the_previous_runtime() -> Result<()> {
-        let (root, paths) = test_paths("service-restart-clears-stale");
+    fn a_failed_restart_is_counted_by_whether_the_server_is_still_up() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-failure-counting");
         paths.ensure()?;
-        let mut record = plant_service_record_on_runtime(
+        // Refused BEFORE the stop, so this server is still serving from the
+        // runtime the activation switched away from when the attempt returns.
+        let mut still_up = plant_service_record_on_runtime(
             &paths,
             "svc-public",
             "vllm",
@@ -32308,49 +32377,76 @@ ID_LIKE="suse opensuse"
             Some(OLD_RUNTIME_KEY),
             None,
         )?;
-        // Same refusal the test above uses: it reaches the failure branch
-        // without spawning anything, and a FAILED restart is the harder case
-        // for the count — the service is not on the new runtime either, so it
-        // is tempting to leave it counted.
-        record.host = "0.0.0.0".to_owned();
-        record.write()?;
+        still_up.host = "0.0.0.0".to_owned();
+        still_up.write()?;
         endpoint_keys::clear_endpoint_api_key(&paths, "svc-public");
+        // Refused AFTER the stop, so this one really is down.
+        let mut taken_down = plant_service_record_on_runtime(
+            &paths,
+            "svc-cpu-policy",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        taken_down.device_policy = Some("cpu_only".to_owned());
+        taken_down.write()?;
+        let stale_entry = |service_id: &str| RuntimeServiceEntry {
+            service_id: service_id.to_owned(),
+            engine: "vllm".to_owned(),
+            recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+        };
         let mut services = RuntimeServiceReconciliation {
-            stale: vec![RuntimeServiceEntry {
-                service_id: "svc-public".to_owned(),
-                engine: "vllm".to_owned(),
-                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
-            }],
+            stale: vec![stale_entry("svc-public"), stale_entry("svc-cpu-policy")],
             ..RuntimeServiceReconciliation::default()
         };
 
         restart_stale_runtime_services(&paths, NEW_RUNTIME_KEY, &mut services);
         let rendered = render_runtime_service_reconciliation(&services);
+        let exit_error = format!(
+            "{:#}",
+            bail_on_failed_service_restarts(&services)
+                .expect_err("a failed restart must make the command exit non-zero")
+        );
         let _ = fs::remove_dir_all(&root);
 
-        assert_eq!(services.failed.len(), 1, "{services:?}");
-        assert!(
-            services.stale.is_empty(),
-            "an attempted service is reported by what the attempt did to it, not \
-             counted a second time as a live server still serving from the \
-             previous runtime: {services:?}"
+        assert_eq!(services.failed.len(), 2, "{services:?}");
+        assert_eq!(
+            services.stale,
+            vec![stale_entry("svc-public")],
+            "a restart refused before the stop leaves the server serving from \
+             the runtime it recorded, so dropping it under-reports a live \
+             server on the previous runtime exactly the way counting a moved \
+             one over-reported it; the server the attempt took down is not \
+             serving from anything and must not be listed: {services:?}"
         );
         assert!(
-            rendered.contains("services_on_previous_runtime: 0"),
-            "the count must not contradict the failure listed beneath it:\n{rendered}"
+            rendered.contains("services_on_previous_runtime: 1")
+                && rendered.contains(&format!(
+                    "- svc-public engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+                )),
+            "the count and the line beneath it both describe what is actually \
+             still serving:\n{rendered}"
         );
         assert!(
-            !rendered.contains("recorded_runtime="),
-            "naming the service as still on its recorded runtime is exactly the \
-             stale claim the restart attempt invalidated:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("services_restart_failed: 1"),
-            "the failure still has to be reported:\n{rendered}"
+            rendered.contains("services_restart_failed: 2"),
+            "every failure is reported, whichever side of the stop it fell \
+             on:\n{rendered}"
         );
         assert!(
             !rendered.contains("add --restart-services --yes"),
             "advising a flag the user just passed is advice that cannot help:\n{rendered}"
+        );
+        assert!(
+            exit_error.contains("stopped by the attempt and are no longer serving: svc-cpu-policy"),
+            "the server the attempt took down has to be named as down:\n{exit_error}"
+        );
+        assert!(
+            exit_error.contains("still serving from the runtime they recorded")
+                && exit_error.contains("svc-public"),
+            "telling this user the server is down sends them away from a live \
+             server on the runtime they just switched off:\n{exit_error}"
         );
         Ok(())
     }

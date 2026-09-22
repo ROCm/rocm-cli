@@ -266,10 +266,12 @@ Expected result:
   it restored, listing them under `services_restarted: <n>`; `rocm services`
   shows them running again.
 - A server that fails to restart is named under
-  `services_restart_failed: <n>`; it is stopped by the attempt — only its
-  record is put back on the runtime it last ran on — and the command exits
-  with an error instead of reporting success. Verify with `rocm services`
-  that the server shows as stopped, not running.
+  `services_restart_failed: <n>`, its record is put back on the runtime it last
+  ran on, and the command exits with an error instead of reporting success. The
+  error names the servers the attempt stopped separately from the ones it never
+  reached: a stopped one shows as stopped in `rocm services` and drops out of
+  `services_on_previous_runtime`, while one whose restart was refused before the
+  stop keeps serving and stays counted there. Verify whichever the error names.
 
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:
