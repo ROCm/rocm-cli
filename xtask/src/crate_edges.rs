@@ -30,10 +30,12 @@
 //! `rocm-dash-daemon` dev-depends on `rocm-core` for a test-only contract
 //! pin), so they are collected but never checked against the allowlist.
 
-use std::process::Command;
+use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use crate::paths;
 
 /// Every currently-allowed first-party `(source, target)` normal/build
 /// dependency edge — `source` depends on `target`. Adding a first-party path
@@ -116,18 +118,9 @@ fn edge_kind(kind: Option<&String>) -> Kind {
 /// only, so there's no need to resolve or filter out the external dependency
 /// tree.
 fn load_edges() -> Result<Vec<(String, String, Kind)>> {
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--locked", "--no-deps"])
-        .output()
-        .context("failed to run `cargo metadata`")?;
-    if !output.status.success() {
-        bail!(
-            "`cargo metadata` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout)
-        .context("failed to parse `cargo metadata` output")?;
+    let stdout = paths::run_cargo_metadata(&["--no-deps"])?;
+    let metadata: Metadata =
+        serde_json::from_slice(&stdout).context("failed to parse `cargo metadata` output")?;
     Ok(edges_from_metadata(&metadata))
 }
 
@@ -190,8 +183,14 @@ fn invariant_for(source: &str, target: &str) -> String {
 /// is stale (the dependency was removed but its allowlist entry wasn't) —
 /// left unchecked, that entry would let the same edge reappear later without
 /// the conscious review this guard exists to force.
+///
+/// `enforced` is deduplicated (a `BTreeSet`, not a `Vec`): a first-party crate
+/// could in principle declare the same target as both a normal and a build
+/// dependency, which `cargo metadata` reports as two edges that collapse to
+/// the same `(source, target)` pair here — without dedup, an undeclared such
+/// edge would be reported twice.
 fn check(edges: &[(String, String, Kind)]) -> Vec<String> {
-    let enforced: Vec<(&str, &str)> = edges
+    let enforced: BTreeSet<(&str, &str)> = edges
         .iter()
         .filter(|(_, _, kind)| *kind == Kind::Enforced)
         .map(|(source, target, _)| (source.as_str(), target.as_str()))
@@ -302,6 +301,20 @@ mod tests {
         let violations = check(&edges);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("not in the declared allowlist"));
+    }
+
+    #[test]
+    fn duplicate_undeclared_edge_reported_once() {
+        // A first-party crate could declare the same target as both a normal
+        // and a build dependency; `cargo metadata` reports that as two edges
+        // that collapse to the same (source, target) pair here, and an
+        // undeclared such edge must be reported once, not once per duplicate.
+        let mut edges = allowlisted_edges();
+        edges.push(edge("rocm-engine-vllm", "rocm-deps", Kind::Enforced));
+        edges.push(edge("rocm-engine-vllm", "rocm-deps", Kind::Enforced));
+        let violations = check(&edges);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("rocm-engine-vllm -> rocm-deps"));
     }
 
     #[test]
