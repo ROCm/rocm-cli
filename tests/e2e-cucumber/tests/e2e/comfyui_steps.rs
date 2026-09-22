@@ -53,7 +53,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cucumber::{given, then, when};
-use e2e_cucumber::paced_download::{PacedDownloadServer, build_gzip_tarball, xorshift_payload};
+use e2e_cucumber::paced_download::{
+    PacedDownloadServer, build_gzip_tarball, is_intermediate_download_progress_frame,
+    xorshift_payload,
+};
 
 use crate::E2eWorld;
 use crate::e2e::tui_driver::TuiSession;
@@ -531,18 +534,10 @@ async fn assert_intermediate_comfyui_download_progress_frame(world: &mut E2eWorl
         .tui
         .as_mut()
         .expect("no pty session for the ComfyUI install");
-    // `download_file_streaming_with_progress` reports once, unthrottled,
-    // before the transfer starts (an immediate "(0%)" frame) and once per
-    // chunk after — so waiting for any "%)" frame while only excluding
-    // "(100%)" would pass on that very first callback even if pacing never
-    // let a real in-transfer frame render. Requiring a percentage strictly
-    // between 0 and 100 proves an actual mid-transfer frame was observed.
     session
         .wait_for_screen_where(
             "an intermediate (neither 0% nor 100%) download progress frame",
-            |screen| {
-                screen.contains("%)") && !screen.contains("(0%)") && !screen.contains("(100%)")
-            },
+            |screen| is_intermediate_download_progress_frame(screen),
             PTY_SCREEN_TIMEOUT,
         )
         .await
