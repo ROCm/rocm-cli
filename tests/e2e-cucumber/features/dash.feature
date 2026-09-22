@@ -276,14 +276,17 @@ Feature: Interactive dashboard
 
   @id:dash-instance-detail-scroll-hint @requires-os:linux
   Scenario: dash-22 - Instance detail shows a scroll hint when content overflows
-    # The demo fixtures' launch_args/env_vars are too few to overflow the detail
-    # popup at the default or enlarged terminal size, so this shrinks the
-    # terminal until the args/env panes can't fit them, exercising the one path
-    # (render_footer's scrollable branch) unit tests can't reach end to end.
+    # Opening the Observe view already enlarges the terminal (so other
+    # journeys can assert the detail popup's full layout); even the demo
+    # fixtures' launch_args/env_vars overflow that size, but this scenario
+    # needs the args/env panes to overflow specifically once shrunk further,
+    # so the assertion right before the shrink pins that starting point.
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens instance detail
-    And the user shrinks the terminal until the detail body overflows
+    Then the instance detail footer does not show the scroll hint
+    When the user shrinks the terminal until the detail body overflows
     Then the instance detail footer shows the scroll hint
+    And the instance detail body shows a scrollbar
     When the user quits the dashboard
     Then the dashboard exits successfully

@@ -223,9 +223,11 @@ async fn open_instance_detail(world: &mut E2eWorld) {
 
 #[when("the user shrinks the terminal until the detail body overflows")]
 async fn shrink_until_detail_overflows(world: &mut E2eWorld) {
-    // The demo fixtures' `launch_args`/`env_vars` are too few to overflow the
-    // detail popup at either the default or the enlarged (`use_detail_size`)
-    // geometry — this is the only terminal size small enough to force it.
+    // `open_observe_view` already enlarged the terminal (`use_detail_size`)
+    // before this scenario reached the detail popup, and the demo fixtures'
+    // `launch_args`/`env_vars` don't overflow the args/env panes at *that*
+    // size — this is the terminal size small enough to force it relative to
+    // the size the scenario is actually at, not relative to the true default.
     let tui = session(world);
     tui.use_overflow_size()
         .unwrap_or_else(|e| panic!("failed to shrink the dashboard: {e}"));
@@ -841,6 +843,35 @@ async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
         .unwrap_or_else(|e| {
             panic!("footer did not show the scroll hint once the detail body overflowed: {e}")
         });
+}
+
+#[then("the instance detail footer does not show the scroll hint")]
+async fn detail_footer_does_not_show_scroll_hint(world: &mut E2eWorld) {
+    // Pins the precondition the later shrink step's barrier depends on: the
+    // enlarged pre-shrink geometry must genuinely have no hint yet, or the
+    // shrink step's own wait would silently revert to a no-op (its marker
+    // already present) for the same reason a prior round of this scenario
+    // was flagged for. A plain read is correct here — this runs right after
+    // `open_instance_detail`'s own wait, with no action in between that
+    // could still be in flight.
+    let screen = session(world).screen_text();
+    assert!(
+        !screen.contains("↑/↓ scroll"),
+        "footer must not show the scroll hint before the terminal shrinks:\n{screen}"
+    );
+}
+
+#[then("the instance detail body shows a scrollbar")]
+async fn detail_body_shows_scrollbar(world: &mut E2eWorld) {
+    // Runs immediately after the scroll-hint `Then`, which already
+    // synchronized to the post-resize frame via `wait_for_screen` — no
+    // further redraw is expected between the two assertions, so a plain
+    // read is correct here too.
+    let screen = session(world).screen_text();
+    assert!(
+        screen.contains('║') || screen.contains('█'),
+        "detail body did not show a scrollbar once it overflowed:\n{screen}"
+    );
 }
 
 #[then("the backdrop behind the popup is dimmed")]

@@ -496,6 +496,13 @@ impl TuiSession {
     /// Poll the current screen until it contains `marker`, or fail with a
     /// deadline that includes the last screen for diagnosis. Also fails fast if
     /// the child exits before the marker appears.
+    ///
+    /// This only gates on the action you're waiting *for* if `marker` is
+    /// genuinely absent before it — the marker is tested before the first
+    /// sleep, so a call whose marker is already on screen returns
+    /// immediately and proves nothing about what happens afterward. A step
+    /// that re-waits on a marker a prior step already waited for is a silent
+    /// no-op, not a barrier.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
