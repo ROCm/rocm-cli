@@ -709,13 +709,26 @@ enum RuntimesCommand {
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Restart running local servers so they use the newly active runtime.
+        #[arg(long)]
+        restart_services: bool,
+        /// Do not ask for interactive confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Switch back to the previously selected ROCm runtime.
     #[command(
         after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
-    Rollback,
+    Rollback {
+        /// Restart running local servers so they use the restored runtime.
+        #[arg(long)]
+        restart_services: bool,
+        /// Do not ask for interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
@@ -7885,8 +7898,19 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
         RuntimesCommand::List => {
             print!("{}", render_runtimes_text(&paths, &config)?);
         }
-        RuntimesCommand::Activate { runtime } => {
-            let result = activate_runtime(&paths, &mut config, &runtime)?;
+        RuntimesCommand::Activate {
+            runtime,
+            restart_services,
+            yes,
+        } => {
+            // Checked before anything is written: a refused restart must leave
+            // the previously active runtime in place, not switch the runtime and
+            // then decline the half of the job the user actually asked for.
+            ensure_service_restart_approved(restart_services, yes, "activate <runtime_key>")?;
+            let mut result = activate_runtime(&paths, &mut config, &runtime)?;
+            if restart_services {
+                restart_stale_runtime_services(&paths, &result.runtime_key, &mut result.services);
+            }
             println!("runtime activated");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
@@ -7894,8 +7918,9 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 "  changed_from_runtime_key: {}",
                 result.previous_runtime_key.as_deref().unwrap_or("<unset>")
             );
-            println!(
-                "  note: running services keep their recorded runtime until they are restarted"
+            print!(
+                "{}",
+                render_runtime_service_reconciliation(&result.services)
             );
             if result.previous_runtime_key.is_some() {
                 println!("{ROLLBACK_RECOVERY_HINT}");
@@ -7913,9 +7938,17 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 ),
                 None,
             );
+            bail_on_failed_service_restarts(&result.services)?;
         }
-        RuntimesCommand::Rollback => {
-            let result = rollback_runtime(&paths, &mut config)?;
+        RuntimesCommand::Rollback {
+            restart_services,
+            yes,
+        } => {
+            ensure_service_restart_approved(restart_services, yes, "rollback")?;
+            let mut result = rollback_runtime(&paths, &mut config)?;
+            if restart_services {
+                restart_stale_runtime_services(&paths, &result.runtime_key, &mut result.services);
+            }
             println!("runtime rolled back");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
@@ -7923,8 +7956,9 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 "  changed_from_runtime_key: {}",
                 result.previous_runtime_key.as_deref().unwrap_or("<unset>")
             );
-            println!(
-                "  note: running services keep their recorded runtime until they are restarted"
+            print!(
+                "{}",
+                render_runtime_service_reconciliation(&result.services)
             );
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
@@ -7939,6 +7973,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 ),
                 None,
             );
+            bail_on_failed_service_restarts(&result.services)?;
         }
         RuntimesCommand::Uninstall {
             runtime,
@@ -8127,6 +8162,289 @@ pub(crate) struct RuntimeActivationResult {
     runtime_id: String,
     runtime_key: String,
     previous_runtime_key: Option<String>,
+    /// What the live local servers were running on when this activation
+    /// happened. Read from disk, never assumed: the activation report used to
+    /// print a fixed "running services keep their recorded runtime" note
+    /// whether or not a single service existed.
+    services: RuntimeServiceReconciliation,
+}
+
+/// Where one live local server stands relative to the runtime being activated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceRuntimeState {
+    /// The service already runs on this runtime, or is pinned to something
+    /// this activation does not move (a self-managed engine runtime, or an
+    /// explicit environment id).
+    Matches,
+    /// The service still runs on a different, recorded ROCm runtime.
+    Stale { recorded: String },
+    /// The service records neither a runtime nor an environment, so which
+    /// runtime it actually loaded cannot be derived from the record.
+    Unknown,
+}
+
+/// One live local server named in the activation report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeServiceEntry {
+    service_id: String,
+    engine: String,
+    /// The runtime key recorded on the service. `None` for `Unknown` entries.
+    recorded_runtime: Option<String>,
+}
+
+impl RuntimeServiceEntry {
+    fn recorded_runtime_display(&self) -> &str {
+        self.recorded_runtime.as_deref().unwrap_or("<unset>")
+    }
+}
+
+/// A local server whose restart onto the newly active runtime did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FailedServiceRestart {
+    service_id: String,
+    error: String,
+}
+
+/// The live local servers seen at activation time, grouped by what the
+/// activation means for them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RuntimeServiceReconciliation {
+    /// Live services still running on a different recorded runtime.
+    stale: Vec<RuntimeServiceEntry>,
+    /// Live services whose runtime cannot be derived from their record.
+    unknown: Vec<RuntimeServiceEntry>,
+    /// Stale services successfully moved onto the new runtime.
+    restarted: Vec<String>,
+    /// Stale services that could not be moved; each keeps running on the
+    /// runtime it recorded before the attempt.
+    failed: Vec<FailedServiceRestart>,
+}
+
+/// Classify one record against the runtime key being activated.
+///
+/// Two live services are deliberately NOT stale:
+///
+/// - engines that manage their own runtime (`engine_manages_own_runtime`)
+///   record an engine-private key such as `lemonade-embeddable-<version>`,
+///   which is never a ROCm runtime key, so comparing it to one would report
+///   every lemonade server as permanently stale;
+/// - a service pinned to an explicit `env_id` with no recorded runtime was
+///   launched against that environment, not against whatever runtime happens
+///   to be active, so activation does not move it.
+fn classify_service_runtime_state(
+    record: &ManagedServiceRecord,
+    runtime_key: &str,
+) -> ServiceRuntimeState {
+    if engine_manages_own_runtime(&record.engine) {
+        return ServiceRuntimeState::Matches;
+    }
+    match record.runtime_id.as_deref() {
+        // A plain string compare is enough: every launch path resolves its
+        // selector through `resolve_runtime_selector_to_exact_key`, so the
+        // recorded value is already an exact versioned runtime key, the same
+        // shape as `runtime_key` here.
+        Some(recorded) if recorded == runtime_key => ServiceRuntimeState::Matches,
+        Some(recorded) => ServiceRuntimeState::Stale {
+            recorded: recorded.to_owned(),
+        },
+        None if record.env_id.is_some() => ServiceRuntimeState::Matches,
+        None => ServiceRuntimeState::Unknown,
+    }
+}
+
+/// Read the live local servers and work out which of them the activation of
+/// `runtime_key` leaves behind.
+///
+/// Called BEFORE the activation writes, so a services folder that cannot be
+/// read fails the command while the previous runtime is still fully in place.
+///
+/// `load_managed_services` refreshes each record against the engine state and
+/// the real processes, and rewrites the manifest when that refresh corrects a
+/// status — so reading service state here can touch disk. That is safe on this
+/// path: unlike `build_service_prune_plan`, which snapshots manifest mtimes
+/// first because its age gate reads them, nothing in activation looks at
+/// manifest timestamps. The refresh is also what makes the report trustworthy,
+/// since a dead process must not be reported as a service still holding the
+/// previous runtime.
+fn reconcile_services_for_runtime(
+    paths: &AppPaths,
+    runtime_key: &str,
+) -> Result<RuntimeServiceReconciliation> {
+    let mut reconciliation = RuntimeServiceReconciliation::default();
+    for record in load_managed_services(paths)? {
+        if !managed_service_is_live(&record) {
+            continue;
+        }
+        match classify_service_runtime_state(&record, runtime_key) {
+            ServiceRuntimeState::Matches => {}
+            ServiceRuntimeState::Stale { recorded } => {
+                reconciliation.stale.push(RuntimeServiceEntry {
+                    service_id: record.service_id,
+                    engine: record.engine,
+                    recorded_runtime: Some(recorded),
+                });
+            }
+            ServiceRuntimeState::Unknown => reconciliation.unknown.push(RuntimeServiceEntry {
+                service_id: record.service_id,
+                engine: record.engine,
+                recorded_runtime: None,
+            }),
+        }
+    }
+    Ok(reconciliation)
+}
+
+/// Render the service half of an activation/rollback report.
+///
+/// Always prints a count, including `services_on_previous_runtime: 0`, so a
+/// clean switch is distinguishable from a report that simply forgot to look —
+/// which is exactly what the old fixed note could not tell a user.
+fn render_runtime_service_reconciliation(services: &RuntimeServiceReconciliation) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "  services_on_previous_runtime: {}",
+        services.stale.len()
+    );
+    for entry in &services.stale {
+        let _ = writeln!(
+            output,
+            "    - {} engine={} recorded_runtime={}",
+            entry.service_id,
+            entry.engine,
+            entry.recorded_runtime_display()
+        );
+    }
+    if !services.unknown.is_empty() {
+        let _ = writeln!(
+            output,
+            "  services_with_unrecorded_runtime: {}",
+            services.unknown.len()
+        );
+        for entry in &services.unknown {
+            let _ = writeln!(
+                output,
+                "    - {} engine={} recorded_runtime={}",
+                entry.service_id,
+                entry.engine,
+                entry.recorded_runtime_display()
+            );
+        }
+    }
+    if !services.restarted.is_empty() {
+        let _ = writeln!(output, "  services_restarted: {}", services.restarted.len());
+        for service_id in &services.restarted {
+            let _ = writeln!(output, "    - {service_id}");
+        }
+    }
+    if !services.failed.is_empty() {
+        let _ = writeln!(
+            output,
+            "  services_restart_failed: {}",
+            services.failed.len()
+        );
+        for failure in &services.failed {
+            let _ = writeln!(output, "    - {}: {}", failure.service_id, failure.error);
+        }
+    }
+    if !services.stale.is_empty() && services.restarted.is_empty() && services.failed.is_empty() {
+        let _ = writeln!(
+            output,
+            "  note: those keep serving on their recorded runtime until they are restarted; \
+             add --restart-services --yes to move them"
+        );
+    }
+    output
+}
+
+/// `--restart-services` stops and respawns running local servers, so it takes
+/// the same explicit approval every other service mutation takes. This path
+/// never prompts — `--yes` is the only approval it accepts.
+fn ensure_service_restart_approved(restart_services: bool, yes: bool, command: &str) -> Result<()> {
+    if restart_services && !yes {
+        bail!(
+            "restarting running local servers requires --yes.\n\nTry: rocm runtimes {command} --restart-services --yes"
+        );
+    }
+    Ok(())
+}
+
+/// Move every stale live service onto the newly active runtime.
+///
+/// Best-effort per service: one failure does not abandon the rest, and the
+/// caller reports every failure and exits non-zero.
+fn restart_stale_runtime_services(
+    paths: &AppPaths,
+    runtime_key: &str,
+    services: &mut RuntimeServiceReconciliation,
+) {
+    // Taken out and put back so the report still lists what was found while the
+    // restarted/failed vectors beside it are appended to.
+    let stale = std::mem::take(&mut services.stale);
+    for entry in &stale {
+        match restart_service_onto_runtime(paths, &entry.service_id, runtime_key) {
+            Ok(()) => services.restarted.push(entry.service_id.clone()),
+            Err(error) => services.failed.push(FailedServiceRestart {
+                service_id: entry.service_id.clone(),
+                error: format!("{error:#}"),
+            }),
+        }
+    }
+    services.stale = stale;
+}
+
+/// Rewrite the service record onto `runtime_key`, THEN restart it.
+///
+/// The order is load-bearing. `restart_internal_managed_service` rebuilds the
+/// child's argv from the record on disk and passes `record.runtime_id`
+/// verbatim, so restarting first would bring the service back up on the runtime
+/// it was already using and report success — the very bug this path exists to
+/// fix. The restart itself goes through the unchanged managed-serve path, so
+/// device policy (including gpu_required) is validated exactly as it is for a
+/// fresh `rocm serve`.
+///
+/// On failure the record is put back on the runtime it actually ran on, so a
+/// service left running is never described by a runtime it never loaded.
+fn restart_service_onto_runtime(
+    paths: &AppPaths,
+    service_id: &str,
+    runtime_key: &str,
+) -> Result<()> {
+    let mut record = load_managed_service(paths, service_id)?;
+    let previous_runtime_id = record.runtime_id.clone();
+    record.runtime_id = Some(runtime_key.to_owned());
+    record.write()?;
+    match restart_internal_managed_service(paths, service_id) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if let Ok(mut current) = load_managed_service(paths, service_id) {
+                current.runtime_id = previous_runtime_id;
+                let _ = current.write();
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Fail the command when any requested restart did not happen, naming every
+/// service that was left behind. The report has already been printed, so this
+/// only has to make the exit code match what the report says.
+fn bail_on_failed_service_restarts(services: &RuntimeServiceReconciliation) -> Result<()> {
+    if services.failed.is_empty() {
+        return Ok(());
+    }
+    let names = services
+        .failed
+        .iter()
+        .map(|failure| failure.service_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "the runtime was switched, but {} local server(s) could not be restarted onto it: {names}. \
+         Each still runs on the runtime it recorded; check `rocm services logs <id>` and restart it \
+         again once the cause is fixed.",
+        services.failed.len()
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -8295,6 +8613,10 @@ pub(crate) fn activate_runtime(
         .map(|manifest| manifest.runtime_id.clone())
         .filter(|_| previous_runtime_key.is_some());
 
+    // Read the live services before anything is written, so an unreadable
+    // services folder refuses the activation instead of half-applying it.
+    let services = reconcile_services_for_runtime(paths, &manifest.runtime_key)?;
+
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
     config.previous_runtime_key = previous_runtime_key.clone();
@@ -8316,6 +8638,7 @@ pub(crate) fn activate_runtime(
         runtime_id: manifest.runtime_id.clone(),
         runtime_key: manifest.runtime_key.clone(),
         previous_runtime_key,
+        services,
     })
 }
 
@@ -8340,6 +8663,8 @@ fn rollback_runtime(
         .map(|manifest| manifest.runtime_id.clone())
         .filter(|_| new_previous_key.is_some());
 
+    let services = reconcile_services_for_runtime(paths, &previous.runtime_key)?;
+
     config.default_runtime_id = Some(previous.runtime_id.clone());
     config.active_runtime_key = Some(previous.runtime_key.clone());
     config.previous_runtime_key = new_previous_key.clone();
@@ -8361,6 +8686,7 @@ fn rollback_runtime(
         runtime_id: previous.runtime_id.clone(),
         runtime_key: previous.runtime_key.clone(),
         previous_runtime_key: new_previous_key,
+        services,
     })
 }
 
@@ -17809,9 +18135,10 @@ fn append_update_activate_summary(output: &mut String, activation: &RuntimeActiv
             .as_deref()
             .unwrap_or("<unset>")
     );
-    let _ = writeln!(
+    let _ = write!(
         output,
-        "  note: running services keep their recorded runtime until they are restarted"
+        "{}",
+        render_runtime_service_reconciliation(&activation.services)
     );
     if activation.previous_runtime_key.is_some() {
         let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
@@ -26969,18 +27296,41 @@ install therock";
         status: &str,
         supervisor_pid: u32,
     ) -> Result<ManagedServiceRecord> {
-        let mut record = ManagedServiceRecord::new(
+        plant_service_record_on_runtime(
             paths,
             service_id,
             "vllm",
+            status,
+            supervisor_pid,
+            None,
+            None,
+        )
+    }
+
+    /// [`plant_service_record`] with the three fields the runtime-activation
+    /// tests need to vary: the engine (self-managed engines are never stale),
+    /// the recorded runtime key, and the environment pin.
+    fn plant_service_record_on_runtime(
+        paths: &AppPaths,
+        service_id: &str,
+        engine: &str,
+        status: &str,
+        supervisor_pid: u32,
+        runtime_id: Option<&str>,
+        env_id: Option<&str>,
+    ) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            engine,
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
             9,
             "managed",
             supervisor_pid,
-            None,
-            None,
+            runtime_id.map(ToOwned::to_owned),
+            env_id.map(ToOwned::to_owned),
             Some("gpu_required".to_owned()),
         );
         status.clone_into(&mut record.status);
@@ -31093,6 +31443,227 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    /// The two runtimes every activation/reconciliation test switches between.
+    const OLD_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-12-0";
+    const NEW_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-13-0";
+
+    /// Register both runtimes and make `OLD_RUNTIME_KEY` the active one, which
+    /// is the state every "switch away from it" test starts from.
+    fn activate_old_runtime(paths: &AppPaths) -> Result<RocmCliConfig> {
+        write_test_pip_runtime(
+            paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        activate_runtime(paths, &mut config, OLD_RUNTIME_KEY)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn runtime_activation_reports_live_service_on_previous_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-live-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // The current process is a guaranteed-live pid, and "starting" keeps the
+        // liveness refresh from probing an endpoint nothing is serving — the
+        // record stays live without a server behind it.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-on-old-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        assert_eq!(
+            result.services.stale,
+            vec![RuntimeServiceEntry {
+                service_id: "svc-on-old-runtime".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+            }],
+            "a live service still recording the previous runtime is exactly what \
+             the activation report exists to name"
+        );
+        let rendered = render_runtime_service_reconciliation(&result.services);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1"),
+            "the report must count what it found:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- svc-on-old-runtime engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+            )),
+            "the report must name the service and the runtime it is still on:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("add --restart-services --yes to move them"),
+            "having found something to move, the report must say how:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("running services keep their recorded runtime"),
+            "the fixed note this replaced was printed whether or not any service \
+             existed; it must not survive alongside the derived report:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_ignores_stopped_services() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-stopped-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // A stopped service holds no runtime: it will pick up whatever is active
+        // when it is next launched, so reporting it would send the user chasing
+        // a restart that changes nothing.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-stopped",
+            "vllm",
+            "stopped",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = render_runtime_service_reconciliation(&result.services);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.services.stale.is_empty(), "{:?}", result.services);
+        assert!(result.services.unknown.is_empty(), "{:?}", result.services);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "a clean switch must still print the count, so it reads differently \
+             from a report that never looked:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_ignores_self_managed_engine_services() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-self-managed");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // lemonade pins its own embeddable runtime, which is never a ROCm
+        // runtime key — comparing it against one would report every lemonade
+        // server as permanently stale, on every activation, forever.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-lemonade",
+            "lemonade",
+            "starting",
+            std::process::id(),
+            Some("lemonade-embeddable-8.1.11"),
+            None,
+        )?;
+        // A service pinned to an explicit environment was launched against that
+        // environment, not against whatever runtime happens to be active.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-env-pinned",
+            "vllm",
+            "starting",
+            std::process::id(),
+            None,
+            Some("custom-env"),
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = render_runtime_service_reconciliation(&result.services);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.services.stale.is_empty(), "{:?}", result.services);
+        assert!(result.services.unknown.is_empty(), "{:?}", result.services);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "neither service is moved by a ROCm runtime switch:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_restart_services_requires_yes() {
+        let error = ensure_service_restart_approved(true, false, "activate <runtime_key>")
+            .expect_err("restarting local servers must not happen without --yes")
+            .to_string();
+
+        assert!(
+            error.contains("requires --yes"),
+            "the refusal must name the missing approval:\n{error}"
+        );
+        assert!(
+            error.contains("rocm runtimes activate <runtime_key> --restart-services --yes"),
+            "this path never prompts, so the refusal must spell out the command \
+             that does work:\n{error}"
+        );
+
+        assert!(
+            ensure_service_restart_approved(true, true, "activate <runtime_key>").is_ok(),
+            "--yes is the approval this path accepts"
+        );
+        assert!(
+            ensure_service_restart_approved(false, false, "rollback").is_ok(),
+            "an activation that restarts nothing needs no approval"
+        );
+    }
+
+    #[test]
+    fn runtime_rollback_reports_live_service_on_previous_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-rollback-live-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        // Serving started on the newer runtime; rolling back leaves this server
+        // behind exactly the way activating forward does.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-on-new-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(NEW_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = rollback_runtime(&paths, &mut config)?;
+        let rendered = render_runtime_service_reconciliation(&result.services);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(result.runtime_key, OLD_RUNTIME_KEY);
+        assert_eq!(
+            result.services.stale,
+            vec![RuntimeServiceEntry {
+                service_id: "svc-on-new-runtime".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(NEW_RUNTIME_KEY.to_owned()),
+            }]
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- svc-on-new-runtime engine=vllm recorded_runtime={NEW_RUNTIME_KEY}"
+            )),
+            "rollback reports live services the same way activate does:\n{rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn runtime_activation_rejects_ambiguous_runtime_id() -> Result<()> {
         let (root, paths) = test_paths("runtime-ambiguous");
@@ -34489,9 +35060,18 @@ ID_LIKE="suse opensuse"
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
+            // No live services: this test is about the rollback hint, and an
+            // empty reconciliation is what an update on a machine with nothing
+            // serving produces.
+            services: RuntimeServiceReconciliation::default(),
         };
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &with_previous);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "the update summary reports service state the same way `runtimes \
+             activate` does, including when there is none:\n{rendered}"
+        );
         assert!(
             rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
@@ -34505,6 +35085,7 @@ ID_LIKE="suse opensuse"
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: None,
+            services: RuntimeServiceReconciliation::default(),
         };
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &without_previous);
