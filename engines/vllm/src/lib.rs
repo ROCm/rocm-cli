@@ -1530,8 +1530,8 @@ fn vllm_rocm10_discover_install_args(
 
 /// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
 /// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
-/// download` resolved so the real install can never silently drift to a
-/// different (or non-ROCm) build. Returns the five pins actually installed.
+/// install --dry-run` resolved so the real install can never silently drift
+/// to a different (or non-ROCm) build. Returns the five pins actually installed.
 fn install_vllm_rocm10_discover(
     uv: &Path,
     paths: &AppPaths,

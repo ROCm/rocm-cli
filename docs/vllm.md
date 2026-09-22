@@ -62,12 +62,13 @@ and amd-aiter there under a rotating dev-tag filename (for example
 so there is no fixed filename to pin in the adapter.
 
 Instead, the install resolves each package's current wheel from AMD's index
-with `uv pip download --no-deps --no-index`, then reinstalls pinned to the
-exact version that resolved (torch and tensorizer stay pinned as usual). If
-discovery finds zero or more than one matching wheel for a package, the
-install fails rather than falling back to an unpinned or CPU install. Every
-other ROCm SDK version, including 7.2.3, is unaffected and keeps using the
-static pin table.
+with `uv pip install --dry-run --reinstall`, parses the version it reports it
+would install, then reinstalls pinned to that exact version (torch and
+tensorizer stay pinned as usual). If AMD's index has no compatible build for a
+package, the resolver fails and the install fails rather than falling back to
+an unpinned or CPU install. Every other ROCm SDK version, including 7.2.3,
+keeps using the static pin table; an SDK version with no matching row there
+falls back to the table's default pin instead of failing outright.
 
 Supported discovery paths:
 
