@@ -173,6 +173,7 @@ stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
 
 Guardrails:
 
+- new subsystems/subcommands default to their own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs`), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)

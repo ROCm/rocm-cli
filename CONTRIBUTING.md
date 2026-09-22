@@ -65,6 +65,15 @@ cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_
 | `crates/rocm-engine-protocol` | Engine IPC protocol |
 | `engines/` | Inference engine adapters (lemonade, vllm) |
 
+### Module organization
+
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. Two extraction patterns already exist in this codebase; use whichever fits:
+
+- **Full domain extraction** — a self-contained subsystem gets its own file with its own types and a `pub mod x;` + re-export. Default for new subsystems. Examples: `apps/rocm/src/therock.rs`, `comfyui.rs`, `providers.rs`; `crates/rocm-core`'s `diagnose.rs`/`examine.rs`.
+- **Mechanical relocation** — a `pub(crate) fn` moves out verbatim, with shared types/config staying at the crate root and reached via `crate::`. Used for dispatch-adjacent clusters where a minimal, easy-to-review diff matters more than full extraction. Examples: `apps/rocm/src/automations.rs`, `uninstall.rs`.
+
+See `docs/architecture.md` for the current module map.
+
 ### Test commands
 
 | Component | Command |
