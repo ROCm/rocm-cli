@@ -319,9 +319,28 @@ Activate one validated runtime:
 
 ```bash
 rocm runtimes activate <runtime_key>
+rocm runtimes activate <runtime_key> --restart-services --yes
 ```
 
-Engine installs and managed serving inherit this active runtime by default.
+New engine installs and new serve launches use this active runtime by default.
+Already-running managed servers do not follow the activation: each one keeps
+the runtime recorded in its service record until it is restarted. The
+activation report says so from that recorded state rather than as a fixed
+note — it prints `services_on_previous_runtime: <n>` with one line per stale
+service (`- <service_id> engine=<engine> recorded_runtime=<key>`), and
+`services_on_previous_runtime: 0` when nothing is left behind. Live services
+whose record pins neither a runtime nor an environment are counted separately
+under `services_with_unrecorded_runtime:`. Services on an engine that manages
+its own runtime (`lemonade`) and services pinned to an explicit env id are
+never counted as stale.
+
+`--restart-services` moves those services: it rewrites each service record onto
+the newly active runtime and then restarts it. It requires `--yes` and never
+prompts, the same idiom as `rocm services restart <id> --yes` and
+`rocm runtimes uninstall --yes`. Restart is best effort per service — a service
+that fails to restart is put back on the runtime it actually ran on, every
+failure is named, and the command exits non-zero.
+
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.
 
@@ -333,10 +352,12 @@ Developer-only previous-runtime regression check:
 
 ```bash
 rocm runtimes rollback
+rocm runtimes rollback --restart-services --yes
 ```
 
 This command validates the saved previous-runtime marker, but it is not the
-primary user-facing way to switch ROCm installs.
+primary user-facing way to switch ROCm installs. It reports and restarts
+running services exactly as `activate` does.
 
 Import an existing rocm-cli/TheRock runtime manifest in read-only mode:
 

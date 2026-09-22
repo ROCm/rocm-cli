@@ -168,6 +168,14 @@ Expected result:
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
   pinned `rocm[libraries,devel,device-…]` install succeeds.
 - `rocm examine` reports the active runtime as ready.
+- `rocm runtimes activate <runtime_key>` ends its report with a count of the
+  running local servers left on the previous runtime. Nothing is serving yet at
+  this point, so it must read `services_on_previous_runtime: 0`. A fixed note
+  about running services in place of that count means this test fails.
+- `rocm runtimes activate <runtime_key> --restart-services` without `--yes`
+  refuses, names `--restart-services --yes` as the way to repeat it, and leaves
+  the active runtime alone. Section 4 exercises the same report and the same
+  flags with a server actually running.
 
 Developer-only deterministic override:
 
@@ -225,6 +233,41 @@ Expected result:
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
+
+Switching runtimes does not move a server that is already running. With one up,
+check what an activation says about it, using the other runtime key from
+section 2:
+
+```powershell
+rocm services
+rocm runtimes activate <other_runtime_key>
+rocm runtimes rollback --restart-services --yes
+```
+
+The second switch is a `rollback` rather than a second `activate` of the same
+key on purpose: activating the runtime that is already active clears the
+rollback target, so it is not the command to repeat here.
+
+Expected result:
+
+- The activation report counts the running servers left on the previous runtime
+  under `services_on_previous_runtime: <n>` and names each one as
+  `- <service-id> engine=<engine> recorded_runtime=<runtime_key>`, then says
+  they keep serving on their recorded runtime until they are restarted and that
+  `--restart-services --yes` moves them.
+- A Lemonade server is never counted, because that engine brings its own
+  runtime: with only Lemonade serving, the count stays
+  `services_on_previous_runtime: 0`. Use a vLLM server on Linux or WSL to see a
+  non-zero count. A server started against an explicit engine environment
+  (`--env-id`) is not counted either.
+- A running server whose record names neither a runtime nor an engine
+  environment is counted apart, under `services_with_unrecorded_runtime:`.
+- The rollback switches back and restarts each counted server onto the runtime
+  it restored, listing them under `services_restarted: <n>`; `rocm services`
+  shows them running again.
+- A server that fails to come back is named under
+  `services_restart_failed: <n>`, is left on the runtime it was actually
+  running, and the command exits with an error instead of reporting success.
 
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:

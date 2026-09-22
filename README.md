@@ -373,13 +373,43 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key>
-rocm runtimes rollback
+rocm runtimes activate <runtime-key> [--restart-services] [--yes]
+rocm runtimes rollback [--restart-services] [--yes]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`activate` and `rollback` change which runtime the next install or server
+picks up. A server that is already running is not moved: it keeps serving on
+the runtime it started with until it is restarted. Both commands count the
+servers that leaves behind and name each one, from what those servers
+themselves recorded:
+
+```
+  services_on_previous_runtime: 2
+    - svc-a engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
+    - svc-b engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
+  note: those keep serving on their recorded runtime until they are restarted; add --restart-services --yes to move them
+```
+
+When nothing is left behind the count is `services_on_previous_runtime: 0`. A
+running server whose record names neither a runtime nor an engine environment
+is counted separately under `services_with_unrecorded_runtime:`, because what
+it loaded cannot be read back from the record. Servers on an engine that brings
+its own runtime (`lemonade`) and servers started against an explicit
+environment are never counted: activating a runtime does not move them. The
+same summary appears in the `rocm update --apply --activate` report.
+
+Add `--restart-services` to move those servers onto the newly active runtime
+rather than leave them behind; each one is put on the new runtime and then
+restarted, so it comes back serving from it. That restarts running servers, so
+it requires `--yes` and never prompts, the same as
+`rocm services restart <service-id> --yes`. Servers are handled one at a time
+and a failure does not stop the rest: a server that fails to come back is left
+on the runtime it was actually running, every failure is named in the summary,
+and the command exits with an error.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
