@@ -56,10 +56,12 @@ kernel will fail at serving time.
 ### ROCm 10.x wheel discovery
 
 For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
-and index URL. ROCm SDK 10.0.0 is different: AMD publishes vLLM, flash-attn,
-and amd-aiter there under a rotating dev-tag filename (for example
+and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,
+flash-attn, and amd-aiter there under a rotating dev-tag filename (for example
 `vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
-so there is no fixed filename to pin in the adapter.
+so there is no fixed filename to pin in the adapter. This route is selected by
+major version alone, so `10.0.0`, `10.1.0`, and any other `10.x` all discover
+through it rather than only `10.0.0`.
 
 Instead, the install resolves each package's current wheel from AMD's index
 with `uv pip install --dry-run --reinstall`, parses the version it reports it
@@ -68,7 +70,11 @@ tensorizer stay pinned as usual). If AMD's index has no compatible build for a
 package, the resolver fails and the install fails rather than falling back to
 an unpinned or CPU install. Every other ROCm SDK version, including 7.2.3,
 keeps using the static pin table; an SDK version with no matching row there
-falls back to the table's default pin instead of failing outright.
+falls back to the table's default pin, *unless* its major release matches a
+discovery-table entry, in which case guessing the default pin would very
+likely install an ABI-incompatible build, so the install fails closed instead
+with a message naming the detected version and pointing at
+`ROCM_CLI_VLLM_ROCM_INDEX_URL` as the way to install anyway.
 
 Supported discovery paths:
 

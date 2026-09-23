@@ -92,18 +92,12 @@ Feature: TheRock "next" ROCm 10 install layout
   # install should resolve the runner's real GPU into the exact arch the next
   # layout needs without the user ever typing a raw GFX code. The fixture
   # scenarios above can't prove this: their fixtures serve a fixed gfx1200
-  # regardless of what GPU the runner actually has.
-  #
-  # The last two steps prove the vLLM ROCm 10.x wheel discovery route rather
-  # than the fixed pin table other SDK versions use: AMD publishes vllm,
-  # flash-attn, and amd-aiter under rotating dev-tag filenames for 10.0.0, so
-  # the adapter resolves each package's current wheel from AMD's live index
-  # with `uv pip install --dry-run --reinstall` before installing pinned to
-  # what that reported. No fixture can serve a rotating dev-tag filename and
-  # stay meaningful, so this is the only place that mechanism runs against the
-  # real index at all. `@requires-engine:vllm` because the fixed-pin engines
-  # never take this route.
-  @id:therock-next-07-live-install-auto-detects-arch @requires-gpu @requires-engine:vllm @nightly
+  # regardless of what GPU the runner actually has. Deliberately not tagged
+  # `@requires-engine:vllm`: that tag would skip this scenario's arch-detection
+  # assertions wherever vLLM can't start (e.g. a lemonade-only Strix host),
+  # narrowing coverage this scenario exists to provide. See therock-next-09 for
+  # the vLLM-specific route, which pays for its own runtime instead.
+  @id:therock-next-07-live-install-auto-detects-arch @requires-gpu @nightly
   Scenario: therock-next-07 - Installing the SDK from the live ROCm 10 preview source auto-detects the exact arch
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override
@@ -113,8 +107,6 @@ Feature: TheRock "next" ROCm 10 install layout
     And the runtime is set as active
     And the runtime includes an inference engine
     And the ROCm 10 runtime passes SDK and Torch GPU probes
-    When the user reinstalls vllm
-    Then the install reports the vLLM ROCm 10.x discovery pins
 
   # The regression this pins is distinct from therock-next-02's: that scenario
   # proves a *fresh* install resolves an exact arch when the user supplies one.
@@ -130,3 +122,23 @@ Feature: TheRock "next" ROCm 10 install layout
     And a registered ROCm 10 wheel runtime with a grouped family
     When the user previews applying the pending update to that runtime
     Then the preview requests the gfx1200 device extras
+
+  # Proves the vLLM ROCm 10.x wheel discovery route rather than the fixed pin
+  # table other SDK versions use: AMD publishes vllm, flash-attn, and
+  # amd-aiter under rotating dev-tag filenames for ROCm 10.x, so the adapter
+  # resolves each package's current wheel from AMD's live index with
+  # `uv pip install --dry-run --reinstall` before installing pinned to what
+  # that reported. No fixture can serve a rotating dev-tag filename and stay
+  # meaningful, so this is the only place that mechanism runs against the
+  # real index at all. Provisions its own ROCm 10 runtime rather than reusing
+  # therock-next-07's, so that scenario's arch-detection coverage still runs
+  # on hosts that can't start vLLM.
+  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm @nightly
+  Scenario: therock-next-09 - Installing vLLM against a live ROCm 10 preview runtime reports the discovery pins
+    Given a machine with no CLI-managed runtimes
+    When the user installs the SDK from the ROCm 10 preview source with no family override
+    Then a runtime is registered
+    And the runtime is set as active
+    And the runtime includes an inference engine
+    When the user reinstalls vllm
+    Then the install reports the vLLM ROCm 10.x discovery pins
