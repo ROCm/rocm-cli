@@ -223,7 +223,17 @@ mod tests {
                 }
                 State::Str => {
                     if c == '\\' {
-                        out.push_str("  ");
+                        // The escaped character cannot close the literal, so
+                        // it is consumed here. When it is a NEWLINE -- a line
+                        // continuation, which several strings in this tree use,
+                        // including this file's own assertion message -- the
+                        // newline is not part of the string's value but it is
+                        // part of the file's line structure. Replacing it with
+                        // a space merges two source lines and shifts the line
+                        // number of every offense reported after it, which is
+                        // the `file:line` the assertion promises.
+                        out.push(' ');
+                        out.push(if next == Some('\n') { '\n' } else { ' ' });
                         i += 2;
                         continue;
                     }
@@ -732,6 +742,25 @@ mod tests {
         assert!(
             stripped.contains("let c = 1;"),
             "code must survive: {stripped:?}"
+        );
+    }
+
+    /// A `\` at end of line continues a string literal onto the next one. The
+    /// newline is not part of the string's value, but it is part of the file's
+    /// line structure, and losing it renumbers everything below.
+    #[test]
+    fn a_line_continuation_in_a_literal_does_not_renumber_the_lines() {
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n\
+             \x20       let _s = \"continued \\\n             here\";\n\
+             \x20       {}\n    }}\n}}\n",
+            mutation_call("set_var")
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            hits[0].line, 7,
+            "the continuation spans lines 5-6, so the mutation is on line 7"
         );
     }
 
