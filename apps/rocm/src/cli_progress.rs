@@ -39,7 +39,7 @@ pub(crate) struct Spinner {
     label: String,
     /// The byte-count/percentage tail of a progress label (e.g.
     /// `" 1.5 MiB / 19.1 MiB (8%)"`), kept apart from `label` so
-    /// [`Self::render_current`] can always keep it intact — see its comment.
+    /// [`assemble_status_line`] can always keep it intact — see its comment.
     /// `None` outside of [`Self::set_progress`] (a plain [`Self::set_label`]
     /// message has no such suffix to preserve).
     progress_suffix: Option<String>,
@@ -187,7 +187,8 @@ fn truncate_to_width(line: &str, max_width: usize) -> String {
 /// If `frame` and `suffix` alone already exceed `max_width` (an extremely
 /// narrow terminal, or a suffix wider than the terminal), there is no
 /// longer room to keep `suffix` intact either — falls back to truncating
-/// `"{frame} {suffix}"` as a whole, same as the no-suffix case below, so the
+/// `"{frame}{suffix}"` as a whole (no literal space; `suffix` already
+/// carries its own leading space), same as the no-suffix case below, so the
 /// result never exceeds `max_width` regardless of how narrow it is.
 fn assemble_status_line(
     frame: &str,
@@ -303,7 +304,7 @@ impl Drop for AnimatedSpinner {
 
 /// The trailing `" <bytes> / <total> (<pct>%)"` (or `" <bytes>"` when the
 /// total is unknown) portion of a progress label, kept separate from the
-/// operation prefix so [`Spinner::render_current`] can always keep it
+/// operation prefix so [`assemble_status_line`] can always keep it
 /// visible — see its comment.
 fn format_progress_suffix(bytes: u64, total: Option<u64>) -> String {
     match total {
@@ -348,6 +349,10 @@ mod tests {
         assert!(
             !rendered.contains('/') && !rendered.contains('%'),
             "no total means no fraction or percentage: {rendered}"
+        );
+        assert!(
+            rendered.starts_with(' '),
+            "format_progress_suffix's None-total branch must keep its own leading space: {rendered}"
         );
     }
 
