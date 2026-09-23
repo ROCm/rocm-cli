@@ -35,25 +35,38 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, linux, strix-halo, wsl]` |
+| `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
 | `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
 
-The Ubuntu and Windows Strix Halo lanes run on the AMD Ryzen DevLab Dispatch
-pool: a fresh runner is registered per job and destroyed after, opt-in only via
-the `devlab-dispatch` label, so the pool never picks up a job by accident even
-though its hosts also carry `strix-halo`. `e2e-wsl` stays on a static, always-on
-host (a WSL2 guest on a specific pre-configured Windows box, not generic Strix
-Halo hardware — the pool doesn't provide an equivalent) and pins the extra
-`wsl` label to disambiguate it from any other Linux Strix Halo runner.
+All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
+runner is registered per job and destroyed after, opt-in only via the
+`devlab-dispatch` label, so the pool never picks up a job by accident even
+though its hosts also carry `strix-halo`. `e2e-wsl` lands on the same
+Windows hosts as `e2e-gpu-strix-windows` — it installs WSL2 and an
+Ubuntu-24.04 distro fresh inside the job rather than needing a dedicated
+`wsl`-labeled runner. That distro is unregistered between jobs by the pool's
+own design (confirmed by its maintainer, along with `/dev/dxg` passthrough
+working on these hosts), so every run pays a ~5min distro-install cost before
+installing ROCm's WSL driver bridge (`librocdxg`, via
+`scripts/wsl_setup_rocdxg.sh`) and cloning the checkout into the guest's
+native filesystem to avoid building against the slow DrvFs mount.
 
-This migration is scoped to the per-PR lanes in this table only.
-`nightly.yml`'s Ubuntu and Windows Strix lanes (`e2e-gpu-nightly-strix`,
-`e2e-gpu-nightly-strix-windows`) still pin the `native` label and run on the
-same static, always-on host these per-PR lanes moved off of — that label still
-means what it always did there (two Linux runners share `strix-halo`, a native
-host and a WSL host, and `native` disambiguates the former). Moving nightly
-onto the pool is a separate, not-yet-made decision.
+This migration is scoped to the per-PR lanes in this table, plus the nightly
+WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
+Strix lanes (`e2e-gpu-nightly-strix`, `e2e-gpu-nightly-strix-windows`) still
+pin the `native` label and run on the same static, always-on host these per-PR
+lanes moved off of — that label still means what it always did there:
+`native` disambiguates this host from any runner that might carry a bare
+`wsl` label alongside `strix-halo` (the static WSL runner this repo used
+before the WSL lanes below moved to the ephemeral pool). Whether that runner
+remains registered is not something this migration changes either way, since
+nothing here targets a `wsl`-labeled runner anymore. `nightly.yml`'s
+`e2e-wsl-nightly`, however, already moved onto the same DevLab Dispatch pool
+as the per-PR `e2e-wsl` lane above, for the same reason: WSL2 needs no
+dedicated `wsl`-labeled runner, so there is nothing pool-incompatible about
+it. Moving the two `native` nightly lanes onto the pool as well is a
+separate, not-yet-made decision.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
@@ -73,15 +86,22 @@ exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
 
-`e2e-wsl` runs on an Ubuntu distro hosted in WSL2 on the Strix Halo Windows box
-and mirrors the sibling Linux lane step for step: stray-serve reclaim, GPU
+`e2e-wsl` runs on the DevLab Dispatch pool. Its WSL2/Ubuntu-24.04 distro is
+built fresh inside every job (see above), so there is nothing of its own for
+a reclaim step to clean up. The sibling Linux lane still carries a `Reclaim
+GPU from stray E2E processes` step, retained from when that lane ran on a
+static host rather than added for anything specific to the pool; both lanes
+now pin the same `devlab-dispatch` label, so whether that step still earns
+its place there is a separate, open question, not something this paragraph
+answers. Beyond that, `e2e-wsl` otherwise mirrors the Linux lane: GPU
 preflight, toolchain bootstrap, shared-runtime pre-warm, then the full suite
-with no hand filtering. It covers WSL host detection, the Windows-to-WSL
-execution boundary, and whatever GPU access WSL exposes on that machine. The
-GPU preflight is advisory here precisely because GPU-on-WSL is what the lane is
-proving out: where it is unavailable the capability probe resolves those
-scenarios to not-applicable and the rest of the suite still runs. Scenarios the
-product deliberately routes around on WSL carry `@requires-bare-metal`;
+with no hand filtering. It covers WSL host detection, the
+Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
+machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
+what the lane is proving out: where it is unavailable the capability probe
+resolves those scenarios to not-applicable and the rest of the suite still
+runs. Scenarios the product deliberately routes around on WSL carry
+`@requires-bare-metal`;
 scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
 only lane that runs them.
 
@@ -92,10 +112,12 @@ than carried out — are proven here and nowhere else.
 
 ### What the WSL distro needs
 
-The distro needs `pkg-config`, `build-essential` and `libcap-dev` to build the
-workspace; the lane installs them itself where it has passwordless sudo, and
-otherwise fails with the list of what is missing rather than hanging on a
-password prompt.
+The distro is fresh every job (see above), so the lane provisions it from
+scratch each run: `pkg-config`, `build-essential`, `libcap-dev` and friends to
+build the workspace (installed unconditionally — the guest always runs as
+`root`, so there's no passwordless-sudo gate to check), and ROCm's WSL driver
+bridge via `scripts/wsl_setup_rocdxg.sh`, run advisory rather than fail-fast
+(see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
 `/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
@@ -245,12 +267,10 @@ surface in the self-hosted consolidated report for visibility.
 Every Strix Halo lane raises two budgets rather than letting a slow host read
 as a product failure: `E2E_SERVE_TIMEOUT_SECS` for serve readiness, and
 `E2E_TUI_TIMEOUT_SECS` for the PTY-driven dashboard waits. On the pool-hosted
-Ubuntu/Windows lanes this covers a busy or cold-starting pool host; `e2e-wsl`
-additionally shares its physical machine with nothing else in this workflow
-now that the other two lanes moved to the pool, but WSL2's own virtualization
-overhead can still make a wait that's comfortable on native hardware run long.
-Both budgets only lengthen how long a wait may take; a genuine hang still
-fails, just later.
+lanes this covers a busy or cold-starting pool host; `e2e-wsl` additionally
+runs through WSL2's own virtualization overhead, which can make a wait that's
+comfortable on native hardware run long. Both budgets only lengthen how long
+a wait may take; a genuine hang still fails, just later.
 
 **Required-check history.** These job names — and `E2E consolidated report
 (self-hosted)` — used to be in `main`'s required-status-check list, where a
