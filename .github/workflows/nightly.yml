@@ -901,6 +901,12 @@ jobs:
       # than let that read as a product failure; a genuine hang still fails,
       # just later.
       E2E_TUI_TIMEOUT_SECS: "90"
+      # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
+      # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
+      # guest's cargo build (wsl.exe doesn't share the calling process's
+      # environment, and the guest's own checkout is a detached-HEAD clone by
+      # SHA). Same fix this file's own docker build step already uses.
+      ROCM_CLI_RELEASE_REF: "${{ github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1080,7 +1086,7 @@ jobs:
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli

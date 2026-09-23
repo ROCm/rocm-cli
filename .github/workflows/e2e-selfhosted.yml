@@ -736,6 +736,13 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
+      # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
+      # guest's cargo build (wsl.exe doesn't share the calling process's
+      # environment, and the guest's own checkout is a detached-HEAD clone by
+      # SHA -- see the "Clone checkout" step). Same fix release.yml/nightly.yml
+      # already use for their own container/docker builds.
+      ROCM_CLI_RELEASE_REF: "${{ github.head_ref || github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -963,7 +970,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
