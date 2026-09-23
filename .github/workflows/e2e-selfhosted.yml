@@ -831,8 +831,9 @@ jobs:
       # A freshly installed distro has none of this; install unconditionally
       # (idempotent) rather than gating on passwordless sudo like the old
       # static-host step did — this guest always runs as root. `sudo` itself
-      # is included because scripts/wsl_setup_rocdxg.sh hard-requires the
-      # binary to exist even when the caller is already root.
+      # is included because `rocm install driver` emits a hard `command -v
+      # sudo` precondition into its WSL plan even when the caller is already
+      # root, and the @requires-wsl driver scenarios render that plan.
       - name: Ensure native build deps
         shell: powershell
         run: |
@@ -868,28 +869,16 @@ jobs:
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script $script
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # librocdxg is not part of a bare Ubuntu-24.04 image, so it needs
-      # installing every job (the per-job distro install is the ~5min/job cost
-      # the pool maintainer flagged — see the job header above; this step is
-      # not that estimate, just one of the things a freshly installed distro
-      # needs). Advisory, like the GPU preflight below — a distro without
-      # working passthrough still runs the non-GPU suite, the capability
-      # probe's `driver_status` check resolves @requires-gpu scenarios to skip
-      # rather than failing them on a premise the host can't meet.
-      - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
-        shell: powershell
-        run: |
-          # See .github/scripts/Invoke-WslBash.ps1.
-          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
-          set -eo pipefail
-          cd /root/work/rocm-cli
-          if bash scripts/wsl_setup_rocdxg.sh; then
-            echo "librocdxg installed"
-          else
-            echo "::warning::librocdxg install failed or was skipped -- @requires-gpu scenarios will resolve to skip"
-          fi
-          '@
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # NO librocdxg provisioning step here, deliberately. The lane used to run
+      # `scripts/wsl_setup_rocdxg.sh`; installing ROCDXG is now the CLI's own
+      # job (`rocm install driver`), and the @requires-wsl driver scenarios
+      # assert on the plan it produces. A lane that pre-installed ROCDXG would
+      # hand those scenarios a host that is already in the state the command
+      # under test exists to reach. Leaving the distro bare costs no coverage
+      # today: @requires-gpu scenarios already resolve to skip here, since
+      # `rocm-smi` is absent too (see the GPU preflight below). If this lane
+      # ever needs a real GPU, provision it through the CLI as a separate,
+      # explicitly-not-under-test step rather than restoring the old script.
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
