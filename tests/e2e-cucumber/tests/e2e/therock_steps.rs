@@ -30,7 +30,6 @@ use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::paced_download::{
     PacedDownloadServer, build_gzip_tarball, deterministic_payload,
-    is_intermediate_download_progress_frame,
 };
 
 use crate::E2eWorld;
@@ -455,13 +454,8 @@ async fn assert_intermediate_download_progress_frame(world: &mut E2eWorld) {
         .as_mut()
         .expect("no pty session for the tarball install");
     session
-        .wait_for_screen_where(
-            "an intermediate (neither 0% nor 100%) download progress frame",
-            is_intermediate_download_progress_frame,
-            PTY_SCREEN_TIMEOUT,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("intermediate download progress frame never appeared: {e}"));
+        .assert_intermediate_download_progress_frame("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
 }
 
 #[then("the terminal shows the archive being extracted")]
@@ -483,9 +477,8 @@ async fn assert_tarball_install_exits_cleanly(world: &mut E2eWorld) {
         .as_mut()
         .expect("no pty session for the tarball install");
     session
-        .wait_for_exit(PTY_SCREEN_TIMEOUT)
-        .await
-        .unwrap_or_else(|e| panic!("tarball install did not exit cleanly: {e}"));
+        .assert_exits_cleanly("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
 }
 
 #[then("the final terminal screen shows neither spinner line")]
