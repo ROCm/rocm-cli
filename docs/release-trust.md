@@ -239,10 +239,10 @@ ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE
 ```
 
 Unlike the TheRock base overrides above, this needs no separate "allow" gate:
-the override accessor does not exist at all in a build without
-`e2e-test-hooks`, so a stray environment variable can never redirect a
-production install. A production build always resolves the hardcoded default
-URL.
+the override *logic* does not exist at all in a build without
+`e2e-test-hooks` — the accessor compiled in that configuration ignores the
+environment entirely and unconditionally returns the hardcoded default URL, so
+a stray environment variable can never redirect a production install.
 
 ## Remaining Owner Step
 
