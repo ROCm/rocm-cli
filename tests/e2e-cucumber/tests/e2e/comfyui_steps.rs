@@ -520,6 +520,10 @@ async fn install_comfyui_under_pty(world: &mut E2eWorld) {
     // negative check into a tautology, the same trap `therock_steps.rs`'s
     // identical check hit once its own (much longer) summary was added. Grow
     // rows now, matching that fix, rather than waiting for it to recur here.
+    //
+    // As in `therock_steps.rs`: issued right after spawn with no
+    // synchronization point, on the assumption that the child's fork/exec
+    // and first repaint take longer than this resize call.
     session
         .grow_rows(60)
         .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
