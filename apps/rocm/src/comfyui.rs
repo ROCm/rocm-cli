@@ -336,7 +336,7 @@ pub(crate) fn install(
         fs::remove_dir_all(&source_path)
             .with_context(|| format!("failed to remove {}", source_path.display()))?;
     }
-    if source_path.exists() {
+    let source_url = if source_path.exists() {
         println!("Using existing ComfyUI source folder...");
         let _ = io::stdout().flush();
         writeln!(
@@ -344,11 +344,12 @@ pub(crate) fn install(
             "Using existing ComfyUI folder at {}.",
             source_path.display()
         )?;
+        comfyui_source_archive_url()
     } else {
         println!("Downloading ComfyUI source...");
         let _ = io::stdout().flush();
-        download_and_extract_source(&app_root, &source_path, &mut log)?;
-    }
+        download_and_extract_source(&app_root, &source_path, &mut log)?
+    };
     fs::create_dir_all(&models_folder)
         .with_context(|| format!("failed to create {}", models_folder.display()))?;
 
@@ -396,7 +397,7 @@ pub(crate) fn install(
         runtime_version: runtime.manifest.version.clone(),
         runtime_root: runtime.manifest.install_root.clone(),
         python_executable: runtime.python.clone(),
-        source_url: comfyui_source_archive_url(),
+        source_url,
         source_path: source_path.clone(),
         requirements_path,
         pip_cache_dir: None,
@@ -1390,11 +1391,16 @@ fn same_path_text(left: &Path, right: &Path) -> bool {
     runtime_paths_equivalent(left, right)
 }
 
+/// Downloads (if not already cached) and extracts the ComfyUI source
+/// archive, returning the source URL it resolved — so the caller can record
+/// it on the install manifest without re-resolving
+/// [`comfyui_source_archive_url`] a second time.
 fn download_and_extract_source(
     app_root: &Path,
     source_path: &Path,
     log: &mut fs::File,
-) -> Result<()> {
+) -> Result<String> {
+    let source_url = comfyui_source_archive_url();
     let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
     fs::create_dir_all(
         archive_path
@@ -1408,7 +1414,6 @@ fn download_and_extract_source(
             archive_path.display()
         )?;
     } else {
-        let source_url = comfyui_source_archive_url();
         writeln!(log, "Downloading {source_url}.")?;
         let download_label = "Fetching ComfyUI source archive…";
         let spinner = AnimatedSpinner::start(download_label);
@@ -1446,7 +1451,7 @@ fn download_and_extract_source(
     })?;
     fs::remove_dir_all(&extract_root).ok();
     writeln!(log, "Installed source at {}.", source_path.display())?;
-    Ok(())
+    Ok(source_url)
 }
 
 fn first_child_dir(root: &Path) -> Result<PathBuf> {
