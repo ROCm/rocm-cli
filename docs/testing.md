@@ -32,9 +32,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 `std::env::set_var` / `remove_var` change state shared by every thread in the
 process. Under a threaded harness two tests touching the same key race, and one
 reads the other's value and fails an assertion unrelated to what it tests. This
-is enforced: `cargo xtask`'s `a_test_mutating_the_environment_serializes_itself`
-scans the tree and **fails the build** on an unguarded mutation inside a
-`#[test]`.
+is enforced by a test, not by an `xtask` subcommand:
+`a_test_mutating_the_environment_serializes_itself` in `xtask` scans the whole
+tree and **fails the build** on an unguarded mutation inside a `#[test]` or
+`#[tokio::test]`. Run it on its own with:
+
+```bash
+cargo test -p xtask a_test_mutating_the_environment_serializes_itself
+```
 
 Best is not to touch the environment at all — pass the value in through a test
 seam, as `newest_rocm_install_dir_in` and `engine_envs_root_from` do. A seam
@@ -43,9 +48,14 @@ env-reading path *is* the point, take a process-wide lock for the duration of
 the test and restore the previous value before releasing it:
 
 ```rust
+/// Serializes every test in this process that replaces `KEY`.
+static SOMETHING_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
 #[test]
 fn reads_its_setting_from_the_environment() {
+    // Poison is not a failure here: a panicking sibling leaves the value
+    // restored or not, and either way this test still wants the lock.
     let _guard = SOMETHING_ENV_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
