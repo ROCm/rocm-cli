@@ -434,6 +434,12 @@ async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
     // `Spinner::clear` actually ran. Grow rows only — not `use_detail_size`,
     // which also widens the terminal and would stop the label from
     // truncating, defeating the whole point of this scenario.
+    //
+    // Issued immediately after spawn with no synchronization point: this
+    // assumes the child process's fork/exec and first spinner repaint take
+    // longer than this resize call, so the grow always lands before more
+    // than 24 lines could have been written. True at real process-startup
+    // timings; there's no signal to wait on that would prove it instead.
     world
         .tui
         .as_mut()
@@ -497,6 +503,14 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
     // was cleared. Truncation always keeps the label's head intact and cuts
     // its tail, so a short prefix is present whenever the line is live and
     // gone once `Spinner::clear` erases it.
+    //
+    // Note this download-line check by itself can't distinguish a real
+    // `Drop`-time clear from the extraction spinner's first repaint simply
+    // overwriting the same row with `Clear(CurrentLine)` — it would pass
+    // either way, since extraction always starts once the download spinner
+    // stops. The extraction assertion just below, and the ComfyUI scenario's
+    // equivalent check (a spinner with nothing after it to overwrite its
+    // row), are what actually prove `Spinner::clear` runs on `Drop`.
     let downloading = format!("Downloading {CURRENT_TARBALL}");
     let downloading_prefix = downloading
         .get(..DOWNLOADING_PREFIX_LEN)
