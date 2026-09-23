@@ -251,9 +251,9 @@ impl Theme {
     /// of truth for job-status color shared by the job console banner and the
     /// Home tab activity feed — they must not each pick their own mapping.
     /// The LOGS dock shares the same underlying tone table via
-    /// [`log_body_tone`] rather than calling this function directly, since it
+    /// `log_body_tone` rather than calling this function directly, since it
     /// needs `Running` to stay neutral instead of accent — see
-    /// `dock::logs_dock` and [`log_body_tone`]'s doc comment.
+    /// `dock::logs_dock` and `log_body_tone`'s doc comment.
     pub const fn job_status_color(&self, status: &JobStatus) -> Color {
         self.tone_color(job_status_tone(status))
     }
