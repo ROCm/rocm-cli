@@ -109,11 +109,14 @@ pub fn draw_job_console(
     // terminal state, render a full-width colored banner instead — a small chip
     // is easy to miss against a whole popup of scrolled output.
     let (label, color) = status_label(job, theme);
-    let is_terminal = !matches!(job.status, JobStatus::Running);
+    let is_terminal = job.is_terminal();
     let mut header = Vec::new();
     if is_terminal {
-        assert!(
-            !matches!(job.status, JobStatus::Running),
+        // Redundant by construction now that both branches share `is_terminal()` —
+        // kept as a cheap regression guard against a future edit splitting the two
+        // checks back apart, not because this can fail today.
+        debug_assert!(
+            job.is_terminal(),
             "terminal banner only renders for finished jobs"
         );
         let glyph = job.status.glyph();
