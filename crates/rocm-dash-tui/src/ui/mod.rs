@@ -428,8 +428,30 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     } else {
         KeyAction::OpenDetail
     };
+    // Single source of truth for "does a global hotkey reach its normal
+    // `handle_key` arm right now, or does something else own the keyboard
+    // first?" — mirrors, in order, `event_loop`'s own dispatch: a manager
+    // overlay or pending approval owns every key before `handle_key` is ever
+    // called (`overlay_or_approval`); a plain `Modal::*` fully returns from
+    // its own arm before reaching the global match (`modal_open`); and
+    // focused chat text entry absorbs every key except PageUp/PageDown
+    // (`chat_typing`, see `handle_key`'s `chat.focused` branch). Any footer
+    // chip whose click dispatches a *global* hotkey action must gate on this,
+    // or the click can do something the key it displays never could.
+    let overlay_or_approval = state.overlay_or_approval();
+    let modal_open = state.modal != Modal::None;
+    let chat_typing = state.active_tab == ActiveTab::Chat && state.chat_focused;
+    let hotkeys_owned_elsewhere = overlay_or_approval || modal_open || chat_typing;
     let mut segs: Vec<Seg> = vec![
-        Seg::Key("Tab", Some(KeyAction::SwitchTab(state.active_tab.next()))),
+        // A real Tab keypress reaches `SwitchTab` only in that same idle
+        // state: every modal arm (including `Options`, which remaps Tab to
+        // `OptionsTab`) returns before the global match, a manager overlay
+        // owns keys entirely, and focused chat text entry consumes Tab as
+        // `Nothing` rather than falling through.
+        Seg::Key(
+            "Tab",
+            (!hotkeys_owned_elsewhere).then_some(KeyAction::SwitchTab(state.active_tab.next())),
+        ),
         Seg::Sep(" next  "),
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
@@ -522,14 +544,18 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
     // ROCm/Serving the Actions list is the single path, so no letter chips.
     //
-    // Gated the same way the t/?/q chips are: a real w/e/d/u/i/l/s/b keypress
-    // can never reach these `Open*` actions while a manager overlay owns the
-    // event loop or a chat approval is pending (both route every key to their
-    // own handler first), but a footer-chip click bypasses that dispatch. Each
-    // `Open*` handler starts with `close_overlays()`, which would silently
-    // discard whatever overlay or pending approval was open — the same class
-    // of bug the t/?/q gating above exists to prevent.
-    if state.active_tab == ActiveTab::Observe && !state.overlay_or_approval() {
+    // Gated on `overlay_or_approval || modal_open`, not just the former: a
+    // real w/e/d/u/i/l/s/b keypress can't reach these `Open*` actions while a
+    // manager overlay owns the event loop, a chat approval is pending, *or* a
+    // plain `Modal::*` is open (every modal arm in `handle_key` fully returns
+    // before this letter-hotkey match, none of them match these letters), but
+    // a footer-chip click bypasses all three. Each `Open*` handler starts
+    // with `close_overlays()`, which would silently discard whatever overlay,
+    // approval, or modal was open — the same class of bug the t/?/q gating
+    // below exists to prevent. (`chat_typing` doesn't apply: this whole block
+    // is already tab-gated to Observe, and `chat_typing` can only be true on
+    // the Chat tab.)
+    if state.active_tab == ActiveTab::Observe && !overlay_or_approval && !modal_open {
         segs.push(Seg::Key("w", Some(KeyAction::OpenServeWizard)));
         segs.push(Seg::Sep(" serve  "));
         segs.push(Seg::Key("e", Some(KeyAction::OpenEngineManager)));
@@ -547,7 +573,11 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Key("b", Some(KeyAction::OpenBenchRun)));
         segs.push(Seg::Sep(" bench  "));
     }
-    if state.replay.is_some() {
+    // Same reachability argument as the Tab chip above: a real Space/+/-
+    // keypress only reaches `ReplayTogglePause`/`ReplaySpeedUp` when nothing
+    // else — overlay, approval, modal, or focused chat text entry — owns the
+    // key first.
+    if state.replay.is_some() && !hotkeys_owned_elsewhere {
         segs.push(Seg::Key("Space", Some(KeyAction::ReplayTogglePause)));
         segs.push(Seg::Sep(" pause  "));
         segs.push(Seg::Key("+/-", Some(KeyAction::ReplaySpeedUp)));
@@ -564,18 +594,26 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     // gating layer), so `approval_pending()` has to be checked here too, or
     // these chips would stay clickable and let a mouse click silently discard
     // a pending approval that a real keypress never could.
-    let overlay_or_approval = state.overlay_or_approval();
+    //
     // `t`/`?` additionally need `state.modal` itself checked: `OpenThemePicker`/
     // `ToggleHelp` both call `close_overlays()` then unconditionally overwrite
     // `state.modal`, silently replacing whatever plain `Modal::*` is already
     // open (Detail/Menu/Palette/Options/GlobalHelp) — but `handle_key` routes
     // `t`/`?` differently (or not at all) inside every one of those modals'
     // own arms, so a real keypress never reaches those actions there either.
-    // `q` doesn't need this extra check: every modal arm already maps a real
-    // `q` to `Quit` (see `handle_key`), so gating it on `overlay_or_approval`
-    // alone still matches what the key does. `None` keeps a chip non-clickable
-    // so a click can't do something the key never would.
-    if overlay_or_approval || state.modal != Modal::None {
+    // And both need `chat_typing` checked: focused chat text entry consumes
+    // any `Char` key (including `t`/`?`) as ordinary input, never as a global
+    // hotkey — `hotkeys_owned_elsewhere` covers all three conditions.
+    // `q`'s label ("close" vs "quit") only depends on `overlay_or_approval` —
+    // that's the one condition under which a real `q` still does something
+    // (the overlay's own `on_key` backs it out), so `chat_typing` alone must
+    // not relabel it "close" with no overlay to close. But `q`'s
+    // *clickability* also has to account for `chat_typing`: while typing, a
+    // real `q` types the letter rather than reaching `Quit`, so the chip must
+    // go non-clickable there too even though it keeps the "quit" label.
+    // `modal_open` doesn't affect `q` either way: every modal arm already
+    // maps a real `q` to `Quit` (see `handle_key`).
+    if hotkeys_owned_elsewhere {
         segs.push(Seg::Key("t", None));
         segs.push(Seg::Sep(" theme  "));
         segs.push(Seg::Key("?", None));
@@ -590,7 +628,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Key("q", None));
         segs.push(Seg::Sep(" close"));
     } else {
-        segs.push(Seg::Key("q", Some(KeyAction::Quit)));
+        segs.push(Seg::Key("q", (!chat_typing).then_some(KeyAction::Quit)));
         segs.push(Seg::Sep(" quit"));
     }
 
@@ -1129,6 +1167,12 @@ mod tests {
                 KeyAction::ToggleHelp,
                 "no chip may dispatch ToggleHelp while a plain modal is open"
             );
+            assert!(
+                !matches!(chip.action, KeyAction::SwitchTab(_)),
+                "no chip may dispatch SwitchTab while a plain modal is open \
+                 (Modal::Detail doesn't remap Tab at all, so a real Tab \
+                 keypress there is swallowed as Nothing)"
+            );
         }
         // `q` is unaffected: every modal arm already maps a real `q` to `Quit`
         // (see `handle_key`), so the chip must stay clickable and correctly
@@ -1137,6 +1181,159 @@ mod tests {
             chips.iter().any(|c| c.action == KeyAction::Quit),
             "q chip must still dispatch Quit while only a plain modal is open"
         );
+    }
+
+    #[test]
+    fn observe_guided_action_chips_are_hidden_while_a_plain_modal_is_open() {
+        // Regression: `observe_guided_action_chips_are_hidden_while_an_overlay_or_approval_owns_input`
+        // only covered the manager-overlay and pending-approval cases, missing
+        // a plain `Modal::*` (e.g. `Detail`) — every modal arm in `handle_key`
+        // fully returns before the w/e/d/u/i/l/s/b match, so a real keypress
+        // never reaches an `Open*` action there either, but before this fix
+        // the chips stayed clickable and their `Open*` handler's
+        // `close_overlays()` would silently discard the open modal.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let open_actions = [
+            KeyAction::OpenServeWizard,
+            KeyAction::OpenEngineManager,
+            KeyAction::OpenExamine,
+            KeyAction::OpenUpdate,
+            KeyAction::OpenInstall,
+            KeyAction::OpenLogs,
+            KeyAction::OpenServices,
+            KeyAction::OpenBenchRun,
+        ];
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Observe;
+        state.modal = Modal::Detail;
+        assert!(!state.has_open_overlay() && !state.approval_pending());
+
+        let backend = TestBackend::new(160, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+        for chip in &chips {
+            assert!(
+                !open_actions.contains(&chip.action),
+                "no chip may dispatch {:?} while a plain modal is open",
+                chip.action
+            );
+        }
+    }
+
+    #[test]
+    fn footer_global_hotkey_chips_are_not_clickable_while_chat_is_focused() {
+        // Regression: focused chat text entry consumes every `Char` key
+        // (including `t`/`?`/`q`, and — via the catch-all `_ => Nothing` arm —
+        // `Tab`) as ordinary input, never as a global hotkey (see
+        // `handle_key`'s `chat.focused` branch). Before this fix, `Tab`/`t`/`?`
+        // stayed clickable while composing a chat message, and clicking them
+        // would switch tabs or open the theme picker / help overlay out from
+        // under the user mid-sentence — something no keystroke there could do.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Chat;
+        state.chat_consent = ChatConsent::Accepted;
+        state.chat_focused = true;
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert!(
+                !matches!(
+                    chip.action,
+                    KeyAction::SwitchTab(_)
+                        | KeyAction::OpenThemePicker
+                        | KeyAction::ToggleHelp
+                        | KeyAction::Quit
+                ),
+                "no chip may dispatch {:?} while chat is focused",
+                chip.action
+            );
+        }
+        // `q`'s label stays "quit" here (unlike the overlay/approval case,
+        // there is no overlay to "close" while merely typing) even though the
+        // chip itself is non-clickable.
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("quit"),
+            "q chip should still say quit while chat is focused: {row:?}"
+        );
+        assert!(
+            !row.contains("close"),
+            "q chip should not say close while chat is focused (no overlay to close): {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_replay_chips_are_not_clickable_while_an_overlay_or_modal_owns_input() {
+        // Same reachability argument as the Tab/t/?/q chips: a real
+        // Space/+/- keypress only reaches `ReplayTogglePause`/`ReplaySpeedUp`
+        // when nothing else owns the key first.
+        use crate::app::ReplayState;
+        use crate::replay::ReplayController;
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let replay_actions = [KeyAction::ReplayTogglePause, KeyAction::ReplaySpeedUp];
+        let assert_no_replay_chip = |state: &AppState, why: &str| {
+            let backend = TestBackend::new(90, 1);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut chips = Vec::new();
+            term.draw(|f| chips = draw_footer(f, f.area(), state, &theme))
+                .unwrap();
+            for chip in &chips {
+                assert!(
+                    !replay_actions.contains(&chip.action),
+                    "no chip may dispatch {:?} {why}",
+                    chip.action
+                );
+            }
+        };
+
+        let mut overlay_state = AppState::new("t".into(), "default-dark".into());
+        overlay_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        overlay_state.services = Some(ServicesManagerState::default());
+        assert!(overlay_state.has_open_overlay());
+        assert_no_replay_chip(&overlay_state, "while a manager overlay is open");
+
+        let mut modal_state = AppState::new("t".into(), "default-dark".into());
+        modal_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        modal_state.modal = Modal::Detail;
+        assert_no_replay_chip(&modal_state, "while a plain modal is open");
+
+        let mut idle_state = AppState::new("t".into(), "default-dark".into());
+        idle_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &idle_state, &theme))
+            .unwrap();
+        for action in replay_actions {
+            assert!(
+                chips.iter().any(|c| c.action == action),
+                "{action:?} chip must still be clickable while idle and replaying"
+            );
+        }
     }
 
     /// The wash `grey_overlay` paints behind an open overlay (see
