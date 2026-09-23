@@ -107,6 +107,24 @@ fn write_shim(path: &Path, body: &str) {
     }
 }
 
+/// Writes a fake runtime Python that answers both forms `probe_comfyui`'s
+/// post-install GPU check shells out to: `-c <script>` (the pre-install
+/// torch-stack probe) and `<script-path> <result-path>` (the post-install
+/// check, which writes its JSON result to the given path instead of stdout).
+fn write_gpu_probe_shim(path: &Path) {
+    write_shim(
+        path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-c\" ]; then\n\
+         \tprintf '{}'\n\
+         \texit 0\n\
+         fi\n\
+         cat > \"$2\" <<'JSON'\n\
+         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
+         JSON\n",
+    );
+}
+
 /// Plant one ready wheel runtime: the on-disk stubs the CLI's readiness check
 /// requires (an install root holding its local manifest, a Python executable,
 /// and a rocm_sdk bin exposing amdhip64 + hipblas) plus the registry manifest
@@ -272,17 +290,7 @@ async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
         .join("comfyui-fixture")
         .join("python")
         .join("rocm-python");
-    write_shim(
-        &python,
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"-c\" ]; then\n\
-         \tprintf '{}'\n\
-         \texit 0\n\
-         fi\n\
-         cat > \"$2\" <<'JSON'\n\
-         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
-         JSON\n",
-    );
+    write_gpu_probe_shim(&python);
 }
 
 #[when("the user installs ComfyUI")]
@@ -458,17 +466,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
         .join(RUNTIME_KEY)
         .join("bin")
         .join("python3");
-    write_shim(
-        &python,
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"-c\" ]; then\n\
-         \tprintf '{}'\n\
-         \texit 0\n\
-         fi\n\
-         cat > \"$2\" <<'JSON'\n\
-         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
-         JSON\n",
-    );
+    write_gpu_probe_shim(&python);
 
     // Build a real `.tar.gz`: one top-level directory holding a
     // `requirements.txt` naming only the torch stack, so `install()`'s
