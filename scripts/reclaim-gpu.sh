@@ -87,12 +87,33 @@ process_alive() {
 # Fails when the process is gone or its command line is empty (a kernel thread,
 # or a zombie whose argv has already been released).
 #
+# TAB and NEWLINE are flattened along with the NUL separators, because they are
+# the record delimiters `select_leaked` emits and `reclaim` reads back. Only the
+# NUL is a separator the kernel inserted; a tab or newline INSIDE an argv element
+# is content, and `--chat-template` or `--prompt` can carry either. Left intact,
+# one such process emits a record that splits into two on the way back: the real
+# pid arrives carrying a truncated command line, fails the identity check against
+# its own full one, and is reported "recycled ... not signalling" — so the leak
+# survives both TERM and KILL while the summary prints "0 process(es) terminated".
+# That is the silent miss this whole script exists to end, so it is fixed at the
+# single point every consumer already reads through rather than at each of them.
+#
+# Matching is unaffected: no root or marker contains either byte. The identity
+# comparison in same_selected_process does get marginally coarser — two command
+# lines differing ONLY in which of these bytes sits at a given position now read
+# as equal, where before they differed. Both sides come through here, so they
+# are flattened alike; the cost is that a recycled pid whose new process differs
+# from the old one by nothing but delimiter bytes would be taken for the same
+# process. Against the silent miss above, which is reachable by any engine
+# invocation carrying a template or a prompt, that is the trade worth making —
+# but it is a trade, not a free win.
+#
 # Redirect stderr BEFORE the input redirection: the shell applies them left to
 # right, so `<file 2>/dev/null` still lets the shell's own "No such file" reach
 # the terminal when the open fails.
 cmdline_of() {
   local cmdline
-  cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${1}/cmdline")" || return 1
+  cmdline="$(tr '\0\n\t' '   ' 2>/dev/null <"/proc/${1}/cmdline")" || return 1
   [[ -n "${cmdline}" ]] || return 1
   printf '%s' "${cmdline}"
 }
@@ -257,16 +278,40 @@ reclaim() {
 # Diagnostics for a preflight that hit its ceiling. Never fails: it runs on the
 # failure path, where masking the real error would be worse than missing output.
 report_holders() {
+  local engine
+  local -a marker_args=()
   echo "--- rocm-smi KFD processes (per-process VRAM) ---"
   # Process names show as UNKNOWN inside a container: KFD reports host PIDs,
   # which do not resolve in the container's PID namespace. The VRAM column is
   # still the answer to "what is holding the card".
   timeout 15 rocm-smi --showpids 2>&1 | head -40 || true
   echo "--- engine/serve processes visible here ---"
+  # Derived from ENGINE_MARKERS rather than spelled out again. A second copy of
+  # the list is exactly the drift the PowerShell mirrors demonstrated and that
+  # the xtask contract test exists to catch — and this call site had no such
+  # guard, so a marker added above would have quietly stopped appearing here.
+  # Deriving it needs no guard: there is no longer a copy that can go stale.
+  #
+  # -F, not an -E alternation: the markers are literal substrings everywhere
+  # else in this script, and building a regex out of them would give a future
+  # marker containing a metacharacter a different meaning here than in the rule.
+  #
+  # No empty-array guard. Given zero patterns grep prints its usage to stderr
+  # and exits 2; the `|| true` below swallows the STATUS, so the section would
+  # carry that usage error in place of any holders — wrong, but not silent.
+  # Reaching it needs ENGINE_MARKERS to be empty, which
+  # assert_rule_covers_every_list_entry already fails on: it pins the list to
+  # its four entries by exact comparison, so an emptied array reds the
+  # self-test before anything gets here. Guarding it again would add a branch
+  # the self-test could never reach, which is worth less than the assertion
+  # that already covers it.
+  for engine in "${ENGINE_MARKERS[@]}"; do
+    marker_args+=(-e "${engine}")
+  done
   # shellcheck disable=SC2009 # pgrep cannot print elapsed time, and how long a
   # holder has been alive is what distinguishes a leak from this job's own serve.
   ps -eo pid,etimes,args 2>/dev/null |
-    grep -Ei 'llama-server|vllm|__engine-serve-http|rocm daemon' |
+    grep -Fi "${marker_args[@]}" |
     grep -v grep |
     head -40 || true
   echo "--- of those, E2E-owned (reclaim would take these) ---"
@@ -344,6 +389,28 @@ DECOY
   echo $!
 }
 
+# Spawn a decoy carrying the record delimiters INSIDE one argument — a newline
+# and a tab, as a `--chat-template` or `--prompt` value does.
+#
+# Not spawn_decoy with an extra argument: that decoy is `cp /bin/sleep`, and
+# sleep rejects a non-numeric argument and exits before it can be observed. This
+# needs something that ignores what it is handed and stays alive.
+#
+# Ordinary in every other respect — it must die on SIGTERM, so it is the stubborn
+# decoy's body without the trap. Its `sleep 1` children name no E2E root, so they
+# are never selected, and none outlives the scratch tree by more than a second.
+spawn_delimiter_decoy() {
+  local path="$1"
+  mkdir -p "$(dirname "${path}")"
+  cat >"${path}" <<'DECOY'
+#!/usr/bin/env bash
+while :; do sleep 1; done
+DECOY
+  chmod +x "${path}"
+  "${path}" $'--chat-template\nrole:\tuser' >/dev/null 2>&1 &
+  echo $!
+}
+
 # Every root and every marker, asserted individually against the rule.
 #
 # The expectation is written out rather than derived from the arrays: a loop
@@ -403,6 +470,7 @@ self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
   local outside outside_decoy outside_pid outside_cmd
+  local delimiter_decoy delimiter_pid delimiter_raw record_pid
   local forced_out guard_pid
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
@@ -410,6 +478,8 @@ self_test() {
   local superseded_hit=0
   local probe_failures=0
   local containment_failures=0
+  local fixture_failures=0
+  local record_failures=0
   local list_failures=0
   local failures=0
 
@@ -454,21 +524,27 @@ self_test() {
   stubborn_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9753/llama-server"
   # Matches the rule in full — an E2E root AND an engine marker — but lies
   # OUTSIDE the scope. It is the only fixture the SELFTEST_SCOPE filter can be
-  # observed doing anything to, and therefore the only reason check 6 can fail.
+  # observed doing anything to, and therefore the only reason check 7 can fail.
   outside_decoy="${outside}/e2e-prewarm-bystander/bin/llama-server"
+  # Same pre-warm shape again, but its ARGUMENTS carry a newline and a tab — the
+  # two bytes the pid<TAB>cmdline<NEWLINE> record format is built out of. Without
+  # a fixture whose command line contains them, the format is only ever exercised
+  # on strings that cannot break it.
+  delimiter_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9754/llama-server"
 
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
   harness_pid="$(spawn_decoy "${harness_decoy}")"
   stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
   outside_pid="$(spawn_decoy "${outside_decoy}")"
+  delimiter_pid="$(spawn_delimiter_decoy "${delimiter_decoy}")"
   read -r zombie_pid zombie_keeper_pid <<<"$(spawn_zombie "${tmp}/zombie")"
   # Every process this function spawned that can still be signalled, so cleanup
   # is one list rather than a line kept in step at each early return. The zombie
   # itself is absent deliberately: it is already dead, and killing its keeper is
   # what lets init reap it.
   decoy_pids=("${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}"
-    "${outside_pid}" "${zombie_keeper_pid}")
+    "${outside_pid}" "${delimiter_pid}" "${zombie_keeper_pid}")
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
@@ -513,7 +589,86 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 3. A manual-testing serve is left alone (engine marker, but no E2E root).
+  # 3. The record format survives a command line containing the delimiters.
+  #
+  #    select_leaked emits "pid<TAB>cmdline<NEWLINE>" and reclaim reads it back
+  #    with `IFS=$'\t' read -r`. A tab or newline inside an argv element is
+  #    content, not a separator — `--chat-template` and `--prompt` carry both —
+  #    and unless cmdline_of flattens them one record splits into two on the way
+  #    back. The genuine pid then arrives with a TRUNCATED command line, fails
+  #    the identity check against its own full one, and is passed over as
+  #    "recycled": the leak survives TERM and KILL alike while the run signs off
+  #    with "0 process(es) terminated". A silent miss is the one outcome this
+  #    script exists to prevent, so the format is asserted rather than assumed.
+  #
+  #    Placed HERE, ahead of containment, deliberately. A split record also
+  #    trips check 7's escape loop — its continuation line names no scratch
+  #    tree — which arms the gate and returns before checks 8-11 ever run. The
+  #    run is red either way; what this adds is the true cause, printed before
+  #    the one check 7 would otherwise report in its place.
+  # Read RAW, flattening only the kernel's NUL separators: cmdline_of now
+  # flattens the delimiters too, so asking it would report the fixture is fine
+  # no matter what the decoy was actually given. Both bytes are asserted
+  # individually, because either one alone breaks the format differently — the
+  # newline splits the record, the tab shifts the field boundary.
+  # Counted apart from the record loop below, for the same reason check 7 keeps
+  # its empty-selection count separate: these say the FIXTURE is unusable, the
+  # loop says the FORMAT is broken, and the "ok:" line must not be able to
+  # affirm the second while the first has just been denied.
+  # stderr redirected BEFORE the input, for the reason cmdline_of spells out:
+  # the shell applies them left to right, so the input-first form lets its own
+  # "No such file" reach the terminal on a failed open — here, noise printed by
+  # the very branch that exists to report a dead fixture cleanly.
+  if ! delimiter_raw="$(tr '\0' ' ' 2>/dev/null <"/proc/${delimiter_pid}/cmdline")"; then
+    # Distinguished from "carries no delimiter": if the decoy died before this
+    # read, the byte assertions below would report a format problem for what is
+    # really a dead fixture, and send the next reader after the wrong thing.
+    echo "FAIL: delimiter decoy's command line could not be read; the fixture is gone, not malformed"
+    fixture_failures=$((fixture_failures + 1))
+    delimiter_raw=''
+  else
+    case "${delimiter_raw}" in
+      *$'\n'*) ;;
+      *)
+        echo "FAIL: delimiter decoy's command line carries no newline; the record-format check is vacuous"
+        fixture_failures=$((fixture_failures + 1))
+        ;;
+    esac
+    case "${delimiter_raw}" in
+      *$'\t'*) ;;
+      *)
+        echo "FAIL: delimiter decoy's command line carries no tab; the record-format check is vacuous"
+        fixture_failures=$((fixture_failures + 1))
+        ;;
+    esac
+  fi
+  if ! grep -q "^${delimiter_pid}	" <<<"${selected}"; then
+    # Selection is NOT what this check tests — and note it survives the
+    # unflattened form, because the `^pid<TAB>` grep matches the first line of a
+    # split record. It is asserted only so the loop below cannot report a pass
+    # having never seen a command line with a delimiter in it.
+    echo "FAIL: delimiter decoy was not selected; the record-format check has no fixture"
+    fixture_failures=$((fixture_failures + 1))
+  fi
+  failures=$((failures + fixture_failures))
+  while IFS=$'\t' read -r record_pid _; do
+    [[ -n "${record_pid}" ]] || continue
+    if [[ ! "${record_pid}" =~ ^[0-9]+$ ]]; then
+      echo "FAIL: selection record does not begin with a pid: '${record_pid}'"
+      record_failures=$((record_failures + 1))
+    fi
+  done <<<"${selected}"
+  failures=$((failures + record_failures))
+  # Gated on the fixture too, not just on the record loop. A loop that examined
+  # a command line with no delimiter in it proves nothing, so affirming it here
+  # would print "every record survives delimiters" directly beneath a FAIL line
+  # saying there were none — evidence contradicting itself on the run someone is
+  # reading, which is the very thing check 7 is shaped to avoid.
+  if [[ "${record_failures}" -eq 0 && "${fixture_failures}" -eq 0 ]]; then
+    echo "ok: every selection record survives delimiters in a command line"
+  fi
+
+  # 4. A manual-testing serve is left alone (engine marker, but no E2E root).
   if grep -q "^${workload_pid}	" <<<"${selected}"; then
     echo "FAIL: /workload manual serve was selected; reclaim must not touch it"
     failures=$((failures + 1))
@@ -521,7 +676,7 @@ self_test() {
     echo "ok: /workload manual serve is not selected"
   fi
 
-  # 4. Both halves are required: an E2E root alone must not select. Deleting the
+  # 5. Both halves are required: an E2E root alone must not select. Deleting the
   #    `has_engine` requirement makes exactly this check fail and nothing else.
   if grep -q "^${harness_pid}	" <<<"${selected}"; then
     echo "FAIL: E2E test binary was selected; the engine half of the rule is not enforced"
@@ -530,7 +685,7 @@ self_test() {
     echo "ok: an E2E root without an engine marker is not selected"
   fi
 
-  # 5. A process that ignores SIGTERM is still selected.
+  # 6. A process that ignores SIGTERM is still selected.
   if grep -q "^${stubborn_pid}	" <<<"${selected}"; then
     echo "ok: SIGTERM-ignoring pre-warm engine process is selected"
   else
@@ -538,7 +693,7 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 6. Containment: self_test issues REAL kills, and SELFTEST_SCOPE is the only
+  # 7. Containment: self_test issues REAL kills, and SELFTEST_SCOPE is the only
   #    thing keeping them inside the scratch tree. Assert that before killing
   #    rather than trusting it — this step runs on a hosted ephemeral lane
   #    today, but nothing in the script stops it being run anywhere else.
@@ -551,17 +706,17 @@ self_test() {
   # thing the filter can be caught NOT doing its job on.
   # An empty selection satisfies the loop below trivially, so without this the
   # "ok:" line would report containment verified on a run where nothing was
-  # examined. Checks 2 and 5 already fail such a run, so this is not a false
+  # examined. Checks 2 and 6 already fail such a run, so this is not a false
   # green — but the evidence line is read by whoever is diagnosing that run.
   #
   #    Counted apart from containment_failures on purpose: that counter arms the
   #    gate below, whose message and early return are specifically about a
   #    selection reaching OUTSIDE the scratch tree. An empty selection is the
   #    opposite failure and signals nothing at all, so routing it through that
-  #    gate would report a false cause and cut the run short of checks 7-10.
+  #    gate would report a false cause and cut the run short of checks 8-11.
   #
   #    Diagnostic only, and said plainly rather than implied: an empty selection
-  #    is already caught — checks 2 and 5 fail it — so deleting this check does
+  #    is already caught — checks 2 and 6 fail it — so deleting this check does
   #    NOT let such a run pass. What it adds is the reason, on the run someone
   #    is reading, which is also why the "ok:" line below is gated on it.
   if [[ -z "${selected}" ]]; then
@@ -605,7 +760,7 @@ self_test() {
   elif [[ "${containment_failures}" -eq 0 ]]; then
     : # empty selection: already reported above, and nothing to affirm here
   else
-    # A GATE, not a score. Check 8 below calls the real `reclaim 0`, which
+    # A GATE, not a score. Check 9 below calls the real `reclaim 0`, which
     # sends real signals to whatever select_leaked returns at that moment. If
     # containment has just failed, that selection reaches outside this scratch
     # tree — the exact accident this check exists to prevent — so scoring it
@@ -617,10 +772,10 @@ self_test() {
     return 1
   fi
 
-  # 7. The escalation guard's comparison, in all three directions — and for
+  # 8. The escalation guard's comparison, in all three directions — and for
   #    "gone", by BOTH routes into it.
   #
-  #    The COMPARISON is covered here; check 8 covers the two CALL SITES by
+  #    The COMPARISON is covered here; check 9 covers the two CALL SITES by
   #    forcing the verdict, because a pid cannot be made to be reused by a
   #    different process on demand.
   if same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")"; then
@@ -667,7 +822,7 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 8. The guard's two CALL SITES, by forcing the verdict they act on.
+  # 9. The guard's two CALL SITES, by forcing the verdict they act on.
   #
   #    A pid cannot be made to be reused by a different process on demand, so
   #    until now both call sites were exercised only in the always-proceed
@@ -696,7 +851,7 @@ self_test() {
   # verdict forced to "recycled" nothing is signalled, so both engine decoys
   # survive to the escalation loop and either pid would serve; the stubborn one
   # is named because it is the decoy that reaches escalation in the UNforced
-  # run too, which keeps this assertion reading the same way as check 10.
+  # run too, which keeps this assertion reading the same way as check 11.
   if grep -q "pid=${stubborn_pid} was recycled during the grace period, not escalating" <<<"${forced_out}"; then
     echo "ok: pre-KILL guard refused to escalate onto a recycled pid"
   else
@@ -710,7 +865,7 @@ self_test() {
       failures=$((failures + 1))
     fi
   done
-  # 9. End to end: reclaim kills the leaks and spares all three bystanders —
+  # 10. End to end: reclaim kills the leaks and spares all three bystanders —
   #    the manual serve, the harness binary, and the out-of-scope decoy.
   reclaim_out="$(reclaim 0)"
   sleep 1
@@ -732,8 +887,17 @@ self_test() {
     echo "FAIL: E2E test binary was killed by reclaim"
     failures=$((failures + 1))
   fi
+  # The end-to-end form of check 3, and the one that states the cost: with the
+  # delimiters unflattened this process is selected, passed over as "recycled",
+  # and still holding the card when reclaim reports success.
+  if process_alive "${delimiter_pid}"; then
+    echo "FAIL: engine process with delimiters in its command line survived reclaim"
+    failures=$((failures + 1))
+  else
+    echo "ok: engine process with delimiters in its command line was reclaimed"
+  fi
   # The bystander matches the rule in full, so only the scope kept it out of the
-  # selection. Its survival is the end-to-end form of check 6.
+  # selection. Its survival is the end-to-end form of check 7.
   if process_alive "${outside_pid}"; then
     echo "ok: rule-matching process outside the scratch tree survived reclaim"
   else
@@ -741,7 +905,7 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 10. The escalation ran, and ran only where it was needed. Asserting the
+  # 11. The escalation ran, and ran only where it was needed. Asserting the
   #     stubborn decoy died covers the SIGKILL block; asserting the ordinary
   #     decoy did NOT reach escalation covers the `kill -TERM` that precedes it,
   #     which would otherwise be silently replaceable by any no-op.
