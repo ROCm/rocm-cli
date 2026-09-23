@@ -693,6 +693,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More docs
 
+- Architecture and module map: `docs/architecture.md`
 - Testing and verification: `docs/testing.md`
 - Developer manual QA: `docs/manual-testing.md`
 - Engine plugin policy: `docs/engine-plugins.md`
