@@ -99,7 +99,11 @@ const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/ro
 /// Matched on major version only: unlike [`VLLM_ROCM_BUILD_TABLE`], where a
 /// row pins one exact release's wheel filename, a discover row is a live
 /// resolver recipe AMD's index applies uniformly across an entire ROCm major
-/// line (AMD rotates ROCm 10.x minor/patch releases constantly), so `10.0.0`
+/// line. AMD's preview wheels are tagged with the real target release
+/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0`, and
+/// `+rocm7.14.1` as genuinely distinct, coexisting builds), so once ROCm
+/// 10.x's target moves past `10.0.0` the same rotation will happen here; a
+/// row keyed to an exact string would then silently stop matching. `10.0.0`
 /// and `10.1.0` should both discover through the same `"10.0.0"` row. This
 /// intentionally differs from `apps/rocm/src/therock.rs`'s SDK layout
 /// selection, which avoids major-only gating for unrelated reasons (on-disk
@@ -4268,9 +4272,11 @@ mod tests {
     #[test]
     fn vllm_rocm_discover_build_looks_up_known_and_unknown_versions() {
         assert!(vllm_rocm_discover_build("10.0.0").is_some());
-        // AMD rotates the ROCm 10.x minor/patch constantly; the discovery
-        // recipe must keep firing across the whole major line, not just the
-        // exact version it happened to be added for.
+        // AMD tags preview wheels with the real target release (verified via
+        // whl-multi-arch/torch/'s coexisting +rocm7.13.0/7.14.0/7.14.1
+        // builds), so ROCm 10.x's tag will move past 10.0.0 the same way;
+        // the discovery recipe must keep firing across the whole major line,
+        // not just the exact version it happened to be added for.
         assert!(vllm_rocm_discover_build("10.1.0a20260822").is_some());
         assert!(vllm_rocm_discover_build("999.0.0").is_none());
     }
