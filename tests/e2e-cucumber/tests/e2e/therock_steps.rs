@@ -29,8 +29,8 @@ use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::paced_download::{
-    PacedDownloadServer, build_gzip_tarball, is_intermediate_download_progress_frame,
-    xorshift_payload,
+    PacedDownloadServer, build_gzip_tarball, deterministic_payload,
+    is_intermediate_download_progress_frame,
 };
 
 use crate::E2eWorld;
@@ -359,17 +359,17 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
 
     // Build a real gzip tarball so `extract_tarball` (auto-detecting `-xf`) has
     // a genuine archive to unpack once the paced download completes. The
-    // payload bytes come from a small xorshift PRNG rather than a simple
+    // payload bytes come from a seeded CSPRNG (`StdRng`) rather than a simple
     // multiplicative-hash sequence: the latter looked scrambled but gzip still
     // crushed it down to under 2 KB (well under one paced chunk), collapsing
     // the whole "transfer" into a single unpaced chunk and defeating the
-    // pacing entirely. Xorshift output is high-entropy enough that gzip
+    // pacing entirely. `StdRng` output is high-entropy enough that gzip
     // cannot shrink it, keeping the wire transfer close to
     // `PACED_TARBALL_PAYLOAD_BYTES`.
     let build_dir = root(world).join("therock-paced-tarball-build");
     let payload_dir = build_dir.join("payload");
     std::fs::create_dir_all(&payload_dir).expect("failed to create tarball payload directory");
-    let payload = xorshift_payload(PACED_TARBALL_PAYLOAD_BYTES);
+    let payload = deterministic_payload(PACED_TARBALL_PAYLOAD_BYTES);
     std::fs::write(payload_dir.join("payload.bin"), &payload)
         .expect("failed to write tarball payload");
     let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload");

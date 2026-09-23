@@ -26,6 +26,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::stream;
+use rand::{RngCore, SeedableRng};
 use tower_http::services::ServeDir;
 
 use crate::http_server::{self, ServerHandle};
@@ -78,19 +79,17 @@ impl PacedDownloadServer {
 /// A naive multiplicative-hash sequence looked pseudo-random but gzip still
 /// compressed it by over 99%, collapsing a paced transfer into a single
 /// unpaced chunk. A fixed seed keeps the fixture (and therefore the archive's
-/// compressed size) deterministic across runs. Shared by both the TheRock
-/// tarball and ComfyUI source-archive fixtures, which each need enough
-/// incompressible bytes to stream in more than one paced chunk.
-pub fn xorshift_payload(len: usize) -> Vec<u8> {
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 56) as u8
-        })
-        .collect()
+/// compressed size) deterministic across runs — though `rand` doesn't
+/// guarantee `StdRng`'s algorithm is stable across crate versions, so a
+/// future `rand` bump could change these bytes (and the compressed size)
+/// even with the seed unchanged. Shared by both the TheRock tarball and
+/// ComfyUI source-archive fixtures, which each need enough incompressible
+/// bytes to stream in more than one paced chunk.
+pub fn deterministic_payload(len: usize) -> Vec<u8> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
+    let mut buf = vec![0u8; len];
+    rng.fill_bytes(&mut buf);
+    buf
 }
 
 /// Builds a real gzip tarball and returns its bytes.
@@ -136,6 +135,9 @@ pub fn is_intermediate_download_progress_frame(screen: &str) -> bool {
 /// in `chunk_size`-byte pieces, sleeping `delay` before every chunk after the
 /// first.
 fn paced_response(contents: Arc<Vec<u8>>, chunk_size: usize, delay: Duration) -> Response {
+    // Fail fast on a fixture bug in debug builds, but degrade to 1 byte per
+    // chunk rather than panic (dividing the whole transfer into single-byte
+    // chunks is slow, not wrong) if this ever runs in a release test binary.
     debug_assert!(chunk_size > 0, "chunk_size must be at least 1 byte");
     let total_len = contents.len();
     let chunk_size = chunk_size.max(1);

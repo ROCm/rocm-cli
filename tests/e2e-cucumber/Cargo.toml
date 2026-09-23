@@ -27,6 +27,9 @@ futures = "0.3"
 # emitted terminal stream into the current on-screen grid (`vt100`). This is the
 # only way to exercise the crossterm raw-mode event loop a piped `Command` can't.
 portable-pty = "0.9"
+# Deterministic filler bytes for the paced-download fixtures (see
+# `src/paced_download.rs`) — a seeded `StdRng` rather than a hand-rolled PRNG.
+rand.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
