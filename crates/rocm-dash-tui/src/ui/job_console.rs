@@ -112,6 +112,10 @@ pub fn draw_job_console(
     let is_terminal = !matches!(job.status, JobStatus::Running);
     let mut header = Vec::new();
     if is_terminal {
+        assert!(
+            !matches!(job.status, JobStatus::Running),
+            "terminal banner only renders for finished jobs"
+        );
         let glyph = job.status.glyph();
         header.push(Span::styled(
             format!(" {glyph} {label} "),
