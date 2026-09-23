@@ -54,8 +54,8 @@ use std::time::Duration;
 
 use cucumber::{given, then, when};
 use e2e_cucumber::paced_download::{
-    PacedDownloadServer, build_gzip_tarball, is_intermediate_download_progress_frame,
-    xorshift_payload,
+    PacedDownloadServer, build_gzip_tarball, deterministic_payload,
+    is_intermediate_download_progress_frame,
 };
 
 use crate::E2eWorld;
@@ -474,7 +474,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     // `requirements.txt` naming only the torch stack, so `install()`'s
     // dependency filter empties the spec list and skips `uv` entirely — this
     // scenario is about the download spinner, not the dependency install.
-    // Padded with high-entropy filler (`xorshift_payload`) so the paced
+    // Padded with high-entropy filler (`deterministic_payload`) so the paced
     // server has enough incompressible bytes to stream in more than one
     // chunk.
     let build_dir = root(world).join("comfyui-fixture").join("archive-build");
@@ -486,7 +486,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     );
     std::fs::write(
         source_dir.join("payload.bin"),
-        xorshift_payload(PACED_ARCHIVE_PAYLOAD_BYTES),
+        deterministic_payload(PACED_ARCHIVE_PAYLOAD_BYTES),
     )
     .expect("failed to write archive filler payload");
     let contents = build_gzip_tarball(&build_dir, "comfyui-source.tar.gz", "ComfyUI-master");
