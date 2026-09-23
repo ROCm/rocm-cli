@@ -448,6 +448,35 @@ mod tests {
         assert_eq!(hits[0].line, 8, "should flag the line inside the test");
     }
 
+    /// Every entry in [`MUTATIONS`] is actually detected.
+    ///
+    /// The kinds are spelled out here rather than read from the const on
+    /// purpose: a fixture that iterated `MUTATIONS` would shrink along with it,
+    /// so deleting an entry would leave the suite green — which is exactly the
+    /// hole this closes. `remove_var` previously appeared in one fixture that
+    /// asserts `is_empty()`, so nothing anywhere proved an unguarded
+    /// `remove_var` inside a `#[test]` was flagged at all.
+    ///
+    /// The length assertion is what stops the next entry arriving untested: a
+    /// third call added to the const fails here until it gains a case.
+    #[test]
+    fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
+        let kinds = ["set_var", "remove_var"];
+        assert_eq!(
+            MUTATIONS.len(),
+            kinds.len(),
+            "a call was added to MUTATIONS without a case here"
+        );
+        for kind in kinds {
+            let source = unguarded_test(&mutation_call(kind));
+            assert_eq!(
+                env_mutations_in_unserialized_tests(&source).len(),
+                1,
+                "an unguarded std::env::{kind} inside a #[test] must be flagged"
+            );
+        }
+    }
+
     #[test]
     fn the_scanner_ignores_production_mutations() {
         // Production code owns the process and may legitimately set a variable;
