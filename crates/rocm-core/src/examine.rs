@@ -1246,6 +1246,13 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// So ask the kernel here too, but only as a fallback: `lspci` carries PCI ids,
 /// vendor strings and the APU/discrete distinction that sysfs does not, and
 /// those are worth keeping whenever they are available.
+///
+/// When the preceding probes *did* find AMD GPUs there is nothing to discover,
+/// but the kernel may still know something they left blank: `lspci` never knows
+/// a gfx target, and `rocminfo` is what normally supplies it. So that case is
+/// not a no-op either — it hands off to
+/// [`fill_missing_gfx_targets_from_topology`], which fills that one gap under
+/// much stricter conditions than the discovery path above.
 fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     if e.gpus.iter().any(|gpu| gpu.is_amd) {
         fill_missing_gfx_targets_from_topology(e);
@@ -1280,32 +1287,32 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
 /// `rocminfo`. On an Instinct host without ROCm on PATH nothing supplies it, so
 /// the entries would carry an empty target even though the kernel plainly
 /// states one — and `gpus[].gfx_target` is the only place the JSON report names
-/// a target at all.
+/// the hardware's own target per device.
 ///
-/// Same rule as the enumeration fallback above: fill a gap, never overwrite. A
-/// target that `rocminfo` already resolved per-device is left alone, because
-/// the topology read yields one target for the host and cannot distinguish a
-/// mixed-GPU machine.
+/// Only fills when the topology **unambiguously** accounts for what `lspci`
+/// found: every KFD GPU node reports the same target, and there are exactly as
+/// many of them as there are AMD GPUs. Anything else is left empty rather than
+/// guessed. The topology read cannot attribute a target to a *particular*
+/// device, so on an APU+dGPU host a single host-wide answer would be stamped
+/// onto the discrete card — and `diagnose`'s iGPU/dGPU check splits precisely
+/// on `gfx_target` to tell the user which GPU to pin, where a confident wrong
+/// answer is worse than none.
 fn fill_missing_gfx_targets_from_topology(e: &mut Examination) {
-    if !e
-        .gpus
-        .iter()
-        .any(|gpu| gpu.is_amd && gpu.gfx_target.is_empty())
-    {
-        return;
-    }
-    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+    let Some((gpu_nodes, gfx_target)) = crate::detect_linux_uniform_kfd_gfx_target() else {
         return;
     };
-    fill_missing_gfx_targets(e, &gfx_target);
+    fill_missing_gfx_targets(e, gpu_nodes, &gfx_target);
 }
 
-/// The gap-fill itself, against a caller-supplied target.
+/// The gap-fill itself, against a caller-supplied topology reading.
 ///
 /// Split out from the sysfs read for the same reason as `detect_kfd_gfx_target_in`:
 /// the hosts this matters on are the ones a test cannot run on, and reading the
 /// real topology from a test would make the assertion depend on the machine.
-fn fill_missing_gfx_targets(e: &mut Examination, gfx_target: &str) {
+fn fill_missing_gfx_targets(e: &mut Examination, gpu_nodes: usize, gfx_target: &str) {
+    if gpu_nodes != e.gpus.iter().filter(|gpu| gpu.is_amd).count() {
+        return;
+    }
     for gpu in e.gpus.iter_mut().filter(|gpu| gpu.is_amd) {
         if gpu.gfx_target.is_empty() {
             gpu.gfx_target = gfx_target.to_owned();
@@ -2883,9 +2890,11 @@ mod tests {
 
     #[test]
     fn the_topology_fills_a_missing_gfx_target_but_never_replaces_one() {
-        // lspci names an Instinct part "Device" and knows no gfx target, so
-        // without rocminfo the entries carried an empty target while the kernel
-        // plainly said gfx942 -- the only place the JSON names a target at all.
+        // lspci knows no gfx target -- and on a host whose `pci.ids` predates
+        // the part it has no marketing name to guess one from either, naming an
+        // MI300X just "Device". So without rocminfo the entries carried an
+        // empty target while the kernel plainly said gfx942, and `gpus[]` is
+        // the only place the JSON names the hardware's own target per device.
         let mut e = Examination {
             gpus: vec![
                 Gpu {
@@ -2912,7 +2921,8 @@ mod tests {
             ],
             ..Examination::default()
         };
-        fill_missing_gfx_targets(&mut e, "gfx942");
+        // Two AMD GPUs, so a two-GPU topology accounts for them exactly.
+        fill_missing_gfx_targets(&mut e, 2, "gfx942");
 
         assert_eq!(e.gpus[0].gfx_target, "gfx942", "the gap must be filled");
         // A target rocminfo already resolved must survive: the topology read
@@ -2920,6 +2930,43 @@ mod tests {
         assert_eq!(e.gpus[1].gfx_target, "gfx90a");
         // A non-AMD entry is never given an AMD target.
         assert_eq!(e.gpus[2].gfx_target, "");
+    }
+
+    #[test]
+    fn a_topology_that_does_not_account_for_every_amd_gpu_fills_nothing() {
+        // The APU+dGPU host this guard exists for: lspci recognises the
+        // integrated part by name and resolves gfx1103, but the discrete card
+        // matches no pattern and comes back empty. Stamping a host-wide target
+        // onto it would label the dGPU with the APU's target -- and diagnose's
+        // iGPU/dGPU check splits on exactly this field to tell the user which
+        // GPU to pin, so a confident wrong answer is worse than none.
+        let discrete = Gpu {
+            name: "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]".to_owned(),
+            gfx_target: String::new(),
+            pci_id: "0000:03:00.0".to_owned(),
+            is_amd: true,
+            is_apu: Some(false),
+        };
+        let integrated = Gpu {
+            name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
+            gfx_target: "gfx1103".to_owned(),
+            pci_id: "0000:64:00.0".to_owned(),
+            is_amd: true,
+            is_apu: Some(true),
+        };
+        let mut e = Examination {
+            gpus: vec![discrete, integrated],
+            ..Examination::default()
+        };
+
+        // Only the APU is a KFD GPU node here, so the topology does not account
+        // for both cards and must not speak for the one it cannot see.
+        fill_missing_gfx_targets(&mut e, 1, "gfx1103");
+        assert_eq!(
+            e.gpus[0].gfx_target, "",
+            "the discrete card must not inherit the APU's target"
+        );
+        assert_eq!(e.gpus[1].gfx_target, "gfx1103");
     }
 
     #[test]

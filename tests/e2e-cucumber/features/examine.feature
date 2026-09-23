@@ -174,3 +174,21 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system both for reading and for scripting
     Then the framework report names the runtime's interpreter
+
+  # EAI-8449: Instinct parts enumerate under PCI class 1200 ("Processing
+  # accelerators") rather than a display class, so the lspci probe skipped them
+  # and the machine-readable form fell back to a single topology-sourced entry
+  # carrying no PCI address -- one row for an eight-GPU MI300X host. Neither
+  # examine-04 nor examine-08 noticed, because both assert `detected_gfx_target`
+  # and `has_amd_gpu`, which that fallback still satisfied. So this reads
+  # `gpus[]` itself, cross-checked against the kernel's own GPU node count
+  # rather than against a fixed number, which keeps it host-agnostic.
+  #
+  # The step no-ops where the premise does not hold -- no readable KFD topology,
+  # or no `lspci` to supply PCI addresses -- because the fallback it would
+  # otherwise flag is the correct answer on such a host.
+  @id:examine-lists-every-gpu-with-its-pci-address @requires-gpu
+  Scenario: examine-16 - The machine-readable report lists every GPU the kernel sees
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then it lists one AMD GPU per kernel GPU node, each with its PCI address

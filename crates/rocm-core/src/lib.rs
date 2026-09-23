@@ -5099,6 +5099,47 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
     detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
 }
 
+/// How many GPUs the KFD topology describes and the single target they all
+/// report, or `None` when they disagree or the topology is unreadable.
+///
+/// [`detect_kfd_gfx_target_in`] answers "what is this host's target" by taking
+/// the lowest-numbered node, which is the right answer for HIP ordinal 0 and
+/// the wrong one to attribute to a *particular* device: on an APU+dGPU box that
+/// node is typically the integrated part, so its target would be stamped onto
+/// the discrete card. Callers that need to label an individual GPU want this
+/// instead, and must treat `None` as "cannot say" rather than falling back.
+#[cfg(target_os = "linux")]
+pub(crate) fn detect_linux_uniform_kfd_gfx_target() -> Option<(usize, String)> {
+    if !runtime_is_linux() {
+        return None;
+    }
+    uniform_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) const fn detect_linux_uniform_kfd_gfx_target() -> Option<(usize, String)> {
+    None
+}
+
+/// The uniform-target read, against a caller-supplied nodes directory. Same
+/// planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn uniform_kfd_gfx_target_in(nodes_dir: &Path) -> Option<(usize, String)> {
+    let targets: Vec<String> = fs::read_dir(nodes_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let value = kfd_node_gfx_target_version(&entry.path())?;
+            parse_linux_kfd_gfx_target(value.trim())
+        })
+        .collect();
+    let first = targets.first()?;
+    if targets.iter().any(|target| target != first) {
+        return None;
+    }
+    Some((targets.len(), first.clone()))
+}
+
 /// The KFD-topology read, against a caller-supplied nodes directory.
 ///
 /// Split out so it can be driven against a planted directory: the hosts where
@@ -11171,6 +11212,61 @@ Class Name:                Display
         fs::remove_dir_all(&root).ok();
 
         assert_eq!(count, Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_uniform_topology_reports_its_target_and_a_mixed_one_refuses() -> Result<()> {
+        // Eight identical MI300X GPUs behind two CPU nodes: the topology speaks
+        // for every one of them, so it can label an individual device.
+        let (root, _) = temp_app_paths("kfd-uniform-topology");
+        let nodes = root.join("nodes");
+        for node in ["0", "1"] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                "cpu_cores_count 56\ngfx_target_version 0\n",
+            )?;
+        }
+        for node in ["2", "3", "4", "5", "6", "7", "8", "9"] {
+            fs::create_dir_all(nodes.join(node))?;
+            fs::write(
+                nodes.join(node).join("properties"),
+                "simd_count 1216\ngfx_target_version 90402\n",
+            )?;
+        }
+        let uniform = uniform_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(uniform, Some((8, "gfx942".to_owned())));
+
+        // An APU + a discrete card: one target cannot describe both, and
+        // `detect_kfd_gfx_target_in` would hand back whichever node sorts first.
+        let (root, _) = temp_app_paths("kfd-mixed-topology");
+        let nodes = root.join("nodes");
+        fs::create_dir_all(nodes.join("0"))?;
+        fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 16\ngfx_target_version 0\n",
+        )?;
+        fs::create_dir_all(nodes.join("1"))?;
+        fs::write(
+            nodes.join("1").join("properties"),
+            "simd_count 256\ngfx_target_version 110003\n",
+        )?;
+        fs::create_dir_all(nodes.join("2"))?;
+        fs::write(
+            nodes.join("2").join("properties"),
+            "simd_count 768\ngfx_target_version 110000\n",
+        )?;
+        let mixed = uniform_kfd_gfx_target_in(&nodes);
+        let lowest = detect_kfd_gfx_target_in(&nodes);
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(mixed, None, "a mixed topology must refuse to speak");
+        // The contrast that makes the new read necessary: the host-wide answer
+        // is still available, and is the APU -- which is why it must not be
+        // attributed to the discrete card.
+        assert_eq!(lowest.as_deref(), Some("gfx1103"));
         Ok(())
     }
 

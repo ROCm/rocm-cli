@@ -760,3 +760,75 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
          ({major}.{minor}.{revision} = {expected})\n{output}"
     );
 }
+
+/// How many GPUs the KFD topology describes, read straight from sysfs.
+///
+/// `None` when the topology is unreadable, which is the normal case off Linux.
+/// CPU nodes report a `gfx_target_version` of `0` and are skipped.
+fn kfd_gpu_node_count() -> Option<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
+        .ok()?
+        .flatten()
+    {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let version = properties.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "gfx_target_version" {
+                return None;
+            }
+            parts.next()?.parse::<u32>().ok()
+        });
+        if version.is_some_and(|value| value != 0) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+/// Whether `lspci` is on PATH, which is what supplies the PCI addresses this
+/// step asserts. Without it the CLI's topology fallback is the right answer and
+/// there is nothing here to check.
+fn host_has_lspci() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
+}
+
+#[then("it lists one AMD GPU per kernel GPU node, each with its PCI address")]
+async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
+    let Some(expected) = kfd_gpu_node_count().filter(|count| *count > 0) else {
+        return;
+    };
+    if !host_has_lspci() {
+        return;
+    }
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .expect("`examine --json` did not report a gpus array");
+    let amd: Vec<&serde_json::Value> = gpus
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+
+    assert_eq!(
+        amd.len(),
+        expected,
+        "the kernel describes {expected} GPU node(s) but the report lists {} AMD GPU(s): {gpus:#?}",
+        amd.len()
+    );
+    for gpu in amd {
+        let pci_id = gpu
+            .get("pci_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !pci_id.is_empty(),
+            "an AMD GPU was reported without a PCI address, so it came from the \
+             topology fallback rather than the PCI enumeration: {gpu:#?}"
+        );
+    }
+}
