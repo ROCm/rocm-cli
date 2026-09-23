@@ -404,12 +404,15 @@ rocm storage remove-downloads [--dry-run] [--yes]
 ```
 
 `remove-old-installs` keeps the two most recent installs for each channel,
-format, and GPU family, and never touches the install in use, the rollback
-target, or a folder rocm-cli did not create. "Most recent" means most recently
-installed rather than highest version, so after a deliberate downgrade the
-older version counts as the newer install. Because the count applies per
-channel, format, and GPU family, a machine that has tried several channels
-keeps `--keep` installs for each of them. Anything it declines to remove is
+format, GPU family, and toolchain choice, and never touches the install in use,
+the rollback target, or a folder rocm-cli did not create. "Most recent" means
+most recently installed rather than highest version, so after a deliberate
+downgrade the older version counts as the newer install. Because the count
+applies per channel, format, GPU family, and toolchain choice, a machine that
+has tried several channels keeps `--keep` installs for each of them — and a
+runtime-only install never evicts a `--devel` one, since the two are separate
+runtimes serving different purposes rather than newer and older versions of the
+same thing. Anything it declines to remove is
 listed with the reason, and `--dry-run` shows the whole plan without changing
 anything. `remove-downloads` clears cached archives that rocm-cli can download
 again; a cache folder that is a link to somewhere else is left alone rather

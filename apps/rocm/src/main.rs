@@ -776,12 +776,15 @@ enum StorageCommand {
     /// Remove older ROCm installs, keeping the most recent ones.
     #[command(name = "remove-old-installs", alias = "remove-old-runtimes")]
     RemoveOldInstalls {
-        /// How many recent installs to keep for each channel, format, and GPU family.
+        /// How many recent installs to keep for each channel, format, GPU
+        /// family, and toolchain choice.
         ///
         /// "Recent" means most recently installed, not highest version, so
         /// after a deliberate downgrade the older version counts as the newer
-        /// install. The one in use and the rollback target are always kept on
-        /// top of this count, whatever it is set to.
+        /// install. A `--devel` install and a plain one are separate runtimes
+        /// and get separate counts, so a newer runtime-only install never
+        /// evicts the toolchain. The one in use and the rollback target are
+        /// always kept on top of this count, whatever it is set to.
         #[arg(long, default_value_t = storage::DEFAULT_KEEP)]
         keep: usize,
         /// Show what would happen without changing files.
