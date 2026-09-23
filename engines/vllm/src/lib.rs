@@ -95,15 +95,35 @@ const VLLM_ROCM_DISCOVER_INDEX_URL: &str = "https://rocm.frameworks.amd.com/whl-
 const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/rocm/whl-next/";
 
 /// Looks up the discovery build recipe for a ROCm SDK version, if any.
+///
+/// Matched on major version only: unlike [`VLLM_ROCM_BUILD_TABLE`], where a
+/// row pins one exact release's wheel filename, a discover row is a live
+/// resolver recipe AMD's index applies uniformly across an entire ROCm major
+/// line (AMD rotates ROCm 10.x minor/patch releases constantly), so `10.0.0`
+/// and `10.1.0` should both discover through the same `"10.0.0"` row. This
+/// intentionally differs from `apps/rocm/src/therock.rs`'s SDK layout
+/// selection, which avoids major-only gating for unrelated reasons (on-disk
+/// layout, not wheel availability).
 fn vllm_rocm_discover_build(rocm_sdk_version: &str) -> Option<&'static VllmRocmDiscoverBuild> {
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
-        .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
+        .find(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version))
 }
 
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
-/// is the same release as `table_key` (a literal key in [`VLLM_ROCM_BUILD_TABLE`]
-/// or [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]), ignoring any dev/pre-release suffix.
+/// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
+/// a ROCm SDK major version, ignoring minor, patch, and any dev/pre-release
+/// suffix. See [`vllm_rocm_discover_build`] for why major alone is enough here.
+fn rocm_sdk_major_matches(recorded: &str, table_key: &str) -> bool {
+    fn major(version: &str) -> Option<u64> {
+        version.trim().split('.').next()?.parse().ok()
+    }
+    major(recorded).is_some() && major(recorded) == major(table_key)
+}
+
+/// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
+/// is the same release as `table_key` (a literal key in [`VLLM_ROCM_BUILD_TABLE`]),
+/// ignoring any dev/pre-release suffix.
 ///
 /// Real probes routinely carry a suffix the table keys never do (e.g.
 /// `7.13.0a20260423`), and that suffix is not valid semver pre-release syntax
@@ -2200,7 +2220,14 @@ fn vllm_install_target(rocm_sdk_version: Option<&str>) -> Result<VllmInstallTarg
 /// the target runtime's manifest) is looked up in [`VLLM_ROCM_BUILD_TABLE`].
 /// A version with no row falls back to the table's first (default) row,
 /// matching the single unconditional pin `rocm-cli` used before per-version
-/// rows existed, rather than leaving an unrecognized version uninstallable.
+/// rows existed, rather than leaving an unrecognized version uninstallable,
+/// *unless* the version's major release matches a
+/// [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] row (see [`vllm_rocm_discover_build`]),
+/// in which case guessing the default row's wheel would very likely install
+/// an ABI-incompatible build, so that case fails closed instead. In practice
+/// callers route such a version through discovery before ever reaching this
+/// function (see [`vllm_install_route`]); this is a safety net for the case
+/// where they don't.
 fn resolve_vllm_install_target(
     index_override: Option<String>,
     rocm_sdk_version: Option<&str>,
@@ -2234,11 +2261,30 @@ fn resolve_vllm_install_target(
         )
     })?;
 
-    let build = VLLM_ROCM_BUILD_TABLE
+    let default_build = VLLM_ROCM_BUILD_TABLE
+        .first()
+        .ok_or_else(|| anyhow!("VLLM_ROCM_BUILD_TABLE has no default row"))?;
+    let build = match VLLM_ROCM_BUILD_TABLE
         .iter()
         .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
-        .or_else(|| VLLM_ROCM_BUILD_TABLE.first())
-        .ok_or_else(|| anyhow!("VLLM_ROCM_BUILD_TABLE has no default row"))?;
+    {
+        Some(build) => build,
+        None if VLLM_ROCM_DISCOVER_BUILD_TABLE
+            .iter()
+            .any(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version)) =>
+        {
+            bail!(
+                "cannot install vLLM: ROCm SDK version `{rocm_sdk_version}` has no static \
+                 build pin, and its major release is only known to `rocm-cli` via live wheel \
+                 discovery, not a static pin; guessing the default \
+                 vllm=={}+{} build would very likely install an incompatible wheel. Set \
+                 ROCM_CLI_VLLM_ROCM_INDEX_URL to a published release index to install anyway.",
+                default_build.vllm_version,
+                default_build.abi,
+            );
+        }
+        None => default_build,
+    };
 
     Ok(VllmInstallTarget {
         index_url: format!(
@@ -3849,7 +3895,7 @@ mod tests {
             .first()
             .expect("build table has at least one row for this test to check");
 
-        for unknown_version in ["999.0.0", "7.13.0a20260326", "10.1.0a20260822"] {
+        for unknown_version in ["999.0.0", "7.13.0a20260326", "not-a-version"] {
             let target = install_target(None, Some(unknown_version))
                 .expect("an unrecognized version still resolves to the default pin");
             assert_eq!(
@@ -3857,6 +3903,20 @@ mod tests {
                 format!("vllm=={}+{}", default_build.vllm_version, default_build.abi)
             );
         }
+    }
+
+    #[test]
+    fn vllm_install_target_refuses_to_guess_a_static_pin_for_an_unmatched_discover_major() {
+        // `10.1.0a20260822` shares a major with the `VLLM_ROCM_DISCOVER_BUILD_TABLE`
+        // row but does not match any `VLLM_ROCM_BUILD_TABLE` row, so guessing the
+        // ROCm 7.2.3 default here would install an incompatible wheel. Callers
+        // route this version through discovery before reaching this function (see
+        // `vllm_install_route`); this checks the fallback itself fails closed.
+        let error = install_target(None, Some("10.1.0a20260822"))
+            .expect_err("an unmatched version in a known discovery major must not guess")
+            .to_string();
+        assert!(error.contains("10.1.0a20260822"), "{error}");
+        assert!(error.contains("ROCM_CLI_VLLM_ROCM_INDEX_URL"), "{error}");
     }
 
     #[test]
@@ -4208,6 +4268,10 @@ mod tests {
     #[test]
     fn vllm_rocm_discover_build_looks_up_known_and_unknown_versions() {
         assert!(vllm_rocm_discover_build("10.0.0").is_some());
+        // AMD rotates the ROCm 10.x minor/patch constantly; the discovery
+        // recipe must keep firing across the whole major line, not just the
+        // exact version it happened to be added for.
+        assert!(vllm_rocm_discover_build("10.1.0a20260822").is_some());
         assert!(vllm_rocm_discover_build("999.0.0").is_none());
     }
 
@@ -4218,6 +4282,15 @@ mod tests {
         assert!(rocm_sdk_version_matches("7.2.3.dev0+abc", "7.2.3"));
         assert!(!rocm_sdk_version_matches("7.14.1", "7.2.3"));
         assert!(!rocm_sdk_version_matches("garbage", "7.2.3"));
+    }
+
+    #[test]
+    fn rocm_sdk_major_matches_ignores_minor_patch_and_dev_suffixes() {
+        assert!(rocm_sdk_major_matches("10.0.0", "10.0.0"));
+        assert!(rocm_sdk_major_matches("10.1.0a20260822", "10.0.0"));
+        assert!(rocm_sdk_major_matches("10.99.7.dev0+abc", "10.0.0"));
+        assert!(!rocm_sdk_major_matches("7.13.0", "10.0.0"));
+        assert!(!rocm_sdk_major_matches("garbage", "10.0.0"));
     }
 
     #[test]
@@ -4232,6 +4305,12 @@ mod tests {
     fn vllm_install_route_discovers_for_a_known_discover_version() {
         assert_eq!(
             vllm_install_route(None, Some("10.0.0")),
+            VllmInstallRoute::RocmDiscover
+        );
+        // A same-major, different-minor/patch nightly must still route
+        // through discovery rather than falling back to the static table.
+        assert_eq!(
+            vllm_install_route(None, Some("10.1.0a20260822")),
             VllmInstallRoute::RocmDiscover
         );
     }
