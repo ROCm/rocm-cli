@@ -97,14 +97,20 @@ unverified.
 ### Doing it by hand
 
 The equivalent manual steps, for reference or for a host where the CLI is not
-installed yet:
+installed yet. The `sha256sum -c` line is the same trust anchor `rocm install
+driver` uses — `apt install` runs the package's maintainer scripts as root, so
+do not skip it. The digest below is the one rocm-cli pins for 1.2.2; for a
+different release, take the digest published with it:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
-curl -L -o /tmp/rocdxg-roct_1.2.0_amd64.deb \
-  https://github.com/ROCm/librocdxg/releases/download/v1.2.0/rocdxg-roct_1.2.0_amd64.deb
-sudo apt install -y /tmp/rocdxg-roct_1.2.0_amd64.deb
+curl -L -o /tmp/rocdxg-roct_1.2.2_amd64.deb \
+  https://github.com/ROCm/librocdxg/releases/download/v1.2.2/rocdxg-roct_1.2.2_amd64.deb
+printf '%s  %s\n' \
+  28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541 \
+  /tmp/rocdxg-roct_1.2.2_amd64.deb | sha256sum -c -
+sudo apt install -y /tmp/rocdxg-roct_1.2.2_amd64.deb
 sudo ldconfig
 ```
 

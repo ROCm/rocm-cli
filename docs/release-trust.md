@@ -140,8 +140,10 @@ a plan that will not run rather than an unauthenticated root install.
 It is deliberately explicit, and the plan then carries a command that prints a
 warning naming the version it is not checking, so the choice is visible in the
 plan under review and in `state.json` rather than being inferred from a missing
-variable. It takes the usual affirmative values (`1`, `true`, `yes`, `on`);
-anything else — including `0` and `false` — leaves verification on.
+variable. The value is matched against a fixed allowlist of affirmative
+spellings — `1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON` — after trimming
+surrounding whitespace; anything else, including `0` and `false`, leaves
+verification on.
 
 ## Runtime Metadata Verification
 

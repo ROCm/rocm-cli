@@ -3500,7 +3500,28 @@ struct DriverPassiveCheck {
 /// pin. The concrete value is baked into the archive name, the release URL and
 /// the `repo_version:` line, so the plan a user reviews names the build the
 /// install will actually fetch rather than an unexpanded `${...}` placeholder.
-const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.0}";
+///
+/// How the default is chosen: the newest non-prerelease `librocdxg` release
+/// whose `rocdxg-roct` digest is pinned in [`ROCDXG_PINNED_DIGESTS`]. Moving it
+/// is two edits — add the `(version, digest)` row to that table, then change
+/// the literal here — and the two must move together: a default with no row
+/// makes [`resolve_rocdxg_verification`] refuse to build a plan at all unless
+/// the caller supplies a digest, so a bump that forgets the table breaks every
+/// default WSL install rather than falling back to the previous release.
+///
+/// Deliberately out of scope: `rocdxg-amd-smi-lib_<version>_amd64.deb`, which
+/// v1.2.1 and v1.2.2 ship alongside `rocdxg-roct` and the five releases before
+/// them do not, is not installed here. It is a second prefix under
+/// `/opt/rocm-wsl` carrying its own `amd-smi` and `libamd_smi.so`, and it
+/// installs an `/etc/profile.d` entry that sources the package's own
+/// `/opt/rocm-wsl/.env.sh`, which in turn prepends that prefix to `PATH` and
+/// `LD_LIBRARY_PATH` for new login shells. That is a system-wide environment
+/// change in service of a monitoring utility that neither `wsl_rocdxg_ready`
+/// nor `rocm serve` depends on, and it is not available for every version in
+/// the pinned table. Installing it is a separate decision that belongs behind
+/// its own opt-in, not folded into the plan whose job is to supply the runtime
+/// bridge.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.2}";
 
 /// Supplies a SHA-256 digest for the ROCDXG package, overriding the pinned one.
 /// Required when installing a version this build has no digest for.
@@ -3612,7 +3633,8 @@ enum RocdxgVerification {
 /// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
 /// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
 /// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
-///    (`1`, `true`, `yes`, `on`), which opts out. `0` and `false` do not.
+///    — see [`crate::therock::truthy_env`] for the exact allowlist — which opts
+///    out. `0` and `false` do not.
 ///
 /// Nothing left means refusal. Verification is therefore opt-*out*: the failure
 /// mode of an unset variable is a plan that will not run, not a root install of
@@ -30877,9 +30899,12 @@ VERSION_ID="41"
         // build, so the flag must not pull in the bare-metal path.
         //
         // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
-        // from process env before it reaches the WSL branch, so this reader has
-        // to take the same guard as the mutating tests in this binary.
-        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // from process env before it reaches the WSL branch, and the WSL branch
+        // then reads the three ROCDXG vars — an exported
+        // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
+        // fail the `plan.supported` assertion below. So this reader takes the
+        // guard that clears both sets.
+        let _env = scoped_rocdxg_env();
         let plan = build_driver_install_plan(
             &test_examine("linux", true),
             "",
@@ -30914,6 +30939,29 @@ VERSION_ID="41"
         assert!(commands.contains("rocdxg-roct_"));
         assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
         assert!(commands.contains("sudo ldconfig"));
+
+        // And in that order. `ldconfig` refreshes the cache from what is on
+        // disk now, so running it before `apt-get install` has unpacked
+        // `librocdxg.so` scans a directory that does not contain it yet and
+        // publishes nothing — leaving the plan reporting success while the
+        // `ldconfig -p` verification below is the only thing that would notice.
+        // Both steps are still present under that swap, so every `contains`
+        // assertion in this file stays green; only a position comparison
+        // catches it.
+        let steps = plan.execution_commands();
+        let install = steps
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        let publish = steps
+            .iter()
+            .position(|c| c.trim_end().ends_with("ldconfig"))
+            .expect("plan publishes the library");
+        assert!(
+            install < publish,
+            "ldconfig must run after the package is installed:\n{}",
+            steps.join("\n")
+        );
 
         // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
         // on, so a silently partial install cannot report success.
@@ -30967,8 +31015,14 @@ VERSION_ID="41"
     /// Clear every input that steers the ROCDXG plan, so a value exported in
     /// the developer's or runner's shell cannot decide the outcome of a test
     /// that is asserting on the default.
+    ///
+    /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
+    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
+    /// branch: a caller needing one of these two guards needs both, and one
+    /// helper spares every test from picking the wrong half.
     fn scoped_rocdxg_env() -> ScopedTestEnv {
-        let mut env = ScopedTestEnv::new();
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
         env.clear("ROCM_CLI_ROCDXG_VERSION");
         env.clear(ROCDXG_SHA256_ENV);
         env.clear(ROCDXG_ALLOW_UNVERIFIED_ENV);
@@ -30988,7 +31042,7 @@ VERSION_ID="41"
 
         let pinned = ROCDXG_PINNED_DIGESTS
             .iter()
-            .find_map(|(version, digest)| (*version == "1.2.0").then_some(*digest))
+            .find_map(|(version, digest)| (*version == "1.2.2").then_some(*digest))
             .expect("the default version is pinned");
         assert!(joined.contains(pinned), "{joined}");
         assert!(joined.contains("sha256sum -c -"), "{joined}");
@@ -31186,15 +31240,47 @@ VERSION_ID="41"
     /// executable self-test that used to cover it was deleted along with
     /// `scripts/wsl_setup_rocdxg.sh`. Substring assertions would let a quoting,
     /// field-order or newline regression in the `printf | sha256sum -c -`
-    /// fragment ship green.
+    /// fragment ship green, so the generated command is pinned whole with
+    /// `assert_eq!` and then executed — with only the two values it embeds
+    /// redirected at a test payload, so the quoting, spacing and field order
+    /// under test are production's rather than a replica's.
+    ///
+    /// Field order in particular is invisible to a `starts_with`/`ends_with`
+    /// pair: `sha256sum -c -` reads `DIGEST  FILENAME`, so emitting the path
+    /// first breaks every real WSL install while still starting with
+    /// `printf '%s  %s\n' '` and ending with `' | sha256sum -c -`.
     #[cfg(unix)]
     #[test]
     fn wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file() {
         use std::process::Command;
 
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let version = plan.repo_version.clone();
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(pinned_version, digest)| {
+                (*pinned_version == version.as_str()).then_some(*digest)
+            })
+            .expect("the default version is pinned");
+        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let generated = plan
+            .execution_commands()
+            .into_iter()
+            .find(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+
+        // Whole-string, not `contains`: the digest has to come first and the
+        // two fields have to be separated by exactly the two spaces
+        // `sha256sum -c -` expects.
+        assert_eq!(
+            generated,
+            format!("printf '%s  %s\\n' '{pinned}' '{deb_path}' | sha256sum -c -")
+        );
+
         let (root, _paths) = test_paths("wsl-rocdxg-digest");
         fs::create_dir_all(&root).expect("test root");
-        let payload = root.join("rocdxg-roct_1.2.0_amd64.deb");
+        let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
         fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
 
         let digest_of = |path: &Path| -> String {
@@ -31212,12 +31298,14 @@ VERSION_ID="41"
         };
         let good = digest_of(&payload);
 
-        // Build the real command the same way the plan does, then run it.
+        // The command under test is the generated one; the only edits are the
+        // digest being checked and the path being checked, so a regression in
+        // how the fragment is built reaches `sh` here instead of being masked
+        // by a replica built to the test's own idea of the right shape.
         let step = |digest: &str| -> bool {
-            let command = format!(
-                "printf '%s  %s\\n' '{digest}' '{}' | sha256sum -c -",
-                payload.display()
-            );
+            let command = generated
+                .replace(pinned, digest)
+                .replace(&deb_path, &payload.display().to_string());
             Command::new("sh")
                 .arg("-c")
                 .arg(&command)
@@ -31234,17 +31322,6 @@ VERSION_ID="41"
         );
         assert!(!step("deadbeef"), "a malformed digest must fail the step");
         assert!(!step(""), "an empty digest must fail the step");
-
-        // And the digest the plan embeds by default is wired into that same
-        // shape, so the above is testing the real fragment.
-        let _env = scoped_rocdxg_env();
-        let generated = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo)
-            .execution_commands()
-            .into_iter()
-            .find(|c| c.contains("sha256sum -c -"))
-            .expect("plan verifies the download");
-        assert!(generated.starts_with("printf '%s  %s\\n' '"), "{generated}");
-        assert!(generated.ends_with("' | sha256sum -c -"), "{generated}");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -31289,7 +31366,7 @@ VERSION_ID="41"
         let mut env = scoped_rocdxg_env();
 
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
-        assert_eq!(plan.repo_version, "1.2.0");
+        assert_eq!(plan.repo_version, "1.2.2");
         let commands = plan.execution_commands().join("\n");
         // The version is resolved here, not deferred to the shell: the plan the
         // user approves has to name the build the install will actually fetch.
@@ -31301,7 +31378,7 @@ VERSION_ID="41"
             !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
             "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
         );
-        let occurrences = commands.matches("1.2.0").count();
+        let occurrences = commands.matches("1.2.2").count();
         assert!(
             occurrences >= 3,
             "version should drive the deb name, the tag and the path; saw {occurrences}"
@@ -31327,7 +31404,7 @@ VERSION_ID="41"
             "{commands}"
         );
         assert!(
-            !commands.contains("1.2.0"),
+            !commands.contains("1.2.2"),
             "override left a reference on the default version:\n{commands}"
         );
     }

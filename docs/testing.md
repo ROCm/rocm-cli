@@ -793,12 +793,15 @@ python scripts/release_readiness.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ```
 
-The ROCDXG digest check runs the shell fragment the WSL driver plan generates
-against a real file — a matching digest, a mismatched one, and a malformed one
-— because that step is the only thing authenticating a package that is then
-installed as root. It replaces the self-test that shipped with the removed
-`scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and `sha256sum`, so it is
-Unix-only.
+The ROCDXG digest check pins the shell fragment the WSL driver plan generates
+as a whole string — so a change to its quoting, spacing or field order fails
+the test rather than slipping past a substring assertion — and then runs that
+same generated fragment against a real file, with only the digest and the path
+redirected at a test payload: a matching digest, a mismatched one, a malformed
+one, and an empty one. That step is the only thing authenticating a package
+that is then installed as root, and this replaces the self-test that shipped
+with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
+`sha256sum`, so it is Unix-only.
 
 The release-readiness self-test is cross-platform and uses only workspace-local
 temporary files under `.rocm-work/tests/release-readiness`. It also checks exact
