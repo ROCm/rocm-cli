@@ -806,13 +806,17 @@ jobs:
       - name: Verify the host really is WSL2
         shell: powershell
         run: |
-          # Windows PowerShell prepends a UTF-8 BOM when piping a string to a
-          # native process's stdin by default, which lands as the first bytes
-          # bash reads — breaking `proc_version=...`'s assignment syntax and
-          # making bash treat the whole line as a (nonexistent) command
-          # (observed on run 34832369689's re-run). BOM-less UTF8 fixes it.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          @'
+          # Windows PowerShell 5.1 prepends a UTF-8 BOM whenever a *string* is
+          # piped to a native process's stdin, even with an explicit no-BOM
+          # UTF8Encoding set as $OutputEncoding (a long-standing PS 5.1 quirk
+          # in the native-command redirection path) — the BOM landed as the
+          # first bytes bash read, breaking `proc_version=...`'s assignment
+          # syntax and making bash treat the whole line as a (nonexistent)
+          # command (observed on run 34832369689's re-run, and again on
+          # 35849756082 despite the $OutputEncoding fix below). Piping a byte
+          # array instead of a string bypasses that conversion entirely —
+          # byte-array pipeline objects go to the native process's stdin as-is.
+          [Text.Encoding]::UTF8.GetBytes(@'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
             && [ -z "${WSL_DISTRO_NAME+x}" ] \
@@ -821,7 +825,7 @@ jobs:
             exit 1
           fi
           printf 'WSL kernel: %s\n' "$(uname -r)"
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # A freshly installed distro has none of this; install unconditionally
@@ -832,13 +836,12 @@ jobs:
       - name: Ensure native build deps
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          @'
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
+          [Text.Encoding]::UTF8.GetBytes(@'
           apt-get update
           apt-get install -y --no-install-recommends \
             pkg-config build-essential libcap-dev git ca-certificates curl sudo
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Building against the /mnt/<drive> DrvFs mount directly is a well-known
@@ -848,8 +851,7 @@ jobs:
       - name: Clone checkout into the WSL guest's native filesystem
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
           $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
           $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
           $script = @"
@@ -860,7 +862,7 @@ jobs:
           cd /root/work/rocm-cli
           git checkout --quiet '$sha'
           "@
-          $script | wsl -d Ubuntu-24.04 -u root -- bash
+          [Text.Encoding]::UTF8.GetBytes($script) | wsl -d Ubuntu-24.04 -u root -- bash
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # librocdxg is not part of a bare Ubuntu-24.04 image, so it needs
@@ -874,9 +876,8 @@ jobs:
       - name: Install ROCm's WSL driver bridge (librocdxg, advisory)
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          @'
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
+          [Text.Encoding]::UTF8.GetBytes(@'
           set -eo pipefail
           cd /root/work/rocm-cli
           if bash scripts/wsl_setup_rocdxg.sh; then
@@ -884,7 +885,7 @@ jobs:
           else
             echo "::warning::librocdxg install failed or was skipped -- @requires-gpu scenarios will resolve to skip"
           fi
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
@@ -900,9 +901,8 @@ jobs:
       - name: GPU preflight (advisory bounded wait)
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          @'
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
+          [Text.Encoding]::UTF8.GetBytes(@'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
@@ -939,7 +939,7 @@ jobs:
           # relies on a non-matching `grep` in the pipeline being tolerated
           # rather than aborting the script, so `rocm-smi` output this parser
           # doesn't recognize retries instead of hard-failing the step.
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile.
@@ -951,26 +951,24 @@ jobs:
       - name: Ensure Rust toolchain
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-          @'
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
+          [Text.Encoding]::UTF8.GetBytes(@'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run E2E tests on Strix Halo WSL2
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
           $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE'
-          @'
+          [Text.Encoding]::UTF8.GetBytes(@'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
 
@@ -1012,7 +1010,7 @@ jobs:
           else
             cargo xtask e2e
           fi
-          '@ | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
+          '@) | wsl -d Ubuntu-24.04 -u root -- bash -eo pipefail
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # actions/upload-artifact runs on the Windows host, not inside the WSL
@@ -1023,15 +1021,14 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          # See "Verify the host really is WSL2": avoid the stdin-pipe BOM.
-          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          # See "Verify the host really is WSL2": byte array bypasses the stdin BOM bug.
           $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
-          @"
+          [Text.Encoding]::UTF8.GetBytes(@"
           mkdir -p '$winPath/tests/e2e-cucumber/results'
           if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then
             cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
           fi
-          "@ | wsl -d Ubuntu-24.04 -u root -- bash
+          "@) | wsl -d Ubuntu-24.04 -u root -- bash
           # Best-effort per the step name: an earlier failure (e.g. the distro
           # itself never came up) already failed the job through its own step,
           # so this one must not also report red on the resulting "no such
