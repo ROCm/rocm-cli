@@ -8,6 +8,13 @@
 #   (each byte's decimal value) instead of the script text.
 # Writing the script to a file with .NET's WriteAllText (true no-BOM control)
 # and executing that file by path sidesteps both: no pipe, no marshaling.
+#
+# The WSL path is built manually instead of shelling out to `wslpath`: passing
+# a Windows temp path (e.g. C:\Users\...\tmp1234.tmp) as a bare argument to
+# `wsl -- wslpath` silently strips every backslash before wslpath sees it, so
+# it fails and leaves nothing to convert. Default WSL2 automount always
+# exposes drive letters at /mnt/<lowercase-letter>, so the translation is a
+# one-line string replace.
 param(
     [Parameter(Mandatory)][string]$Script,
     [string]$Distro = 'Ubuntu-24.04',
@@ -18,7 +25,8 @@ param(
 $tmp = [System.IO.Path]::GetTempFileName()
 try {
     [System.IO.File]::WriteAllText($tmp, $Script, [System.Text.UTF8Encoding]::new($false))
-    $wslPath = (wsl -d $Distro -u $User -- wslpath $tmp).Trim()
+    $drive = $tmp.Substring(0, 1).ToLower()
+    $wslPath = "/mnt/$drive" + $tmp.Substring(2).Replace('\', '/')
     if ($PipeFail) {
         wsl -d $Distro -u $User -- bash -eo pipefail $wslPath
     } else {
