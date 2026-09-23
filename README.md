@@ -311,7 +311,16 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli; pass `--devel` to also install the compiler and headers needed to
-build GPU code, roughly doubling the download.
+build GPU code, roughly doubling the download. `--devel` is not an addition to
+an existing runtime: a runtime is identified by the packages it was installed
+from, so running `rocm install sdk` and later `rocm install sdk --devel` at the
+same version leaves you with **two** side-by-side runtimes — the second is a
+fresh full install, not a toolchain bolted onto the first — and the second one
+becomes active. `rocm runtimes list` marks each one `toolchain=included` or
+`toolchain=excluded`, `rocm examine` reports the active runtime's as
+`active_runtime_toolchain`, and `rocm storage remove-old-installs` counts the
+two kinds separately so neither evicts the other. To reclaim the space, uninstall
+the one you do not want with `rocm runtimes uninstall <runtime-key>`.
 An install with no active default runtime never prompts, but once a
 managed runtime is the active default every `install sdk` asks first, because
 the new install takes over as the active default. That gate is not scoped to the
@@ -382,6 +391,13 @@ rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`list` shows each runtime's version, GPU family, mode, and whether it carries
+the compiler toolchain (`toolchain=included|excluded`). Runtimes are told apart
+by the packages they were installed from, not by version alone, so one version
+can appear more than once: a `--devel` install and a plain one of the same
+version are two separate runtimes, as are two installs that resolved different
+GPU device payloads.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and

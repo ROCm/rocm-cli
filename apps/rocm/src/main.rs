@@ -625,6 +625,13 @@ rocm install sdk --devel")]
         /// Also install the ROCm compiler, headers, and static libraries for
         /// building GPU code. Roughly doubles the wheel download; already
         /// included by `--format tarball`.
+        ///
+        /// This does not add the toolchain to a runtime you already have: a
+        /// runtime is identified by the packages it was installed from, so
+        /// passing --devel over an existing plain install of the same version
+        /// creates a SECOND side-by-side runtime and activates it. Remove the
+        /// one you do not want with `rocm runtimes uninstall <runtime-key>`;
+        /// `rocm runtimes list` shows which is which.
         #[arg(long)]
         devel: bool,
         /// Resolve the install plan without changing files.
