@@ -478,13 +478,12 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
     // `Given` activates one, so its absence is a broken precondition, and
     // silently falling through to the `PATH` case is how this scenario would
     // stop testing anything.
-    let root = value
+    let Some(root) = value
         .pointer("/summary/active_runtime_root")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
-        });
+    else {
+        panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
+    };
     // Both forms resolve the active manifest the same way, so a disagreement
     // means one of the two paths is looking at a different runtime.
     if let Some(stated) = human_states(human, "active_runtime_root") {
@@ -534,7 +533,7 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
     // skip, rather than guess.
     if human_states(human, "active_runtime_mode").as_deref() == Some("managed") {
         assert!(
-            std::path::Path::new(&named_interpreter).starts_with(&root),
+            std::path::Path::new(&named_interpreter).starts_with(root),
             "a managed runtime keeps its interpreter under its own root, so naming \
              {named_interpreter} instead of something under {root} means the framework \
              report is describing a different runtime than the active one"
