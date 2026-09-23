@@ -1016,6 +1016,27 @@ impl AppState {
             || self.bench_run.is_some()
     }
 
+    /// Whether a chat tool-call approval is pending. Its own gating layer,
+    /// separate from [`has_open_overlay`](Self::has_open_overlay) — a real
+    /// keypress or click can never reach `OpenThemePicker`/`ToggleHelp`/`Quit`/
+    /// a scrollbar/the pane body while this is `true`, so every input path
+    /// that swallows for an open overlay must also check this, or a mouse
+    /// gesture could bypass a gate no keypress ever could. Single source of
+    /// truth for that check so the call sites can't drift apart.
+    pub(crate) const fn approval_pending(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    /// Whether *either* gating layer owns the screen: an open manager overlay
+    /// or a pending chat approval. This exact `||` is what every input path
+    /// that swallows for one must also swallow for the other — two call sites
+    /// wrote it out by hand before this existed, each with its own copy of
+    /// this same reasoning; a third forgetting one half would reopen the
+    /// class of bug `approval_pending`'s own doc comment describes.
+    pub(crate) const fn overlay_or_approval(&self) -> bool {
+        self.has_open_overlay() || self.approval_pending()
+    }
+
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
     /// overlay is closed (no manager is `Some`).
     ///
@@ -1121,7 +1142,10 @@ impl AppState {
     /// per-manager clause enumerates every nesting field the manager's state
     /// struct has — see the note on `OnboardingState` (and its sibling
     /// manager-state structs) about keeping that enumeration in sync when a
-    /// new nested sub-view field is added.
+    /// new nested sub-view field is added. `active_overlay_at_root_enumeration_is_exhaustive`
+    /// turns that into a build break instead of a silent drift: it destructures
+    /// every one of those structs without `..`, so adding a field to any of
+    /// them without updating both the test and this function fails to compile.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -2679,7 +2703,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // On Approve: replay the approved action off the
                     // event loop (spawn_blocking) and post ChatApprovalResult.
                     // On Deny/Cancel: a declined turn, no execution.
-                    Some(Ok(CtEvent::Key(k))) if state.approval.is_some() => {
+                    Some(Ok(CtEvent::Key(k))) if state.approval_pending() => {
                         use crate::ui::approval::ApprovalVerdict;
                         match state.on_approval_key(k.code) {
                             Some(ApprovalVerdict::Approve) => {
@@ -3500,6 +3524,17 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     // A held drag on a scrollbar keeps updating that offset until release, even
     // when the pointer slides off the narrow track.
     if me.kind == MouseEventKind::Drag(MouseButton::Left) {
+        // A drag can start before an approval becomes pending (it's only
+        // gated at the click that starts it, via `scrollbar_hit`'s own
+        // `approval_pending()` check below) and then have an approval land
+        // asynchronously mid-drag. Swallow it here too, or the drag would
+        // keep mutating a scroll position hidden behind the approval modal —
+        // "a pending approval owns the body with no exception" (see the
+        // wheel-scroll swallow further down) applies to an in-flight drag
+        // just as much as to input that starts fresh.
+        if state.approval_pending() {
+            return KeyAction::Nothing;
+        }
         if let Some(drag) = state.scroll_drag
             && let Some(h) = state
                 .scrollbars
@@ -3533,7 +3568,7 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // the approval modal itself, so any handle on screen while one is
         // pending belongs to content underneath it, which the swallow below
         // must still catch rather than let a scrollbar drag bypass it.
-        if state.approval.is_none()
+        if !state.approval_pending()
             && let Some(a) = scrollbar_hit(state, me.column, me.row)
         {
             return a;
@@ -3553,9 +3588,9 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // silently change the selection, re-open a verb, or switch tabs
         // underneath the approval modal). Tab-bar and footer-chip clicks
         // above still work, matching the manager-overlay swallow this
-        // mirrors (see the analogous `state.approval.is_some()` check next
-        // to `has_open_overlay()` in ui/mod.rs's footer-chip gating).
-        if state.has_open_overlay() || state.approval.is_some() {
+        // mirrors (see the analogous `overlay_or_approval()` check in
+        // ui/mod.rs's footer-chip gating).
+        if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }
         if state.modal == Modal::None
@@ -3594,7 +3629,7 @@ fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     // A pending approval owns the body with no exception (mirrors the click
     // swallow a few lines above) — unlike a plain manager overlay, it never
     // has its own console to pan, so there is nothing to fall through to.
-    if state.approval.is_some() {
+    if state.approval_pending() {
         return KeyAction::Nothing;
     }
     // An open manager owns the body. When it is showing its job console, the
@@ -5200,6 +5235,44 @@ mod tests {
     }
 
     #[test]
+    fn drag_is_swallowed_once_an_approval_becomes_pending_mid_drag() {
+        // A drag can only start while no approval is pending (the click that
+        // starts it goes through `scrollbar_hit`, which is itself gated), but
+        // an approval can land asynchronously (a chat tool call) while a drag
+        // started earlier is still in flight. The Drag branch must not keep
+        // updating the scroll position once that happens — "a pending
+        // approval owns the body with no exception" applies to an in-flight
+        // drag, not just to input that starts fresh.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        apply_action(&mut s, a);
+        assert!(s.scroll_drag.is_some(), "drag must have started");
+        assert_eq!(s.console_scroll, 90);
+
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        assert_eq!(
+            resolve_mouse(drag, &s),
+            KeyAction::Nothing,
+            "a drag in flight when an approval becomes pending must be swallowed"
+        );
+    }
+
+    #[test]
     fn rendered_thumb_cells_are_grabbable() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5850,6 +5923,153 @@ mod tests {
             s.active_overlay_at_root(),
             "bench_run (no sub-popup/job) is always at root"
         );
+    }
+
+    /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
+    /// enumeration of each manager's nested sub-view fields (documented on
+    /// `OnboardingState`, which lists every struct this covers). Nothing stops
+    /// a future field — a new sub-popup, picker, or prompt — from being added
+    /// to one of these structs without a matching update there, which would
+    /// silently let Esc eject the whole manager instead of deferring to the
+    /// new sub-view.
+    ///
+    /// This exhaustively destructures every one of those structs (no `..`),
+    /// naming every field. Adding a field to any of them without updating
+    /// this test — and, in step, `active_overlay_at_root` — fails to compile
+    /// (E0027), turning the silent-drift risk into a build break.
+    #[test]
+    fn active_overlay_at_root_enumeration_is_exhaustive() {
+        use crate::ui::automations_manager::AutomationsManagerState;
+        use crate::ui::command_screen::CommandScreenState;
+        use crate::ui::config_manager::ConfigManagerState;
+        use crate::ui::engine_manager::EngineManagerState;
+        use crate::ui::examine_manager::ExamineManagerState;
+        use crate::ui::install_manager::InstallManagerState;
+        use crate::ui::logs_view::LogsViewState;
+        use crate::ui::onboarding::OnboardingState;
+        use crate::ui::runtime_manager::RuntimeManagerState;
+        use crate::ui::serve_wizard::ServeWizardState;
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::update_manager::UpdateManagerState;
+
+        let ServeWizardState {
+            field: _,
+            model: _,
+            engine_idx: _,
+            device_idx: _,
+            host: _,
+            port: _,
+            managed: _,
+            browser,
+            picker,
+            approval,
+            active_job,
+            message: _,
+        } = ServeWizardState::default();
+        assert!(
+            browser.is_none() && picker.is_none() && approval.is_none() && active_job.is_none()
+        );
+
+        let InstallManagerState {
+            field: _,
+            channel: _,
+            format_idx: _,
+            prefix: _,
+            dry_run: _,
+            browser,
+            approval,
+            active_job,
+            message: _,
+        } = InstallManagerState::default();
+        assert!(browser.is_none() && approval.is_none() && active_job.is_none());
+
+        let OnboardingState {
+            step: _,
+            choice: _,
+            browser,
+            install_config,
+            approval,
+            active_job,
+            message: _,
+        } = OnboardingState::default();
+        assert!(
+            browser.is_none()
+                && install_config.is_none()
+                && approval.is_none()
+                && active_job.is_none()
+        );
+
+        let RuntimeManagerState {
+            selected: _,
+            browser,
+            import_input,
+            approval,
+            active_job,
+            message: _,
+        } = RuntimeManagerState::default();
+        assert!(
+            browser.is_none()
+                && import_input.is_none()
+                && approval.is_none()
+                && active_job.is_none()
+        );
+
+        let EngineManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = EngineManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let ServicesManagerState {
+            selected: _,
+            approval,
+            active_job,
+        } = ServicesManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let UpdateManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = UpdateManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let ConfigManagerState {
+            action_sel: _,
+            provider_sel: _,
+            approval,
+            active_job,
+            message: _,
+        } = ConfigManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let CommandScreenState {
+            input: _,
+            approval,
+            active_job,
+            message: _,
+        } = CommandScreenState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let AutomationsManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = AutomationsManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let ExamineManagerState { active_job } = ExamineManagerState::default();
+        assert!(active_job.is_none());
+
+        let LogsViewState {
+            query: _,
+            active_job,
+        } = LogsViewState::default();
+        assert!(active_job.is_none());
     }
 
     #[test]

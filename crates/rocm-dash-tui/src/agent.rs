@@ -1624,14 +1624,12 @@ impl MockAgentClient {
         approval_tx: UnboundedSender<ClientMsg>,
     ) -> Self {
         Self {
-            reply: reply.into(),
-            fail: false,
-            cited: vec![tool_name.into()],
             approval: Some(MockApprovalTrigger {
                 phrase: phrase.into().to_lowercase(),
                 intent,
                 tx: approval_tx,
             }),
+            ..Self::with_tool_call(reply, tool_name)
         }
     }
 

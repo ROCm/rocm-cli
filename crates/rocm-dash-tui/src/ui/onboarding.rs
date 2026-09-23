@@ -220,6 +220,9 @@ pub struct PendingOnboard {
 /// has focus. The same applies to every other manager-state struct that
 /// clause enumerates (`serve_wizard`, `install_manager`, `runtime_manager`,
 /// `engine_manager`, `services`, `update_manager`, `config_manager`, ...).
+/// `app::tests::active_overlay_at_root_enumeration_is_exhaustive` destructures
+/// every one of those structs without `..`, so forgetting this fails to
+/// compile rather than silently mis-gating Esc.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
     pub step: OnboardingStep,

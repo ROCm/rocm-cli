@@ -792,12 +792,19 @@ fn render_scrollable_pane(
     reserve: bool,
     theme: &Theme,
 ) -> (u16, Rect) {
-    let len = if reserve {
-        p.line_count(inner.width.saturating_sub(1))
+    // `vertical_scrollbar_forced` (`panel.rs`) bails out and returns `inner`
+    // unmodified — no column actually reserved — whenever `inner.width < 2`,
+    // regardless of `reserve`. `len` must be measured at whatever width the
+    // pane will really render at, so mirror that exact guard here: measuring
+    // at `inner.width - 1` (down to 0) when the bar can't fit would disagree
+    // with content that's still drawn at the full, unreserved `inner.width`.
+    let will_reserve = reserve && inner.width >= 2;
+    let len = if will_reserve {
+        p.line_count(inner.width - 1)
     } else {
         full_len
     };
-    let content = if reserve {
+    let content = if will_reserve {
         panel::vertical_scrollbar_forced(
             f,
             inner,
@@ -882,6 +889,22 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, state: &AppState, the
     // a scrollbar in either pane reserves the column in *both* — the two
     // share one scroll position and would otherwise end up different widths
     // whenever only one pane's content happened to overflow.
+    //
+    // This measures each pane at its pre-reservation width; `render_scrollable_pane`
+    // measures again at the post-reservation width when `reserve` ends up true
+    // (up to 4 `line_count` calls total for the two panes). That looks like it
+    // could be collapsed to one measurement per pane by reusing the narrower
+    // (reserved) width's count either way — word-wrap only ever wraps to the
+    // same or *more* lines as width shrinks, so a pane that already fits within
+    // `height` at the narrower width provably also fits at the wider one. But
+    // the reverse direction doesn't hold: a pane whose narrower-width count
+    // exceeds `height` might still fit fine at the wider, unreserved width, and
+    // deciding `reserve` from the narrower count there would show a scrollbar
+    // for a pane that never actually overflows when rendered without one —
+    // reintroducing, one width away, the exact class of bug that measuring
+    // `reserve` and the final wrap at two different widths (4773c227) exists to
+    // prevent. The two measurements are a deliberate cost of that fix, not an
+    // oversight — don't collapse them.
     let args_full_len = args_p.line_count(args_inner.width);
     let env_full_len = env_p.line_count(env_inner.width);
     let reserve = args_full_len > usize::from(args_inner.height)
@@ -902,22 +925,20 @@ fn render_body(f: &mut Frame, area: Rect, inst: &Instance, state: &AppState, the
     // own content.
     let shared_max = args_max.max(env_max);
     let content_len = usize::from(shared_max) + usize::from(args_inner.height);
-    state.record_scrollbar(
-        args_inner,
-        args_content,
-        false,
-        content_len,
-        usize::from(args_inner.height),
-        ScrollTarget::InstanceDetail,
-    );
-    state.record_scrollbar(
-        env_inner,
-        env_content,
-        false,
-        content_len,
-        usize::from(env_inner.height),
-        ScrollTarget::InstanceDetail,
-    );
+    // Both panes register against the same `content_len` (the shared max) so
+    // dragging either bar clamps consistently — looping over the two
+    // (area, drawn) pairs instead of writing the call out twice keeps that
+    // guarantee from silently drifting if only one call site is ever edited.
+    for (area, drawn) in [(args_inner, args_content), (env_inner, env_content)] {
+        state.record_scrollbar(
+            area,
+            drawn,
+            false,
+            content_len,
+            usize::from(area.height),
+            ScrollTarget::InstanceDetail,
+        );
+    }
 
     shared_max
 }
@@ -1706,6 +1727,47 @@ mod tests {
             ["█", "█", "█"],
             "the bar must not render as a full 'nothing to scroll' thumb \
              when max_scroll is nonzero; got {bar_column:?}"
+        );
+    }
+
+    #[test]
+    fn render_scrollable_pane_measures_at_full_width_when_too_narrow_to_reserve() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `vertical_scrollbar_forced` (panel.rs) bails out and returns `area`
+        // unmodified whenever `area.width < 2` — no column is actually
+        // reserved at width 1, regardless of `reserve`. Before this fix, `len`
+        // was still measured at `inner.width.saturating_sub(1)` == 0 in that
+        // case, disagreeing with content that's really drawn at the full,
+        // unreserved width 1 — this pins that the two stay consistent.
+        let inner = Rect::new(0, 0, 1, 3);
+        let lines: Vec<Line> = vec![Line::raw("a"), Line::raw("b")];
+        let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let full_len = p.line_count(inner.width);
+
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(1, 3)).unwrap();
+        let mut result = (0u16, Rect::default());
+        term.draw(|f| {
+            result = render_scrollable_pane(f, inner, p, full_len, 0, true, &theme);
+        })
+        .unwrap();
+        let (max, content) = result;
+
+        assert_eq!(
+            content.width, inner.width,
+            "no column can be reserved at width 1, so the content rect must \
+             stay the full, unreserved width"
+        );
+        assert_eq!(
+            max,
+            u16::try_from(full_len)
+                .unwrap()
+                .saturating_sub(inner.height),
+            "max_scroll must be derived from the same (full) width the \
+             content is actually rendered at, not from a width-0 measurement \
+             that never happens on screen"
         );
     }
 
