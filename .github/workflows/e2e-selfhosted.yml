@@ -846,7 +846,10 @@ jobs:
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
           $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
-          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
           $script = @"
           set -eo pipefail
           rm -rf /root/work
@@ -1015,7 +1018,10 @@ jobs:
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
-          $winPath = (wsl -d Ubuntu-24.04 -u root -- wslpath "$env:GITHUB_WORKSPACE").Trim()
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
           $script = @"
           mkdir -p '$winPath/tests/e2e-cucumber/results'
           if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then

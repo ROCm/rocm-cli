@@ -15,6 +15,11 @@
 # it fails and leaves nothing to convert. Default WSL2 automount always
 # exposes drive letters at /mnt/<lowercase-letter>, so the translation is a
 # one-line string replace.
+#
+# The script text is also normalized to LF-only: it's checked out from a
+# CRLF-line-ended .yml file on Windows, and bash's `\` line-continuation only
+# works when the backslash is immediately followed by a bare LF -- `\<CR><LF>`
+# ends the statement early instead of continuing it.
 param(
     [Parameter(Mandatory)][string]$Script,
     [string]$Distro = 'Ubuntu-24.04',
@@ -24,7 +29,8 @@ param(
 
 $tmp = [System.IO.Path]::GetTempFileName()
 try {
-    [System.IO.File]::WriteAllText($tmp, $Script, [System.Text.UTF8Encoding]::new($false))
+    $normalized = $Script -replace "`r`n", "`n" -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($tmp, $normalized, [System.Text.UTF8Encoding]::new($false))
     $drive = $tmp.Substring(0, 1).ToLower()
     $wslPath = "/mnt/$drive" + $tmp.Substring(2).Replace('\', '/')
     if ($PipeFail) {
