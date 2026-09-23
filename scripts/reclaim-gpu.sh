@@ -559,6 +559,11 @@ self_test() {
   #    selection reaching OUTSIDE the scratch tree. An empty selection is the
   #    opposite failure and signals nothing at all, so routing it through that
   #    gate would report a false cause and cut the run short of checks 7-10.
+  #
+  #    Diagnostic only, and said plainly rather than implied: an empty selection
+  #    is already caught — checks 2 and 5 fail it — so deleting this check does
+  #    NOT let such a run pass. What it adds is the reason, on the run someone
+  #    is reading, which is also why the "ok:" line below is gated on it.
   if [[ -z "${selected}" ]]; then
     echo "FAIL: selection was empty; containment had nothing to examine"
     failures=$((failures + 1))
@@ -591,8 +596,14 @@ self_test() {
   # Counted on its own rather than off the running total: gating this line on
   # the total suppressed it whenever an EARLIER check had failed — which is
   # precisely the run whose output someone is reading.
-  if [[ "${containment_failures}" -eq 0 ]]; then
+  # Gated on a non-empty selection as well as on containment: the loop above is
+  # satisfied trivially by an empty one, so without this the run would print
+  # "selection was empty" and then immediately claim every selected process was
+  # checked — evidence contradicting itself on the run being diagnosed.
+  if [[ "${containment_failures}" -eq 0 && -n "${selected}" ]]; then
     echo "ok: every selected process lies inside the self-test scratch tree"
+  elif [[ "${containment_failures}" -eq 0 ]]; then
+    : # empty selection: already reported above, and nothing to affirm here
   else
     # A GATE, not a score. Check 8 below calls the real `reclaim 0`, which
     # sends real signals to whatever select_leaked returns at that moment. If
@@ -680,7 +691,13 @@ self_test() {
     echo "FAIL: pre-TERM guard did not act on a recycled verdict"
     failures=$((failures + 1))
   fi
-  if grep -q "was recycled during the grace period, not escalating" <<<"${forced_out}"; then
+  # Bound to a specific pid, like its pre-TERM sibling above: an unbound match
+  # would be satisfied by this message emitted for any process. With every
+  # verdict forced to "recycled" nothing is signalled, so both engine decoys
+  # survive to the escalation loop and either pid would serve; the stubborn one
+  # is named because it is the decoy that reaches escalation in the UNforced
+  # run too, which keeps this assertion reading the same way as check 10.
+  if grep -q "pid=${stubborn_pid} was recycled during the grace period, not escalating" <<<"${forced_out}"; then
     echo "ok: pre-KILL guard refused to escalate onto a recycled pid"
   else
     echo "FAIL: pre-KILL guard did not act on a recycled verdict"

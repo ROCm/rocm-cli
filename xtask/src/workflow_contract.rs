@@ -1569,12 +1569,24 @@ permissions:
                 .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
                 .collect();
 
-            // Tracked per WORKFLOW, not per alternation: requiring every
+            // Pinned at one, which is what lets the exemption below be tracked
+            // per WORKFLOW rather than per alternation. Requiring EVERY
             // alternation to name the exempted marker would fail spuriously the
-            // moment an unrelated `Where-Object … -match` line is added — the
-            // very case `powershell_reclaim_root_alternations` warns it cannot
-            // distinguish. One mirror still naming it is what keeps the
-            // exemption live.
+            // moment an unrelated `Where-Object … -match` line appeared — the
+            // case `powershell_reclaim_root_alternations` warns it cannot
+            // distinguish — but relaxing it to "some alternation" would stop
+            // catching a second matcher that copies every root and drops the
+            // marker. While there is exactly one, the two readings coincide;
+            // this assertion is what keeps that true, and fails loudly with
+            // something to decide if a second one is ever added.
+            assert_eq!(
+                alternations.len(),
+                1,
+                "{workflow} now has {} PowerShell reclaim matcher alternations; the \
+                 divergence-exemption check below assumes exactly one, and must be \
+                 re-read per alternation before this count changes (EAI-8751)",
+                alternations.len()
+            );
             let mut divergence_seen = false;
             for alternation in &alternations {
                 let present: Vec<&str> = alternation.split('|').collect();
