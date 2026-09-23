@@ -972,11 +972,30 @@ async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
     // and `InstalledRuntimeManifest::includes_devel` reads the answer back out
     // of them. Asserting the `devel` field alone would miss the install args
     // and the manifest disagreeing, which is the drift this guards.
+    //
+    // `wheel_composition` is legitimately absent on a tarball install and on an
+    // adopted runtime, so an unwrap here would report a reachable manifest
+    // state as a missing-field crash the moment this step is reused outside a
+    // wheel install. Name the precondition instead: the failure a future
+    // scenario author needs to read is "this step only applies to wheel
+    // installs", not "Option::unwrap on a None value".
+    let format = manifest
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<absent>");
     let specs = manifest
         .get("wheel_composition")
         .and_then(|composition| composition.get("package_specs"))
         .and_then(serde_json::Value::as_array)
-        .expect("wheel runtime manifest has no recorded package_specs");
+        .unwrap_or_else(|| {
+            panic!(
+                "this step reads the extras a wheel install requested, but runtime {} \
+                 (format={format}) records no wheel_composition.package_specs. Tarball \
+                 installs and adopted runtimes have none — use this step only on a \
+                 wheel-format install.\n{manifest}",
+                manifest_path.display()
+            )
+        });
     let rocm_spec = specs
         .iter()
         .filter_map(serde_json::Value::as_str)
@@ -1018,6 +1037,25 @@ async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
         String::from_utf8_lossy(&output.stdout).trim(),
         "absent",
         "default SDK install pulled rocm-sdk-devel back transitively"
+    );
+}
+
+/// The manifest half of this is `the runtime excludes the compiler toolchain`,
+/// which reads the recorded specs directly. This is the half a user can see:
+/// `rocm examine` is where someone looks when a build cannot find `hipcc`, and
+/// a manifest that records the right thing while the diagnostic stays silent
+/// about it is indistinguishable, from the outside, from one that does not.
+#[then("the inspection reports the active runtime has no compiler toolchain")]
+async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
+    let examine = crate::run_rocm_ok(world, &["examine"]);
+    let reported = super::examine_steps::field_value(&examine, "active_runtime_toolchain")
+        .unwrap_or_else(|| {
+            panic!("`rocm examine` reported no toolchain state for the active runtime:\n{examine}")
+        });
+    assert_eq!(
+        reported, "excluded",
+        "the SDK was installed without --devel, but `rocm examine` reports the active \
+         runtime's toolchain as `{reported}`:\n{examine}"
     );
 }
 

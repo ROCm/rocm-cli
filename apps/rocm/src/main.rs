@@ -8645,14 +8645,10 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         } else {
             "managed"
         };
-        // `toolchain` is the only runtime property a user cannot otherwise
-        // see: the compiler is opt-in, and `rocm update` reinstalls whatever
-        // this says, so an install missing it should not be silent about that.
-        let toolchain = if manifest.includes_devel() {
-            "included"
-        } else {
-            "excluded"
-        };
+        // The compiler is opt-in and `rocm update` reinstalls whatever this
+        // says, so an install missing it should not be silent about that.
+        // `rocm examine` reports the same thing for the active runtime.
+        let toolchain = toolchain_state_text(manifest.includes_devel());
         let _ = writeln!(
             output,
             "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
@@ -11461,6 +11457,20 @@ pub(crate) fn runtime_usability_status(manifest: &therock::InstalledRuntimeManif
     match validate_runtime_manifest_for_activation(manifest) {
         Ok(()) => "ready".to_owned(),
         Err(error) => format!("unusable ({error})"),
+    }
+}
+
+/// How the CLI names the toolchain state of a runtime.
+///
+/// `rocm runtimes list` reports it per runtime and `rocm examine` reports it
+/// for the active one; sharing the vocabulary here keeps the two from drifting
+/// into different words for the same fact, which is the kind of difference a
+/// user reads as a difference in meaning.
+pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
+    if includes_devel {
+        "included"
+    } else {
+        "excluded"
     }
 }
 
@@ -16032,6 +16042,16 @@ fn append_examine_runtime_state(
             therock::runtime_version_display(&manifest.version)
         );
         let _ = writeln!(output, "  active_runtime_family: {}", manifest.family);
+        // The same fact `rocm runtimes list` reports as `toolchain=`, for the
+        // one runtime that is actually in use. `examine` is where a user looks
+        // when a build fails on a missing `hipcc`, and without this line the
+        // command that exists to answer "what is my ROCm state" could not say
+        // whether the active runtime has a compiler at all.
+        let _ = writeln!(
+            output,
+            "  active_runtime_toolchain: {}",
+            toolchain_state_text(manifest.includes_devel())
+        );
         let mode = if manifest.read_only {
             "read-only"
         } else {
@@ -32244,10 +32264,11 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
-    /// Whether a runtime carries the compiler toolchain is otherwise invisible:
-    /// nothing else in the CLI reports it, and `rocm update` reinstalls whatever
-    /// the runtime recorded — so a user who installed without it has no way to
-    /// see that, or to understand why a later build step fails.
+    /// Whether a runtime carries the compiler toolchain is otherwise invisible,
+    /// and `rocm update` reinstalls whatever the runtime recorded — so a user
+    /// who installed without it has no way to see that, or to understand why a
+    /// later build step fails. This is the per-runtime half; `rocm examine`
+    /// reports the same fact for the active one.
     #[test]
     fn runtime_list_reports_whether_the_toolchain_is_installed() -> Result<()> {
         let (root, paths) = test_paths("runtime-list-toolchain");
@@ -35433,6 +35454,62 @@ ID_LIKE="suse opensuse"
         assert!(output.contains("active_runtime_status: ready"));
         assert!(output.contains("active_runtime_family: gfx120X-all"));
         assert!(output.contains("registered_runtime_keys: release-pip-gfx120x-all"));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `rocm examine` is the first command a user runs when something ROCm is
+    /// wrong, and "my build cannot find `hipcc`" is now a reachable state by
+    /// design. Reporting the toolchain only from `rocm runtimes list` leaves
+    /// the primary diagnostic unable to answer the question the opt-in
+    /// created. Both polarities are pinned, because a field hardcoded to either
+    /// word reads as working from a single run.
+    #[test]
+    fn examine_runtime_state_reports_whether_the_active_runtime_has_the_toolchain() -> Result<()> {
+        let (root, paths) = test_paths("examine-runtime-toolchain");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        // The fixture records `devel: true` with no composition.
+        let mut output = String::new();
+        append_examine_runtime_state(&mut output, &paths, &config)?;
+        assert!(
+            output.contains("active_runtime_toolchain: included"),
+            "a toolchain runtime must say so:\n{output}"
+        );
+
+        // A runtime-only install reports the other way. Written through the
+        // recorded specs, which is what `includes_devel` actually reads, so
+        // this exercises the same path a real `rocm install sdk` produces.
+        let runtime_only = therock::InstalledRuntimeManifest {
+            devel: false,
+            wheel_composition: Some(therock::WheelRuntimeComposition {
+                source_layout_generation: "canonical".to_owned(),
+                package_specs: vec!["rocm[libraries,device-gfx1201]==7.13.0".to_owned()],
+                rocm_sdk_target: Some("gfx1201".to_owned()),
+            }),
+            ..manifest
+        };
+        fs::write(
+            runtime_manifest_path(&paths, &runtime_only.runtime_key),
+            serde_json::to_vec_pretty(&runtime_only)?,
+        )?;
+        output.clear();
+        append_examine_runtime_state(&mut output, &paths, &config)?;
+        assert!(
+            output.contains("active_runtime_toolchain: excluded"),
+            "a runtime-only runtime must say so:\n{output}"
+        );
+
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
