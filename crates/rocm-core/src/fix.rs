@@ -1445,9 +1445,16 @@ mod tests {
         // Passing it alongside the override is what exercises the ordering the
         // assertion below claims: with `&[]` the search loop never runs, so
         // "the override outranks the search roots" would hold vacuously.
+        //
+        // Planted in BOTH shapes because the resolver is told the host's
+        // layout: `rocm-6.2.0` is a versioned sibling and only matches on
+        // Linux, `6.2` is a bare-version child and only matches on Windows.
+        // Planting one shape would leave the search loop empty on the other
+        // platform and make the ordering half vacuous again -- on Windows
+        // first, which is the lane this test exists for.
         let searched = root.join("search");
-        let older = searched.join("rocm-6.2.0");
-        plant_install(&older);
+        plant_install(&searched.join("rocm-6.2.0"));
+        plant_install(&searched.join("6.2"));
 
         // The override goes in as an argument rather than through
         // `std::env::set_var`: the environment is process-global, so a sibling
@@ -1455,9 +1462,19 @@ mod tests {
         // this assertion fail on whichever test lost the race.
         // `..._reads_rocm_path_from_the_environment` covers the real read.
         let found = newest_rocm_install_dir_in(std::slice::from_ref(&searched), Some(&install));
+        // Run the same search WITHOUT the override, so the ordering claim below
+        // cannot pass by finding nothing to outrank. A planted decoy the
+        // resolver's layout does not recognise is indistinguishable, from the
+        // assertion's point of view, from no decoy at all.
+        let without_override = newest_rocm_install_dir_in(std::slice::from_ref(&searched), None);
 
         std::fs::remove_dir_all(&root).ok();
 
+        assert!(
+            !without_override.is_empty(),
+            "the decoy must be reachable through the search roots on this \
+             platform, or 'the override outranks them' holds vacuously"
+        );
         assert_eq!(
             found,
             install.to_string_lossy(),
