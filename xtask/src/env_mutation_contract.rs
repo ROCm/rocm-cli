@@ -300,27 +300,55 @@ mod tests {
         }
     }
 
-    /// A `#[test]` function that mutates the environment.
+    /// Whether `code` carries a test attribute.
+    ///
+    /// The rule is "the attribute path's last segment is `test`", which covers
+    /// `#[test]`, `#[tokio::test]` and `#[tokio::test(flavor = "...")]` alike.
+    /// Arming only on the literal `#[test]` left the 87 `#[tokio::test]`
+    /// functions in this tree invisible to the scan — none of them mutates the
+    /// environment today, but nothing was watching if one started.
+    ///
+    /// `#[cfg(test)]` and `#[cfg_attr(test, ...)]` stop at the `(`, so their
+    /// path is `cfg`/`cfg_attr` and neither is mistaken for a test.
+    fn has_test_attribute(code: &str) -> bool {
+        code.match_indices("#[").any(|(start, _)| {
+            let path: String = code[start + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            path.rsplit("::").next() == Some("test")
+        })
+    }
+
+    /// A test function that mutates the environment.
     #[derive(Debug, PartialEq, Eq)]
     struct Offense {
         line: usize,
         call: String,
     }
 
-    /// Mutations inside a `#[test]` function that does not serialize itself.
+    /// Mutations inside a test function that does not serialize itself.
     ///
     /// Scoped to the test FUNCTION, not the file. The file-level rule this
     /// replaces asked only whether a marker appeared anywhere in the text, so a
     /// comment reading "maybe migrate this to ScopedTestEnv one day" exempted
-    /// every test in the file — and `apps/rocm/src/main.rs` (379 tests) and
-    /// `apps/rocm/src/therock.rs` (73) were both wholly exempt for that reason,
-    /// which is precisely where the next unguarded test is most likely to land.
+    /// every test in the file — and the two largest test modules in the tree,
+    /// `apps/rocm/src/main.rs` and `apps/rocm/src/therock.rs`, were both wholly
+    /// exempt for that reason, which is precisely where the next unguarded test
+    /// is most likely to land. (Deliberately no test counts here: they were
+    /// wrong within weeks of being written, and the point does not need them.)
     ///
-    /// Known limit: a `#[test]` that delegates its mutation to an unguarded
-    /// helper is not caught, because the helper's body is a different scope.
-    /// Mutations outside `#[test]` functions are deliberately not flagged —
-    /// that is production code, and test-support types such as `ScopedTestEnv`
-    /// whose whole job is to perform the mutation on a test's behalf.
+    /// Known limits:
+    ///
+    /// * A test that delegates its mutation to an unguarded helper is not
+    ///   caught, because the helper's body is a different scope.
+    /// * Attributes are recognised by path (see [`has_test_attribute`]), so a
+    ///   harness whose attribute does not end in `test` — `#[test_case(..)]`,
+    ///   `#[rstest]` — would not arm the scan. Neither is used in this tree.
+    ///
+    /// Mutations outside test functions are deliberately not flagged — that is
+    /// production code, and test-support types such as `ScopedTestEnv` whose
+    /// whole job is to perform the mutation on a test's behalf.
     fn env_mutations_in_unserialized_tests(text: &str) -> Vec<Offense> {
         let stripped = strip_literals_and_comments(text);
         let mut offenses = Vec::new();
@@ -332,7 +360,7 @@ mod tests {
         for (index, line) in stripped.lines().enumerate() {
             let code = line.trim();
 
-            if current.is_none() && code.contains("#[test]") {
+            if current.is_none() && has_test_attribute(code) {
                 pending_test_attr = true;
             }
 
@@ -477,6 +505,57 @@ mod tests {
         }
     }
 
+    /// An async test is a test.
+    ///
+    /// The scan used to arm on the literal `#[test]`, which left every
+    /// `#[tokio::test]` in the tree outside the guard. They run in the same
+    /// process under the same threaded harness, so the hazard is identical.
+    #[test]
+    fn the_scanner_sees_a_mutation_inside_an_async_test() {
+        for attribute in [
+            "#[tokio::test]",
+            "#[tokio::test(flavor = \"multi_thread\")]",
+        ] {
+            let source = format!(
+                "#[cfg(test)]\nmod tests {{\n    {attribute}\n    async fn t() {{\n        {}\n    }}\n}}\n",
+                mutation_call("set_var")
+            );
+            let hits = env_mutations_in_unserialized_tests(&source);
+            assert_eq!(hits.len(), 1, "{attribute} should arm the scan: {hits:?}");
+        }
+    }
+
+    /// The line after a test attribute need not open a block.
+    ///
+    /// This is a text scan, not a parser, so it cannot assume it does. Without
+    /// the disarm the attribute stays armed and the next brace anywhere in the
+    /// file — here, production code — is taken for the test body.
+    #[test]
+    fn a_test_attribute_on_a_braceless_item_does_not_open_a_block() {
+        let source = format!(
+            "#[test]\nfn declared_elsewhere();\n\nfn production() {{\n    {}\n}}\n",
+            mutation_call("set_var")
+        );
+        assert!(
+            env_mutations_in_unserialized_tests(&source).is_empty(),
+            "no test body was opened; the mutation below is production code"
+        );
+    }
+
+    /// `#[cfg(test)]` names `test` but is not a test attribute. Arming on it
+    /// would make the whole rest of the file read as one test body.
+    #[test]
+    fn a_cfg_test_gate_is_not_a_test_attribute() {
+        for attribute in ["#[cfg(test)]", "#[cfg_attr(test, derive(Debug))]"] {
+            assert!(
+                !has_test_attribute(attribute),
+                "{attribute} must not arm the scan"
+            );
+        }
+        assert!(has_test_attribute("#[test]"));
+        assert!(has_test_attribute("#[tokio::test]"));
+    }
+
     #[test]
     fn the_scanner_ignores_production_mutations() {
         // Production code owns the process and may legitimately set a variable;
@@ -545,8 +624,8 @@ mod tests {
     ///
     /// Under the previous rule this whole file was exempt because SOME test in
     /// it took a lock -- or merely because a comment named one. That is how
-    /// `apps/rocm/src/main.rs` (379 tests) and `apps/rocm/src/therock.rs` (73)
-    /// ended up with no line-level enforcement at all.
+    /// `apps/rocm/src/main.rs` and `apps/rocm/src/therock.rs`, the two largest
+    /// test modules in the tree, ended up with no line-level enforcement at all.
     #[test]
     fn one_serialized_test_does_not_exempt_its_neighbour() {
         let call = mutation_call("set_var");
