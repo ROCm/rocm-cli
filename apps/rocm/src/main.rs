@@ -2621,6 +2621,11 @@ struct ExamineJsonSummary<'a> {
     active_runtime_id: Option<&'a str>,
     active_runtime_key: Option<&'a str>,
     previous_runtime_key: Option<&'a str>,
+    /// Where the active runtime lives, completing the `id`/`key`/`root` triple.
+    /// Not derivable from the key: `install_root` is its own field on the
+    /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
+    /// import` all set it freely.
+    active_runtime_root: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2643,6 +2648,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
+        // Same resolution the human report uses, minus the recovery write above:
+        // an unreadable registry leaves the root `null` rather than failing the
+        // inspection, which is the weaker answer but still an answer.
+        let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+        let active_runtime_root = current_runtime_manifest(&config, &manifests)
+            .map(|manifest| manifest.install_root.display().to_string());
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2651,6 +2662,7 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_id: config.default_runtime_id.as_deref(),
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
+                active_runtime_root,
                 host: &host,
             },
         };

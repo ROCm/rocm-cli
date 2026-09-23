@@ -426,6 +426,10 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
         &["managed_runtimes", "managed_runtime_count"],
     ),
     ("config_dir", &["config_dir"]),
+    // Where the active runtime lives. A caller holding the key cannot compute
+    // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
+    // set `install_root` freely.
+    ("active_runtime_root", &["active_runtime_root"]),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -468,16 +472,28 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
         .cli_stderr
         .as_ref()
         .expect("the human report was not captured");
-    // Read the runtime from the human form: `examine --json` carries no runtime
-    // fields at all, so there is nowhere else in the JSON to learn this from.
-    // Asserted rather than branched on: the scenario's `Given` activates one, so
-    // its absence is a broken precondition, and silently falling through to the
-    // `PATH` case is how this scenario would stop testing anything.
-    let root = human_states(human, "active_runtime_root").unwrap_or_else(|| {
-        panic!("the scenario activates a managed runtime, but the report names none:\n{human}")
-    });
-
     let value = parsed_json(world);
+    // Read the runtime from the machine-readable form, which is the one this
+    // scenario is about. Asserted rather than branched on: the scenario's
+    // `Given` activates one, so its absence is a broken precondition, and
+    // silently falling through to the `PATH` case is how this scenario would
+    // stop testing anything.
+    let root = value
+        .pointer("/summary/active_runtime_root")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
+        });
+    // Both forms resolve the active manifest the same way, so a disagreement
+    // means one of the two paths is looking at a different runtime.
+    if let Some(stated) = human_states(human, "active_runtime_root") {
+        assert_eq!(
+            root, stated,
+            "the two forms name different roots for the same active runtime"
+        );
+    }
+
     let source = value
         .get("framework_source")
         .and_then(serde_json::Value::as_str)
