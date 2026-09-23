@@ -1065,6 +1065,23 @@ fn gfx_model_digit(gfx: &str, prefix: &str) -> Option<u32> {
     gfx.strip_prefix(prefix)?.chars().next()?.to_digit(10)
 }
 
+/// Whether an `lspci -nn` line describes a GPU this probe should enumerate.
+///
+/// Instinct parts report PCI class `1200` ("Processing accelerators"), not a
+/// display class: an MI300X enumerates as `Processing accelerators [1200]` with
+/// no display class anywhere on the device. Matching only the three display
+/// classes therefore skipped every datacenter GPU, so on a bare-metal Instinct
+/// host `lspci` contributed nothing and `has_amd_gpu` rested entirely on
+/// `rocminfo` or the sysfs fallback — and came back false when neither was
+/// reachable. Verified on an 8-GPU MI300X host, where all eight devices read
+/// `class=0x120000` in sysfs (EAI-8449).
+fn is_lspci_gpu_line(line: &str) -> bool {
+    line.contains("VGA compatible controller")
+        || line.contains("3D controller")
+        || line.contains("Display controller")
+        || line.contains("Processing accelerators")
+}
+
 fn probe_gpus_lspci(e: &mut Examination) {
     if !which("lspci") {
         e.probe_failures
@@ -1078,10 +1095,7 @@ fn probe_gpus_lspci(e: &mut Examination) {
         return;
     }
     for line in out.lines() {
-        let is_controller = line.contains("VGA compatible controller")
-            || line.contains("3D controller")
-            || line.contains("Display controller");
-        if !is_controller {
+        if !is_lspci_gpu_line(line) {
             continue;
         }
         let pci_id = line
@@ -1234,6 +1248,7 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// those are worth keeping whenever they are available.
 fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     if e.gpus.iter().any(|gpu| gpu.is_amd) {
+        fill_missing_gfx_targets_from_topology(e);
         return;
     }
     let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
@@ -1255,6 +1270,47 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
          available; PCI id and marketing name are unknown."
             .to_owned(),
     );
+}
+
+/// Fill in `gfx_target` for AMD GPUs that `lspci` enumerated but could not name
+/// a target for, using the kernel topology.
+///
+/// `lspci` knows the PCI id, the vendor string and the APU/discrete
+/// distinction, but it does not know the gfx target: that normally arrives from
+/// `rocminfo`. On an Instinct host without ROCm on PATH nothing supplies it, so
+/// the entries would carry an empty target even though the kernel plainly
+/// states one — and `gpus[].gfx_target` is the only place the JSON report names
+/// a target at all.
+///
+/// Same rule as the enumeration fallback above: fill a gap, never overwrite. A
+/// target that `rocminfo` already resolved per-device is left alone, because
+/// the topology read yields one target for the host and cannot distinguish a
+/// mixed-GPU machine.
+fn fill_missing_gfx_targets_from_topology(e: &mut Examination) {
+    if !e
+        .gpus
+        .iter()
+        .any(|gpu| gpu.is_amd && gpu.gfx_target.is_empty())
+    {
+        return;
+    }
+    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+        return;
+    };
+    fill_missing_gfx_targets(e, &gfx_target);
+}
+
+/// The gap-fill itself, against a caller-supplied target.
+///
+/// Split out from the sysfs read for the same reason as `detect_kfd_gfx_target_in`:
+/// the hosts this matters on are the ones a test cannot run on, and reading the
+/// real topology from a test would make the assertion depend on the machine.
+fn fill_missing_gfx_targets(e: &mut Examination, gfx_target: &str) {
+    for gpu in e.gpus.iter_mut().filter(|gpu| gpu.is_amd) {
+        if gpu.gfx_target.is_empty() {
+            gpu.gfx_target = gfx_target.to_owned();
+        }
+    }
 }
 
 fn summarise_gpu_categories(e: &mut Examination) {
@@ -2826,6 +2882,47 @@ mod tests {
     }
 
     #[test]
+    fn the_topology_fills_a_missing_gfx_target_but_never_replaces_one() {
+        // lspci names an Instinct part "Device" and knows no gfx target, so
+        // without rocminfo the entries carried an empty target while the kernel
+        // plainly said gfx942 -- the only place the JSON names a target at all.
+        let mut e = Examination {
+            gpus: vec![
+                Gpu {
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: "0000:11:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                },
+                Gpu {
+                    name: "already resolved by rocminfo".to_owned(),
+                    gfx_target: "gfx90a".to_owned(),
+                    pci_id: "0000:2f:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                },
+                Gpu {
+                    name: "NVIDIA".to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: "0000:46:00.0".to_owned(),
+                    is_amd: false,
+                    is_apu: Some(false),
+                },
+            ],
+            ..Examination::default()
+        };
+        fill_missing_gfx_targets(&mut e, "gfx942");
+
+        assert_eq!(e.gpus[0].gfx_target, "gfx942", "the gap must be filled");
+        // A target rocminfo already resolved must survive: the topology read
+        // yields one target for the host and cannot describe a mixed machine.
+        assert_eq!(e.gpus[1].gfx_target, "gfx90a");
+        // A non-AMD entry is never given an AMD target.
+        assert_eq!(e.gpus[2].gfx_target, "");
+    }
+
+    #[test]
     fn a_topology_sourced_gpu_counts_as_present_without_claiming_a_package() {
         // What the fallback produces: enough to stop reporting "no AMD GPU",
         // and no more. `is_apu: None` is deliberate -- the topology says which
@@ -2899,6 +2996,41 @@ mod tests {
             extract_lspci_name(line),
             "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
         );
+    }
+
+    #[test]
+    fn lspci_matches_instinct_processing_accelerator_class() {
+        // An MI300X carries no display class at all: it enumerates under PCI
+        // class 1200. Matching only the display classes skipped it, which is
+        // how a bare-metal Instinct host reported has_amd_gpu: false (EAI-8449).
+        let mi300x = "0000:11:00.0 Processing accelerators [1200]: Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X] [1002:74a1] (rev 02)";
+        assert!(is_lspci_gpu_line(mi300x));
+        assert_eq!(
+            extract_lspci_name(mi300x),
+            "Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X]"
+        );
+        // Instinct is discrete, and has_discrete_amd depends on that verdict.
+        assert!(
+            !classify_amd_marketing_name(&extract_lspci_name(mi300x)).1,
+            "an Instinct part must not be classified as an APU"
+        );
+
+        // The display classes still match.
+        assert!(is_lspci_gpu_line(
+            "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c]"
+        ));
+        assert!(is_lspci_gpu_line(
+            "0000:01:00.0 3D controller [0302]: NVIDIA Corporation Device [10de:2204]"
+        ));
+        assert!(is_lspci_gpu_line(
+            "0000:00:02.0 Display controller [0380]: Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:164e]"
+        ));
+
+        // The MI300X host also exposes an AMD-vendor PCI bridge per GPU; those
+        // are not GPUs and must stay out of the enumeration.
+        assert!(!is_lspci_gpu_line(
+            "0000:10:00.0 PCI bridge [0604]: Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:1501]"
+        ));
     }
 
     #[test]
