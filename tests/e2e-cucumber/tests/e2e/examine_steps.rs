@@ -40,10 +40,18 @@ async fn setup_wsl_host(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user asks for the version")]
+#[when("the user asks for the version through every CLI surface")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
-    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(
+        [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["-V"].as_slice(),
+        ]
+        .into_iter()
+        .map(|args| crate::run_rocm(world, args).0)
+        .collect(),
+    );
 }
 
 #[when("the user lists available engines")]
@@ -76,12 +84,64 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[then("a version string is returned")]
+#[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
+    let outputs = world.cli_outputs.as_ref().expect("no commands were run");
+    assert_eq!(outputs.len(), 3, "expected all three version surfaces");
+    let (version_output, flag_outputs) = outputs.split_first().expect("three version surfaces");
     assert!(
-        output.trim().starts_with("rocm "),
-        "expected version string starting with 'rocm ': {output}"
+        flag_outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "-V/--version returned different output: {flag_outputs:?}"
+    );
+
+    // `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    // so only its first line -- the same traceable build string -- has to
+    // match `-V`/`--version`.
+    let version_first_line = version_output.lines().next().unwrap_or_default();
+    assert_eq!(
+        version_first_line,
+        flag_outputs[0].trim(),
+        "`rocm version`'s build line does not match `-V`/`--version`: {outputs:?}"
+    );
+
+    let output = version_first_line.trim();
+    let parsed = output
+        .strip_prefix("rocm-cli ")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split_once(" ("))
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, hash)| (version, reference, hash))
+        });
+    let Some((version, reference, hash)) = parsed else {
+        panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {output}");
+    };
+    assert!(!version.is_empty(), "version is empty: {output}");
+    assert!(!reference.is_empty(), "version ref is empty: {output}");
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {output}"
+    );
+    assert!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "version hash is not hexadecimal: {output}"
+    );
+
+    // `rocm version`'s own two lines beyond the build string. Both are printed
+    // unconditionally (either the detected value or a "not detected"/"unmanaged"
+    // variant), so their presence -- not their value, which depends on the host
+    // -- is what this surface promises.
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("ROCm SDK:")),
+        "`rocm version` did not report the ROCm SDK line:\n{version_output}"
+    );
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("GPU driver:")),
+        "`rocm version` did not report the GPU driver line:\n{version_output}"
     );
 }
 
@@ -366,6 +426,10 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
         &["managed_runtimes", "managed_runtime_count"],
     ),
     ("config_dir", &["config_dir"]),
+    // Where the active runtime lives. A caller holding the key cannot compute
+    // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
+    // set `install_root` freely.
+    ("active_runtime_root", &["active_runtime_root"]),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -408,16 +472,27 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
         .cli_stderr
         .as_ref()
         .expect("the human report was not captured");
-    // Read the runtime from the human form: `examine --json` carries no runtime
-    // fields at all, so there is nowhere else in the JSON to learn this from.
-    // Asserted rather than branched on: the scenario's `Given` activates one, so
-    // its absence is a broken precondition, and silently falling through to the
-    // `PATH` case is how this scenario would stop testing anything.
-    let root = human_states(human, "active_runtime_root").unwrap_or_else(|| {
-        panic!("the scenario activates a managed runtime, but the report names none:\n{human}")
-    });
-
     let value = parsed_json(world);
+    // Read the runtime from the machine-readable form, which is the one this
+    // scenario is about. Asserted rather than branched on: the scenario's
+    // `Given` activates one, so its absence is a broken precondition, and
+    // silently falling through to the `PATH` case is how this scenario would
+    // stop testing anything.
+    let Some(root) = value
+        .pointer("/summary/active_runtime_root")
+        .and_then(serde_json::Value::as_str)
+    else {
+        panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
+    };
+    // Both forms resolve the active manifest the same way, so a disagreement
+    // means one of the two paths is looking at a different runtime.
+    if let Some(stated) = human_states(human, "active_runtime_root") {
+        assert_eq!(
+            root, stated,
+            "the two forms name different roots for the same active runtime"
+        );
+    }
+
     let source = value
         .get("framework_source")
         .and_then(serde_json::Value::as_str)
@@ -458,7 +533,7 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
     // skip, rather than guess.
     if human_states(human, "active_runtime_mode").as_deref() == Some("managed") {
         assert!(
-            std::path::Path::new(&named_interpreter).starts_with(&root),
+            std::path::Path::new(&named_interpreter).starts_with(root),
             "a managed runtime keeps its interpreter under its own root, so naming \
              {named_interpreter} instead of something under {root} means the framework \
              report is describing a different runtime than the active one"

