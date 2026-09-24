@@ -2648,9 +2648,20 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
-        // Same resolution the human report uses, minus the recovery write above:
-        // an unreadable registry leaves the root `null` rather than failing the
-        // inspection, which is the weaker answer but still an answer.
+        // Same resolution the human report uses, minus the recovery write above,
+        // which costs this form two answers the text form can give:
+        //
+        // - A registry entry that went missing but is still recoverable from the
+        //   install tree. The human report re-files it and then names the root;
+        //   here the lookup simply misses, so `active_runtime_root` is `null`
+        //   beside an `active_runtime_key` that config still knows. The folder is
+        //   reachable as the human report's separate `setup_runtime_root`, which
+        //   needs no registry — carry that too if this stops being acceptable.
+        // - An unreadable registry, which leaves the root `null` rather than
+        //   failing an inspection that would otherwise have answered.
+        //
+        // Both are the weaker answer, and both beat writing to a machine that was
+        // only asked a question.
         let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
         let active_runtime_root = current_runtime_manifest(&config, &manifests)
             .map(|manifest| manifest.install_root.display().to_string());
