@@ -19,7 +19,23 @@ use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// File the daemon's test-only logical clock reads every cycle (see
 /// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
-const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
+///
+/// `rocm dash` looks for exactly `<ROCM_CLI_DATA_DIR>/telemetry/test-clock-offset`
+/// and falls back to wall time when it is absent, so a rename or a move on
+/// either side would drop the whole mechanism without failing: the dashboard
+/// would just run on wall time and these scenarios would time out on a symptom
+/// that points nowhere near the cause.
+///
+/// `apps/rocm` is a binary crate, so this cannot import its
+/// `DASH_TEST_CLOCK_FILE` — and hosting the constant in a library both sides
+/// could depend on would add a first-party crate edge for one string (see
+/// `xtask check-crate-edges`). The two copies are instead pinned to each other
+/// by `dash::tests::e2e_harness_plants_the_file_rocm_dash_reads` in
+/// `apps/rocm/src/dash.rs`, which reads this file's source and fails in the
+/// every-PR unit lane. It needs this constant declared on one line, and needs
+/// `dash_clock_path` below to keep that name and to keep building the path
+/// from `.join(..)` links — otherwise the guard stops seeing this.
+const DASH_CLOCK_OFFSET_FILE: &str = "test-clock-offset";
 
 /// The Observe instances table's TTFT cell while the scripted mock is serving:
 /// its histogram pins time-to-first-token at exactly 50 ms
@@ -1102,23 +1118,28 @@ async fn managed_model_scripted_metrics(world: &mut E2eWorld) {
     world.register_mock_service_with(ServiceRecordOptions::default());
 }
 
+/// Plant the clock file before the dashboard is launched.
+///
+/// `rocm dash` decides once, at daemon construction, whether a logical clock is
+/// in play — it takes the file's presence as the signal. So this must run before
+/// the "opens the dashboard" step, which the scenarios guarantee by ordering
+/// this `Given` ahead of them.
 #[given("dashboard observation time is deterministic")]
 async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
-    let path = dash_clock_path(world);
-    write_dash_clock(&path, "0");
-    world.command_env.push((
-        "ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH",
-        path.into_os_string(),
-    ));
+    write_dash_clock(&dash_clock_path(world), "0");
 }
 
-/// Path of this scenario's test-clock file, inside its isolated root.
+/// Path of this scenario's test-clock file, inside the isolated data root the
+/// CLI resolves from `ROCM_CLI_DATA_DIR` — no env var of its own, so the
+/// binary under test carries no test-only branch.
 fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
     world
         .isolated_root
         .as_ref()
         .expect("scenario has no isolated root")
         .path()
+        .join("data")
+        .join("telemetry")
         .join(DASH_CLOCK_OFFSET_FILE)
 }
 
@@ -1127,6 +1148,12 @@ fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
 /// write can be observed mid-update as an empty file; rename makes each
 /// directive visible all-at-once instead.
 fn write_dash_clock(path: &std::path::Path, directive: &str) {
+    // The telemetry state dir is created by `AppPaths::ensure()` on the first
+    // CLI run, which for these scenarios happens after this step.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+    }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, directive).expect("failed to stage the dashboard test clock");
     std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
