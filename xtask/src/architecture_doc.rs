@@ -179,13 +179,16 @@ fn is_path_candidate(span: &str) -> bool {
 }
 
 /// Whether every character in `span` is safe to appear in a path, as
-/// opposed to prose punctuation: alphanumeric, `/`, `_`, `-`, or `.`. Shared
-/// by [`is_path_candidate`] and [`is_directory_shaped`] so a malformed span
-/// (stray punctuation from surrounding prose) is rejected the same way by
-/// both, rather than one accepting what the other would reject.
+/// opposed to prose punctuation: alphanumeric (any Unicode letter or digit,
+/// not just ASCII — a tracked file can have a non-ASCII name, e.g.
+/// `café.rs`; see [`tracked_files`]'s `core.quotePath` handling), `/`, `_`,
+/// `-`, or `.`. Shared by [`is_path_candidate`] and [`is_directory_shaped`]
+/// so a malformed span (stray punctuation from surrounding prose) is
+/// rejected the same way by both, rather than one accepting what the other
+/// would reject.
 fn is_path_safe(span: &str) -> bool {
     span.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+        .all(|c| c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
 }
 
 /// A bare (no `/`, no extension), all-lowercase, hyphenated word — the
@@ -446,6 +449,16 @@ fn split_code_spans(line: &str) -> Vec<&str> {
 fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     let mut citations = BTreeSet::new();
     let mut fence: Option<(char, usize)> = None;
+    // Whether the current line is inside a CommonMark indented code block
+    // (4+ leading spaces). Its content, including backticks, is literal —
+    // not parsed as inline code spans — so a since-removed path shown as a
+    // code example must not be extracted as a citation. Unlike a fenced
+    // block, an indented block also can't interrupt a paragraph: a 4+
+    // space line only STARTS one when the previous line was blank (or this
+    // is the top of the doc); otherwise it's an ordinary (if oddly
+    // indented) paragraph continuation line and still gets parsed.
+    let mut in_indented_block = false;
+    let mut prev_line_blank = true;
     let mut section_dirs: Vec<String> = Vec::new();
     // Remembers, for the current heading section, the single owner each
     // `SCOPED_BARE_EXTENSIONS` citation text was last narrowed to by a
@@ -482,6 +495,25 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
         if fence.is_some() {
             continue;
         }
+        let indent = line.chars().take_while(|&c| c == ' ').count();
+        let is_blank = line.trim().is_empty();
+        let skip_as_indented_code = if in_indented_block {
+            if is_blank || indent > 3 {
+                true
+            } else {
+                in_indented_block = false;
+                false
+            }
+        } else if !is_blank && indent > 3 && prev_line_blank {
+            in_indented_block = true;
+            true
+        } else {
+            false
+        };
+        prev_line_blank = is_blank;
+        if skip_as_indented_code {
+            continue;
+        }
         // Alternates outside-span (even index) and inside-span (odd index)
         // segments, for any number of balanced inline spans on that line —
         // see [`split_code_spans`] for why this can't just be
@@ -500,7 +532,15 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
             }
         }
         // A heading's own citations are scoped to its OWN directories, not
-        // whatever the previous heading left behind.
+        // whatever the previous heading left behind — and must not reuse a
+        // PRIOR heading's narrowed owner either (cleared here, before this
+        // line's own citations are processed below, not after — otherwise
+        // a heading that itself bare-cites a filename a previous section
+        // narrowed would inherit that stale owner instead of falling back
+        // to its own heading directory).
+        if is_heading(line) {
+            narrowed_owners.clear();
+        }
         let effective_section_dirs = if is_heading(line) {
             &heading_dirs
         } else {
@@ -571,7 +611,6 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
         }
         if is_heading(line) {
             section_dirs = heading_dirs;
-            narrowed_owners.clear();
         }
     }
     citations
@@ -1148,6 +1187,57 @@ More prose citing `lib.rs`.
     }
 
     #[test]
+    fn extract_path_citations_skips_indented_code_blocks() {
+        // Regression: a CommonMark indented code block (4+ leading spaces)
+        // is literal content, not inline-parsed — unlike a fenced block,
+        // it has no closing delimiter to notice, so a since-removed path
+        // shown as an indented example must not be extracted as a live
+        // citation.
+        let markdown = "\
+Prose citing `main.rs`.
+
+    example: `removed/path.rs` is indented code, not a citation
+
+More prose citing `lib.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
+    }
+
+    #[test]
+    fn an_indented_line_continuing_a_paragraph_is_still_parsed() {
+        // An indented code block can't interrupt a paragraph (CommonMark):
+        // a 4+-space line right after non-blank prose is a lazy
+        // continuation of that paragraph, still inline-parsed, not the
+        // start of a code block. Only a blank line (or start of document)
+        // before it lets an indented line start one — see the previous
+        // test.
+        let markdown = "\
+Prose citing `main.rs`, wrapped so the continuation happens to be
+    indented, still citing `lib.rs` here.
+";
+        let citations = extract_path_citations(markdown);
+        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
+    }
+
+    #[test]
+    fn citation_exists_checks_a_non_ascii_bare_citation_end_to_end() {
+        // Regression: `is_path_safe` used to reject any non-ASCII
+        // character, so a citation like `café.rs` was discarded before
+        // extraction ever ran — making `tracked_files`'s
+        // `core.quotePath=false` handling unreachable via the real
+        // extract -> check pipeline. Exercise both directions here: a
+        // present non-ASCII file matches, and a removed one is caught.
+        assert!(is_path_candidate("café.rs"));
+        let present = tracked(&["crates/rocm-core/src/café.rs"]);
+        assert!(citation_exists(&citation("café.rs", &[]), &present));
+        let absent = tracked(&["crates/rocm-core/src/lib.rs"]);
+        assert!(!citation_exists(&citation("café.rs", &[]), &absent));
+    }
+
+    #[test]
     fn a_backtick_fence_line_does_not_close_an_open_tilde_fence() {
         // A `` ``` `` line inside a still-open `~~~` fence (e.g. a shell
         // snippet demonstrating backtick-fenced Markdown) is literal fence
@@ -1441,6 +1531,34 @@ A later, unconnected sentence also mentions `agent.rs` again for context.
             "both mentions should collapse to one citation with the same narrowed scope"
         );
         assert_eq!(mentions[0].section_dirs, vec!["rocm-dash-tui".to_string()]);
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_leak_a_narrowed_owner_into_the_next_heading() {
+        // Regression: `narrowed_owners` was cleared only AFTER a heading's
+        // own citations were processed, so a new heading that itself bare-
+        // cites the same filename a previous section narrowed (`lib.rs` to
+        // `crates/rocm-core`) inherited that stale narrowing instead of
+        // its own heading directory (`apps/rocmd`). Worse, the wrongly-
+        // scoped citation is then indistinguishable from (and collapses
+        // into, via the `BTreeSet`) the earlier one, so a missing
+        // `apps/rocmd/lib.rs` would go completely unchecked.
+        let markdown = "\
+### `crates/rocm-core` — core library
+
+`crates/rocm-core`'s `lib.rs` is not yet modularized.
+
+### `apps/rocmd`, `lib.rs` — background daemon
+";
+        let citations = extract_path_citations(markdown);
+        let lib_citations: Vec<&Citation> =
+            citations.iter().filter(|c| c.text == "lib.rs").collect();
+        assert!(
+            lib_citations
+                .iter()
+                .any(|c| c.section_dirs == vec!["apps/rocmd".to_string()]),
+            "expected a lib.rs citation scoped to the new heading's own directory, got: {lib_citations:?}"
+        );
     }
 
     #[test]
