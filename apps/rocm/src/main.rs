@@ -20912,11 +20912,34 @@ fn select_auto_gpu_index(
     // is the space the selection is exported through, so the retained ordinals
     // are directly selectable. When the host is unprobeable (`visible` is
     // `None`) the set is left unrestricted (mask-unaware, as before).
+    //
+    // A short row set is not always a mask, though: `parse_gpu_vram_usage`
+    // drops any device entry missing `/mem_usage/used_vram/value` or
+    // `/mem_usage/total_vram/value`, so a device the lighter `list` enumeration
+    // counts can simply have no row. Taking rows-only there would shrink the
+    // candidate set for a reason that has nothing to do with visibility, and if
+    // every *reported* device is busy the terminal fallback would hand back a
+    // busy GPU while an idle, merely untelemetried one went unconsidered —
+    // exactly the "serve pinned to an occupied GPU" fault this selection exists
+    // to avoid. So when `visible` is known, union the detected `0..count` range
+    // back in: the retain below validates every ordinal against that mask, so
+    // nothing unconfirmed survives (under a `[2, 3]` mask with `count == 2` the
+    // synthetic `[0, 1]` is dropped wholesale and the rows still stand alone).
+    // Without `visible` there is no second source to confirm an ordinal
+    // against, so the rows remain authoritative and no index is invented.
     let mut reported: Vec<u32> = match vram {
-        Some(rows) => rows.iter().map(|row| row.index).collect(),
+        Some(rows) => {
+            let mut indices: Vec<u32> = rows.iter().map(|row| row.index).collect();
+            if visible.is_some() {
+                indices.extend(0..count as u32);
+            }
+            indices
+        }
         None => (0..count as u32).collect(),
     };
     reported.sort_unstable();
+    // The union above can repeat an ordinal that both sources name.
+    reported.dedup();
     if let Some(visible) = visible {
         reported.retain(|index| visible.contains(index));
     }
@@ -30159,6 +30182,51 @@ install therock";
             select_auto_gpu_index(None, None, &[2, 3], Some(&descending)),
             vec![2],
             "the fallback must take the lowest reported ordinal, not the first row"
+        );
+    }
+
+    #[test]
+    fn auto_selection_considers_a_detected_gpu_that_reported_no_vram_row() {
+        // A short row set is not always a visibility mask. `parse_gpu_vram_usage`
+        // drops any device entry missing its `used_vram`/`total_vram` pointers, so
+        // here `list` counts two GPUs, both are visible, but only GPU 0 produced a
+        // row — and GPU 0 is pinned by a managed service. Driving candidates from
+        // the rows alone leaves `[0]`, the busy filter empties it, every pass
+        // iterates nothing and the terminal fallback hands back GPU 0: `serve`
+        // pinned to an already-occupied GPU, the exact failure this selection
+        // exists to prevent. The untelemetried GPU 1 is confirmed by both the
+        // count and the visible set, so it must be a candidate and must win.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 182_000, 192_000)])
+            ),
+            vec![1],
+            "a detected, visible GPU with no VRAM row must be preferred over a busy reported one"
+        );
+        // The same shape without telemetry for the busy device being conclusive:
+        // GPU 1 is still the only non-busy ordinal either source confirms.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 1_000, 192_000)])
+            ),
+            vec![1],
+            "an idle-looking but service-pinned GPU 0 must still lose to the free GPU 1"
+        );
+        // The masking behaviour this rows-only construction was introduced for is
+        // untouched: under a `[2, 3]` mask the synthetic `0..count` range is
+        // dropped wholesale by the visible retain, so no unconfirmed ordinal is
+        // ever synthesised and the all-busy fallback still names a reported GPU.
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), Some(&[2, 3]), &[2, 3], Some(&masked)),
+            vec![2],
+            "a masked host must not gain candidates 0/1 from the detected count"
         );
     }
 
