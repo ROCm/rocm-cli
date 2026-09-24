@@ -18,7 +18,14 @@ name: E2E self-hosted
 
 on:
   push:
-    branches: [main]
+    # `release/**` (EAI-8761): a release-branch push runs the full self-hosted
+    # matrix automatically, ahead of cutting the `v*` tag that release.yml
+    # builds/publishes from. Deliberately a branch, not a tag pattern like
+    # `v*-rc*` — GitHub tag globs match by prefix, so any `v*`-prefixed RC tag
+    # would ALSO fire release.yml's publish job and auto-publish a real
+    # GitHub release. A branch push carries no such risk (release.yml has no
+    # branch-push trigger).
+    branches: [main, "release/**"]
   # Mirror ci.yml: run on PRs against ANY base branch so a stacked PR still gets
   # the GPU lanes. Affected-crate/heavy selection diffs against github.base_ref.
   pull_request:
