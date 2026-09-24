@@ -16,11 +16,85 @@ Run the Rust test suite:
 cargo test --workspace --all-targets
 ```
 
+Note that `cargo test` runs every test as a thread in **one process**, which is
+also what the required `windows-build-and-test` lane does. See
+[Tests that touch the environment](#tests-that-touch-the-environment) before
+writing a test that sets an environment variable.
+
 Run clippy with warnings as errors:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+### Tests that touch the environment
+
+`std::env::set_var` / `remove_var` change state shared by every thread in the
+process. Under a threaded harness two tests touching the same key race, and one
+reads the other's value and fails an assertion unrelated to what it tests. This
+is enforced by a test, not by an `xtask` subcommand:
+`a_test_mutating_the_environment_serializes_itself` in `xtask` scans the whole
+tree and **fails the build** on an unguarded mutation inside a `#[test]` or
+`#[tokio::test]`. Run it on its own with:
+
+```bash
+cargo test -p xtask a_test_mutating_the_environment_serializes_itself
+```
+
+Best is not to touch the environment at all — pass the value in through a test
+seam, as `newest_rocm_install_dir_in` and `engine_envs_root_from` do. A seam
+cannot test the wiring it bypasses, though, so when exercising the real
+env-reading path *is* the point, take a process-wide lock for the duration of
+the test and restore the previous value before releasing it:
+
+```rust
+/// Stands in for the production code under test. It reads `KEY` itself, which
+/// is why the test cannot use a seam and has to set a real variable.
+fn production_function() -> String {
+    std::env::var("KEY").unwrap_or_default()
+}
+
+/// Serializes every test in this process that replaces `KEY`.
+static SOMETHING_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+#[test]
+fn reads_its_setting_from_the_environment() {
+    // Poison is not a failure here: a panicking sibling leaves the value
+    // restored or not, and either way this test still wants the lock.
+    let _guard = SOMETHING_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = std::env::var_os("KEY");
+    unsafe { std::env::set_var("KEY", "value") };
+    let observed = production_function();
+    match &previous {
+        Some(value) => unsafe { std::env::set_var("KEY", value) },
+        None => unsafe { std::env::remove_var("KEY") },
+    }
+    assert_eq!(observed, "value");
+}
+```
+
+The guard accepts `ScopedTestEnv`, `ScopedEnvVar`, or **any** static named
+`*_TEST_LOCK` taken inside the test body. The suffix is the rule, so a new lock
+is recognised the day it is declared rather than when someone remembers to add
+it to a list. The exemption is per test function, not per file: one test taking
+a lock does not cover its neighbours.
+
+Two things the shape above gets right, both of which the guard checks only
+partly:
+
+- **Take the lock before the mutation.** A lock protects from where it is
+  acquired, not retroactively. The guard enforces this ordering.
+- **Use the same lock as every other test that touches that key.** Two tests
+  replacing one key under two different mutexes race each other while both
+  satisfy the guard — it cannot see which key a call names, because the keys
+  are string literals it strips before scanning. This one is on you.
+
+Keep the mutation and the lock in the same test body. A `#[test]` that delegates
+its mutation to an unguarded helper is a known blind spot — the helper is a
+different scope, so the scan cannot see the two together.
 
 Run the cross-platform smoke test:
 

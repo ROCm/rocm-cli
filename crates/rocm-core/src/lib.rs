@@ -1803,15 +1803,43 @@ impl AppPaths {
         self.engine_dir(engine).join("logs")
     }
 
+    /// Where engine virtualenvs live, honouring `ROCM_CLI_ENGINE_ENVS_ROOT`.
+    ///
+    /// Read-side of a write-only contract at present: `apps/rocm` exports this
+    /// key into the children it spawns, and this is the only code that reads it
+    /// back, so no in-tree production path reaches here today. That predates
+    /// the seam below and is deliberate — the key exists for an engine process
+    /// to honour. Being `pub` says nothing either way: `unreachable_pub` is
+    /// switched off workspace-wide (see the root `Cargo.toml`), so nothing warns
+    /// about an unused one. Delete this and the key together if the contract is
+    /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
+    /// keeps the lookup honest meanwhile.
     pub fn engine_envs_root(&self) -> PathBuf {
-        env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").map_or_else(
+        self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
+    }
+
+    /// [`Self::engine_envs_root`] against a caller-supplied override.
+    ///
+    /// Lets a test drive the override without `std::env::set_var`, which is
+    /// process-global and races other tests under a threaded runner. Same seam
+    /// as [`discover_rocm_installs_in_layout`].
+    fn engine_envs_root_from(&self, override_root: Option<&Path>) -> PathBuf {
+        override_root.map_or_else(
             || self.data_dir.join("engines"),
-            |root| normalize_runtime_path_for_host(&root),
+            normalize_runtime_path_for_host,
         )
     }
 
     pub fn engine_envs_dir(&self, engine: &str) -> PathBuf {
         self.engine_envs_root().join(engine).join("envs")
+    }
+
+    /// [`Self::engine_envs_dir`] against a caller-supplied override.
+    #[cfg(test)]
+    fn engine_envs_dir_from(&self, engine: &str, override_root: Option<&Path>) -> PathBuf {
+        self.engine_envs_root_from(override_root)
+            .join(engine)
+            .join("envs")
     }
 
     pub fn engine_locks_dir(&self, engine: &str) -> PathBuf {
@@ -2829,19 +2857,43 @@ pub(crate) struct RocmInstall {
     pub(crate) version: Option<String>,
 }
 
+/// The search roots and layout this host's installs use.
+fn host_rocm_search() -> (Vec<PathBuf>, RocmLayout) {
+    let (dirs, layout) = if runtime_is_windows() {
+        (WINDOWS_ROCM_SEARCH_DIRS, RocmLayout::Children)
+    } else {
+        (LINUX_ROCM_SEARCH_DIRS, RocmLayout::Siblings)
+    };
+    (dirs.iter().map(PathBuf::from).collect(), layout)
+}
+
 /// Every unmanaged ROCm install on this host, best candidate first.
 ///
 /// Supplies the platform's search roots, layout, and `$ROCM_PATH` to
 /// [`discover_rocm_installs_in_layout`].
 pub(crate) fn discover_rocm_installs() -> Vec<RocmInstall> {
     let env_override = std::env::var_os("ROCM_PATH").map(PathBuf::from);
-    let (dirs, layout) = if runtime_is_windows() {
-        (WINDOWS_ROCM_SEARCH_DIRS, RocmLayout::Children)
-    } else {
-        (LINUX_ROCM_SEARCH_DIRS, RocmLayout::Siblings)
-    };
-    let search_dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+    let (search_dirs, layout) = host_rocm_search();
     discover_rocm_installs_in_layout(&search_dirs, env_override.as_deref(), layout)
+}
+
+/// [`discover_rocm_installs`] with the host's `$ROCM_PATH` and search roots
+/// supplied by the caller instead of read from the process.
+///
+/// Reading `$ROCM_PATH` inside [`discover_rocm_installs`] is what forced its
+/// callers' tests to mutate the process environment, and two of them racing on
+/// that global is what made the Windows lane flake — that lane runs `cargo test`
+/// (threads in one process) where `Test (affected crates)` runs `cargo nextest`
+/// (a process per test), so only Windows observed it. Not every Linux lane uses
+/// nextest, so that is where it fired rather than where it could. Passing the
+/// override in keeps those tests hermetic. Same seam as [`discover_rocm_installs_in`], but
+/// keeps the host's layout so the caller under test is the real one.
+#[cfg(test)]
+pub(crate) fn discover_rocm_installs_on_host_in(
+    search_dirs: &[PathBuf],
+    env_override: Option<&Path>,
+) -> Vec<RocmInstall> {
+    discover_rocm_installs_in_layout(search_dirs, env_override, host_rocm_search().1)
 }
 
 /// [`discover_rocm_installs_in_layout`] for the Linux sibling layout.
@@ -12328,28 +12380,92 @@ Class Name:                Display
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn engine_envs_dir_honors_dedicated_root_override() {
         let (root, paths) = temp_app_paths("engine-envs-root-override");
         let override_root = root.join("runtime").join("engines");
-        let previous = std::env::var_os("ROCM_CLI_ENGINE_ENVS_ROOT");
-        unsafe {
-            std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
-        }
 
+        // Passed in rather than set via `std::env::set_var`: the environment is
+        // process-global, so mutating it here would race any concurrent test
+        // that reads the same key under a threaded runner.
+        //
+        // What this assertion covers is the override being consulted and the
+        // `<root>/<engine>/envs` shape built on it. It deliberately does NOT
+        // claim to cover the host-normalisation step, and routing the expected
+        // value through the same call the production code makes is why: on a
+        // non-Windows target `normalize_runtime_path_for_host` is the identity
+        // for every input (see `normalize_runtime_path_text_for_platform`), so
+        // dropping normalisation from the override arm cannot fail this on a
+        // Linux lane — nor, with an already-normal temp path, on a Windows one.
+        // Making it fail would need the platform threaded through the seam, and
+        // the normaliser itself is already covered on every host by
+        // `runtime_path_normalization_accepts_windows_drive_forms` and its
+        // neighbours, which pass the platform in explicitly.
         assert_eq!(
-            paths.engine_envs_dir("vllm"),
+            paths.engine_envs_dir_from("vllm", Some(&override_root)),
             normalize_runtime_path_for_host(&override_root)
                 .join("vllm")
                 .join("envs")
         );
 
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", value),
-                None => std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT"),
-            }
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Serializes tests that replace a process-global env var while they run.
+    ///
+    /// Named `*_TEST_LOCK` so the env-mutation contract guard recognises the
+    /// discipline by suffix rather than by a hardcoded list of lock names.
+    static ENGINE_ENVS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The two tests around this one drive the seam, which deliberately does
+    /// not read the environment — so on their own the production lookup, and
+    /// the key it names, could both be deleted without failing anything. This
+    /// drives `engine_envs_dir` itself against a real variable.
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    #[test]
+    fn engine_envs_dir_reads_its_root_from_the_environment() {
+        let _guard = ENGINE_ENVS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, paths) = temp_app_paths("engine-envs-root-env");
+        let override_root = root.join("runtime").join("engines");
+
+        let previous = std::env::var_os("ROCM_CLI_ENGINE_ENVS_ROOT");
+        // SAFETY: the lock above serializes every test in this process that
+        // touches this key, and the value is restored before it is released.
+        unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root) };
+        let resolved = paths.engine_envs_dir("vllm");
+        match &previous {
+            Some(value) => unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", value) },
+            None => unsafe { std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT") },
         }
+
+        // Same scope as the seam test above: this pins that `engine_envs_dir`
+        // reaches the variable, not that the value is host-normalised on the
+        // way through. See that test for why the normalisation step is not
+        // observable here.
+        assert_eq!(
+            resolved,
+            normalize_runtime_path_for_host(&override_root)
+                .join("vllm")
+                .join("envs"),
+            "engine_envs_dir must reach $ROCM_CLI_ENGINE_ENVS_ROOT"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn engine_envs_dir_falls_back_to_the_data_dir_without_an_override() {
+        // The other half of the override contract: with nothing supplied the
+        // root is the data dir, which is what the unset-environment production
+        // path resolves to.
+        let (root, paths) = temp_app_paths("engine-envs-root-default");
+
+        assert_eq!(
+            paths.engine_envs_dir_from("vllm", None),
+            paths.data_dir.join("engines").join("vllm").join("envs")
+        );
+
         fs::remove_dir_all(root).ok();
     }
 

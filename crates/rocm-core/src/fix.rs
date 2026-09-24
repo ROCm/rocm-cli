@@ -1357,11 +1357,30 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
 /// It now asks the same resolver as `examine`, which also means `$ROCM_PATH` is
 /// honoured here for the first time.
 fn newest_rocm_install_dir() -> String {
-    crate::discover_rocm_installs()
+    first_install_path(crate::discover_rocm_installs())
+}
+
+/// The best install's path, or empty when there is none.
+fn first_install_path(installs: Vec<crate::RocmInstall>) -> String {
+    installs
         .into_iter()
         .next()
         .map(|install| install.path.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// [`newest_rocm_install_dir`] against a caller-supplied `$ROCM_PATH` and
+/// search roots, so a test can drive it without touching the process
+/// environment. Same seam as [`crate::discover_rocm_installs_in`].
+#[cfg(test)]
+fn newest_rocm_install_dir_in(
+    search_dirs: &[std::path::PathBuf],
+    env_override: Option<&std::path::Path>,
+) -> String {
+    first_install_path(crate::discover_rocm_installs_on_host_in(
+        search_dirs,
+        env_override,
+    ))
 }
 
 #[cfg(test)]
@@ -1371,6 +1390,12 @@ mod tests {
     // Serializes tests that replace the process-global `ROCM_PATH` env var while
     // they run. Because env is shared across all test threads, two such tests
     // running concurrently can otherwise see each other's value mid-test.
+    //
+    // Deliberately kept alongside the seam rather than instead of it, and the
+    // split is not arbitrary: tests about resolution semantics take the seam
+    // and never touch the environment, and exactly one test — the one whose
+    // subject IS the `$ROCM_PATH` read — takes this lock. Anything provable
+    // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1402,16 +1427,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_finds_the_install_the_rest_of_the_cli_found() {
         // Discriminating on purpose: the scanner this replaces looked only in
         // two hardcoded `C:\Program Files` directories and ignored $ROCM_PATH
         // outright, so it returned nothing here no matter what was planted.
         // Going through the shared resolver is what makes this pass -- and is
         // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-resolver-{}-{:?}",
             std::process::id(),
@@ -1420,35 +1441,93 @@ mod tests {
         let install = root.join("rocm-6.10.0");
         plant_install(&install);
 
+        // A second, older install reachable through the hardcoded search roots.
+        // Passing it alongside the override is what exercises the ordering the
+        // assertion below claims: with `&[]` the search loop never runs, so
+        // "the override outranks the search roots" would hold vacuously.
+        //
+        // Planted in BOTH shapes because the resolver is told the host's
+        // layout: `rocm-6.2.0` is a versioned sibling and only matches on
+        // Linux, `6.2` is a bare-version child and only matches on Windows.
+        // Planting one shape would leave the search loop empty on the other
+        // platform and make the ordering half vacuous again -- on Windows
+        // first, which is the lane this test exists for.
+        let searched = root.join("search");
+        plant_install(&searched.join("rocm-6.2.0"));
+        plant_install(&searched.join("6.2"));
+
+        // The override goes in as an argument rather than through
+        // `std::env::set_var`: the environment is process-global, so a sibling
+        // test mutating $ROCM_PATH between this set and its read used to make
+        // this assertion fail on whichever test lost the race.
+        // `..._reads_rocm_path_from_the_environment` covers the real read.
+        let found = newest_rocm_install_dir_in(std::slice::from_ref(&searched), Some(&install));
+        // Run the same search WITHOUT the override, so the ordering claim below
+        // cannot pass by finding nothing to outrank. A planted decoy the
+        // resolver's layout does not recognise is indistinguishable, from the
+        // assertion's point of view, from no decoy at all.
+        let without_override = newest_rocm_install_dir_in(std::slice::from_ref(&searched), None);
+
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !without_override.is_empty(),
+            "the decoy must be reachable through the search roots on this \
+             platform, or 'the override outranks them' holds vacuously"
+        );
+        assert_eq!(
+            found,
+            install.to_string_lossy(),
+            "fix-6-path must resolve installs the same way examine does, and \
+             $ROCM_PATH must outrank the hardcoded search roots"
+        );
+    }
+
+    /// The seam tests above deliberately bypass `$ROCM_PATH`, so on their own
+    /// the production read could be deleted and the suite would stay green.
+    /// This one drives the real entry point against a real variable.
+    ///
+    /// It takes the lock rather than a seam because exercising the env read IS
+    /// the point — the escape hatch the contract guard advertises for exactly
+    /// this case.
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    #[test]
+    fn the_path_fix_reads_rocm_path_from_the_environment() {
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("rocm-6.10.0");
+        plant_install(&install);
+
         let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &install);
-        }
+        // SAFETY: the lock above serializes every test in this process that
+        // touches this key, and the value is restored before it is released.
+        unsafe { std::env::set_var("ROCM_PATH", &install) };
         let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
+        match &previous {
+            Some(value) => unsafe { std::env::set_var("ROCM_PATH", value) },
+            None => unsafe { std::env::remove_var("ROCM_PATH") },
         }
+
         std::fs::remove_dir_all(&root).ok();
 
         assert_eq!(
             found,
             install.to_string_lossy(),
-            "fix-6-path must resolve installs the same way examine does"
+            "fix-6-path must reach $ROCM_PATH through the shared resolver"
         );
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
         // marker.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
@@ -1457,17 +1536,8 @@ mod tests {
         let empty = root.join("6.10");
         std::fs::create_dir_all(&empty).expect("create empty dir");
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &empty);
-        }
-        let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        let found = newest_rocm_install_dir_in(&[], Some(&empty));
+
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
