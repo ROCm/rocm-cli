@@ -39,7 +39,7 @@ pub(crate) fn feature_group(feature: &Feature) -> Markup {
     }
 }
 
-pub(crate) fn scenario_block(scenario: &Element) -> Markup {
+fn scenario_block(scenario: &Element) -> Markup {
     let status = scenario_status(scenario);
     let dur_ms = scenario_duration(scenario) / 1_000_000;
     let badge_class = match status {
@@ -66,7 +66,7 @@ pub(crate) fn scenario_block(scenario: &Element) -> Markup {
     }
 }
 
-pub(crate) fn step_row(step: &Step) -> Markup {
+fn step_row(step: &Step) -> Markup {
     let (icon, icon_class) = match step.result.status.as_str() {
         "passed" => ("\u{2714}", "pass"),
         "failed" => ("\u{2718}", "fail"),
@@ -121,7 +121,7 @@ pub(crate) fn now_utc() -> String {
 /// Format Unix epoch seconds as `YYYY-MM-DD HH:MM:SS UTC` without pulling in a
 /// date crate. Uses Howard Hinnant's civil-from-days algorithm (valid for all
 /// Gregorian dates), so the report shows a real timestamp rather than a stub.
-pub(crate) fn format_utc(secs: u64) -> String {
+fn format_utc(secs: u64) -> String {
     let days = i64::try_from(secs / 86_400).unwrap_or(0);
     let rem = secs % 86_400;
     let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
