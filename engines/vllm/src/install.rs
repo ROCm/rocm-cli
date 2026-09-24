@@ -126,7 +126,7 @@ fn rocm_sdk_version_matches(recorded: &str, table_key: &str) -> bool {
 }
 /// How [`install_vllm_with_uv`] should install vLLM for a given target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VllmInstallRoute {
+pub(crate) enum VllmInstallRoute {
     /// Pin from [`VLLM_ROCM_BUILD_TABLE`] (or a caller-supplied index override).
     Static,
     /// Discover the current wheels for a [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] row.
@@ -136,7 +136,7 @@ enum VllmInstallRoute {
 /// override always wins (it means the caller already knows exactly which
 /// wheels to use), otherwise a known ROCm SDK version routes through
 /// discovery, and everything else falls back to the static pin table.
-fn vllm_install_route(
+pub(crate) fn vllm_install_route(
     index_override: Option<&str>,
     rocm_sdk_version: Option<&str>,
 ) -> VllmInstallRoute {

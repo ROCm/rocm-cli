@@ -407,7 +407,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
     ))
 }
 
-fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
     if runtime
         .rocm_sdk_version

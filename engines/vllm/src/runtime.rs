@@ -316,7 +316,7 @@ pub(crate) fn sdk_torch_build_from_manifest(manifest: &TheRockRuntimeManifest) -
 }
 /// The bare ROCm SDK version a manifest records (e.g. `7.2.3`), unlike
 /// [`sdk_torch_build_from_manifest`] which wraps it as a `rocm<version>` build tag.
-fn rocm_sdk_version_from_manifest(manifest: &TheRockRuntimeManifest) -> Option<String> {
+pub(crate) fn rocm_sdk_version_from_manifest(manifest: &TheRockRuntimeManifest) -> Option<String> {
     let version = manifest
         .rocm_sdk
         .as_ref()
