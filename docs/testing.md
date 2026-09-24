@@ -48,6 +48,12 @@ env-reading path *is* the point, take a process-wide lock for the duration of
 the test and restore the previous value before releasing it:
 
 ```rust
+/// Stands in for the production code under test. It reads `KEY` itself, which
+/// is why the test cannot use a seam and has to set a real variable.
+fn production_function() -> String {
+    std::env::var("KEY").unwrap_or_default()
+}
+
 /// Serializes every test in this process that replaces `KEY`.
 static SOMETHING_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -75,6 +81,16 @@ The guard accepts `ScopedTestEnv`, `ScopedEnvVar`, or **any** static named
 is recognised the day it is declared rather than when someone remembers to add
 it to a list. The exemption is per test function, not per file: one test taking
 a lock does not cover its neighbours.
+
+Two things the shape above gets right, both of which the guard checks only
+partly:
+
+- **Take the lock before the mutation.** A lock protects from where it is
+  acquired, not retroactively. The guard enforces this ordering.
+- **Use the same lock as every other test that touches that key.** Two tests
+  replacing one key under two different mutexes race each other while both
+  satisfy the guard — it cannot see which key a call names, because the keys
+  are string literals it strips before scanning. This one is on you.
 
 Keep the mutation and the lock in the same test body. A `#[test]` that delegates
 its mutation to an unguarded helper is a known blind spot — the helper is a

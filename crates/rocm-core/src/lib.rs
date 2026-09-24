@@ -12387,6 +12387,19 @@ Class Name:                Display
         // Passed in rather than set via `std::env::set_var`: the environment is
         // process-global, so mutating it here would race any concurrent test
         // that reads the same key under a threaded runner.
+        //
+        // What this assertion covers is the override being consulted and the
+        // `<root>/<engine>/envs` shape built on it. It deliberately does NOT
+        // claim to cover the host-normalisation step, and routing the expected
+        // value through the same call the production code makes is why: on a
+        // non-Windows target `normalize_runtime_path_for_host` is the identity
+        // for every input (see `normalize_runtime_path_text_for_platform`), so
+        // dropping normalisation from the override arm cannot fail this on a
+        // Linux lane — nor, with an already-normal temp path, on a Windows one.
+        // Making it fail would need the platform threaded through the seam, and
+        // the normaliser itself is already covered on every host by
+        // `runtime_path_normalization_accepts_windows_drive_forms` and its
+        // neighbours, which pass the platform in explicitly.
         assert_eq!(
             paths.engine_envs_dir_from("vllm", Some(&override_root)),
             normalize_runtime_path_for_host(&override_root)
@@ -12426,6 +12439,10 @@ Class Name:                Display
             None => unsafe { std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT") },
         }
 
+        // Same scope as the seam test above: this pins that `engine_envs_dir`
+        // reaches the variable, not that the value is host-normalised on the
+        // way through. See that test for why the normalisation step is not
+        // observable here.
         assert_eq!(
             resolved,
             normalize_runtime_path_for_host(&override_root)
