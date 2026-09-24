@@ -12,7 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use crate::ENGINE_NAME;
-use crate::runtime::VllmRuntime;
+use crate::runtime::{
+    VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
+    recorded_sdk_torch_build, resolve_managed_runtime_python, resolve_vllm_runtime,
+    runtime_is_managed, vllm_runtime_warnings,
+};
+use crate::state::runtime_lock_hash;
 
 /// Known-good `(ROCm SDK version, vLLM version, ABI tag)` combinations for
 /// `uv pip install vllm`, keyed by the ROCm SDK version recorded in the
@@ -148,10 +153,10 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
     // Resolve regardless of `reinstall`. Resolution answers *which* interpreter holds
     // vLLM, and a forced reinstall needs that answer just as much as a repair does —
     // gating it on `reinstall` left `--reinstall` with no assessed environment, so it
-    // fell back to `crate::runtime::resolve_managed_runtime_python` (first prefix-matching candidate)
+    // fell back to `resolve_managed_runtime_python` (first prefix-matching candidate)
     // and could reinstall a healthy environment while leaving the broken one broken.
     // Only the short-circuit below is gated on `reinstall`.
-    let resolved = crate::runtime::resolve_vllm_runtime(Some(&request.runtime_id)).ok();
+    let resolved = resolve_vllm_runtime(Some(&request.runtime_id)).ok();
     // A resolvable vLLM is not necessarily a usable one. `rocm install sdk` writes the
     // TheRock torch stack into the same environment vLLM lives in, so a second run
     // replaces the torch build vLLM pins without touching vLLM itself.
@@ -161,11 +166,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
         Some(runtime) => {
             let repair = assess_runtime_repair(&runtime);
             if request.reinstall || repair.needed {
-                (
-                    None,
-                    repair,
-                    crate::runtime::assessed_python_for_repair(&runtime),
-                )
+                (None, repair, assessed_python_for_repair(&runtime))
             } else {
                 (Some(runtime), repair, None)
             }
@@ -177,20 +178,20 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
         runtime
     } else {
         // A repair installs into the environment that was *assessed*. The two resolvers
-        // do not agree: `crate::runtime::resolve_vllm_runtime` walks the candidates until one actually
-        // has vLLM beside it, while `crate::runtime::resolve_managed_runtime_python` takes the first
+        // do not agree: `resolve_vllm_runtime` walks the candidates until one actually
+        // has vLLM beside it, while `resolve_managed_runtime_python` takes the first
         // candidate unconditionally — and `runtime_id` matches by prefix, so several
         // candidates routinely qualify. Installing into a different interpreter than the
         // one found broken would leave the broken one broken and report it fixed.
         let managed = match assessed {
             Some(assessed) => assessed,
-            None => crate::runtime::resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
+            None => resolve_managed_runtime_python(Some(&request.runtime_id))?.with_context(
                 || {
                     let base = format!(
                         "runtime `{}` did not resolve to a managed TheRock Python environment for automatic vLLM install",
                         request.runtime_id
                     );
-                    match crate::runtime::describe_skipped_managed_runtimes(Some(&request.runtime_id)) {
+                    match describe_skipped_managed_runtimes(Some(&request.runtime_id)) {
                         Some(skipped) => format!("{base}\n\n{skipped}"),
                         None => base,
                     }
@@ -202,7 +203,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             request.reinstall,
             managed.rocm_sdk_version.as_deref(),
         )?;
-        crate::runtime::resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
+        resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
                 "vLLM install completed in {}, but runtime `{}` still could not be resolved",
                 managed.python_executable.display(),
@@ -225,7 +226,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             .to_string(),
         runtime_kind: Some("external_vllm".to_owned()),
         runtime_executable: Some(runtime.command.display().to_string()),
-        managed_env: Some(crate::runtime::runtime_is_managed(&runtime)),
+        managed_env: Some(runtime_is_managed(&runtime)),
         installed_packages: vec![format!(
             "vllm{}",
             runtime
@@ -235,11 +236,11 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
                 .unwrap_or_default()
         )],
         capabilities: crate::capabilities(),
-        lock_hash: crate::state::runtime_lock_hash(&runtime),
+        lock_hash: runtime_lock_hash(&runtime),
         warnings: repair
             .notes
             .into_iter()
-            .chain(crate::runtime::vllm_runtime_warnings(&runtime))
+            .chain(vllm_runtime_warnings(&runtime))
             .chain((!discover_pins.is_empty()).then(|| {
                 format!(
                     "vLLM ROCm 10.x discovery pinned: {}",
@@ -265,7 +266,7 @@ struct RepairAssessment {
 /// rocm-cli reports on it but does not rewrite its packages, which is the very failure
 /// mode this check exists to catch.
 fn assess_runtime_repair(runtime: &VllmRuntime) -> RepairAssessment {
-    if !crate::runtime::runtime_is_managed(runtime) {
+    if !runtime_is_managed(runtime) {
         return RepairAssessment::default();
     }
     let Some(python) = runtime.python_executable.as_ref() else {
@@ -278,7 +279,7 @@ fn assess_runtime_repair(runtime: &VllmRuntime) -> RepairAssessment {
     match check_dependencies(&paths, python) {
         Ok(violations) => repair_from_violations(
             &violations,
-            crate::runtime::recorded_sdk_torch_build(&runtime.runtime_id).as_deref(),
+            recorded_sdk_torch_build(&runtime.runtime_id).as_deref(),
             torch_alignment_disabled(),
         ),
         // An unusable `uv` or an offline host must not block an install that would
@@ -825,7 +826,9 @@ fn vllm_rocm_build_from_index_url(index_url: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{RocmSdkRuntimeProbe, TheRockRuntimeManifest};
+    use crate::runtime::{
+        RocmSdkRuntimeProbe, TheRockRuntimeManifest, sdk_torch_build_from_manifest,
+    };
 
     fn install_target(
         index: Option<&str>,
@@ -1173,7 +1176,7 @@ mod tests {
     fn a_settled_runtime_converges_on_the_build_its_own_manifest_records() {
         // The convergence proof the tests above cannot give on their own. They hand
         // the classification a build literal, so a change to what
-        // `crate::runtime::sdk_torch_build_from_manifest` yields — `7.13.0` where the local segment
+        // `sdk_torch_build_from_manifest` yields — `7.13.0` where the local segment
         // reads `rocm7.13.0`, say — would leave every one of them passing while the
         // real pipeline churned forever: the engine would call the realigned torch a
         // defect, reinstall its own build, rocm-cli would put the SDK's back, and the
@@ -1202,7 +1205,7 @@ mod tests {
         };
 
         for manifest in [recorded, reconstructed] {
-            let build = crate::runtime::sdk_torch_build_from_manifest(&manifest)
+            let build = sdk_torch_build_from_manifest(&manifest)
                 .expect("both manifest generations identify the SDK's build");
             let assessment =
                 repair_from_violations(std::slice::from_ref(&settled), Some(&build), ALIGNED);
