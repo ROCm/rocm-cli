@@ -289,3 +289,35 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
     And the preview states that the CLI can run it automatically
+
+  # vLLM runs on Linux and WSL, but not native Windows. This scenario is
+  # GPU-independent: it supplies the captured startup error as symptom text and
+  # proves the public diagnosis output preserves both branches of the remedy.
+  @id:diagnose-vllm-oom-is-conditional @requires-os:linux
+  Scenario: diagnose-21 - A vLLM startup OOM receives conditional remediation
+    Given a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the diagnosis identifies the vLLM startup OOM
+    And the OOM remedy distinguishes a busy GPU from a model that does not fit
+    # A report that names `rocm fix <id>` and a `rocm fix` that then refuses that
+    # id leaves the user worse off than no fix path at all. The two halves are
+    # selected by separate platform lists -- the checker's, and the recipe's
+    # against the RUNNING os, where WSL2 is its own family -- so they can
+    # disagree while each looks right alone. Every Linux lane runs this step; the
+    # WSL one is where the two lists can differ.
+    And the CLI can act on the fix the diagnosis named
+
+  # `--symptom` is where a user pastes a raw terminal capture, and a terminal
+  # capture is full of line advances that are not `\n`: a progress bar repaints
+  # with `\r`, and curses- and `rich`-style progress UIs move down with `ESC E`,
+  # `ESC D` or `CSI n B` (terminfo's `nel`, `ind` and `cud1`). If those are not
+  # line boundaries the whole paste collapses into a single line, a `vllm`
+  # mention anywhere in it anchors another engine's OOM, and the user is told
+  # with high confidence that vLLM ran out of memory -- quoting the other
+  # engine's error text back as the evidence for it. A confidently wrong cause is
+  # worse than no cause, so this is pinned at the level the user sees it.
+  @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
+  Scenario: diagnose-22 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+    Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no vLLM startup OOM is reported

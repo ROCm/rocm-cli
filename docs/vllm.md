@@ -173,6 +173,44 @@ Earlier releases pinned this to `0.80` to leave display/WSL headroom. That pin i
 gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
 `--gpu-memory-utilization 0.8` to restore the previous reservation.
 
+#### Shared or busy GPUs
+
+Because the reservation is a fraction of **total** VRAM, it ignores memory
+already held by other workloads. On a shared multi-GPU node the default can
+collide with in-use memory and the engine fails with `HIP out of memory` even for
+a tiny model. rocm-cli helps in three ways:
+
+- **Auto-selection avoids busy cards.** `--gpu auto` ranks GPUs by free VRAM and
+  skips heavily-used ones. When `amd-smi` is not installed it falls back to the
+  amdgpu DRM sysfs counters
+  (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), so selection still
+  works on stripped-down container images with a single GPU. That fallback
+  withholds telemetry on a multi-GPU host, since its `card<N>` numbering is not
+  guaranteed to match HIP's device ordinal there.
+- **The serve summary warns on low free VRAM.** When the selected GPU is already
+  heavily used, `rocm serve` prints a note — before launch on the plain path, or
+  in the post-readiness summary in the default interactive mode — and, for vLLM,
+  points at `--gpu-memory-utilization` as the fix.
+- **OOM failures hint the workaround.** When a startup failure log shows an
+  out-of-memory error, the failure message suggests retrying with a smaller
+  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
+  with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
+  for the full conditional remediation (busy GPU vs. a model that does not fit).
+  The printed command quotes your actual failing line when it can be rendered as
+  one intact single-quoted argument; a line carrying an apostrophe or terminal
+  control bytes falls back to the canonical symptom below rather than handing you
+  a command whose quoting the log text broke.
+
+Explicitly, the workaround for an OOM on a shared card is:
+
+```bash
+rocm serve <model> --engine vllm --gpu-memory-utilization 0.5
+# optionally target a specific, less-busy GPU by index
+rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
+# for the full busy-GPU-vs-model-too-large breakdown, pass the error to diagnose
+rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
+```
+
 ### Tool calling
 
 The TUI chat tab attaches tool definitions to every chat request. vLLM rejects
