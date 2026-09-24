@@ -8,7 +8,7 @@ use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint, GpuSelection, LaunchRequest,
     LaunchResponse, ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -405,94 +405,6 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
     Ok(rocm_engine_protocol::launch_gpu_indices(
         parse_gpu_selection_arg(value)?.as_ref(),
     ))
-}
-
-pub(crate) fn vllm_command_from_python(python: &Path) -> Option<PathBuf> {
-    let dir = python.parent()?;
-    candidate_command_names("vllm")
-        .into_iter()
-        .map(|name| dir.join(name))
-        .find(|path| path.is_file())
-}
-
-pub(crate) fn find_command_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for candidate in candidate_command_names(name) {
-            let path = dir.join(candidate);
-            if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn resolve_command_path(command: &Path) -> Result<PathBuf> {
-    if command.components().count() > 1 || command.is_absolute() {
-        if command.is_file() {
-            return Ok(command.to_path_buf());
-        }
-        bail!(
-            "configured vLLM command is not a file: {}",
-            command.display()
-        );
-    }
-    find_command_on_path(&command.display().to_string()).with_context(|| {
-        format!(
-            "configured vLLM command `{}` was not found on PATH",
-            command.display()
-        )
-    })
-}
-
-fn candidate_command_names(name: &str) -> Vec<String> {
-    if cfg!(windows) {
-        vec![
-            format!("{name}.exe"),
-            format!("{name}.cmd"),
-            name.to_owned(),
-        ]
-    } else {
-        vec![name.to_owned()]
-    }
-}
-
-pub(crate) fn probe_vllm_version(python: &Path) -> Result<Option<String>> {
-    let script = r#"import importlib.metadata, importlib.util, json
-spec = importlib.util.find_spec("vllm")
-version = None
-if spec is not None:
-    try:
-        version = importlib.metadata.version("vllm")
-    except importlib.metadata.PackageNotFoundError:
-        version = "unknown"
-print(json.dumps({"present": spec is not None, "version": version}))
-"#;
-    let output = ProcessCommand::new(python)
-        .arg("-c")
-        .arg(script)
-        .output()
-        .with_context(|| format!("failed to probe vLLM with {}", python.display()))?;
-    if !output.status.success() {
-        bail!(
-            "vLLM probe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let value: Value = serde_json::from_slice(&output.stdout).context("invalid vLLM probe JSON")?;
-    if value
-        .get("present")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        Ok(value
-            .get("version")
-            .and_then(Value::as_str)
-            .map(str::to_owned))
-    } else {
-        bail!("Python environment does not contain the vLLM package")
-    }
 }
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {

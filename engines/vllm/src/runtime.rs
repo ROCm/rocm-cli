@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub(crate) struct VllmRuntime {
@@ -133,7 +133,7 @@ pub(crate) fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRunti
         .or_else(|| std::env::var_os("VLLM_COMMAND"))
         .map(PathBuf::from)
     {
-        let command = crate::process::resolve_command_path(&command)?;
+        let command = resolve_command_path(&command)?;
         return Ok(VllmRuntime {
             runtime_id: runtime_id.unwrap_or("external-vllm").to_owned(),
             env_id: "external-vllm-command".to_owned(),
@@ -170,7 +170,7 @@ pub(crate) fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRunti
         return Ok(runtime);
     }
 
-    if let Some(command) = crate::process::find_command_on_path("vllm") {
+    if let Some(command) = find_command_on_path("vllm") {
         return Ok(VllmRuntime {
             runtime_id: runtime_id.unwrap_or("external-vllm-path").to_owned(),
             env_id: "external-vllm-path".to_owned(),
@@ -195,9 +195,9 @@ pub(crate) fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRunti
 
 fn runtime_from_python(candidate: ManagedRuntimeCandidate) -> Result<VllmRuntime> {
     let python = candidate.python_executable;
-    let command = crate::process::vllm_command_from_python(&python)
+    let command = vllm_command_from_python(&python)
         .with_context(|| format!("vLLM command not found beside {}", python.display()))?;
-    let version = crate::process::probe_vllm_version(&python).ok().flatten();
+    let version = probe_vllm_version(&python).ok().flatten();
     Ok(VllmRuntime {
         env_id: format!(
             "external-vllm-{}",
@@ -454,6 +454,95 @@ fn stable_id_component(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn vllm_command_from_python(python: &Path) -> Option<PathBuf> {
+    let dir = python.parent()?;
+    candidate_command_names("vllm")
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+fn find_command_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in candidate_command_names(name) {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_command_path(command: &Path) -> Result<PathBuf> {
+    if command.components().count() > 1 || command.is_absolute() {
+        if command.is_file() {
+            return Ok(command.to_path_buf());
+        }
+        bail!(
+            "configured vLLM command is not a file: {}",
+            command.display()
+        );
+    }
+    find_command_on_path(&command.display().to_string()).with_context(|| {
+        format!(
+            "configured vLLM command `{}` was not found on PATH",
+            command.display()
+        )
+    })
+}
+
+fn candidate_command_names(name: &str) -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_owned(),
+        ]
+    } else {
+        vec![name.to_owned()]
+    }
+}
+
+fn probe_vllm_version(python: &Path) -> Result<Option<String>> {
+    let script = r#"import importlib.metadata, importlib.util, json
+spec = importlib.util.find_spec("vllm")
+version = None
+if spec is not None:
+    try:
+        version = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+print(json.dumps({"present": spec is not None, "version": version}))
+"#;
+    let output = std::process::Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .with_context(|| format!("failed to probe vLLM with {}", python.display()))?;
+    if !output.status.success() {
+        bail!(
+            "vLLM probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("invalid vLLM probe JSON")?;
+    if value
+        .get("present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        Ok(value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned))
+    } else {
+        bail!("Python environment does not contain the vLLM package")
+    }
 }
 
 #[cfg(test)]
