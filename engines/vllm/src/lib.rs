@@ -40,24 +40,24 @@ const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 const STOP_GRACE: Duration = Duration::from_secs(10);
 /// vLLM launches worker descendants that retain GPU allocations.
 const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
-/// Default ROCm wheel index for `uv pip install vllm`.
+/// Known-good `(ROCm SDK version, vLLM version, ABI tag)` combinations for
+/// `uv pip install vllm`, keyed by the ROCm SDK version recorded in the
+/// runtime manifest (see [`rocm_sdk_version_from_manifest`]).
 ///
-/// This pins both the vLLM release and the ROCm ABI tag, so it can drift from
-/// the resolved runtime. Override it with `ROCM_CLI_VLLM_ROCM_INDEX_URL` to
-/// match a different vLLM/ROCm combination without rebuilding; see
-/// [`resolve_vllm_install_target`] for how the requirement follows the URL.
-///
-/// Keep the release and ABI tag here in sync with [`VLLM_PINNED_SPEC`] below;
-/// `vllm_pinned_spec_matches_extra_index_url` fails if the two drift apart.
-const VLLM_ROCM_EXTRA_INDEX_URL: &str = "https://wheels.vllm.ai/rocm/0.26.0/rocm723";
-/// Exact requirement handed to `uv pip install` for [`VLLM_ROCM_EXTRA_INDEX_URL`].
-///
-/// The index URL alone is not a pin: it only constrains where wheels are
-/// fetched from, so a bare `vllm` requirement would install whatever version
-/// that path happens to serve (or fall back to PyPI when no wheel on the index
-/// matches the interpreter). Spelling the version and local ABI tag out here
-/// makes the pin real.
-const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
+/// Add a row only once wheels.vllm.ai actually publishes a build for that
+/// ROCm SDK version — see `docs/vllm.md` for AMD's current ROCm X guidance
+/// when this table has no matching row.
+struct VllmRocmBuild {
+    rocm_sdk_version: &'static str,
+    vllm_version: &'static str,
+    abi: &'static str,
+}
+
+const VLLM_ROCM_BUILD_TABLE: &[VllmRocmBuild] = &[VllmRocmBuild {
+    rocm_sdk_version: "7.2.3",
+    vllm_version: "0.26.0",
+    abi: "rocm723",
+}];
 /// Prefix shared by every published vLLM ROCm wheel index.
 ///
 /// Release indexes are `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`, which is
@@ -66,6 +66,115 @@ const VLLM_PINNED_SPEC: &str = "vllm==0.26.0+rocm723";
 const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// A ROCm SDK version whose vLLM/flash-attn/amd-aiter wheels aren't published
+/// under a fixed filename (AMD rotates the dev-tag suffix constantly), so the
+/// exact wheel must be discovered from the index at install time instead of
+/// pinned in [`VLLM_ROCM_BUILD_TABLE`].
+struct VllmRocmDiscoverBuild {
+    rocm_sdk_version: &'static str,
+    vllm_version_prefix: &'static str,
+    flash_attn_version_prefix: &'static str,
+    amd_aiter_version_prefix: &'static str,
+    torch_requirement: &'static str,
+    tensorizer_requirement: &'static str,
+}
+
+const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[VllmRocmDiscoverBuild {
+    rocm_sdk_version: "10.0.0",
+    vllm_version_prefix: "0.27",
+    flash_attn_version_prefix: "2.8",
+    amd_aiter_version_prefix: "0.1",
+    torch_requirement: "torch==2.12.0+rocm10.0.0",
+    tensorizer_requirement: "tensorizer==2.12.1",
+}];
+/// Index that publishes the rotating-dev-tag vLLM/flash-attn/amd-aiter
+/// wheels for [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
+const VLLM_ROCM_DISCOVER_INDEX_URL: &str = "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/";
+/// Index that publishes the pinned torch build for
+/// [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
+const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/rocm/whl-next/";
+
+/// Looks up the discovery build recipe for a ROCm SDK version, if any.
+///
+/// Matched on major version only: unlike [`VLLM_ROCM_BUILD_TABLE`], where a
+/// row pins one exact release's wheel filename, a discover row is a live
+/// resolver recipe AMD's index applies uniformly across an entire ROCm major
+/// line. AMD's preview wheels are tagged with the real target release
+/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0`, and
+/// `+rocm7.14.1` as genuinely distinct, coexisting builds), so once ROCm
+/// 10.x's target moves past `10.0.0` the same rotation will happen here; a
+/// row keyed to an exact string would then silently stop matching. `10.0.0`
+/// and `10.1.0` should both discover through the same `"10.0.0"` row. This
+/// intentionally differs from `apps/rocm/src/therock.rs`'s SDK layout
+/// selection, which avoids major-only gating for unrelated reasons (on-disk
+/// layout, not wheel availability).
+fn vllm_rocm_discover_build(rocm_sdk_version: &str) -> Option<&'static VllmRocmDiscoverBuild> {
+    VLLM_ROCM_DISCOVER_BUILD_TABLE
+        .iter()
+        .find(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version))
+}
+
+/// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
+/// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
+/// a ROCm SDK major version, ignoring minor, patch, and any dev/pre-release
+/// suffix. See [`vllm_rocm_discover_build`] for why major alone is enough here.
+fn rocm_sdk_major_matches(recorded: &str, table_key: &str) -> bool {
+    fn major(version: &str) -> Option<u64> {
+        version.trim().split('.').next()?.parse().ok()
+    }
+    major(recorded).is_some() && major(recorded) == major(table_key)
+}
+
+/// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
+/// is the same release as `table_key` (a literal key in [`VLLM_ROCM_BUILD_TABLE`]),
+/// ignoring any dev/pre-release suffix.
+///
+/// Real probes routinely carry a suffix the table keys never do (e.g.
+/// `7.13.0a20260423`), and that suffix is not valid semver pre-release syntax
+/// (no leading `-`), so comparing by exact string, or even by a semver parse,
+/// would reject a matching release. Comparing by leading `major.minor.patch`
+/// instead matches the release the table row actually covers.
+fn rocm_sdk_version_matches(recorded: &str, table_key: &str) -> bool {
+    fn release_triple(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor, patch.parse().ok()?))
+    }
+    release_triple(recorded).is_some_and(|version| Some(version) == release_triple(table_key))
+}
+
+/// How [`install_vllm_with_uv`] should install vLLM for a given target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VllmInstallRoute {
+    /// Pin from [`VLLM_ROCM_BUILD_TABLE`] (or a caller-supplied index override).
+    Static,
+    /// Discover the current wheels for a [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] row.
+    RocmDiscover,
+}
+
+/// Picks the install route for a vLLM install. A caller-supplied index
+/// override always wins (it means the caller already knows exactly which
+/// wheels to use), otherwise a known ROCm SDK version routes through
+/// discovery, and everything else falls back to the static pin table.
+fn vllm_install_route(
+    index_override: Option<&str>,
+    rocm_sdk_version: Option<&str>,
+) -> VllmInstallRoute {
+    if index_override.is_some() {
+        return VllmInstallRoute::Static;
+    }
+    match rocm_sdk_version.and_then(vllm_rocm_discover_build) {
+        Some(_) => VllmInstallRoute::RocmDiscover,
+        None => VllmInstallRoute::Static,
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rocm-engine-vllm", about = "rocm-cli vLLM engine adapter")]
@@ -140,6 +249,10 @@ struct VllmRuntime {
     sdk_bin: Option<PathBuf>,
     sdk_bin_paths: Vec<PathBuf>,
     sdk_library_paths: Vec<PathBuf>,
+    /// ROCm SDK version recorded in the runtime manifest, if known. Drives
+    /// [`vllm_install_route`] and [`apply_therock_env`]'s ROCm 10.x discovery
+    /// dispatch.
+    rocm_sdk_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -194,6 +307,12 @@ struct ServiceFiles {
 struct ManagedRuntimePython {
     runtime_id: String,
     python_executable: PathBuf,
+    /// ROCm SDK version recorded for the specific manifest this Python came
+    /// from. `runtime_id` is the GPU-family identifier shared by every
+    /// installed version, so it cannot be used to look this back up: re-deriving
+    /// it from `runtime_id` picks whichever version was installed most recently,
+    /// not the one this Python executable actually belongs to.
+    rocm_sdk_version: Option<String>,
 }
 
 pub fn run_cli() -> Result<()> {
@@ -445,6 +564,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
         }
         None => (None, RepairAssessment::default(), None),
     };
+    let mut discover_pins: Vec<String> = Vec::new();
     let runtime = if let Some(runtime) = already_installed {
         runtime
     } else {
@@ -469,7 +589,11 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
                 },
             )?,
         };
-        install_vllm_with_uv(&managed.python_executable, request.reinstall)?;
+        discover_pins = install_vllm_with_uv(
+            &managed.python_executable,
+            request.reinstall,
+            managed.rocm_sdk_version.as_deref(),
+        )?;
         resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
                 "vLLM install completed in {}, but runtime `{}` still could not be resolved",
@@ -508,6 +632,12 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
             .notes
             .into_iter()
             .chain(vllm_runtime_warnings(&runtime))
+            .chain((!discover_pins.is_empty()).then(|| {
+                format!(
+                    "vLLM ROCm 10.x discovery pinned: {}",
+                    discover_pins.join(", ")
+                )
+            }))
             .collect(),
     })
 }
@@ -529,6 +659,7 @@ fn assessed_python_for_repair(runtime: &VllmRuntime) -> Option<ManagedRuntimePyt
     Some(ManagedRuntimePython {
         runtime_id: runtime.runtime_id.clone(),
         python_executable: runtime.python_executable.clone()?,
+        rocm_sdk_version: runtime.rocm_sdk_version.clone(),
     })
 }
 
@@ -1174,6 +1305,7 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
         });
     }
 
@@ -1182,15 +1314,16 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
         .map(PathBuf::from)
         .filter(|path| path.is_file())
     {
-        return runtime_from_python(
-            python,
-            runtime_id.unwrap_or("external-vllm-python"),
-            "environment python",
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-        );
+        return runtime_from_python(ManagedRuntimeCandidate {
+            runtime_id: runtime_id.unwrap_or("external-vllm-python").to_owned(),
+            source: "environment python".to_owned(),
+            python_executable: python,
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        });
     }
 
     if let Some(runtime) = resolve_managed_runtime(runtime_id)? {
@@ -1209,6 +1342,7 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
         });
     }
 
@@ -1219,56 +1353,258 @@ fn resolve_vllm_runtime(runtime_id: Option<&str>) -> Result<VllmRuntime> {
     }
 }
 
-fn runtime_from_python(
-    python: PathBuf,
-    runtime_id: &str,
-    source: &str,
-    sdk_root: Option<PathBuf>,
-    sdk_bin: Option<PathBuf>,
-    sdk_bin_paths: Vec<PathBuf>,
-    sdk_library_paths: Vec<PathBuf>,
-) -> Result<VllmRuntime> {
+fn runtime_from_python(candidate: ManagedRuntimeCandidate) -> Result<VllmRuntime> {
+    let python = candidate.python_executable;
     let command = vllm_command_from_python(&python)
         .with_context(|| format!("vLLM command not found beside {}", python.display()))?;
     let version = probe_vllm_version(&python).ok().flatten();
     Ok(VllmRuntime {
-        runtime_id: runtime_id.to_owned(),
-        env_id: format!("external-vllm-{}", stable_id_component(runtime_id)),
+        env_id: format!(
+            "external-vllm-{}",
+            stable_id_component(&candidate.runtime_id)
+        ),
+        runtime_id: candidate.runtime_id,
         command,
         python_executable: Some(python),
         version,
-        source: source.to_owned(),
-        sdk_root,
-        sdk_bin,
-        sdk_bin_paths,
-        sdk_library_paths,
+        source: candidate.source,
+        sdk_root: candidate.sdk_root,
+        sdk_bin: candidate.sdk_bin,
+        sdk_bin_paths: candidate.sdk_bin_paths,
+        sdk_library_paths: candidate.sdk_library_paths,
+        rocm_sdk_version: candidate.rocm_sdk_version,
     })
 }
 
-fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let uv = ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
-    let VllmInstallTarget {
-        index_url,
-        requirement,
-    } = vllm_install_target()?;
+/// Installs vLLM into `python`, returning any resolved pins worth surfacing
+/// to the caller as install warnings (empty for the static-pin route).
+fn install_vllm_with_uv(
+    python: &Path,
+    reinstall: bool,
+    rocm_sdk_version: Option<&str>,
+) -> Result<Vec<String>> {
+    let index_override = std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok();
+    let index_override = index_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match vllm_install_route(index_override, rocm_sdk_version) {
+        VllmInstallRoute::RocmDiscover => {
+            let paths = AppPaths::discover()?;
+            let uv =
+                ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+            // Unwrap is safe: `vllm_install_route` only returns `RocmDiscover`
+            // when `rocm_sdk_version` looks up a build in the table.
+            let build = rocm_sdk_version.and_then(vllm_rocm_discover_build).expect(
+                "vllm_install_route returned RocmDiscover without a matching discover build",
+            );
+            install_vllm_rocm10_discover(&uv, &paths, python, reinstall, build)
+        }
+        VllmInstallRoute::Static => {
+            let paths = AppPaths::discover()?;
+            let uv =
+                ensure_uv_binary(&paths).context("failed to acquire uv binary for vLLM install")?;
+            let VllmInstallTarget {
+                index_url,
+                requirement,
+            } = vllm_install_target(rocm_sdk_version)?;
+            let mut args = uv_pip_install_base(python);
+            // Without `--reinstall`, `uv pip install vllm` is a no-op when the
+            // wheel is already present, which would silently turn a requested
+            // reinstall into a no-op. Force the reinstall so the caller's
+            // intent is honored.
+            if reinstall {
+                args.push("--reinstall".to_owned());
+            }
+            args.push(requirement.clone());
+            args.push("--extra-index-url".to_owned());
+            args.push(index_url.clone());
+            let output = ProcessCommand::new(&uv)
+                .args(args)
+                .envs(uv_command_env(&paths))
+                .output()
+                .context("failed to launch uv pip install for vLLM")?;
+            if output.status.success() {
+                return Ok(Vec::new());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                "no output".to_owned()
+            };
+            bail!(
+                "`uv pip install {} --extra-index-url {}` failed for {}: {}",
+                requirement,
+                index_url,
+                python.display(),
+                detail
+            )
+        }
+    }
+}
+
+/// Resolves the exact requirement `uv` would install for
+/// `{pkg}=={version_prefix}.*` from `index_url`, without installing anything.
+///
+/// `uv` has no `pip download` command (and never has — it's a declined
+/// upstream feature request, astral-sh/uv#3163), so this uses `uv pip
+/// install --dry-run` instead: it runs the real resolver against `python`'s
+/// platform/interpreter tags and reports the version it would install on a
+/// ` + {pkg}==<version>` line, which is parsed back out by
+/// [`dry_run_resolved_pin`]. A prefix with no compatible build published
+/// surfaces as a resolver failure (never fall back to unpinned PyPI).
+///
+/// `--reinstall` is always passed here (independent of the caller's own
+/// `reinstall` request, which governs the *real* install below): without it,
+/// a dry-run against a package already present in `python` prints `Would
+/// make no changes` with no ` + {pkg}==<version>` line at all, so a
+/// discovery pin could never be resolved for an environment being repaired.
+fn discover_pinned_requirement(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    index_url: &str,
+    pkg: &str,
+    version_prefix: &str,
+) -> Result<String> {
+    let requirement_prefix = format!("{pkg}=={version_prefix}.*");
+    let output = ProcessCommand::new(uv)
+        .args([
+            "pip",
+            "install",
+            "--dry-run",
+            "--reinstall",
+            "--no-deps",
+            "--index-url",
+        ])
+        .arg(index_url)
+        .args(["--prerelease", "allow", "--python"])
+        .arg(python)
+        .arg(&requirement_prefix)
+        .envs(uv_command_env(paths))
+        .output()
+        .with_context(|| format!("failed to launch uv pip install --dry-run for {pkg}"))?;
+    // `uv pip install --dry-run` writes its whole human-readable resolution
+    // report — including the ` + {pkg}==<version>` line this parses — to
+    // stderr; stdout is empty on both success and failure. Check both so a
+    // future `uv` that moves the report back to stdout keeps working too.
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        let stderr_trimmed = stderr.trim();
+        let detail = if !stderr_trimmed.is_empty() {
+            stderr_trimmed.to_owned()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_owned()
+        } else {
+            "no output".to_owned()
+        };
+        bail!("`uv pip install --dry-run {requirement_prefix}` from {index_url} failed: {detail}");
+    }
+    dry_run_resolved_pin(&stderr, pkg)
+        .or_else(|| dry_run_resolved_pin(&stdout, pkg))
+        .ok_or_else(|| {
+            let reported = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            anyhow!(
+                "`uv pip install --dry-run {requirement_prefix}` from {index_url} did not report a \
+                 resolved version for {pkg}: {reported}"
+            )
+        })
+}
+
+/// Parses the ` + {pkg}==<version>` line `uv pip install --dry-run` prints
+/// for each package it would install, returning it as a `{pkg}==<version>`
+/// requirement.
+fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
+    let prefix = format!("+ {pkg}==");
+    stdout.lines().find_map(|line| {
+        let version = line.trim_start().strip_prefix(&prefix)?;
+        (!version.is_empty()).then(|| format!("{pkg}=={version}"))
+    })
+}
+
+/// Builds the `uv pip install` argv for a ROCm 10.x discovery install: the
+/// resolved `pins` plus `--prerelease allow` and both discovery indexes.
+fn vllm_rocm10_discover_install_args(
+    python: &Path,
+    reinstall: bool,
+    pins: &[String],
+) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
-    // Without `--reinstall`, `uv pip install vllm` is a no-op when the wheel is
-    // already present, which would silently turn a requested reinstall into a
-    // no-op. Force the reinstall so the caller's intent is honored.
     if reinstall {
         args.push("--reinstall".to_owned());
     }
-    args.push(requirement.clone());
+    args.extend(pins.iter().cloned());
+    args.push("--prerelease".to_owned());
+    args.push("allow".to_owned());
     args.push("--extra-index-url".to_owned());
-    args.push(index_url.clone());
-    let output = ProcessCommand::new(&uv)
+    args.push(VLLM_ROCM_DISCOVER_INDEX_URL.to_owned());
+    args.push("--extra-index-url".to_owned());
+    args.push(VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned());
+    args
+}
+
+/// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
+/// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
+/// install --dry-run` resolved so the real install can never silently drift
+/// to a different (or non-ROCm) build. Returns the five pins actually installed.
+fn install_vllm_rocm10_discover(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
+) -> Result<Vec<String>> {
+    let vllm = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        VLLM_ROCM_DISCOVER_INDEX_URL,
+        "vllm",
+        build.vllm_version_prefix,
+    )?;
+    let flash_attn = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        VLLM_ROCM_DISCOVER_INDEX_URL,
+        "flash-attn",
+        build.flash_attn_version_prefix,
+    )?;
+    let amd_aiter = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        VLLM_ROCM_DISCOVER_INDEX_URL,
+        "amd-aiter",
+        build.amd_aiter_version_prefix,
+    )?;
+
+    let pins = vec![
+        build.torch_requirement.to_owned(),
+        vllm,
+        flash_attn,
+        amd_aiter,
+        build.tensorizer_requirement.to_owned(),
+    ];
+
+    let args = vllm_rocm10_discover_install_args(python, reinstall, &pins);
+    let output = ProcessCommand::new(uv)
         .args(args)
-        .envs(uv_command_env(&paths))
+        .envs(uv_command_env(paths))
         .output()
-        .context("failed to launch uv pip install for vLLM")?;
+        .context("failed to launch uv pip install for vLLM (ROCm 10.x discovery)")?;
     if output.status.success() {
-        return Ok(());
+        return Ok(pins);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -1280,9 +1616,8 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
         "no output".to_owned()
     };
     bail!(
-        "`uv pip install {} --extra-index-url {}` failed for {}: {}",
-        requirement,
-        index_url,
+        "`uv pip install {}` failed for {}: {}",
+        pins.join(" "),
         python.display(),
         detail
     )
@@ -1291,15 +1626,7 @@ fn install_vllm_with_uv(python: &Path, reinstall: bool) -> Result<()> {
 fn resolve_managed_runtime(runtime_id: Option<&str>) -> Result<Option<VllmRuntime>> {
     let candidates = collect_managed_runtime_candidates(runtime_id)?;
     for candidate in candidates {
-        if let Ok(runtime) = runtime_from_python(
-            candidate.python_executable,
-            &candidate.runtime_id,
-            &candidate.source,
-            candidate.sdk_root,
-            candidate.sdk_bin,
-            candidate.sdk_bin_paths,
-            candidate.sdk_library_paths,
-        ) {
+        if let Ok(runtime) = runtime_from_python(candidate) {
             return Ok(Some(runtime));
         }
     }
@@ -1316,6 +1643,7 @@ fn resolve_managed_runtime_python(
     Ok(Some(ManagedRuntimePython {
         runtime_id: candidate.runtime_id,
         python_executable: candidate.python_executable,
+        rocm_sdk_version: candidate.rocm_sdk_version,
     }))
 }
 
@@ -1328,6 +1656,7 @@ struct ManagedRuntimeCandidate {
     sdk_bin: Option<PathBuf>,
     sdk_bin_paths: Vec<PathBuf>,
     sdk_library_paths: Vec<PathBuf>,
+    rocm_sdk_version: Option<String>,
 }
 
 /// The runtime manifests matching `runtime_id`, most recently installed first.
@@ -1392,6 +1721,17 @@ fn sdk_torch_build_from_manifest(manifest: &TheRockRuntimeManifest) -> Option<St
         .and_then(|probe| probe.rocm_sdk_version.clone())
         .or_else(|| manifest.version.clone())?;
     (!version.trim().is_empty()).then(|| format!("rocm{version}"))
+}
+
+/// The bare ROCm SDK version a manifest records (e.g. `7.2.3`), unlike
+/// [`sdk_torch_build_from_manifest`] which wraps it as a `rocm<version>` build tag.
+fn rocm_sdk_version_from_manifest(manifest: &TheRockRuntimeManifest) -> Option<String> {
+    let version = manifest
+        .rocm_sdk
+        .as_ref()
+        .and_then(|probe| probe.rocm_sdk_version.clone())
+        .or_else(|| manifest.version.clone())?;
+    (!version.trim().is_empty()).then_some(version)
 }
 
 /// Registered runtimes that matched the request but were passed over because the
@@ -1465,6 +1805,7 @@ fn collect_managed_runtime_candidates(
             || "managed_runtime_manifest".to_owned(),
             |key| format!("managed_runtime_manifest:{key}"),
         );
+        let rocm_sdk_version = rocm_sdk_version_from_manifest(&manifest);
         let (sdk_root, sdk_bin, sdk_bin_paths, sdk_library_paths) = manifest
             .rocm_sdk
             .as_ref()
@@ -1485,6 +1826,7 @@ fn collect_managed_runtime_candidates(
             sdk_bin,
             sdk_bin_paths,
             sdk_library_paths,
+            rocm_sdk_version,
         });
     }
     Ok(candidates)
@@ -1673,6 +2015,14 @@ print(json.dumps({"present": spec is not None, "version": version}))
 
 fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
+    if runtime
+        .rocm_sdk_version
+        .as_deref()
+        .and_then(vllm_rocm_discover_build)
+        .is_some()
+    {
+        apply_vllm_rocm10_discover_env(command, runtime)?;
+    }
     let Some(root) = runtime.sdk_root.as_ref() else {
         return Ok(());
     };
@@ -1703,6 +2053,81 @@ fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Res
             )?,
         );
     }
+    Ok(())
+}
+
+/// The venv root a runtime's vLLM lives in, derived from its own python
+/// executable (`<venv>/bin/python` → `<venv>`) rather than the TheRock SDK
+/// root: the ROCm 10.x discovery install lands packages in the venv's own
+/// site-packages, not under the SDK tree.
+fn vllm_venv_root(runtime: &VllmRuntime) -> Result<PathBuf> {
+    let python = runtime.python_executable.as_ref().ok_or_else(|| {
+        anyhow!(
+            "runtime `{}` has no python executable to derive a venv root from",
+            runtime.runtime_id
+        )
+    })?;
+    python
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow!(
+                "python executable `{}` is not inside a venv (bin/Scripts) layout",
+                python.display()
+            )
+        })
+}
+
+/// Finds `<venv>/lib/python3.*/site-packages`, the one location a venv keeps
+/// its packages under. Bails on anything other than exactly one `python3.*`
+/// directory: zero means `venv` isn't a real venv, and more than one means
+/// the layout is ambiguous and picking one would be a guess.
+fn venv_site_packages_dir(venv: &Path) -> Result<PathBuf> {
+    let lib_dir = venv.join("lib");
+    let mut python_dirs = fs::read_dir(&lib_dir)
+        .with_context(|| format!("failed to read {}", lib_dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("python3."))
+        })
+        .collect::<Vec<_>>();
+    match python_dirs.len() {
+        1 => Ok(python_dirs.remove(0).join("site-packages")),
+        0 => bail!("no python3.* directory found under {}", lib_dir.display()),
+        n => bail!(
+            "found {n} python3.* directories under {}, expected exactly one",
+            lib_dir.display()
+        ),
+    }
+}
+
+/// Environment vLLM needs on ROCm 10.x discovery installs, beyond the shared
+/// TheRock env `apply_therock_env` already sets: `amd_smi` lives under the
+/// venv's own site-packages rather than the SDK tree, and Triton's ROCm
+/// flash-attention backend needs to be opted into explicitly.
+fn apply_vllm_rocm10_discover_env(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+) -> Result<()> {
+    let venv = vllm_venv_root(runtime)?;
+    let site_packages = venv_site_packages_dir(&venv)?;
+    command.env(
+        "PYTHONPATH",
+        prepend_path_entries(
+            &[site_packages
+                .join("_rocm_sdk_core")
+                .join("share")
+                .join("amd_smi")],
+            std::env::var_os("PYTHONPATH"),
+        )?,
+    );
+    command.env("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE");
     Ok(())
 }
 
@@ -1776,58 +2201,102 @@ struct VllmInstallTarget {
     requirement: String,
 }
 
-/// Pure resolution of the ROCm wheel index from an optional override value.
-///
-/// Falls back to [`VLLM_ROCM_EXTRA_INDEX_URL`] when the override is absent or
-/// blank; a usable one is trimmed. The caller supplies the value (see
-/// [`vllm_install_target`] for the environment read) so this stays testable.
-fn resolve_vllm_rocm_extra_index_url(override_value: Option<String>) -> String {
-    override_value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| VLLM_ROCM_EXTRA_INDEX_URL.to_owned())
-}
-
-/// Index URL and requirement for the current environment.
-fn vllm_install_target() -> Result<VllmInstallTarget> {
-    resolve_vllm_install_target(std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok())
+/// Index URL and requirement for the given runtime's recorded ROCm SDK version.
+fn vllm_install_target(rocm_sdk_version: Option<&str>) -> Result<VllmInstallTarget> {
+    resolve_vllm_install_target(
+        std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok(),
+        rocm_sdk_version,
+    )
 }
 
 /// Resolve the wheel index and the exact requirement to install from it.
 ///
-/// Without an override, the built-in [`VLLM_ROCM_EXTRA_INDEX_URL`] and
-/// [`VLLM_PINNED_SPEC`] are used. With `ROCM_CLI_VLLM_ROCM_INDEX_URL` set, the
-/// build is recovered from the URL when it has the published
+/// With `ROCM_CLI_VLLM_ROCM_INDEX_URL` set to a non-blank value, the build is
+/// recovered from the URL when it has the published
 /// `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>` shape — so pointing at another
 /// release of the same index works *and* stays pinned, with no extra
-/// configuration.
+/// configuration. A URL of any other shape cannot be pinned automatically, and
+/// dropping the pin is not an option: the install passes `--extra-index-url`,
+/// so PyPI stays in play and a bare `vllm` can silently resolve to the
+/// non-ROCm build. Such a URL is therefore rejected rather than installed
+/// unpinned.
 ///
-/// A URL of any other shape cannot be pinned automatically, and dropping the
-/// pin is not an option: the install passes `--extra-index-url`, so PyPI stays
-/// in play and a bare `vllm` can silently resolve to the non-ROCm build. Such a
-/// URL is therefore rejected rather than installed unpinned.
-fn resolve_vllm_install_target(index_override: Option<String>) -> Result<VllmInstallTarget> {
-    let index_url = resolve_vllm_rocm_extra_index_url(index_override);
-    if index_url == VLLM_ROCM_EXTRA_INDEX_URL {
+/// Without an override, `rocm_sdk_version` (the ROCm SDK version recorded in
+/// the target runtime's manifest) is looked up in [`VLLM_ROCM_BUILD_TABLE`].
+/// A version with no row falls back to the table's first (default) row,
+/// matching the single unconditional pin `rocm-cli` used before per-version
+/// rows existed, rather than leaving an unrecognized version uninstallable,
+/// *unless* the version's major release matches a
+/// [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] row (see [`vllm_rocm_discover_build`]),
+/// in which case guessing the default row's wheel would very likely install
+/// an ABI-incompatible build, so that case fails closed instead. In practice
+/// callers route such a version through discovery before ever reaching this
+/// function (see [`vllm_install_route`]); this is a safety net for the case
+/// where they don't.
+fn resolve_vllm_install_target(
+    index_override: Option<String>,
+    rocm_sdk_version: Option<&str>,
+) -> Result<VllmInstallTarget> {
+    let index_override = index_override
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    if let Some(index_url) = index_override {
+        let (version, abi) = vllm_rocm_build_from_index_url(&index_url).ok_or_else(|| {
+            anyhow!(
+                "cannot determine which vLLM build `{index_url}` serves: it is not a published \
+                 release index of the form `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`. Installing \
+                 an unpinned `vllm` instead would let the resolver fall back to PyPI's non-ROCm \
+                 build, so point ROCM_CLI_VLLM_ROCM_INDEX_URL at a release index, or unset it to \
+                 use the built-in one."
+            )
+        })?;
+
         return Ok(VllmInstallTarget {
             index_url,
-            requirement: VLLM_PINNED_SPEC.to_owned(),
+            requirement: format!("vllm=={version}+{abi}"),
         });
     }
 
-    let (version, abi) = vllm_rocm_build_from_index_url(&index_url).ok_or_else(|| {
+    let rocm_sdk_version = rocm_sdk_version.ok_or_else(|| {
         anyhow!(
-            "cannot determine which vLLM build `{index_url}` serves: it is not a published \
-             release index of the form `{VLLM_ROCM_INDEX_PREFIX}/<version>/<abi>`. Installing an \
-             unpinned `vllm` instead would let the resolver fall back to PyPI's non-ROCm build, \
-             so point ROCM_CLI_VLLM_ROCM_INDEX_URL at a release index, or unset it to use the \
-             built-in one."
+            "cannot install vLLM: the target runtime's ROCm SDK version could not be determined \
+             from its manifest, so no compatible vLLM build can be selected. Set \
+             ROCM_CLI_VLLM_ROCM_INDEX_URL to a published release index to install anyway."
         )
     })?;
 
+    let default_build = VLLM_ROCM_BUILD_TABLE
+        .first()
+        .ok_or_else(|| anyhow!("VLLM_ROCM_BUILD_TABLE has no default row"))?;
+    let build = match VLLM_ROCM_BUILD_TABLE
+        .iter()
+        .find(|build| rocm_sdk_version_matches(rocm_sdk_version, build.rocm_sdk_version))
+    {
+        Some(build) => build,
+        None if VLLM_ROCM_DISCOVER_BUILD_TABLE
+            .iter()
+            .any(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version)) =>
+        {
+            bail!(
+                "cannot install vLLM: ROCm SDK version `{rocm_sdk_version}` has no static \
+                 build pin, and its major release is only known to `rocm-cli` via live wheel \
+                 discovery, not a static pin; guessing the default \
+                 vllm=={}+{} build would very likely install an incompatible wheel. Set \
+                 ROCM_CLI_VLLM_ROCM_INDEX_URL to a published release index to install anyway.",
+                default_build.vllm_version,
+                default_build.abi,
+            );
+        }
+        None => default_build,
+    };
+
     Ok(VllmInstallTarget {
-        index_url,
-        requirement: format!("vllm=={version}+{abi}"),
+        index_url: format!(
+            "{VLLM_ROCM_INDEX_PREFIX}/{}/{}",
+            build.vllm_version, build.abi
+        ),
+        requirement: format!("vllm=={}+{}", build.vllm_version, build.abi),
     })
 }
 
@@ -2711,6 +3180,7 @@ mod tests {
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
         };
 
         assert!(runtime_is_managed(&runtime));
@@ -3328,8 +3798,11 @@ mod tests {
         );
     }
 
-    fn install_target(index: Option<&str>) -> Result<VllmInstallTarget> {
-        resolve_vllm_install_target(index.map(ToOwned::to_owned))
+    fn install_target(
+        index: Option<&str>,
+        rocm_sdk_version: Option<&str>,
+    ) -> Result<VllmInstallTarget> {
+        resolve_vllm_install_target(index.map(ToOwned::to_owned), rocm_sdk_version)
     }
 
     fn violation(requiring: &str, detail: &str) -> DependencyViolation {
@@ -3358,6 +3831,7 @@ mod tests {
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
         };
 
         let target = assessed_python_for_repair(&assessed).expect("a managed runtime has a python");
@@ -3754,6 +4228,43 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_rocm_sdk_probe_names_the_bare_version() {
+        let manifest = TheRockRuntimeManifest {
+            rocm_sdk: Some(RocmSdkRuntimeProbe {
+                rocm_sdk_version: Some("7.2.3".to_owned()),
+                ..RocmSdkRuntimeProbe::default()
+            }),
+            ..TheRockRuntimeManifest::default()
+        };
+
+        assert_eq!(
+            rocm_sdk_version_from_manifest(&manifest).as_deref(),
+            Some("7.2.3")
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_an_sdk_probe_falls_back_to_its_own_version() {
+        let manifest = TheRockRuntimeManifest {
+            version: Some("7.13.0".to_owned()),
+            ..TheRockRuntimeManifest::default()
+        };
+
+        assert_eq!(
+            rocm_sdk_version_from_manifest(&manifest).as_deref(),
+            Some("7.13.0")
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_identifies_no_rocm_sdk_version_says_so() {
+        assert_eq!(
+            rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
+            None
+        );
+    }
+
+    #[test]
     fn a_settled_runtime_converges_on_the_build_its_own_manifest_records() {
         // The convergence proof the tests above cannot give on their own. They hand
         // the classification a build literal, so a change to what
@@ -3813,35 +4324,65 @@ mod tests {
     }
 
     #[test]
-    fn vllm_extra_index_url_defaults_to_const() {
+    fn vllm_install_target_resolves_a_known_rocm_sdk_version() {
+        let build = VLLM_ROCM_BUILD_TABLE
+            .first()
+            .expect("build table has at least one row for this test to check");
+        let target = install_target(None, Some(build.rocm_sdk_version))
+            .expect("a table row resolves to a pinned target");
         assert_eq!(
-            resolve_vllm_rocm_extra_index_url(None),
-            VLLM_ROCM_EXTRA_INDEX_URL
+            target.index_url,
+            format!(
+                "{VLLM_ROCM_INDEX_PREFIX}/{}/{}",
+                build.vllm_version, build.abi
+            )
         );
         assert_eq!(
-            resolve_vllm_rocm_extra_index_url(Some("   ".to_owned())),
-            VLLM_ROCM_EXTRA_INDEX_URL
+            target.requirement,
+            format!("vllm=={}+{}", build.vllm_version, build.abi)
         );
-    }
 
-    #[test]
-    fn vllm_extra_index_url_honors_override() {
-        assert_eq!(
-            resolve_vllm_rocm_extra_index_url(Some(
-                "  https://example.test/rocm/wheels  ".to_owned()
-            )),
-            "https://example.test/rocm/wheels"
-        );
-    }
-
-    #[test]
-    fn vllm_install_target_defaults_to_the_built_in_pin() {
-        let target = install_target(None).expect("built-in target resolves");
-        assert_eq!(target.index_url, VLLM_ROCM_EXTRA_INDEX_URL);
-        assert_eq!(target.requirement, VLLM_PINNED_SPEC);
-
-        let blank = install_target(Some("  ")).expect("a blank override is ignored");
+        let blank = install_target(Some("  "), Some(build.rocm_sdk_version))
+            .expect("a blank override is ignored");
         assert_eq!(blank, target);
+    }
+
+    #[test]
+    fn vllm_install_target_falls_back_to_the_default_row_for_an_unknown_rocm_sdk_version() {
+        let default_build = VLLM_ROCM_BUILD_TABLE
+            .first()
+            .expect("build table has at least one row for this test to check");
+
+        for unknown_version in ["999.0.0", "7.13.0a20260326", "not-a-version"] {
+            let target = install_target(None, Some(unknown_version))
+                .expect("an unrecognized version still resolves to the default pin");
+            assert_eq!(
+                target.requirement,
+                format!("vllm=={}+{}", default_build.vllm_version, default_build.abi)
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_install_target_refuses_to_guess_a_static_pin_for_an_unmatched_discover_major() {
+        // `10.1.0a20260822` shares a major with the `VLLM_ROCM_DISCOVER_BUILD_TABLE`
+        // row but does not match any `VLLM_ROCM_BUILD_TABLE` row, so guessing the
+        // ROCm 7.2.3 default here would install an incompatible wheel. Callers
+        // route this version through discovery before reaching this function (see
+        // `vllm_install_route`); this checks the fallback itself fails closed.
+        let error = install_target(None, Some("10.1.0a20260822"))
+            .expect_err("an unmatched version in a known discovery major must not guess")
+            .to_string();
+        assert!(error.contains("10.1.0a20260822"), "{error}");
+        assert!(error.contains("ROCM_CLI_VLLM_ROCM_INDEX_URL"), "{error}");
+    }
+
+    #[test]
+    fn vllm_install_target_fails_when_no_rocm_sdk_version_is_known() {
+        let error = install_target(None, None)
+            .expect_err("with no override and no version, nothing can be pinned")
+            .to_string();
+        assert!(error.contains("could not be determined"), "{error}");
     }
 
     #[test]
@@ -3856,7 +4397,7 @@ mod tests {
                 "https://wheels.vllm.ai/rocm/0.27.0/rocm730/",
             ),
         ] {
-            let target = install_target(Some(index)).expect("published index shape resolves");
+            let target = install_target(Some(index), None).expect("published index shape resolves");
             assert_eq!(target.index_url, expected_url);
             assert_eq!(target.requirement, "vllm==0.27.0+rocm730");
         }
@@ -3872,7 +4413,7 @@ mod tests {
             "https://wheels.vllm.ai/rocm//rocm730",
             "https://wheels.vllm.ai/rocm/0.27.0/rocm 730",
         ] {
-            let error = install_target(Some(index))
+            let error = install_target(Some(index), None)
                 .expect_err("an unpinnable index must fail")
                 .to_string();
             assert!(
@@ -3887,27 +4428,19 @@ mod tests {
     }
 
     #[test]
-    fn vllm_pinned_spec_matches_extra_index_url() {
-        let (version, abi) = VLLM_PINNED_SPEC
-            .strip_prefix("vllm==")
-            .and_then(|rest| rest.split_once('+'))
-            .expect("pinned spec is spelled `vllm==<version>+<abi>`");
-        let expected_suffix = format!("/{version}/{abi}");
-        assert!(
-            VLLM_ROCM_EXTRA_INDEX_URL.ends_with(&expected_suffix),
-            "pinned spec {VLLM_PINNED_SPEC} does not match index {VLLM_ROCM_EXTRA_INDEX_URL}: \
-             expected the index to end with {expected_suffix}"
-        );
-    }
-
-    #[test]
-    fn vllm_default_index_has_the_published_release_shape() {
-        assert_eq!(
-            vllm_rocm_build_from_index_url(VLLM_ROCM_EXTRA_INDEX_URL),
-            Some(("0.26.0".to_owned(), "rocm723".to_owned())),
-            "the built-in index must parse back to its build, or overrides of the same shape \
-             cannot be pinned"
-        );
+    fn every_build_table_row_has_a_self_consistent_index_and_requirement() {
+        for build in VLLM_ROCM_BUILD_TABLE {
+            let index_url = format!(
+                "{VLLM_ROCM_INDEX_PREFIX}/{}/{}",
+                build.vllm_version, build.abi
+            );
+            assert_eq!(
+                vllm_rocm_build_from_index_url(&index_url),
+                Some((build.vllm_version.to_owned(), build.abi.to_owned())),
+                "row for ROCm SDK {} must parse back to its own build",
+                build.rocm_sdk_version
+            );
+        }
     }
 
     #[test]
@@ -4001,6 +4534,7 @@ mod tests {
             sdk_bin: Some(root.join("bin")),
             sdk_bin_paths: vec![root.join("runtime").join("bin")],
             sdk_library_paths: vec![root.join("runtime").join("lib")],
+            rocm_sdk_version: None,
         };
         let entries = therock_library_path_entries(&runtime);
         assert!(entries.contains(&root.join("runtime").join("lib")));
@@ -4025,6 +4559,7 @@ mod tests {
             sdk_bin: None,
             sdk_bin_paths: Vec::new(),
             sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
         };
         let mut command = ProcessCommand::new("vllm");
 
@@ -4089,6 +4624,7 @@ mod tests {
             } else {
                 "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
             })],
+            rocm_sdk_version: None,
         };
 
         write_running_state(&request, &runtime, 12345)?;
@@ -4160,5 +4696,258 @@ mod tests {
     #[test]
     fn identity_from_state_without_pid_is_none() {
         assert!(identity_from_state(&json!({ "status": "running" })).is_none());
+    }
+
+    #[test]
+    fn dry_run_resolved_pin_parses_a_rotated_dev_tag() {
+        let stdout = "Resolved 1 package in 601ms\nWould download 1 package\nWould install 1 package\n + vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826\n";
+        assert_eq!(
+            dry_run_resolved_pin(stdout, "vllm"),
+            Some("vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826".to_owned())
+        );
+    }
+
+    #[test]
+    fn dry_run_resolved_pin_parses_a_simple_version() {
+        let stdout = "Resolved 1 package in 553ms\n + flash-attn==2.8.3\n";
+        assert_eq!(
+            dry_run_resolved_pin(stdout, "flash-attn"),
+            Some("flash-attn==2.8.3".to_owned())
+        );
+    }
+
+    #[test]
+    fn dry_run_resolved_pin_ignores_other_packages_and_missing_lines() {
+        let stdout = "Resolved 1 package in 553ms\n + amd-aiter==0.1.20.post1\n";
+        assert_eq!(dry_run_resolved_pin(stdout, "vllm"), None);
+        assert_eq!(dry_run_resolved_pin("no solution found", "vllm"), None);
+    }
+
+    #[test]
+    fn vllm_rocm_discover_build_looks_up_known_and_unknown_versions() {
+        assert!(vllm_rocm_discover_build("10.0.0").is_some());
+        // AMD tags preview wheels with the real target release (verified via
+        // whl-multi-arch/torch/'s coexisting +rocm7.13.0/7.14.0/7.14.1
+        // builds), so ROCm 10.x's tag will move past 10.0.0 the same way;
+        // the discovery recipe must keep firing across the whole major line,
+        // not just the exact version it happened to be added for.
+        assert!(vllm_rocm_discover_build("10.1.0a20260822").is_some());
+        assert!(vllm_rocm_discover_build("999.0.0").is_none());
+    }
+
+    #[test]
+    fn rocm_sdk_version_matches_ignores_dev_suffixes_and_rejects_other_releases() {
+        assert!(rocm_sdk_version_matches("10.0.0", "10.0.0"));
+        assert!(rocm_sdk_version_matches("7.13.0a20260423", "7.13.0"));
+        assert!(rocm_sdk_version_matches("7.2.3.dev0+abc", "7.2.3"));
+        assert!(!rocm_sdk_version_matches("7.14.1", "7.2.3"));
+        assert!(!rocm_sdk_version_matches("garbage", "7.2.3"));
+    }
+
+    #[test]
+    fn rocm_sdk_major_matches_ignores_minor_patch_and_dev_suffixes() {
+        assert!(rocm_sdk_major_matches("10.0.0", "10.0.0"));
+        assert!(rocm_sdk_major_matches("10.1.0a20260822", "10.0.0"));
+        assert!(rocm_sdk_major_matches("10.99.7.dev0+abc", "10.0.0"));
+        assert!(!rocm_sdk_major_matches("7.13.0", "10.0.0"));
+        assert!(!rocm_sdk_major_matches("garbage", "10.0.0"));
+    }
+
+    #[test]
+    fn vllm_install_route_prefers_an_index_override_even_for_a_discover_version() {
+        assert_eq!(
+            vllm_install_route(Some("https://example.test/rocm"), Some("10.0.0")),
+            VllmInstallRoute::Static
+        );
+    }
+
+    #[test]
+    fn vllm_install_route_discovers_for_a_known_discover_version() {
+        assert_eq!(
+            vllm_install_route(None, Some("10.0.0")),
+            VllmInstallRoute::RocmDiscover
+        );
+        // A same-major, different-minor/patch nightly must still route
+        // through discovery rather than falling back to the static table.
+        assert_eq!(
+            vllm_install_route(None, Some("10.1.0a20260822")),
+            VllmInstallRoute::RocmDiscover
+        );
+    }
+
+    #[test]
+    fn vllm_install_route_falls_back_to_static_for_unknown_or_missing_versions() {
+        assert_eq!(
+            vllm_install_route(None, Some("7.2.3")),
+            VllmInstallRoute::Static
+        );
+        assert_eq!(vllm_install_route(None, None), VllmInstallRoute::Static);
+    }
+
+    fn test_vllm_runtime(
+        python_executable: Option<PathBuf>,
+        rocm_sdk_version: Option<String>,
+    ) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "test".to_owned(),
+            env_id: "test".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable,
+            version: None,
+            source: "test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version,
+        }
+    }
+
+    #[test]
+    fn vllm_venv_root_fails_without_a_python_executable() {
+        let runtime = test_vllm_runtime(None, None);
+        let error = vllm_venv_root(&runtime)
+            .expect_err("no python executable")
+            .to_string();
+        assert!(error.contains("no python executable"), "{error}");
+    }
+
+    #[test]
+    fn vllm_venv_root_derives_the_venv_from_bin_python() {
+        let runtime = test_vllm_runtime(Some(PathBuf::from("/opt/venv/bin/python")), None);
+        assert_eq!(
+            vllm_venv_root(&runtime).unwrap(),
+            PathBuf::from("/opt/venv")
+        );
+    }
+
+    #[test]
+    fn venv_site_packages_dir_finds_the_single_python3_dir() -> Result<()> {
+        let venv = tempfile::tempdir()?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
+        let site_packages = venv_site_packages_dir(venv.path())?;
+        assert_eq!(
+            site_packages,
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn venv_site_packages_dir_fails_with_zero_or_multiple_python3_dirs() -> Result<()> {
+        let venv = tempfile::tempdir()?;
+        fs::create_dir_all(venv.path().join("lib"))?;
+        let error = venv_site_packages_dir(venv.path())
+            .expect_err("no python3.* dir")
+            .to_string();
+        assert!(error.contains("no python3.*"), "{error}");
+
+        fs::create_dir_all(venv.path().join("lib").join("python3.11"))?;
+        fs::create_dir_all(venv.path().join("lib").join("python3.12"))?;
+        let error = venv_site_packages_dir(venv.path())
+            .expect_err("ambiguous python3.* dirs")
+            .to_string();
+        assert!(error.contains("found 2 python3.*"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_vllm_rocm10_discover_env_sets_pythonpath_and_flash_attention_flag() -> Result<()> {
+        let venv = tempfile::tempdir()?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
+        let runtime = test_vllm_runtime(
+            Some(venv.path().join("bin").join("python")),
+            Some("10.0.0".to_owned()),
+        );
+        let mut command = ProcessCommand::new("vllm");
+        apply_vllm_rocm10_discover_env(&mut command, &runtime)?;
+
+        let pythonpath = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "PYTHONPATH").then_some(value))
+            .flatten()
+            .expect("PYTHONPATH set");
+        let expected_entry = venv
+            .path()
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("_rocm_sdk_core")
+            .join("share")
+            .join("amd_smi");
+        assert!(
+            std::env::split_paths(pythonpath).any(|entry| entry == expected_entry),
+            "{pythonpath:?} should contain {expected_entry:?}"
+        );
+
+        let flag = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "FLASH_ATTENTION_TRITON_AMD_ENABLE").then_some(value))
+            .flatten();
+        assert_eq!(flag, Some(std::ffi::OsStr::new("TRUE")));
+        Ok(())
+    }
+
+    #[test]
+    fn apply_therock_env_dispatches_to_discover_env_for_a_discover_rocm_sdk_version() -> Result<()>
+    {
+        let venv = tempfile::tempdir()?;
+        fs::create_dir_all(
+            venv.path()
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages"),
+        )?;
+        let runtime = test_vllm_runtime(
+            Some(venv.path().join("bin").join("python")),
+            Some("10.0.0".to_owned()),
+        );
+        let mut command = ProcessCommand::new("vllm");
+        apply_therock_env(&mut command, &runtime)?;
+
+        let flag = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "FLASH_ATTENTION_TRITON_AMD_ENABLE").then_some(value))
+            .flatten();
+        assert_eq!(flag, Some(std::ffi::OsStr::new("TRUE")));
+        Ok(())
+    }
+
+    #[test]
+    fn vllm_rocm10_discover_install_args_includes_pins_and_both_indexes() {
+        let pins = vec![
+            "torch==2.12.0+rocm10.0.0".to_owned(),
+            "vllm==0.27.1.dev5+rocm10.0.0".to_owned(),
+            "flash-attn==2.8.3".to_owned(),
+            "amd-aiter==0.1.4".to_owned(),
+            "tensorizer==2.12.1".to_owned(),
+        ];
+        let python = PathBuf::from("/opt/venv/bin/python");
+
+        let args = vllm_rocm10_discover_install_args(&python, false, &pins);
+        assert!(!args.contains(&"--reinstall".to_owned()));
+        for pin in &pins {
+            assert!(args.contains(pin), "{args:?} should contain {pin}");
+        }
+        assert!(args.contains(&"--prerelease".to_owned()));
+        assert!(args.contains(&"allow".to_owned()));
+        assert!(args.contains(&VLLM_ROCM_DISCOVER_INDEX_URL.to_owned()));
+        assert!(args.contains(&VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned()));
+
+        let args = vllm_rocm10_discover_install_args(&python, true, &pins);
+        assert!(args.contains(&"--reinstall".to_owned()));
     }
 }

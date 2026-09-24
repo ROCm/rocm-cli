@@ -2052,16 +2052,16 @@ fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let fix = Fix {
         summary: "Install ROCDXG inside the distro: it is the ROCm-to-DXCore shim the WSL path runs on.".to_owned(),
         commands: vec![
-            "bash scripts/wsl_setup_rocdxg.sh".to_owned(),
-            "# Or, to pin the package you install:".to_owned(),
-            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+            "rocm install driver".to_owned(),
+            "# Then, once the plan looks right:".to_owned(),
+            "#   rocm install driver --yes".to_owned(),
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
         auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
-            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. Set ROCDXG_SHA256 to verify the download against a digest you trust.".to_owned(),
+            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the download against a digest pinned for that ROCDXG release.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -3526,10 +3526,20 @@ mod tests {
             !fix.auto_applicable,
             "installing a .deb with sudo must stay print-only"
         );
+        // Verification is no longer something the user has to remember to turn
+        // on: `rocm install driver` pins a digest per release. The note has to
+        // say so, because a print-only recipe is all the user sees here.
         assert!(
-            fix.notes.iter().any(|n| n.contains("ROCDXG_SHA256")),
-            "must offer the checksum option: {:?}",
+            fix.notes.iter().any(|n| n.contains("digest")),
+            "must state that the download is verified: {:?}",
             fix.notes
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("rocm install driver")),
+            "must route to the command that carries the plan: {:?}",
+            fix.commands
         );
     }
 
