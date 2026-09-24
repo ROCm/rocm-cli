@@ -340,6 +340,11 @@ fn possessive_owner_for<'a>(
     is_scoped_extension: bool,
     current_owner: Option<&'a str>,
 ) -> Option<&'a str> {
+    // Diagnostic-only: this guard shapes which citation gets an
+    // "(expected under ...)" hint in a failure message, never the pass/fail
+    // verdict itself — `citation_exists` never consults `section_dirs` for
+    // an unscoped extension, so an unnarrowed citation here just prints a
+    // plainer stale-path line rather than a wrong one.
     if !is_scoped_extension {
         return None;
     }
@@ -717,8 +722,17 @@ pub fn run() -> Result<()> {
     let doc_path = root.join(DOC_PATH);
     let markdown = std::fs::read_to_string(&doc_path)
         .with_context(|| format!("reading {}", doc_path.display()))?;
-    let citations = extract_path_citations(&markdown);
     let tracked = tracked_files(&root)?;
+    check_citations(&markdown, &tracked)
+}
+
+/// The gate itself: fail, naming every stale citation, if any path cited in
+/// `markdown` doesn't exist among `tracked`. Split out of [`run`] as a pure
+/// function over plain data (rather than inlining this into `run`'s
+/// filesystem/git IO) so the failure branch — the actual point of this
+/// gate — is directly testable without a real doc or tree to break.
+fn check_citations(markdown: &str, tracked: &[PathBuf]) -> Result<()> {
+    let citations = extract_path_citations(markdown);
 
     // `citations` is already a `BTreeSet` of distinct `(text, section_dirs)`
     // pairs, so this naturally reports the same bare text once per distinct
@@ -726,7 +740,7 @@ pub fn run() -> Result<()> {
     // them and losing which section's file is actually missing.
     let stale: Vec<&Citation> = citations
         .iter()
-        .filter(|citation| !citation_exists(citation, &tracked))
+        .filter(|citation| !citation_exists(citation, tracked))
         .collect();
 
     if !stale.is_empty() {
@@ -741,6 +755,7 @@ pub fn run() -> Result<()> {
 /// several same-named mentions (e.g. `lib.rs` under both `apps/rocmd` and
 /// `crates/rocm-core`) is the one that's actually stale.
 fn stale_message(stale: &[&Citation]) -> String {
+    let stale = dedupe_stale_for_display(stale);
     format!(
         "{DOC_PATH} cites {} path(s) that no longer exist in the tree:\n{}\n\
          update the citation to the path's new location, or remove it if the \
@@ -752,6 +767,26 @@ fn stale_message(stale: &[&Citation]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     )
+}
+
+/// Drop a bare (unscoped) stale citation when the same text is also stale
+/// under an explicit section elsewhere in `stale` — the scoped entry already
+/// names that file precisely, so keeping the bare one too would report one
+/// missing file as two. This does not touch two *scoped* entries with the
+/// same text under different sections (e.g. `lib.rs` stale under both
+/// `apps/rocmd` and `crates/rocm-core`): those are two different missing
+/// files, both worth a line, exactly as [`stale_message`] intends.
+fn dedupe_stale_for_display<'a>(stale: &[&'a Citation]) -> Vec<&'a Citation> {
+    stale
+        .iter()
+        .copied()
+        .filter(|citation| {
+            !citation.section_dirs.is_empty()
+                || !stale
+                    .iter()
+                    .any(|other| other.text == citation.text && !other.section_dirs.is_empty())
+        })
+        .collect()
 }
 
 /// One line of [`stale_message`]'s report for a single stale citation.
@@ -1748,6 +1783,22 @@ See `apps/rocmd/src/main.rs` for the entry point.
     }
 
     #[test]
+    fn check_citations_fails_and_names_a_stale_path() {
+        // Regression guard for the gate itself: a reviewer found that
+        // `run`'s only end-to-end test (`run_passes_against_the_real_doc`,
+        // above) exercises only the Ok direction, and would pass just as
+        // vacuously against an empty citation set — nothing in the suite
+        // would notice if the failure branch stopped being reachable. This
+        // drives `check_citations` directly against a fabricated doc and
+        // tracked-file list, asserting the Err direction by name.
+        let markdown = "`apps/rocm/src/deleted.rs` no longer exists.";
+        let tracked = vec![PathBuf::from("apps/rocm/src/providers.rs")];
+        let err = check_citations(markdown, &tracked)
+            .expect_err("a citation absent from `tracked` must fail the check");
+        assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
+    }
+
+    #[test]
     fn stale_message_names_every_stale_path() {
         let unscoped = citation("apps/rocm/src/deleted.rs", &[]);
         let hyphenated = citation("old-crate-dir", &[]);
@@ -1766,5 +1817,34 @@ See `apps/rocmd/src/main.rs` for the entry point.
         let apps_rocmd_lib = citation("lib.rs", &["apps/rocmd"]);
         let message = stale_message(&[&apps_rocmd_lib]);
         assert!(message.contains("`lib.rs` (expected under `apps/rocmd`)"));
+    }
+
+    #[test]
+    fn stale_message_does_not_double_report_a_bare_and_scoped_citation_of_the_same_file() {
+        // Regression case: a reviewer found that a file cited both bare and
+        // under a directory heading (e.g. `providers.rs` mentioned plainly,
+        // then again as `apps/rocm`'s `providers.rs`) was listed twice when
+        // both went stale — reading as two missing paths when it's one. The
+        // scoped line is more specific, so it wins; the bare line is
+        // dropped.
+        let bare = citation("providers.rs", &[]);
+        let scoped = citation("providers.rs", &["apps/rocm"]);
+        let message = stale_message(&[&bare, &scoped]);
+        assert!(message.contains("1 path(s)"));
+        assert!(message.contains("`providers.rs` (expected under `apps/rocm`)"));
+    }
+
+    #[test]
+    fn stale_message_keeps_the_same_bare_text_stale_under_two_different_sections() {
+        // Companion to the case above: two *scoped* citations sharing text
+        // (e.g. `lib.rs` under both `apps/rocmd` and `crates/rocm-core`) are
+        // two distinct missing files, not a bare/scoped duplicate, so both
+        // must still be reported.
+        let apps_rocmd_lib = citation("lib.rs", &["apps/rocmd"]);
+        let rocm_core_lib = citation("lib.rs", &["crates/rocm-core"]);
+        let message = stale_message(&[&apps_rocmd_lib, &rocm_core_lib]);
+        assert!(message.contains("2 path(s)"));
+        assert!(message.contains("`lib.rs` (expected under `apps/rocmd`)"));
+        assert!(message.contains("`lib.rs` (expected under `crates/rocm-core`)"));
     }
 }
