@@ -1132,6 +1132,85 @@ jobs:
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
 
+  architecture-doc:
+    name: Architecture doc path citations are current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Deliberately NOT gated by the `changes` path filter: `cargo xtask
+    # check-architecture-doc` verifies every backtick-quoted path citation in
+    # docs/architecture.md still exists in the tracked tree, and the citations
+    # aren't limited to any fixed set of paths — the doc can cite any tracked
+    # file. A path-filter allowlist here would need to list every file the doc
+    # could ever cite and be kept current as citations are added, which is
+    # exactly the kind of drift this check exists to catch; a rename/removal
+    # of a currently-cited file wouldn't itself touch docs/architecture.md, so
+    # gating on that path (as a prior version of this job did) could skip the
+    # check on the very PR that goes stale. Run unconditionally instead.
+    #
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      # Shares build-and-test's/clippy's key prefix: `cargo xtask
+      # check-architecture-doc` fully links the same xtask binary (and its
+      # rocm-core/e2e-report dependencies) those jobs already compile, so a
+      # cache they populated lets this job's otherwise-unconditional run
+      # skip a cold compile instead of paying for one on every push/PR/
+      # merge_group event.
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # See clippy's equivalent step for why this is a probe (continue-on-error
+      # plus a follow-up health check) rather than a hard requirement, and why
+      # failure clears the Azure variables rather than the wrapper.
+      - name: Set up sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            # Nothing will read the credential now; don't leave it in the job env.
+            disable
+            exit 0
+          fi
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if ! sccache --start-server; then
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Architecture doc path citations are current
+        run: cargo xtask check-architecture-doc
+
+      - name: sccache stats
+        if: steps.sccache_probe.outputs.active == 'true'
+        run: sccache --show-stats
+
   docs-build:
     name: Sphinx docs build (-W)
     runs-on: ubuntu-latest
