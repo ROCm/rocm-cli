@@ -1256,6 +1256,12 @@ async fn assert_past_attempts_reported(world: &mut E2eWorld) {
         stdout.contains("rocm services logs e2e-mock"),
         "the user must be given a pasteable command to read the log:\n{stdout}"
     );
+    // The two lines above only let the user look. Every hidden record keeps an
+    // unrotated engine log, so this is the one line that gets that space back.
+    assert!(
+        stdout.contains("Reclaim the space: rocm services prune"),
+        "the user must be told how to reclaim the space:\n{stdout}"
+    );
     assert!(
         !stdout.contains("Status: none ready"),
         "the header must not claim nothing is recorded:\n{stdout}"
