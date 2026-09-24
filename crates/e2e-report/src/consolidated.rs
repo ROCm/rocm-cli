@@ -23,19 +23,19 @@ use crate::parse::{
 /// Splitting these into separate fields (rather than one mashed
 /// "Gpu Strix Ubuntu" label) is what lets the matrix show distinct
 /// Platform / OS columns.
-pub(crate) struct Descriptor {
-    pub(crate) platform: String,
-    pub(crate) os: String,
+struct Descriptor {
+    platform: String,
+    os: String,
     /// True for a legacy `known-bugs` artifact (xfail-inverted). With the
     /// one-job-per-platform model these no longer exist, but the flag is retained
     /// as a stable secondary sort key so old artifacts still order predictably.
-    pub(crate) known_bugs: bool,
+    known_bugs: bool,
 }
 
 /// Parse an artifact/dir name like `e2e-gpu-strix-windows-report`
 /// into its Platform / OS. Unknown shapes fall back to a titlecased
 /// platform on Linux so a new artifact still renders sensibly.
-pub(crate) fn parse_descriptor(name: &str) -> Descriptor {
+fn parse_descriptor(name: &str) -> Descriptor {
     // Strip prefix, then suffix, each relative to the prior result (not `name`),
     // so `e2e-report` correctly reduces to the empty core, not back to itself.
     let core = name.strip_prefix("e2e-").unwrap_or(name);
@@ -138,42 +138,42 @@ impl RunMeta {
 ///
 /// One of these corresponds to one uploaded `*-report` artifact (a
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
-pub(crate) struct PlatformReport {
-    pub(crate) desc: Descriptor,
+struct PlatformReport {
+    desc: Descriptor,
     /// Human label kept for the per-platform detail sections.
-    pub(crate) label: String,
-    pub(crate) features: Vec<Feature>,
-    pub(crate) stats: Stats,
-    pub(crate) xfail: XfailReport,
+    label: String,
+    features: Vec<Feature>,
+    stats: Stats,
+    xfail: XfailReport,
     /// True when the report contains any `@expected-failure` scenario — i.e. it
     /// is a known-bugs run, whose health follows xfail inversion rather than a
     /// plain zero-failures rule.
-    pub(crate) is_known_bugs: bool,
+    is_known_bugs: bool,
     /// Recorded `rocm` invocations from this platform's `commands.jsonl`.
-    pub(crate) commands: Vec<CommandRecord>,
+    commands: Vec<CommandRecord>,
     /// Expectation-reconciled outcome (`platform.json` × `report.json` by `@id`).
     /// `None` for pre-expectation artifacts, which fall back to the junit status.
     tally: Option<ReconciledTally>,
     /// Component versions (OS/ROCm/vLLM/lemonade) from `platform.json`, for the
     /// summary-matrix Platform/OS cells. Default (all `None`) for older artifacts.
-    pub(crate) versions: PlatformVersions,
+    versions: PlatformVersions,
 }
 
 /// One recorded `rocm` invocation from a platform's `commands.jsonl` sidecar.
 #[derive(Deserialize)]
-pub(crate) struct CommandRecord {
-    pub(crate) scenario: Option<String>,
-    pub(crate) subcommand: String,
+struct CommandRecord {
+    scenario: Option<String>,
+    subcommand: String,
     /// Full command as executed (e.g. "rocm serve Qwen/... --engine vllm").
     /// Falls back to `subcommand` for older artifacts that predate this field.
     #[serde(default)]
-    pub(crate) command: Option<String>,
+    command: Option<String>,
     #[serde(default)]
-    pub(crate) engine: Option<String>,
+    engine: Option<String>,
     /// True when `engine` was the CLI's own default choice (no `--engine` flag),
     /// so the report can show it as "<engine> (default)".
     #[serde(default)]
-    pub(crate) engine_is_default: bool,
+    engine_is_default: bool,
 }
 
 /// Read a platform's `commands.jsonl` (sibling of `report.json`). Missing file =
@@ -215,9 +215,9 @@ struct ManifestCapability {
 /// Per-platform component versions, mirrored from the harness `platform.json`.
 /// All optional — a source not present on a platform is simply omitted.
 #[derive(Deserialize, Default, Clone)]
-pub(crate) struct PlatformVersions {
+struct PlatformVersions {
     #[serde(default)]
-    pub(crate) os: Option<String>,
+    os: Option<String>,
     #[serde(default)]
     rocm: Option<String>,
     #[serde(default)]
@@ -245,7 +245,7 @@ impl PlatformVersions {
     /// The software-stack versions (ROCm/vLLM/lemonade, WITHOUT the OS — that goes
     /// in its own cell), for the summary-matrix Platform cell. Empty when none are
     /// known (e.g. mock, which has no installed runtime).
-    pub(crate) fn platform_stack(&self) -> String {
+    fn platform_stack(&self) -> String {
         [
             self.rocm.as_deref().map(|v| format!("ROCm {v}")),
             self.vllm.as_deref().map(|v| format!("vLLM {v}")),
@@ -294,7 +294,7 @@ fn parse_platform_manifest(json_path: &Path) -> Option<PlatformManifest> {
 /// How a scenario's actual result compared to its expectation on one platform.
 /// Drives both the grid glyph and the "needs attention" list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum CellOutcome {
+enum CellOutcome {
     /// Expected pass, passed.
     Pass,
     /// Expected xfail, failed as expected.
@@ -675,7 +675,7 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
 }
 
 impl PlatformReport {
-    pub(crate) fn load(artifact: String, json_path: &Path) -> Self {
+    fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
         let stats = stats_of(&features);
         let xfail = evaluate_xfail_features(&features);
@@ -721,7 +721,7 @@ impl PlatformReport {
     /// not a failure). Falls back to the legacy junit rule only for artifacts
     /// without a `platform.json`: for a normal tier, no failures; for a
     /// known-bugs tier, no XPASS and no untagged failures.
-    pub(crate) const fn ok(&self) -> bool {
+    const fn ok(&self) -> bool {
         if let Some(tally) = &self.tally {
             return tally.ok();
         }
@@ -732,7 +732,7 @@ impl PlatformReport {
         }
     }
 
-    pub(crate) const fn status_text(&self) -> &'static str {
+    const fn status_text(&self) -> &'static str {
         if let Some(tally) = &self.tally {
             return tally.status_text();
         }
@@ -751,7 +751,7 @@ impl PlatformReport {
     /// attention (unexpected-fail / XPASS / ran-when-NA) — a known bug failing as
     /// expected lands in `xfail`, not `fail`. Without one, falls back to raw
     /// junit stats.
-    pub(crate) const fn display_counts(&self) -> (u32, u32, u32, u32, u32) {
+    const fn display_counts(&self) -> (u32, u32, u32, u32, u32) {
         if let Some(t) = &self.tally {
             let total = t.pass + t.xfail + t.skip + t.problems;
             (total, t.pass, t.problems, t.skip, t.xfail)
