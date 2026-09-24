@@ -152,6 +152,25 @@ pub fn is_control_or_format(c: char) -> bool {
             | '\u{e0020}'..='\u{e007f}')
 }
 
+/// Whether `c` is a `Cc` control or one of the two Unicode separators that
+/// mandate a line break.
+///
+/// `U+2028 LINE SEPARATOR` and `U+2029 PARAGRAPH SEPARATOR` are `Zl`/`Zp`, so
+/// neither `char::is_control` nor [`is_control_or_format`]'s enumerated `Cf`
+/// set covers them, yet a terminal draws the text after either on the next row.
+/// The two places that must not let that happen — this module's classifier and
+/// the vLLM engine's guard on what may be quoted into the `rocm diagnose
+/// --symptom '...'` command it prints — therefore share this predicate instead
+/// of each deciding for itself what breaks a line. The classifier was widened
+/// to the pair when this walk moved out of the vLLM engine (the commit that
+/// moved it says "behaviour is unchanged", which is true of everything except
+/// this); the guard was not, and a line separator went on riding into the
+/// printed command.
+#[must_use]
+pub fn is_control_or_line_separator(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// Consumes one glyph, control character or escape sequence and says which of
 /// the three it was.
 ///
@@ -260,32 +279,18 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
 /// Classifies a character that is not an escape introducer.
 ///
 /// `\t` is [`Token::Text`] rather than a boundary: it moves the cursor along the
-/// row it is already on, so it is legitimate intra-line whitespace. Every other
-/// `Cc` control is a boundary — `\n` and `\r` obviously, but equally `\x0b`
-/// (`VT`) and `\x0c` (`FF`), which advance a line, `\u{85}` (`NEL`), and the
-/// bytes that do nothing at all. The last group is the lopsidedness above: a
-/// stray `\x01` between two rendered lines is far likelier to be a mangled line
-/// advance than intra-line text, and guessing "boundary" costs a missed
-/// diagnosis where guessing "text" costs a wrong one.
-///
-/// `U+2028`/`U+2029` are `Zl`/`Zp` rather than `Cc`, so `char::is_control` does
-/// not cover them, but Unicode defines both as mandatory line breaks.
-///
-/// Those two scalars are the one place where moving this walk out of the vLLM
-/// engine changed [`strip_terminal_control_sequences`] rather than merely
-/// relocating it, and the commit that moved it says "behaviour is unchanged",
-/// which is true of everything except this. The engine-local stripper tested
-/// every non-escape character with [`is_control_or_format`] alone; that is
-/// `false` for both (neither is `Cc`, neither is in the enumerated `Cf` set), so
-/// both used to survive into the stripped message and now do not. The widening
-/// is intentional — a mandatory line break is exactly the kind of non-drawing
-/// character that stripper exists to remove — and the stripper table test in
-/// `engines/vllm/src/lib.rs` pins both scalars so the next drift is caught.
+/// row it is already on, so it is legitimate intra-line whitespace. Everything
+/// else [`is_control_or_line_separator`] accepts is a boundary — `\n` and `\r`
+/// obviously, but equally `\x0b` (`VT`) and `\x0c` (`FF`), which advance a line,
+/// `\u{85}` (`NEL`), and the bytes that do nothing at all. The last group is the
+/// lopsidedness above: a stray `\x01` between two rendered lines is far likelier
+/// to be a mangled line advance than intra-line text, and guessing "boundary"
+/// costs a missed diagnosis where guessing "text" costs a wrong one.
 fn classify_char(c: char) -> Token {
     if c == '\t' {
         return Token::Text(c);
     }
-    if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+    if is_control_or_line_separator(c) {
         return Token::LineBreak;
     }
     if is_control_or_format(c) {

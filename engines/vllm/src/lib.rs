@@ -4,7 +4,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use rocm_core::terminal::{is_control_or_format, strip_terminal_control_sequences};
+use rocm_core::terminal::{
+    is_control_or_format, is_control_or_line_separator, strip_terminal_control_sequences,
+};
 use rocm_core::{
     AppPaths, DEFAULT_LOCAL_PORT, DependencyViolation, check_dependencies, ensure_uv_binary,
     format_http_base_url, openai_models_endpoint_has_model, require_nonempty, split_local_version,
@@ -2774,11 +2776,16 @@ fn oom_utilization_hint(log_tail: &str) -> String {
 /// human-readable sentence above the command (and in the log tail printed with
 /// it), so nothing is lost but the copy-paste convenience.
 ///
-/// The character test is [`is_control_or_format`], not `char::is_control`: the
-/// latter is Unicode `Cc` only, so a bidi override in the failing line survived
-/// into the printed command and reordered how it renders.
+/// The character test is [`is_control_or_format`] together with
+/// [`is_control_or_line_separator`], because each covers scalars the other does
+/// not and `symptom` is the *raw* log line, not the stripped one: a `Cf` bidi
+/// override reordered how the printed command renders, and a `Zl` line
+/// separator broke it across two rows.
 fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'') && !symptom.chars().any(is_control_or_format)
+    !symptom.contains('\'')
+        && !symptom
+            .chars()
+            .any(|c| is_control_or_format(c) || is_control_or_line_separator(c))
 }
 
 /// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
@@ -3510,16 +3517,9 @@ mod tests {
                 "RuntimeError: HIP out of memory",
                 "a bidi override must not survive into the message",
             ),
-            // U+2028/U+2029 are `Zl`/`Zp`, not `Cc`, and are in neither the
-            // enumerated `Cf` set, so the engine-local stripper this one
-            // replaced let both through verbatim -- it classified every
-            // non-escape character with `is_control_or_format` alone. Moving the
-            // walk into `rocm-core::terminal` widened that one case on purpose:
-            // both are mandatory Unicode line breaks, so a terminal draws the
-            // rest of the message on the next row, which is exactly what this
-            // stripper exists to stop untrusted output doing. These two cases
-            // are the only thing pinning it -- drop the pair from
-            // `classify_char`'s boundary set and both go red.
+            // The `Zl`/`Zp` pair that `is_control_or_line_separator` adds to
+            // `char::is_control`: drop it from that predicate and both of these
+            // go red, as do the quoting assertions below.
             (
                 "RuntimeError: HIP\u{2028}out of memory",
                 "RuntimeError: HIPout of memory",
@@ -3544,13 +3544,21 @@ mod tests {
             );
         }
 
-        // Cf characters must also be inadmissible in the quoted command, not
-        // merely stripped from the echoed sentence: the two tests are separate
-        // because they are separate call sites and only one of them used
-        // `char::is_control`.
+        // Every one of those scalars must also be inadmissible in the quoted
+        // command, not merely stripped from the echoed sentence: the candidate
+        // the guard sees is built from the raw line, not the stripped one, so
+        // the second call site needs its own pins.
         assert!(
             !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
             "a bidi override must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            !quotable_in_single_quotes("vllm: HIP\u{2028}out of memory"),
+            "a line separator must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            !quotable_in_single_quotes("vllm: HIP\u{2029}out of memory"),
+            "a paragraph separator must make a line unquotable, not ride into the command"
         );
         assert!(
             quotable_in_single_quotes("vllm: HIP out of memory"),
