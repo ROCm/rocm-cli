@@ -344,18 +344,7 @@ pub(crate) fn install(
             "Using existing ComfyUI folder at {}.",
             source_path.display()
         )?;
-        // Reuse whatever URL the manifest already on disk recorded, rather
-        // than the current `comfyui_source_archive_url()` — that folder was
-        // produced by *some* prior install, which may have run under a
-        // different source-archive override than this one. Falls back to the
-        // current URL if there's no prior manifest that can be read (e.g. it
-        // was deleted out from under an otherwise-intact source folder, or is
-        // unreadable/unparseable) — this path must not abort on a broken
-        // manifest, since it's otherwise the one command that recovers from one.
-        load_manifest(paths)
-            .ok()
-            .flatten()
-            .map_or_else(comfyui_source_archive_url, |manifest| manifest.source_url)
+        reused_source_url(paths)
     } else {
         println!("Downloading ComfyUI source...");
         let _ = io::stdout().flush();
@@ -1002,6 +991,21 @@ fn load_manifest(paths: &AppPaths) -> Result<Option<ComfyUiManifest>> {
     serde_json::from_slice(&bytes)
         .map(Some)
         .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Reuse whatever URL the manifest already on disk recorded, rather than the
+/// current `comfyui_source_archive_url()` — that folder was produced by
+/// *some* prior install, which may have run under a different
+/// source-archive override than this one. Falls back to the current URL if
+/// there's no prior manifest that can be read (e.g. it was deleted out from
+/// under an otherwise-intact source folder, or is unreadable/unparseable) —
+/// this path must not abort on a broken manifest, since it's otherwise the
+/// one command that recovers from one.
+fn reused_source_url(paths: &AppPaths) -> String {
+    load_manifest(paths)
+        .ok()
+        .flatten()
+        .map_or_else(comfyui_source_archive_url, |manifest| manifest.source_url)
 }
 
 fn save_manifest(paths: &AppPaths, manifest: &ComfyUiManifest) -> Result<()> {
@@ -2141,6 +2145,65 @@ mod tests {
             !rendered.contains("ROCm install"),
             "status must not reintroduce the `ROCm install` label, got: {rendered}"
         );
+        Ok(())
+    }
+
+    fn test_manifest_with_source_url(paths: &AppPaths, source_url: &str) -> ComfyUiManifest {
+        ComfyUiManifest {
+            app_id: APP_ID.to_owned(),
+            runtime_key: "test-runtime".to_owned(),
+            runtime_id: "test-runtime-id".to_owned(),
+            runtime_version: "1.0.0".to_owned(),
+            runtime_root: paths.data_dir.join("runtimes").join("test-runtime"),
+            python_executable: paths.data_dir.join("runtimes").join("python.exe"),
+            source_url: source_url.to_owned(),
+            source_path: source_path(paths),
+            requirements_path: source_path(paths).join("requirements.txt"),
+            pip_cache_dir: None,
+            log_path: app_root(paths).join("logs").join("install-100.log"),
+            torch_version: None,
+            torch_cuda_available: false,
+            installed_at_unix_ms: 100,
+        }
+    }
+
+    #[test]
+    fn reused_source_url_falls_back_to_current_url_when_no_manifest_on_disk() {
+        let paths = test_paths("comfyui-reused-url-no-manifest");
+
+        let url = reused_source_url(&paths);
+
+        assert_eq!(url, comfyui_source_archive_url());
+    }
+
+    #[test]
+    fn reused_source_url_returns_recorded_url_from_valid_manifest() -> Result<()> {
+        let paths = test_paths("comfyui-reused-url-valid-manifest");
+        let recorded_url = "https://example.invalid/prior-comfyui-source.tar.gz";
+        save_manifest(
+            &paths,
+            &test_manifest_with_source_url(&paths, recorded_url),
+        )?;
+
+        let url = reused_source_url(&paths);
+
+        assert_eq!(url, recorded_url);
+        Ok(())
+    }
+
+    #[test]
+    fn reused_source_url_falls_back_to_current_url_on_unparseable_manifest() -> Result<()> {
+        // Mutation-sensitive: fails the instant `reused_source_url` reverts
+        // from `.ok().flatten()` to propagating `load_manifest`'s error,
+        // which is the exact regression this PR shipped and then fixed.
+        let paths = test_paths("comfyui-reused-url-corrupt-manifest");
+        let path = manifest_path(&paths);
+        fs::create_dir_all(path.parent().expect("manifest path has a parent"))?;
+        fs::write(&path, b"not valid json")?;
+
+        let url = reused_source_url(&paths);
+
+        assert_eq!(url, comfyui_source_archive_url());
         Ok(())
     }
 
