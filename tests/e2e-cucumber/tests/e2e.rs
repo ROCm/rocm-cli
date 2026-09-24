@@ -57,6 +57,12 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// Wall-clock time the last measured `rocm` invocation took, for scenarios
+    /// where the *duration* is part of the behaviour under test rather than
+    /// incidental — `service-cleanup-07`, where a prune that failed to block on
+    /// the managed-launch lock is exactly a prune that returned too fast. Set by
+    /// the When step that measures it; `None` everywhere else.
+    pub cli_elapsed: Option<std::time::Duration>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
     /// report can join commands to pass/fail results.
@@ -219,6 +225,7 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            cli_elapsed: None,
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,

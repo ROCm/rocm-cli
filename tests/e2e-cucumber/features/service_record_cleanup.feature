@@ -83,3 +83,33 @@ Feature: Local server record cleanup
     Then the CLI names the file it could not remove and exits non-zero
     And the record's other files are gone
     And the prune is still recorded in the audit log
+
+  # `rocm serve` writes the 0600 endpoint key file *before* it writes the
+  # record, so a server that is still coming up has a key with no record beside
+  # it — exactly what the leftover sweep above looks for, and `--any-age` leaves
+  # no age rule to hide behind. `serve` holds the shared launch lock across both
+  # of those writes, so `prune` takes the same lock before it reads the
+  # directory and can only ever see a launch's published state.
+  #
+  # Staged rather than raced: a background thread takes the real lock, waits,
+  # then publishes the record — so the outcome is decided by the lock and not by
+  # scheduling. The `rocm services prune` under test is a separate process, which
+  # is the whole point: cross-process exclusion is what the fix relies on.
+  #
+  # The staged hold is a fixed two seconds, so the risk is one-sided and points
+  # the wrong way: a prune that reached the lock only after the hold expired
+  # would leave the key alone for the wrong reason and pass without exercising
+  # anything. The prune's own wall clock is therefore asserted to cover the
+  # hold — it either blocked, or the scenario fails instead of passing quietly.
+  #
+  # The record `--any-age` was asked to remove still goes, in the same run: a
+  # record file on disk is what makes its companions not-leftovers in the first
+  # place, so the lock costs `--any-age` nothing.
+  @id:service-cleanup-prune-waits-for-a-launch-to-publish
+  Scenario: service-cleanup-07 - Prune waits for an in-flight launch instead of sweeping its key
+    Given a local server record that is no longer running
+    And a managed launch holding the launch lock between its key write and its record write
+    When the user prunes every record whatever its age
+    Then the prune blocked until the launch published its record
+    And every file belonging to that record is gone
+    And the endpoint key file of the starting server is still there

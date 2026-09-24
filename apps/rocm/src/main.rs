@@ -848,6 +848,12 @@ enum ComfyuiCommand {
     },
 }
 
+// The doc comments below are `--help` output, one of the four user-facing
+// surfaces that describe these commands. When a command's flags, defaults,
+// arguments, or observable behaviour change here, change the other three in the
+// same commit too (AGENTS.md section 5): README.md, docs/testing.md, and
+// docs/manual-testing.md. `--help` is the one most often left behind, because
+// it is the only one of the four that is not a Markdown file.
 #[derive(Subcommand, Debug)]
 enum ServicesCommand {
     /// Show currently running local model servers.
@@ -894,6 +900,10 @@ enum ServicesCommand {
     ///
     /// Running servers are always left alone. Leftover files whose record is
     /// already gone are cleaned up too.
+    ///
+    /// Waits for a managed launch already under way to publish its record
+    /// before reading the directory, and waits as long as that launch takes.
+    /// There is no timeout. It says so on screen while it waits.
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///
@@ -7923,10 +7933,19 @@ fn describe_hours(hours: u64) -> String {
 /// investigate. The corrupt manifest itself is never removed for the same
 /// reason.
 ///
+/// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
+/// like: `serve` writes the 0600 `<id>.endpoint-key` before
+/// [`spawn_managed_engine_child`] writes the first `<id>.json`. Nothing about
+/// the file distinguishes the two cases — under `--any-age` there is no age gate
+/// left to ask — so this function does not try. It is only ever reached with the
+/// managed-launch lock held, which excludes that window outright; see
+/// [`prune_managed_service_records`].
+///
 /// `services_dir` also holds `launch.lock`, which is shared by every managed
 /// launch rather than owned by one service (see
 /// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
-/// extensions are considered, so the lock is never a candidate.
+/// extensions are considered, so the lock is never a candidate — including the
+/// one this sweep is itself running under.
 fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
     let services_dir = paths.services_dir();
     let mut orphans = Vec::new();
@@ -8189,6 +8208,85 @@ fn apply_service_prune_plan(
 /// error: a bulk cleanup that aborted because one server happened to be serving
 /// would be unusable on the hosts that need it most. The count is reported so
 /// the skip is never silent.
+///
+/// # Why this takes the managed-launch lock
+///
+/// [`collect_service_orphans`] calls a file with no `<id>.json` beside it a
+/// leftover, and that is also what a launch looks like mid-flight: `serve`
+/// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
+/// first `<id>.json` only lands at `record.write()` inside
+/// [`spawn_managed_engine_child`]. Between those two writes a live server's
+/// secret is indistinguishable from a leftover, and `--any-age` removes the age
+/// gate that used to hide the window, so a concurrent
+/// `rocm services prune --any-age --yes` deleted it.
+///
+/// `serve` already holds `managed_launch_lock_path` across the whole of that
+/// window — [`select_gpu_indices_under_launch_lock`] acquires it, hands the
+/// guard back to its caller, and `start_managed_service`/`run_attached_service`
+/// only drop it once the record is persisted (see that function's own comment,
+/// which this one must not drift from). The gap was simply that prune never
+/// acquired it: the helper above was the single acquirer in the tree. Taking it
+/// here closes the window deterministically, for any number of records, which no
+/// age floor can — the window is not short and is not bounded, because
+/// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
+/// first, and that refreshes every `ready`/`running` record through a 750ms
+/// listing plus an up-to-8s inference probe ([`rocm_core::INFERENCE_PROBE_TIMEOUT`]),
+/// sequentially, over a record count the user controls.
+///
+/// **Scope: the whole operation, not just the scan.** Holding it across
+/// [`build_service_prune_plan`] alone is very nearly enough — a launch already
+/// under way blocks prune until its manifest exists, at which point its key is
+/// no longer an orphan, and a launch starting after the scan has not written a
+/// key yet so it cannot be in the plan. "Cannot be in the plan" leans on
+/// `generate_service_id` minting a millisecond-unique id, though, which is a
+/// property of an unrelated function and a backwards clock step would break.
+/// Covering [`apply_service_prune_plan`] too makes the exclusion unconditional,
+/// and costs nothing worth measuring next to the scan it already serializes:
+/// the apply phase is `unlink` calls plus one manifest read per record.
+///
+/// That wider scope is *not* pinned by a test, and neither the unit test nor
+/// `service-cleanup-07` fails if the guard is released after plan building. It
+/// cannot be pinned at that level: the only behaviour the extra span changes is
+/// the id-collision case above, which needs `generate_service_id` to mint an id
+/// a previous run already used — i.e. a backwards clock step — and any test that
+/// instead tried to catch a launch slipping in between the two phases would be
+/// racing a microsecond-wide window, so it would pass on a timing-lucky run
+/// rather than flake. Treat the scope as a deliberately conservative choice
+/// argued from the code, not as a property under regression cover: narrowing it
+/// will not turn anything red.
+///
+/// **What it costs.** Prune's own plan building calls `load_managed_services`,
+/// so prune can now delay a launch for as long as its own scan runs, and a
+/// launch already under way delays prune for as long as *it* runs. Neither
+/// direction is bounded: the per-record worst case is the same 8.75s, over a
+/// record count the user controls, and `FileLock::acquire` has no timeout. The
+/// usual wait is milliseconds, because those are ceilings on probes that hang
+/// rather than costs every record pays — but "usually imperceptible" is the
+/// honest claim, not "a few seconds". Because the wait has no upper bound, it is
+/// announced on screen ([`cli_progress::AnimatedSpinner`]) instead of leaving
+/// the command silent. `--dry-run` takes the lock as well: a preview that
+/// disagreed with what `--yes` would do is worth less than the launch it blocks.
+///
+/// **What `--dry-run` writes.** `FileLock::acquire` creates the lock file and
+/// any missing parents, and `services` only calls `AppPaths::discover`, never
+/// `ensure` — so a preview on a host that has never served now creates
+/// `<data>/services/` and an empty `launch.lock`, and fails outright where the
+/// data directory is not writable. Both are accepted. The lock file is a 0-byte
+/// rendezvous point inside the CLI's own data directory, in the directory
+/// `rocm serve` creates there anyway. And a data directory the CLI cannot write
+/// is one no managed server could have written a record into, so the preview
+/// that now errors had nothing to report; where records *do* exist, deleting
+/// them needs write permission on the very directory the lock needs, so a
+/// preview that still succeeded would be predicting a `--yes` run that cannot
+/// run — the same kind of disagreement the paragraph above declines to ship.
+///
+/// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
+/// a second acquire on a path already held by this process would hang forever.
+/// Nothing under either phase acquires this path: the only other
+/// `FileLock::acquire` in the tree is `ensure_background_helper_running_quiet`,
+/// on a different lock file, and it is not reachable from here. In the other
+/// direction `serve` holds this lock but never runs prune, in-process or as a
+/// subprocess.
 fn prune_managed_service_records(
     paths: &AppPaths,
     hours: u64,
@@ -8200,6 +8298,23 @@ fn prune_managed_service_records(
             "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
         );
     }
+    // Held until this function returns, so no managed launch can be between its
+    // key write and its record write while the sweep looks at the directory.
+    //
+    // The acquire blocks with no timeout, and the thing it blocks behind is a
+    // launch whose own duration is unbounded — so it is announced rather than
+    // left as a silent hang, in the command a user reaches for precisely when a
+    // launch has gone wrong. `AnimatedSpinner` rather than the caller-driven
+    // `Spinner` because there is no loop here to tick one: the wait is a single
+    // blocking syscall, so only a background ticker can keep it moving. It is
+    // TTY-gated and erased on drop, so an uncontended prune — the normal case,
+    // where this costs microseconds — leaves nothing behind, and piped or
+    // redirected output never sees it at all.
+    let _launch_lock = {
+        let _waiting =
+            cli_progress::AnimatedSpinner::start("Waiting for a launch already under way…");
+        rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?
+    };
     let min_age = Duration::from_secs(hours.saturating_mul(3600));
     let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
     let mut outcome = ServicePruneOutcome {
@@ -20693,6 +20808,14 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// unrelated concurrent serve can wait on the order of seconds. `FileLock`
 /// blocks without a timeout; the slow first-use install is deliberately kept
 /// outside this section so it is not also serialized.
+///
+/// That span is relied on by a second caller: because the guard outlives both
+/// `store_endpoint_api_key` and the first `record.write()`, it also covers the
+/// interval in which a launch's 0600 endpoint key sits on disk with no manifest
+/// beside it. [`prune_managed_service_records`] acquires the same lock so its
+/// leftover sweep cannot read the directory in that state. Shortening the
+/// guard's life — releasing it before the record is persisted — would silently
+/// reopen that window as well as the GPU double-booking one.
 fn select_gpu_indices_under_launch_lock(
     paths: &AppPaths,
     cpu_only: bool,
@@ -27345,6 +27468,27 @@ install therock";
         status: &str,
         supervisor_pid: u32,
     ) -> Result<ManagedServiceRecord> {
+        let record =
+            plant_service_record_without_its_key(paths, service_id, status, supervisor_pid)?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
+        Ok(record)
+    }
+
+    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// key: the manifest, the log, and the engine state file.
+    ///
+    /// Split out for the launch-lock test below, which writes the key itself —
+    /// as `serve` does, before the record — and then has to publish the record
+    /// without touching the key again. Planting the key a second time there
+    /// would re-create whatever `prune` had already deleted, turning that test's
+    /// key assertions into assertions about this helper: they would hold whether
+    /// or not the sweep had swept.
+    fn plant_service_record_without_its_key(
+        paths: &AppPaths,
+        service_id: &str,
+        status: &str,
+        supervisor_pid: u32,
+    ) -> Result<ManagedServiceRecord> {
         let mut record = ManagedServiceRecord::new(
             paths,
             service_id,
@@ -27375,7 +27519,6 @@ install therock";
             &record.engine_state_path,
             serde_json::to_vec(&serde_json::json!({ "status": status }))?,
         )?;
-        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
         Ok(record)
     }
 
@@ -27587,6 +27730,135 @@ install therock";
         assert!(!key_exists, "the orphaned endpoint key must be swept");
         assert_eq!(outcome.removed_records, 0);
         assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    /// The window the launch lock exists to close here: `serve` writes
+    /// the 0600 endpoint key *before* the first manifest, so between those two
+    /// writes a live server's key has no `<id>.json` beside it — the exact shape
+    /// the sweep calls a leftover, and `--any-age` leaves no age gate to hide it
+    /// behind. `serve` holds the managed-launch lock across the whole of that
+    /// interval, so the fix is for `prune` to acquire it too.
+    ///
+    /// Shape of the test, since `FileLock::acquire` blocks with no `try_`
+    /// variant and calling `prune` on the thread that holds the lock would
+    /// simply deadlock: the main thread stands in for the launch and holds the
+    /// lock with only the key written, a second thread runs the real
+    /// `--any-age --yes` argv, and the main thread then does what the launch
+    /// does next — writes the record — *before* releasing. So the sweep sees the
+    /// directory only in its published state.
+    ///
+    /// Two independent assertions each fail on their own if `prune` stops
+    /// acquiring the lock: the negative wait (prune returns while the lock is
+    /// held, so it never waited for it) and the endpoint key (prune scans before
+    /// the record lands and deletes it). The negative wait is reported first
+    /// only because it names the cause; it is not load-bearing on its own, so
+    /// deleting it as "timing-sensitive" still leaves a pure filesystem fact
+    /// behind it. For that second assertion to mean anything, the record has to
+    /// be published *without* rewriting the key — hence
+    /// [`plant_service_record_without_its_key`] below rather than the full
+    /// planter. The negative wait in turn cannot pass vacuously: the worker
+    /// physically cannot report completion without first holding the lock the
+    /// main thread has.
+    #[test]
+    fn services_prune_waits_for_the_managed_launch_lock_before_sweeping() -> Result<()> {
+        use std::sync::mpsc;
+
+        /// Long enough that a `prune` over an all-but-empty data dir would have
+        /// finished many times over, short enough to keep the suite quick. Only
+        /// ever compared against "did not finish", so a slow machine makes this
+        /// more conclusive, never flakier.
+        const WAIT_PROOF: Duration = Duration::from_millis(500);
+        const ID: &str = "svc-launching";
+
+        let (root, paths) = test_paths("services-prune-launch-lock");
+        paths.ensure()?;
+        // Write 1 of 2, byte for byte as `serve` does it at the top of the
+        // managed path. No manifest yet: `spawn_managed_engine_child` has not
+        // reached `record.write()`.
+        endpoint_keys::store_endpoint_api_key(&paths, ID, "live-secret")?;
+        assert!(
+            !paths.service_manifest_path(ID).exists(),
+            "premise: the manifest must not be written yet"
+        );
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (waited, published, finished) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("signal about to prune");
+                let outcome =
+                    parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                        .and_then(|(hours, dry_run, yes)| {
+                            prune_managed_service_records(&paths, hours, dry_run, yes)
+                        });
+                let _ = done_tx.send(
+                    outcome
+                        .map(|outcome| (outcome.removed_files, outcome.skipped_live, outcome.text))
+                        .map_err(|error| error.to_string()),
+                );
+            });
+            // The worker is running before the negative check below, so that
+            // check is about the lock and not about scheduling latency.
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("prune thread started");
+            let early = done_rx.recv_timeout(WAIT_PROOF);
+            let waited = early.is_err();
+            // Write 2 of 2, still under the lock: the launch publishes its
+            // record, and the key stops looking like a leftover. `serve` does
+            // this at `record.write()`, well before it drops the guard.
+            // Only the record: the key was written above, by the launch, and
+            // must not be re-planted here. `plant_service_record` would rewrite
+            // it, and a rewritten key is present at the end of the test whether
+            // or not the sweep deleted it — which is exactly how the two key
+            // assertions below would stop being tripwires.
+            let published =
+                plant_service_record_without_its_key(&paths, ID, "starting", std::process::id())
+                    .map(|_| ());
+            // Nothing above this line may panic: the worker is blocked on this
+            // guard, and `scope` would join it forever.
+            drop(launch_lock);
+            let finished = match early {
+                Ok(finished) => finished,
+                Err(_) => done_rx
+                    .recv_timeout(Duration::from_mins(1))
+                    .expect("prune completes once the launch lock is released"),
+            };
+            (waited, published, finished)
+        });
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, ID).exists();
+        let key_value = endpoint_keys::endpoint_api_key(&paths, ID);
+        let _ = fs::remove_dir_all(&root);
+
+        published.context("failed to publish the launch's record under the lock")?;
+        assert!(
+            waited,
+            "prune finished while the managed-launch lock was held, so it never \
+             acquired it — a launch between its key write and its record write \
+             is still exposed:\n{finished:?}"
+        );
+        let (removed_files, skipped_live, text) =
+            finished.map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+        assert!(
+            key_exists,
+            "the starting server's endpoint key must survive a concurrent \
+             --any-age prune:\n{text}"
+        );
+        assert_eq!(
+            key_value.as_deref(),
+            Some("live-secret"),
+            "the key the starting server needs must survive intact"
+        );
+        assert_eq!(
+            removed_files, 0,
+            "the published record makes its key a companion, not a leftover:\n{text}"
+        );
+        assert_eq!(
+            skipped_live, 1,
+            "the launch is live by the time prune reads the directory:\n{text}"
+        );
         Ok(())
     }
 
