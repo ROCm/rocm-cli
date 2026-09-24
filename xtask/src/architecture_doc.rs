@@ -55,6 +55,15 @@ const DOC_PATH: &str = "docs/architecture.md";
 /// File extensions the doc cites by bare name (no directory), trusting
 /// surrounding prose — or, since [`extract_path_citations`], its nearest
 /// heading — for which subsystem the file lives in.
+///
+/// A bare citation whose extension isn't in this list is NOT a candidate
+/// (see [`is_path_candidate`]) — the same deliberate, documented blind spot
+/// as a bare non-hyphenated word (module doc comment): the doc doesn't cite
+/// any other extension bare today, and guessing at arbitrary extensions
+/// would risk false-flagging prose (version strings, flag names) as path
+/// citations. A future bare citation with an unlisted extension (e.g.
+/// `` `ci.yml` ``) needs a directory-qualified path (`` `.github/workflows/ci.yml` ``)
+/// to be checked, or this list extended deliberately.
 const BARE_FILE_EXTENSIONS: [&str; 3] = [".rs", ".md", ".toml"];
 
 /// Extensions among [`BARE_FILE_EXTENSIONS`] whose bare citations get scoped
