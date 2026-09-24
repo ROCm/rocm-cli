@@ -344,7 +344,14 @@ pub(crate) fn install(
             "Using existing ComfyUI folder at {}.",
             source_path.display()
         )?;
-        comfyui_source_archive_url()
+        // Reuse whatever URL the manifest already on disk recorded, rather
+        // than the current `comfyui_source_archive_url()` — that folder was
+        // produced by *some* prior install, which may have run under a
+        // different source-archive override than this one. Falls back to the
+        // current URL only if there's no prior manifest to read (e.g. it was
+        // deleted out from under an otherwise-intact source folder).
+        load_manifest(paths)?
+            .map_or_else(comfyui_source_archive_url, |manifest| manifest.source_url)
     } else {
         println!("Downloading ComfyUI source...");
         let _ = io::stdout().flush();

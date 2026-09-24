@@ -99,22 +99,35 @@ pub fn deterministic_payload(len: usize) -> Vec<u8> {
 /// source-archive fixtures, which each need a genuine archive for their
 /// installer's real `tar` extraction to unpack once the paced download
 /// completes.
-pub fn build_gzip_tarball(build_dir: &Path, archive_name: &str, dir_name: &str) -> Vec<u8> {
-    let archive_path = build_dir.join(archive_name);
-    let status = std::process::Command::new("tar")
-        .arg("-czf")
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(build_dir)
-        .arg(dir_name)
-        .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => panic!("tar exited with {status} while building {archive_name}"),
-        Err(error) => panic!("tar is required to build {archive_name}: {error}"),
-    }
-    std::fs::read(&archive_path)
-        .unwrap_or_else(|error| panic!("failed to read built archive {archive_name}: {error}"))
+///
+/// Runs the actual `tar` invocation on a blocking-pool thread
+/// (`spawn_blocking`) rather than the calling task's worker thread: building
+/// a multi-megabyte archive is not instant, and shelling out synchronously
+/// from an async `given` step would otherwise tie up a tokio worker thread
+/// for the duration.
+pub async fn build_gzip_tarball(build_dir: &Path, archive_name: &str, dir_name: &str) -> Vec<u8> {
+    let build_dir = build_dir.to_path_buf();
+    let archive_name = archive_name.to_owned();
+    let dir_name = dir_name.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let archive_path = build_dir.join(&archive_name);
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&build_dir)
+            .arg(&dir_name)
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => panic!("tar exited with {status} while building {archive_name}"),
+            Err(error) => panic!("tar is required to build {archive_name}: {error}"),
+        }
+        std::fs::read(&archive_path)
+            .unwrap_or_else(|error| panic!("failed to read built archive {archive_name}: {error}"))
+    })
+    .await
+    .unwrap_or_else(|error| panic!("build_gzip_tarball blocking task panicked: {error}"))
 }
 
 /// Whether `screen` shows a genuine in-transfer download progress frame: a
@@ -198,6 +211,31 @@ mod tests {
             Some("10000"),
             "Content-Length must report the exact total so the client can compute a percentage"
         );
+        assert_eq!(
+            response.bytes().await.expect("no body").as_ref(),
+            &contents[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_a_multi_segment_paced_route_byte_for_byte() {
+        // Both real callers register a multi-segment paced path
+        // (`archive/comfyui-source.tar.gz`, `tarball/current/<name>`), not the
+        // single-segment paths the other tests here use — cover that route
+        // shape directly so a future axum/tower_http routing regression can't
+        // break both real E2E scenarios while these unit tests keep passing.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let contents: Vec<u8> = (0..5_000).map(|i| (i % 251) as u8).collect();
+        let server = PacedDownloadServer::start(
+            dir.path(),
+            "tarball/current/archive.tar.gz",
+            contents.clone(),
+            1_000,
+            Duration::from_millis(1),
+        );
+
+        let response = get(&server, "tarball/current/archive.tar.gz").await;
+        assert!(response.status().is_success());
         assert_eq!(
             response.bytes().await.expect("no body").as_ref(),
             &contents[..]
