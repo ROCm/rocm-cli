@@ -9,9 +9,11 @@
 //! runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
-//!   step to pick the channel (Release/Nightly) and an optional version pin
-//!   (`--build-date` / `--version`); defaults to `--channel release --format
-//!   wheel`.
+//!   step to pick the channel (Release/Nightly), an optional version pin
+//!   (`--build-date` / `--version`), and an optional install folder
+//!   (`--prefix`, via the same Wave-0 [`FolderBrowser`] the Adopt path uses);
+//!   defaults to `--channel release --format wheel` installed into the
+//!   default managed folder.
 //! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
@@ -179,6 +181,9 @@ pub struct InstallConfig {
     pub channel: Channel,
     pub pin_mode: PinMode,
     pub pin_value: String,
+    /// Install folder (`--prefix`); empty uses the CLI's default managed
+    /// folder. Set via the folder browser (`Tab`), never typed directly.
+    pub prefix: String,
 }
 
 /// Build the `install sdk` args from a configuration. A `None` pin (or an empty
@@ -192,13 +197,20 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         cfg.channel.as_arg().to_string(),
         "--format".to_string(),
         "wheel".to_string(),
+    ];
+    let prefix = cfg.prefix.trim();
+    if !prefix.is_empty() {
+        args.push("--prefix".to_string());
+        args.push(prefix.to_string());
+    }
+    args.push(
         // Onboarding installs are spawned with null stdin, so a would-be
         // consent prompt cannot be answered and the install would refuse. This
         // keeps the first-run install non-interactive. Deliberately not `--yes`,
         // which would also approve a `sudo` system-package install this spawn
         // has no terminal to answer.
         "--approve-replacing-active-default".to_string(),
-    ];
+    );
     let pin = cfg.pin_value.trim();
     if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
         args.push(flag.to_string());
@@ -268,16 +280,23 @@ pub fn on_key(
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
                 o.browser = None;
-                let root = path.to_string_lossy().into_owned();
-                let args = vec![
-                    "runtimes".to_string(),
-                    "adopt".to_string(),
-                    "--root".to_string(),
-                    root.clone(),
-                    "--python".to_string(),
-                    derive_python_executable(&root),
-                ];
-                stage_approval(o, OnboardingChoice::AdoptExisting, args);
+                let selected = path.to_string_lossy().into_owned();
+                if let Some(cfg) = o.install_config.as_mut() {
+                    // Opened from the SDK Configure step — just fill the
+                    // field; the user still confirms with Enter.
+                    cfg.prefix = selected;
+                } else {
+                    let root = selected;
+                    let args = vec![
+                        "runtimes".to_string(),
+                        "adopt".to_string(),
+                        "--root".to_string(),
+                        root.clone(),
+                        "--python".to_string(),
+                        derive_python_executable(&root),
+                    ];
+                    stage_approval(o, OnboardingChoice::AdoptExisting, args);
+                }
             }
             FolderOutcome::Cancelled => o.browser = None,
             FolderOutcome::None | FolderOutcome::Navigated => {}
@@ -376,8 +395,9 @@ fn activate_choice(o: &mut OnboardingState) -> Vec<SideEffect> {
 }
 
 /// Handle a key while the SDK Configure sub-view has focus: `←/→` toggle the
-/// channel, `↑/↓` cycle the pin mode, typing edits the pin value, Enter stages
-/// the install for approval, Esc returns to the choose menu.
+/// channel, `↑/↓` cycle the pin mode, `Tab` opens the folder browser to pick
+/// an install location, typing edits the pin value, Enter stages the install
+/// for approval, Esc returns to the choose menu.
 fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
     match key.code {
         KeyCode::Esc => {
@@ -390,10 +410,14 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                 stage_approval(o, OnboardingChoice::InstallSdk, args);
             }
         }
+        KeyCode::Tab => {
+            let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            o.browser = Some(FolderBrowser::new("Pick an install folder", start));
+        }
         other => {
             if let Some(cfg) = o.install_config.as_mut() {
                 match other {
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    KeyCode::Left | KeyCode::Right => {
                         cfg.channel = cfg.channel.toggled();
                     }
                     KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
@@ -550,7 +574,7 @@ pub fn draw_onboarding(
     );
 
     let hint = if o.install_config.is_some() {
-        "←→ channel · ↑↓ pin · type value · Enter confirm · Esc back"
+        "←→ channel · ↑↓ pin · Tab browse folder · type value · Enter confirm · Esc back"
     } else {
         match o.step {
             OnboardingStep::Welcome => "Enter continue · Esc close",
@@ -635,7 +659,23 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
             value,
         ]));
     }
+    lines.push(Line::from(vec![
+        Span::styled("Folder:   ", Style::default().fg(theme.fg)),
+        Span::styled(
+            display(&cfg.prefix, "(default managed folder · Tab to browse)"),
+            Style::default().fg(theme.fg),
+        ),
+    ]));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// `v`, or `placeholder` when `v` is empty.
+fn display(v: &str, placeholder: &'static str) -> String {
+    if v.is_empty() {
+        placeholder.to_string()
+    } else {
+        v.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -903,6 +943,33 @@ mod tests {
         assert!(out.contains("needs approval"));
     }
 
+    #[test]
+    fn snapshot_configure_shows_folder_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let o = OnboardingState {
+            step: OnboardingStep::Choose,
+            install_config: Some(InstallConfig::default()),
+            ..Default::default()
+        };
+        let jobs = State::default();
+        term.draw(|f| draw_onboarding(f, f.area(), &o, &jobs, &theme))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains("Folder:"));
+        assert!(out.contains("default managed folder"));
+        assert!(out.contains("Tab browse folder"));
+    }
+
     /// Open the SDK Configure view (choice 0 = InstallSdk) and return the state.
     fn open_configure() -> (Option<OnboardingState>, State) {
         let mut ob = Some(OnboardingState {
@@ -1010,6 +1077,59 @@ mod tests {
             ],
             "an empty pin must not add a flag"
         );
+    }
+
+    #[test]
+    fn tab_opens_browser_from_configure() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_some());
+        assert!(s.install_config.is_some(), "Configure stays open underneath");
+    }
+
+    #[test]
+    fn choosing_folder_from_configure_sets_prefix_without_staging() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        // Enter on row 0 (UseCurrent) of the freshly opened browser chooses cwd.
+        let fx = on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty());
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_none());
+        assert!(
+            s.approval.is_none(),
+            "picking a folder must not stage the install by itself"
+        );
+        let cfg = s
+            .install_config
+            .as_ref()
+            .expect("Configure regains focus after choosing a folder");
+        assert!(!cfg.prefix.is_empty());
+    }
+
+    #[test]
+    fn confirming_after_folder_choice_stages_prefix_flag() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // choose folder
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm Configure
+        assert!(
+            staged_args(ob.as_ref().unwrap())
+                .iter()
+                .any(|a| a == "--prefix")
+        );
+    }
+
+    #[test]
+    fn cancelling_folder_browser_leaves_configure_untouched() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Esc)); // cancel the browser
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_none());
+        let cfg = s.install_config.as_ref().expect("back on Configure");
+        assert!(cfg.prefix.is_empty(), "no folder was chosen");
     }
 
     #[test]
