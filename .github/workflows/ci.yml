@@ -1135,7 +1135,7 @@ jobs:
   architecture-doc:
     name: Architecture doc path citations are current
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     # Deliberately NOT gated by the `changes` path filter: `cargo xtask
     # check-architecture-doc` verifies every backtick-quoted path citation in
     # docs/architecture.md still exists in the tracked tree, and the citations

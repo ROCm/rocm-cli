@@ -8,7 +8,7 @@ SPDX-License-Identifier: MIT
 
 This is the living module map for rocm-cli. It's a contributor-facing reference to where things live and why, updated in the same PR as the code it documents. It also tracks the files still pending modularization (see EAI-7768) so contributors know what's coming — but it is not a design-history document: entries describe current structure, not the decisions or debates that produced it.
 
-> Before relying on any entry below, verify current file and function boundaries directly (e.g. `grep`) rather than trusting this doc's wording. Module boundaries shift as the codebase grows, and a stale-but-plausible-looking note is worse than an explicit prompt to check.
+> Before relying on any entry below, verify current file and function boundaries directly (e.g. `grep`) rather than trusting this doc's wording. Module boundaries shift as the codebase grows, and a stale-but-plausible-looking note is worse than an explicit prompt to check. `cargo xtask check-architecture-doc` fails CI if a backtick-quoted path cited below no longer exists in the tracked tree, but it doesn't check that the surrounding prose (e.g. which extraction pattern a module follows) is still accurate — the caution above still applies to everything but bare path existence.
 
 ## Module organization convention
 
