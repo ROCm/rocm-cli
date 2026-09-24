@@ -21,7 +21,6 @@ use tokio::time::timeout;
 use tracing::warn;
 
 const KFD_DEVICE: &str = "/dev/kfd";
-const DXG_DEVICE: &str = "/dev/dxg";
 const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,46 +34,57 @@ impl AmdSmiCollector {
     /// `amd-smi version` succeeds.
     ///
     /// The device pre-flight is mandatory: without an accessible `/dev/kfd` on
-    /// bare-metal Linux or `/dev/dxg` on WSL, `amd-smi` can block in
-    /// uninterruptible kernel sleep (D-state) that no signal can escape.
+    /// bare-metal Linux, `amd-smi` can block in uninterruptible kernel sleep
+    /// (D-state) that no signal can escape.
     pub async fn detect() -> Option<Self> {
-        Self::detect_with_binary("amd-smi").await
+        Self::detect_with_binary("amd-smi", false).await
     }
 
-    /// Like [`detect`](Self::detect) but uses an explicit `amd-smi` binary path.
+    /// Like [`detect`](Self::detect) but uses an explicit `amd-smi` binary path,
+    /// and takes a precomputed GPU-reachability verdict for the pre-flight.
     ///
     /// The managed ROCm SDK ships `amd-smi` inside the runtime wheel's bin
     /// directory rather than on `PATH`, so callers resolve the path or command
     /// name (via `rocm_core::resolve_amd_smi_binary`) and pass it here.
-    pub async fn detect_with_binary(binary: impl Into<OsString>) -> Option<Self> {
-        Self::detect_with_binary_inner(binary, false).await
+    ///
+    /// `gpu_reachable` lets the pre-flight pass without a readable `/dev/kfd`
+    /// (e.g. on WSL, where the real signal is `rocm_core::has_usable_amd_gpu()`
+    /// rather than any single device node this crate could probe directly).
+    /// This crate deliberately does not depend on `rocm-core` to compute that
+    /// verdict itself; the caller (`apps/rocm`, which already depends on it)
+    /// threads it through instead, so `serve`/`examine`/the dashboard never
+    /// disagree about whether a host's GPU is usable.
+    pub async fn detect_with_binary(
+        binary: impl Into<OsString>,
+        gpu_reachable: bool,
+    ) -> Option<Self> {
+        Self::detect_with_binary_inner(binary, false, gpu_reachable).await
     }
 
     /// Like [`detect_with_binary`](Self::detect_with_binary) but skips the
     /// mandatory GPU-device pre-flight.
     ///
     /// **Test-only.** The device pre-flight is a safety guard: against a *real*
-    /// `amd-smi` on a host without an accessible `/dev/kfd` or `/dev/dxg`, the
-    /// process can block in uninterruptible kernel sleep (D-state) that no
-    /// signal can escape. This entry point exists solely so daemon integration
-    /// tests can point [`detect_with_binary`](Self::detect_with_binary) at a
-    /// *fake* script (for which the hang cannot happen) and have it actually run
-    /// on a GPU-less CI host, instead of short-circuiting to `None` and turning
-    /// the test into a no-op. Never call it against a real binary in production.
+    /// `amd-smi` on a host without an accessible `/dev/kfd`, the process can
+    /// block in uninterruptible kernel sleep (D-state) that no signal can
+    /// escape. This entry point exists solely so daemon integration tests can
+    /// point [`detect_with_binary`](Self::detect_with_binary) at a *fake*
+    /// script (for which the hang cannot happen) and have it actually run on a
+    /// GPU-less CI host, instead of short-circuiting to `None` and turning the
+    /// test into a no-op. Never call it against a real binary in production.
     #[doc(hidden)]
     pub async fn detect_with_binary_skipping_device_preflight(
         binary: impl Into<OsString>,
     ) -> Option<Self> {
-        Self::detect_with_binary_inner(binary, true).await
+        Self::detect_with_binary_inner(binary, true, false).await
     }
 
     async fn detect_with_binary_inner(
         binary: impl Into<OsString>,
         skip_device_preflight: bool,
+        gpu_reachable: bool,
     ) -> Option<Self> {
-        if !skip_device_preflight
-            && !gpu_device_accessible(Path::new(KFD_DEVICE), Path::new(DXG_DEVICE))
-        {
+        if !preflight_passes(skip_device_preflight, gpu_reachable, Path::new(KFD_DEVICE)) {
             return None;
         }
         let me = Self {
@@ -140,8 +150,12 @@ impl AmdSmiCollector {
     }
 }
 
-fn gpu_device_accessible(kfd_device: &Path, dxg_device: &Path) -> bool {
-    device_accessible(kfd_device) || device_accessible(dxg_device)
+/// The device pre-flight passes if the caller already skipped it, already
+/// knows the GPU is reachable by some other means (e.g. WSL, via
+/// `rocm_core::has_usable_amd_gpu()`), or the bare-metal device node itself is
+/// readable.
+fn preflight_passes(skip_device_preflight: bool, gpu_reachable: bool, kfd_device: &Path) -> bool {
+    skip_device_preflight || gpu_reachable || device_accessible(kfd_device)
 }
 
 fn device_accessible(path: &Path) -> bool {
@@ -371,13 +385,34 @@ fn parse_memory(v: Option<&Value>) -> MemoryPartitionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn dxg_access_satisfies_device_preflight_without_kfd() {
-        let dir = tempfile::tempdir().unwrap();
-        let dxg = dir.path().join("dxg");
-        std::fs::write(&dxg, []).unwrap();
 
-        assert!(gpu_device_accessible(&dir.path().join("missing-kfd"), &dxg));
+    #[test]
+    fn preflight_skipped_passes_regardless_of_device_or_reachability() {
+        let missing = Path::new("/nonexistent/kfd");
+        assert!(preflight_passes(true, false, missing));
+    }
+
+    #[test]
+    fn precomputed_reachability_satisfies_preflight_without_kfd() {
+        let missing = Path::new("/nonexistent/kfd");
+        assert!(preflight_passes(false, true, missing));
+    }
+
+    #[test]
+    fn readable_kfd_device_satisfies_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let kfd = dir.path().join("kfd");
+        std::fs::write(&kfd, []).unwrap();
+
+        assert!(preflight_passes(false, false, &kfd));
+    }
+
+    #[test]
+    fn missing_kfd_and_no_reachability_fails_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_kfd = dir.path().join("missing-kfd");
+
+        assert!(!preflight_passes(false, false, &missing_kfd));
     }
 
     const SAMPLE_METRIC: &str = r#"{
