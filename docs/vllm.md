@@ -18,6 +18,64 @@ the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
 valid no-fallback setup for rocm-cli GPU serving.
 
+## Torch alignment on engine install
+
+Installing an engine into a managed TheRock runtime can change the torch in that
+runtime. Two installers write torch into the same environment — the SDK install
+writes TheRock's build, and the engine install then writes the build from its own
+index — so `rocm engines install` settles which one stays and prints the result
+as a `torch_alignment:` line.
+
+A torch that already executes a GPU kernel against the installed SDK is kept
+exactly as it is, whichever installer put it there. Otherwise the runtime is
+moved to the SDK's *build* of the torch *release* the engine pins: the release
+comes from the engine, which was built against it, and the build comes from the
+SDK, whose libraries it has to load. A `device_check:` line reports what the
+result can actually do, and a realignment also reports what the runtime could do
+before it.
+
+Set `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` to keep whatever torch is installed and
+skip the replacement:
+
+```bash
+ROCM_CLI_DISABLE_TORCH_ALIGNMENT=1 rocm engines install vllm --yes
+```
+
+Any value works, including an empty one — the variable being set is the signal.
+The install then reports `torch_alignment: disabled`, naming both the build it
+would have installed and the one it kept. The device check still runs, so an
+opt-out that leaves the runtime unable to serve says so rather than failing later
+during serving.
+
+Use it when you are deliberately running a torch the alignment would replace — a
+locally built wheel, a version under test, a stack pinned for a reproduction. It
+is an escape hatch, not a supported configuration: the resulting combination is
+not validated against the supported matrix, and a runtime that cannot execute a
+kernel will fail at serving time.
+
+### ROCm 10.x wheel discovery
+
+For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
+and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,
+flash-attn, and amd-aiter there under a rotating dev-tag filename (for example
+`vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
+so there is no fixed filename to pin in the adapter. This route is selected by
+major version alone, so `10.0.0`, `10.1.0`, and any other `10.x` all discover
+through it rather than only `10.0.0`.
+
+Instead, the install resolves each package's current wheel from AMD's index
+with `uv pip install --dry-run --reinstall`, parses the version it reports it
+would install, then reinstalls pinned to that exact version (torch and
+tensorizer stay pinned as usual). If AMD's index has no compatible build for a
+package, the resolver fails and the install fails rather than falling back to
+an unpinned or CPU install. Every other ROCm SDK version, including 7.2.3,
+keeps using the static pin table; an SDK version with no matching row there
+falls back to the table's default pin, *unless* its major release matches a
+discovery-table entry, in which case guessing the default pin would very
+likely install an ABI-incompatible build, so the install fails closed instead
+with a message naming the detected version and pointing at
+`ROCM_CLI_VLLM_ROCM_INDEX_URL` as the way to install anyway.
+
 Supported discovery paths:
 
 - `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`

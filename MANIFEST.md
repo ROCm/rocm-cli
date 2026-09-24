@@ -81,9 +81,8 @@ repository.
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
 | block-padding | 0.3.3 | MIT OR Apache-2.0 |
 | blocking | 1.6.2 | Apache-2.0 OR MIT |
-| bollard | 0.17.1 | Apache-2.0 |
-| bollard-stubs | 1.45.0-rc.26.0.1 | Apache-2.0 |
-| bs58 | 0.5.1 | MIT/Apache-2.0 |
+| bollard | 0.21.0 | Apache-2.0 |
+| bollard-stubs | 1.53.1-rc.29.3.1 | Apache-2.0 |
 | bstr | 1.12.3 | MIT OR Apache-2.0 |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 |
 | by_address | 1.2.1 | MIT OR Apache-2.0 |
@@ -150,6 +149,7 @@ repository.
 | directories | 6.0.0 | MIT OR Apache-2.0 |
 | dirs | 6.0.0 | MIT OR Apache-2.0 |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 |
+| dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT |
 | displaydoc | 0.2.6 | MIT OR Apache-2.0 |
 | document-features | 0.2.12 | MIT OR Apache-2.0 |
 | downcast-rs | 1.2.1 | MIT/Apache-2.0 |
@@ -202,7 +202,6 @@ repository.
 | globset | 0.4.18 | Unlicense OR MIT |
 | globwalk | 0.9.1 | MIT |
 | h2 | 0.4.15 | MIT |
-| hashbrown | 0.12.3 | MIT OR Apache-2.0 |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |
 | heck | 0.5.0 | MIT OR Apache-2.0 |
@@ -236,7 +235,6 @@ repository.
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT |
 | ignore | 0.4.27 | Unlicense OR MIT |
 | indenter | 0.3.4 | MIT OR Apache-2.0 |
-| indexmap | 1.9.3 | Apache-2.0 OR MIT |
 | indexmap | 2.14.0 | Apache-2.0 OR MIT |
 | indoc | 2.0.7 | MIT OR Apache-2.0 |
 | inflections | 1.1.1 | MIT |
@@ -303,7 +301,12 @@ repository.
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | num_cpus | 1.17.0 | MIT OR Apache-2.0 |
 | num_threads | 0.1.7 | MIT OR Apache-2.0 |
+| objc2 | 0.6.4 | MIT |
 | objc2-core-foundation | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-encode | 4.1.0 | MIT |
+| objc2-foundation | 0.3.2 | MIT |
+| objc2-io-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-open-directory | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | object | 0.37.3 | Apache-2.0 OR MIT |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 |
@@ -355,7 +358,7 @@ repository.
 | quote | 1.0.46 | MIT OR Apache-2.0 |
 | r-efi | 5.3.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
-| rand | 0.8.6 | MIT OR Apache-2.0 |
+| rand | 0.8.7 | MIT OR Apache-2.0 |
 | rand | 0.9.4 | MIT OR Apache-2.0 |
 | rand_chacha | 0.3.1 | MIT OR Apache-2.0 |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
@@ -398,7 +401,6 @@ repository.
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | schannel | 0.1.29 | MIT |
-| schemars | 0.9.0 | MIT |
 | schemars | 1.2.1 | MIT |
 | schemars_derive | 1.2.1 | MIT |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |
@@ -455,7 +457,7 @@ repository.
 | synthez | 0.4.0 | BlueOak-1.0.0 |
 | synthez-codegen | 0.4.0 | BlueOak-1.0.0 |
 | synthez-core | 0.4.0 | BlueOak-1.0.0 |
-| sysinfo | 0.34.2 | MIT |
+| sysinfo | 0.39.6 | MIT |
 | system-configuration | 0.7.0 | MIT OR Apache-2.0 |
 | system-configuration-sys | 0.6.0 | MIT OR Apache-2.0 |
 | tar | 0.4.46 | MIT OR Apache-2.0 |
@@ -553,17 +555,16 @@ repository.
 | winapi-i686-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
-| windows | 0.57.0 | MIT OR Apache-2.0 |
-| windows-core | 0.57.0 | MIT OR Apache-2.0 |
+| windows | 0.62.2 | MIT OR Apache-2.0 |
+| windows-collections | 0.3.2 | MIT OR Apache-2.0 |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 |
-| windows-implement | 0.57.0 | MIT OR Apache-2.0 |
+| windows-future | 0.3.2 | MIT OR Apache-2.0 |
 | windows-implement | 0.60.2 | MIT OR Apache-2.0 |
-| windows-interface | 0.57.0 | MIT OR Apache-2.0 |
 | windows-interface | 0.59.3 | MIT OR Apache-2.0 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 |
 | windows-native-keyring-store | 1.1.0 | MIT OR Apache-2.0 |
+| windows-numerics | 0.3.1 | MIT OR Apache-2.0 |
 | windows-registry | 0.6.1 | MIT OR Apache-2.0 |
-| windows-result | 0.1.2 | MIT OR Apache-2.0 |
 | windows-result | 0.4.1 | MIT OR Apache-2.0 |
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 |
@@ -572,6 +573,7 @@ repository.
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | windows-targets | 0.53.5 | MIT OR Apache-2.0 |
+| windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 |
@@ -647,8 +649,8 @@ ROCm distribution. Two install formats are supported:
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
   installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl/<gpu-family>/`. Nightly
-  channel wheels are served from `https://rocm.nightlies.amd.com/v2/<gpu-family>/`.
+  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
+  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
   artifact storage. Release channel tarballs are served from
   `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
@@ -670,13 +672,15 @@ The binary is cached in the rocm-cli managed data directory and reused for
 subsequent operations. The version may be pinned via `ROCM_CLI_UV_VERSION`.
 
 `uv`'s own content-addressed package cache is also kept in the managed data
-directory (at `<data-dir>/uv-cache`), so that it shares a filesystem with the
-environments `uv` populates and packages can be hardlinked into them instead of
-copied. This cache holds every wheel `uv` downloads — the ROCm SDK and the
-torch stack included — so it is typically the largest directory rocm-cli
-manages, on the order of several GB per SDK version installed. It is removed by
-`rocm uninstall` unless `--keep-data` is passed, and its location can be
-overridden with `ROCM_CLI_UV_CACHE_DIR`.
+directory (at `<data-dir>/uv-cache`), so that it is reachable from the
+environments `uv` populates without crossing a mount point and packages can be
+hardlinked into them instead of copied. Note it is the mount, not the
+filesystem: a bind mount or `subPath` volume is enough to make Linux refuse the
+hardlink, and `uv` then silently copies. This cache holds every wheel `uv`
+downloads — the ROCm SDK and the torch stack included — so it is typically the
+largest directory rocm-cli manages, on the order of several GB per SDK version
+installed. It is removed by `rocm uninstall` unless `--keep-data` is passed, and
+its location can be overridden with `ROCM_CLI_UV_CACHE_DIR`.
 
 ### Lemonade Embeddable Runtime
 
@@ -686,6 +690,11 @@ Lemonade embeddable archive from the official Lemonade SDK GitHub releases at
 to the rocm-cli managed data directory and is reused for subsequent
 `rocm engines start lemonade` invocations. This is a self-contained binary
 distribution; no Python packages are installed for Lemonade by rocm-cli.
+On Linux/WSL, `rocm engines install lemonade` may also query
+`https://api.github.com/repos/lemonade-sdk/llama.cpp/releases/latest` (an
+unauthenticated call) while aligning Lemonade's `llamacpp:rocm` backend to
+the active ROCm SDK version; see
+[Lemonade backend alignment on engine install](docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install).
 
 ### Engine-Specific Python Dependencies
 
@@ -737,6 +746,10 @@ dependency tree changes — and as part of every release — with:
 cargo install cargo-about@0.9.1 --locked --features cli   # one-time
 cargo xtask tpn
 ```
+
+With the prek hooks installed this runs automatically whenever you commit a
+dependency-graph change, so the notices rarely go stale by hand; the hook skips
+if cargo-about is absent or not the pinned version.
 
 CI verifies the committed file is current with `cargo xtask tpn --check`; a new
 dependency under a license not listed in `about.toml` fails the check until the

@@ -27,7 +27,7 @@ use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_r
 use serde::Serialize;
 
 use crate::{
-    ActiveRuntimeMarker, StorageCommand, UninstallPlan, UninstallPlanEntry,
+    ActiveRuntimeMarker, InstallRootDecision, StorageCommand, UninstallPlan, UninstallPlanEntry,
     active_runtime_marker_path, confirm_uninstall, format_bytes, remove_path,
     should_remove_runtime_install_root, therock,
 };
@@ -621,8 +621,15 @@ pub(crate) fn build_prune_plan(
         // It refuses read-only and imported records and requires a matching
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(decision) if decision.should_remove() => {}
+            Ok(InstallRootDecision::ManifestMismatch) => {
+                plan.skipped.push(format!(
+                    "{runtime_key}: local runtime manifest did not match the registry, \
+                     so it is left in place"
+                ));
+                continue;
+            }
+            Ok(_) => {
                 plan.skipped.push(format!(
                     "{runtime_key}: ROCm CLI did not create this folder, so it is left in place"
                 ));
@@ -962,12 +969,15 @@ mod tests {
             version: version.to_owned(),
             install_root: PathBuf::from("rocm-storage-test").join(runtime_key),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,
             python_executable: None,
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -1269,9 +1279,8 @@ mod tests {
         assert_eq!(removed, vec!["old"]);
         assert!(plan.remove[0].size_bytes >= 2048);
         assert!(
-            plan.skipped
-                .iter()
-                .any(|line| line.starts_with("unowned: ROCm CLI did not create this folder")),
+            plan.skipped.iter().any(|line| line
+                .starts_with("unowned: local runtime manifest did not match the registry")),
             "unowned install must be reported as left alone: {:?}",
             plan.skipped
         );

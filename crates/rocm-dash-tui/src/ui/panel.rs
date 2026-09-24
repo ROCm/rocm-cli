@@ -114,6 +114,24 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
     }
 }
 
+/// Whether [`stamp_title`] has room to draw `title` on a box `area_width`
+/// columns wide.
+///
+/// The top row spends one column on each rounded corner, one on the dash before
+/// the label, and one on each label bracket, so the label itself needs
+/// `area_width - 4` columns. A title that does not fit is dropped rather than
+/// overflowing the border.
+///
+/// Public so a caller choosing between a long and a short title — the help
+/// modals, which append a truncation marker only when they have to — can *ask*
+/// instead of re-deriving this arithmetic and drifting from it. Without it the
+/// longer form would silently erase the title it was meant to annotate.
+#[must_use]
+pub fn title_fits(area_width: u16, title: &str) -> bool {
+    let label_w = title.trim().chars().count();
+    label_w > 0 && label_w.saturating_add(4) < usize::from(area_width)
+}
+
 /// Overlay the btop-style title onto the already-drawn rounded top border.
 ///
 /// Layout on the top row: `╭─╮ Title ╭───────╮` — the inner `╮`/`╭` are the label
@@ -123,17 +141,13 @@ fn put(f: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 /// tint on every theme.
 fn stamp_title(f: &mut Frame, area: Rect, title: &str, border: Color, bg: Color, text_fg: Color) {
     let title = title.trim();
-    if title.is_empty() {
-        return;
+    if !title_fits(area.width, title) {
+        return; // empty, or not enough room — leave the plain rounded top edge
     }
     let label_w = title.chars().count() as u16;
     // corner(x0) + at least one dash, then the left bracket.
     let lb = area.x + 2;
     let rb = lb + 1 + label_w; // right bracket column
-    let x1 = area.x + area.width - 1;
-    if rb >= x1 {
-        return; // not enough room — leave the plain rounded top edge
-    }
     let y0 = area.y;
     let bracket = Style::default().fg(border).bg(bg);
     let text = Style::default()
@@ -235,9 +249,56 @@ pub fn vertical_scrollbar(
     position: usize,
     theme: &Theme,
 ) -> Rect {
-    if content_len <= viewport_len || area.width < 2 || area.height == 0 {
+    vertical_scrollbar_impl(f, area, content_len, viewport_len, position, theme, false)
+}
+
+/// Like [`vertical_scrollbar`], but always reserves and draws the column even
+/// when `content_len` alone would not warrant one.
+///
+/// For a pair of panes that share one scroll position (e.g. two side-by-side
+/// panels scrolled in lockstep), gating each pane's column on its *own*
+/// `content_len` lets one reserve a column while its sibling doesn't, so the
+/// two end up different widths purely because one has slightly less content —
+/// a layout wobble with no functional meaning. Callers that need the pair to
+/// stay the same width decide reservation once (e.g. "either pane
+/// overflows") and pass that decision in here for both, rather than letting
+/// each pane re-derive its own answer.
+#[must_use]
+pub fn vertical_scrollbar_forced(
+    f: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+    theme: &Theme,
+) -> Rect {
+    vertical_scrollbar_impl(f, area, content_len, viewport_len, position, theme, true)
+}
+
+fn vertical_scrollbar_impl(
+    f: &mut Frame,
+    area: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+    theme: &Theme,
+    force: bool,
+) -> Rect {
+    if area.width < 2 || area.height == 0 || (!force && content_len <= viewport_len) {
         return area;
     }
+    // A forced bar can be asked to represent content that doesn't actually
+    // overflow (see `vertical_scrollbar_forced`). Normalize to a single unit
+    // of content/viewport in that case: ratatui's thumb-size formula treats
+    // `content_len` and `viewport_len` as real proportions, so feeding it
+    // `content_len <= viewport_len` as-is renders a partial thumb sized by
+    // that (meaningless) ratio rather than the "fully visible, nothing to
+    // scroll" full-track thumb this case should show.
+    let (content_len, viewport_len, position) = if content_len <= viewport_len {
+        (1, 1, 0)
+    } else {
+        (content_len, viewport_len, position)
+    };
     let max_position = content_len.saturating_sub(viewport_len);
     let rendered_position =
         position.min(max_position) * content_len.saturating_sub(1) / max_position.max(1);
@@ -422,6 +483,40 @@ mod tests {
             "content rect shrinks by the scrollbar column"
         );
         assert_eq!(got.height, area.height, "height unchanged for vertical bar");
+    }
+
+    #[test]
+    fn vertical_scrollbar_forced_reserves_column_even_when_content_fits() {
+        let theme = Theme::default_dark();
+        let area = Rect::new(0, 0, 20, 10);
+        // Plain `vertical_scrollbar` would no-op here (8 <= 10) — `_forced`
+        // must reserve the column anyway, for a pane whose sibling overflows
+        // and needs both panes to share one width.
+        let got = draw_scrollbar(20, 10, |f| {
+            vertical_scrollbar_forced(f, area, 8, 10, 0, &theme)
+        });
+        assert_eq!(
+            got.width, 19,
+            "forced bar reserves the column regardless of content_len"
+        );
+    }
+
+    #[test]
+    fn vertical_scrollbar_forced_fills_the_track_when_content_fits() {
+        let theme = Theme::default_dark();
+        let backend = TestBackend::new(2, 4);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = vertical_scrollbar_forced(f, f.area(), 2, 4, 0, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // content_len (2) < viewport_len (4): the thumb must fill the whole
+        // track ("fully visible, nothing to scroll") rather than computing a
+        // bogus partial thumb from a max_position that would underflow to 0
+        // by coincidence rather than by the fits-entirely case being handled.
+        let cells: Vec<&str> = (0..4).map(|y| buf.cell((1, y)).unwrap().symbol()).collect();
+        assert_eq!(cells, ["█", "█", "█", "█"]);
     }
 
     #[test]

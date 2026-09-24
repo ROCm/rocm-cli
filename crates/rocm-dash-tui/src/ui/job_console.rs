@@ -20,7 +20,7 @@ use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::app::{ScrollTarget, ScrollbarHandle};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, readable_text_on};
 
 /// What a console keypress means to the owning screen.
 ///
@@ -40,6 +40,16 @@ pub enum ConsoleOutcome {
     Unhandled,
 }
 
+/// Whether Esc on `job` fully closes the owning overlay, rather than merely
+/// dismissing the console back to the screen body.
+///
+/// `true` when the job is still running; `false` once it's finished or
+/// missing. Shared by [`on_console_key`] and the dashboard footer's Esc-chip
+/// label so the two can't drift out of sync.
+pub fn console_esc_closes(job: Option<&JobState>) -> bool {
+    job.is_some_and(|j| !j.is_terminal())
+}
+
 /// Interpret a key while a job console is showing `job_id`. Pure except for the
 /// `CancelJob` reducer apply (which only mutates the in-memory job model).
 pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleOutcome {
@@ -53,16 +63,10 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
         // Esc on a still-running job leaves the overlay (the job keeps running in
         // the background) — the conventional "get me out" key, so the user is
         // never trapped during a long step (e.g. a managed serve readiness wait).
-        KeyCode::Esc if jobs.job(job_id).is_some_and(|j| !j.is_terminal()) => {
-            ConsoleOutcome::Closed
-        }
+        KeyCode::Esc if console_esc_closes(jobs.job(job_id)) => ConsoleOutcome::Closed,
         // On a finished (or vanished) job, Esc/Enter dismiss the console back to
         // the screen body.
-        KeyCode::Esc | KeyCode::Enter
-            if jobs
-                .job(job_id)
-                .is_none_or(rocm_dash_core::state::JobState::is_terminal) =>
-        {
+        KeyCode::Esc | KeyCode::Enter if !console_esc_closes(jobs.job(job_id)) => {
             ConsoleOutcome::Dismissed
         }
         _ => ConsoleOutcome::Unhandled,
@@ -70,14 +74,8 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
 }
 
 /// Human-readable status label + the color it should render in.
-pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
-    match &job.status {
-        JobStatus::Running => ("running".to_string(), theme.accent),
-        JobStatus::Done { code: 0 } => ("done".to_string(), theme.ok),
-        JobStatus::Done { code } => (format!("exited ({code})"), theme.warn),
-        JobStatus::Failed { message } => (format!("failed: {message}"), theme.err),
-        JobStatus::Cancelled => ("cancelled".to_string(), theme.muted),
-    }
+fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
+    (job.status.label(), theme.job_status_color(&job.status))
 }
 
 /// Render the job console centered over `area`.
@@ -110,30 +108,45 @@ pub fn draw_job_console(
         ])
         .split(inner);
 
-    // Header: status badge, plus an animated braille spinner and parsed
-    // percentage while the job runs so progress reads as live motion.
+    // Header: while running, a compact chip + animated braille spinner + parsed
+    // percentage (already visually distinct via motion). Once the job reaches a
+    // terminal state, render a full-width colored banner instead — a small chip
+    // is easy to miss against a whole popup of scrolled output.
     let (label, color) = status_label(job, theme);
-    let mut header = vec![
-        Span::styled(
+    let is_terminal = job.is_terminal();
+    let mut header = Vec::new();
+    if is_terminal {
+        // Redundant by construction now that both branches share `is_terminal()` —
+        // kept as a cheap regression guard against a future edit splitting the two
+        // checks back apart, not because this can fail today.
+        debug_assert!(
+            job.is_terminal(),
+            "terminal banner only renders for finished jobs"
+        );
+        let glyph = job.status.glyph();
+        header.push(Span::styled(
+            format!(" {glyph} {label} "),
+            Style::default()
+                .fg(readable_text_on(color))
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        header.push(Span::styled(
             " status ",
             Style::default()
-                .fg(theme.bg)
+                .fg(readable_text_on(color))
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ];
-    if matches!(job.status, JobStatus::Running) {
+        ));
+        header.push(Span::raw(" "));
         header.push(Span::styled(
             format!("{} ", crate::ui::spinner::spinner_frame(tick_count)),
             Style::default().fg(theme.accent),
         ));
-    }
-    header.push(Span::styled(
-        label,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    ));
-    if matches!(job.status, JobStatus::Running) {
+        header.push(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
         // The most recent line carrying a percentage wins (later output is more
         // current than earlier); silently omit the figure when none is present.
         if let Some(pct) = job
@@ -150,7 +163,13 @@ pub fn draw_job_console(
             ));
         }
     }
-    f.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+    let header_para = Paragraph::new(Line::from(header));
+    let header_para = if is_terminal {
+        header_para.style(Style::default().bg(color))
+    } else {
+        header_para
+    };
+    f.render_widget(header_para, rows[0]);
 
     // Body: streamed output lines, with a scrollbar when the ring overflows the
     // viewport so the user can see there's more above/below.
@@ -210,7 +229,7 @@ pub fn draw_job_console(
     let hints = if matches!(job.status, JobStatus::Running) {
         "Esc close (keeps running) · Ctrl+C cancel · wheel / PgUp·PgDn scroll"
     } else {
-        "Enter/Esc close · wheel / PgUp·PgDn scroll"
+        "Enter/Esc dismiss · wheel / PgUp·PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -289,6 +308,26 @@ mod tests {
     }
 
     #[test]
+    fn console_esc_closes_tracks_job_terminality() {
+        // Direct coverage for the seam itself: `on_console_key` and the
+        // footer's Esc-chip label both call through `console_esc_closes`, so
+        // a regression here would silently desync the two without this test.
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "x".into(),
+            args: vec![],
+        });
+        assert!(console_esc_closes(s.job("j")));
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        assert!(!console_esc_closes(s.job("j")));
+        assert!(!console_esc_closes(None));
+    }
+
+    #[test]
     fn status_labels_track_lifecycle() {
         let mut s = State::default();
         s.apply(StateEvent::StartJob {
@@ -303,5 +342,155 @@ mod tests {
             code: 0,
         });
         assert_eq!(status_label(s.job("j").unwrap(), &t).0, "done");
+    }
+
+    #[test]
+    fn status_label_delegates_to_shared_job_status_helpers() {
+        // Guards `job_console::status_label` specifically: it must return the
+        // literal label/color the shared `JobStatus`/`Theme` helpers define,
+        // not a hand-rolled match of its own. This does not exercise
+        // `tabs/home` or `dock` — those have their own render-level
+        // regression tests (`activity_feed_colors_match_shared_job_status_color`,
+        // `logs_dock_tints_nonzero_exit_as_warn_not_ok`).
+        let t = theme();
+        let cases: [(JobStatus, &str, ratatui::style::Color); 5] = [
+            (JobStatus::Running, "running", t.accent),
+            (JobStatus::Done { code: 0 }, "done", t.ok),
+            (JobStatus::Done { code: 7 }, "exited (7)", t.warn),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                "failed: boom",
+                t.err,
+            ),
+            (JobStatus::Cancelled, "cancelled", t.muted),
+        ];
+        for (status, expected_label, expected_color) in cases {
+            let job = JobState {
+                cmd: "x".into(),
+                args: Vec::new(),
+                status,
+                output: std::collections::VecDeque::default(),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let (label, color) = status_label(&job, &t);
+            assert_eq!(label, expected_label);
+            assert_eq!(color, expected_color);
+        }
+    }
+
+    #[test]
+    fn terminal_status_fills_full_width_banner() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 0,
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let filled = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(t.ok))
+            .count();
+        assert!(
+            filled > 50,
+            "expected a done job to paint a full-width header banner, only {filled} cells colored"
+        );
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains('✓'), "done banner missing glyph: {out:?}");
+    }
+
+    #[test]
+    fn running_status_keeps_compact_chip() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let filled = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(t.accent))
+            .count();
+        assert!(
+            filled < 20,
+            "a running job should keep the compact status chip, not a full-width banner: {filled} cells colored"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_gets_a_distinct_glyph_from_success() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let t = theme();
+        let mut s = State::default();
+        s.apply(StateEvent::StartJob {
+            id: "j".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        s.apply(StateEvent::JobDone {
+            id: "j".into(),
+            code: 1,
+        });
+        let job = s.job("j").unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_job_console(f, f.area(), job, (0, 0), 0, &t);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !out.contains('✓'),
+            "a nonzero exit banner should not reuse the success glyph: {out:?}"
+        );
+        assert!(
+            out.contains('!'),
+            "a nonzero exit banner should carry a distinct glyph: {out:?}"
+        );
     }
 }

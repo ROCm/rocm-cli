@@ -1,7 +1,7 @@
 Feature: Runtime configuration
 
   @id:runtime-install-sdk-active @requires-gpu @nightly
-  Scenario: 1 - Installing the SDK makes it the active runtime
+  Scenario: runtime-01 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK
     Then a runtime is registered
@@ -14,18 +14,334 @@ Feature: Runtime configuration
   # runtime's folder path has no such recursive segment. GPU-gated (needs a real
   # install so the folder path is populated).
   @id:runtime-path-not-nested @requires-gpu
-  Scenario: 3 - The managed runtime path is not nested inside another runtime
+  Scenario: runtime-02 - The managed runtime path is not nested inside another runtime
     Given a managed runtime is active
     When the user inspects the system
     Then the managed runtime folder path is not recursively nested
+
+  # The SDK and the engine share one Python environment and both write torch into
+  # it, so a second `install sdk` could leave a torch that one of the two cannot
+  # use. Every health surface still reported `ready` and the install still exited
+  # 0 — the first signal was a serve failure naming neither. The runtime now
+  # settles on the SDK's build of the release the engine pins, so this asserts the
+  # outcome that actually matters rather than the wording of a check: can the
+  # runtime still reach the GPU afterwards. Needs a real SDK install, a real engine
+  # install, and a second SDK install, so it runs on the nightly GPU lane.
+  # `@requires-engine:vllm` because only vLLM shares the runtime environment;
+  # Lemonade manages its own.
+  #
+  # The second Then is not a restatement of the first. A runtime the alignment never
+  # touched can still open a device, so the device check alone cannot distinguish
+  # "settled correctly" from "skipped entirely" — and skipping is the regression the
+  # gate in front of the settle step would produce. Only the alignment block
+  # separates them, and it is the one part of this path with no other e2e coverage.
+  # It reads the block's verdict rather than one string, because a torch that has
+  # already run a GPU kernel with this SDK is kept instead of rewritten and reports
+  # a `retained_*` verdict — settled, with nothing installed.
+  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
+  Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
+    Given a managed runtime with an inference engine already installed
+    When the user installs the SDK again
+    Then the runtime can still use the GPU
+    And the torch alignment settled rather than being skipped
+
+  # `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` is the exit for the machine where the stack
+  # the alignment settles on — the SDK's build of the release the engine pins —
+  # does not work. That stack is not validated against the supported matrix, and
+  # the alignment runs on every path that installs an engine, so without the
+  # opt-out a torch the user installed deliberately is replaced again by the next
+  # command and the only remaining exit is to stop using the CLI.
+  #
+  # Nothing asserted it from the user's side. The unit tests reach the gate
+  # directly, and a gate that is honoured in isolation but bypassed by the install
+  # path around it looks identical to a working one from every surface a user can
+  # see. This is the same reinstall as scenario 4 with the opt-out set, so what
+  # differs between them is exactly the variable.
+  #
+  # Four claims across three Thens, because the opt-out is only coherent if all
+  # four hold: torch was not rewritten; the skip is reported as its own verdict
+  # rather than folded into the generic `not_applicable`, which would leave the
+  # user unable to tell whether the variable did anything; the divergence the
+  # opt-out deliberately leaves behind is not then sold back to that user as a
+  # runtime to repair by reinstalling the engine — an instruction that would undo
+  # what they asked for; and the checks the opt-out does not suppress still run,
+  # because it suppresses the correction, not the diagnosis.
+  #
+  # Same lane as scenario 4 and for the same reasons: a real SDK install and a
+  # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
+  # because only vLLM shares the runtime environment the alignment writes into.
+  @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @nightly
+  Scenario: runtime-04 - Opting out of the torch alignment keeps the torch the user installed
+    Given a managed runtime with an inference engine already installed
+    And the user has opted out of realigning torch
+    When the user installs the SDK again
+    Then the torch alignment reports the opt-out instead of rewriting torch
+    And the install does not offer to reinstall the engine over the kept torch
+    And the runtime's device health is still reported
+
+  # The GPU E2E lanes no longer install the shared runtime once and keep it
+  # forever: `xtask e2e-prewarm` asks `rocm update` whether the channel index has
+  # published a newer version, and installs it side-by-side when it has (EAI-8057).
+  # That makes CI depend on the freshness line this scenario pins. A unit test on a
+  # hand-written fixture cannot catch the renderer drifting away from the parser —
+  # only running the real command can, which is why this is a scenario and not just
+  # an xtask test. Cheap enough for the per-PR lanes: one CLI call against the
+  # already-installed shared runtime. `status=error` is an ACCEPTED outcome, so an
+  # offline runner reports honestly instead of flaking.
+  @id:runtime-update-reports-freshness @requires-gpu
+  Scenario: runtime-05 - The update check reports the active runtime's freshness
+    Given a managed runtime is active
+    When the user checks for runtime updates
+    Then the report states the runtime's freshness against the channel index
+
+  # The install used to record the path it was handed rather than the folder the
+  # files land in, so reaching `data/runtimes` through a link made the runtime name
+  # a folder that disappeared with the link — taking every console-script shebang
+  # in the environment with it, while the files stayed where they were written
+  # (rocm-cli#315). The E2E harness itself creates exactly that link when a scenario
+  # opts into the shared pre-warmed runtime, so the shared tree on a runner was the
+  # thing being poisoned. Previewing the install is enough to pin this and needs no
+  # GPU and no download: the planned folder is resolved before the preview prints
+  # it, so a regression shows up in the plan. `--family` is supplied because
+  # without a GPU there is no target to detect.
+  #
+  # `@nightly` is not about this scenario's own cost — it runs in about eight
+  # seconds, nearly all of it resolving the channel index. It is that the no-GPU
+  # mock lane runs 64 scenarios at once, and that much concurrent network work is
+  # enough to push `eai-7960-gen-tps-held-after-scrape-failure` and
+  # `eai-7960-gen-tps-expiry-boundary` past the validity window they assert on
+  # (measured: both fail 3/3 with this scenario on the mock lane, and pass with the
+  # very same scenario once the suite is serialized). Those two are timing-fragile
+  # under load, which is their own problem to fix; until then this runs on the
+  # nightly lanes, where a GPU is present and scenarios are serialized.
+  @id:runtime-install-records-the-real-folder @nightly
+  Scenario: runtime-06 - Previewing an install through a linked runtimes folder names the real folder
+    Given a machine whose runtimes folder is a link to somewhere else
+    When the user previews an SDK install
+    Then the planned runtime folder is inside the folder the link points at
+    And the planned runtime folder is not expressed through the link
 
   # Linux-only: the step adopts a standard `/opt/rocm` install with a Unix python
   # path. On Windows those paths don't exist (the CLI resolves `/usr/bin/python3`
   # to a bogus `C:/usr/bin/python3` and errors on the missing path before it can
   # emit the install-type guidance), so the scenario's premise doesn't hold there.
   @id:runtime-adopt-preexisting-rejected @requires-os:linux
-  Scenario: 2 - Adopting a pre-existing ROCm install is rejected with guidance
+  Scenario: runtime-07 - Adopting a pre-existing ROCm install is rejected with guidance
     Given a machine with a standard ROCm install
     When the user tries to adopt the existing install
     Then the adoption is refused
     And the error explains which install types can be adopted
+
+  # Both channels now resolve from one canonical aggregate index each, so the
+  # provenance the preview prints is the whole of what the user can check before
+  # committing to a multi-GiB install. This pins the nightly half: the source that
+  # was selected, the version that came back from it, and the layout generation
+  # that source was read as. `--family` is supplied so the scenario needs no GPU,
+  # and `@nightly` because it resolves the real index over the network — the same
+  # cost that keeps scenario runtime-06 off the unserialized mock lane.
+  @id:runtime-resolve-canonical-nightly @nightly
+  Scenario: runtime-08 - Previewing a nightly SDK install reports canonical provenance
+    When the user dry-runs a nightly SDK install for a known family
+    Then the SDK preview reports canonical nightly provenance
+
+  # The release channel is where this went wrong in the field (rocm-cli#271). The
+  # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
+  # frozen at 7.13.0 and has no device payloads at all, so every release install
+  # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
+  # Both halves are fixed by the same canonical model: one flat aggregate index
+  # for the channel, and the device payload for the chip this host actually has.
+  #
+  # The obvious regression test for that history is the one that does not work.
+  # Asserting the broken per-family URL is *absent* passes with the bug present:
+  # the old resolver only ever printed a candidate it failed on, and the stale
+  # per-family index succeeded, so the URL never reached stdout either way. These
+  # Thens assert the positives instead — which source was selected, which version
+  # came back from it, which device payload the plan asks for. On the old resolver
+  # the first reports a per-family URL and the second finds no device payload.
+  #
+  # The two Thens are not one claim split in half. A preview can name the right
+  # source and still ask for the wrong payload — that is exactly what the earlier
+  # attempt at this fix did on Instinct hosts, resolving the aggregate correctly
+  # and then requesting every device wheel ROCm publishes. Only the second Then
+  # separates them.
+  #
+  # `@requires-gfx-target` is narrower than `@requires-gpu`: this preview only
+  # needs a detected chip name and never opens the device. It therefore runs on
+  # WSL hosts that can read the Windows-side target before ROCm passthrough is
+  # ready, while mock hosts with no target skip it.
+  @id:runtime-resolve-canonical-release @requires-gfx-target
+  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+    Given a machine with an AMD GPU
+    When the user dry-runs a release SDK install for this host
+    Then the SDK preview reports canonical release provenance
+    And the SDK preview requests the device payload for this host's GPU
+
+  # `rollback` can only ever undo one step, not walk a history. A unit test on
+  # `render_long_help()` proves clap renders the NOTE, but not that the built
+  # binary prints it to a real user (examine.feature:15-18 sets this precedent
+  # for `--help` text). No runtime state needed, so this runs on the mock lane.
+  @id:runtime-rollback-help-states-single-level-limit
+  Scenario: runtime-10 - Stating rollback's single-level limit in --help
+    When the user asks for rollback help
+    Then the help states that rollback has no history
+
+  # Installing over the active default managed runtime must not silently
+  # displace it. Outside an interactive terminal (as every e2e invocation
+  # is here), `install sdk` with neither consent flag must refuse rather than
+  # proceed, and the refusal has to name the flag the caller should actually
+  # reach for: `--approve-replacing-active-default`, not `--yes`, which would
+  # additionally approve a `sudo` system-package install no script can answer.
+  # GPU-gated because the precondition needs a GPU to have a runtime active.
+  # The refusal is not free: the gate reports the version relation, so
+  # it runs after the Python launcher is resolved and the channel index is read.
+  # Both are already warm here — the `Given` installed a runtime, so the launcher
+  # resolves to the saved managed Python rather than bootstrapping uv, and the
+  # index read is cached — but on a cold host the launcher step can still fetch.
+  # What the refusal does bail before is the SDK and torch download and any
+  # change on disk.
+  @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
+  Scenario: runtime-11 - Reinstalling the SDK over an existing runtime without consent is refused
+    Given a managed runtime is active
+    When the user reinstalls the SDK without confirming
+    Then the reinstall is refused
+    And the error explains how to approve the replacement non-interactively
+
+  # Companion to Scenario runtime-11: with --yes the same reinstall proceeds and the
+  # runtime stays registered and active afterward. Nightly-gated in addition to
+  # GPU because, unlike Scenario runtime-11, this exercises a real second SDK install.
+  # The registered/active Thens hold from the Given alone, so the approval Then
+  # is what actually distinguishes this from a no-op: it fails if --yes ever
+  # regresses to a refusal or silently takes the fresh-install path.
+  @id:runtime-install-sdk-overwrite-with-yes @requires-gpu @nightly
+  Scenario: runtime-12 - Reinstalling the SDK over an existing runtime with --yes proceeds
+    Given a managed runtime is active
+    When the user reinstalls the SDK with --yes
+    Then the install reports that --yes approved replacing the existing runtime
+    And a runtime is registered
+    And the runtime is set as active
+
+  # The case a family-and-channel-scoped gate waved through. Activation is
+  # global — whatever finishes installing last becomes the active default, no
+  # matter which family it was built for — so installing a family this host has
+  # never held displaces the active runtime exactly as a same-family reinstall
+  # does, and has to ask exactly as loudly. Scenario runtime-11 cannot catch
+  # this: it reinstalls the same family, so it passes under both the old
+  # family-scoped gate and this one.
+  #
+  # No `@nightly` despite the second family: like Scenario runtime-11 this is a
+  # refusal, so it bails before the multi-GiB download and costs a resolve, not
+  # an install. The third Then is what separates a correct refusal from an
+  # unrelated failure (a bad family name would also exit non-zero and could also
+  # name the consent flags in a usage line): only the real gate names the
+  # runtime it would replace.
+  #
+  # `@requires-os:linux` because the second family has to arrive by the tarball
+  # format to reach the gate at all, and tarball installs are refused outright on
+  # Windows. A wheel install picks its device payload from the GPU this host
+  # reports and refuses a family that target does not belong to *before* the
+  # consent gate — correctly, since that install could never have worked — so on
+  # a GPU host the wheel path answers with a target error and the displacement
+  # never comes up. The tarball path takes the family it is given, consults no
+  # host target, and reaches the same gate. What is lost on Windows is this
+  # cross-family case only: Scenario runtime-11 still covers the refusal there.
+  @id:runtime-install-sdk-other-family-requires-yes @requires-gpu @requires-os:linux
+  Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without consent
+    Given a managed runtime is active
+    When the user installs a different GPU family without confirming
+    Then the reinstall is refused
+    And the error explains how to approve the replacement non-interactively
+    And the error names the active default runtime it would replace
+
+  # `--yes` approves two unrelated things: replacing the active default runtime,
+  # and running `sudo` to install required system packages such as OpenMPI for
+  # vLLM. ROCm CLI's own non-interactive surfaces (chat, MCP, the dashboard)
+  # spawn `rocm` with null stdin, so they need the first and can never answer a
+  # password prompt for the second; they pass the narrow flag instead. A reader
+  # who believes the two flags are synonyms will reach for `--yes` from a script
+  # and get a sudo prompt nothing can answer, so `--help` has to state the
+  # difference (Scenario runtime-10 sets the precedent for pinning help text
+  # that a unit test on `render_long_help()` cannot prove reaches a real user).
+  # No runtime state needed, so this runs on the mock lane.
+  @id:runtime-install-sdk-help-separates-consents
+  Scenario: runtime-14 - Stating that the non-interactive consent flag does not approve sudo in --help
+    When the user asks for SDK install help
+    Then the help offers a consent flag that does not approve system-package installs
+
+  # `rocm --yes <request>` prints the planned command twice — once under `request
+  # plan`, once under `execution` — and the two deliberately disagree: the plan
+  # render is shared with the no-`--yes` review path, which must never hand a
+  # human a pre-approved command, so the replacement consent is injected only
+  # after it. What the operator sees, though, is a consent flag appearing on the
+  # command that runs and nowhere on the command they were shown, which reads as
+  # something approved behind their back. The `note:` under the execution
+  # `tool_call:` is the only place that difference is explained, and it is
+  # command output, so a unit test on the renderer does not discharge it.
+  #
+  # The three Thens are one claim only if the note can be trusted on its own. It
+  # cannot: a note saying "this differs from the plan above" is a lie if the two
+  # lines actually agree, and a plan line that already carried the flag would
+  # make the note false without changing its text. So the first two Thens pin the
+  # difference the third one describes.
+  #
+  # The install itself must not run — on the GPU lanes this request resolves to a
+  # real multi-GiB SDK pull — and these assertions are about output the CLI
+  # prints *before* it dispatches. The Given makes the first step of `install
+  # sdk` (finding a Python) fail, which is deterministic, offline, writes
+  # nothing, and happens after the header is on stdout. That is also why the When
+  # tolerates a non-zero exit. No runtime state needed, so this runs on the mock
+  # lane and every other lane identically.
+  @id:runtime-freeform-yes-discloses-injected-consent
+  Scenario: runtime-15 - Disclosing the consent added to a natural-language install approved with --yes
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install with --yes
+    Then the request plan shows an install command carrying no replacement consent
+    And the executed command carries the replacement consent
+    And the execution section says the consent came from the user's --yes
+
+  # Lemonade's llama.cpp backend re-pins itself to match the ROCm SDK rocm-cli
+  # actually installed (Tier 1: point the pinned build at it; Tier 2: fall back
+  # to the newest build if the pin is too old to have shipped a matching
+  # ROCm-version asset; revert to the packaged default if neither verifies).
+  # The unit tests exercise that state machine directly against injected
+  # install/align steps, but nothing else asserts that `rocm engines install
+  # lemonade` actually surfaces the outcome to a real user -- this is the one
+  # part of that path with no other e2e coverage.
+  #
+  # `--reinstall` re-extracts the packaged embeddable, resetting
+  # `backend_versions.json` to its pinned defaults, so this fires
+  # deterministically even against a shared runtime tree where an earlier
+  # scenario already left Lemonade's backend aligned (a plain install would
+  # find nothing left to do and print no alignment line at all). Verified
+  # against real hardware (Strix Halo, gfx1151): a fresh SDK's version does not
+  # match Lemonade's packaged pin, Tier 1's install 404s (the pinned build
+  # predates a matching ROCm-version asset), and Tier 2's newest build
+  # succeeds -- producing exactly the line this scenario asserts.
+  #
+  # `@requires-engine:lemonade` because vLLM shares the SDK's own runtime
+  # environment and has no llama.cpp backend to align; `@nightly` for the same
+  # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
+  # and a real backend download, not something to repeat on every PR.
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
+    Given a managed runtime is active
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+
+  # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
+  # `backend_versions.json` -- the alignment runs on every Lemonade install, so
+  # without the opt-out a manual pin is silently overwritten the next time the
+  # engine is installed. Mirrors the vLLM torch-alignment opt-out (scenario 4)
+  # and its reasoning: a gate honoured only by the unit tests looks identical to
+  # a working one from every surface a user can see, so this asserts it from the
+  # CLI's own output -- the second Then does the enforcement proving (it reads
+  # the packaged pin and checks for the alignment/revert log lines); the first
+  # Then only proves the CLI read the variable and named it, which is a weaker
+  # claim on its own. Same lane as scenario 16 and for the same reason -- a real
+  # managed SDK and a real backend, on the serialized nightly GPU runners.
+  @id:runtime-lemonade-backend-alignment-opt-out @requires-gpu @requires-engine:lemonade @nightly
+  Scenario: runtime-17 - Opting out of the Lemonade backend alignment keeps the packaged pin
+    Given a managed runtime is active
+    And the user has opted out of realigning Lemonade's backend
+    When the user reinstalls the lemonade engine
+    Then the CLI reports that Lemonade's backend alignment was skipped by the opt-out
+    And the packaged pin survives the install

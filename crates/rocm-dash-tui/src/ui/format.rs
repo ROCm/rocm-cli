@@ -119,6 +119,29 @@ pub fn tokens_per_watt(value: Option<f64>) -> String {
     }
 }
 
+/// Energy efficiency, held-observation-aware.
+///
+/// Same formatting as [`tokens_per_watt`], with [`HELD_MARKER`] appended when
+/// `obs` is Held — tok/W derives from the same per-tick `gen_tps` sample, so
+/// it goes stale exactly when gen_tps does.
+///
+/// - `None` or non-finite → `"-"` (unchanged from [`tokens_per_watt`])
+/// - `Some(v)`, Held → `"{v:.2} tok/W*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.2} tok/W"`
+pub fn tokens_per_watt_cell(value: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match value {
+        Some(v) if v.is_finite() => {
+            let base = format!("{v:.2} tok/W");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
 /// Human duration from seconds. Sub-second → `ms`; otherwise `Hh Mm Ss`,
 /// dropping any leading zero components.
 pub fn duration(seconds: f64) -> String {
@@ -345,6 +368,27 @@ mod tests {
         assert_eq!(tokens_per_watt(None), "-");
         assert_eq!(tokens_per_watt(Some(0.42)), "0.42 tok/W");
         assert_eq!(tokens_per_watt(Some(f64::INFINITY)), "-");
+    }
+
+    #[test]
+    fn tokens_per_watt_cell_appends_held_marker() {
+        let held = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        };
+        let fresh = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        };
+        assert_eq!(tokens_per_watt_cell(None, None), "-");
+        assert_eq!(tokens_per_watt_cell(Some(f64::NAN), Some(&held)), "-");
+        assert_eq!(
+            tokens_per_watt_cell(Some(0.42), None),
+            "0.42 tok/W",
+            "unknown metadata must not fabricate a held marker"
+        );
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&fresh)), "0.42 tok/W");
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&held)), "0.42 tok/W*");
     }
 
     #[test]

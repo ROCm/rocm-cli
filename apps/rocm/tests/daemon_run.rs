@@ -9,7 +9,7 @@
 //! spawn the built binary, read stdout until the banner appears (or a short
 //! timeout elapses), then kill the process.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -47,12 +47,13 @@ fn daemon_runs_real_foreground_loop() {
         .env("ROCM_CLI_DATA_DIR", &data_dir)
         .env("ROCM_CLI_CACHE_DIR", &cache_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
         .expect("spawn rocm daemon");
 
     let stdout = child.stdout.take().expect("capture daemon stdout");
+    let mut stderr = child.stderr.take().expect("capture daemon stderr");
     let (tx, rx) = mpsc::channel::<bool>();
     let reader = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -77,13 +78,17 @@ fn daemon_runs_real_foreground_loop() {
 
     // The foreground loop blocks; terminate it regardless of outcome.
     let _ = child.kill();
-    let _ = child.wait();
+    let status = child.wait().expect("wait for rocm daemon");
     let _ = reader.join();
+    let mut stderr_text = String::new();
+    stderr
+        .read_to_string(&mut stderr_text)
+        .expect("read daemon stderr");
     let _ = std::fs::remove_dir_all(&state_dir);
 
     assert!(
         saw_banner,
         "expected `rocm daemon` to print the rocmd run banner (real foreground loop), \
-         but it did not appear before timeout"
+         but it did not appear before timeout; exit status: {status}; stderr: {stderr_text}"
     );
 }

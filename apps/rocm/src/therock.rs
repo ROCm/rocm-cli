@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, ManagedToolConfig, RocmCliConfig, detect_host_gpu_diagnostics,
-    detect_host_therock_family, detect_managed_therock_family, disk_space, ensure_uv_binary,
+    AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
+    detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
     known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
     normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
     normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
@@ -18,20 +19,39 @@ use rocm_core::{
     generate_rsa_signing_keypair, managed_uv_cache_dir, sign_rsa_pkcs1_sha256_signature,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/v2";
-const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl";
-const THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
+const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
 const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
 const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
+/// ROCm 10's aggregate pip index. Same simple-index shape the canonical
+/// multi-arch stream publishes, on a separate host, with its own package
+/// generation; it is not a mirror of, or a fallback for, the canonical index.
+const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
+/// ROCm 10's tarball catalog. Same scrapeable listing the canonical catalog
+/// uses, but it publishes non-release sibling archives beside the real dist
+/// archive (see [`select_tarball_candidate`]).
+const THEROCK_NEXT_TARBALL_BASE: &str = "https://stable.repo.amd.com/rocm/core/tarball/";
+const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
+/// Recorded in a [`WheelRuntimeComposition`] installed from the ROCm 10 layout,
+/// so a later update reads back the layout that produced the runtime instead of
+/// guessing it from the version.
+const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
+/// The first ROCm major version published only in the next layout. A pin at or
+/// past it is the one request the canonical stream provably cannot serve, and
+/// therefore the only thing that selects [`SourceLayout::Next`].
+const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
@@ -47,10 +67,62 @@ const THEROCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_hours(1);
 /// misconfigured proxy or a hostile header rather than a real artifact, and
 /// must not be allowed to refuse an install on its own authority.
 const THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+/// Maximum size accepted for index, catalog, and detached-signature responses.
+const THEROCK_MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TheRockChannel {
     Release,
     Nightly,
+}
+
+/// Which published hosting layout a resolution reads from.
+///
+/// Orthogonal to [`TheRockChannel`]. `Canonical` is the release/nightly stream
+/// the CLI has always installed and remains the answer for every request that
+/// does not explicitly ask for something else. `Next` is ROCm 10's separately
+/// hosted layout — an extension, never a fallback: nothing degrades into it and
+/// nothing degrades out of it, so a canonical install resolves exactly the URLs,
+/// device target, and package specs it resolved before the layout existed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceLayout {
+    Canonical,
+    Next,
+}
+
+impl SourceLayout {
+    const fn generation(self) -> &'static str {
+        match self {
+            Self::Canonical => THEROCK_SOURCE_LAYOUT_GENERATION,
+            Self::Next => THEROCK_NEXT_LAYOUT_GENERATION,
+        }
+    }
+
+    /// The layout a recorded [`WheelRuntimeComposition`] was installed from.
+    ///
+    /// Manifests written before compositions existed carry no generation and
+    /// therefore came from the canonical stream. A non-empty generation is an
+    /// explicit provenance contract: reject values this build cannot reproduce
+    /// instead of silently redirecting an update to the canonical source.
+    fn from_generation(generation: Option<&str>) -> Result<Self> {
+        match generation {
+            None | Some(THEROCK_SOURCE_LAYOUT_GENERATION) => Ok(Self::Canonical),
+            Some(THEROCK_NEXT_LAYOUT_GENERATION) => Ok(Self::Next),
+            Some(other) => bail!(
+                "runtime records unsupported TheRock source layout generation `{other}`; update rocm-cli before updating this runtime"
+            ),
+        }
+    }
+}
+
+/// The concrete bases one (channel, layout) pair resolves artifacts from.
+///
+/// Owns its strings because every base is overridable for fixture testing; see
+/// [`env_override_base`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedSource {
+    wheel_index: String,
+    tarball_catalog: String,
+    layout: SourceLayout,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -111,11 +183,302 @@ impl TheRockChannel {
             Self::Nightly => "nightly",
         }
     }
+}
 
-    const fn tarball_base_url(self) -> &'static str {
+/// Whether a `ROCM_CLI_THEROCK_*_BASE` override is honoured at all.
+///
+/// Every artifact base is a trust boundary: a stray override left in a shell
+/// profile would silently redirect a real install to an untrusted host. Reading
+/// them requires a second, deliberate opt-in that no normal install sets, so the
+/// overrides exist for fixture servers and operators who mean it, and are inert
+/// otherwise. See `docs/release-trust.md`.
+fn therock_base_override_allowed() -> bool {
+    std::env::var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// The base to use, given the opt-in flag and whatever the per-base variable
+/// says. Pure so the trust rule is stated once and can be checked without
+/// mutating process environment from a test.
+fn select_base_override(allowed: bool, override_value: Option<&str>, default: &str) -> String {
+    if !allowed {
+        return default.to_owned();
+    }
+    override_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| default.to_owned(), str::to_owned)
+}
+
+fn env_override_base(env_var: &str, default: &str) -> String {
+    select_base_override(
+        therock_base_override_allowed(),
+        std::env::var(env_var).ok().as_deref(),
+        default,
+    )
+}
+
+/// The bases `channel` publishes under `layout`.
+///
+/// The next layout is hosted per-layout rather than per-channel: it has no
+/// nightly stream, and [`select_source_layout`] refuses to reach it from one, so
+/// there is nothing here to branch on.
+fn resolve_source(channel: TheRockChannel, layout: SourceLayout) -> ResolvedSource {
+    match layout {
+        SourceLayout::Canonical => match channel {
+            TheRockChannel::Release => ResolvedSource {
+                wheel_index: env_override_base(
+                    "ROCM_CLI_THEROCK_RELEASE_PIP_BASE",
+                    THEROCK_RELEASE_PIP_INDEX_BASE,
+                ),
+                tarball_catalog: env_override_base(
+                    "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+                    THEROCK_RELEASE_TARBALL_BASE,
+                ),
+                layout,
+            },
+            TheRockChannel::Nightly => ResolvedSource {
+                wheel_index: env_override_base(
+                    "ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE",
+                    THEROCK_NIGHTLY_PIP_INDEX_BASE,
+                ),
+                tarball_catalog: env_override_base(
+                    "ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE",
+                    THEROCK_NIGHTLY_TARBALL_BASE,
+                ),
+                layout,
+            },
+        },
+        SourceLayout::Next => ResolvedSource {
+            wheel_index: env_override_base(
+                "ROCM_CLI_THEROCK_NEXT_PIP_BASE",
+                THEROCK_NEXT_PIP_INDEX_BASE,
+            ),
+            tarball_catalog: env_override_base(
+                "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
+                THEROCK_NEXT_TARBALL_BASE,
+            ),
+            layout,
+        },
+    }
+}
+
+/// Whether `selector` names a ROCm release that only the next layout publishes.
+///
+/// An exact *stable* pin is the only signal that qualifies. A build date names
+/// a nightly build, an unparseable string names nothing this CLI can reason
+/// about, and neither is evidence that the canonical stream cannot serve the
+/// request. Nor is a pinned prerelease of a future major: the canonical
+/// nightly stream already serves those (see
+/// `nightly_accepts_future_prerelease_major_without_cli_changes`), so gating
+/// on major alone would route a nightly alpha pin like `10.1.0a20260822` into
+/// a refusal the release-channel retry it suggests could never satisfy.
+fn next_layout_requested(selector: &RuntimeVersionSelector) -> bool {
+    let RuntimeVersionSelector::Version(version) = selector else {
+        return false;
+    };
+    parse_version(version).is_some_and(|parsed| {
+        parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR
+    })
+}
+
+/// The layout an install must read from, and the refusal when it cannot.
+///
+/// Only an explicit pin at ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] selects `Next`,
+/// because that is the one request the canonical stream provably cannot serve.
+/// No selector, a build date, an unparseable pin, or an older pin all stay
+/// canonical, so nothing that resolves today starts resolving somewhere else.
+/// A pin that does reach `Next` still needs an exact arch, because that layout
+/// picks its device payload by exact arch and a grouped family names none.
+fn select_source_layout(
+    channel: TheRockChannel,
+    family_resolution: &FamilyResolution,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Result<SourceLayout> {
+    let Some(selector) = version_selector.filter(|selector| next_layout_requested(selector)) else {
+        return Ok(SourceLayout::Canonical);
+    };
+    let RuntimeVersionSelector::Version(version) = selector else {
+        return Ok(SourceLayout::Canonical);
+    };
+    let major = parse_version(version).map_or(THEROCK_NEXT_MIN_MAJOR, |parsed| parsed.major);
+    if !matches!(channel, TheRockChannel::Release) {
+        bail!(
+            "ROCm {major} and newer is published only on the release channel; re-run `rocm install sdk --channel release --version {version}`"
+        );
+    }
+    if family_resolution.raw_arch.is_none() {
+        bail!(
+            "installing ROCm {major} requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
+             ROCm {major} selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --version {version} --family gfx1200`.\n\n{}",
+            family_resolution.family,
+            detect_host_gpu_diagnostics()
+        );
+    }
+    Ok(SourceLayout::Next)
+}
+
+fn render_canonical_provenance(
+    output: &mut String,
+    channel: TheRockChannel,
+    source_url: &str,
+    layout_generation: &str,
+    version: &str,
+) {
+    let build_date = runtime_version_build_date(version)
+        .unwrap_or_else(|| "not encoded in stable version".to_owned());
+    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    let _ = writeln!(output, "  canonical_source: {source_url}");
+    let _ = writeln!(output, "  selected_rocm_version: {version}");
+    let _ = writeln!(output, "  build_date: {build_date}");
+    let _ = writeln!(output, "  source_layout_generation: {layout_generation}");
+}
+
+/// The package names a canonical aggregate index links to, lowercased.
+///
+/// The simple index publishes one `<a href="<name>/">` per package. Matching on
+/// parsed names rather than on raw substrings keeps `rocm` from being satisfied
+/// by `rocm-sdk-core` and `torch` from being satisfied by
+/// `amd-torch-device-gfx1100`.
+fn parse_aggregate_package_links(html: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for tail in html.split("href=\"").skip(1) {
+        let Some(href) = tail.split('"').next() else {
+            continue;
+        };
+        let name = href.trim().trim_matches('/').to_ascii_lowercase();
+        if name.is_empty() || name.contains('/') {
+            continue;
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The exact GFX targets the canonical source publishes a device payload for.
+///
+/// This is the authoritative list rather than a table in this file: the
+/// aggregate `rocm` distribution declares one `device-<target>` extra per
+/// `rocm-sdk-device-<target>` package the index links, and `rocm_sdk` refuses
+/// any target outside that set. Reading it from the stream means a target the
+/// source adds or withdraws needs no CLI change, and a target it never
+/// published cannot be requested by accident.
+fn parse_aggregate_device_targets(html: &str) -> Vec<String> {
+    let mut targets = parse_aggregate_package_links(html)
+        .iter()
+        .filter_map(|name| name.strip_prefix("rocm-sdk-device-"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
+}
+
+fn validate_aggregate_index_layout(html: &str) -> Result<()> {
+    let names = parse_aggregate_package_links(html);
+    let missing = ["rocm", "torch", "torchvision", "torchaudio"]
+        .into_iter()
+        .filter(|package| !names.iter().any(|name| name == package))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "unknown canonical TheRock aggregate index layout: expected package links for rocm, torch, torchvision, and torchaudio, but {} not published",
+            missing.join(", ")
+        );
+    }
+    if !names
+        .iter()
+        .any(|name| name.starts_with("rocm-sdk-device-"))
+    {
+        bail!(
+            "unknown canonical TheRock aggregate index layout: no `rocm-sdk-device-*` payload packages are published, so no GPU backend could be selected"
+        );
+    }
+    Ok(())
+}
+
+/// Which device payload the canonical aggregate source must supply for this host.
+///
+/// The aggregate `rocm` distribution ships no GPU backend unless a `device-*`
+/// extra asks for one, so this choice decides whether the installed runtime can
+/// launch a kernel at all. Exactly one exact target is ever requested. The
+/// blanket `device-all` extra pulls every published payload — measured at 24
+/// wheels and 4451 MiB on an MI300X that needs one of them — and then leaves
+/// `rocm_sdk` to guess a target family out of that pile; a family-bucket alias
+/// such as `device-gfx120X-all` is not an extra the source declares at all.
+///
+/// When no exact target can be pinned the answer is [`Undetermined`] rather
+/// than a fallback: a preview still renders and says so, and a real install
+/// refuses instead of producing a runtime with no kernels.
+///
+/// [`Undetermined`]: AggregateDeviceTarget::Undetermined
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum AggregateDeviceTarget {
+    /// The exact detected GFX target, published by the canonical source.
+    Exact(String),
+    /// No exact target could be pinned, and why.
+    Undetermined(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResolvedAggregateWheelSource {
+    index_url: String,
+    layout: SourceLayout,
+    device_target: AggregateDeviceTarget,
+    published_device_targets: Vec<String>,
+}
+
+/// Stands in for a real target in a preview, so a plan that cannot be installed
+/// yet reads as incomplete rather than as installable.
+const UNDETERMINED_DEVICE_TARGET: &str = "<undetermined>";
+
+impl AggregateDeviceTarget {
+    fn resolve(detected: Option<&str>, family: &str, published: &[String]) -> Self {
+        let Some(detected) = detected else {
+            return Self::Undetermined("no AMD GPU target was detected on this host".to_owned());
+        };
+        // KFD reports feature suffixes (`gfx90a:sramecc+:xnack-`); published
+        // targets never carry them.
+        let Some(target) = extract_first_gfx_token(detected) else {
+            return Self::Undetermined(format!(
+                "detected GPU target `{detected}` is not a recognizable GFX target"
+            ));
+        };
+        match normalize_therock_family(&target) {
+            Some(detected_family) if detected_family == family => {}
+            Some(detected_family) => {
+                return Self::Undetermined(format!(
+                    "detected GPU target `{target}` belongs to family `{detected_family}`, not the resolved target family `{family}`"
+                ));
+            }
+            None => {
+                return Self::Undetermined(format!(
+                    "detected GPU target `{target}` belongs to no recognized package family"
+                ));
+            }
+        }
+        if !published.iter().any(|candidate| candidate == &target) {
+            return Self::Undetermined(format!(
+                "the canonical source publishes no `device-{target}` payload for detected GPU target `{target}` (published targets: {})",
+                published.join(", ")
+            ));
+        }
+        Self::Exact(target)
+    }
+
+    fn as_str(&self) -> &str {
         match self {
-            Self::Release => THEROCK_RELEASE_TARBALL_BASE,
-            Self::Nightly => THEROCK_NIGHTLY_TARBALL_BASE,
+            Self::Exact(target) => target,
+            Self::Undetermined(_) => UNDETERMINED_DEVICE_TARGET,
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Undetermined(reason) => Some(reason),
         }
     }
 }
@@ -124,6 +487,13 @@ impl TheRockChannel {
 struct FamilyResolution {
     family: String,
     source: String,
+    /// The exact GFX arch behind `family`, when one is genuinely known —
+    /// `gfx1200`, never the group `gfx120X-all`.
+    ///
+    /// A grouped family names no single arch, and the next layout selects its
+    /// device payload by exact arch, so `None` here is what makes a ROCm 10 pin
+    /// refuse instead of installing a runtime with the wrong kernels.
+    raw_arch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,8 +501,22 @@ struct PipRuntimeResolution {
     family: String,
     family_source: String,
     index_url: String,
+    /// The layout `index_url` belongs to, carried forward so the composition
+    /// this resolution produces records the stream that produced it.
+    layout: SourceLayout,
     latest_version: String,
+    /// Newest `rocm` version offered by the repository for this channel,
+    /// regardless of whether it has a matching PyTorch wheel stack. When this is
+    /// newer than `latest_version`, the repo's newest release could not be
+    /// installed (no wheels) and we warn about it. `None` when a specific version
+    /// was requested (the "latest" concept does not apply).
+    newest_repo_version: Option<String>,
     package_versions: TheRockPipPackageVersions,
+    /// The device payload the resolved source must supply for this host,
+    /// decided against the targets that source actually publishes.
+    device_target: AggregateDeviceTarget,
+    /// Exact device payloads advertised by the resolved aggregate source.
+    published_device_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -154,6 +538,11 @@ struct WheelCompatibility {
 struct TarballArtifact {
     family: String,
     family_source: String,
+    /// The catalog this archive was listed in, and which layout that catalog
+    /// is, so provenance reports the stream the artifact actually came from
+    /// rather than re-deriving it from the channel.
+    catalog_url: String,
+    layout: SourceLayout,
     file_name: String,
     version: String,
     url: String,
@@ -240,7 +629,63 @@ pub(crate) struct RuntimeUpdatePlan {
     pub latest_source: String,
     pub format: String,
     pub status: String,
+    /// The runtime key the applied install will produce. Update apply selects
+    /// the resulting manifest by this key rather than by version, because a
+    /// same-version repair produces a sibling that version alone cannot name.
+    pub target_runtime_key: String,
+    /// Exact device payload encoded in the planned wheel composition.
+    pub device_target: Option<String>,
+    /// The layout this runtime was installed from, carried into the apply so a
+    /// runtime never silently migrates between streams when it updates.
+    pub source_layout_generation: Option<String>,
+    pub repair_required: bool,
     pub update_available: bool,
+}
+
+/// Exact canonical wheel install intent last applied successfully to a runtime.
+///
+/// Version alone cannot identify a reusable environment: adding a required ROCm
+/// extra at the same release version must make an older cache repairable.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WheelRuntimeComposition {
+    pub source_layout_generation: String,
+    pub package_specs: Vec<String>,
+    /// Exact target supplied to `rocm_sdk` when resolving runtime libraries.
+    #[serde(default)]
+    pub rocm_sdk_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RuntimeFreshness {
+    UpToDate,
+    UpdateAvailable,
+    RepairAvailable,
+    AheadOfIndex,
+}
+
+impl RuntimeFreshness {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::UpToDate => "up_to_date",
+            Self::UpdateAvailable => "update_available",
+            Self::RepairAvailable => "repair_available",
+            Self::AheadOfIndex => "ahead_of_index",
+        }
+    }
+
+    const fn update_available(self) -> bool {
+        matches!(self, Self::UpdateAvailable | Self::RepairAvailable)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRuntimeUpdate {
+    latest_version: String,
+    latest_source: String,
+    target_runtime_key: String,
+    format: String,
+    source_layout_generation: String,
+    wheel_composition: Option<WheelRuntimeComposition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +699,15 @@ pub(crate) struct InstalledRuntimeManifest {
     pub version: String,
     pub install_root: PathBuf,
     pub selected_artifact_url: String,
+    /// Which published layout this runtime's artifact came from.
+    ///
+    /// Provenance, not identity: an update reads it so a runtime resolves the
+    /// stream it was installed from instead of whichever stream the channel
+    /// happens to default to. Absent on every manifest written before the
+    /// layout existed, which reads back as the canonical stream those runtimes
+    /// came from.
+    #[serde(default)]
+    pub source_layout_generation: Option<String>,
     #[serde(default)]
     pub index_url: Option<String>,
     #[serde(default)]
@@ -266,6 +720,18 @@ pub(crate) struct InstalledRuntimeManifest {
     pub pip_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub rocm_sdk: Option<RocmSdkPythonProbe>,
+    /// The torch this SDK install wrote, e.g. `2.11.0+rocm7.13.0`.
+    ///
+    /// Recorded because an engine install later overwrites torch in the same
+    /// environment. Reading the environment afterwards tells you what is there
+    /// now, not which build belongs to these libraries; only the manifest still
+    /// knows that, and it has to survive repeat installs to be worth anything.
+    #[serde(default)]
+    pub sdk_torch: Option<String>,
+    /// Missing on manifests written before composition-aware freshness. Such a
+    /// managed wheel runtime is repaired once and rewritten with this field.
+    #[serde(default)]
+    pub wheel_composition: Option<WheelRuntimeComposition>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -459,6 +925,49 @@ enum VersionStage {
     Stable,
 }
 
+/// Outcome of an `install sdk` request.
+///
+/// `mutated` is `false` for dry-run plans and for installs the user declined at
+/// the confirmation prompt, so the caller can skip the post-install activation
+/// and success reporting that only make sense after a real install.
+#[derive(Debug)]
+pub(crate) struct SdkInstallResult {
+    pub output: String,
+    pub mutated: bool,
+}
+
+impl SdkInstallResult {
+    const fn plan(output: String) -> Self {
+        Self {
+            output,
+            mutated: false,
+        }
+    }
+
+    const fn installed(output: String) -> Self {
+        Self {
+            output,
+            mutated: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InstallSourceOverride<'a> {
+    family: Option<&'a str>,
+    device_target: Option<&'a str>,
+    layout: Option<SourceLayout>,
+}
+
+/// Install a TheRock SDK runtime.
+///
+/// `consent` carries the *source* of any up-front approval rather than a bare
+/// bool, because the progress line names it: `--yes` and
+/// `--approve-replacing-active-default` both clear this gate, but only the
+/// former also approves a `sudo` system-package install, so collapsing them
+/// would print "Approved by --yes" on every install ROCm CLI's own
+/// terminal-less surfaces make.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sdk(
     paths: &AppPaths,
     channel: &str,
@@ -467,7 +976,8 @@ pub(crate) fn install_sdk(
     version_selector: Option<RuntimeVersionSelector>,
     family_override: Option<&str>,
     dry_run: bool,
-) -> Result<String> {
+    consent: SdkInstallConsent,
+) -> Result<SdkInstallResult> {
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
@@ -475,16 +985,96 @@ pub(crate) fn install_sdk(
             paths,
             channel,
             prefix,
-            family_override,
+            InstallSourceOverride {
+                family: family_override,
+                ..InstallSourceOverride::default()
+            },
             version_selector.as_ref(),
             dry_run,
+            consent,
         ),
         "tarball" => {
-            if version_selector.is_some() {
-                bail!("specific TheRock version selection is only supported for wheel installs")
+            // A tarball catalog lists whole archives, not a resolvable package
+            // graph, so there is nothing to pin a version against — except the
+            // ROCm 10 catalog, which is reachable *only* by naming a version,
+            // because nothing else distinguishes it from the canonical one.
+            if let Some(selector) = version_selector.as_ref()
+                && !next_layout_requested(selector)
+            {
+                bail!(
+                    "specific TheRock version selection for tarball installs is only supported for a stable ROCm {THEROCK_NEXT_MIN_MAJOR}+ pin (e.g. `--version 10.0.0`); for any other version, use `--format wheel`"
+                )
             }
-            install_tarball_runtime(paths, channel, prefix, family_override, dry_run)
+            install_tarball_runtime(
+                paths,
+                channel,
+                prefix,
+                family_override,
+                version_selector.as_ref(),
+                None,
+                dry_run,
+                consent,
+            )
         }
+        other => bail!("unsupported install format: {other}"),
+    }
+}
+
+/// Apply an update using the exact family, device payload, and source layout
+/// resolved by its plan.
+///
+/// Consent is preapproved rather than asked for: the update targets the runtime
+/// the user selected (or the active default), so installing over it is the
+/// operation requested, and `rocm update` has no terminal contract — reaching a
+/// prompt here would only fail the command. `rocm update` does accept a `--yes`
+/// flag for consistency with other mutating commands, but it is inert and never
+/// reaches this function, so it grants nothing here.
+///
+/// `activate_after_install` mirrors `rocm update --apply --activate` so the
+/// approval line can state what will actually happen. Without it,
+/// `apply_runtime_update` installs beside the active default and leaves the
+/// default untouched, so the line must not claim an activation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_sdk_for_update(
+    paths: &AppPaths,
+    channel: &str,
+    format: &str,
+    family: &str,
+    device_target: Option<&str>,
+    source_layout_generation: Option<&str>,
+    dry_run: bool,
+    activate_after_install: bool,
+) -> Result<SdkInstallResult> {
+    let channel = TheRockChannel::parse(channel)?;
+    ensure_install_format_supported(format)?;
+    let consent = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::UpdateApply {
+        activates: activate_after_install,
+    });
+    let layout = Some(SourceLayout::from_generation(source_layout_generation)?);
+    match format {
+        "wheel" => install_wheel_runtime(
+            paths,
+            channel,
+            None,
+            InstallSourceOverride {
+                family: Some(family),
+                device_target,
+                layout,
+            },
+            None,
+            dry_run,
+            consent,
+        ),
+        "tarball" => install_tarball_runtime(
+            paths,
+            channel,
+            None,
+            Some(family),
+            None,
+            layout,
+            dry_run,
+            consent,
+        ),
         other => bail!("unsupported install format: {other}"),
     }
 }
@@ -527,8 +1117,8 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         return Ok(output);
     }
 
-    for manifest in manifests {
-        let plan = match runtime_update_plan(paths, &manifest) {
+    for manifest in &manifests {
+        let plan = match runtime_update_plan(paths, manifest, &manifests, None) {
             Ok(plan) => Some(plan),
             Err(error) => {
                 let _ = writeln!(
@@ -543,16 +1133,21 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         let Some(plan) = plan else {
             continue;
         };
+        // `target=` names the runtime key an apply from this line would produce.
+        // For a superseded legacy manifest that is its already-installed
+        // replacement, which is how a reader — `xtask e2e-prewarm` above all —
+        // learns which sibling to activate without re-deriving the composition.
         let _ = writeln!(
             output,
-            "  runtime {} format={} channel={} family={} installed={} latest={} status={}",
+            "  runtime {} format={} channel={} family={} installed={} latest={} status={} target={}",
             manifest.runtime_key,
             plan.format,
             manifest.channel,
             manifest.family,
             runtime_version_display(&manifest.version),
             runtime_version_display(&plan.latest_version),
-            plan.status
+            plan.status,
+            plan.target_runtime_key
         );
         let _ = writeln!(
             output,
@@ -561,14 +1156,21 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
         );
         let _ = writeln!(output, "    source: {}", plan.latest_source);
         if plan.update_available {
+            let next_step = if plan.repair_required {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install a composition-keyed replacement side-by-side",
+                    manifest.runtime_key
+                )
+            } else {
+                format!(
+                    "run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
+                    manifest.runtime_key
+                )
+            };
+            let _ = writeln!(output, "    next step: {next_step}");
             let _ = writeln!(
                 output,
-                "    next step: run `rocm update --apply --runtime {}` to install the newer runtime side-by-side",
-                manifest.runtime_key
-            );
-            let _ = writeln!(
-                output,
-                "    activate: add `--activate` to make the newly installed runtime the default after install"
+                "    activate: add `--activate` to make the installed runtime the default after install"
             );
         }
     }
@@ -576,32 +1178,237 @@ pub(crate) fn render_update_report(paths: &AppPaths) -> Result<String> {
     Ok(output)
 }
 
+/// Structured counterpart to [`render_update_report`], for `rocm update --json`.
+/// Consumed by the dash TUI's background update-check job (parsed off a
+/// single compact JSON line captured from the job's stdout), so field names
+/// are a stable-ish contract — extend, don't rename, without checking callers.
+///
+/// Three outcomes a consumer must handle: `runtimes: []` (nothing managed),
+/// one row per manifest with `status: "error"` for any that failed to
+/// resolve (this struct still returns `Ok`), or no JSON at all with a
+/// non-zero exit — [`load_runtime_manifests`] failing is not caught per-row
+/// and fails the whole call.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJson {
+    pub runtimes: Vec<UpdateJsonRuntime>,
+}
+
+/// `format`, `install_root`, and `source` are deliberately omitted: this
+/// contract only needs to answer "is an update available," and every consumer
+/// so far (the dash TUI's Updates tile) only reads `status`/`latest_version`.
+/// Add a field when a real consumer needs it, not preemptively.
+#[derive(Debug, Serialize)]
+pub(crate) struct UpdateJsonRuntime {
+    pub runtime_key: String,
+    pub channel: String,
+    pub family: String,
+    pub installed_version: String,
+    pub latest_version: Option<String>,
+    /// `"update_available"` | `"repair_available"` | `"up_to_date"` | `"ahead_of_index"` | `"error"`.
+    pub status: String,
+    pub message: Option<String>,
+}
+
+pub(crate) fn render_update_json(
+    paths: &AppPaths,
+    download_timeout_secs: Option<u64>,
+) -> Result<UpdateJson> {
+    // Resolving a wheel-format manifest's latest version can fall through to
+    // Python resolution/bootstrap, which otherwise prints progress lines (and
+    // an installer's raw stdout) ahead of the JSON below, breaking the
+    // documented single-line contract on `UpdateJson`.
+    let _quiet = SuppressProgressOutput::new();
+    let manifests = load_runtime_manifests(paths)?;
+    let mut runtimes = Vec::with_capacity(manifests.len());
+    for manifest in &manifests {
+        match runtime_update_plan(paths, manifest, &manifests, download_timeout_secs) {
+            Ok(plan) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: Some(plan.latest_version),
+                status: plan.status,
+                message: None,
+            }),
+            Err(error) => runtimes.push(UpdateJsonRuntime {
+                runtime_key: manifest.runtime_key.clone(),
+                channel: manifest.channel.clone(),
+                family: manifest.family.clone(),
+                installed_version: manifest.version.clone(),
+                latest_version: None,
+                status: "error".to_owned(),
+                message: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(UpdateJson { runtimes })
+}
+
+/// Whether the composition-keyed replacement for `source` is already installed.
+///
+/// A repair installs a sibling and leaves the legacy manifest in place until the
+/// retention pass removes it. Without this, that retained manifest keeps
+/// reporting `repair_available` forever, so every pre-warm reinstalls a runtime
+/// that is already there and every startup check re-notifies.
+fn replacement_runtime_is_installed(
+    manifests: &[InstalledRuntimeManifest],
+    source: &InstalledRuntimeManifest,
+    target_runtime_key: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+) -> bool {
+    // `RepairAvailable` currently implies a wheel composition, but keep this
+    // helper total if a future freshness state reaches it without one.
+    let Some(required_composition) = required_composition else {
+        return false;
+    };
+    manifests.iter().any(|candidate| {
+        !candidate.read_only
+            && candidate.runtime_key == target_runtime_key
+            && candidate.channel == source.channel
+            && candidate.format == source.format
+            && candidate.family == source.family
+            && candidate.wheel_composition.as_ref() == Some(required_composition)
+            && has_nontrivial_directory_contents(&candidate.install_root).unwrap_or(false)
+    })
+}
+
+/// Freshness of one runtime against the index, ignoring its siblings.
+///
+/// An installed version newer than the index is [`RuntimeFreshness::AheadOfIndex`]
+/// before any composition is considered: that build cannot be reproduced from the
+/// index at all, so calling it repairable would promise an install that must
+/// either fail or silently roll the runtime back.
+fn runtime_freshness(
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    match compare_version_strings(&manifest.version, latest_version) {
+        Ordering::Less => RuntimeFreshness::UpdateAvailable,
+        Ordering::Greater => RuntimeFreshness::AheadOfIndex,
+        Ordering::Equal
+            if !manifest.read_only
+                && required_composition.is_some()
+                && (manifest.wheel_composition.as_ref() != required_composition
+                    || manifest.runtime_key != target_runtime_key) =>
+        {
+            RuntimeFreshness::RepairAvailable
+        }
+        Ordering::Equal => RuntimeFreshness::UpToDate,
+    }
+}
+
+fn runtime_freshness_with_manifests(
+    manifests: &[InstalledRuntimeManifest],
+    manifest: &InstalledRuntimeManifest,
+    latest_version: &str,
+    required_composition: Option<&WheelRuntimeComposition>,
+    target_runtime_key: &str,
+) -> RuntimeFreshness {
+    let freshness = runtime_freshness(
+        manifest,
+        latest_version,
+        required_composition,
+        target_runtime_key,
+    );
+    if freshness == RuntimeFreshness::RepairAvailable
+        && replacement_runtime_is_installed(
+            manifests,
+            manifest,
+            target_runtime_key,
+            required_composition,
+        )
+    {
+        RuntimeFreshness::UpToDate
+    } else {
+        freshness
+    }
+}
+
 pub(crate) fn runtime_update_plan(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
+    download_timeout_secs: Option<u64>,
 ) -> Result<RuntimeUpdatePlan> {
-    let (latest_version, latest_source, format) =
-        resolve_latest_for_manifest(paths, manifest, None)?;
-    let status = match compare_version_strings(&manifest.version, &latest_version) {
-        Ordering::Less => "update_available",
-        Ordering::Equal => "up_to_date",
-        Ordering::Greater => "ahead_of_index",
-    };
+    let latest = resolve_latest_for_manifest(paths, manifest, download_timeout_secs)?;
+    let freshness = runtime_freshness_with_manifests(
+        manifests,
+        manifest,
+        &latest.latest_version,
+        latest.wheel_composition.as_ref(),
+        &latest.target_runtime_key,
+    );
+    let device_target = latest
+        .wheel_composition
+        .as_ref()
+        .and_then(|composition| wheel_composition_device_target(Some(composition)))
+        .map(str::to_owned);
     Ok(RuntimeUpdatePlan {
-        latest_version,
-        latest_source,
-        format,
-        status: status.to_owned(),
-        update_available: status == "update_available",
+        latest_version: latest.latest_version,
+        latest_source: latest.latest_source,
+        format: latest.format,
+        status: freshness.status().to_owned(),
+        target_runtime_key: latest.target_runtime_key,
+        device_target,
+        source_layout_generation: Some(latest.source_layout_generation),
+        repair_required: freshness == RuntimeFreshness::RepairAvailable,
+        update_available: freshness.update_available(),
     })
+}
+
+/// The layout a manifest's artifact came from.
+///
+/// Manifests written before the field existed fall back to the generation their
+/// wheel composition recorded, and manifests older than compositions fall back
+/// to the canonical stream, which is where they came from. No URL is inspected:
+/// a base can be overridden or rehosted, and the recorded generation is the only
+/// statement about the stream that survives that.
+fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceLayout> {
+    SourceLayout::from_generation(manifest.source_layout_generation.as_deref().or_else(|| {
+        manifest
+            .wheel_composition
+            .as_ref()
+            .map(|composition| composition.source_layout_generation.as_str())
+    }))
+}
+
+/// The family override to actually resolve a next-layout wheel request with,
+/// given a (possibly grouped) family and an exact arch recorded or requested
+/// alongside it.
+///
+/// A grouped family (e.g. `gfx125X-dcgpu`) carries no exact arch, so passing
+/// it straight through would leave the next layout's device target
+/// undetermined and the whole resolve would bail — on the very host the
+/// runtime is already installed on. `candidate_arch` is the exact arch a more
+/// authoritative source already recorded for this same family; when it
+/// agrees, pass it as the override itself, which `resolve_family` also
+/// normalizes back to this same family. Used by both halves of updating a
+/// next-layout manifest: `resolve_latest_for_manifest` (planning) and
+/// `install_wheel_runtime` via `device_target_override` (applying) — a fix to
+/// one without the other leaves the update path half-working.
+fn family_override_or_recovered_arch(family: &str, candidate_arch: Option<&str>) -> String {
+    raw_arch_agreeing_with_family(candidate_arch.map(str::to_owned), family)
+        .unwrap_or_else(|| family.to_owned())
+}
+
+/// The family override to re-resolve a wheel manifest's update *plan* with.
+/// See [`family_override_or_recovered_arch`] — the composition recorded at
+/// install time is this call's source for the exact arch.
+fn manifest_wheel_family_override(manifest: &InstalledRuntimeManifest) -> String {
+    let recorded_arch = wheel_composition_device_target(manifest.wheel_composition.as_ref());
+    family_override_or_recovered_arch(&manifest.family, recorded_arch)
 }
 
 fn resolve_latest_for_manifest(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
     download_timeout_secs: Option<u64>,
-) -> Result<(String, String, String)> {
+) -> Result<ResolvedRuntimeUpdate> {
     let channel = TheRockChannel::parse(&manifest.channel)?;
+    let layout = manifest_source_layout(manifest)?;
     match manifest.format.as_str() {
         "wheel" => {
             let manifest_python = manifest
@@ -619,28 +1426,76 @@ fn resolve_latest_for_manifest(
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
+            let family_override = manifest_wheel_family_override(manifest);
             let resolution = resolve_pip_runtime_with_timeout(
                 paths,
                 channel,
-                Some(manifest.family.as_str()),
+                Some(family_override.as_str()),
                 &wheel_compatibility,
                 None,
+                Some(layout),
                 download_timeout_secs,
             )?;
-            Ok((
-                resolution.latest_version,
-                resolution.index_url,
-                "wheel".to_owned(),
-            ))
+            // Prefer the device payload this runtime was actually built with over
+            // a fresh host probe. Planning must predict the key an apply will
+            // produce, and re-probing would disagree with the installed runtime on
+            // any host whose GPU is absent, hidden, or simply a second card.
+            let device_target =
+                wheel_composition_device_target(manifest.wheel_composition.as_ref()).map_or_else(
+                    || resolution.device_target.clone(),
+                    |target| {
+                        AggregateDeviceTarget::resolve(
+                            Some(target),
+                            &resolution.family,
+                            &resolution.published_device_targets,
+                        )
+                    },
+                );
+            // No exact target means no reproducible composition, so freshness
+            // falls back to the version comparison rather than demanding a repair
+            // this host could not perform.
+            let wheel_composition = match &device_target {
+                AggregateDeviceTarget::Exact(_) => {
+                    Some(wheel_runtime_composition(&resolution, &device_target))
+                }
+                AggregateDeviceTarget::Undetermined(_) => None,
+            };
+            let target_runtime_key = wheel_composition.as_ref().map_or_else(
+                || manifest.runtime_key.clone(),
+                |composition| wheel_runtime_key(channel, &resolution.latest_version, composition),
+            );
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: resolution.latest_version,
+                latest_source: resolution.index_url,
+                target_runtime_key,
+                format: "wheel".to_owned(),
+                source_layout_generation: resolution.layout.generation().to_owned(),
+                wheel_composition,
+            })
         }
         "tarball" => {
             let artifact = resolve_tarball_artifact_with_timeout(
                 paths,
                 channel,
                 Some(manifest.family.as_str()),
+                None,
+                Some(layout),
                 download_timeout_secs,
             )?;
-            Ok((artifact.version, artifact.url, "tarball".to_owned()))
+            let target_runtime_key = runtime_key(
+                channel,
+                "tarball",
+                &artifact.family,
+                Some(&artifact.version),
+            );
+            Ok(ResolvedRuntimeUpdate {
+                latest_version: artifact.version,
+                latest_source: artifact.url,
+                target_runtime_key,
+                format: "tarball".to_owned(),
+                source_layout_generation: artifact.layout.generation().to_owned(),
+                wheel_composition: None,
+            })
         }
         other => bail!("unknown manifest format `{other}`"),
     }
@@ -677,6 +1532,7 @@ fn maybe_refresh_startup_update_check_at(
     let record = build_startup_update_check_record(
         paths,
         manifest,
+        &manifests,
         now_unix_ms,
         Some(STARTUP_UPDATE_CHECK_TIMEOUT_SECS),
     );
@@ -708,25 +1564,28 @@ fn select_startup_update_manifest<'a>(
 fn build_startup_update_check_record(
     paths: &AppPaths,
     manifest: &InstalledRuntimeManifest,
+    manifests: &[InstalledRuntimeManifest],
     now_unix_ms: u128,
     download_timeout_secs: Option<u64>,
 ) -> StartupUpdateCheckRecord {
     match resolve_latest_for_manifest(paths, manifest, download_timeout_secs) {
-        Ok((latest_version, _latest_source, kind)) => {
-            let status = match compare_version_strings(&manifest.version, &latest_version) {
-                Ordering::Less => "update_available",
-                Ordering::Equal => "up_to_date",
-                Ordering::Greater => "ahead_of_index",
-            };
+        Ok(latest) => {
+            let freshness = runtime_freshness_with_manifests(
+                manifests,
+                manifest,
+                &latest.latest_version,
+                latest.wheel_composition.as_ref(),
+                &latest.target_runtime_key,
+            );
             StartupUpdateCheckRecord {
                 runtime_key: manifest.runtime_key.clone(),
                 runtime_id: manifest.runtime_id.clone(),
                 channel: manifest.channel.clone(),
-                format: kind,
+                format: latest.format,
                 family: manifest.family.clone(),
                 installed_version: manifest.version.clone(),
-                latest_version: Some(latest_version),
-                status: status.to_owned(),
+                latest_version: Some(latest.latest_version),
+                status: freshness.status().to_owned(),
                 message: None,
                 checked_at_unix_ms: now_unix_ms,
             }
@@ -766,27 +1625,28 @@ fn load_startup_update_check(paths: &AppPaths) -> Result<Option<StartupUpdateChe
 
 fn save_startup_update_check(paths: &AppPaths, record: &StartupUpdateCheckRecord) -> Result<()> {
     let path = startup_update_check_path(paths);
-    let parent = path
-        .parent()
-        .context("startup update check path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    fs::write(
+    write_file_atomically(
         &path,
-        serde_json::to_vec_pretty(record)
+        &serde_json::to_vec_pretty(record)
             .context("failed to serialize startup update check record")?,
     )
-    .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_wheel_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
-    family_override: Option<&str>,
+    source_override: InstallSourceOverride<'_>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
-) -> Result<String> {
+    consent: SdkInstallConsent,
+) -> Result<SdkInstallResult> {
+    let InstallSourceOverride {
+        family: family_override,
+        device_target: device_target_override,
+        layout: layout_override,
+    } = source_override;
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
         managed_python_version()
@@ -815,24 +1675,42 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
+    // for the next layout, which needs an exact arch before it can query
+    // package metadata at all. Recover it into the family override up front.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
-        family_override,
+        recovered_family_override.as_deref(),
         &wheel_compatibility,
         version_selector,
+        layout_override,
     )?;
-    progress_line(format!(
-        "Found TheRock package family {} version {} with a matching PyTorch stack.",
-        resolution.family, resolution.latest_version
-    ));
-    let runtime_key = runtime_key(
-        channel,
-        "wheel",
-        &resolution.family,
-        Some(&resolution.latest_version),
+    let device_target = device_target_override.map_or_else(
+        || resolution.device_target.clone(),
+        |target| {
+            AggregateDeviceTarget::resolve(
+                Some(target),
+                &resolution.family,
+                &resolution.published_device_targets,
+            )
+        },
     );
-    let install_root = prefix.unwrap_or_else(|| managed_runtime_root(paths, "wheel", &runtime_key));
+    // The exact device payload, not the version alone, decides what this runtime
+    // can run, so it is what identifies the runtime. A preview on a host with no
+    // usable target still composes a key here — from the `<undetermined>` extras
+    // — which no real install can ever produce, and the refusal below stops it
+    // from reaching a manifest.
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
+    progress_line(format!(
+        "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
+        resolution.latest_version, resolution.family
+    ));
+    let runtime_key = wheel_runtime_key(channel, &resolution.latest_version, &wheel_composition);
+    let install_root = resolved_install_root(paths, "wheel", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
 
     let mut output = String::new();
@@ -841,19 +1719,47 @@ fn install_wheel_runtime(
         output,
         "  summary: rocm-cli will install the ROCm SDK and matching PyTorch packages for this Python and operating system"
     );
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        &resolution.index_url,
+        resolution.layout.generation(),
+        &resolution.latest_version,
+    );
     let _ = writeln!(output, "  format: wheel");
     if let Some(selector) = version_selector {
         let _ = writeln!(output, "  requested: {}", selector.describe());
     }
-    let _ = writeln!(output, "  family: {}", resolution.family);
-    let _ = writeln!(output, "  family_source: {}", resolution.family_source);
+    let _ = writeln!(output, "  target_family: {}", resolution.family);
+    let _ = writeln!(
+        output,
+        "  target_family_source: {}",
+        resolution.family_source
+    );
+    let _ = writeln!(output, "  device_target: {}", device_target.as_str());
+    if let Some(reason) = device_target.reason() {
+        let _ = writeln!(output, "  device_target_reason: {reason}");
+    }
     let _ = writeln!(output, "  index_url: {}", resolution.index_url);
     let _ = writeln!(
         output,
         "  latest_compatible_version: {}",
         runtime_version_display(&resolution.latest_version)
     );
+    // Probed once and reused by the progress line below: each call is a full
+    // filesystem scan for a legacy ROCm, and the summary block and the visible
+    // note report the same answer about the same resolved version.
+    let host_version_newer = host_rocm_version_newer_than(&resolution.latest_version);
+    if let Some(host_version) = host_version_newer.as_deref() {
+        let _ = writeln!(
+            output,
+            "  version_note: {}",
+            wheel_host_version_note(
+                host_version,
+                &runtime_version_display(&resolution.latest_version)
+            )
+        );
+    }
     let _ = writeln!(
         output,
         "  compatibility_key: {}",
@@ -880,12 +1786,25 @@ fn install_wheel_runtime(
     let _ = writeln!(
         output,
         "  package_specs: {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" ")
+        wheel_composition.package_specs.join(" ")
     );
     let _ = writeln!(
         output,
-        "  package_policy: find the newest TheRock ROCm SDK version that has a matching PyTorch stack in the same index, then install pinned rocm[libraries,devel], torch, torchvision, and torchaudio versions in one uv transaction"
+        "  package_policy: resolve the pinned target-complete rocm, torch, torchvision, and torchaudio plan from published package metadata, then install it in one uv transaction"
     );
+    let no_wheel_warning = repo_version_without_wheels(
+        resolution.newest_repo_version.as_deref(),
+        &resolution.latest_version,
+    )
+    .map(|newest| {
+        no_wheel_warning_message(
+            &newest,
+            &runtime_version_display(&resolution.latest_version),
+        )
+    });
+    if let Some(warning) = no_wheel_warning.as_deref() {
+        let _ = writeln!(output, "  warning: {warning}");
+    }
     if dry_run {
         let env_python = venv_python_path(&install_root);
         let mut install_args = uv_pip_install_base(&env_python);
@@ -893,7 +1812,7 @@ fn install_wheel_runtime(
         if matches!(channel, TheRockChannel::Nightly) {
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
-        install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+        install_args.extend(wheel_composition.package_specs.iter().cloned());
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
         let venv_args_display = venv_args
             .iter()
@@ -915,7 +1834,92 @@ fn install_wheel_runtime(
             "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
         );
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-        return Ok(output);
+        return Ok(SdkInstallResult::plan(output));
+    }
+
+    // Requirement: surface the "newest version has no wheels" case as a warning
+    // on the real install path too, not only in the dry-run plan.
+    if let Some(warning) = no_wheel_warning.as_deref() {
+        progress_line(format!("Warning: {warning}"));
+    }
+
+    // Explain, in the visible install log, why an older TheRock ROCm is chosen
+    // when this host reports a newer legacy ROCm (the ticket's 7.14 case). The
+    // same note is recorded in the summary block above; surfacing it here keeps
+    // it from being buried at the end of a long key/value dump.
+    if let Some(host_version) = host_version_newer.as_deref() {
+        progress_line(format!(
+            "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm with a matching PyTorch stack for this repository; installing {resolved} (pass `--version <VERSION>` to override).",
+            resolved = runtime_version_display(&resolution.latest_version)
+        ));
+    }
+
+    // Past the preview, the plan has to be installable. A runtime composed
+    // without its exact device payload loads and then faults on the first
+    // kernel, so an undetermined target is refused here rather than papered
+    // over with every published payload.
+    //
+    // Checked *before* the consent gate: an install that cannot work should say
+    // so, not first demand a consent flag for it. With the order reversed, a
+    // non-interactive host with an unresolvable target reports only "re-run with
+    // --approve-replacing-active-default", and supplying it just surfaces this
+    // error instead.
+    if let Some(reason) = device_target.reason() {
+        bail!(
+            "cannot compose a canonical TheRock {} runtime: {reason}.\n\
+             The aggregate `rocm` distribution ships no GPU backend unless an exact `device-<target>` extra requests one, so this install would produce a runtime that cannot run a kernel.\n\
+             Re-run `rocm install sdk` on the target host, or preview the plan with `--dry-run`.\n\n{}",
+            channel.as_str(),
+            detect_host_gpu_diagnostics()
+        );
+    }
+
+    // Installs with no active default runtime proceed with just an informational
+    // line. Only an install that would displace the current active default asks
+    // for confirmation, and it asks regardless of family or channel because
+    // activation is global. With no terminal to answer the prompt it refuses
+    // instead, naming `--approve-replacing-active-default` as the
+    // non-interactive approval — see `refuse_non_interactive_message` for why
+    // that flag and not `--yes`.
+    let existing = active_default_runtime_relation(
+        paths,
+        channel,
+        &resolution.family,
+        &resolution.latest_version,
+    )?;
+    match sdk_install_approval(existing.is_some(), consent, interactive_terminal()) {
+        SdkInstallApproval::ProceedFresh => {
+            progress_line(fresh_install_line(
+                &runtime_version_display(&resolution.latest_version),
+                &resolution.family,
+            ));
+        }
+        SdkInstallApproval::ProceedApproved(source) => {
+            progress_line(preapproved_install_line(
+                source,
+                existing.as_deref().unwrap_or_default(),
+                &runtime_version_display(&resolution.latest_version),
+            ));
+        }
+        SdkInstallApproval::PromptOverwrite => {
+            if !confirm_overwrite_existing_sdk(
+                channel,
+                &resolution.family,
+                &resolution.latest_version,
+                existing.as_deref().unwrap_or_default(),
+            )? {
+                let _ = writeln!(
+                    output,
+                    "  status: cancelled by user; the existing ROCm SDK was left unchanged"
+                );
+                return Ok(SdkInstallResult::plan(output));
+            }
+        }
+        SdkInstallApproval::RefuseNonInteractive => {
+            bail!(refuse_non_interactive_message(
+                existing.as_deref().unwrap_or_default()
+            ));
+        }
     }
 
     let uv = ensure_uv_binary(paths)?;
@@ -933,7 +1937,7 @@ fn install_wheel_runtime(
 
     progress_line(format!(
         "Installing {} from {}",
-        therock_pip_package_specs(&resolution.package_versions).join(" "),
+        wheel_composition.package_specs.join(" "),
         resolution.index_url
     ));
     let mut install_args = uv_pip_install_base(&env_python);
@@ -941,7 +1945,7 @@ fn install_wheel_runtime(
     if matches!(channel, TheRockChannel::Nightly) {
         install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
     }
-    install_args.extend(therock_pip_package_specs(&resolution.package_versions));
+    install_args.extend(wheel_composition.package_specs.iter().cloned());
     run_uv_progress_command(
         paths,
         &uv,
@@ -954,8 +1958,9 @@ fn install_wheel_runtime(
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
-    let rocm_sdk_probe = probe_rocm_sdk_runtime(&env_python)
-        .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
+    let rocm_sdk_probe =
+        probe_rocm_sdk_runtime_for_target(&env_python, Some(device_target.as_str()))
+            .context("TheRock packages did not expose a usable rocm_sdk runtime")?;
     validate_rocm_sdk_runtime_probe(&rocm_sdk_probe)?;
     let installed_version = rocm_sdk_probe
         .rocm_sdk_version
@@ -971,12 +1976,15 @@ fn install_wheel_runtime(
         version: installed_version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: resolution.index_url.clone(),
+        source_layout_generation: Some(resolution.layout.generation().to_owned()),
         index_url: Some(resolution.index_url.clone()),
         tarball_file_name: None,
         python_launcher: Some(python_launcher.executable.display().to_string()),
         python_executable: Some(env_python.display().to_string()),
         pip_cache_dir: None,
         rocm_sdk: Some(rocm_sdk_probe.clone()),
+        sdk_torch: Some(resolution.package_versions.torch.clone()),
+        wheel_composition: Some(wheel_composition),
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1009,16 +2017,63 @@ fn install_wheel_runtime(
         let _ = writeln!(output, "  rocm_sdk_target_family: {target_family}");
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-    Ok(output)
+    Ok(SdkInstallResult::installed(output))
 }
 
-fn therock_pip_package_specs(package_versions: &TheRockPipPackageVersions) -> Vec<String> {
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    device_target: &str,
+) -> Vec<String> {
+    let device_extra = format!("device-{device_target}");
     vec![
-        format!("rocm[libraries,devel]=={}", package_versions.rocm),
-        format!("torch=={}", package_versions.torch),
-        format!("torchvision=={}", package_versions.torchvision),
+        format!(
+            "rocm[libraries,devel,{device_extra}]=={}",
+            package_versions.rocm
+        ),
+        format!("torch[{device_extra}]=={}", package_versions.torch),
+        format!(
+            "torchvision[{device_extra}]=={}",
+            package_versions.torchvision
+        ),
         format!("torchaudio=={}", package_versions.torchaudio),
     ]
+}
+/// The exact install intent for `resolution` and its source-validated device target.
+///
+/// Kept beside [`therock_pip_package_specs`] so the specs that identify a
+/// runtime are, by construction, the specs that get installed.
+fn wheel_runtime_composition(
+    resolution: &PipRuntimeResolution,
+    device_target: &AggregateDeviceTarget,
+) -> WheelRuntimeComposition {
+    WheelRuntimeComposition {
+        source_layout_generation: resolution.layout.generation().to_owned(),
+        package_specs: therock_pip_package_specs(
+            &resolution.package_versions,
+            device_target.as_str(),
+        ),
+        rocm_sdk_target: matches!(device_target, AggregateDeviceTarget::Exact(_))
+            .then(|| device_target.as_str().to_owned()),
+    }
+}
+
+/// The GFX target a recorded composition installed, read back out of its
+/// `rocm[...,device-<target>]` requirement.
+///
+/// Update planning needs the target the runtime was built with, not the one this
+/// host happens to report now; storing the specs verbatim means that answer
+/// survives without a second manifest field to keep in sync.
+fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>) -> Option<&str> {
+    let composition = composition?;
+    composition.rocm_sdk_target.as_deref().or_else(|| {
+        composition.package_specs.iter().find_map(|spec| {
+            let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+            extras
+                .split(',')
+                .map(str::trim)
+                .find_map(|extra| extra.strip_prefix("device-"))
+        })
+    })
 }
 
 fn quote_display_arg(value: &str) -> String {
@@ -1033,28 +2088,523 @@ fn quote_display_arg(value: &str) -> String {
     }
 }
 
+/// Describe the managed runtime this install would displace as the active
+/// default: the one the runtime config's `active_runtime_key` (or an
+/// unambiguous `default_runtime_id`) currently resolves to. Returns `None` only
+/// when neither config pointer points at an active default — a genuinely fresh
+/// install, where the new runtime takes a slot nothing occupies and there is
+/// nothing to consent to.
+///
+/// Deliberately NOT scoped to the target family and channel. Activation is
+/// global: `finalize_successful_sdk_install` activates whatever was just
+/// installed regardless of family or channel, so `rocm install sdk --family
+/// gfx120X-all` displaces an active `gfx110X-all` runtime just as surely as a
+/// same-family upgrade does. A family/channel-scoped gate would wave exactly
+/// that case through unconfirmed while every message promised otherwise.
+///
+/// Errors reading the manifest directory or the config are propagated rather
+/// than treated as "no active default": silently falling back to a
+/// fresh-install verdict on a read error would skip the confirmation gate
+/// precisely when we are least sure what is currently active.
+///
+/// The same reasoning covers the ways an active default can fail to resolve
+/// without any I/O error at all, and all of them used to reach the
+/// fresh-install verdict. `current_runtime_manifest` resolves through two
+/// pointers — `active_runtime_key` first, then `default_runtime_id` — and each
+/// has its own failure shapes:
+///
+/// * a registry manifest that reads fine but does not deserialize —
+///   `load_runtime_manifests` drops those silently, so a manifest written by an
+///   older binary (`family_source`, `selected_artifact_url` and
+///   `installed_at_unix_ms` carry no `#[serde(default)]`) vanishes from the
+///   list and `current_runtime_manifest` misses;
+/// * `active_runtime_key` naming a runtime whose manifest is not in the
+///   registry at all;
+/// * `default_runtime_id` matching no installed manifest — `runtime_id` is not
+///   version-scoped, and `rocm config set-default-runtime` stores whatever it
+///   is handed without validating it against the registry;
+/// * `default_runtime_id` matching more than one installed manifest, which is
+///   the ordinary state once two versions of the same family are installed,
+///   because they share the one `therock-<channel>:<family>` id.
+///   `current_runtime_manifest` resolves only an exactly-one match, so both the
+///   zero-match and the multi-match shapes arrive here.
+///
+/// Every one of these is something `rocm runtimes list` already calls out, as
+/// `active_status: missing manifest for active_runtime_key=...`,
+/// `active_status: missing manifest for active_runtime_id=...` or
+/// `active_status: ambiguous runtime_id=...`, so proceeding as a fresh install
+/// would have one CLI assert both that a runtime is active and that none is.
+/// These fail closed into the consent gate rather than into a hard error, so
+/// `--approve-replacing-active-default` (or `--yes`) still gets an operator
+/// through a stale or ambiguous config.
+fn active_default_runtime_relation(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+) -> Result<Option<String>> {
+    let (manifests, unparsed) = load_runtime_manifests_reporting_unparsed(paths)?;
+    let config = RocmCliConfig::load(paths)?;
+    let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
+        return Ok(unresolved_active_default_relation_text(
+            config.active_runtime_key.as_deref(),
+            config.default_runtime_id.as_deref(),
+            crate::default_runtime_id_matches(&config, &manifests).len(),
+            &unparsed,
+        ));
+    };
+    Ok(Some(active_default_relation_text(
+        active,
+        channel,
+        family,
+        resolved_version,
+    )))
+}
+
+/// Wording for the fail-closed half of [`active_default_runtime_relation`]:
+/// nothing resolved, but the on-disk state says something should have.
+///
+/// `None` here is the only genuinely fresh verdict, and it needs *neither*
+/// config pointer to claim an active default: with no `active_runtime_key` and
+/// no `default_runtime_id`, neither pointer asserts that a runtime is active,
+/// so an unparsable manifest is a registry wart rather than a displacement
+/// risk and demanding a consent flag would be a false positive on a genuinely
+/// fresh install. Once a pointer does claim something, anything unresolved
+/// names what could not be resolved, because the relation string is what the
+/// prompt, the preapproved progress line and the non-interactive refusal all
+/// print, and "unknown" is the honest answer the operator needs to see.
+///
+/// `default_runtime_id_match_count` is the number of installed manifests whose
+/// `runtime_id` equals `default_runtime_id`. The caller only reaches this
+/// function when resolution failed, so that count is 0 (dangling) or greater
+/// than 1 (ambiguous) — an exactly-one match is what
+/// `current_runtime_manifest` resolves successfully.
+///
+/// `unparsed` is reported two different ways on purpose. An entry is only the
+/// *cause* of an unresolved `active_runtime_key` when it is that key's own
+/// manifest; every other unreadable entry is a separate registry wart that
+/// happens to be visible at the same time, so it is appended as a suffix rather
+/// than named as the reason. Blaming an unrelated file — the ordinary
+/// older-binary manifest is exactly that — would point the operator at the
+/// wrong path while a deleted runtime went unmentioned.
+///
+/// Both config pointers are named when both are set. `current_runtime_manifest`
+/// tries `active_runtime_key` first and falls through to `default_runtime_id`,
+/// so arriving here means *both* failed, and the message is what the prompt,
+/// the preapproved progress line and the non-interactive refusal print: it has
+/// to name everything that could not be resolved, not just the first pointer.
+fn unresolved_active_default_relation_text(
+    active_runtime_key: Option<&str>,
+    default_runtime_id: Option<&str>,
+    default_runtime_id_match_count: usize,
+    unparsed: &[PathBuf],
+) -> Option<String> {
+    let unparsed_text = || {
+        unparsed
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let unparsed_suffix = || {
+        if unparsed.is_empty() {
+            String::new()
+        } else {
+            format!("; unreadable runtime manifests: {}", unparsed_text())
+        }
+    };
+    let non_empty = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    // The registry stores each manifest at `<runtime_key>.json`
+    // (`runtime_manifest_path`), so the file stem is the key. Compared
+    // case-insensitively because that is how `current_runtime_manifest` matches
+    // `active_runtime_key` against `runtime_key`.
+    let key_manifest_is_unparsable = |key: &str| {
+        unparsed.iter().any(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(key))
+        })
+    };
+    // Reached only when `active_runtime_key` is also set and also unresolved, so
+    // this is always a continuation of the key clause, never a sentence by
+    // itself. The count is 0 or >1 for the reason given on the parameter.
+    //
+    // Pinned rather than left in prose because the else branch below states
+    // "no installed runtime manifest matches it" as fact: at exactly 1 that
+    // sentence is false, and the operator would be told nothing matched the
+    // recorded default while a manifest did — sending them to re-register a
+    // runtime that is already there.
+    debug_assert_ne!(
+        default_runtime_id_match_count, 1,
+        "an exactly-one match is what `current_runtime_manifest` resolves, so this function is unreachable with it"
+    );
+    let also_unresolved_id = |id: &str| {
+        if default_runtime_id_match_count > 1 {
+            format!(
+                "; the recorded default runtime_id `{id}` does not settle it either, because {default_runtime_id_match_count} installed runtime manifests match it"
+            )
+        } else {
+            format!(
+                "; the recorded default runtime_id `{id}` does not settle it either, because no installed runtime manifest matches it"
+            )
+        }
+    };
+
+    match (non_empty(active_runtime_key), non_empty(default_runtime_id)) {
+        (Some(key), id) => {
+            let cause = if key_manifest_is_unparsable(&key) {
+                format!("recorded as `{key}`, but its manifest could not be read")
+            } else {
+                format!("recorded as `{key}`, but no installed runtime manifest matches it")
+            };
+            Some(format!(
+                "{cause}, so what is currently active cannot be determined{}{}",
+                id.as_deref().map(also_unresolved_id).unwrap_or_default(),
+                unparsed_suffix()
+            ))
+        }
+        (None, Some(id)) if default_runtime_id_match_count > 1 => Some(format!(
+            "recorded as runtime_id `{id}`, which {default_runtime_id_match_count} installed runtime manifests match, so which one is currently active cannot be determined{}",
+            unparsed_suffix()
+        )),
+        (None, Some(id)) => Some(format!(
+            "recorded as runtime_id `{id}`, but no installed runtime manifest matches it, so what is currently active cannot be determined{}",
+            unparsed_suffix()
+        )),
+        (None, None) => None,
+    }
+}
+
+/// Pure wording for [`active_default_runtime_relation`].
+///
+/// Two shapes, because the two cases are not the same event. When the active
+/// default is the same family and channel the install targets, the version
+/// comparison is meaningful and the user wants to read "upgrade"/"downgrade"/
+/// "reinstall". When it is a different family or channel, comparing versions
+/// would invent a relation between two unrelated runtimes, so the text names
+/// what is actually being displaced instead.
+fn active_default_relation_text(
+    active: &InstalledRuntimeManifest,
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+) -> String {
+    if active.family == family && active.channel == channel.as_str() {
+        let relation = match compare_version_strings(resolved_version, &active.version) {
+            Ordering::Greater => "upgrade",
+            Ordering::Less => "downgrade",
+            Ordering::Equal => "reinstall",
+        };
+        format!(
+            "{relation} from installed {installed} ({key})",
+            installed = runtime_version_display(&active.version),
+            key = active.runtime_key
+        )
+    } else {
+        format!(
+            "replaces active default {installed} for family {active_family} on the {active_channel} channel ({key})",
+            installed = runtime_version_display(&active.version),
+            active_family = active.family,
+            active_channel = active.channel,
+            key = active.runtime_key
+        )
+    }
+}
+
+/// The host's legacy/system ROCm version when it is strictly newer than the
+/// version rocm-cli is about to install, otherwise `None`. Used to explain why a
+/// seemingly older wheel version is selected over the host's ROCm.
+fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
+    host_version_newer_than(detect_legacy_rocm_summary().version, resolved_version)
+}
+
+/// Pure core of [`host_rocm_version_newer_than`]: given the host's detected ROCm
+/// version (if any) and the version about to be installed, return the host
+/// version only when it is strictly newer. Split out from the filesystem probe so
+/// the newer-than decision is unit-testable without a real legacy ROCm on disk.
+fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
+    let host_version = host_version?;
+    // Only claim the host is newer when BOTH versions parse and the host is
+    // strictly greater. `parse_host_version` normalises the shapes hosts
+    // actually report — a build suffix (`7.2.4-98` -> 7.2.4) and a
+    // two-component report (`7.4` -> 7.4.0) — so those are compared, not
+    // discarded. Only a string that still fails to parse is "can't tell", and
+    // "can't tell" is never "newer". Falling back to a lexicographic compare
+    // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
+    // the third char), inventing a host-newer note that misleads the user.
+    let host_parsed = parse_host_version(&host_version)?;
+    let resolved_parsed = parse_host_version(resolved_version)?;
+    (host_parsed > resolved_parsed).then_some(host_version)
+}
+
+/// The wheel-path `version_note` body explaining why a host-newer legacy ROCm is
+/// passed over for the newest TheRock version that still has a matching PyTorch
+/// stack. Pure so the exact user-facing wording is unit-testable.
+fn wheel_host_version_note(host_version: &str, resolved_display: &str) -> String {
+    format!(
+        "this host reports ROCm {host_version}, but {resolved_display} is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override"
+    )
+}
+
+/// The tarball-path `version_note` body explaining why a host-newer legacy ROCm is
+/// passed over for the newest TheRock tarball for this GPU family.
+fn tarball_host_version_note(host_version: &str, resolved_display: &str) -> String {
+    format!(
+        "this host reports ROCm {host_version}, but {resolved_display} is the newest TheRock ROCm tarball for this GPU family, so it is selected"
+    )
+}
+
+/// The `warning` body surfaced when the repository's newest version has no
+/// installable PyTorch wheels for this Python/platform, so an older one is used.
+fn no_wheel_warning_message(newest: &str, resolved_display: &str) -> String {
+    format!(
+        "ROCm {newest} is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm {resolved_display} instead"
+    )
+}
+
+/// The repo's newest version when it is strictly newer than the version we are
+/// about to install — i.e. the newest release exists in the index but has no
+/// installable PyTorch wheels for this Python/platform, so an older one is used.
+/// Returns `None` when the newest version is the one being installed (or is
+/// unknown), so the caller only warns when there is a real gap.
+fn repo_version_without_wheels(
+    newest_repo: Option<&str>,
+    resolved_version: &str,
+) -> Option<String> {
+    let newest = newest_repo?;
+    match compare_version_strings(newest, resolved_version) {
+        Ordering::Greater => Some(newest.to_owned()),
+        _ => None,
+    }
+}
+
+/// Where an already-granted approval for displacing the active default came
+/// from. Carried rather than collapsed to a bare bool so the line the CLI
+/// prints can name the real source: `rocm update --apply` takes its approval
+/// from the runtime the user selected, not from a flag, so a message crediting
+/// `--yes` would name an approval that was never given. (`rocm update` does
+/// accept a `--yes` flag, but it is inert by its own documentation — applying
+/// never prompts — so it grants nothing to credit.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SdkInstallApprovalSource {
+    /// The user passed `--yes` to `rocm install sdk`, which also approves
+    /// installing required system packages with `sudo`.
+    AssumeYes,
+    /// `--approve-replacing-active-default` was passed: the narrow consent, and
+    /// the one ROCm CLI's own terminal-less surfaces (chat, MCP, `rocmd`, the
+    /// dashboard, onboarding) inject. Kept distinct from `AssumeYes` so the
+    /// install log names the flag that was actually given — those surfaces never
+    /// pass `--yes`, and a line crediting it would tell a reader that consent to
+    /// run `sudo` had been granted when it was not.
+    ApproveReplacingActiveDefault,
+    /// `rocm update --apply`, which owns its own consent: the user named the
+    /// runtime to update, so replacing it is the operation asked for. Non-
+    /// interactive by construction, so it must never reach a prompt.
+    ///
+    /// `activates` records whether `--activate` was given. Only then does the
+    /// new install become the active default; without it `apply_runtime_update`
+    /// leaves the current default alone and prints a `runtimes activate` hint.
+    UpdateApply { activates: bool },
+}
+
+/// How consent for displacing the active default runtime is obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SdkInstallConsent {
+    /// Ask the user: prompt when a terminal is attached, refuse when not.
+    Ask,
+    /// Already granted before the install started, by the named source.
+    Preapproved(SdkInstallApprovalSource),
+}
+
+/// Whether a real SDK install needs the user's approval before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SdkInstallApproval {
+    /// No active default runtime — nothing is displaced, so install without asking.
+    ProceedFresh,
+    /// An active default runtime exists and consent was already granted —
+    /// displace it without asking, crediting the source.
+    ProceedApproved(SdkInstallApprovalSource),
+    /// An active default runtime exists and there is a terminal — prompt before
+    /// displacing it.
+    PromptOverwrite,
+    /// An active default runtime exists but there is no terminal and no
+    /// preapproval — refuse.
+    RefuseNonInteractive,
+}
+
+/// Decide whether an SDK install proceeds, prompts, or is refused. Installs with
+/// no active default runtime to displace (`existing == false`) always proceed;
+/// displacing the active default needs consent, and outside an interactive
+/// terminal that consent must have been granted up front.
+const fn sdk_install_approval(
+    existing: bool,
+    consent: SdkInstallConsent,
+    interactive: bool,
+) -> SdkInstallApproval {
+    match (existing, consent) {
+        (false, _) => SdkInstallApproval::ProceedFresh,
+        (true, SdkInstallConsent::Preapproved(source)) => {
+            SdkInstallApproval::ProceedApproved(source)
+        }
+        (true, SdkInstallConsent::Ask) if interactive => SdkInstallApproval::PromptOverwrite,
+        (true, SdkInstallConsent::Ask) => SdkInstallApproval::RefuseNonInteractive,
+    }
+}
+
+/// The progress line printed when an install displaces the active default
+/// without asking. Pure so the exact wording is pinned by unit tests.
+///
+/// Each arm states only what that caller will actually do. `update --apply`
+/// without `--activate` installs beside the active default and leaves it alone,
+/// so claiming the new install "becomes the active default runtime" there would
+/// be false — and crediting `--yes` would claim an approval the update path
+/// never received, since `rocm update`'s `--yes` is inert and its approval
+/// comes from the runtime selection instead.
+///
+/// `pub(crate)` so the `Update` subcommand's own test can pin that invariant at
+/// the site of the flag it must not credit.
+pub(crate) fn preapproved_install_line(
+    source: SdkInstallApprovalSource,
+    relation: &str,
+    resolved_display: &str,
+) -> String {
+    match source {
+        SdkInstallApprovalSource::AssumeYes => format!(
+            "Approved by --yes: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
+        SdkInstallApprovalSource::ApproveReplacingActiveDefault => format!(
+            "Approved by --approve-replacing-active-default: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
+        SdkInstallApprovalSource::UpdateApply { activates: true } => format!(
+            "Requested by `rocm update --apply --activate`: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display}, which becomes the active default runtime."
+        ),
+        SdkInstallApprovalSource::UpdateApply { activates: false } => format!(
+            "Requested by `rocm update --apply`: an existing ROCm SDK is the active default runtime ({relation}); installing ROCm {resolved_display} alongside it. The active default runtime is unchanged; re-run with --activate, or use `rocm runtimes activate`, to switch to it."
+        ),
+    }
+}
+
+/// The progress line printed when nothing is displaced. States only that no
+/// active default exists, because whether this install *becomes* the active
+/// default depends on the caller: `rocm install sdk` activates what it
+/// installed, `rocm update --apply` without `--activate` does not.
+fn fresh_install_line(resolved_display: &str, family: &str) -> String {
+    format!(
+        "No active ROCm SDK runtime is configured; installing ROCm SDK {resolved_display} for family {family}."
+    )
+}
+
+/// The error raised when the active default would be displaced but there is no
+/// terminal to confirm it and no preapproval.
+///
+/// This is the only message a script or CI job sees when it hits this gate, so
+/// it names the narrow flag first: that is the whole consent the caller needs
+/// here, and recommending `--yes` instead would hand an unattended caller the
+/// second consent it carries — approval to install system packages with `sudo`,
+/// whose password prompt a job with no terminal cannot answer. `--yes` is still
+/// named, because a user at a terminal who wants both should not have to
+/// discover it elsewhere.
+fn refuse_non_interactive_message(relation: &str) -> String {
+    format!(
+        "an existing ROCm SDK is the active default runtime ({relation}); continuing would make the newly installed ROCm the active default runtime instead. Re-run with --approve-replacing-active-default to approve this non-interactively, for example `rocm install sdk --approve-replacing-active-default`. Use --yes instead only if you also want to approve installing required system packages with sudo, which needs a terminal to answer a password prompt"
+    )
+}
+
+/// Interactive confirmation gate for displacing the active default managed
+/// runtime. Prints what would be replaced, then reads a yes/no answer from
+/// stdin. Only reached when an active default runtime exists, consent was not
+/// preapproved, and a terminal is attached (see `sdk_install_approval`).
+///
+/// "Displacing" rather than "overwriting" is deliberate: in the default managed
+/// install root `runtime_key` embeds the resolved version, so an upgrade or
+/// downgrade lands in its own install root with its own manifest and the previous
+/// install stays on disk — what changes is which runtime is the active default.
+/// Only a same-version reinstall reuses the same root. The prompt says so instead
+/// of claiming a deletion that does not happen.
+///
+/// `--prefix` is the exception and the prompt does not claim otherwise:
+/// `resolved_install_root` uses the given folder verbatim for every version, so
+/// a second install into one prefix does replace the first in place (and
+/// `ensure_uv_venv` will `remove_dir_all` it outright if the existing venv's
+/// python no longer answers `--version`). The gate is unchanged either way —
+/// what is being consented to is the change of active default, not a deletion.
+fn confirm_overwrite_existing_sdk(
+    channel: TheRockChannel,
+    family: &str,
+    resolved_version: &str,
+    relation: &str,
+) -> Result<bool> {
+    println!("sdk install: an existing ROCm SDK is the active default runtime");
+    println!("  active default runtime: {relation}");
+    println!(
+        "  replacing with: ROCm {} for family {family} ({} channel)",
+        runtime_version_display(resolved_version),
+        channel.as_str()
+    );
+    println!(
+        "  effect: this install becomes the active default runtime, overriding the current default"
+    );
+    // The host-newer ROCm explanation is already emitted as a visible progress
+    // line before this prompt on the real install path, so it is not repeated
+    // here.
+    prompt_yes_no("Replace the existing ROCm SDK as the active default? [y/N]: ")
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush confirmation prompt")?;
+    let mut response = String::new();
+    std::io::stdin()
+        .read_line(&mut response)
+        .context("failed to read confirmation response")?;
+    let normalized = response.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn install_tarball_runtime(
     paths: &AppPaths,
     channel: TheRockChannel,
     prefix: Option<PathBuf>,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     dry_run: bool,
-) -> Result<String> {
-    let artifact = resolve_tarball_artifact(paths, channel, family_override)?;
+    consent: SdkInstallConsent,
+) -> Result<SdkInstallResult> {
+    let artifact = resolve_tarball_artifact(
+        paths,
+        channel,
+        family_override,
+        version_selector,
+        layout_override,
+    )?;
     let runtime_key = runtime_key(
         channel,
         "tarball",
         &artifact.family,
         Some(&artifact.version),
     );
-    let install_root =
-        prefix.unwrap_or_else(|| managed_runtime_root(paths, "tarball", &runtime_key));
+    let install_root = resolved_install_root(paths, "tarball", &runtime_key, prefix);
     let manifest_path = runtime_manifest_path(paths, &runtime_key);
     let cache_path = paths.cache_dir.join("therock").join(&artifact.file_name);
 
     let mut output = String::new();
     let _ = writeln!(output, "sdk install");
-    let _ = writeln!(output, "  channel: {}", channel.as_str());
+    render_canonical_provenance(
+        &mut output,
+        channel,
+        &artifact.catalog_url,
+        artifact.layout.generation(),
+        &artifact.version,
+    );
     let _ = writeln!(output, "  format: tarball");
     let _ = writeln!(output, "  family: {}", artifact.family);
     let _ = writeln!(output, "  family_source: {}", artifact.family_source);
@@ -1065,13 +2615,72 @@ fn install_tarball_runtime(
         "  latest_version: {}",
         runtime_version_display(&artifact.version)
     );
+    // Probed once and reused by the progress line below; see the wheel path.
+    let host_version_newer = host_rocm_version_newer_than(&artifact.version);
+    if let Some(host_version) = host_version_newer.as_deref() {
+        let _ = writeln!(
+            output,
+            "  version_note: {}",
+            tarball_host_version_note(host_version, &runtime_version_display(&artifact.version))
+        );
+    }
     let _ = writeln!(output, "  target: {}", install_root.display());
     let _ = writeln!(output, "  cache_path: {}", cache_path.display());
     let _ = writeln!(output, "  runtime_key: {runtime_key}");
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
         let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-        return Ok(output);
+        return Ok(SdkInstallResult::plan(output));
+    }
+
+    // Mirror the wheel path: surface the host-newer ROCm explanation as a visible
+    // line so "why this version and not the host's newer ROCm" is in the install
+    // log rather than only in the trailing summary block.
+    if let Some(host_version) = host_version_newer.as_deref() {
+        progress_line(format!(
+            "Note: this host reports ROCm {host_version}, but ROCm {resolved} is the newest TheRock ROCm tarball for this GPU family; installing {resolved}.",
+            resolved = runtime_version_display(&artifact.version)
+        ));
+    }
+
+    // Same gate as the wheel path: only an install that would displace the
+    // current active default runtime asks for confirmation, and it asks
+    // regardless of family or channel because activation is global.
+    let existing =
+        active_default_runtime_relation(paths, channel, &artifact.family, &artifact.version)?;
+    match sdk_install_approval(existing.is_some(), consent, interactive_terminal()) {
+        SdkInstallApproval::ProceedFresh => {
+            progress_line(fresh_install_line(
+                &runtime_version_display(&artifact.version),
+                &artifact.family,
+            ));
+        }
+        SdkInstallApproval::ProceedApproved(source) => {
+            progress_line(preapproved_install_line(
+                source,
+                existing.as_deref().unwrap_or_default(),
+                &runtime_version_display(&artifact.version),
+            ));
+        }
+        SdkInstallApproval::PromptOverwrite => {
+            if !confirm_overwrite_existing_sdk(
+                channel,
+                &artifact.family,
+                &artifact.version,
+                existing.as_deref().unwrap_or_default(),
+            )? {
+                let _ = writeln!(
+                    output,
+                    "  status: cancelled by user; the existing ROCm SDK was left unchanged"
+                );
+                return Ok(SdkInstallResult::plan(output));
+            }
+        }
+        SdkInstallApproval::RefuseNonInteractive => {
+            bail!(refuse_non_interactive_message(
+                existing.as_deref().unwrap_or_default()
+            ));
+        }
     }
 
     fs::create_dir_all(paths.cache_dir.join("therock"))?;
@@ -1087,8 +2696,21 @@ fn install_tarball_runtime(
         let _ = writeln!(output, "  {warning}");
     }
 
-    download_file(&artifact.url, &cache_path)?;
-    extract_tarball_and_discard_archive(&cache_path, &install_root)?;
+    let download_label = format!("Downloading {}…", artifact.file_name);
+    let spinner = crate::cli_progress::AnimatedSpinner::start(download_label.clone());
+    let download_result = download_file(&artifact.url, &cache_path, &mut |bytes, total| {
+        spinner.set_progress(&download_label, bytes, total);
+    });
+    drop(spinner);
+    download_result?;
+
+    let extract_spinner =
+        crate::cli_progress::AnimatedSpinner::start(format!("Extracting {}…", artifact.file_name));
+    let extract_result = extract_tarball_and_discard_archive(&cache_path, &install_root);
+    drop(extract_spinner);
+    if let Some(cleanup_warning) = extract_result? {
+        progress_line(cleanup_warning);
+    }
 
     let manifest = InstalledRuntimeManifest {
         runtime_key: runtime_key.clone(),
@@ -1100,12 +2722,15 @@ fn install_tarball_runtime(
         version: artifact.version.clone(),
         install_root: install_root.clone(),
         selected_artifact_url: artifact.url.clone(),
+        source_layout_generation: Some(artifact.layout.generation().to_owned()),
         index_url: None,
         tarball_file_name: Some(artifact.file_name.clone()),
         python_launcher: None,
         python_executable: None,
         pip_cache_dir: None,
         rocm_sdk: None,
+        sdk_torch: None,
+        wheel_composition: None,
         read_only: false,
         imported_from: None,
         installed_at_unix_ms: unix_time_millis(),
@@ -1114,7 +2739,7 @@ fn install_tarball_runtime(
 
     let _ = writeln!(output, "  extracted: {}", install_root.display());
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
-    Ok(output)
+    Ok(SdkInstallResult::installed(output))
 }
 
 fn resolve_pip_runtime(
@@ -1123,6 +2748,7 @@ fn resolve_pip_runtime(
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
 ) -> Result<PipRuntimeResolution> {
     resolve_pip_runtime_with_timeout(
         paths,
@@ -1130,57 +2756,94 @@ fn resolve_pip_runtime(
         family_override,
         wheel_compatibility,
         version_selector,
+        layout_override,
         None,
     )
 }
 
+/// `layout_override` is how an update keeps a runtime on the stream it was
+/// installed from; a fresh install passes `None` and lets the request decide.
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_with_timeout(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
-    let index_urls = therock_index_urls(channel, &family_resolution.family);
-    let mut errors = Vec::new();
-    for index_url in index_urls {
-        match resolve_pip_runtime_from_index(
-            paths,
-            channel,
-            &family_resolution,
-            &index_url,
-            wheel_compatibility,
-            version_selector,
-            download_timeout_secs,
-        ) {
-            Ok(resolution) => return Ok(resolution),
-            Err(error) => errors.push(format!("{index_url}: {error}")),
-        }
-    }
-    bail!(
-        "failed to resolve TheRock {} wheel runtime from candidate indexes:\n  - {}\n\n{}",
-        channel.as_str(),
-        errors.join("\n  - "),
-        family_resolution_hint(
-            &family_resolution.source,
-            &family_resolution.family,
-            channel,
-            "wheel",
+    let layout = match layout_override {
+        Some(layout) => layout,
+        None => select_source_layout(channel, &family_resolution, version_selector)?,
+    };
+    let source = resolve_source(channel, layout);
+    let root_url = format!("{}/", source.wheel_index.trim_end_matches('/'));
+    // Distinct cache keys per layout: the two streams answer the same request
+    // with different package sets, so one must never serve the other's listing.
+    let root_cache_key = match layout {
+        SourceLayout::Canonical => format!("canonical-wheel-root-{}", channel.as_str()),
+        SourceLayout::Next => format!("next-wheel-root-{}", channel.as_str()),
+    };
+    let root_html =
+        download_text_cached(paths, &root_cache_key, &root_url, download_timeout_secs)?.text;
+    validate_aggregate_index_layout(&root_html).with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}",
+            channel.as_str(),
+            source.wheel_index
         )
+    })?;
+    let published_device_targets = parse_aggregate_device_targets(&root_html);
+    // The canonical stream validates against what this host reports, exactly as
+    // before. The next layout is reachable only through an explicit pin that
+    // already carried a validated exact arch, and that arch — not a second probe
+    // of whatever card happens to be plugged in — is what the pin asked to
+    // install for.
+    let detected_target = match layout {
+        SourceLayout::Canonical => detect_host_gfx_target(),
+        SourceLayout::Next => family_resolution.raw_arch.clone(),
+    };
+    let source = ResolvedAggregateWheelSource {
+        index_url: source.wheel_index,
+        layout,
+        device_target: AggregateDeviceTarget::resolve(
+            detected_target.as_deref(),
+            &family_resolution.family,
+            &published_device_targets,
+        ),
+        published_device_targets,
+    };
+    resolve_pip_runtime_from_index(
+        paths,
+        channel,
+        &family_resolution,
+        &source,
+        wheel_compatibility,
+        version_selector,
+        download_timeout_secs,
     )
+    .with_context(|| {
+        format!(
+            "failed to resolve TheRock {} wheel runtime from canonical source {}\n\n{}",
+            channel.as_str(),
+            source.index_url,
+            canonical_wheel_resolution_hint(channel)
+        )
+    })
 }
 
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_resolution: &FamilyResolution,
-    index_url: &str,
+    source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
+    let index_url = source.index_url.as_str();
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -1193,48 +2856,99 @@ fn resolve_pip_runtime_from_index(
             "release channel only installs stable TheRock wheel versions, but no stable `rocm` package versions were found in {index_url}; try `rocm install sdk --channel release --format tarball` for stable release artifacts, or use `--channel nightly --format wheel` for preview builds"
         );
     }
-    let torch_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torch",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchvision_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchvision",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let torchaudio_versions = load_simple_index_versions(
-        paths,
-        index_url,
-        "torchaudio",
-        Some(wheel_compatibility),
-        download_timeout_secs,
-    )?;
-    let package_versions = select_matching_pip_package_versions(
-        channel,
-        &rocm_versions,
-        &torch_versions,
-        &torchvision_versions,
-        &torchaudio_versions,
-        version_selector,
-    )
-    .with_context(|| {
-        let requested = version_selector.map_or_else(|| "latest compatible version".to_owned(), RuntimeVersionSelector::describe);
-        format!(
-            "no mutually compatible TheRock rocm[libraries,devel], torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+    let package_versions = if matches!(source.layout, SourceLayout::Next) {
+        let device_target = match &source.device_target {
+            AggregateDeviceTarget::Exact(target) => target.as_str(),
+            AggregateDeviceTarget::Undetermined(reason) => {
+                bail!(
+                    "cannot resolve ROCm X package metadata without an exact device target: {reason}"
+                )
+            }
+        };
+        let rocm_version = select_rocm_version(channel, &rocm_versions, version_selector)
+            .with_context(|| {
+                let requested = version_selector.map_or_else(
+                    || "latest compatible version".to_owned(),
+                    RuntimeVersionSelector::describe,
+                );
+                format!("no TheRock rocm package was found for {requested} in {index_url}")
+            })?;
+        // The canonical branch below budgets one `download_timeout_secs` per
+        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
+        // fetches). `uv pip compile` resolves that same four-package metadata
+        // set in one subprocess call, so it needs a comparable aggregate
+        // budget, not the single-fetch one — reusing the bare per-fetch value
+        // here would make a startup check that budgets 2s per fetch reliably
+        // time out a call doing 4 fetches' worth of work.
+        resolve_published_pip_package_versions(
+            paths,
+            index_url,
+            &rocm_version,
+            device_target,
+            wheel_compatibility,
+            download_timeout_secs.map(|secs| secs.saturating_mul(4)),
+        )?
+    } else {
+        let torch_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torch",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchvision_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchvision",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        select_matching_pip_package_versions(
+            channel,
+            &rocm_versions,
+            &torch_versions,
+            &torchvision_versions,
+            &torchaudio_versions,
+            version_selector,
         )
-    })?;
+        .with_context(|| {
+            let requested = version_selector.map_or_else(
+                || "latest compatible version".to_owned(),
+                RuntimeVersionSelector::describe,
+            );
+            format!(
+                "no mutually compatible TheRock rocm, torch, torchvision, and torchaudio versions were found for {requested} in {index_url}"
+            )
+        })?
+    };
     let latest_version = package_versions.rocm.clone();
+    // The repo's newest version for this channel, ignoring wheel availability.
+    // Only meaningful when we auto-selected "latest" (no explicit request), so a
+    // caller can warn when that newest version has no installable wheels.
+    let newest_repo_version = if version_selector.is_none() {
+        channel_rocm_candidates(&rocm_versions, channel)
+            .into_iter()
+            .last()
+    } else {
+        None
+    };
     Ok(PipRuntimeResolution {
         family: family_resolution.family.clone(),
         family_source: family_resolution.source.clone(),
         index_url: index_url.to_owned(),
+        layout: source.layout,
         latest_version,
+        newest_repo_version,
         package_versions,
+        device_target: source.device_target.clone(),
+        published_device_targets: source.published_device_targets.clone(),
     })
 }
 
@@ -1242,51 +2956,61 @@ fn resolve_tarball_artifact(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
 ) -> Result<TarballArtifact> {
-    resolve_tarball_artifact_with_timeout(paths, channel, family_override, None)
+    resolve_tarball_artifact_with_timeout(
+        paths,
+        channel,
+        family_override,
+        version_selector,
+        layout_override,
+        None,
+    )
 }
 
 fn resolve_tarball_artifact_with_timeout(
     paths: &AppPaths,
     channel: TheRockChannel,
     family_override: Option<&str>,
+    version_selector: Option<&RuntimeVersionSelector>,
+    layout_override: Option<SourceLayout>,
     download_timeout_secs: Option<u64>,
 ) -> Result<TarballArtifact> {
     let family_resolution = resolve_family(paths, family_override)?;
+    let layout = match layout_override {
+        Some(layout) => layout,
+        None => select_source_layout(channel, &family_resolution, version_selector)?,
+    };
+    let source = resolve_source(channel, layout);
+    let catalog_cache_key = match layout {
+        SourceLayout::Canonical => format!("tarball-index-{}", channel.as_str()),
+        SourceLayout::Next => format!("next-tarball-index-{}", channel.as_str()),
+    };
     let html = download_text_cached(
         paths,
-        &format!("tarball-index-{}", channel.as_str()),
-        channel.tarball_base_url(),
+        &catalog_cache_key,
+        &source.tarball_catalog,
         download_timeout_secs,
     )?
     .text;
-    let files = parse_tarball_index_html(&html)?;
-    let prefix = format!(
-        "therock-dist-{}-{}-",
-        platform_tarball_token(),
-        family_resolution.family
-    );
-    let mut candidates = files
-        .into_iter()
-        .filter_map(|file| {
-            let version = file
-                .name
-                .strip_prefix(&prefix)?
-                .strip_suffix(".tar.gz")?
-                .to_owned();
-            Some((file, version))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        left.0
-            .mtime
-            .partial_cmp(&right.0.mtime)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| compare_version_strings(&left.1, &right.1))
-    });
-    let (file, version) = candidates.pop().with_context(|| {
+    let files = parse_tarball_index_html(&html).with_context(|| {
         format!(
-            "no matching TheRock tarball artifact was found for the resolved GPU family\n\n{}",
+            "unknown canonical TheRock tarball catalog layout at {}",
+            source.tarball_catalog
+        )
+    })?;
+    let (file, version) = select_tarball_candidate(
+        &files,
+        channel,
+        layout,
+        &family_resolution.family,
+        version_selector,
+    )
+    .with_context(|| {
+        format!(
+            "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
+            channel.as_str(),
             family_resolution_hint(
                 &family_resolution.source,
                 &family_resolution.family,
@@ -1300,12 +3024,113 @@ fn resolve_tarball_artifact_with_timeout(
         family_source: family_resolution.source,
         url: format!(
             "{}/{}",
-            channel.tarball_base_url().trim_end_matches('/'),
+            source.tarball_catalog.trim_end_matches('/'),
             file.name
         ),
+        catalog_url: source.tarball_catalog,
+        layout,
         file_name: file.name,
         version,
     })
+}
+
+/// The filename token a catalog spells `family` with.
+///
+/// ROCm 10's catalog renamed exactly one family's archive token; every other
+/// family keeps its canonical spelling. Confined here rather than pushed into
+/// [`normalize_therock_family`] so a filename quirk cannot leak into the family
+/// a manifest records or the extras a wheel install requests.
+fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
+    if matches!(layout, SourceLayout::Next) && family == "gfx103X-dgpu" {
+        "gfx103X-all"
+    } else {
+        family
+    }
+}
+
+/// The newest archive in `files` that this request can actually install.
+///
+/// The release channel's stable-version filter does double duty on the next
+/// catalog: that catalog publishes non-release siblings beside the real dist
+/// archive (`...-tests-10.0.0.tar.gz`) whose leftover suffix is not a version at
+/// all, and whose mtime is *later* than the archive they shadow, so an unfiltered
+/// "newest wins" would pick the wrong file. Requiring a parseable stable version
+/// excludes them without inventing a second grammar for the canonical catalogs,
+/// which publish no such siblings and have never been held to one.
+fn select_tarball_candidate(
+    files: &[TarballIndexFile],
+    channel: TheRockChannel,
+    layout: SourceLayout,
+    family: &str,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Option<(TarballIndexFile, String)> {
+    let prefix = format!(
+        "therock-dist-{}-{}-",
+        platform_tarball_token(),
+        tarball_family_token(layout, family)
+    );
+    let mut candidates = files
+        .iter()
+        .filter_map(|file| {
+            let version = file
+                .name
+                .strip_prefix(&prefix)?
+                .strip_suffix(".tar.gz")?
+                .to_owned();
+            if matches!(channel, TheRockChannel::Release) && !is_stable_runtime_version(&version) {
+                return None;
+            }
+            if version_selector.is_some_and(|selector| !selector.matches_version(&version)) {
+                return None;
+            }
+            Some((file.clone(), version))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .mtime
+            .partial_cmp(&right.0.mtime)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| compare_version_strings(&left.1, &right.1))
+    });
+    candidates.pop()
+}
+
+/// Whether `value` is an exact GFX arch code (`gfx1200`, `gfx90a`) rather than
+/// a grouped family label (`gfx120X-all`) or prose with a gfx token in it.
+///
+/// Deliberately stricter than [`extract_first_gfx_token`], which digs a target
+/// out of noisy KFD output: a `--family` value is only evidence of an exact arch
+/// when the user typed exactly one, and `gfx120X-all` normalizing to a family
+/// must not be mistaken for naming a member of it.
+fn is_raw_gfx_arch_code(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("gfx") else {
+        return false;
+    };
+    let Some(last) = rest.len().checked_sub(1) else {
+        return false;
+    };
+    rest.bytes()
+        .enumerate()
+        .all(|(index, byte)| byte.is_ascii_digit() || (index == last && byte.is_ascii_lowercase()))
+}
+
+fn family_override_raw_arch(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    is_raw_gfx_arch_code(trimmed).then(|| trimmed.to_ascii_lowercase())
+}
+
+/// A host-probed arch, kept only when it belongs to the family some more
+/// authoritative source already resolved.
+///
+/// A managed runtime's manifest records the family but never the arch, so the
+/// arch can only be recovered by probing this host. That probe is trustworthy
+/// exactly when it agrees: a second card, or a machine the runtime was moved to,
+/// reports an arch from a different family, and installing its device payload
+/// would produce a runtime that cannot run the family's kernels.
+fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Option<String> {
+    raw_arch.filter(|raw| normalize_therock_family(raw).as_deref() == Some(family))
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
@@ -1315,6 +3140,7 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "manifest".to_owned(),
+            raw_arch: family_override_raw_arch(value),
         });
     }
 
@@ -1324,20 +3150,26 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         return Ok(FamilyResolution {
             family,
             source: "env".to_owned(),
+            raw_arch: family_override_raw_arch(&value),
         });
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
+        let raw_arch = raw_arch_agreeing_with_family(detect_host_gfx_target(), &family);
         return Ok(FamilyResolution {
             family,
             source: "managed-runtime".to_owned(),
+            raw_arch,
         });
     }
 
-    if let Some(family) = detect_host_therock_family() {
+    if let Some(raw_arch) = detect_host_gfx_target()
+        && let Some(family) = normalize_therock_family(&raw_arch)
+    {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
+            raw_arch: Some(raw_arch),
         });
     }
 
@@ -1348,6 +3180,219 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
     )
+}
+
+fn select_rocm_version(
+    channel: TheRockChannel,
+    rocm_versions: &[String],
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Option<String> {
+    let mut candidates = if version_selector.is_some() {
+        rocm_versions.to_vec()
+    } else {
+        channel_rocm_candidates(rocm_versions, channel)
+    };
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates.sort_by(|left, right| compare_version_strings(left, right));
+    candidates.pop()
+}
+
+fn uv_python_version(compatibility: &WheelCompatibility) -> Result<String> {
+    let digits = compatibility
+        .python_tag
+        .strip_prefix("cp")
+        .context("managed Python reported an unsupported wheel tag")?;
+    if digits.len() < 2 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!(
+            "managed Python reported unsupported wheel tag `{}`",
+            compatibility.python_tag
+        );
+    }
+    Ok(format!("{}.{}", &digits[..1], &digits[1..]))
+}
+
+fn uv_python_platform(compatibility: &WheelCompatibility) -> Result<&'static str> {
+    if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "win_amd64")
+    {
+        Ok("x86_64-pc-windows-msvc")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_x86_64")
+    {
+        Ok("x86_64-unknown-linux-gnu")
+    } else if compatibility
+        .platform_tags
+        .iter()
+        .any(|tag| tag == "linux_aarch64")
+    {
+        Ok("aarch64-unknown-linux-gnu")
+    } else {
+        bail!(
+            "managed Python reported unsupported platform wheel tags: {}",
+            compatibility.platform_tags.join(",")
+        )
+    }
+}
+
+fn parse_uv_compiled_package_versions(output: &str) -> Result<TheRockPipPackageVersions> {
+    let mut versions = std::collections::HashMap::new();
+    for line in output.lines().map(str::trim) {
+        let Some((name, version)) = line.split_once("==") else {
+            continue;
+        };
+        versions.insert(name.to_ascii_lowercase(), version.to_owned());
+    }
+    let required = |name: &str| {
+        versions
+            .get(name)
+            .cloned()
+            .with_context(|| format!("uv metadata resolution did not pin `{name}`"))
+    };
+    let rocm = required("rocm")?;
+    let torch = required("torch")?;
+    let torchvision = required("torchvision")?;
+    let torchaudio = required("torchaudio")?;
+    for (name, version) in [
+        ("torch", torch.as_str()),
+        ("torchvision", torchvision.as_str()),
+        ("torchaudio", torchaudio.as_str()),
+    ] {
+        if package_rocm_suffix(version).as_deref() != Some(rocm.as_str()) {
+            bail!(
+                "published package metadata selected {name} {version}, which does not share ROCm build {rocm}"
+            );
+        }
+    }
+    Ok(TheRockPipPackageVersions {
+        compatibility_key: rocm.clone(),
+        rocm,
+        torch,
+        torchvision,
+        torchaudio,
+    })
+}
+
+/// Waits for `child` to exit, killing it and failing once `timeout` elapses.
+///
+/// `None` waits unbounded, matching an explicit user-invoked install with no
+/// budget to respect. Reads stdout/stderr on background threads throughout the
+/// wait so a slow or silent child can't deadlock the poll on a full pipe.
+fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Result<Output> {
+    let Some(timeout) = timeout else {
+        return child
+            .wait_with_output()
+            .context("failed to wait for child process");
+    };
+    let stdout_reader = child.stdout.take().map(|mut stdout| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll child process status")?
+        {
+            let stdout = stdout_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            let stderr = stderr_reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "timed out after {}s waiting for child process",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn resolve_published_pip_package_versions(
+    paths: &AppPaths,
+    index_url: &str,
+    rocm_version: &str,
+    device_target: &str,
+    compatibility: &WheelCompatibility,
+    download_timeout_secs: Option<u64>,
+) -> Result<TheRockPipPackageVersions> {
+    let uv =
+        ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
+    let python_version = uv_python_version(compatibility)?;
+    let python_platform = uv_python_platform(compatibility)?;
+    let device_extra = format!("device-{device_target}");
+    let requirements = format!(
+        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
+    );
+    let mut child = Command::new(&uv)
+        .args([
+            "pip",
+            "compile",
+            "-",
+            "--index-url",
+            index_url,
+            "--python-version",
+            &python_version,
+            "--python-platform",
+            python_platform,
+            "--no-header",
+            "--no-annotate",
+        ])
+        .envs(uv_command_env(paths))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to launch {} for ROCm X metadata resolution",
+                uv.display()
+            )
+        })?;
+    // ponytail: written before `wait_with_output_bounded` spawns its stdout/
+    // stderr reader threads, so a child that fills its stdout pipe before this
+    // write returns would deadlock outside the timeout below. `requirements`
+    // is a handful of short lines today; move the write onto its own thread
+    // (or start the readers first) if it ever grows enough to matter.
+    child
+        .stdin
+        .take()
+        .context("uv metadata resolver stdin was unavailable")?
+        .write_all(requirements.as_bytes())
+        .context("failed to send ROCm X requirements to uv")?;
+    let timeout = download_timeout_secs.map(Duration::from_secs);
+    let output = wait_with_output_bounded(child, timeout)
+        .context("failed to wait for ROCm X metadata resolution")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        bail!("published ROCm X package metadata is not jointly installable: {detail}");
+    }
+    parse_uv_compiled_package_versions(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn select_matching_pip_package_versions(
@@ -1819,7 +3864,12 @@ impl MetadataSignaturePolicy {
     }
 }
 
-fn truthy_env(name: &str) -> bool {
+/// Whether an environment variable is set to an affirmative value.
+///
+/// Deliberately an allowlist rather than "set to anything non-empty": the
+/// callers are opt-ins to weaker behaviour, so `=0` and `=false` must read as
+/// off rather than as "the variable is present, therefore yes".
+pub(crate) fn truthy_env(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|value| {
         matches!(
             value.trim(),
@@ -2148,24 +4198,29 @@ fn http_header_value(headers: &str, name: &str) -> Option<String> {
     value
 }
 
-/// Fetch an artifact to `destination`.
+/// Fetch an artifact to `destination`, reporting cumulative bytes written and
+/// (when known) the total size to `on_progress` as the transfer proceeds.
 ///
 /// Streams rather than buffers: SDK tarballs are single-digit gigabytes, and
 /// holding one in memory to write it out again costs that much RAM on top of
 /// the same amount of disk. The primitive also handles the free-space
 /// preflight, retry with resume, and the length cross-check that catches a
 /// transfer the server ended early.
-fn download_file(url: &str, destination: &Path) -> Result<()> {
+fn download_file(
+    url: &str,
+    destination: &Path,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<()> {
     let parent = destination
         .parent()
         .context("download destination has no parent directory")?;
     fs::create_dir_all(parent)?;
-    rocm_core::download_file_streaming(&rocm_core::DownloadRequest::new(
-        url,
-        destination,
-        THEROCK_DOWNLOAD_TIMEOUT,
-    ))
-    .with_context(|| format!("failed to fetch {url}"))?;
+    let request = rocm_core::DownloadRequest {
+        max_bytes: Some(THEROCK_MAX_PLAUSIBLE_TARBALL_BYTES),
+        ..rocm_core::DownloadRequest::new(url, destination, THEROCK_DOWNLOAD_TIMEOUT)
+    };
+    rocm_core::download_file_streaming_with_progress(&request, on_progress)
+        .with_context(|| format!("failed to fetch {url}"))?;
     Ok(())
 }
 
@@ -2222,10 +4277,12 @@ fn preflight_tarball_space(
         disk_space::with_margin(download_bytes),
     )?;
 
-    // When the cache and the install root share a filesystem, the archive and
-    // the extracted tree must both fit at the same time.
+    // When the cache and the install root share a mount, the archive and the
+    // extracted tree must both fit at the same time. Conservative in the other
+    // direction: two mounts backed by one filesystem also share a pool, and this
+    // treats them as separate, so the estimate can come in under the true need.
     let mut extract_estimate = disk_space::estimated_extracted_size(download_bytes);
-    if disk_space::on_same_filesystem(cache_path, install_root) == Some(true) {
+    if disk_space::on_same_mount(cache_path, install_root) == Some(true) {
         extract_estimate = extract_estimate.saturating_add(download_bytes);
     }
     Ok(disk_space::warn_if_low_space(
@@ -2243,7 +4300,15 @@ fn http_get(
     let timeout = max_time_secs
         .filter(|value| *value > 0)
         .map_or_else(|| Duration::from_mins(10), Duration::from_secs);
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    // Connecting should always be fast if the host is reachable at all, so cap it
+    // independently of the (possibly very generous, e.g. 10-minute default) overall
+    // timeout. Without this, a blackholed host stalls the connect phase for the full
+    // overall timeout on every request instead of failing fast.
+    let connect_timeout = timeout.min(Duration::from_secs(THEROCK_HEAD_PROBE_TIMEOUT_SECS));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(connect_timeout)
+        .timeout(timeout)
+        .build();
     let mut request = agent.get(url).set("User-Agent", "rocm-cli");
     for (name, value) in headers {
         request = request.set(name, value);
@@ -2264,11 +4329,18 @@ fn http_get(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut reader = response.into_reader();
+    let mut reader = response
+        .into_reader()
+        .take(THEROCK_MAX_METADATA_BYTES.saturating_add(1));
     let mut body = Vec::new();
     reader
         .read_to_end(&mut body)
         .with_context(|| format!("failed to read HTTP response body for {url}"))?;
+    if body.len() as u64 > THEROCK_MAX_METADATA_BYTES {
+        bail!(
+            "HTTP response body for {url} exceeded the approved metadata limit of {THEROCK_MAX_METADATA_BYTES} bytes"
+        );
+    }
     Ok(HttpResponseBody {
         status,
         headers,
@@ -2548,16 +4620,22 @@ fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
 /// `ensure_uv_binary` already performs after unpacking its own download.
 ///
 /// Removing the archive is best-effort: the install has already succeeded by
-/// this point, so a cleanup failure is reported rather than raised.
-fn extract_tarball_and_discard_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+/// this point, so a cleanup failure is non-fatal. The message is returned
+/// rather than printed directly, so callers running a progress spinner over
+/// this call can drop it first and avoid interleaving spinner frames with
+/// the report.
+fn extract_tarball_and_discard_archive(
+    archive_path: &Path,
+    target_dir: &Path,
+) -> Result<Option<String>> {
     extract_tarball(archive_path, target_dir)?;
     if let Err(error) = fs::remove_file(archive_path) {
-        progress_line(format!(
+        return Ok(Some(format!(
             "Could not remove the downloaded archive {}: {error}",
             archive_path.display()
-        ));
+        )));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn ensure_uv_venv(
@@ -2612,10 +4690,28 @@ fn python_venv_args(install_root: &Path) -> Vec<String> {
     ]
 }
 
+/// What `rocm_sdk` reports about an installed runtime.
+///
+/// A newly composed aggregate runtime is probed with the exact device payload
+/// selected from the canonical source. Without that input `rocm_sdk` may choose
+/// an unrelated default target even though only one device package was installed,
+/// producing library paths and a kernel check for the wrong GPU. Adopted legacy
+/// runtimes remain unforced so the probe reports their existing composition.
 pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdkPythonProbe> {
-    let text = capture_python_stdout(
+    probe_rocm_sdk_runtime_for_target(python_executable, None)
+}
+
+fn probe_rocm_sdk_runtime_for_target(
+    python_executable: &Path,
+    device_target: Option<&str>,
+) -> Result<RocmSdkPythonProbe> {
+    let env = device_target
+        .map(|target| vec![("ROCM_SDK_TARGET_FAMILY".to_owned(), target.to_owned())])
+        .unwrap_or_default();
+    let text = capture_python_stdout_with_env(
         python_executable,
         ROCM_SDK_PROBE_SCRIPT,
+        &env,
         "launch rocm_sdk probe",
     )
     .with_context(|| {
@@ -2629,6 +4725,264 @@ pub(crate) fn probe_rocm_sdk_runtime(python_executable: &Path) -> Result<RocmSdk
 
 fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
     serde_json::from_str(output.trim()).context("failed to parse rocm_sdk probe output")
+}
+
+/// What the runtime's torch reports about the GPUs it can actually open, and
+/// whether those GPUs can actually run a kernel.
+///
+/// [`validate_rocm_sdk_runtime_probe`] establishes that the SDK's libraries are
+/// present and resolvable. That is not the same question as whether the torch
+/// sharing the venv can enumerate a device: a torch built against a different
+/// HIP version loads happily against those libraries and then reports no
+/// devices at all.
+///
+/// Enumeration succeeding is in turn not the same question as the device being
+/// usable. A torch built against a different HIP version can enumerate the
+/// GPUs and then fault on the first kernel it launches, so the two failures are
+/// reported separately and must not be conflated.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct RuntimeDeviceProbe {
+    pub import_ok: bool,
+    pub torch_version: Option<String>,
+    pub hip_version: Option<String>,
+    /// `None` when torch never imported, so "unknown" stays distinct from "zero".
+    pub device_count: Option<u32>,
+    /// An import or enumeration failure. Never a kernel failure.
+    pub error: Option<String>,
+    /// A GPU kernel failure observed *after* devices enumerated successfully.
+    /// `None` when no kernel was attempted (no devices, or enumeration failed).
+    #[serde(default)]
+    pub kernel_error: Option<String>,
+}
+
+/// Ask the runtime's own interpreter how many devices its torch can open.
+///
+/// `library_paths` must be the runtime's recorded ROCm library directories (see
+/// [`RocmSdkPythonProbe::library_paths`]). They are prepended to
+/// `LD_LIBRARY_PATH` for the child, which is how a served process resolves them.
+///
+/// This cannot be replaced with an in-process `rocm_sdk.initialize_process()`
+/// call in the probe script. Measured on MI300X against a runtime that serves
+/// correctly: with the library directories on `LD_LIBRARY_PATH` torch reports 8
+/// devices, and with `initialize_process()` alone it reports 0. A probe built on
+/// the latter would fail healthy runtimes and send people to reinstall them,
+/// which is the operation that breaks them.
+pub(crate) fn probe_runtime_devices(
+    python_executable: &Path,
+    library_paths: &[PathBuf],
+) -> Result<RuntimeDeviceProbe> {
+    let mut env = Vec::new();
+    if !library_paths.is_empty() {
+        let mut entries = library_paths.to_vec();
+        if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
+            entries.extend(split_runtime_path(&existing));
+        }
+        let joined = std::env::join_paths(entries)
+            .context("failed to compose the runtime library path for the device probe")?;
+        env.push((
+            RUNTIME_LIBRARY_PATH_ENV.to_owned(),
+            joined.to_string_lossy().into_owned(),
+        ));
+    }
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        RUNTIME_DEVICE_PROBE_SCRIPT,
+        &env,
+        "launch runtime device probe",
+    )
+    .with_context(|| {
+        format!(
+            "failed to launch runtime device probe via {}",
+            python_executable.display()
+        )
+    })?;
+    parse_runtime_device_probe(&text)
+}
+
+fn parse_runtime_device_probe(output: &str) -> Result<RuntimeDeviceProbe> {
+    serde_json::from_str(output.trim()).context("failed to parse runtime device probe output")
+}
+
+/// Reports what torch sees, never raising: an unusable runtime must be
+/// described, not turned into a probe crash.
+const RUNTIME_DEVICE_PROBE_SCRIPT: &str = r#"
+import json
+
+out = {
+    "import_ok": False,
+    "torch_version": None,
+    "hip_version": None,
+    "device_count": None,
+    "error": None,
+    "kernel_error": None,
+}
+
+try:
+    import torch
+
+    out["import_ok"] = True
+    out["torch_version"] = getattr(torch, "__version__", None)
+    out["hip_version"] = getattr(getattr(torch, "version", None), "hip", None)
+    out["device_count"] = int(torch.cuda.device_count())
+except Exception as exc:
+    out["error"] = type(exc).__name__ + ": " + str(exc)
+
+# Enumeration is not execution. A runtime whose torch and HIP disagree can
+# report devices and then fault on the first kernel, so the kernel is launched
+# under its own guard and its failure is recorded in its own field. Only run it
+# once enumeration actually produced a device: with no devices there is nothing
+# to execute on, and a failed import has already been described.
+if out["error"] is None and (out["device_count"] or 0) > 0:
+    try:
+        probe = torch.ones(32, device="cuda")
+        probe.add_(1.0)
+        torch.cuda.synchronize()
+    except Exception as exc:
+        out["kernel_error"] = type(exc).__name__ + ": " + str(exc)
+
+print(json.dumps(out))
+"#;
+
+/// What torch is installed, and what torch the engine's metadata demands.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct TorchAlignmentProbe {
+    /// The installed torch, e.g. `2.11.0+rocm7.13.0`. `None` if torch is absent.
+    pub installed_torch: Option<String>,
+    /// The engine's pinned requirement, e.g. `torch==2.11.0+gitd0c8b1f`. `None`
+    /// when the engine is not installed yet or does not pin torch.
+    pub engine_requires_torch: Option<String>,
+}
+
+/// Read installed/required torch from distribution metadata, without importing
+/// torch. Metadata questions must not depend on the runtime being usable — this
+/// is called both before and after an engine install, and in the broken state
+/// importing torch is exactly what fails.
+pub(crate) fn probe_torch_alignment(
+    python_executable: &Path,
+    engine_distribution: &str,
+) -> Result<TorchAlignmentProbe> {
+    let env = vec![(
+        "ROCM_CLI_PROBE_DIST".to_owned(),
+        engine_distribution.to_owned(),
+    )];
+    let text = capture_python_stdout_with_env(
+        python_executable,
+        TORCH_ALIGNMENT_PROBE_SCRIPT,
+        &env,
+        "launch torch alignment probe",
+    )?;
+    serde_json::from_str(text.trim()).context("failed to parse torch alignment probe output")
+}
+
+const TORCH_ALIGNMENT_PROBE_SCRIPT: &str = r#"
+import json
+import os
+import re
+import importlib.metadata as md
+
+out = {"installed_torch": None, "engine_requires_torch": None}
+
+try:
+    out["installed_torch"] = md.version("torch")
+except Exception:
+    pass
+
+try:
+    for raw in md.requires(os.environ.get("ROCM_CLI_PROBE_DIST", "vllm")) or []:
+        # `Requires-Dist` entries carry environment markers after ';'. Only the
+        # requirement itself matters here.
+        requirement = raw.split(";")[0].strip()
+        # The distribution name runs up to the first specifier, extra or space —
+        # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
+        matched = re.match(r"[A-Za-z0-9._-]+", requirement)
+        if matched is None:
+            continue
+        if matched.group(0).lower().replace("_", "-") == "torch":
+            out["engine_requires_torch"] = requirement
+            break
+except Exception:
+    pass
+
+print(json.dumps(out))
+"#;
+
+/// Split a version into its public part and its local segment.
+///
+/// `2.11.0+rocm7.13.0` -> `("2.11.0", Some("rocm7.13.0"))`. The local segment is
+/// the build identifier: for TheRock wheels it names the ROCm build, and for the
+/// engine's own index it is an opaque commit tag.
+///
+/// Defined in `rocm-core` because the vLLM engine has to make the same split to
+/// recognise a runtime the CLI deliberately realigned; two copies of this would be
+/// two places for the two sides to drift apart.
+pub(crate) fn split_local_version(version: &str) -> (&str, Option<&str>) {
+    rocm_core::uv::split_local_version(version)
+}
+
+/// The version pinned by a `==` requirement, e.g. `torch==2.11.0+git…` -> the
+/// version. Returns `None` for any looser requirement, since only an exact pin
+/// tells us which release the engine was built against.
+pub(crate) fn requirement_pinned_version(requirement: &str) -> Option<&str> {
+    let (_, version) = requirement.split_once("==")?;
+    let version = version.trim();
+    if version.is_empty() || version.contains(',') {
+        return None;
+    }
+    Some(version)
+}
+
+/// Install one exact package version from `index_url` into `python_executable`.
+///
+/// Used to put the SDK's build of a package back after another installer has
+/// replaced it. `--reinstall-package` is required: without it uv treats the
+/// already-present distribution as satisfying the request and does nothing.
+///
+/// `--index-url`, not `--extra-index-url`, so the SDK index is the only place a
+/// candidate can come from. This matches how `install_therock_runtime` installs
+/// from the same index, and it is load-bearing rather than cosmetic: with PyPI
+/// left in the candidate set, a `+rocm` build the SDK index does not publish can
+/// resolve against PyPI instead, and the caller's `Unavailable` classification —
+/// the whole point of which is to say "the SDK index has no such build" — never
+/// gets the resolver error it keys on.
+///
+/// `--no-deps` because this is a surgical swap of one build for another build of
+/// the *same release*: the environment already carries a resolved dependency tree
+/// and re-resolving it here is free to move `torchvision`/`torchaudio` as a side
+/// effect, which is the mixed stack this change is trying not to create. A build
+/// that genuinely needs a different dependency is not silently ignored — the
+/// `uv pip check` that runs immediately after reports it as a violation.
+pub(crate) fn install_pinned_package(
+    paths: &AppPaths,
+    python_executable: &Path,
+    index_url: &str,
+    package: &str,
+    requirement: &str,
+) -> Result<()> {
+    let uv = rocm_core::uv::ensure_uv_binary(paths)
+        .context("failed to acquire uv binary for the torch alignment install")?;
+    let mut args = rocm_core::uv::uv_pip_install_base(python_executable);
+    args.push("--index-url".to_owned());
+    args.push(index_url.to_owned());
+    args.push("--no-deps".to_owned());
+    args.push("--reinstall-package".to_owned());
+    args.push(package.to_owned());
+    args.push(requirement.to_owned());
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    // `run_command_with_env`, not `run_command`, for two reasons. The uv environment
+    // carries `UV_HTTP_TIMEOUT` (uv has no `--timeout` flag) and `UV_CACHE_DIR`;
+    // without the latter uv falls back to `$HOME/.cache/uv`, loses hardlinking when
+    // that is on another filesystem, and silently copies the whole torch stack per
+    // environment — and the e2e lanes' shared cache is threaded through the same
+    // helper. It also captures stderr on every platform, where `run_command`'s
+    // Windows branch reports only an exit status; the caller classifies this
+    // install's outcome by matching the resolver's message, so on Windows an
+    // unpublished build would otherwise be reported as a generic failure.
+    run_command_with_env(
+        &uv,
+        &borrowed,
+        &rocm_core::uv::uv_command_env(paths),
+        "install the SDK build of the engine's torch",
+    )
 }
 
 pub(crate) fn validate_rocm_sdk_runtime_probe(probe: &RocmSdkPythonProbe) -> Result<()> {
@@ -2796,9 +5150,64 @@ except Exception as exc:
 print(json.dumps(out))
 "#;
 
+thread_local! {
+    /// Set while rendering `--json` output, whose "single compact JSON line"
+    /// contract [`progress_line`] and the managed-Python installer would
+    /// otherwise break by writing extra lines to stdout ahead of the JSON.
+    static SUPPRESS_PROGRESS_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that silences [`progress_line`] and redirects managed-Python
+/// installer output away from stdout for its lifetime, restoring the prior
+/// state on drop (so nested callers compose correctly).
+struct SuppressProgressOutput {
+    previous: bool,
+}
+
+impl SuppressProgressOutput {
+    fn new() -> Self {
+        let previous = SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for SuppressProgressOutput {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        SUPPRESS_PROGRESS_OUTPUT.with(|flag| flag.set(previous));
+    }
+}
+
+fn progress_output_suppressed() -> bool {
+    SUPPRESS_PROGRESS_OUTPUT.with(Cell::get)
+}
+
 fn progress_line(message: impl AsRef<str>) {
-    println!("{}", message.as_ref());
+    if progress_output_suppressed() {
+        return;
+    }
+    emit_progress_line(message.as_ref());
+}
+
+#[cfg(not(test))]
+fn emit_progress_line(message: &str) {
+    println!("{message}");
     let _ = std::io::stdout().flush();
+}
+
+// In tests, write through a thread-local buffer instead of stdout so a test can
+// assert on `progress_line`'s actual output (in particular, that a
+// `SuppressProgressOutput` guard held around a call really does silence it),
+// rather than only on the suppression flag's own bookkeeping.
+#[cfg(test)]
+thread_local! {
+    static PROGRESS_LINE_SINK: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn emit_progress_line(message: &str) {
+    PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().push(message.to_owned()));
 }
 
 fn capture_command_output(program: &Path, args: &[&str]) -> Result<Output> {
@@ -2834,6 +5243,50 @@ fn capture_command_output_with_temp_files(program: &Path, args: &[&str]) -> Resu
         stdout,
         stderr,
     })
+}
+
+/// Run a probe script with extra environment set and return its stdout.
+///
+/// The script goes to a temp file rather than `python -c`, because the loader
+/// search path this exists to set must reach the child through its environment,
+/// and a file keeps the invocation identical on every platform.
+fn capture_python_stdout_with_env(
+    python_executable: &Path,
+    script: &str,
+    env: &[(String, String)],
+    context_text: &str,
+) -> Result<String> {
+    let temp_root = if runtime_is_windows() {
+        windows_temp_dir("rocm-cli-python-probe")?
+    } else {
+        linux_temp_dir("rocm-cli-python-probe")?
+    };
+    let script_path = temp_root.join("probe.py");
+    fs::write(&script_path, script)
+        .with_context(|| format!("failed to write {}", script_path.display()))?;
+
+    let mut command = Command::new(python_executable);
+    command.arg(&script_path);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to launch {}", python_executable.display()));
+    let _ = fs::remove_dir_all(&temp_root);
+    let output = output?;
+
+    if !output.status.success() {
+        bail!(
+            "{context_text}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("{context_text}: failed to decode Python output"))
 }
 
 fn capture_python_stdout(
@@ -3087,16 +5540,29 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
     }
 
     progress_line(format!("Installing Python {version} via uv..."));
-    let status = Command::new(&uv)
+    let install_stdio = || {
+        if progress_output_suppressed() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        }
+    };
+    let install_output = Command::new(&uv)
         .args(["python", "install", &version])
         .envs(uv_command_env(paths))
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+        .stdout(install_stdio())
+        .stderr(install_stdio())
+        .output()
         .context("failed to launch uv python install")?;
-    if !status.success() {
-        bail!("uv python install {version} failed with {status}");
+    if !install_output.status.success() {
+        let status = install_output.status;
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("uv python install {version} failed with {status}");
+        }
+        bail!("uv python install {version} failed with {status}: {stderr}");
     }
 
     progress_line(format!("Finding Python {version}..."));
@@ -3319,7 +5785,55 @@ fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
         .find("];")
         .context("tarball index did not contain the end of the embedded file list")?;
     let json = format!("{}]", &rest[..end]);
-    serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")
+    let files: Vec<TarballIndexFile> =
+        serde_json::from_str(&json).context("failed to parse TheRock tarball index file list")?;
+    for file in &files {
+        validate_tarball_file_name(&file.name)?;
+    }
+    Ok(files)
+}
+
+fn validate_tarball_file_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .trim_end_matches([' ', '.']);
+    let windows_reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if name.contains(['/', '\\', ':'])
+        || name.ends_with([' ', '.'])
+        || windows_reserved
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+        || name.chars().any(char::is_control)
+    {
+        bail!("tarball catalog contains unsafe file name `{name}`");
+    }
+    Ok(())
 }
 
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
@@ -3367,14 +5881,52 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     })
 }
 
-fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
-    match channel {
-        TheRockChannel::Release => vec![
-            format!("{THEROCK_RELEASE_PIP_INDEX_BASE}/{family}"),
-            format!("{THEROCK_RELEASE_PIP_MULTI_ARCH_INDEX_BASE}/{family}"),
-        ],
-        TheRockChannel::Nightly => vec![format!("{THEROCK_NIGHTLY_PIP_INDEX_BASE}/{family}")],
-    }
+/// Lenient parse of a host-reported ROCm version for the "is the host newer?"
+/// decision. Unlike [`parse_version`], this tolerates the shapes a legacy/system
+/// ROCm actually reports: a build suffix (`7.2.4-98`) and a missing patch
+/// component (`7.4`). Major and minor are required; patch defaults to 0 when
+/// absent and may still carry an `rc`/`a` stage suffix. Returns `None` when
+/// major/minor cannot be read so an unparseable host string is treated as
+/// "can't tell" instead of being compared lexicographically.
+fn parse_host_version(value: &str) -> Option<ParsedVersion> {
+    // Drop build/local metadata: `7.2.4-98`, `7.2.4+local` -> `7.2.4`.
+    let value = value.split(['+', '-']).next().unwrap_or(value).trim();
+    let mut parts = value.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let (patch, stage, stage_number) = match parts.next() {
+        // Two-component report (`7.4`) -> treat as `7.4.0`.
+        None => (0, VersionStage::Stable, 0),
+        Some(patch_and_rest) => {
+            let patch_len = patch_and_rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .count();
+            if patch_len == 0 {
+                return None;
+            }
+            let patch = patch_and_rest[..patch_len].parse().ok()?;
+            let suffix = &patch_and_rest[patch_len..];
+            let (stage, stage_number) = if suffix.is_empty() {
+                (VersionStage::Stable, 0)
+            } else if let Some(rest) = suffix.strip_prefix("rc") {
+                (VersionStage::Rc, rest.parse().ok()?)
+            } else if let Some(rest) = suffix.strip_prefix('a') {
+                (VersionStage::Alpha, rest.parse().ok()?)
+            } else {
+                return None;
+            };
+            (patch, stage, stage_number)
+        }
+    };
+
+    Some(ParsedVersion {
+        major,
+        minor,
+        patch,
+        stage,
+        stage_number,
+    })
 }
 
 /// Recovery guidance appended to family/index resolution failures so a clean
@@ -3386,6 +5938,59 @@ fn therock_index_urls(channel: TheRockChannel, family: &str) -> Vec<String> {
 /// so an auto-detected miss points the user at `--family`, while a user-supplied
 /// miss confirms the family they already named. Both point at the other channel
 /// and, where valid for the platform, the other install format.
+fn canonical_wheel_resolution_hint(channel: TheRockChannel) -> String {
+    let other_channel = match channel {
+        TheRockChannel::Release => "nightly",
+        TheRockChannel::Nightly => "release",
+    };
+    let mut hint = format!(
+        "No complete compatible package stack was found in the canonical {} aggregate stream. Try `--channel {other_channel}`",
+        channel.as_str()
+    );
+    if !runtime_is_windows() {
+        hint.push_str(" or `--format tarball`");
+    }
+    hint.push('.');
+    hint
+}
+
+/// Identify a wheel runtime by channel, version, AND the exact composition it
+/// was installed from.
+///
+/// Two installs of the same version that request different device payloads are
+/// different runtimes: one can run this host's kernels and the other cannot. A
+/// version-only key gave them the same name, so a corrected composition
+/// overwrote the old tree in place — the one thing side-by-side installs exist
+/// to avoid — and left no way to tell the two apart afterwards.
+///
+/// The fingerprint is a truncated SHA-256 over the generation and the specs,
+/// length-delimited so no regrouping of the same characters collides. Truncation
+/// is safe here: this names sibling directories, it does not authenticate them.
+fn wheel_runtime_key(
+    channel: TheRockChannel,
+    version: &str,
+    composition: &WheelRuntimeComposition,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(composition.source_layout_generation.as_bytes());
+    for package_spec in &composition.package_specs {
+        hasher.update([0]);
+        hasher.update(package_spec.as_bytes());
+    }
+    hasher.update([0]);
+    hasher.update(b"rocm-sdk-target");
+    if let Some(target) = &composition.rocm_sdk_target {
+        hasher.update([0]);
+        hasher.update(target.as_bytes());
+    }
+    let fingerprint = format!("{:x}", hasher.finalize());
+    slugify(&format!(
+        "{}-wheel-multi-arch-{version}-{}",
+        channel.as_str(),
+        &fingerprint[..16]
+    ))
+}
+
 fn family_resolution_hint(
     source: &str,
     family: &str,
@@ -3472,6 +6077,34 @@ fn managed_runtime_root(paths: &AppPaths, format: &str, runtime_key: &str) -> Pa
         .join(runtime_key)
 }
 
+/// Where to build a runtime, resolved to its real location on disk first.
+///
+/// `install sdk` writes this path into three places that all outlive the command:
+/// the registry manifest, the sidecar beside the runtime, and — via `uv` — the
+/// `#!` line of every console script in the venv. So the path handed to the
+/// installer has to name where the files land, not the route taken to get there.
+/// Reaching `data/runtimes` through a symlink is enough to make those differ, and
+/// once the link goes the runtime reports itself installed at a folder that is not
+/// there while the files sit untouched next door.
+///
+/// Applies to `--prefix` too, which has the identical failure mode.
+///
+/// Only the root is resolved. `python_executable` is derived from it and must
+/// keep the venv's own `bin/python`, which is itself a symlink to the base
+/// interpreter — resolving that would record the system Python and break venv
+/// semantics. The adopt path already draws the line in the same place: see
+/// `main::adopt_runtime_from_probe`, which canonicalizes the install root next to
+/// `absolute_existing_file_path_preserving_symlink` for the interpreter.
+fn resolved_install_root(
+    paths: &AppPaths,
+    format: &str,
+    runtime_key: &str,
+    prefix: Option<PathBuf>,
+) -> PathBuf {
+    let requested = prefix.unwrap_or_else(|| managed_runtime_root(paths, format, runtime_key));
+    rocm_core::resolve_path_through_symlinks(&requested)
+}
+
 fn runtime_registry_dir(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("runtimes").join("registry")
 }
@@ -3505,12 +6138,29 @@ fn save_runtime_manifest(paths: &AppPaths, manifest: &InstalledRuntimeManifest) 
 }
 
 pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRuntimeManifest>> {
+    Ok(load_runtime_manifests_reporting_unparsed(paths)?.0)
+}
+
+/// [`load_runtime_manifests`] plus the registry entries that read fine but did
+/// not deserialize.
+///
+/// A manifest written by an older binary is the ordinary way to land here:
+/// `family_source`, `selected_artifact_url` and `installed_at_unix_ms` carry no
+/// `#[serde(default)]`, so an older file fails `from_slice` against a newer
+/// binary. Dropping those silently is right for the listing and lookup callers
+/// — one stale file must not brick `rocm runtimes list` — but it is wrong for
+/// the install consent gate, which has to know that its view of "what is
+/// active" is incomplete. Hence two entry points rather than one hard error.
+fn load_runtime_manifests_reporting_unparsed(
+    paths: &AppPaths,
+) -> Result<(Vec<InstalledRuntimeManifest>, Vec<PathBuf>)> {
     let registry_dir = runtime_registry_dir(paths);
     if !registry_dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut manifests = Vec::new();
+    let mut unparsed = Vec::new();
     for entry in fs::read_dir(&registry_dir)
         .with_context(|| format!("failed to read {}", registry_dir.display()))?
     {
@@ -3521,12 +6171,14 @@ pub(crate) fn load_runtime_manifests(paths: &AppPaths) -> Result<Vec<InstalledRu
         }
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if let Ok(manifest) = serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
-            manifests.push(manifest.normalize_host_paths());
+        match serde_json::from_slice::<InstalledRuntimeManifest>(&bytes) {
+            Ok(manifest) => manifests.push(manifest.normalize_host_paths()),
+            Err(_) => unparsed.push(path),
         }
     }
     manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
-    Ok(manifests)
+    unparsed.sort();
+    Ok((manifests, unparsed))
 }
 
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
@@ -3564,7 +6216,584 @@ fn slugify(value: &str) -> String {
 mod tests {
     use super::*;
 
-    static PYTHON_RESOLVER_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serializes tests that replace process-global `PATH` (or other env vars) while
+    // they run. Because env is shared across all test threads, any test that spawns a
+    // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
+    // can fail with ENOENT while another test has temporarily narrowed `PATH`.
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
+        FamilyResolution {
+            family: family.to_owned(),
+            source: "manifest".to_owned(),
+            raw_arch: raw_arch.map(str::to_owned),
+        }
+    }
+
+    /// Everything a user can ask for today must keep resolving the canonical
+    /// stream. The next layout is an extension, so no existing request may start
+    /// answering from somewhere else.
+    #[test]
+    fn only_a_rocm_10_pin_leaves_the_canonical_layout() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let build_date = RuntimeVersionSelector::build_date("2026-06-05").unwrap();
+        let older_pin = RuntimeVersionSelector::version("7.14.0").unwrap();
+        let unparseable = RuntimeVersionSelector::version("main").unwrap();
+
+        for selector in [
+            None,
+            Some(&build_date),
+            Some(&older_pin),
+            Some(&unparseable),
+        ] {
+            assert_eq!(
+                select_source_layout(TheRockChannel::Release, &exact, selector).unwrap(),
+                SourceLayout::Canonical,
+                "selector {selector:?} must stay canonical"
+            );
+        }
+
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, Some(&pin)).unwrap(),
+            SourceLayout::Next
+        );
+    }
+
+    /// A grouped family names no single arch, and the next layout has no
+    /// grouped device payload to fall back to, so the refusal has to name the
+    /// flag and a value that would work.
+    #[test]
+    fn rocm_10_pin_without_an_exact_arch_refuses_actionably() {
+        let grouped = family_for_test("gfx120X-all", None);
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        let error = select_source_layout(TheRockChannel::Release, &grouped, Some(&pin))
+            .expect_err("a grouped family cannot select a device payload")
+            .to_string();
+
+        assert!(error.contains("requires an exact GPU arch"), "{error}");
+        assert!(error.contains("--family gfx1200"), "{error}");
+    }
+
+    #[test]
+    fn rocm_10_pin_on_nightly_refuses_instead_of_resolving() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        let error = select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin))
+            .expect_err("the next layout has no nightly stream")
+            .to_string();
+
+        assert!(error.contains("--channel release"), "{error}");
+    }
+
+    /// A pinned nightly prerelease of a future major (e.g. a ROCm 10 alpha
+    /// build) is not evidence the canonical stream can't serve it — only a
+    /// *stable* pin is. Gating on major alone would refuse this pin and then
+    /// suggest a release-channel retry that the stable-version filter would
+    /// also reject, leaving no working path.
+    #[test]
+    fn nightly_prerelease_pin_of_a_future_major_stays_canonical() {
+        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
+        let pin = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin)).unwrap(),
+            SourceLayout::Canonical
+        );
+    }
+
+    #[test]
+    fn next_layout_resolves_its_own_bases() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
+
+        assert_eq!(
+            next.wheel_index,
+            "https://stable.repo.amd.com/rocm/whl-next"
+        );
+        assert_eq!(
+            next.tarball_catalog,
+            "https://stable.repo.amd.com/rocm/core/tarball/"
+        );
+        assert_eq!(next.layout.generation(), "next-v1");
+    }
+
+    /// A base override is a redirect to an arbitrary host, so naming the
+    /// variable must not be enough on its own.
+    #[test]
+    fn base_overrides_are_inert_without_the_explicit_opt_in() {
+        let default = THEROCK_NEXT_PIP_INDEX_BASE;
+        let fixture = "http://127.0.0.1:9/whl";
+
+        // Naming the variable is not enough; without the opt-in it is ignored.
+        assert_eq!(select_base_override(false, Some(fixture), default), default);
+        assert_eq!(
+            select_base_override(true, Some(fixture), default),
+            fixture,
+            "an opted-in override must be honoured"
+        );
+        // A variable that is present but blank is not a redirect.
+        assert_eq!(select_base_override(true, Some("   "), default), default);
+        assert_eq!(select_base_override(true, None, default), default);
+    }
+
+    /// The test above only proves the pure decision rule; it never reads
+    /// process environment, so it can't catch `env_override_base` or
+    /// `resolve_source` failing to wire that rule to the real variables. The
+    /// only thing that does today is `therock-next-06`, an e2e scenario gated
+    /// `@nightly` because it has to reach the live default index — so on the
+    /// blocking lane this trust boundary otherwise has zero coverage of the
+    /// actual env-reading path. Exercise it here instead, with no network.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn env_override_is_ignored_end_to_end_without_the_opt_in() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_override = std::env::var_os("ROCM_CLI_THEROCK_NEXT_PIP_BASE");
+        let old_allow = std::env::var_os("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", "http://127.0.0.1:9/whl");
+            std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
+        }
+
+        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
+
+        unsafe {
+            match old_override {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE"),
+            }
+            match old_allow {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE"),
+            }
+        }
+
+        assert_eq!(
+            next.wheel_index, THEROCK_NEXT_PIP_INDEX_BASE,
+            "an override named without the trust opt-in must not redirect resolution"
+        );
+    }
+
+    #[test]
+    fn tarball_catalog_rejects_unsafe_file_names_at_the_parser_boundary() {
+        for name in [
+            "../escape.tar.gz",
+            "folder/escape.tar.gz",
+            r"folder\escape.tar.gz",
+            "/absolute.tar.gz",
+            "control\nname.tar.gz",
+            "archive.tar.gz:payload",
+            "CON.tar.gz",
+            "archive.tar.gz.",
+            "archive.tar.gz ",
+        ] {
+            let html =
+                format!(r#"<script>const files = [{{"name":"{name}","mtime":1.0}}];</script>"#);
+            assert!(
+                parse_tarball_index_html(&html).is_err(),
+                "unsafe catalog name was accepted: {name:?}"
+            );
+        }
+        let html = r#"<script>const files = [{"name":"therock-dist-linux-gfx120X-all-10.0.0.tar.gz","mtime":1.0}];</script>"#;
+        assert_eq!(
+            parse_tarball_index_html(html)
+                .expect("safe catalog name must parse")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn family_override_raw_arch_accepts_only_exact_arch_codes() {
+        assert_eq!(
+            family_override_raw_arch("gfx1200"),
+            Some("gfx1200".to_owned())
+        );
+        assert_eq!(
+            family_override_raw_arch(" gfx90a "),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            family_override_raw_arch("GFX1250"),
+            Some("gfx1250".to_owned())
+        );
+        assert_eq!(family_override_raw_arch("gfx120X-all"), None);
+        assert_eq!(family_override_raw_arch("gfx103X-dgpu"), None);
+        assert_eq!(
+            family_override_raw_arch("gpu target gfx1030 detected"),
+            None
+        );
+        assert_eq!(family_override_raw_arch("gfx"), None);
+        assert_eq!(family_override_raw_arch(""), None);
+    }
+
+    /// A managed runtime records only its family, so the arch has to come from
+    /// a host probe — and is worth nothing when the host is a different card.
+    #[test]
+    fn managed_family_keeps_only_a_host_arch_from_the_same_family() {
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx1030".to_owned()), "gfx103X-dgpu"),
+            Some("gfx1030".to_owned())
+        );
+        assert_eq!(
+            raw_arch_agreeing_with_family(Some("gfx90a".to_owned()), "gfx103X-dgpu"),
+            None
+        );
+        assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
+    }
+
+    /// Updating a next-layout manifest whose family is a group label (as
+    /// `gfx125X-dcgpu` always is) must recover the exact arch this runtime was
+    /// installed with from its composition, not resolve an undetermined
+    /// device target on the very host that arch came from.
+    #[test]
+    fn manifest_wheel_family_override_recovers_the_installed_arch() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx1250"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx1250");
+    }
+
+    /// A composition recorded for a different family (e.g. moved to another
+    /// host) must not be trusted — the plain family label is the safe fallback.
+    #[test]
+    fn manifest_wheel_family_override_ignores_a_disagreeing_composition() {
+        let mut manifest = test_runtime_manifest("next-v1:gfx125X-dcgpu", "next:gfx125X-dcgpu", 0);
+        manifest.wheel_composition = Some(test_wheel_composition("gfx90a"));
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx125X-dcgpu");
+    }
+
+    /// No recorded composition at all (an older manifest, or an undetermined
+    /// install) falls back to the plain family label, same as before this fix.
+    #[test]
+    fn manifest_wheel_family_override_falls_back_without_a_composition() {
+        let manifest = test_runtime_manifest("v1:gfx120X-all", "canonical:gfx120X-all", 0);
+
+        assert_eq!(manifest_wheel_family_override(&manifest), "gfx120X-all");
+    }
+
+    /// The next catalog's gfx103X token differs from the canonical token, and
+    /// its later `-tests-` sibling must not win selection.
+    #[test]
+    fn next_gfx103x_tarball_selection_uses_alias_and_skips_tests_sibling() {
+        let platform = platform_tarball_token();
+        let next_prefix = format!("therock-dist-{platform}-gfx103X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{next_prefix}10.0.0.tar.gz"),
+                mtime: 1_787_612_008.0,
+            },
+            TarballIndexFile {
+                name: format!("{next_prefix}tests-10.0.0.tar.gz"),
+                mtime: 1_787_612_032.0,
+            },
+        ];
+
+        assert!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Canonical,
+                "gfx103X-dgpu",
+                None,
+            )
+            .is_none(),
+            "the canonical layout must not recognize the next-only family alias"
+        );
+
+        let (file, version) = select_tarball_candidate(
+            &files,
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            "gfx103X-dgpu",
+            None,
+        )
+        .expect("the next alias must select the real dist archive");
+
+        assert_eq!(file.name, format!("{next_prefix}10.0.0.tar.gz"));
+        assert_eq!(version, "10.0.0");
+    }
+
+    /// The rename `tarball_family_token` applies for the next catalog must not
+    /// drift from what `normalize_therock_family` maps back to `gfx103X-dgpu`;
+    /// a family manifests under is worthless if the catalog's own alias for it
+    /// no longer round-trips.
+    ///
+    /// The first assertion is the one that actually pins the rename:
+    /// `normalize_therock_family` already maps *both* `gfx103X-dgpu` and its
+    /// `gfx103X-all` alias back to `gfx103X-dgpu` (that is the whole point of
+    /// the alias), so asserting only the round-trip's final value passes
+    /// identically whether or not `tarball_family_token` renames anything —
+    /// it does not distinguish the rename from its absence.
+    #[test]
+    fn next_tarball_family_token_round_trips_through_normalize_therock_family() {
+        let token = tarball_family_token(SourceLayout::Next, "gfx103X-dgpu");
+        assert_eq!(token, "gfx103X-all");
+        assert_eq!(
+            normalize_therock_family(token),
+            Some("gfx103X-dgpu".to_owned())
+        );
+    }
+
+    /// A pinned tarball install must install what it named, not whatever is
+    /// newest in the catalog.
+    #[test]
+    fn pinned_tarball_selection_installs_the_named_version() {
+        let platform = platform_tarball_token();
+        let prefix = format!("therock-dist-{platform}-gfx120X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}10.0.0.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}10.1.0.tar.gz"),
+                mtime: 2.0,
+            },
+        ];
+        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Next,
+                "gfx120X-all",
+                Some(&pin)
+            )
+            .map(|(_, version)| version),
+            Some("10.0.0".to_owned())
+        );
+    }
+
+    /// The next catalog spells exactly one family differently; the canonical
+    /// catalog and every other family are untouched, and the family a manifest
+    /// records never changes.
+    #[test]
+    fn next_tarball_token_renames_only_the_gfx103x_family() {
+        assert_eq!(
+            tarball_family_token(SourceLayout::Next, "gfx103X-dgpu"),
+            "gfx103X-all"
+        );
+        assert_eq!(
+            tarball_family_token(SourceLayout::Canonical, "gfx103X-dgpu"),
+            "gfx103X-dgpu"
+        );
+        assert_eq!(
+            tarball_family_token(SourceLayout::Next, "gfx120X-all"),
+            "gfx120X-all"
+        );
+    }
+
+    /// An installed runtime must keep resolving the stream it came from, and a
+    /// manifest written before the field existed must still be readable.
+    #[test]
+    fn manifest_layout_survives_older_manifests() {
+        let mut manifest = test_runtime_manifest("runtime-key", "therock-release:gfx120X-all", 0);
+        manifest.source_layout_generation = Some("next-v1".to_owned());
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Next
+        );
+
+        manifest.source_layout_generation = None;
+        manifest.wheel_composition = Some(WheelRuntimeComposition {
+            source_layout_generation: "next-v1".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx1200]==10.0.0".to_owned()],
+            rocm_sdk_target: Some("gfx1200".to_owned()),
+        });
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Next
+        );
+
+        manifest.wheel_composition = None;
+        assert_eq!(
+            manifest_source_layout(&manifest).unwrap(),
+            SourceLayout::Canonical
+        );
+
+        manifest.source_layout_generation = Some("some-future-generation".to_owned());
+        let error = manifest_source_layout(&manifest).unwrap_err().to_string();
+        assert!(error.contains("unsupported TheRock source layout generation"));
+    }
+
+    #[test]
+    fn suppress_progress_output_contract() {
+        // `SUPPRESS_PROGRESS_OUTPUT` is thread-local, so this doesn't race with
+        // other tests' threads.
+        assert!(!progress_output_suppressed());
+        {
+            let _outer = SuppressProgressOutput::new();
+            assert!(progress_output_suppressed());
+            {
+                let _inner = SuppressProgressOutput::new();
+                assert!(
+                    progress_output_suppressed(),
+                    "a nested guard must still suppress"
+                );
+            }
+            assert!(
+                progress_output_suppressed(),
+                "dropping the inner guard must not lift the outer guard's suppression"
+            );
+        }
+        assert!(
+            !progress_output_suppressed(),
+            "dropping the outer guard must restore the pre-guard state"
+        );
+    }
+
+    #[test]
+    fn progress_line_is_suppressed_while_guard_is_held() {
+        // Unlike `suppress_progress_output_contract` (which only checks the
+        // flag `SuppressProgressOutput` flips), this asserts on `progress_line`'s
+        // actual output via the `#[cfg(test)]` sink, so it fails if the guard
+        // is ever wired up but `progress_line` stops consulting it.
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        progress_line("before guard");
+        {
+            let _guard = SuppressProgressOutput::new();
+            progress_line("during guard");
+        }
+        progress_line("after guard");
+        let captured = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+        assert_eq!(
+            captured,
+            vec!["before guard".to_owned(), "after guard".to_owned()]
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn render_update_json_installs_the_suppression_guard_around_resolution() -> Result<()> {
+        // Unlike the two tests above (which only exercise the guard's own
+        // bookkeeping in isolation), this proves `render_update_json` itself
+        // installs the guard around a code path that *actually reaches* a
+        // live `progress_line` call: a wheel-format manifest whose only PATH
+        // python is a non-executable stub fails
+        // `python_launcher_install_ready`, so `resolve_python_launcher_in`
+        // falls back to the managed-Python path and calls
+        // `progress_line("Python from PATH cannot create a virtual
+        // environment; using ROCm CLI's managed Python.")` before bailing out
+        // (managed bootstrap is disabled here, so the whole thing stays
+        // network-free). If `render_update_json` stopped installing the
+        // guard, that call would land in `PROGRESS_LINE_SINK` instead of
+        // being swallowed, and the assertion below would fail.
+        let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("render-update-json-installs-guard");
+
+        let manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        fs::write(bin_dir.join("python3"), "not an interpreter")?;
+
+        let old_path = std::env::var_os("PATH");
+        let old_python_override = std::env::var_os("ROCM_CLI_PYTHON");
+        let old_bootstrap_disabled = std::env::var_os("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP");
+        unsafe {
+            std::env::set_var("PATH", &bin_dir);
+            std::env::remove_var("ROCM_CLI_PYTHON");
+            std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", "1");
+        }
+
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&paths, Some(1));
+
+        unsafe {
+            match old_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match old_python_override {
+                Some(value) => std::env::set_var("ROCM_CLI_PYTHON", value),
+                None => std::env::remove_var("ROCM_CLI_PYTHON"),
+            }
+            match old_bootstrap_disabled {
+                Some(value) => {
+                    std::env::set_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP", value);
+                }
+                None => std::env::remove_var("ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"),
+            }
+        }
+
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped once render_update_json returns"
+        );
+        let captured = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+        assert!(
+            captured.is_empty(),
+            "a progress_line call reachable during resolution must be suppressed by \
+             render_update_json's guard, not delivered to the sink: {captured:?}"
+        );
+
+        let document = result?;
+        assert_eq!(document.runtimes.len(), 1);
+        assert_eq!(
+            document.runtimes[0].status, "error",
+            "PATH python cannot create a venv and managed bootstrap is disabled, \
+             so resolution must fail"
+        );
+        let message = document.runtimes[0]
+            .message
+            .as_deref()
+            .expect("a failed resolution should carry an error message");
+        assert!(
+            message.contains("managed Python bootstrap is disabled"),
+            "expected the deterministic bootstrap-disabled failure, got: {message}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn progress_suppression_guard_releases_on_ok_and_err_exit_paths() {
+        // This only proves the guard's own release semantics on both of
+        // `render_update_json`'s exit paths (both fixtures below exit before
+        // ever reaching resolution, so `progress_line` is never called here).
+        // It does NOT prove `render_update_json` installs the guard around a
+        // live `progress_line` call — see
+        // `render_update_json_installs_the_suppression_guard_around_resolution`
+        // for that.
+        //
+        // Ok path: no `runtimes` directory at all, so `load_runtime_manifests`
+        // returns `Ok(vec![])` and `render_update_json` succeeds trivially.
+        let (ok_root, ok_paths) = test_paths("render-update-json-ok");
+        fs::create_dir_all(&ok_root).unwrap();
+        assert!(!progress_output_suppressed());
+        let result = render_update_json(&ok_paths, Some(1));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Ok path"
+        );
+        fs::remove_dir_all(&ok_root).ok();
+
+        // Err path: `broken.json` is a directory, not a file, so the loader's
+        // `fs::read` on it fails and the error bubbles through
+        // `render_update_json`'s `?` before ever constructing an `UpdateJson`.
+        let (err_root, err_paths) = test_paths("render-update-json-err");
+        let registry_dir = err_root.join("data").join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json")).unwrap();
+        let result = render_update_json(&err_paths, Some(1));
+        assert!(
+            result.is_err(),
+            "a directory named *.json must fail to be read as manifest bytes"
+        );
+        assert!(
+            !progress_output_suppressed(),
+            "the guard must be dropped after the Err path too"
+        );
+        fs::remove_dir_all(&err_root).ok();
+    }
 
     #[test]
     fn tarball_space_preflight_skips_when_the_download_size_is_unknown() {
@@ -4026,7 +7255,445 @@ mod tests {
     }
 
     #[test]
-    fn pip_runtime_installs_pinned_devel_and_torch_stack_from_therock_index() {
+    fn canonical_channels_use_only_their_aggregate_streams() {
+        let release = resolve_source(TheRockChannel::Release, SourceLayout::Canonical);
+        assert_eq!(
+            release.wheel_index,
+            "https://repo.amd.com/rocm/whl-multi-arch"
+        );
+        assert_eq!(
+            release.tarball_catalog,
+            "https://repo.amd.com/rocm/tarball/"
+        );
+        assert_eq!(release.layout.generation(), "multi-arch-v2");
+
+        let nightly = resolve_source(TheRockChannel::Nightly, SourceLayout::Canonical);
+        assert_eq!(
+            nightly.wheel_index,
+            "https://rocm.nightlies.amd.com/whl-multi-arch"
+        );
+        assert_eq!(
+            nightly.tarball_catalog,
+            "https://rocm.nightlies.amd.com/tarball/"
+        );
+        assert_eq!(nightly.layout.generation(), "multi-arch-v2");
+    }
+
+    #[test]
+    fn nightly_accepts_future_prerelease_major_without_cli_changes() {
+        let selected = select_matching_pip_package_versions(
+            TheRockChannel::Nightly,
+            &["10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            &["0.27.0+rocm10.1.0a20260822".to_owned()],
+            &["2.12.0+rocm10.1.0a20260822".to_owned()],
+            None,
+        )
+        .expect("future nightly major should resolve");
+
+        assert_eq!(selected.rocm, "10.1.0a20260822");
+    }
+
+    #[test]
+    fn tarball_selection_never_crosses_channels() {
+        let platform = platform_tarball_token();
+        let files = vec![
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-7.14.0.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.0a20260822.tar.gz"),
+                mtime: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Canonical,
+                "gfx120X-all",
+                None
+            )
+            .map(|(_, version)| version),
+            Some("7.14.0".to_owned())
+        );
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Nightly,
+                SourceLayout::Canonical,
+                "gfx120X-all",
+                None
+            )
+            .map(|(_, version)| version),
+            Some("10.1.0a20260822".to_owned())
+        );
+    }
+
+    #[test]
+    fn canonical_provenance_reports_required_dry_run_fields() {
+        let source = resolve_source(TheRockChannel::Nightly, SourceLayout::Canonical);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Nightly,
+            &source.wheel_index,
+            source.layout.generation(),
+            "10.1.0a20260822",
+        );
+
+        assert!(output.contains("channel: nightly"));
+        assert!(output.contains("canonical_source: https://rocm.nightlies.amd.com/whl-multi-arch"));
+        assert!(output.contains("selected_rocm_version: 10.1.0a20260822"));
+        assert!(output.contains("build_date: 2026-08-22"));
+        assert!(output.contains("source_layout_generation: multi-arch-v2"));
+    }
+
+    /// A representative slice of what the canonical aggregate index publishes.
+    /// Notably it has no `gfx943`: MI300 steppings other than `gfx942` have no
+    /// payload of their own, which is exactly the case a remap used to hide.
+    const PUBLISHED_DEVICE_TARGETS_HTML: &str = r#"<!DOCTYPE html><html><body>
+<a href="rocm/">rocm</a><br/>
+<a href="torch/">torch</a><br/>
+<a href="torchvision/">torchvision</a><br/>
+<a href="torchaudio/">torchaudio</a><br/>
+<a href="rocm-sdk-core/">rocm-sdk-core</a><br/>
+<a href="amd-torch-device-gfx942/">amd-torch-device-gfx942</a><br/>
+<a href="rocm-sdk-device-gfx90a/">rocm-sdk-device-gfx90a</a><br/>
+<a href="rocm-sdk-device-gfx942/">rocm-sdk-device-gfx942</a><br/>
+<a href="rocm-sdk-device-gfx1151/">rocm-sdk-device-gfx1151</a><br/>
+<a href="rocm-sdk-device-gfx1201/">rocm-sdk-device-gfx1201</a><br/>
+</body></html>"#;
+
+    fn published_device_targets() -> Vec<String> {
+        parse_aggregate_device_targets(PUBLISHED_DEVICE_TARGETS_HTML)
+    }
+
+    #[test]
+    fn published_device_targets_come_from_the_sdk_payload_packages_only() {
+        // `amd-torch-device-*` and `rocm-sdk-core` share the page; only the
+        // `rocm-sdk-device-*` names name a `device-<target>` extra of `rocm`.
+        assert_eq!(
+            published_device_targets(),
+            vec![
+                "gfx1151".to_owned(),
+                "gfx1201".to_owned(),
+                "gfx90a".to_owned(),
+                "gfx942".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn device_extra_is_the_exact_detected_target_the_source_publishes() {
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx1201"),
+            "gfx120X-all",
+            &published_device_targets(),
+        );
+
+        assert_eq!(target, AggregateDeviceTarget::Exact("gfx1201".to_owned()));
+        assert_eq!(target.as_str(), "gfx1201");
+    }
+
+    #[test]
+    fn device_extra_drops_the_kfd_feature_suffix() {
+        assert_eq!(
+            AggregateDeviceTarget::resolve(
+                Some("gfx90a:sramecc+:xnack-"),
+                "gfx90a",
+                &published_device_targets(),
+            ),
+            AggregateDeviceTarget::Exact("gfx90a".to_owned())
+        );
+    }
+
+    #[test]
+    fn unpublished_detected_target_is_undetermined_rather_than_remapped() {
+        // gfx943 normalizes to the same family as gfx942, so a family-level
+        // answer would silently install gfx942 kernels on a chip the source
+        // never published a payload for.
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx943"),
+            "gfx94X-dcgpu",
+            &published_device_targets(),
+        );
+
+        assert_eq!(target.as_str(), "<undetermined>");
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("no `device-gfx943` payload"))
+        );
+    }
+
+    #[test]
+    fn no_detected_gpu_yields_an_undetermined_target_not_a_blanket_payload() {
+        let target =
+            AggregateDeviceTarget::resolve(None, "gfx110X-all", &published_device_targets());
+
+        assert_eq!(target.as_str(), "<undetermined>");
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("no AMD GPU target was detected"))
+        );
+    }
+
+    #[test]
+    fn a_detected_target_from_another_family_is_undetermined() {
+        let target = AggregateDeviceTarget::resolve(
+            Some("gfx1151"),
+            "gfx120X-all",
+            &published_device_targets(),
+        );
+
+        assert!(
+            target
+                .reason()
+                .is_some_and(|reason| reason.contains("not the resolved target family"))
+        );
+    }
+
+    fn test_wheel_composition(device_target: &str) -> WheelRuntimeComposition {
+        WheelRuntimeComposition {
+            source_layout_generation: THEROCK_SOURCE_LAYOUT_GENERATION.to_owned(),
+            package_specs: vec![
+                format!("rocm[libraries,devel,device-{device_target}]==7.14.0"),
+                "torch==2.11.0+rocm7.14.0".to_owned(),
+                "torchvision==0.26.0+rocm7.14.0".to_owned(),
+                "torchaudio==2.11.0+rocm7.14.0".to_owned(),
+            ],
+            rocm_sdk_target: Some(device_target.to_owned()),
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_without_a_composition_is_repaired_once_then_settles() {
+        // Exactly what a runtime installed before composition-aware freshness
+        // deserializes to: no `wheel_composition`, and a version-only key.
+        let mut old_cache: InstalledRuntimeManifest = serde_json::from_value(serde_json::json!({
+            "runtime_key": "release-wheel-multi-arch-7-14-0",
+            "runtime_id": "therock-release:gfx94X-dcgpu",
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx94X-dcgpu",
+            "family_source": "managed-runtime",
+            "version": "7.14.0",
+            "install_root": "/tmp/release-wheel-multi-arch-7-14-0",
+            "selected_artifact_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "index_url": "https://repo.amd.com/rocm/whl-multi-arch",
+            "tarball_file_name": null,
+            "python_launcher": "/usr/bin/python3",
+            "python_executable": "/tmp/release-wheel-multi-arch-7-14-0/bin/python",
+            "pip_cache_dir": null,
+            "rocm_sdk": null,
+            "read_only": false,
+            "imported_from": null,
+            "installed_at_unix_ms": 1
+        }))
+        .unwrap();
+        assert_eq!(
+            old_cache.wheel_composition, None,
+            "a pre-composition manifest must still load"
+        );
+
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::RepairAvailable
+        );
+
+        old_cache.wheel_composition = Some(required.clone());
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::RepairAvailable,
+            "the right packages under the legacy identity still need side-by-side migration"
+        );
+
+        old_cache.runtime_key = target_runtime_key.clone();
+        assert_eq!(
+            runtime_freshness(&old_cache, "7.14.0", Some(&required), &target_runtime_key),
+            RuntimeFreshness::UpToDate
+        );
+    }
+
+    #[test]
+    fn a_newer_index_version_outranks_a_composition_repair() {
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-multi-arch-7-13-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        manifest.version = "7.13.0".to_owned();
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &manifest,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::UpdateAvailable
+        );
+    }
+
+    #[test]
+    fn an_ahead_of_index_runtime_is_never_offered_an_unreproducible_repair() {
+        // Its version is not in the index, so no install could reproduce it. A
+        // repair here would have to roll the runtime back to the older index
+        // build, which is exactly what `ahead_of_index` exists to prevent.
+        let mut pinned = test_runtime_manifest(
+            "release-wheel-multi-arch-7-15-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        pinned.version = "7.15.0".to_owned();
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &pinned,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::AheadOfIndex
+        );
+    }
+
+    #[test]
+    fn a_read_only_runtime_is_never_repaired() {
+        // `runtimes import` / `adopt` point at a folder this CLI does not own,
+        // so a side-by-side "replacement" would be an install the user never
+        // asked for, against packages they did not choose.
+        let mut adopted =
+            test_runtime_manifest("imported-rocm-7-14-0", "therock-release:gfx94X-dcgpu", 1);
+        adopted.version = "7.14.0".to_owned();
+        adopted.read_only = true;
+        let required = test_wheel_composition("gfx942");
+
+        assert_eq!(
+            runtime_freshness(
+                &adopted,
+                "7.14.0",
+                Some(&required),
+                &wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required),
+            ),
+            RuntimeFreshness::UpToDate
+        );
+    }
+
+    #[test]
+    fn an_installed_replacement_sibling_suppresses_repeat_repair() {
+        let required = test_wheel_composition("gfx942");
+        let target_runtime_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &required);
+        let mut source = test_runtime_manifest(
+            "release-wheel-multi-arch-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            1,
+        );
+        source.version = "7.14.0".to_owned();
+        let mut replacement =
+            test_runtime_manifest(&target_runtime_key, "therock-release:gfx94X-dcgpu", 2);
+        replacement.version = "7.14.0".to_owned();
+        replacement.wheel_composition = Some(required.clone());
+        let (root, _) = test_paths("installed-replacement-sibling");
+        replacement.install_root = root.join("replacement");
+        fs::create_dir_all(&replacement.install_root).unwrap();
+        fs::write(replacement.install_root.join("installed.marker"), b"ok").unwrap();
+
+        let alone = vec![source.clone()];
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &alone,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable,
+            "the legacy runtime alone still has to be replaced"
+        );
+
+        let migrated = vec![source.clone(), replacement.clone()];
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &migrated,
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::UpToDate,
+            "the retained legacy manifest must not keep re-triggering the same repair"
+        );
+
+        // A sibling that merely shares the key without the composition is not the
+        // replacement: accepting it would strand the tree one repair short.
+        let mut impostor = replacement.clone();
+        impostor.wheel_composition = Some(test_wheel_composition("gfx950"));
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &[source.clone(), impostor],
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable
+        );
+
+        // A correct manifest is not an installed replacement after its runtime
+        // directory disappears; accepting it would suppress every repair.
+        fs::remove_dir_all(&replacement.install_root).unwrap();
+        assert_eq!(
+            runtime_freshness_with_manifests(
+                &[source.clone(), replacement],
+                &source,
+                "7.14.0",
+                Some(&required),
+                &target_runtime_key,
+            ),
+            RuntimeFreshness::RepairAvailable
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn aggregate_layout_without_device_payloads_is_rejected() {
+        let error = validate_aggregate_index_layout(
+            r#"<a href="rocm/">rocm</a><a href="torch/">torch</a><a href="torchvision/">torchvision</a><a href="torchaudio/">torchaudio</a>"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no `rocm-sdk-device-*` payload packages"));
+    }
+
+    #[test]
+    fn unknown_aggregate_layout_is_rejected_clearly() {
+        let error =
+            validate_aggregate_index_layout("<html><a href=\"gfx120X-all/\">legacy</a></html>")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("unknown canonical TheRock aggregate index layout"));
+        // `rocm-sdk-core/` must not satisfy the `rocm` requirement.
+        let error = validate_aggregate_index_layout(
+            r#"<a href="rocm-sdk-core/">rocm-sdk-core</a><a href="torch/">torch</a>"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rocm, torchvision, torchaudio not published"));
+    }
+
+    #[test]
+    fn pip_runtime_installs_pinned_target_complete_stack_from_aggregate_index() {
         let package_versions = TheRockPipPackageVersions {
             rocm: "7.13.0a20260513".to_owned(),
             torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
@@ -4034,23 +7701,129 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions);
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942");
 
         assert_eq!(
             package_specs,
             vec![
-                "rocm[libraries,devel]==7.13.0a20260513".to_owned(),
-                "torch==2.10.0+rocm7.13.0a20260513".to_owned(),
-                "torchvision==0.25.0+rocm7.13.0a20260513".to_owned(),
+                "rocm[libraries,devel,device-gfx942]==7.13.0a20260513".to_owned(),
+                "torch[device-gfx942]==2.10.0+rocm7.13.0a20260513".to_owned(),
+                "torchvision[device-gfx942]==0.25.0+rocm7.13.0a20260513".to_owned(),
                 "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn uv_metadata_plan_accepts_non_arithmetic_audio_version() -> Result<()> {
+        let plan = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.0.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )?;
+
+        assert_eq!(plan.rocm, "10.0.0");
+        assert_eq!(plan.torch, "2.13.0+rocm10.0.0");
+        assert_eq!(plan.torchvision, "0.28.0+rocm10.0.0");
+        assert_eq!(plan.torchaudio, "2.11.0.2+rocm10.0.0");
+        Ok(())
+    }
+
+    #[test]
+    fn uv_metadata_plan_rejects_mixed_rocm_builds() {
+        let error = parse_uv_compiled_package_versions(
+            "rocm==10.0.0\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.1.0\ntorchaudio==2.11.0.2+rocm10.0.0\n",
+        )
+        .expect_err("a mixed ROCm build must fail closed")
+        .to_string();
+
+        assert!(error.contains("torchvision"), "{error}");
+        assert!(
+            error.contains("does not share ROCm build 10.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn uv_metadata_resolver_maps_supported_python_platforms() -> Result<()> {
+        let windows = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["win_amd64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_version(&windows)?, "3.12");
+        assert_eq!(uv_python_platform(&windows)?, "x86_64-pc-windows-msvc");
+
+        let linux = WheelCompatibility {
+            python_tag: "cp312".to_owned(),
+            platform_tags: vec!["linux_x86_64".to_owned(), "any".to_owned()],
+        };
+        assert_eq!(uv_python_platform(&linux)?, "x86_64-unknown-linux-gnu");
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("sleep")
+            .arg(seconds.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    // `timeout.exe` refuses to run at all with its stdin redirected (it demands
+    // a real console even with `/nobreak`), exiting immediately instead of
+    // sleeping — which used to make both tests below pass or fail for the
+    // wrong reason. `Start-Sleep` has no such requirement.
+    #[cfg(windows)]
+    fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Start-Sleep -Seconds {seconds}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn Start-Sleep")
+    }
+
+    /// A budget-constrained caller (the startup update check) must get its
+    /// child back, not blocked past the budget it asked for.
+    #[test]
+    fn wait_with_output_bounded_kills_a_slow_child_at_the_deadline() {
+        let child = spawn_test_sleep(30);
+        let started = Instant::now();
+
+        let error = wait_with_output_bounded(child, Some(Duration::from_millis(200)))
+            .expect_err("a 30s sleep must not complete inside a 200ms budget");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill was not prompt"
+        );
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    /// An unbounded wait (an explicit user-invoked install, not a budgeted
+    /// startup check) still returns the child's real output.
+    #[test]
+    fn wait_with_output_bounded_waits_unbounded_when_no_timeout_is_given() {
+        let child = spawn_test_sleep(1);
+
+        let output = wait_with_output_bounded(child, None).expect("child should exit");
+
+        assert!(output.status.success(), "{output:?}");
     }
 
     /// The downloaded archive is removed once it has been unpacked; keeping it
     /// would double the disk cost of every installed SDK version.
     #[test]
     fn extracting_the_sdk_archive_removes_it() -> Result<()> {
+        // Extraction spawns bare-name `tar` via `PATH`; hold the shared env lock so a
+        // concurrent test that temporarily narrows `PATH` cannot make it fail to launch.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("discard-archive");
         let cache = root.join("cache");
         let payload_dir = root.join("payload");
@@ -4075,7 +7848,11 @@ mod tests {
 
         let target = root.join("install");
         fs::create_dir_all(&target)?;
-        extract_tarball_and_discard_archive(&archive, &target)?;
+        let cleanup_warning = extract_tarball_and_discard_archive(&archive, &target)?;
+        assert!(
+            cleanup_warning.is_none(),
+            "archive cleanup should succeed: {cleanup_warning:?}"
+        );
 
         assert!(
             target.join("marker.txt").is_file(),
@@ -4085,6 +7862,78 @@ mod tests {
             !archive.exists(),
             "the archive should be removed once unpacked, found {}",
             archive.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// If the archive can't be removed after a successful extraction, the
+    /// extraction result still succeeds and callers receive a warning message
+    /// describing the cleanup failure instead of a raised error.
+    #[cfg(unix)]
+    #[test]
+    fn extracting_the_sdk_archive_reports_cleanup_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, _paths) = test_paths("discard-archive-cleanup-failure");
+        let cache = root.join("cache");
+        let payload_dir = root.join("payload");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&payload_dir)?;
+        fs::write(payload_dir.join("marker.txt"), b"sdk")?;
+
+        let archive = cache.join("therock-sdk.tar.gz");
+        let tar = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload_dir)
+            .arg("marker.txt")
+            .status()?;
+        if !tar.success() {
+            eprintln!("skipping: tar unavailable on this host");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
+        // Root can unlink a file regardless of its parent directory's write
+        // permission bit, so the `chmod 0o555` below would not actually block
+        // the removal and `cleanup_warning` would come back `None`, failing
+        // the `.expect(...)` below on a mismatched assumption rather than the
+        // behavior under test.
+        #[allow(unsafe_code)] // libc FFI
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipping: test requires a non-root user to enforce permissions");
+            let _ = fs::remove_dir_all(&root);
+            return Ok(());
+        }
+
+        let target = root.join("install");
+        fs::create_dir_all(&target)?;
+
+        // Removing the archive requires write access to its parent directory;
+        // strip that so `fs::remove_file` fails after a successful extraction.
+        let cache_perms = fs::metadata(&cache)?.permissions();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o555))?;
+        let result = extract_tarball_and_discard_archive(&archive, &target);
+        fs::set_permissions(&cache, cache_perms)?;
+
+        let cleanup_warning = result?;
+        assert!(
+            target.join("marker.txt").is_file(),
+            "the archive contents should still be extracted"
+        );
+        assert!(
+            archive.is_file(),
+            "archive removal should have failed, leaving it in place"
+        );
+        let message = cleanup_warning.expect("a cleanup failure should produce a warning message");
+        assert!(
+            message.contains("Could not remove the downloaded archive"),
+            "{message}"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -4241,22 +8090,126 @@ mod tests {
         assert_eq!(args, vec!["-m", "venv", "/mnt/envs/my-env"]);
     }
 
+    /// A data dir whose `runtimes` folder is a symlink to somewhere else, plus the
+    /// real folder it points at — both canonical, so an assertion cannot pass or
+    /// fail on whether the machine's temp dir is itself behind a link.
+    ///
+    /// Deliberately not `test_paths`: that builds paths by plain `join` and never
+    /// canonicalizes, which is exactly the property under test here.
+    #[cfg(unix)]
+    fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-linked-runtimes-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let real = root.join("data").join("real-runtimes");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("data").join("runtimes")).unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        (root, paths, real)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_a_symlinked_runtimes_folder() {
+        // The e2e harness points a scenario's `data/runtimes` at a shared tree this
+        // way. Recording the link's path made the runtime name a folder that
+        // vanished with the scenario, while the files stayed where they were
+        // written (rocm-cli#315).
+        let (root, paths, real) = linked_runtimes_paths("resolves");
+        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+
+        let resolved = resolved_install_root(&paths, "wheel", runtime_key, None);
+
+        assert_eq!(resolved, real.join("wheel").join(runtime_key));
+        assert!(
+            !resolved.starts_with(paths.data_dir.join("runtimes")),
+            "the recorded root must not be expressed through the link: {}",
+            resolved.display()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_a_symlinked_prefix() {
+        // `--prefix` has the identical failure mode, so it gets the identical fix.
+        let (root, paths, real) = linked_runtimes_paths("prefix");
+        let prefix = paths.data_dir.join("runtimes").join("chosen-env");
+
+        let resolved = resolved_install_root(&paths, "wheel", "unused-key", Some(prefix));
+
+        assert_eq!(resolved, real.join("chosen-env"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_root_resolves_the_tarball_format_too() {
+        let (root, paths, real) = linked_runtimes_paths("tarball");
+        let runtime_key = "release-tarball-gfx120x-all-7-14-0";
+
+        let resolved = resolved_install_root(&paths, "tarball", runtime_key, None);
+
+        assert_eq!(resolved, real.join("tarball").join(runtime_key));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn install_root_is_unchanged_when_nothing_is_linked() {
+        // Guards against gratuitous rewriting: on an ordinary tree the recorded
+        // root must still be the plain layout path, so existing installs and the
+        // paths compared against them do not move.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-plain-runtimes-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        // Resolved rather than canonicalized: on Windows `canonicalize` returns a
+        // verbatim `\\?\C:\…` path, so the expectation would carry a prefix the
+        // resolver deliberately strips and the test would fail on that rather than
+        // on whether the layout path moved.
+        let root = rocm_core::resolve_path_through_symlinks(&root);
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+
+        assert_eq!(
+            resolved_install_root(&paths, "wheel", runtime_key, None),
+            managed_runtime_root(&paths, "wheel", runtime_key)
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn managed_uv_cache_sits_under_the_data_dir_for_generated_runtime_folders() {
         let (_root, paths) = test_paths("managed-uv-cache");
-        let runtime_key = "release-wheel-gfx120x-all-7-14-0";
+        let runtime_key = "release-wheel-multi-arch-7-14-0";
         let install_root = managed_runtime_root(&paths, "wheel", runtime_key);
         assert!(install_root.starts_with(&paths.data_dir));
         // Without --prefix the generated runtime folder is itself under the data dir, so
-        // the uv cache shares a filesystem with the environment it populates.
+        // the uv cache is reachable from the environment it populates without crossing a
+        // mount point.
         assert!(managed_uv_cache_dir(&paths.data_dir).starts_with(&paths.data_dir));
     }
 
     #[test]
     fn uv_cache_does_not_follow_a_prefix_install_root() {
         // Documents a known gap rather than an intended behavior: `--prefix` relocates
-        // install_root only, while the uv cache stays keyed off the data dir. When the two
-        // land on different filesystems uv falls back to copying. Tracked separately; see
+        // install_root only, while the uv cache stays keyed off the data dir. When reaching
+        // one from the other crosses a mount point uv falls back to copying — it is the
+        // mount, not the filesystem, so a bind mount is enough. Tracked separately; see
         // the `--prefix` non-goal on the PR that introduced the colocation.
         let (_root, paths) = test_paths("prefix-uv-cache");
         let prefix_root = PathBuf::from("/mnt/elsewhere/envs/my-env");
@@ -4306,6 +8259,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-prefers-path");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -4356,7 +8310,7 @@ mod tests {
         if !runtime_is_windows() {
             return Ok(());
         }
-        let _guard = PYTHON_RESOLVER_TEST_ENV_LOCK.lock().unwrap();
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, _paths) = test_paths("python-probe-temp-root");
         let temp_root = root.join("Temp");
         fs::create_dir_all(&temp_root)?;
@@ -4409,6 +8363,7 @@ mod tests {
             // the managed/uv path regardless of PATH. Nothing to assert here.
             return Ok(());
         }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("python-path-over-managed");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
@@ -4503,16 +8458,97 @@ echo Python 3.12.10
     }
 
     #[test]
-    fn runtime_key_includes_version_for_side_by_side_installs() {
-        assert_eq!(
-            runtime_key(
-                TheRockChannel::Release,
-                "wheel",
-                "gfx120X-all",
-                Some("7.13.0a20260416")
-            ),
-            "release-wheel-gfx120x-all-7-13-0a20260416"
+    fn aggregate_wheel_runtime_key_separates_device_payloads_at_one_version() {
+        let base = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx942]==7.14.0".to_owned()],
+            rocm_sdk_target: Some("gfx942".to_owned()),
+        };
+        let other_payload = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec!["rocm[libraries,devel,device-gfx950]==7.14.0".to_owned()],
+            rocm_sdk_target: Some("gfx950".to_owned()),
+        };
+        let other_generation = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v3".to_owned(),
+            package_specs: base.package_specs.clone(),
+            rocm_sdk_target: base.rocm_sdk_target.clone(),
+        };
+        let mut legacy_probe_default = base.clone();
+        legacy_probe_default.rocm_sdk_target = None;
+
+        let base_key = wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base);
+
+        // Still names its channel and version: the retention policy and every
+        // human reading `runtimes list` group on that prefix.
+        assert!(
+            base_key.starts_with("release-wheel-multi-arch-7-14-0-"),
+            "{base_key}"
         );
+        assert_eq!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &base),
+            "the same composition must always name the same runtime"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &other_payload),
+            "a different device payload is a different runtime, not an overwrite"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &legacy_probe_default,),
+            "a runtime probed without the exact SDK target must be repaired side by side"
+        );
+        assert_ne!(
+            base_key,
+            wheel_runtime_key(TheRockChannel::Release, "7.14.0", &other_generation),
+            "a source-layout generation change must not reuse the old tree"
+        );
+    }
+
+    #[test]
+    fn recorded_composition_names_the_device_payload_it_installed() {
+        let composition = WheelRuntimeComposition {
+            source_layout_generation: "multi-arch-v2".to_owned(),
+            package_specs: vec![
+                "rocm[libraries,devel,device-gfx1103]==7.14.1".to_owned(),
+                "torch==2.11.0+rocm7.14.1".to_owned(),
+            ],
+            rocm_sdk_target: Some("gfx1103".to_owned()),
+        };
+
+        assert_eq!(
+            wheel_composition_device_target(Some(&composition)),
+            Some("gfx1103"),
+            "update planning must recover the installed target without probing the current host"
+        );
+        assert_eq!(wheel_composition_device_target(None), None);
+    }
+
+    #[test]
+    fn aggregate_wheel_resolution_hint_does_not_recommend_family_override() {
+        let hint = canonical_wheel_resolution_hint(TheRockChannel::Release);
+        assert!(!hint.contains("--family"));
+        assert!(hint.contains("--channel nightly"));
+        if !runtime_is_windows() {
+            assert!(hint.contains("--format tarball"));
+        }
+    }
+
+    #[test]
+    fn stable_provenance_uses_neutral_build_date_wording() {
+        let source = resolve_source(TheRockChannel::Release, SourceLayout::Canonical);
+        let mut output = String::new();
+        render_canonical_provenance(
+            &mut output,
+            TheRockChannel::Release,
+            &source.wheel_index,
+            source.layout.generation(),
+            "7.14.0",
+        );
+        assert!(output.contains("build_date: not encoded in stable version"));
+        assert!(!output.contains("not published"));
     }
 
     #[test]
@@ -4817,7 +8853,7 @@ echo Python 3.12.10
         fs::create_dir_all(&temp)?;
         let destination = temp.join("artifact.bin");
 
-        download_file(&url, &destination)?;
+        download_file(&url, &destination, &mut |_, _| {})?;
         assert_eq!(fs::read(&destination)?, body);
 
         let response = http_get(&url, &[], Some(5))?;
@@ -4826,6 +8862,177 @@ echo Python 3.12.10
 
         server.join().expect("localhost server thread panicked")?;
         let _ = fs::remove_dir_all(&temp);
+        Ok(())
+    }
+
+    #[test]
+    fn http_get_respects_max_time_secs() {
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        // Regression test for `http_get`'s `max_time_secs` bound, pre-existing
+        // and unchanged by this PR, which `download_timeout_secs` relies on
+        // once threaded through `resolve_latest_for_manifest`: `http_get` must
+        // actually bound the request to `max_time_secs`, not just accept the
+        // argument and fall back to the 10-minute default. A listener that
+        // accepts the connection but never writes a response simulates a
+        // stalled server past the connect phase, so this exercises the
+        // overall `timeout` (what `max_time_secs` controls), not just
+        // `connect_timeout` (fixed at `THEROCK_HEAD_PROBE_TIMEOUT_SECS`).
+        //
+        // This does not exercise `resolve_latest_for_manifest` itself: its
+        // wheel/tarball index URLs come from `canonical_source`, a `const
+        // fn` over fixed real hostnames with no test-time override, so a
+        // hermetic test can't reach that exact call site without either
+        // hitting the real network or adding a production-code test seam.
+        // `max_time_secs`/`download_timeout_secs` is a single value passed
+        // unchanged through plain pass-through parameters down to here (no
+        // branching on it in between), so a regression in its plumbing would
+        // either fail to compile (type mismatch) or show up as this test
+        // hanging instead of returning quickly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/stalled");
+        let started = Instant::now();
+        let result = http_get(&url, &[], Some(1));
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a stalled server must not be treated as a successful response"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "max_time_secs=Some(1) must bound the request; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn update_json_reports_no_managed_runtimes_as_empty_list() -> Result<()> {
+        let (root, paths) = test_paths("update-json-empty");
+
+        let document = render_update_json(&paths, None)?;
+
+        assert!(document.runtimes.is_empty());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn update_json_reports_per_manifest_error_without_failing_whole_report() -> Result<()> {
+        let (root, paths) = test_paths("update-json-error");
+        // An unsupported channel fails `TheRockChannel::parse` synchronously,
+        // so this error path is deterministic and never depends on real
+        // network reachability (unlike the manifest's placeholder index URL,
+        // which `resolve_pip_runtime_with_timeout` doesn't even consult).
+        //
+        // Deliberate gap: this only covers the all-error case. Asserting a
+        // successful row survives alongside a failing one would need a second
+        // manifest that resolves for real, and no fixture here stands up a
+        // resolvable wheel index — only a raw-body local HTTP server exists,
+        // for `native_http_download_and_get_round_trip_without_powershell`'s
+        // lower-level use. Not worth building just for this one assertion.
+        let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
+        manifest.channel = "unsupported-channel".to_owned();
+        write_test_runtime_manifest(&paths, &manifest)?;
+
+        let document = render_update_json(&paths, None)?;
+
+        assert_eq!(document.runtimes.len(), 1);
+        let row = &document.runtimes[0];
+        assert_eq!(row.runtime_key, "active");
+        assert_eq!(row.status, "error");
+        assert!(row.latest_version.is_none());
+        assert!(row.message.is_some());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn download_file_reports_cumulative_progress_to_its_caller() -> Result<()> {
+        use std::net::TcpListener;
+        use std::thread;
+
+        // A multi-chunk body (`download_file_streaming` reads in 64 KiB
+        // chunks) so a single callback firing wouldn't already satisfy the
+        // "monotonically increasing" assertion below.
+        let body: Vec<u8> = (0..200_000_u32).map(|i| (i % 256) as u8).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let served = body.clone();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            )?;
+            stream.write_all(&served)?;
+            stream.flush()?;
+            Ok(())
+        });
+
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+
+        let temp = workspace_test_artifact_dir().join(format!(
+            "download-progress-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(&temp)?;
+        let destination = temp.join("artifact.bin");
+
+        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
+        download_file(&url, &destination, &mut |bytes, total| {
+            calls.push((bytes, total));
+        })?;
+        assert_eq!(fs::read(&destination)?, body);
+
+        server.join().expect("localhost server thread panicked")?;
+        let _ = fs::remove_dir_all(&temp);
+
+        let total = Some(body.len() as u64);
+        assert!(
+            calls.len() >= 2,
+            "expected at least a pre-transfer and a final callback: {calls:?}"
+        );
+        assert!(
+            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "byte counts must never regress: {calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&(body.len() as u64, total)),
+            "the last callback must report the complete transfer: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|&(_, reported_total)| reported_total == total),
+            "the reported total must stay consistent across callbacks: {calls:?}"
+        );
         Ok(())
     }
 
@@ -5110,12 +9317,793 @@ echo Python 3.12.10
             cache_dir: root.join("cache"),
         };
 
-        let error = install_sdk(&paths, "release", "tarball", None, None, None, true)
-            .unwrap_err()
-            .to_string();
+        let error = install_sdk(
+            &paths,
+            "release",
+            "tarball",
+            None,
+            None,
+            None,
+            true,
+            SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("tarball installs are not supported on Windows"));
         assert!(error.contains("rocm install sdk --format wheel"));
+    }
+
+    /// Register `manifest` and make it the active default runtime, the way a
+    /// completed `install sdk` does.
+    fn write_active_test_runtime(
+        paths: &AppPaths,
+        manifest: &InstalledRuntimeManifest,
+    ) -> Result<()> {
+        write_test_runtime_manifest(paths, manifest)?;
+        let mut config = RocmCliConfig::load(paths)?;
+        config.default_runtime_id = Some(manifest.runtime_id.clone());
+        config.active_runtime_key = Some(manifest.runtime_key.clone());
+        config.save(paths)?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_classifies_upgrade_downgrade_reinstall() -> Result<()> {
+        let (root, paths) = test_paths("active-default-relation");
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        manifest.version = "7.13.0".to_owned();
+        write_active_test_runtime(&paths, &manifest)?;
+
+        let upgrade = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
+        assert!(upgrade.starts_with("upgrade from"), "got: {upgrade}");
+        assert!(upgrade.contains("7.13.0"));
+
+        let downgrade = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.12.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
+        assert!(downgrade.starts_with("downgrade from"), "got: {downgrade}");
+
+        let reinstall = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.13.0",
+        )?
+        .expect("relation should be reported while a runtime is the active default");
+        assert!(reinstall.starts_with("reinstall from"), "got: {reinstall}");
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_gates_a_different_family_or_channel() -> Result<()> {
+        // The regression this gate exists for. `finalize_successful_sdk_install`
+        // activates whatever was installed last regardless of family or channel,
+        // so installing gfx120X-all while a gfx110X-all runtime is the active
+        // default displaces it. A family/channel-scoped gate reported "no
+        // existing SDK" here and let the displacement through unconfirmed.
+        let (root, paths) = test_paths("active-default-relation-cross-family");
+        let mut manifest = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
+        );
+        manifest.version = "7.13.0".to_owned();
+        write_active_test_runtime(&paths, &manifest)?;
+
+        let other_family = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("installing another family must still report the active default it displaces");
+        assert!(
+            other_family.contains("replaces active default")
+                && other_family.contains("gfx110X-all"),
+            "got: {other_family}"
+        );
+
+        let other_channel = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Nightly,
+            "gfx110X-all",
+            "7.14.0",
+        )?
+        .expect("installing another channel must still report the active default it displaces");
+        assert!(
+            other_channel.contains("replaces active default")
+                && other_channel.contains("release channel"),
+            "got: {other_channel}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_none_without_an_active_default() -> Result<()> {
+        // Nothing installed at all, and — the second case — a registered runtime
+        // that no config points at. Neither displaces anything, so neither may
+        // prompt: an install with no active default runtime is the fresh path.
+        let (root, paths) = test_paths("active-default-relation-empty");
+        assert!(
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0"
+            )?
+            .is_none()
+        );
+
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &manifest)?;
+        assert!(
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0"
+            )?
+            .is_none()
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_propagates_manifest_read_errors() -> Result<()> {
+        // A manifest entry that cannot be read (here, a directory sitting where a
+        // `*.json` manifest file is expected) must surface as an error, not be
+        // silently treated as "no active default" — that would skip the
+        // confirmation gate exactly when we're least sure what is active.
+        let (root, paths) = test_paths("active-default-relation-error");
+        let registry_dir = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(registry_dir.join("broken.json"))?;
+
+        let error = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )
+        .expect_err("a manifest read failure should be propagated, not swallowed");
+        assert!(!error.to_string().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_an_unparsable_active_manifest() -> Result<()> {
+        // The other half of the same policy, and the half that used to fail open:
+        // the manifest file *reads* fine, so nothing errors, but it does not
+        // deserialize. `load_runtime_manifests` dropped it silently,
+        // `current_runtime_manifest` then missed, and the gate was skipped with a
+        // fresh-install verdict while `rocm runtimes list` still reported the
+        // runtime as active. This is the older-manifest/newer-binary shape:
+        // `family_source` carries no `#[serde(default)]`.
+        let (root, paths) = test_paths("active-default-relation-unparsable");
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_active_test_runtime(&paths, &manifest)?;
+
+        // The helper carries the preconditions that make this the parse path and
+        // not the I/O path: the file still reads, and it no longer deserializes.
+        let _ = make_test_runtime_manifest_unparsable(&paths, &manifest.runtime_key)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("an unparsable active manifest must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(&manifest.runtime_key),
+            "the relation must name the runtime the config still calls active: {relation}"
+        );
+        assert!(
+            relation.contains("could not be read"),
+            "the relation must say why the active default is unknown: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_a_dangling_active_runtime_key() -> Result<()> {
+        // Same policy, third shape: nothing is unreadable or unparsable, the
+        // config simply names an active runtime the registry has no manifest for.
+        // `rocm runtimes list` reports this as
+        // `active_status: missing manifest for active_runtime_key=...`, so a
+        // fresh-install verdict here would have one CLI assert both that a
+        // runtime is active and that none is.
+        let (root, paths) = test_paths("active-default-relation-dangling");
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.active_runtime_key = Some("release-wheel-gfx120X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling active_runtime_key must not yield a fresh-install verdict");
+        assert!(
+            relation.contains("release-wheel-gfx120X-all"),
+            "the relation must name the unresolved key: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_blames_an_unparsable_manifest_only_when_it_is_the_active_one()
+    -> Result<()> {
+        // A dangling `active_runtime_key` and an unparsable manifest belonging to
+        // some *other* runtime are two independent faults that show up together
+        // routinely: an older binary's manifest fails `from_slice` against this
+        // one while the runtime the config calls active was removed outright.
+        // Naming the stranger's file as "its manifest" would send the operator to
+        // repair a path that has nothing to do with the problem and never mention
+        // the runtime that actually went missing.
+        let (root, paths) = test_paths("active-default-relation-unrelated-unparsable");
+
+        let stranger = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &stranger)?;
+        let stranger_path = make_test_runtime_manifest_unparsable(&paths, &stranger.runtime_key)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        // Nothing on disk is stored under this key, so the only unreadable entry
+        // in the registry is the stranger's.
+        config.active_runtime_key = Some("release-wheel-gfx120X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling active_runtime_key must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all`, but no installed runtime manifest matches it"
+            ),
+            "the missing runtime is the cause, not the stranger's manifest: {relation}"
+        );
+        assert!(
+            !relation.contains("its manifest could not be read"),
+            "an unrelated unparsable manifest must not be blamed as the active one's: {relation}"
+        );
+        assert!(
+            relation.contains(&format!(
+                "; unreadable runtime manifests: {}",
+                stranger_path.display()
+            )),
+            "the unrelated unparsable manifest is still reported, as a suffix: {relation}"
+        );
+
+        // The other direction, in the same registry: once the active key's *own*
+        // manifest is unparsable, "could not be read" is the right cause even
+        // though the stranger's file is unreadable too.
+        let active = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            20,
+        );
+        write_test_runtime_manifest(&paths, &active)?;
+        let active_path = make_test_runtime_manifest_unparsable(&paths, &active.runtime_key)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("an unparsable active manifest must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all`, but its manifest could not be read"
+            ),
+            "the active key's own unparsable manifest is the cause here: {relation}"
+        );
+        assert!(
+            relation.contains(&active_path.display().to_string())
+                && relation.contains(&stranger_path.display().to_string()),
+            "both unreadable entries are still listed: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_names_both_unresolved_config_pointers() -> Result<()> {
+        // `current_runtime_manifest` tries `active_runtime_key` and falls through
+        // to `default_runtime_id`, so arriving at the fail-closed path with both
+        // set means both failed. `rocm runtimes activate` writes the pair
+        // together, so removing that runtime while another version of the family
+        // remains strands them together too. Reporting only the key would have
+        // the operator repair half the config and hit the gate again.
+        let (root, paths) = test_paths("active-default-relation-both-pointers");
+        let runtime_id = "therock-release:gfx120X-all";
+        let mut older = test_runtime_manifest("release-wheel-gfx120X-all-7130", runtime_id, 10);
+        older.version = "7.13.0".to_owned();
+        let mut newer = test_runtime_manifest("release-wheel-gfx120X-all-7140", runtime_id, 20);
+        newer.version = "7.14.0".to_owned();
+        write_test_runtime_manifest(&paths, &older)?;
+        write_test_runtime_manifest(&paths, &newer)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.active_runtime_key = Some("release-wheel-gfx120X-all-7120".to_owned());
+        config.default_runtime_id = Some(runtime_id.to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("two unresolved pointers must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "recorded as `release-wheel-gfx120X-all-7120`, but no installed runtime manifest matches it"
+            ),
+            "the relation must name the unresolved key: {relation}"
+        );
+        assert!(
+            relation.contains(&format!(
+                "; the recorded default runtime_id `{runtime_id}` does not settle it either, because 2 installed runtime manifests match it"
+            )),
+            "the relation must also name the ambiguous fallback id: {relation}"
+        );
+
+        // The zero-match half of the same pairing: the fallback is dangling
+        // rather than ambiguous, and must still be named.
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some("therock-release:gfx110X-all".to_owned());
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("two unresolved pointers must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(
+                "; the recorded default runtime_id `therock-release:gfx110X-all` does not settle it either, because no installed runtime manifest matches it"
+            ),
+            "the relation must also name the dangling fallback id: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_an_ambiguous_default_runtime_id() -> Result<()> {
+        // Same policy, but the *other* resolution path. `current_runtime_manifest`
+        // falls back to `default_runtime_id` when `active_runtime_key` is unset,
+        // and resolves only an exactly-one match. `runtime_id` is
+        // `therock-<channel>:<family>` with no version in it, so two installed
+        // versions of one family share it and the fallback returns `None` — while
+        // `rocm runtimes list` reports `active_status: ambiguous runtime_id=...`.
+        // `rocm config set-default-runtime` reaches this state directly: it stores
+        // the id unvalidated and clears `active_runtime_key`.
+        let (root, paths) = test_paths("active-default-relation-ambiguous-id");
+        let runtime_id = "therock-release:gfx120X-all";
+        let mut older = test_runtime_manifest("release-wheel-gfx120X-all-7130", runtime_id, 10);
+        older.version = "7.13.0".to_owned();
+        let mut newer = test_runtime_manifest("release-wheel-gfx120X-all-7140", runtime_id, 20);
+        newer.version = "7.14.0".to_owned();
+        write_test_runtime_manifest(&paths, &older)?;
+        write_test_runtime_manifest(&paths, &newer)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some(runtime_id.to_owned());
+        // Precondition: this is the `default_runtime_id` shape, not the
+        // `active_runtime_key` shape the sibling tests already cover.
+        config.active_runtime_key = None;
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.15.0",
+        )?
+        .expect("an ambiguous default_runtime_id must not yield a fresh-install verdict");
+        assert!(
+            relation.contains(runtime_id),
+            "the relation must name the id that could not be resolved: {relation}"
+        );
+        assert!(
+            relation.contains("2 installed runtime manifests match"),
+            "the relation must say the id is ambiguous and how badly: {relation}"
+        );
+
+        // Fail closed means the consent gate engages, not that the install is
+        // blocked outright: a consent flag still gets an operator through.
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_fails_closed_on_a_dangling_default_runtime_id() -> Result<()> {
+        // The zero-match half of the same fallback path: `_ => None` in
+        // `current_runtime_manifest` swallows "no match" exactly as it swallows
+        // "many matches". `rocm config set-default-runtime` does not check the id
+        // against the registry, so a typo — or uninstalling the last runtime of a
+        // family — leaves the config asserting an active default that is not
+        // there, which `rocm runtimes list` reports as
+        // `active_status: missing manifest for active_runtime_id=...`.
+        let (root, paths) = test_paths("active-default-relation-dangling-id");
+        let other = test_runtime_manifest(
+            "release-wheel-gfx110X-all",
+            "therock-release:gfx110X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &other)?;
+
+        let mut config = RocmCliConfig::load(&paths)?;
+        config.default_runtime_id = Some("therock-release:gfx120X-all".to_owned());
+        config.active_runtime_key = None;
+        config.save(&paths)?;
+
+        let relation = active_default_runtime_relation(
+            &paths,
+            TheRockChannel::Release,
+            "gfx120X-all",
+            "7.14.0",
+        )?
+        .expect("a dangling default_runtime_id must not yield a fresh-install verdict");
+        assert!(
+            relation.contains("therock-release:gfx120X-all"),
+            "the relation must name the id that could not be resolved: {relation}"
+        );
+        assert!(
+            relation.contains("no installed runtime manifest matches it"),
+            "the relation must say the id resolved to nothing: {relation}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn active_default_relation_is_fresh_when_no_config_pointer_claims_an_active_default()
+    -> Result<()> {
+        // The limit of the fail-closed policy. An unparsable registry manifest is
+        // only evidence of a *displacement* risk if something claims an active
+        // default; with neither `active_runtime_key` nor `default_runtime_id` set,
+        // nothing does, and demanding a consent flag would block a genuinely fresh
+        // install over an unrelated registry wart.
+        let (root, paths) = test_paths("active-default-relation-fresh-unparsable");
+        let manifest = test_runtime_manifest(
+            "release-wheel-gfx120X-all",
+            "therock-release:gfx120X-all",
+            10,
+        );
+        write_test_runtime_manifest(&paths, &manifest)?;
+        // The helper carries the preconditions that make this the parse path and
+        // not the I/O path: the file still reads, and it no longer deserializes.
+        let _ = make_test_runtime_manifest_unparsable(&paths, &manifest.runtime_key)?;
+
+        let config = RocmCliConfig::load(&paths)?;
+        assert!(config.active_runtime_key.is_none());
+        assert!(config.default_runtime_id.is_none());
+
+        assert_eq!(
+            active_default_runtime_relation(
+                &paths,
+                TheRockChannel::Release,
+                "gfx120X-all",
+                "7.14.0",
+            )?,
+            None,
+            "no config pointer claims an active default, so this is a fresh install"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_install_approval_only_prompts_when_an_active_default_is_displaced() {
+        let assume_yes = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes);
+        let update_apply = SdkInstallConsent::Preapproved(SdkInstallApprovalSource::UpdateApply {
+            activates: false,
+        });
+
+        // No active default runtime -> never prompt, regardless of terminal/consent.
+        assert_eq!(
+            sdk_install_approval(false, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::ProceedFresh
+        );
+        assert_eq!(
+            sdk_install_approval(false, SdkInstallConsent::Ask, true),
+            SdkInstallApproval::ProceedFresh
+        );
+        assert_eq!(
+            sdk_install_approval(false, assume_yes, false),
+            SdkInstallApproval::ProceedFresh
+        );
+
+        // Active default present: preapproved consent proceeds and is credited to
+        // its real source; a terminal prompts; neither refuses.
+        assert_eq!(
+            sdk_install_approval(true, assume_yes, false),
+            SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::AssumeYes)
+        );
+        assert_eq!(
+            sdk_install_approval(
+                true,
+                SdkInstallConsent::Preapproved(
+                    SdkInstallApprovalSource::ApproveReplacingActiveDefault
+                ),
+                false
+            ),
+            SdkInstallApproval::ProceedApproved(
+                SdkInstallApprovalSource::ApproveReplacingActiveDefault
+            )
+        );
+        assert_eq!(
+            sdk_install_approval(true, update_apply, false),
+            SdkInstallApproval::ProceedApproved(SdkInstallApprovalSource::UpdateApply {
+                activates: false
+            })
+        );
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, true),
+            SdkInstallApproval::PromptOverwrite
+        );
+        assert_eq!(
+            sdk_install_approval(true, SdkInstallConsent::Ask, false),
+            SdkInstallApproval::RefuseNonInteractive
+        );
+    }
+
+    #[test]
+    fn preapproved_install_line_credits_the_real_consent_source() {
+        // `rocm update --apply` draws its approval from the runtime the user
+        // selected, not from a flag — its `--yes` is inert — so a line
+        // crediting `--yes` names an approval that was never given. And without
+        // `--activate`, `apply_runtime_update` leaves the active default alone,
+        // so claiming the install "becomes the active default runtime" is false.
+        let by_yes = preapproved_install_line(
+            SdkInstallApprovalSource::AssumeYes,
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(by_yes.starts_with("Approved by --yes:"), "got: {by_yes}");
+        assert!(by_yes.contains("becomes the active default runtime"));
+
+        // The narrow flag is not `--yes`: ROCm CLI's own terminal-less surfaces
+        // pass only this one, and a line crediting `--yes` would tell whoever
+        // reads the chat or dashboard transcript that consent to run `sudo` was
+        // given when it never was.
+        let by_narrow = preapproved_install_line(
+            SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            by_narrow.starts_with("Approved by --approve-replacing-active-default:"),
+            "got: {by_narrow}"
+        );
+        assert!(
+            !by_narrow.contains("--yes"),
+            "the narrow flag must not be credited to --yes: {by_narrow}"
+        );
+        assert!(by_narrow.contains("becomes the active default runtime"));
+
+        let update_activates = preapproved_install_line(
+            SdkInstallApprovalSource::UpdateApply { activates: true },
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            !update_activates.contains("--yes"),
+            "the update path must not credit an approval `--yes` did not grant: {update_activates}"
+        );
+        assert!(update_activates.contains("becomes the active default runtime"));
+
+        let update_only = preapproved_install_line(
+            SdkInstallApprovalSource::UpdateApply { activates: false },
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+            "7.14.0",
+        );
+        assert!(
+            !update_only.contains("--yes"),
+            "the update path must not credit an approval `--yes` did not grant: {update_only}"
+        );
+        assert!(
+            !update_only.contains("becomes the active default runtime"),
+            "`update --apply` without --activate does not change the active default: {update_only}"
+        );
+        assert!(update_only.contains("The active default runtime is unchanged"));
+    }
+
+    #[test]
+    fn refusal_recommends_the_narrow_flag_before_yes() {
+        // This is the only message a script or CI job reads when it hits the
+        // gate, and it is the audience the narrow flag exists for. Recommending
+        // `--yes` first would hand an unattended caller the second consent that
+        // flag carries — approval to install system packages with `sudo` — and
+        // park it on a password prompt it has no terminal to answer.
+        let message = refuse_non_interactive_message(
+            "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+        );
+
+        let narrow = message
+            .find("--approve-replacing-active-default")
+            .unwrap_or_else(|| panic!("the refusal must name the narrow flag: {message}"));
+        // `--yes` still has to appear: a user at a terminal who wants both
+        // consents should not have to go looking for it.
+        let yes = message
+            .find("--yes")
+            .unwrap_or_else(|| panic!("the refusal must still explain --yes: {message}"));
+        assert!(
+            narrow < yes,
+            "the narrow flag must be recommended before --yes: {message}"
+        );
+        assert!(
+            message.contains("system packages"),
+            "the refusal must say what --yes additionally approves: {message}"
+        );
+        assert!(
+            message.contains("is the active default runtime"),
+            "the refusal must name what would be replaced: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("overwrit"),
+            "an upgrade leaves the previous install on disk; it replaces the \
+             active default rather than overwriting it: {message}"
+        );
+    }
+
+    #[test]
+    fn fresh_install_line_claims_no_absent_sdk() {
+        // The fresh path is reached whenever no runtime is the active default,
+        // which does not mean no SDK is installed anywhere. Saying "no existing
+        // ROCm SDK found" there would be false on a host holding a registered
+        // but unactivated runtime.
+        let line = fresh_install_line("7.14.0", "gfx120X-all");
+        assert!(
+            !line.to_lowercase().contains("no existing rocm sdk"),
+            "got: {line}"
+        );
+        assert!(line.contains("No active ROCm SDK runtime is configured"));
+        assert!(line.contains("gfx120X-all"));
+    }
+
+    #[test]
+    fn repo_version_without_wheels_warns_only_when_newest_is_newer() {
+        // Newest repo version has no wheels (newer than the installable one) -> warn.
+        assert_eq!(
+            repo_version_without_wheels(Some("7.14.0"), "7.13.0").as_deref(),
+            Some("7.14.0")
+        );
+        // Newest repo version is the one being installed -> no warning.
+        assert!(repo_version_without_wheels(Some("7.13.0"), "7.13.0").is_none());
+        // A specific version was requested (no "newest" known) -> no warning.
+        assert!(repo_version_without_wheels(None, "7.13.0").is_none());
+        // Defensive: an older "newest" (should not happen) never warns.
+        assert!(repo_version_without_wheels(Some("7.12.0"), "7.13.0").is_none());
+    }
+
+    #[test]
+    fn host_version_newer_than_reports_only_a_strictly_newer_host() {
+        // Host ROCm is newer than the version being installed -> surface it.
+        assert_eq!(
+            host_version_newer_than(Some("7.14.0".to_owned()), "7.13.0").as_deref(),
+            Some("7.14.0")
+        );
+        // Host ROCm matches the installed version -> nothing to explain.
+        assert!(host_version_newer_than(Some("7.13.0".to_owned()), "7.13.0").is_none());
+        // Host ROCm is older than the installed version -> nothing to explain.
+        assert!(host_version_newer_than(Some("7.12.0".to_owned()), "7.13.0").is_none());
+        // No legacy ROCm detected on the host -> nothing to explain.
+        assert!(host_version_newer_than(None, "7.13.0").is_none());
+
+        // A build-suffixed host version must not be lexicographically ranked
+        // above the resolved version: `7.2.4-98` is numerically OLDER than
+        // `7.13.0`, so no host-newer note. (This is the reported regression:
+        // char-compare put `7.2…` above `7.13…`.)
+        assert!(host_version_newer_than(Some("7.2.4-98".to_owned()), "7.13.0").is_none());
+        // Two-component host reports are parsed as `.0`; still older here.
+        assert!(host_version_newer_than(Some("7.4".to_owned()), "7.13.0").is_none());
+        assert!(host_version_newer_than(Some("7.9".to_owned()), "7.13.0").is_none());
+        // A build suffix on an equal version is not "newer".
+        assert!(host_version_newer_than(Some("7.13.0-56".to_owned()), "7.13.0").is_none());
+        // A genuinely newer build-suffixed host is surfaced, keeping the
+        // original reported string (suffix included) for the user-facing note.
+        assert_eq!(
+            host_version_newer_than(Some("7.20.1-33".to_owned()), "7.13.0").as_deref(),
+            Some("7.20.1-33")
+        );
+        // A host string we cannot parse is "can't tell", never "newer".
+        assert!(host_version_newer_than(Some("unknown".to_owned()), "7.13.0").is_none());
+    }
+
+    #[test]
+    fn host_version_notes_and_warning_render_the_expected_text() {
+        // Wheel path: the note names both versions and offers the --version override.
+        let wheel = wheel_host_version_note("7.14.0", "7.13.0");
+        assert_eq!(
+            wheel,
+            "this host reports ROCm 7.14.0, but 7.13.0 is the newest TheRock ROCm with a matching PyTorch stack, so it is selected; pass `--version <VERSION>` to override"
+        );
+
+        // Tarball path: same explanation, phrased for the GPU-family tarball.
+        let tarball = tarball_host_version_note("7.14.0", "7.13.0");
+        assert_eq!(
+            tarball,
+            "this host reports ROCm 7.14.0, but 7.13.0 is the newest TheRock ROCm tarball for this GPU family, so it is selected"
+        );
+
+        // The no-wheels warning names the repo-newest and the fallback it installs.
+        let warning = no_wheel_warning_message("7.14.0", "7.13.0");
+        assert_eq!(
+            warning,
+            "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
+        );
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
@@ -5175,12 +10163,15 @@ echo Python 3.12.10
             version: "7.13.0a20260416".to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/rocm".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/simple".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
             python_executable: Some("python".to_owned()),
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -5195,6 +10186,33 @@ echo Python 3.12.10
         fs::create_dir_all(path.parent().expect("manifest path should have parent"))?;
         fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
         Ok(())
+    }
+
+    /// Rewrite an already-written registry manifest so it still *reads* but no
+    /// longer deserializes, and return its path. Drops `family_source`, which
+    /// carries no `#[serde(default)]` — the real older-binary/newer-binary shape,
+    /// not an invented corruption.
+    fn make_test_runtime_manifest_unparsable(
+        paths: &AppPaths,
+        runtime_key: &str,
+    ) -> Result<PathBuf> {
+        let path = runtime_manifest_path(paths, runtime_key);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        value
+            .as_object_mut()
+            .expect("manifest is a JSON object")
+            .remove("family_source")
+            .expect("manifest carries family_source");
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+        assert!(
+            fs::read(&path).is_ok(),
+            "the fixture must still read, or this is the I/O path, not the parse path"
+        );
+        assert!(
+            serde_json::from_slice::<InstalledRuntimeManifest>(&fs::read(&path)?).is_err(),
+            "the test fixture must be unparsable, or this asserts nothing"
+        );
+        Ok(path)
     }
 
     #[test]
@@ -5212,6 +10230,106 @@ echo Python 3.12.10
             runtime_version_build_date("7.14.0a20260230"),
             None,
             "invalid calendar dates should not be displayed"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_without_kernel_error_field_still_parses() {
+        // Output produced before the kernel probe existed must not become a parse
+        // failure: an older runtime's probe is still a valid "no kernel attempted".
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null}"#,
+        )
+        .expect("probe without kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(probe.kernel_error, None);
+    }
+
+    #[test]
+    fn runtime_device_probe_keeps_kernel_failures_out_of_the_enumeration_error() {
+        // The distinction the caller acts on: devices were found, so this is not a
+        // "no devices" runtime, but the GPU cannot run work.
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":true,"torch_version":"2.11.0","hip_version":"7.13",
+                "device_count":8,"error":null,
+                "kernel_error":"RuntimeError: HIP error: invalid device function"}"#,
+        )
+        .expect("probe with kernel_error should parse");
+
+        assert_eq!(probe.device_count, Some(8));
+        assert_eq!(probe.error, None);
+        assert_eq!(
+            probe.kernel_error.as_deref(),
+            Some("RuntimeError: HIP error: invalid device function")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_reports_import_failures_only_as_enumeration_errors() {
+        let probe = parse_runtime_device_probe(
+            r#"{"import_ok":false,"torch_version":null,"hip_version":null,
+                "device_count":null,"error":"ImportError: no module named torch",
+                "kernel_error":null}"#,
+        )
+        .expect("failed-import probe should parse");
+
+        assert!(!probe.import_ok);
+        assert_eq!(probe.device_count, None);
+        assert_eq!(probe.kernel_error, None);
+        assert_eq!(
+            probe.error.as_deref(),
+            Some("ImportError: no module named torch")
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_guards_the_kernel_behind_successful_enumeration() {
+        // The script is the contract: a kernel must never be launched when the
+        // import or enumeration already failed, or when there is no device to launch
+        // it on. Getting this wrong turns a "no devices" runtime into a crash.
+        assert!(
+            RUNTIME_DEVICE_PROBE_SCRIPT
+                .contains(r#"if out["error"] is None and (out["device_count"] or 0) > 0:"#),
+            "the kernel attempt must be gated on a clean enumeration with devices"
+        );
+
+        let guard = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .0;
+        assert!(
+            !guard.contains("device=\"cuda\"") && !guard.contains("synchronize"),
+            "no kernel work may run before the guard"
+        );
+    }
+
+    #[test]
+    fn runtime_device_probe_script_records_kernel_failures_in_their_own_field() {
+        let kernel_section = RUNTIME_DEVICE_PROBE_SCRIPT
+            .split_once(r#"if out["error"] is None"#)
+            .expect("script should contain the kernel guard")
+            .1;
+
+        // Allocate, mutate, and synchronize: an unusable GPU commonly survives the
+        // allocation and only faults once work is actually launched and awaited.
+        assert!(kernel_section.contains(r#"torch.ones(32, device="cuda")"#));
+        assert!(kernel_section.contains("probe.add_(1.0)"));
+        assert!(kernel_section.contains("torch.cuda.synchronize()"));
+
+        assert!(
+            kernel_section.contains(r#"out["kernel_error"] = type(exc).__name__"#),
+            "a kernel failure must be recorded in kernel_error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["error"] ="#),
+            "the kernel attempt must never overwrite the enumeration error"
+        );
+        assert!(
+            !kernel_section.contains(r#"out["device_count"] ="#),
+            "a kernel failure must preserve the enumerated device count"
         );
     }
 }

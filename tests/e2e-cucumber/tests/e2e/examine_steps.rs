@@ -6,7 +6,11 @@ use cucumber::{given, then, when};
 
 use crate::E2eWorld;
 
-fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
+/// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
+///
+/// Shared with `runtime_steps`, which reads the same shape out of the `install
+/// sdk` preview.
+pub(crate) fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
     output.lines().find_map(|line| {
         let (name, value) = line.trim().split_once(':')?;
         (name == field).then(|| value.trim())
@@ -17,8 +21,8 @@ fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
 async fn setup_gpu_machine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
-        stdout.contains("AMD GPU detected") || stdout.contains("detected_gfx_target"),
-        "no AMD GPU detected on this machine:\n{stdout}"
+        field_value(&stdout, "detected_gfx_target").is_some_and(|target| target.starts_with("gfx")),
+        "no AMD GPU target detected on this machine:\n{stdout}"
     );
 }
 
@@ -36,10 +40,18 @@ async fn setup_wsl_host(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user asks for the version")]
+#[when("the user asks for the version through every CLI surface")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
-    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(
+        [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["-V"].as_slice(),
+        ]
+        .into_iter()
+        .map(|args| crate::run_rocm(world, args).0)
+        .collect(),
+    );
 }
 
 #[when("the user lists available engines")]
@@ -63,12 +75,91 @@ async fn user_asks_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[then("a version string is returned")]
+#[when("the user previews the driver install plan")]
+async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
+    // `--dry-run` renders the plan and returns before touching the system, so
+    // this is safe to run on any Linux host including the no-GPU mock lane.
+    let (stdout, _, rc) = crate::run_rocm(world, &["install", "driver", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
+    let outputs = world.cli_outputs.as_ref().expect("no commands were run");
+    assert_eq!(outputs.len(), 3, "expected all three version surfaces");
+    let (version_output, flag_outputs) = outputs.split_first().expect("three version surfaces");
     assert!(
-        output.trim().starts_with("rocm "),
-        "expected version string starting with 'rocm ': {output}"
+        flag_outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "-V/--version returned different output: {flag_outputs:?}"
+    );
+
+    // `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    // so only its first line -- the same traceable build string -- has to
+    // match `-V`/`--version`.
+    let version_first_line = version_output.lines().next().unwrap_or_default();
+    assert_eq!(
+        version_first_line,
+        flag_outputs[0].trim(),
+        "`rocm version`'s build line does not match `-V`/`--version`: {outputs:?}"
+    );
+
+    let output = version_first_line.trim();
+    let parsed = output
+        .strip_prefix("rocm-cli ")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split_once(" ("))
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, hash)| (version, reference, hash))
+        });
+    let Some((version, reference, hash)) = parsed else {
+        panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {output}");
+    };
+    assert!(!version.is_empty(), "version is empty: {output}");
+    assert!(!reference.is_empty(), "version ref is empty: {output}");
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {output}"
+    );
+    assert!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "version hash is not hexadecimal: {output}"
+    );
+
+    // `rocm version`'s own two lines beyond the build string. Both are printed
+    // unconditionally (either the detected value or a "not detected"/"unmanaged"
+    // variant), so their presence -- not their value, which depends on the host
+    // -- is what this surface promises.
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("ROCm SDK:")),
+        "`rocm version` did not report the ROCm SDK line:\n{version_output}"
+    );
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("GPU driver:")),
+        "`rocm version` did not report the GPU driver line:\n{version_output}"
+    );
+}
+
+#[then("the plan's repo version is a concrete version, not a shell placeholder")]
+async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let repo_version = field_value(output, "repo_version")
+        .unwrap_or_else(|| panic!("no repo_version line in driver install plan:\n{output}"));
+    assert!(
+        !repo_version.contains("${"),
+        "repo_version still shows an unresolved shell placeholder: {repo_version:?}\n{output}"
+    );
+    assert!(
+        repo_version
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_digit()),
+        "repo_version is not a concrete version string: {repo_version:?}\n{output}"
     );
 }
 
@@ -149,6 +240,44 @@ async fn assert_all_engines_listed(world: &mut E2eWorld) {
             "engine '{engine}' not found in:\n{output}"
         );
     }
+}
+
+#[then("the engine listing explains the default-engine marker")]
+async fn engine_listing_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the listing")]
+async fn host_default_engine_marked_in_listing(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("* {expected}")),
+        "expected '{expected}' marked as the default engine, got:\n{output}"
+    );
+}
+
+#[then("the inspection explains the default-engine marker")]
+async fn inspection_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend in examine output, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the inspection's engine inventory")]
+async fn host_default_engine_marked_in_inspection(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("  * {expected} ")),
+        "expected '{expected}' marked as the default engine in engine_inventory, got:\n{output}"
+    );
 }
 
 #[then("the inspection reports Linux as the operating system")]
@@ -297,6 +426,10 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
         &["managed_runtimes", "managed_runtime_count"],
     ),
     ("config_dir", &["config_dir"]),
+    // Where the active runtime lives. A caller holding the key cannot compute
+    // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
+    // set `install_root` freely.
+    ("active_runtime_root", &["active_runtime_root"]),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -331,6 +464,81 @@ fn human_states(human: &str, label: &str) -> Option<String> {
         .map(str::trim)
         .find(|value| !value.is_empty() && !value.starts_with('<'))
         .map(str::to_owned)
+}
+
+#[then("the framework report names the runtime's interpreter")]
+async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let value = parsed_json(world);
+    // Read the runtime from the machine-readable form, which is the one this
+    // scenario is about. Asserted rather than branched on: the scenario's
+    // `Given` activates one, so its absence is a broken precondition, and
+    // silently falling through to the `PATH` case is how this scenario would
+    // stop testing anything.
+    let Some(root) = value
+        .pointer("/summary/active_runtime_root")
+        .and_then(serde_json::Value::as_str)
+    else {
+        panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
+    };
+    // Both forms resolve the active manifest the same way, so a disagreement
+    // means one of the two paths is looking at a different runtime.
+    if let Some(stated) = human_states(human, "active_runtime_root") {
+        assert_eq!(
+            root, stated,
+            "the two forms name different roots for the same active runtime"
+        );
+    }
+
+    let source = value
+        .get("framework_source")
+        .and_then(serde_json::Value::as_str)
+        .expect("`examine --json` must report which interpreter answered");
+    assert_eq!(
+        source, "managed-runtime",
+        "this host's active runtime is {root}, and its torch -- not the ambient \
+         interpreter's -- is the one the engines will load"
+    );
+
+    let named_interpreter = value
+        .get("framework_notes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|notes| {
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|note| note.split_once("active managed runtime's interpreter: "))
+                .map(|(_, path)| path.trim().to_owned())
+                .find(|path| !path.is_empty())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the report must name the interpreter it used (runtime root here is \
+                 {root}): {:?}",
+                value.get("framework_notes")
+            )
+        });
+
+    // The containment check is restored where it holds rather than dropped
+    // outright. It was right for a runtime this CLI installed -- `install sdk`
+    // builds the venv under `install_root`, so an interpreter outside it means
+    // the report is describing some OTHER runtime than the active one -- and
+    // wrong only for an imported or adopted runtime, which records an
+    // interpreter that can sit anywhere. Those are exactly the runtimes the
+    // report calls `read-only`, so gating on the mode it already prints keeps
+    // the guard and drops the false-fail that made it go away. Absent mode:
+    // skip, rather than guess.
+    if human_states(human, "active_runtime_mode").as_deref() == Some("managed") {
+        assert!(
+            std::path::Path::new(&named_interpreter).starts_with(root),
+            "a managed runtime keeps its interpreter under its own root, so naming \
+             {named_interpreter} instead of something under {root} means the framework \
+             report is describing a different runtime than the active one"
+        );
+    }
 }
 
 #[then("the machine-readable form states everything the readable one does")]
@@ -474,4 +682,81 @@ async fn assert_frameworks_skipped(world: &mut E2eWorld) {
 async fn assert_still_states_a_verdict(world: &mut E2eWorld) {
     // Skipping the frameworks must narrow the probe, not hollow out the report.
     assert_states_a_verdict(world).await;
+}
+
+/// The `gfx_target_version` of the lowest-numbered KFD GPU node, read straight
+/// from sysfs.
+///
+/// `None` when the topology is unreadable or names no GPU node, which is the
+/// normal case off Linux and on hosts whose GPU is visible only through DRM.
+/// CPU nodes report `0` and are skipped.
+fn lowest_kfd_gpu_node_gfx_target_version() -> Option<u32> {
+    let mut lowest: Option<(u64, u32)> = None;
+    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
+        .ok()?
+        .flatten()
+    {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let version = properties.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "gfx_target_version" {
+                return None;
+            }
+            parts.next()?.parse::<u32>().ok()
+        });
+        let Some(version) = version.filter(|value| *value != 0) else {
+            continue;
+        };
+        // Real node directories are bare integers, so order them numerically:
+        // node 10 must not sort ahead of node 2.
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let order = name
+            .trim_start_matches(|ch: char| !ch.is_ascii_digit())
+            .parse::<u64>()
+            .unwrap_or(u64::MAX);
+        if lowest.is_none_or(|(seen, _)| order < seen) {
+            lowest = Some((order, version));
+        }
+    }
+    lowest.map(|(_, version)| version)
+}
+
+/// Cross-check the reported GPU target against KFD's own answer.
+///
+/// `examine` used to read `gfx_target_version` as a standalone file under each
+/// KFD topology node. No kernel exposes it there -- it is a line inside the
+/// node's `properties` -- so detection found nothing and fell through to the
+/// DRM ip-discovery route, which decodes a GC IP version and is
+/// wrong-but-plausible on the GC 9.4.x line: an MI300X whose KFD reports
+/// `gfx_target_version 90402` was named `gfx943` instead of `gfx942`. Asserting
+/// only that the target starts with `gfx` cannot see that.
+///
+/// The expectation is derived from `/sys/class/kfd` rather than from the CLI,
+/// so this is a cross-check and not a tautology. It re-derives only the
+/// unambiguous half of the decode: a revision below 10 renders as its own digit
+/// (9.4.2 -> gfx942). Revisions from 10 up use a lettered form (9.0.10 ->
+/// gfx90a) whose mapping belongs to the CLI, and copying it here would just
+/// restate the code under test, so those hosts keep the looser assertion above.
+#[then("the inspection names the GPU target that the kernel reports")]
+async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let reported = field_value(output, "detected_gfx_target")
+        .expect("no detected_gfx_target in examine output");
+
+    let Some(packed) = lowest_kfd_gpu_node_gfx_target_version() else {
+        return;
+    };
+    let (major, minor, revision) = (packed / 10_000, (packed / 100) % 100, packed % 100);
+    if revision >= 10 {
+        return;
+    }
+
+    let expected = format!("gfx{major}{minor}{revision}");
+    assert_eq!(
+        reported, expected,
+        "examine reported {reported}, but KFD reports gfx_target_version {packed} \
+         ({major}.{minor}.{revision} = {expected})\n{output}"
+    );
 }

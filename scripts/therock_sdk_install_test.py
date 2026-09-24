@@ -26,7 +26,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-THEROCK_SDK_PACKAGE_SPEC = "rocm[libraries,devel]"
+# A prefix, not the whole spec: the canonical index always appends a third extra
+# naming the device payload (`rocm[libraries,devel,device-gfx1201]`), so the
+# closing bracket is no longer in a fixed place.
+THEROCK_SDK_PACKAGE_SPEC = "rocm[libraries,devel"
 THEROCK_TORCH_PACKAGES = ["torch", "torchvision", "torchaudio"]
 THEROCK_RUNTIME_PACKAGES = ["rocm", "rocm-sdk-core"]
 
@@ -478,6 +481,16 @@ def main() -> int:
         install_argv.extend(["--prefix", str(args.prefix)])
     if args.dry_run:
         install_argv.append("--dry-run")
+    else:
+        # Approve replacing whatever runtime is the active default, so a reused
+        # test root stays non-interactive. Only on the real-install path: a dry
+        # run returns before the consent gate, and passing the flag there would
+        # claim an approval this harness was not asked for. `--yes` rather than
+        # `--approve-replacing-active-default` because this harness is meant to
+        # install the system packages the SDK needs too, and it is run by hand
+        # from a developer's terminal (no workflow invokes it), which can answer
+        # a sudo password prompt.
+        install_argv.append("--yes")
     install_output = run(
         "rocm install sdk pip",
         install_argv,
@@ -496,10 +509,14 @@ def main() -> int:
     assert_contains(install_output, "python_wheel_tag:", "sdk install")
     assert_contains(install_output, "platform_wheel_tags:", "sdk install")
     assert_contains(install_output, "package_specs:", "sdk install")
-    assert_contains(install_output, f"{THEROCK_SDK_PACKAGE_SPEC}==", "sdk install")
+    assert_contains(install_output, THEROCK_SDK_PACKAGE_SPEC, "sdk install")
     for package in THEROCK_TORCH_PACKAGES:
         assert_contains(install_output, f"{package}==", "sdk install")
     assert_not_contains(install_output, "rocm[devel]", "sdk install")
+    # The canonical source never installs every published device payload: a host
+    # whose chip it cannot name fails closed instead. Downloading ~4.3 GiB of
+    # device wheels to use one of them is the regression this forbids.
+    assert_not_contains(install_output, "device-all", "sdk install")
     if args.dry_run:
         assert_contains(install_output, "mode: dry-run", "sdk dry-run")
         dry_run_target = install_output_field(install_output, "target")

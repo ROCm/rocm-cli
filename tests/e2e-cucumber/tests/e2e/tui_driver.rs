@@ -44,6 +44,15 @@ const COLS: u16 = 80;
 /// cards (managed instances and live serving metrics).
 const DETAIL_ROWS: u16 = 40;
 const DETAIL_COLS: u16 = 120;
+/// Short enough that the instance-detail popup's `launch_args`/`env_vars`
+/// panes can't fit even the demo fixtures' handful of entries, forcing
+/// `render_body` to report a nonzero max scroll and the footer's `↑/↓ scroll`
+/// hint to appear — the only way to exercise that hint end to end, since the
+/// demo containers (`rocm-dash-daemon`'s `CONTAINERS`) don't carry enough
+/// launch_args/env_vars to overflow the popup at `ROWS`/`COLS` or
+/// `DETAIL_ROWS`/`DETAIL_COLS`, both of which only ever *enlarge* it.
+const OVERFLOW_ROWS: u16 = 20;
+const OVERFLOW_COLS: u16 = 90;
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -82,6 +91,33 @@ pub fn default_timeout() -> Duration {
     )
 }
 
+/// A termination signal a scenario can deliver to the live TUI, paired with the
+/// conventional `128 + signo` exit code the dashboard's signal handler reports
+/// after restoring the terminal (SIGINT → 130, SIGTERM → 143).
+#[derive(Debug, Clone, Copy)]
+pub enum TermSignal {
+    /// SIGTERM — a supervisor stopping the dashboard (`kill <pid>`).
+    Term,
+    /// SIGINT — an externally delivered `kill -INT` from another process.
+    ///
+    /// Deliberately NOT described as "the Ctrl-C gesture": while the TUI holds
+    /// the terminal in raw mode the driver's `ISIG` translation is off, so a
+    /// typed Ctrl-C never becomes a SIGINT. That gesture is a different code
+    /// path and is covered by [`TuiSession::press_ctrl_c_and_wait`].
+    Int,
+}
+
+impl TermSignal {
+    /// The `kill(1)` name (`TERM`/`INT`), used to deliver the signal to the
+    /// child by pid.
+    const fn kill_name(self) -> &'static str {
+        match self {
+            Self::Term => "TERM",
+            Self::Int => "INT",
+        }
+    }
+}
+
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
     child: Box<dyn Child + Send + Sync>,
@@ -107,6 +143,9 @@ pub struct TuiSession {
     is_chat: bool,
     scenario: Option<String>,
     argv: Vec<String>,
+    /// Exit code observed by [`deliver_signal_and_wait`], read back by the
+    /// signal scenarios' `Then` steps once the child has been reaped.
+    observed_exit_code: Option<i32>,
 }
 
 impl std::fmt::Debug for TuiSession {
@@ -126,6 +165,19 @@ impl TuiSession {
         Self::spawn_binary(world, crate::rocm_binary(), args)
     }
 
+    /// Like [`spawn`](Self::spawn), but overlaying `extra_env` on top of the
+    /// scenario's isolation environment — for a step whose `Given` planted
+    /// scenario-owned state (e.g. a shell rc file) that only the piped
+    /// (`run_rocm_with_env`) path would otherwise pick up, since [`pty_env`]'s
+    /// `HOME`/lack of `SHELL` are the PTY's own isolation, not that state.
+    pub fn spawn_with_env(
+        world: &E2eWorld,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+    }
+
     /// Spawn a specific `rocm` binary under a fresh PTY.
     ///
     /// Most scenarios use [`spawn`](Self::spawn) and exercise the harness-built
@@ -135,6 +187,15 @@ impl TuiSession {
         world: &E2eWorld,
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
+    ) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, binary, args, &[])
+    }
+
+    fn spawn_binary_with_env(
+        world: &E2eWorld,
+        binary: impl AsRef<std::ffi::OsStr>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -157,6 +218,16 @@ impl TuiSession {
             cmd.env(key, value);
         }
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
+            cmd.env(key, value);
+        }
+        // Behavioural fixtures attached by Given steps apply to PTY commands too,
+        // just as they do to the piped `run_rocm_with_scenario_env` path.
+        for (key, value) in &world.command_env {
+            cmd.env(key, value);
+        }
+        // Caller-supplied overrides win over the scenario's own isolation
+        // (e.g. a `Given` step's HOME/SHELL for state it planted itself).
+        for (key, value) in extra_env {
             cmd.env(key, value);
         }
         // Provider configuration changes product startup semantics: a host API
@@ -224,6 +295,7 @@ impl TuiSession {
             is_chat: args.first() == Some(&"chat"),
             scenario: world.current_scenario.clone(),
             argv: args.iter().map(|s| (*s).to_string()).collect(),
+            observed_exit_code: None,
         })
     }
 
@@ -237,6 +309,42 @@ impl TuiSession {
     /// exactly what a user sees — color/attribute independent.
     pub fn screen_text(&self) -> String {
         self.screen_snapshot().0
+    }
+
+    /// Whether the top-left cell carries the dimmed-backdrop wash a popup
+    /// overlay paints behind itself (`grey_overlay`'s fixed RGB(0x1c, 0x1e,
+    /// 0x22)). Popups drawn via `centered_rect` always leave a pad outside
+    /// the frame, and the top-left corner falls in that pad, so this is a
+    /// reliable proxy for "the screen behind the popup was dimmed" without
+    /// importing the product crate's own color constant. Unlike
+    /// `screen_text`, this deliberately inspects style, not just text content.
+    ///
+    /// This check is only as good as its two hardcoded assumptions: the
+    /// `(0, 0)` corner and the literal wash RGB. If a future popup's geometry
+    /// ever grows to cover the corner, or `grey_overlay`'s color constant
+    /// changes, this silently stops discriminating (always false) instead of
+    /// failing loudly — keep both in sync with `grey_overlay` and
+    /// `centered_rect` if either changes.
+    ///
+    /// HARD INVARIANT this relies on: `WASH` must never equal any theme's
+    /// plain `bg` (see the `bg:` fields in
+    /// `crates/rocm-dash-tui/src/ui/theme.rs`) — if it ever did, an
+    /// undimmed screen would misreport as dimmed and this assertion would
+    /// pass for the wrong reason. This is intentionally *not* enforced here
+    /// with a second hardcoded RGB (that would just trade one magic-number
+    /// coupling for two); if you touch either `WASH` or a theme's `bg`,
+    /// diff them against each other by hand.
+    pub fn corner_backdrop_is_dimmed(&self) -> bool {
+        const WASH: vt100::Color = vt100::Color::Rgb(0x1c, 0x1e, 0x22);
+        let p = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cell = p
+            .screen()
+            .cell(0, 0)
+            .expect("screen (0, 0) must exist once a screen has been rendered");
+        cell.bgcolor() == WASH
     }
 
     fn screen_snapshot(&self) -> (String, (u16, u16)) {
@@ -267,13 +375,13 @@ impl TuiSession {
         self.reader_failure.take_message()
     }
 
-    /// Resize both the real PTY and the emulated screen. The application receives
-    /// the normal terminal resize event; assertions continue to inspect exactly
-    /// what a user would see at the new geometry.
-    pub fn use_detail_size(&mut self) -> Result<(), String> {
+    /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
+    /// application receives the normal terminal resize event; assertions
+    /// continue to inspect exactly what a user would see at the new geometry.
+    fn resize_to(&mut self, rows: u16, cols: u16) -> Result<(), String> {
         let size = PtySize {
-            rows: DETAIL_ROWS,
-            cols: DETAIL_COLS,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -287,8 +395,21 @@ impl TuiSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .screen_mut()
-            .set_size(DETAIL_ROWS, DETAIL_COLS);
+            .set_size(rows, cols);
         Ok(())
+    }
+
+    /// Enlarge to [`DETAIL_ROWS`]x[`DETAIL_COLS`], for journeys that assert
+    /// rows below the dashboard's summary cards.
+    pub fn use_detail_size(&mut self) -> Result<(), String> {
+        self.resize_to(DETAIL_ROWS, DETAIL_COLS)
+    }
+
+    /// Shrink to [`OVERFLOW_ROWS`]x[`OVERFLOW_COLS`] — small enough that the
+    /// instance-detail popup's `launch_args`/`env_vars` panes can't fit the
+    /// demo fixtures' entries, forcing a scrollable body.
+    pub fn use_overflow_size(&mut self) -> Result<(), String> {
+        self.resize_to(OVERFLOW_ROWS, OVERFLOW_COLS)
     }
 
     /// Write raw bytes to the terminal (keystrokes/text). `Enter` is `"\r"`.
@@ -375,6 +496,13 @@ impl TuiSession {
     /// Poll the current screen until it contains `marker`, or fail with a
     /// deadline that includes the last screen for diagnosis. Also fails fast if
     /// the child exits before the marker appears.
+    ///
+    /// This only gates on the action you're waiting *for* if `marker` is
+    /// genuinely absent before it — the marker is tested before the first
+    /// sleep, so a call whose marker is already on screen returns
+    /// immediately and proves nothing about what happens afterward. A step
+    /// that re-waits on a marker a prior step already waited for is a silent
+    /// no-op, not a barrier.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -393,41 +521,8 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-                while Instant::now() < drain_deadline {
-                    if self.screen_text().contains(marker) {
-                        return Ok(());
-                    }
-                    if let Some(panic_message) = self.take_reader_panic() {
-                        return Err(format!(
-                            "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                            self.framed_screen()
-                        ));
-                    }
-                    if self
-                        .reader
-                        .as_ref()
-                        .is_some_and(std::thread::JoinHandle::is_finished)
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                // Final check after the drain window closes: the reader may have
-                // committed the last frame between the loop's screen check and the
-                // `is_finished`/deadline exit, so re-read before declaring failure.
-                if self.screen_text().contains(marker) {
+                if self.drain_final_frame(Some(marker)).await? {
                     return Ok(());
-                }
-                // A reader panic landing exactly on the drain deadline would
-                // otherwise be masked by the generic "process exited" error below
-                // (and then swallowed entirely if `Drop` runs during another
-                // unwind). Surface it here so the real cause wins.
-                if let Some(panic_message) = self.take_reader_panic() {
-                    return Err(format!(
-                        "pty reader thread panicked while draining the final frame for {marker:?}: {panic_message}\n{}",
-                        self.framed_screen()
-                    ));
                 }
                 return Err(format!(
                     "process exited ({status:?}) before {marker:?} appeared.\n{}",
@@ -444,20 +539,170 @@ impl TuiSession {
         }
     }
 
+    /// Wait until `marker` no longer appears on screen — the inverse of
+    /// [`wait_for_screen`](Self::wait_for_screen). Use this after a keystroke
+    /// that should dismiss an overlay whose absence is the only signal of
+    /// success (there is no positive marker for "menu didn't open").
+    pub async fn wait_until_gone(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.screen_text().contains(marker) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Poll the current screen until `is_ready` accepts it, with the same
+    /// fail-fast diagnostics as [`wait_for_screen`](Self::wait_for_screen): a
+    /// reader-thread panic or a child that exits mid-wait is reported as itself
+    /// rather than as a timeout against the frozen last screen.
+    ///
+    /// The general form of `wait_for_screen`, for evidence a frame is current
+    /// that is not "it contains this string" — a cleared table cell, or a
+    /// marker the frame stopped showing. `describe` names the condition being
+    /// waited on and is quoted in every diagnostic.
+    pub async fn wait_for_screen_where(
+        &mut self,
+        describe: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if is_ready(&self.screen_text()) {
+                return Ok(());
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Send the quit gesture appropriate to the session and wait for a clean
     /// exit. The dashboard quits with `q`; chat quits with the `/quit` slash
     /// command (a bare `q` would be typed into the focused input instead).
+    ///
+    /// A bare send has no read-back, so if the quit gesture is written before
+    /// the app has finished acting on whatever came just before it (e.g. right
+    /// after an unsynchronized `send` like the Escape key), it can be consumed
+    /// by that transient state and never reach the quit handler — the process
+    /// then never exits and this hangs until `timeout`. Re-sending the gesture
+    /// on a short cadence closes that gap the same way [`send_until`] does for
+    /// screen markers: if the first attempt landed (the common case), the
+    /// process has already exited by the first check and nothing is resent.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
-        if self.is_chat {
-            self.send("/quit\r")?;
-        } else {
-            self.send("q")?;
+        let gesture = if self.is_chat { "/quit\r" } else { "q" };
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.send(gesture)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt = KEY_RESEND_INTERVAL.min(remaining);
+            match self.wait_for_exit_code_within(attempt).await {
+                Some(code) => {
+                    return if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "TUI exited unsuccessfully (code {code}).\n{}",
+                            self.framed_screen()
+                        ))
+                    };
+                }
+                None => {
+                    if let Some(panic_message) = self.take_reader_panic() {
+                        return Err(format!(
+                            "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
+                            self.framed_screen()
+                        ));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+                    self.framed_screen()
+                ));
+            }
         }
-        self.wait_for_exit(timeout).await
+    }
+
+    /// Poll for up to `budget` for the child to exit, returning its exit code
+    /// if it did within that window or `None` (not a timeout error) if it
+    /// didn't — used by [`quit_and_wait`](Self::quit_and_wait) to bound each
+    /// resend attempt without treating "still running" as a hard failure.
+    async fn wait_for_exit_code_within(&mut self, budget: Duration) -> Option<i32> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                self.finished = true;
+                self.record_once(code);
+                return Some(code);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Poll until the child exits, asserting a successful (zero) exit code.
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<(), String> {
+        match self.wait_for_exit_code(timeout).await? {
+            0 => Ok(()),
+            code => Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
+    /// fast refusal contract. Unlike [`wait_for_exit`](Self::wait_for_exit) (which
+    /// requires success), this fails if the child exits 0, and — crucially — if it
+    /// does not exit within `timeout`: the pre-fix `dash --replay <missing>`
+    /// enters the alt-screen and hangs under a real PTY, so a timeout here is the
+    /// regression, not an infrastructure flake.
+    pub async fn wait_for_refusal(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
@@ -465,20 +710,220 @@ impl TuiSession {
                     self.finished = true;
                     self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
                     return if status.success() {
-                        Ok(())
-                    } else {
                         Err(format!(
-                            "TUI exited unsuccessfully ({status:?}).\n{}",
+                            "expected `dash --replay <missing>` to be refused, but it exited 0.\n{}",
                             self.framed_screen()
                         ))
+                    } else {
+                        Ok(())
                     };
                 }
                 Ok(None) => {}
                 Err(e) => return Err(format!("failed to poll TUI child: {e}")),
             }
-            // A reader panic doesn't affect whether the child itself has exited,
-            // but it does mean the screen in any resulting error/diagnostic is
-            // stale, so surface it rather than let this poll silently continue.
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting for refusal: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for `dash --replay <missing>` to be \
+                     refused — it did not exit (pre-fix regression: the dashboard took over the \
+                     terminal and hung).\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// After the child has exited (e.g. via [`wait_for_refusal`](Self::wait_for_refusal)),
+    /// wait a bounded time for the reader thread to commit the final buffered
+    /// frame, then return the visible screen. Lets a sibling assertion read the
+    /// last error line without racing the reader draining the PTY after exit.
+    pub async fn drain_final_screen(&mut self) -> String {
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline {
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        self.screen_text()
+    }
+
+    /// Record this invocation once for the command-coverage report (so `rocm
+    /// dash` / `rocm chat` count as covered), tied to the scenario for the
+    /// pass/fail join. Best-effort and idempotent.
+    fn record_once(&mut self, rc: i32) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let argv: Vec<&str> = self.argv.iter().map(String::as_str).collect();
+        crate::record_command(self.scenario.as_deref(), &argv, rc, "");
+    }
+
+    /// Deliver `signal` to the child, then wait for it to exit and stash the
+    /// observed exit code for the scenario's `Then` steps. Only harness faults
+    /// (no pid, a failed `kill`, a reader panic, or a timeout) are surfaced as
+    /// `Err`; asserting the exit *value* and terminal restoration is left to the
+    /// scenario's `Then` steps, which read the code back via
+    /// [`observed_exit_code`](Self::observed_exit_code) and call
+    /// [`expect_terminal_restored`](Self::expect_terminal_restored).
+    pub async fn deliver_signal_and_wait(
+        &mut self,
+        signal: TermSignal,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let pid = self
+            .child
+            .process_id()
+            .ok_or_else(|| "the TUI child has no pid; cannot deliver a signal".to_string())?;
+        // The signal scenarios are `@requires-os:linux`, so shelling out to
+        // `kill(1)` avoids pulling a `libc`/`nix` dependency into the harness
+        // just to reach `kill(2)`.
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{}", signal.kill_name()))
+            .arg(pid.to_string())
+            .status()
+            .map_err(|e| format!("failed to run `kill -{} {pid}`: {e}", signal.kill_name()))?;
+        if !status.success() {
+            return Err(format!(
+                "`kill -{} {pid}` exited unsuccessfully ({status})",
+                signal.kill_name()
+            ));
+        }
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
+    /// Type a literal Ctrl-C at the TUI and wait for it to exit, stashing the
+    /// observed code for the scenario's `Then` steps.
+    ///
+    /// Sends the raw byte `0x03` — what a terminal actually transmits for the
+    /// keystroke — rather than a signal. While the TUI holds the terminal in raw
+    /// mode, `ISIG` is off (and `ENABLE_PROCESSED_INPUT` on Windows), so the
+    /// driver does not translate the keystroke into SIGINT and the byte arrives
+    /// as an ordinary key event. That is the gesture a user performs;
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) covers the
+    /// externally delivered signal.
+    ///
+    /// What the scenario's assertions do and do not distinguish, stated plainly
+    /// because the two paths converge:
+    ///
+    /// - The *outcome* assertions (exit code 130, terminal restored) are
+    ///   byte-identical to the SIGINT scenario's, and cannot tell the paths
+    ///   apart on their own.
+    /// - The discrimination comes from the input plus the fact that the process
+    ///   exits **at all**. Delete the key-event arm and no signal is ever
+    ///   raised, so nothing ends the process and this call fails on its timeout.
+    ///   That is the regression the step is here to catch, and it catches it.
+    /// - It does **not** independently prove no signal was involved. That rests
+    ///   on the product's own raw mode: a build that failed to enter raw mode
+    ///   would leave `ISIG` on, the tty would turn `0x03` into a SIGINT, and
+    ///   these same assertions would still pass via the signal handler. Probing
+    ///   the pty's termios from the master side would need `libc`/`nix` in the
+    ///   harness, which this module deliberately avoids (see
+    ///   [`deliver_signal_and_wait`](Self::deliver_signal_and_wait), which shells
+    ///   out to `kill(1)` for the same reason).
+    ///
+    /// As with the signal path, only harness faults are `Err`; the exit *value*
+    /// and terminal restoration are asserted by the scenario's `Then` steps.
+    pub async fn press_ctrl_c_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        self.send("\u{3}")?;
+        let code = self.wait_for_exit_code(timeout).await?;
+        self.observed_exit_code = Some(code);
+        Ok(())
+    }
+
+    /// The exit code recorded by the most recent
+    /// [`deliver_signal_and_wait`](Self::deliver_signal_and_wait) or
+    /// [`press_ctrl_c_and_wait`](Self::press_ctrl_c_and_wait), read back by the
+    /// scenario's `Then` step to assert the expected `128 + signo` value.
+    #[must_use]
+    pub const fn observed_exit_code(&self) -> Option<i32> {
+        self.observed_exit_code
+    }
+
+    /// Assert the terminal was restored on exit: the child left the alternate
+    /// screen and made the cursor visible again. A TUI that dies on a signal
+    /// without running its restore path leaves both inverted (still on the
+    /// alt-screen, cursor hidden) — the broken state that needs a `reset`.
+    ///
+    /// Reuses the public [`in_alternate_screen`](Self::in_alternate_screen)
+    /// rather than carrying a second, byte-identical alt-screen probe.
+    pub fn expect_terminal_restored(&self) -> Result<(), String> {
+        let on_alt = self.in_alternate_screen();
+        let cursor_hidden = self.cursor_hidden();
+        if on_alt || cursor_hidden {
+            return Err(format!(
+                "terminal was not restored on exit (alternate_screen={on_alt}, cursor_hidden={cursor_hidden}); expected the process under test to leave the alt-screen and show the cursor.\n{}",
+                self.framed_screen()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the emulated cursor is currently hidden.
+    fn cursor_hidden(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .hide_cursor()
+    }
+
+    /// Whether the emulated terminal is currently in the alternate screen — the
+    /// full-screen buffer a TUI switches to with `ESC[?1049h`. For a fail-fast
+    /// refusal that never takes over the terminal this must stay `false`.
+    #[must_use]
+    pub fn in_alternate_screen(&self) -> bool {
+        self.parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .screen()
+            .alternate_screen()
+    }
+
+    /// Poll until the child exits, returning its raw exit code regardless of
+    /// whether it is zero — journeys whose success case is a specific *nonzero*
+    /// code (a declined confirmation, a signal exit) need the code rather than
+    /// [`wait_for_exit`](Self::wait_for_exit)'s zero-only assertion.
+    ///
+    /// The reader gets a bounded window to consume the final frame first: the
+    /// terminal-restore sequences a signal handler emits arrive immediately
+    /// before the process exits, so the parser must see them before restoration
+    /// is asserted.
+    ///
+    /// That drain runs on *every* path through here, including callers that
+    /// predate the signal scenarios ([`wait_for_exit`](Self::wait_for_exit), and
+    /// through it [`quit_and_wait`](Self::quit_and_wait)). It is not gated on the
+    /// caller needing it, because the frame is just as buffered after a `q` as
+    /// after a signal. It ends the moment the reader thread sees EOF — the usual
+    /// case, costing about one [`POLL_INTERVAL`] — with [`DRAIN_TIMEOUT`] as the
+    /// ceiling a wedged PTY can impose.
+    pub async fn wait_for_exit_code(&mut self, timeout: Duration) -> Result<i32, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.finished = true;
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                    self.record_once(code);
+                    self.drain_final_frame(None).await?;
+                    return Ok(code);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("failed to poll TUI child: {e}")),
+            }
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
                     "pty reader thread panicked while waiting for exit: {panic_message}\n{}",
@@ -495,16 +940,60 @@ impl TuiSession {
         }
     }
 
-    /// Record this invocation once for the command-coverage report (so `rocm
-    /// dash` / `rocm chat` count as covered), tied to the scenario for the
-    /// pass/fail join. Best-effort and idempotent.
-    fn record_once(&mut self, rc: i32) {
-        if self.recorded {
-            return;
+    /// Let the reader thread consume any bytes still buffered after the child
+    /// exits (its final restore sequences) for a short bounded window, so the
+    /// emulated screen reflects the terminal's final state before it is read. A
+    /// single poll is not enough when a large frame is still buffered behind the
+    /// process exit notification.
+    ///
+    /// The one drain loop for both exit paths, so they cannot drift: pass
+    /// `stop_on: Some(marker)` to also return as soon as `marker` appears (that
+    /// caller is racing the drain against a screen assertion), or `None` to just
+    /// wait out the window. Returns whether `stop_on` was found; `Err` if the
+    /// reader thread panicked, which must win over the caller's generic timeout
+    /// or "process exited" message (and would otherwise be swallowed entirely
+    /// when `Drop` runs during another unwind).
+    async fn drain_final_frame(&mut self, stop_on: Option<&str>) -> Result<bool, String> {
+        let found =
+            |session: &Self| stop_on.is_some_and(|marker| session.screen_text().contains(marker));
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+        loop {
+            if found(self) {
+                return Ok(true);
+            }
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(self.drain_panic_message(stop_on, &panic_message));
+            }
+            if self
+                .reader
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                || Instant::now() >= drain_deadline
+            {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        self.recorded = true;
-        let argv: Vec<&str> = self.argv.iter().map(String::as_str).collect();
-        crate::record_command(self.scenario.as_deref(), &argv, rc, "");
+        // Final checks after the drain window closes: the reader may have
+        // committed the last frame — or panicked — between the loop's checks and
+        // the `is_finished`/deadline exit, so re-read before declaring failure.
+        if found(self) {
+            return Ok(true);
+        }
+        if let Some(panic_message) = self.take_reader_panic() {
+            return Err(self.drain_panic_message(stop_on, &panic_message));
+        }
+        Ok(false)
+    }
+
+    /// Reader-panic diagnostic for [`drain_final_frame`], naming the marker the
+    /// drain was racing when there was one.
+    fn drain_panic_message(&self, stop_on: Option<&str>, panic_message: &str) -> String {
+        let context = stop_on.map_or_else(String::new, |marker| format!(" for {marker:?}"));
+        format!(
+            "pty reader thread panicked while draining the final frame{context}: {panic_message}\n{}",
+            self.framed_screen()
+        )
     }
 }
 

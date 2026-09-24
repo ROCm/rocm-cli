@@ -72,8 +72,8 @@ python scripts/build_single_exe_release.py standalone
 On Windows this writes `.rocm-work/standalone-release/rocm.exe`; on Linux it
 writes `.rocm-work/standalone-release/rocm`. The artifact is the rocm-cli binary
 itself, not a self-extracting launcher and not a model bundle. Running it with
-no arguments opens normal rocm-cli; if setup is not complete, the first-time
-setup wizard appears automatically.
+no arguments opens the normal rocm-cli launcher; choose "Set up this system"
+there to run first-time setup (it does not open automatically).
 
 rocm-cli ships native per-OS binaries; there is no cross-OS universal binary.
 Build and test the binary natively on each supported target (native Windows,
@@ -153,8 +153,35 @@ rocm install sdk --channel release --format wheel --dry-run
 The live SDK acceptance test creates an isolated test root under `target/`, creates a local bootstrap Python venv, runs:
 
 ```bash
-rocm install sdk --channel release --format wheel
+rocm install sdk --channel release --format wheel --yes
 ```
+
+`--yes` approves replacing whatever managed runtime is currently the active
+default without prompting, which keeps the command non-interactive when the test
+root is reused across runs (a root with no active default runtime never
+prompts). The gate is not scoped to the family or channel being installed, so
+`--yes` is needed on a reused root even when the install targets a family that
+root has never held. It matches the invocation in
+`scripts/therock_sdk_install_test.py`.
+
+`--yes` is used here because this test also wants the second approval it
+carries: installing required system packages with `sudo`. When all you need is
+to clear the active-default gate — the usual case for a script or a CI job —
+pass the narrower `--approve-replacing-active-default` instead. That is the flag
+the refusal message itself recommends, and the only one ROCm CLI's own
+terminal-less surfaces pass. Without either flag, the same command on a reused
+root prompts when a terminal is attached and fails outright when one is not; the
+failure names the flag to add, so read the message before treating it as a
+regression. Check both routes by hand after changing the gate:
+
+```bash
+rocm install sdk --channel release --format wheel --approve-replacing-active-default
+rocm install sdk --channel release --format wheel < /dev/null   # expect the refusal
+```
+
+The preview path is unaffected: `--dry-run` returns before the gate is
+consulted, so `rocm install sdk --channel release --format wheel --dry-run`
+never prompts and never refuses, whatever the active default is.
 
 Then it verifies:
 
@@ -164,8 +191,12 @@ Then it verifies:
   explicit `--prefix` folders
 - the installer does not pre-create that pip cache during dry-run or setup;
   pip creates it inside the ROCm folder when packages are downloaded
-- a single TheRock-index pip install plan for pinned `rocm[libraries,devel]`,
-  `torch`, `torchvision`, and `torchaudio` versions
+- a single TheRock-index pip install plan for pinned `rocm`, `torch`, and
+  `torchvision` requirements with exactly one `device-<detected-gfx-target>`
+  extra (`rocm` also requests `libraries,devel`), plus pinned `torchaudio`
+- on a host with no detectable AMD GPU the preview reports `device_target:
+  undetermined` and renders the device extra as a placeholder; a real install
+  refuses rather than falling back to every published device payload
 - package selection uses the newest exact ROCm build suffix common to the SDK
   package and the PyTorch stack for the current Python/platform wheel tags
 - `python -m rocm_sdk version`
@@ -460,6 +491,18 @@ still enforcing the key — and the deferred cleanup lands on the liveness refre
 that later observes the process dead. There is no e2e coverage of `services
 stop`/`restart` or endpoint auth; these paths are unit-tested only.
 
+`rocm services remove` / `rocm services prune` are the one place a key file is
+dropped for a service that was never stopped: the record itself is being
+deleted, so keeping its key would strand a 0600 secret belonging to a service
+that can no longer be restarted. Neither will touch a record the liveness
+refresh still reads as running, and `prune` re-checks liveness immediately
+before each delete — but the check and the delete are not atomic, so that
+narrows the race against a concurrent `restart` rather than eliminating it.
+`features/service_record_cleanup.feature` covers both commands on the mock lane,
+asserting on the files left on disk rather than on the summary line the command
+prints — the defect they exist to fix is a file being left behind, which a
+summary claiming success cannot reveal.
+
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server
@@ -745,10 +788,20 @@ Release trust checks:
 ```bash
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
+cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
 python scripts/release_readiness.py --self-test
-ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ```
+
+The ROCDXG digest check pins the shell fragment the WSL driver plan generates
+as a whole string — so a change to its quoting, spacing or field order fails
+the test rather than slipping past a substring assertion — and then runs that
+same generated fragment against a real file, with only the digest and the path
+redirected at a test payload: a matching digest, a mismatched one, a malformed
+one, and an empty one. That step is the only thing authenticating a package
+that is then installed as root, and this replaces the self-test that shipped
+with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
+`sha256sum`, so it is Unix-only.
 
 The release-readiness self-test is cross-platform and uses only workspace-local
 temporary files under `.rocm-work/tests/release-readiness`. It also checks exact
@@ -935,25 +988,50 @@ Reference: [TheRock Windows install tools](https://github.com/ROCm/TheRock/blob/
 Read-only WSL/ROCDXG preflight:
 
 ```bash
-python scripts/wsl_preflight.py --json
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose --json
 ```
 
-`--require-ready` checks WSL, `/dev/dxg`, DXCore, ROCDXG, `python3 -m venv`,
-and library registration. Source-build tools such as Windows SDK headers,
-CMake, and compilers are optional for runtime acceptance; add
-`--require-build-tools` only when validating a WSL source-build environment.
+The WSL catalog covers `/dev/dxg`, the DXCore handoff, ROCDXG and its linker
+entry, the distro release floor, the Windows host driver, and WSL 1. A clean run
+reports no findings; anything it does report carries a `fix-wsl-*` id and a plan.
 
-Interactive ROCDXG install inside WSL:
+From the Windows host, to inspect a distro without installing anything in it:
+
+```powershell
+rocm diagnose --distro          # the only distro installed
+rocm diagnose --distro Ubuntu   # a named one
+```
+
+Both forms run the same catalog. The host-side one collects its facts over
+`wsl.exe` with a POSIX shell, so the target distro needs neither `rocm-cli` nor
+Python.
+
+ROCDXG install inside WSL:
 
 ```bash
-bash scripts/wsl_setup_rocdxg.sh
-python scripts/wsl_preflight.py --require-ready
+rocm install driver            # review the plan
+rocm install driver --yes      # run it
+rocm examine                   # expect driver_status: wsl_rocdxg_ready
+rocm diagnose
 ```
 
-To require checksum verification for the downloaded ROCDXG `.deb`, provide the
-expected package digest from a trusted release source:
+The last two are the plan's own `post_install_checks`, so running them is what
+confirms the install took rather than merely that the commands exited zero.
+
+The `.deb` is verified against a digest pinned per ROCDXG release, so the
+default path needs nothing set. To exercise a release rocm-cli has no digest
+for, supply one — or opt out explicitly, which is the only way to reach an
+unverified install:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
+
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
 ```
+
+The install is covered by unit tests over the generated plan (`cargo test -p
+rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
+`/dev/dxg` and dxcore present, since the plan refuses before installing
+otherwise.

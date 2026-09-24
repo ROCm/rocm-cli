@@ -8,10 +8,11 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use crate::paths;
 
 /// Marker comments bracketing the generated dependency table in MANIFEST.md.
 const MANIFEST_BEGIN: &str =
@@ -42,17 +43,8 @@ struct Package {
 /// `Cargo.lock` exactly, keeping them consistent and preventing CI from
 /// resolving to newer registry versions mid-run.
 fn load_metadata() -> Result<Metadata> {
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--locked"])
-        .output()
-        .context("failed to run `cargo metadata`")?;
-    if !output.status.success() {
-        bail!(
-            "`cargo metadata` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    serde_json::from_slice(&output.stdout).context("failed to parse `cargo metadata` output")
+    let stdout = paths::run_cargo_metadata(&[])?;
+    serde_json::from_slice(&stdout).context("failed to parse `cargo metadata` output")
 }
 
 /// Build the markdown dependency table (header, separator, and one row per

