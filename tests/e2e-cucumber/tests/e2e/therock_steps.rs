@@ -371,7 +371,7 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
     let payload = deterministic_payload(PACED_TARBALL_PAYLOAD_BYTES);
     std::fs::write(payload_dir.join("payload.bin"), &payload)
         .expect("failed to write tarball payload");
-    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload");
+    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload").await;
 
     world.paced_download_server = Some(PacedDownloadServer::start(
         &served,
@@ -507,7 +507,14 @@ async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
     let downloading = format!("Downloading {CURRENT_TARBALL}");
     let downloading_prefix = downloading
         .get(..DOWNLOADING_PREFIX_LEN)
-        .unwrap_or(&downloading);
+        .unwrap_or_else(|| {
+            panic!(
+                "DOWNLOADING_PREFIX_LEN ({DOWNLOADING_PREFIX_LEN}) is not a char boundary in \
+             {downloading:?} — pick a length that lands on one, otherwise this assertion \
+             would silently degrade to checking the untruncated label, which a live \
+             truncated line never shows"
+            )
+        });
     assert!(
         !screen.contains(downloading_prefix),
         "download spinner line was not cleared on completion:\n{screen}"

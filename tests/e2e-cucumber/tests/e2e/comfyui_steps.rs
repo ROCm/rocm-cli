@@ -486,7 +486,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
         deterministic_payload(PACED_ARCHIVE_PAYLOAD_BYTES),
     )
     .expect("failed to write archive filler payload");
-    let contents = build_gzip_tarball(&build_dir, "comfyui-source.tar.gz", "ComfyUI-master");
+    let contents = build_gzip_tarball(&build_dir, "comfyui-source.tar.gz", "ComfyUI-master").await;
 
     let served = root(world).join("comfyui-fixture").join("archive-serve");
     std::fs::create_dir_all(&served).expect("failed to create the archive fixture serve root");
