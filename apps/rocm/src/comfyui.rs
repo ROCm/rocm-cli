@@ -2180,10 +2180,7 @@ mod tests {
     fn reused_source_url_returns_recorded_url_from_valid_manifest() -> Result<()> {
         let paths = test_paths("comfyui-reused-url-valid-manifest");
         let recorded_url = "https://example.invalid/prior-comfyui-source.tar.gz";
-        save_manifest(
-            &paths,
-            &test_manifest_with_source_url(&paths, recorded_url),
-        )?;
+        save_manifest(&paths, &test_manifest_with_source_url(&paths, recorded_url))?;
 
         let url = reused_source_url(&paths);
 
