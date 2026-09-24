@@ -12,6 +12,21 @@
 //! truthfully: a stop is only "graceful" once the recorded process is observed to
 //! have actually exited within a bounded grace period, escalating to `SIGKILL`
 //! only when the caller opts into a forced stop.
+//!
+//! **The recycling defence is Linux-only in practice.** [`process_start_ticks`]
+//! reads the start-time from `/proc` and is a compile-time `None` everywhere
+//! else, so on Windows and macOS every record *captured there* carries no
+//! identity, and [`identity_state`] degrades to best-effort
+//! [`IdentityState::Matches`] — the paragraph above describes what this module
+//! enforces *where the platform can answer*. (A record reconstructed with a
+//! start-time recorded elsewhere is the other case: unconfirmable rather than
+//! absent, so it lands on [`IdentityState::Indeterminate`] and is not signalled
+//! either.) The degradation is deliberate: a
+//! host that cannot tell two processes apart must not therefore refuse to stop
+//! anything, since that would make every service unstoppable rather than making
+//! any of them safer. What holds on those hosts is the rest of the caller's
+//! gate — the port reality-check, the endpoint identity probe, and aborting
+//! with the recovery tooling intact on any unconfirmed stop.
 
 use std::time::{Duration, Instant};
 
@@ -83,12 +98,68 @@ pub enum IdentityState {
 /// [`IdentityState::Indeterminate`], never a risky match. When no identity was
 /// recorded (legacy state files), it degrades to best-effort
 /// [`IdentityState::Matches`].
+///
+/// Reads the PID's current start-time itself. A caller that has already read it
+/// — because it also needs the raw observation — should pass that one reading to
+/// [`identity_state_with_observed`] rather than calling this and reading again,
+/// so a process that exits between the two reads cannot produce two verdicts
+/// derived from disagreeing observations.
 #[must_use]
 pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
-    if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
+    identity_state_from_probes(
+        id,
+        || crate::process_is_running(id.pid) && !process_has_exited(id.pid),
+        || process_start_ticks(id.pid),
+    )
+}
+
+/// [`identity_state`] with its two observations taken lazily, so the order they
+/// are taken in is a property of this body rather than of a call site.
+///
+/// Liveness BEFORE the reading, and the early return is what enforces it. The
+/// reading must not sit in argument position — Rust evaluates arguments before
+/// entering the callee, which inverts the safe side of the race. A PID read
+/// while it was still the recorded process, which then exits and is recycled
+/// before the liveness check, would be compared as `expected == actual` and come
+/// back [`IdentityState::Matches`]: the one verdict that authorises a kill,
+/// handed out for a PID that is now somebody else. Reading only after liveness
+/// means the reading always describes whatever holds the PID *now*, so a
+/// recycled one disagrees and comes back [`IdentityState::Recycled`].
+///
+/// The two probes are parameters purely so that ordering is testable. Staging
+/// the real race needs a process to exit and its PID to be reissued inside a
+/// window of microseconds, which no test can do; two closures that record when
+/// they were called pin it deterministically instead. They are `FnOnce`
+/// generics, so this costs nothing at runtime — the real call above
+/// monomorphizes back into the same two direct calls.
+fn identity_state_from_probes(
+    id: &ProcessIdentity,
+    is_live: impl FnOnce() -> bool,
+    read_start_ticks: impl FnOnce() -> Option<u64>,
+) -> IdentityState {
+    if !is_live() {
         return IdentityState::Gone;
     }
-    match (id.start_ticks, process_start_ticks(id.pid)) {
+    // Compare only. Routing back through `identity_state_with_observed` would
+    // re-run the liveness check just performed, which on Linux is two more
+    // `/proc` reads per call — paid on every 25 ms tick of the bounded waits,
+    // which is where this is called from in a loop.
+    compare_start_ticks(id, read_start_ticks())
+}
+
+/// The identity comparison alone, for callers that have already established
+/// liveness.
+///
+/// Split out so the ordering guarantee above does not have to pay for a second
+/// liveness check. Deliberately not public: on its own it cannot return
+/// [`IdentityState::Gone`], so a caller that had not checked liveness would get
+/// [`IdentityState::Matches`] for a dead PID — the one verdict that authorises a
+/// kill. The two callers that establish liveness first are in this file.
+const fn compare_start_ticks(
+    id: &ProcessIdentity,
+    observed_start_ticks: Option<u64>,
+) -> IdentityState {
+    match (id.start_ticks, observed_start_ticks) {
         (Some(expected), Some(actual)) => {
             if expected == actual {
                 IdentityState::Matches
@@ -102,6 +173,31 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
         // No recorded identity (legacy state): best-effort proceed.
         (None, _) => IdentityState::Matches,
     }
+}
+
+/// [`identity_state`] against a start-time the caller has already observed.
+///
+/// `observed_start_ticks` is what [`process_start_ticks`] returned for `id.pid`:
+/// `None` both where the platform has no `/proc` and where that one PID's
+/// start-time could not be read.
+///
+/// Liveness is checked here too, so a PID that simply exits after the caller's
+/// reading still yields [`IdentityState::Gone`]. What that check cannot catch is
+/// exit *and recycle* between the reading and this call: the PID is live again,
+/// and a reading taken while it was still the recorded process matches the
+/// record, so the verdict is [`IdentityState::Matches`] for a process that is no
+/// longer ours. Callers holding a reading across anything slow should re-read
+/// rather than pass a stale one; [`identity_state`] avoids the window entirely
+/// by reading only after its own liveness check.
+#[must_use]
+pub fn identity_state_with_observed(
+    id: &ProcessIdentity,
+    observed_start_ticks: Option<u64>,
+) -> IdentityState {
+    if !crate::process_is_running(id.pid) || process_has_exited(id.pid) {
+        return IdentityState::Gone;
+    }
+    compare_start_ticks(id, observed_start_ticks)
 }
 
 /// Whether `state` means the recorded process is definitively no longer running.
@@ -361,6 +457,78 @@ mod tests {
     #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
 
+    #[test]
+    fn a_dead_process_is_never_read_for_a_start_time() {
+        // The ordering this module's safety rests on, pinned rather than
+        // inspected. If the reading is ever hoisted back into argument
+        // position — which reads as a harmless inlining, and was exactly the
+        // regression a review caught here — it happens before the liveness
+        // check, and a PID that exits and is recycled in between comes back
+        // `Matches`: the one verdict that authorises a kill, for a process that
+        // is no longer the recorded one.
+        //
+        // The real race is microseconds wide and needs a PID-space wrap, so it
+        // cannot be staged. This stages the observable consequence instead: a
+        // reading taken for a process already known dead is a reading that
+        // could not have informed the verdict.
+        let id = ProcessIdentity {
+            pid: 4321,
+            start_ticks: Some(99),
+        };
+        let mut read_start_ticks = false;
+
+        let state = identity_state_from_probes(
+            &id,
+            || false,
+            || {
+                read_start_ticks = true;
+                Some(99)
+            },
+        );
+
+        assert_eq!(
+            state,
+            IdentityState::Gone,
+            "a process that fails the liveness check is Gone whatever its start time reads as"
+        );
+        assert!(
+            !read_start_ticks,
+            "the start time must not be read at all once liveness has failed — if it was, the \
+             read is back in argument position and the recycle race is inverted"
+        );
+    }
+
+    #[test]
+    fn a_live_process_is_judged_on_a_reading_taken_after_its_liveness_check() {
+        // The other half: when liveness passes, the reading is taken, and it is
+        // the reading — not the record — that decides. A recycled PID reads
+        // differently and must come back `Recycled`.
+        //
+        // The PID is arbitrary, and nothing here establishes whether it is
+        // running — it does not need to. Both probes are stubbed, so this path
+        // never consults the real process table at all, and that is the point:
+        // reaching the comparison at all proves the verdict came from the
+        // liveness this function was handed rather than from a second check of
+        // its own. While the comparison went back through
+        // `identity_state_with_observed`, this same call returned `Gone` from
+        // that function's own liveness check, whatever the stub said.
+        let id = ProcessIdentity {
+            pid: 4321,
+            start_ticks: Some(99),
+        };
+
+        assert_eq!(
+            identity_state_from_probes(&id, || true, || Some(99)),
+            IdentityState::Matches,
+            "a live PID still reading as its recorded start time is the recorded process"
+        );
+        assert_eq!(
+            identity_state_from_probes(&id, || true, || Some(1234)),
+            IdentityState::Recycled,
+            "a live PID reading as a different start time is somebody else"
+        );
+    }
+
     /// Spawn a child that prints a line to stdout once it is ready, and block
     /// until that line arrives. This replaces sleep-based readiness guesses with
     /// a deterministic signal (e.g. that a shell has installed its SIGTERM trap),
@@ -524,6 +692,51 @@ mod tests {
         assert!(!hard.graceful());
         assert_eq!(identity_state(&id), IdentityState::Gone);
         reap(child);
+    }
+
+    /// The observation the caller passes must be the one classified, not a fresh
+    /// read of the same PID. A caller that needs the raw start-time *and* the
+    /// verdict reads once and passes it down precisely so the two cannot
+    /// disagree; an implementation that quietly re-read `/proc` would restore
+    /// that hazard while every existing test still passed. Here the live child's
+    /// real start-time matches its recorded identity, so a re-reading
+    /// implementation returns `Matches` — only one that honours the argument
+    /// returns `Recycled`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_state_with_observed_classifies_the_reading_it_was_given() {
+        let (child, _) = spawn_ready("echo ready; while true; do sleep 1; done");
+        let id = ProcessIdentity::capture(child.id());
+        let real_ticks = id.start_ticks.expect("linux records a start-time");
+
+        // Collect every verdict first, then kill and reap, and only then assert.
+        // The child holds the harness's stdout pipe open, so an assertion that
+        // panics ahead of the kill does not merely fail this test — it leaks a
+        // looping process and hangs the whole suite on the pipe. Ask the
+        // questions, clean up unconditionally, then judge.
+        let agreeing = identity_state_with_observed(&id, Some(real_ticks));
+        let disagreeing = identity_state_with_observed(&id, Some(real_ticks.wrapping_add(1)));
+        let unreadable = identity_state_with_observed(&id, None);
+
+        let hard = terminate_verified(&id, KillScope::Single, Duration::from_secs(5), true);
+        reap(child);
+
+        assert!(hard.stopped(), "the child must not outlive the test");
+        assert_eq!(
+            agreeing,
+            IdentityState::Matches,
+            "the reading that agrees with the record is a match"
+        );
+        assert_eq!(
+            disagreeing,
+            IdentityState::Recycled,
+            "a disagreeing reading must be classified, not discarded for a re-read"
+        );
+        assert_eq!(
+            unreadable,
+            IdentityState::Indeterminate,
+            "an unreadable start-time against a recorded one is unconfirmable"
+        );
     }
 
     /// A terminated child that has not been reaped yet is a zombie: it still has

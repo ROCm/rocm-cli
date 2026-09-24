@@ -131,10 +131,24 @@ Feature: Release install lifecycle
     And the install manifest is gone
     And the isolated XDG config, data, and cache state is gone
 
+  # EAI-8014: uninstall used to report success while a server it manages kept
+  # serving and holding the GPU, then delete the very tooling (`rocm services
+  # stop`, the service records) needed to stop it.
+  @id:lifecycle-linux-uninstall-stops-managed-server @lifecycle @requires-os:linux
+  Scenario: lifecycle-10 - Linux - uninstall stops the local server it manages
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And a local server this machine manages is running
+    When the user uninstalls from the installed binary
+    Then the removal is reported as complete
+    And the local server this machine manages is no longer running
+
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
 
   @id:lifecycle-windows-install-signed @lifecycle @requires-os:windows
-  Scenario: lifecycle-10 - Windows - a signed zip installs and verifies with native crypto
+  Scenario: lifecycle-11 - Windows - a signed zip installs and verifies with native crypto
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -144,7 +158,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-key-rotation-fallback @lifecycle @requires-os:windows
-  Scenario: lifecycle-11 - Windows - a malformed current trust root falls through to the valid next key
+  Scenario: lifecycle-12 - Windows - a malformed current trust root falls through to the valid next key
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -154,7 +168,7 @@ Feature: Release install lifecycle
     And the installed rocm binary is present
 
   @id:lifecycle-windows-all-pinned-keys-malformed @lifecycle @requires-os:windows
-  Scenario: lifecycle-12 - Windows - all malformed pinned trust roots fail deterministically
+  Scenario: lifecycle-13 - Windows - all malformed pinned trust roots fail deterministically
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -164,7 +178,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-updates-user-path @lifecycle @requires-os:windows
-  Scenario: lifecycle-13 - Windows - a default install updates the user PATH and restores it afterwards
+  Scenario: lifecycle-14 - Windows - a default install updates the user PATH and restores it afterwards
     Given a freshly built release tree
     And a generated signing keypair
     And the user PATH is captured for restoration
@@ -175,7 +189,7 @@ Feature: Release install lifecycle
     And the install directory is on the user PATH
 
   @id:lifecycle-windows-verifies-without-openssl @lifecycle @requires-os:windows
-  Scenario: lifecycle-14 - Windows - the installer verifies with native crypto when openssl is absent from PATH
+  Scenario: lifecycle-15 - Windows - the installer verifies with native crypto when openssl is absent from PATH
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -185,7 +199,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-rejects-bad-signature-without-openssl @lifecycle @requires-os:windows
-  Scenario: lifecycle-15 - Windows - a bad signature is rejected with native crypto when openssl is absent from PATH
+  Scenario: lifecycle-16 - Windows - a bad signature is rejected with native crypto when openssl is absent from PATH
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -195,7 +209,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reinstall-purges-stale @lifecycle @requires-os:windows
-  Scenario: lifecycle-16 - Windows - reinstalling purges a stale prior entry
+  Scenario: lifecycle-17 - Windows - reinstalling purges a stale prior entry
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
@@ -206,7 +220,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-reject-untrusted-key @lifecycle @requires-os:windows
-  Scenario: lifecycle-17 - Windows - an install with no public key rejects an untrusted signer
+  Scenario: lifecycle-18 - Windows - an install with no public key rejects an untrusted signer
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -215,7 +229,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-bad-checksum @lifecycle @requires-os:windows
-  Scenario: lifecycle-18 - Windows - a tampered checksum is rejected before activation
+  Scenario: lifecycle-19 - Windows - a tampered checksum is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -225,7 +239,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-bad-signature @lifecycle @requires-os:windows
-  Scenario: lifecycle-19 - Windows - a tampered signature is rejected before activation
+  Scenario: lifecycle-20 - Windows - a tampered signature is rejected before activation
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -235,7 +249,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-reject-missing-signature @lifecycle @requires-os:windows
-  Scenario: lifecycle-20 - Windows - a missing signature is rejected when a signature is required
+  Scenario: lifecycle-21 - Windows - a missing signature is rejected when a signature is required
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -245,7 +259,7 @@ Feature: Release install lifecycle
     And no binaries are activated in the target directory
 
   @id:lifecycle-windows-http-install @lifecycle @requires-os:windows
-  Scenario: lifecycle-21 - Windows - a signed bundle installs over a loopback HTTP download
+  Scenario: lifecycle-22 - Windows - a signed bundle installs over a loopback HTTP download
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
@@ -255,7 +269,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-installed-binary-smoke @lifecycle @requires-os:windows
-  Scenario: lifecycle-22 - Windows - the installed binary honors isolated directories and keeps the running executable on uninstall
+  Scenario: lifecycle-23 - Windows - the installed binary honors isolated directories and keeps the running executable on uninstall
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
@@ -272,3 +286,25 @@ Feature: Release install lifecycle
     Then uninstall reports skipping the running executable on Windows
     And the non-running installed rocmd binary is gone
     And the install manifest is gone
+
+  # The Windows half of EAI-8014. Worth its own scenario rather than trusting the
+  # Linux one because the termination path differs: Windows terminates only the
+  # recorded process, where Linux signals the whole tree.
+  #
+  # What this pins is that PID-based termination, not the gate's port
+  # reality-check. The planted record carries port 0, which nothing can ever be
+  # serving on, so the port branch is satisfied trivially on every run. Staging
+  # the case the port check exists for — an engine grandchild outliving the
+  # recorded process and still serving while the record reads "stopped" — needs
+  # a real listener the scenario does not stand up. That branch is covered by
+  # the unit tests around `stopped_record_verdict` instead.
+  @id:lifecycle-windows-uninstall-stops-managed-server @lifecycle @requires-os:windows
+  Scenario: lifecycle-24 - Windows - uninstall stops the local server it manages
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated directories with state
+    And a local server this machine manages is running
+    When the user uninstalls from the installed binary
+    Then the removal is reported as complete
+    And the local server this machine manages is no longer running
