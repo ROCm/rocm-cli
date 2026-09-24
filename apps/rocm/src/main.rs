@@ -74,10 +74,10 @@ use crate::runtimes_cmd::{
     setup_runtime_paths, toolchain_state_text, validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
+use crate::service_launch::{MANAGED_ENGINE_STARTUP_SETTLE, managed_engine_startup_failure_detail};
 #[cfg(not(windows))]
 use crate::service_launch::{
-    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
-    managed_service_process_command,
+    attach_background_stdio, detach_background_command, managed_service_process_command,
 };
 use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
 use crate::uninstall::uninstall;
@@ -119,7 +119,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(all(test, not(windows)))]
+#[cfg(any(windows, test))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -7272,8 +7272,31 @@ fn restart_internal_managed_service_with(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to restart managed engine process")?
+        use std::os::windows::process::ExitStatusExt as _;
+
+        // Same reasoning as the launch path: without a `Child` to `try_wait()` on,
+        // the only race-free liveness check is the one the Windows helper performs
+        // while the process handle is still open.
+        let spawn = rocm_core::spawn_detached_no_inherit_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to restart managed engine process")?;
+        if let Some(exit_code) = spawn.early_exit_code {
+            update_restarting_record(paths, &stopped_record, |current| {
+                current.status = "failed".to_owned();
+            })?;
+            bail!(
+                "{}",
+                managed_engine_startup_failure_detail(
+                    ExitStatus::from_raw(exit_code),
+                    &record.log_path
+                )
+            );
+        }
+        spawn.pid
     };
     #[cfg(not(windows))]
     let child_pid = {
@@ -7291,7 +7314,7 @@ fn restart_internal_managed_service_with(
         let mut child = command
             .spawn()
             .context("failed to restart managed engine process")?;
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
         if let Some(status) = child
             .try_wait()
             .context("failed to check restarted engine startup state")?
@@ -7306,8 +7329,6 @@ fn restart_internal_managed_service_with(
         }
         child.id()
     };
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
@@ -20609,6 +20630,23 @@ pub(crate) mod tests {
             "the verified process must be terminated"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Build an `ExitStatus` from a plain exit code the way the Windows startup
+    /// check does, i.e. straight from `GetExitCodeProcess`.
+    #[cfg(windows)]
+    pub(crate) fn exit_status_from_code(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        ExitStatus::from_raw(code.cast_unsigned())
+    }
+
+    /// Build an `ExitStatus` from a plain exit code the way the Unix startup
+    /// check does, i.e. from the raw wait status `try_wait` reports.
+    #[cfg(not(windows))]
+    pub(crate) fn exit_status_from_code(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Unix wait status: exit code in the high byte, no signal.
+        ExitStatus::from_raw(code << 8)
     }
 
     pub(crate) fn test_paths(name: &str) -> (PathBuf, AppPaths) {
