@@ -74,14 +74,8 @@ pub fn on_console_key(job_id: &str, jobs: &mut State, key: KeyEvent) -> ConsoleO
 }
 
 /// Human-readable status label + the color it should render in.
-pub fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
-    match &job.status {
-        JobStatus::Running => ("running".to_string(), theme.accent),
-        JobStatus::Done { code: 0 } => ("done".to_string(), theme.ok),
-        JobStatus::Done { code } => (format!("exited ({code})"), theme.warn),
-        JobStatus::Failed { message } => (format!("failed: {message}"), theme.err),
-        JobStatus::Cancelled => ("cancelled".to_string(), theme.muted),
-    }
+fn status_label(job: &JobState, theme: &Theme) -> (String, ratatui::style::Color) {
+    (job.status.label(), theme.job_status_color(&job.status))
 }
 
 /// Render the job console centered over `area`.
@@ -119,19 +113,19 @@ pub fn draw_job_console(
     // terminal state, render a full-width colored banner instead — a small chip
     // is easy to miss against a whole popup of scrolled output.
     let (label, color) = status_label(job, theme);
-    let is_terminal = !matches!(job.status, JobStatus::Running);
+    let is_terminal = job.is_terminal();
     let mut header = Vec::new();
     if is_terminal {
-        let glyph = match job.status {
-            JobStatus::Failed { .. } => "✗ ",
-            JobStatus::Cancelled => "○ ",
-            JobStatus::Done { code: 0 } => "✓ ",
-            JobStatus::Done { .. } => "! ",
-            // Unreachable: `is_terminal` (above) excludes `Running`.
-            JobStatus::Running => unreachable!("terminal banner only renders for finished jobs"),
-        };
+        // Redundant by construction now that both branches share `is_terminal()` —
+        // kept as a cheap regression guard against a future edit splitting the two
+        // checks back apart, not because this can fail today.
+        debug_assert!(
+            job.is_terminal(),
+            "terminal banner only renders for finished jobs"
+        );
+        let glyph = job.status.glyph();
         header.push(Span::styled(
-            format!(" {glyph}{label} "),
+            format!(" {glyph} {label} "),
             Style::default()
                 .fg(readable_text_on(color))
                 .add_modifier(Modifier::BOLD),
@@ -348,6 +342,42 @@ mod tests {
             code: 0,
         });
         assert_eq!(status_label(s.job("j").unwrap(), &t).0, "done");
+    }
+
+    #[test]
+    fn status_label_delegates_to_shared_job_status_helpers() {
+        // Guards `job_console::status_label` specifically: it must return the
+        // literal label/color the shared `JobStatus`/`Theme` helpers define,
+        // not a hand-rolled match of its own. This does not exercise
+        // `tabs/home` or `dock` — those have their own render-level
+        // regression tests (`activity_feed_colors_match_shared_job_status_color`,
+        // `logs_dock_tints_nonzero_exit_as_warn_not_ok`).
+        let t = theme();
+        let cases: [(JobStatus, &str, ratatui::style::Color); 5] = [
+            (JobStatus::Running, "running", t.accent),
+            (JobStatus::Done { code: 0 }, "done", t.ok),
+            (JobStatus::Done { code: 7 }, "exited (7)", t.warn),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                "failed: boom",
+                t.err,
+            ),
+            (JobStatus::Cancelled, "cancelled", t.muted),
+        ];
+        for (status, expected_label, expected_color) in cases {
+            let job = JobState {
+                cmd: "x".into(),
+                args: Vec::new(),
+                status,
+                output: std::collections::VecDeque::default(),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let (label, color) = status_label(&job, &t);
+            assert_eq!(label, expected_label);
+            assert_eq!(color, expected_color);
+        }
     }
 
     #[test]
