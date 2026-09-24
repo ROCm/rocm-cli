@@ -35,6 +35,13 @@ const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
 const MERGE_QUEUE_TAG: &str = "merge-queue";
 
+// `@serial` deliberately has no entry here, and `from_tags` below silently
+// ignores it like any other unrecognized tag: it isn't an expectation-
+// resolution concern, it's a cucumber-rs *runner* concern, consumed directly
+// by its default `Runner::Basic::which_scenario` (unmodified by this crate) to
+// force a scenario to run without any concurrent sibling. A feature file's
+// `@serial` tag works whether or not it's listed here.
+
 /// The resolved expectation for one scenario on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expectation {

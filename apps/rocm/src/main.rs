@@ -9392,6 +9392,23 @@ fn ensure_libnuma_for_torch(approved: bool) {
     );
 }
 
+/// Whether an E2E scenario has asked to skip the torch runtime dependency
+/// checks entirely. These checks run a real system package-manager install
+/// (`apt-get` or equivalent) whenever a dependency happens to be missing on
+/// the host, which is slow, network-dependent, and mutates host state — none
+/// of which a PTY scenario testing an unrelated concern (e.g. the download
+/// spinner) should depend on. Only active under `e2e-test-hooks`; production
+/// builds always run the real check.
+#[cfg(feature = "e2e-test-hooks")]
+fn torch_runtime_dep_checks_disabled() -> bool {
+    std::env::var_os("ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS").is_some()
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn torch_runtime_dep_checks_disabled() -> bool {
+    false
+}
+
 /// Shared control flow behind [`ensure_libatomic_for_torch`] and
 /// [`ensure_libnuma_for_torch`]: detect the dependency, print the distro-aware
 /// plan, and (when approved or auto-installable) run it via
@@ -9399,6 +9416,9 @@ fn ensure_libnuma_for_torch(approved: bool) {
 /// caller. No-op on Windows or when the dependency is already present.
 fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     if cfg!(windows) {
+        return;
+    }
+    if torch_runtime_dep_checks_disabled() {
         return;
     }
     if (dep.present)() {

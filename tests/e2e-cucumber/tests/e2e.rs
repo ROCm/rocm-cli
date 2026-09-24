@@ -14,6 +14,7 @@ use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
+use e2e_cucumber::paced_download::PacedDownloadServer;
 use tempfile::TempDir;
 
 mod e2e {
@@ -48,6 +49,10 @@ pub struct E2eWorld {
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
+    /// Paced download server used by the download-progress-spinner PTY
+    /// scenario. Kept on the World so it remains alive while the real `rocm`
+    /// subprocess downloads.
+    pub paced_download_server: Option<PacedDownloadServer>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -211,6 +216,7 @@ impl Default for E2eWorld {
         Self {
             mock: None,
             artifact_server: None,
+            paced_download_server: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
@@ -531,6 +537,7 @@ impl Drop for E2eWorld {
             mock.stop();
         }
         self.artifact_server.take();
+        self.paced_download_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
         // engine process (vLLM / llama-server) that outlives this harness — the
         // TempDir drop below removes the on-disk record but never kills those

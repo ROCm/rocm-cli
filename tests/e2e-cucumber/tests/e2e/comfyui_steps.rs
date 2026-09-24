@@ -34,14 +34,31 @@
 //! (`crates/rocm-dash-tui/src/app/mod.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
+//! `comfyui-04` covers the source-archive download spinner under a real PTY,
+//! mirroring `download_progress_pty.feature`'s tarball scenario but for
+//! `download_and_extract_source`'s in-process `GzDecoder`/`tar` unpack, which
+//! has no separate extraction phase (unlike TheRock's subprocess `tar -xf`, it
+//! never renders its own "Extracting…" frame — only the download spinner
+//! line matters here). It plants a ready wheel runtime, points
+//! `ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE` at a paced loopback server,
+//! and gives the fixture's `requirements.txt` only torch-stack entries so
+//! `install()`'s dependency filter empties out and skips the `uv` block
+//! entirely — this scenario is about the download spinner, not the
+//! dependency install already covered above.
+//!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use cucumber::{given, then, when};
+use e2e_cucumber::paced_download::{
+    PacedDownloadServer, build_gzip_tarball, deterministic_payload,
+};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::TuiSession;
 
 const RUNTIME_KEY: &str = "e2e-comfyui-runtime";
 
@@ -87,6 +104,24 @@ fn write_shim(path: &Path, body: &str) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|e| panic!("failed to chmod fake {}: {e}", path.display()));
     }
+}
+
+/// Writes a fake runtime Python that answers both forms `probe_comfyui`'s
+/// post-install GPU check shells out to: `-c <script>` (the pre-install
+/// torch-stack probe) and `<script-path> <result-path>` (the post-install
+/// check, which writes its JSON result to the given path instead of stdout).
+fn write_gpu_probe_shim(path: &Path) {
+    write_shim(
+        path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-c\" ]; then\n\
+         \tprintf '{}'\n\
+         \texit 0\n\
+         fi\n\
+         cat > \"$2\" <<'JSON'\n\
+         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
+         JSON\n",
+    );
 }
 
 /// Plant one ready wheel runtime: the on-disk stubs the CLI's readiness check
@@ -254,17 +289,7 @@ async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
         .join("comfyui-fixture")
         .join("python")
         .join("rocm-python");
-    write_shim(
-        &python,
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"-c\" ]; then\n\
-         \tprintf '{}'\n\
-         \texit 0\n\
-         fi\n\
-         cat > \"$2\" <<'JSON'\n\
-         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
-         JSON\n",
-    );
+    write_gpu_probe_shim(&python);
 }
 
 #[when("the user installs ComfyUI")]
@@ -408,4 +433,133 @@ async fn refusal_lists_both_keys(world: &mut E2eWorld) {
             "refusal should list runtime key `{key}`, got:\n{text}"
         );
     }
+}
+
+/// Pacing knobs for `comfyui-04`'s download server, mirroring
+/// `therock_steps.rs`'s `PACED_TARBALL_*` constants: large enough that several
+/// chunk boundaries land before the transfer completes, slow enough per chunk
+/// that the PTY's poll cadence reliably samples an intermediate frame. Smaller
+/// than TheRock's tarball fixture since there is no extraction phase here to
+/// also keep observable — only the download needs to take a moment.
+const PACED_ARCHIVE_PAYLOAD_BYTES: usize = 8_000_000;
+const PACED_ARCHIVE_CHUNK_BYTES: usize = 650_000;
+const PACED_ARCHIVE_CHUNK_DELAY: Duration = Duration::from_millis(150);
+/// Wait budget for this scenario's PTY assertions, matching
+/// `therock_steps.rs`'s file-local `PTY_SCREEN_TIMEOUT` convention.
+const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[given("a paced ComfyUI source archive fixture")]
+async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    plant_ready_runtime(&data, RUNTIME_KEY);
+
+    // `probe_comfyui`'s post-install GPU check runs unconditionally in
+    // `install()`, regardless of whether the `uv` block ran, so the runtime's
+    // stub Python must answer it — `plant_ready_runtime`'s default (`exit 0`,
+    // no output) is not enough. This scenario's requirements.txt (torch-stack
+    // only, below) empties the dependency list and skips the `-c` probe, but
+    // the shim answers both forms anyway for parity with the other fixtures.
+    let python = data
+        .join("runtimes")
+        .join("roots")
+        .join(RUNTIME_KEY)
+        .join("bin")
+        .join("python3");
+    write_gpu_probe_shim(&python);
+
+    // Build a real `.tar.gz`: one top-level directory holding a
+    // `requirements.txt` naming only the torch stack, so `install()`'s
+    // dependency filter empties the spec list and skips `uv` entirely — this
+    // scenario is about the download spinner, not the dependency install.
+    // Padded with high-entropy filler (`deterministic_payload`) so the paced
+    // server has enough incompressible bytes to stream in more than one
+    // chunk.
+    let build_dir = root(world).join("comfyui-fixture").join("archive-build");
+    let source_dir = build_dir.join("ComfyUI-master");
+    std::fs::create_dir_all(&source_dir).expect("failed to create ComfyUI source directory");
+    write_fixture(
+        &source_dir.join("requirements.txt"),
+        "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
+    );
+    std::fs::write(
+        source_dir.join("payload.bin"),
+        deterministic_payload(PACED_ARCHIVE_PAYLOAD_BYTES),
+    )
+    .expect("failed to write archive filler payload");
+    let contents = build_gzip_tarball(&build_dir, "comfyui-source.tar.gz", "ComfyUI-master").await;
+
+    let served = root(world).join("comfyui-fixture").join("archive-serve");
+    std::fs::create_dir_all(&served).expect("failed to create the archive fixture serve root");
+    world.paced_download_server = Some(PacedDownloadServer::start(
+        &served,
+        "archive/comfyui-source.tar.gz",
+        contents,
+        PACED_ARCHIVE_CHUNK_BYTES,
+        PACED_ARCHIVE_CHUNK_DELAY,
+    ));
+    let base = world
+        .paced_download_server
+        .as_ref()
+        .expect("paced download server was just started")
+        .base_url();
+    world.command_env.push((
+        "ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE",
+        format!("{base}/archive/comfyui-source.tar.gz").into(),
+    ));
+}
+
+#[when("the user installs ComfyUI under a real terminal")]
+async fn install_comfyui_under_pty(world: &mut E2eWorld) {
+    let mut session =
+        TuiSession::spawn(world, &["comfyui", "install", "--runtime-id", RUNTIME_KEY])
+            .unwrap_or_else(|e| panic!("failed to spawn `rocm comfyui install` under a pty: {e}"));
+    // The completion report is only ~10 lines today, safely inside the default
+    // 24-row screen (0 lines of scrollback) — but nothing guards against that
+    // growing and silently turning `assert_comfyui_spinner_line_cleared`'s
+    // negative check into a tautology, the same trap `therock_steps.rs`'s
+    // identical check hit once its own (much longer) summary was added. Grow
+    // rows now, matching that fix, rather than waiting for it to recur here.
+    //
+    // As in `therock_steps.rs`: issued right after spawn with no
+    // synchronization point, on the assumption that the child's fork/exec
+    // and first repaint take longer than this resize call.
+    session
+        .grow_rows(60)
+        .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
+    world.tui = Some(session);
+}
+
+#[then("the terminal shows an intermediate ComfyUI download progress frame")]
+async fn assert_intermediate_comfyui_download_progress_frame(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the ComfyUI install");
+    session
+        .assert_intermediate_download_progress_frame("the ComfyUI install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the ComfyUI install exits cleanly")]
+async fn assert_comfyui_install_exits_cleanly(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the ComfyUI install");
+    session
+        .assert_exits_cleanly("the ComfyUI install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the final terminal screen shows no ComfyUI download spinner line")]
+async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_ref()
+        .expect("no pty session for the ComfyUI install");
+    let screen = session.screen_text();
+    assert!(
+        !screen.contains("Fetching ComfyUI source archive"),
+        "download spinner line was not cleared on completion:\n{screen}"
+    );
 }

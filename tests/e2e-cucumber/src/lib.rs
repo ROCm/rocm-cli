@@ -9,6 +9,7 @@ pub mod installer_fixture;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;
+pub mod paced_download;
 pub mod panic_capture;
 pub mod reader_failure;
 pub mod send_until;

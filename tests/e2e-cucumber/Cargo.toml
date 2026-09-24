@@ -20,11 +20,16 @@ path = "src/bin/rocm-demo-env.rs"
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
 e2e-report = { path = "../../crates/e2e-report" }
+# Builds the paced download fixture's chunked response body (`stream::unfold`).
+futures = "0.3"
 # Drive the interactive dash TUI black-box: spawn the real `rocm` binary under a
 # pseudo-terminal (`portable-pty`, cross-platform openpty/ConPTY) and parse the
 # emitted terminal stream into the current on-screen grid (`vt100`). This is the
 # only way to exercise the crossterm raw-mode event loop a piped `Command` can't.
 portable-pty = "0.9"
+# Deterministic filler bytes for the paced-download fixtures (see
+# `src/paced_download.rs`) — a seeded `StdRng` rather than a hand-rolled PRNG.
+rand.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true

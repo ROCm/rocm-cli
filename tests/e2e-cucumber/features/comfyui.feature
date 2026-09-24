@@ -61,3 +61,23 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the refusal names the --runtime-id flag
     And the refusal names rocm runtimes activate
     And the refusal lists both runtime keys
+
+  # `download_and_extract_source` reports its download the same way TheRock's
+  # tarball install does (`cli_progress::AnimatedSpinner`), but its extraction
+  # is an in-process `GzDecoder`/`tar` unpack with no separate progress phase —
+  # unlike TheRock's subprocess `tar -xf`, it never renders its own frame. This
+  # proves the download half end to end: a real `rocm` binary, under a real
+  # PTY, fetching from a server paced slowly enough to observe an intermediate
+  # progress frame, and confirms the spinner line is gone once the process
+  # exits. See `download_progress_pty.feature` for the TheRock counterpart.
+  # @serial: same reasoning as `download_progress_pty.feature`'s
+  # `download-progress-01` — this scenario's intermediate progress frame
+  # depends on real wall-clock pacing that CPU contention from up to 63
+  # concurrently-running scenarios can starve away entirely.
+  @id:comfyui-source-download-shows-live-progress @requires-os:linux @serial
+  Scenario: comfyui-04 - The source-archive download spinner renders progress and clears on completion
+    Given a paced ComfyUI source archive fixture
+    When the user installs ComfyUI under a real terminal
+    Then the terminal shows an intermediate ComfyUI download progress frame
+    And the ComfyUI install exits cleanly
+    And the final terminal screen shows no ComfyUI download spinner line

@@ -30,13 +30,48 @@ const MIN_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// a stalled transfer still visibly animates instead of looking hung.
 const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Assumed terminal width when `crossterm::terminal::size()` fails (e.g.
+/// stderr is a TTY but not one `ioctl(TIOCGWINSZ)` can query). The
+/// conventional default columns most real terminals start at, so a repaint
+/// still truncates to a single row instead of growing unbounded.
+const FALLBACK_WIDTH: u16 = 80;
+
+/// The spinner's current text: either a plain label, or a label paired with
+/// a progress suffix that [`assemble_status_line`] must always keep intact.
+/// Folding both into one type — rather than two independently-mutated
+/// fields a caller could update out of sync — makes "a plain message never
+/// carries a stale byte-count suffix" a structural invariant instead of a
+/// convention every setter has to remember to uphold.
+enum SpinnerText {
+    Plain(String),
+    Progress { label: String, suffix: String },
+}
+
+impl SpinnerText {
+    fn label(&self) -> &str {
+        match self {
+            Self::Plain(label) | Self::Progress { label, .. } => label,
+        }
+    }
+
+    /// The byte-count/percentage tail of a progress label (e.g.
+    /// `" 1.5 MiB / 19.1 MiB (8%)"`), kept apart from the label so
+    /// [`assemble_status_line`] can always keep it intact — see its comment.
+    fn suffix(&self) -> Option<&str> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Progress { suffix, .. } => Some(suffix),
+        }
+    }
+}
+
 /// A carriage-return status indicator written to stderr. Disabled (a no-op) when
 /// stderr is not a TTY, so piped/redirected output never receives control
 /// characters. Keeps stdout clean for whatever the caller prints afterward.
 pub(crate) struct Spinner {
     enabled: bool,
     idx: usize,
-    label: String,
+    text: SpinnerText,
     active: bool,
     last_progress_paint: Option<Instant>,
     max_progress_bytes: u64,
@@ -47,7 +82,7 @@ impl Spinner {
         Self {
             enabled: std::io::stderr().is_terminal(),
             idx: 0,
-            label: label.into(),
+            text: SpinnerText::Plain(label.into()),
             active: false,
             last_progress_paint: None,
             max_progress_bytes: 0,
@@ -56,7 +91,7 @@ impl Spinner {
 
     /// Change the message shown next to the spinner (e.g. "Running smoke test…").
     pub(crate) fn set_label(&mut self, label: impl Into<String>) {
-        self.label = label.into();
+        self.text = SpinnerText::Plain(label.into());
         self.render_current();
     }
 
@@ -90,7 +125,10 @@ impl Spinner {
         }
         self.last_progress_paint = Some(now);
         self.idx = self.idx.wrapping_add(1);
-        self.label = format_download_progress(prefix, bytes, total);
+        self.text = SpinnerText::Progress {
+            label: prefix.to_owned(),
+            suffix: format_progress_suffix(bytes, total),
+        };
         self.render_current();
     }
 
@@ -99,15 +137,23 @@ impl Spinner {
             return;
         }
         let frame = SPINNER_FRAMES[self.idx % SPINNER_FRAMES.len()];
-        let mut line = format!("{frame} {}", self.label);
-        if let Ok((cols, _)) = crossterm::terminal::size() {
-            // A line that fits exactly at `cols` still wraps on some terminals
-            // once the cursor lands in the last column, and `Clear::CurrentLine`
-            // on the next repaint can only erase the row the cursor ends up on
-            // — not a wrapped-over first row. Leaving one column of slack keeps
-            // every repaint confined to a single row.
-            line = truncate_to_width(&line, cols.saturating_sub(1) as usize);
-        }
+        // A line that fits exactly at `cols` still wraps on some terminals
+        // once the cursor lands in the last column, and `Clear::CurrentLine`
+        // on the next repaint can only erase the row the cursor ends up on —
+        // not a wrapped-over first row. Leaving one column of slack keeps
+        // every repaint confined to a single row. When the size can't be
+        // queried, fall back to the same conventional 80-column width the
+        // e2e PTY harness and most real terminals default to, so this path
+        // still truncates instead of emitting an unbounded line — it's rare
+        // (an unusual stderr, not merely "not a TTY", which `enabled` already
+        // filters out above) but not untested.
+        let cols = crossterm::terminal::size().map_or(FALLBACK_WIDTH, |(cols, _)| cols);
+        let line = assemble_status_line(
+            frame,
+            self.text.label(),
+            self.text.suffix(),
+            cols.saturating_sub(1) as usize,
+        );
         let mut err = std::io::stderr();
         let _ = err.queue(MoveToColumn(0));
         let _ = err.queue(Clear(ClearType::CurrentLine));
@@ -153,6 +199,59 @@ fn truncate_to_width(line: &str, max_width: usize) -> String {
     }
     truncated.push('…');
     truncated
+}
+
+/// Assembles `"{frame} {label}{suffix}"` within `max_width` columns.
+///
+/// When `suffix` is present (a download's byte-count/percentage tail) and
+/// the full line would overflow, truncates `label` — the operation's file
+/// name, already printed in full elsewhere in the command's output — rather
+/// than the assembled line as a whole, so `suffix` always survives intact.
+/// Without truncating this way, `label`'s growth alone (e.g. `"0 B"` growing
+/// into `"1.5 MiB"`) can push a line that fit at 0% past the terminal width,
+/// and a blind tail-truncation would silently drop the percentage for the
+/// rest of the transfer.
+///
+/// If `frame` and `suffix` alone already meet or exceed `max_width` (an
+/// extremely narrow terminal, a suffix wider than the terminal, or the exact
+/// boundary where there'd be zero columns left for the label), there is no
+/// longer room to keep `suffix` intact with a label alongside it either —
+/// falls back to truncating `"{frame}{suffix}"` as a whole (no literal
+/// space; `suffix` already carries its own leading space), same as the
+/// no-suffix case below, so the result never exceeds `max_width` regardless
+/// of how narrow it is.
+fn assemble_status_line(
+    frame: &str,
+    label: &str,
+    suffix: Option<&str>,
+    max_width: usize,
+) -> String {
+    let Some(suffix) = suffix.filter(|s| !s.is_empty()) else {
+        return truncate_to_width(&format!("{frame} {label}"), max_width);
+    };
+    debug_assert!(
+        suffix.starts_with(' '),
+        "assemble_status_line's narrow-terminal fallback below assumes `suffix` \
+         already carries its own leading space (true of every current caller via \
+         `format_progress_suffix`); a space-less suffix would glue straight onto \
+         `frame` with no gap: {suffix:?}"
+    );
+    let reserved = frame.width() + 1 + suffix.width();
+    // `>=`, not `>`: at the exact boundary (`reserved == max_width`) the
+    // label_budget branch below would still take the label path, but with a
+    // budget of exactly 0 — truncating the label to nothing while the
+    // explicit space before it and `suffix`'s own leading space both remain,
+    // doubling up the gap. Routing the exact-fit case through this fallback
+    // too keeps that boundary case's single space consistent with every
+    // narrower width's.
+    if reserved >= max_width {
+        // No literal space here: `suffix` (from `format_progress_suffix`)
+        // already carries its own leading space, matching the spacing the
+        // label_budget branch below produces between `frame` and `suffix`.
+        return truncate_to_width(&format!("{frame}{suffix}"), max_width);
+    }
+    let label_budget = max_width - reserved;
+    format!("{frame} {}{suffix}", truncate_to_width(label, label_budget))
 }
 
 /// A [`Spinner`] kept animating by a background thread, for callers whose
@@ -247,10 +346,11 @@ impl Drop for AnimatedSpinner {
     }
 }
 
-/// e.g. `"Downloading SDK tarball… 842.1 MiB / 3.2 GiB (26%)"`, or
-/// `"Downloading SDK tarball… 842.1 MiB"` when the total is unknown (the
-/// server never reported a `Content-Length`).
-pub(crate) fn format_download_progress(prefix: &str, bytes: u64, total: Option<u64>) -> String {
+/// The trailing `" <bytes> / <total> (<pct>%)"` (or `" <bytes>"` when the
+/// total is unknown) portion of a progress label, kept separate from the
+/// operation prefix so [`assemble_status_line`] can always keep it
+/// visible — see its comment.
+fn format_progress_suffix(bytes: u64, total: Option<u64>) -> String {
     match total {
         Some(total) if total > 0 => {
             // Floor rather than round: a multi-gigabyte transfer sitting at
@@ -265,12 +365,12 @@ pub(crate) fn format_download_progress(prefix: &str, bytes: u64, total: Option<u
                 ((u128::from(bytes) * 100) / u128::from(total)) as u64
             };
             format!(
-                "{prefix} {} / {} ({pct}%)",
+                " {} / {} ({pct}%)",
                 rocm_core::format_bytes(bytes),
                 rocm_core::format_bytes(total)
             )
         }
-        _ => format!("{prefix} {}", rocm_core::format_bytes(bytes)),
+        _ => format!(" {}", rocm_core::format_bytes(bytes)),
     }
 }
 
@@ -279,27 +379,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_download_progress_shows_bytes_and_percent_when_total_is_known() {
+    fn format_progress_suffix_shows_bytes_and_percent_when_total_is_known() {
         let gib = 1024 * 1024 * 1024;
         assert_eq!(
-            format_download_progress("Downloading…", gib, Some(4 * gib)),
-            "Downloading… 1.0 GiB / 4.0 GiB (25%)"
+            format_progress_suffix(gib, Some(4 * gib)),
+            " 1.0 GiB / 4.0 GiB (25%)"
         );
     }
 
     #[test]
-    fn format_download_progress_omits_total_when_unknown() {
-        let rendered = format_download_progress("Downloading…", 883_147_264, None);
+    fn format_progress_suffix_omits_total_when_unknown() {
+        let rendered = format_progress_suffix(883_147_264, None);
         assert!(
             !rendered.contains('/') && !rendered.contains('%'),
             "no total means no fraction or percentage: {rendered}"
         );
-        assert!(rendered.starts_with("Downloading… "));
+        assert!(
+            rendered.starts_with(' '),
+            "format_progress_suffix's None-total branch must keep its own leading space: {rendered}"
+        );
     }
 
     #[test]
-    fn format_download_progress_clamps_percent_at_100_when_bytes_exceeds_total() {
-        let rendered = format_download_progress("Downloading…", 105, Some(100));
+    fn format_progress_suffix_clamps_percent_at_100_when_bytes_exceeds_total() {
+        let rendered = format_progress_suffix(105, Some(100));
         assert!(
             rendered.contains("(100%)"),
             "a server sending a few bytes past its declared length must not report over 100%: {rendered}"
@@ -307,8 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn format_download_progress_does_not_round_up_to_100_before_completion() {
-        let rendered = format_download_progress("Downloading…", 995, Some(1000));
+    fn format_progress_suffix_does_not_round_up_to_100_before_completion() {
+        let rendered = format_progress_suffix(995, Some(1000));
         assert!(
             rendered.contains("(99%)"),
             "99.5% must floor to 99%, not round up to a premature 100%: {rendered}"
@@ -316,11 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn format_download_progress_does_not_round_up_to_100_for_huge_totals() {
+    fn format_progress_suffix_does_not_round_up_to_100_for_huge_totals() {
         // An f64 ratio can't distinguish adjacent values this close to
         // u64::MAX — it collapses to 1.0 and would misreport 100% while a
         // byte is still outstanding. Integer arithmetic must not.
-        let rendered = format_download_progress("Downloading…", u64::MAX - 1, Some(u64::MAX));
+        let rendered = format_progress_suffix(u64::MAX - 1, Some(u64::MAX));
         assert!(
             !rendered.contains("(100%)"),
             "a single outstanding byte out of u64::MAX must not show as complete: {rendered}"
@@ -331,16 +434,108 @@ mod tests {
     fn set_progress_never_displays_fewer_bytes_than_already_shown() {
         let mut spinner = Spinner::new("Downloading…");
         spinner.set_progress("Downloading…", 900, Some(1000));
-        assert!(spinner.label.contains("900"));
+        assert!(spinner.text.suffix().unwrap().contains("900"));
         // A retried transfer restarts its own byte count from a lower offset.
         // Force this repaint past the throttle (via a small `total` that the
         // clamped byte count already exceeds) to prove the clamp itself, not
         // just that the repaint was skipped.
         spinner.set_progress("Downloading…", 100, Some(500));
+        let suffix = spinner.text.suffix().unwrap();
         assert!(
-            spinner.label.contains("900"),
-            "progress must not regress after a retry: {}",
-            spinner.label
+            suffix.contains("900"),
+            "progress must not regress after a retry: {suffix}"
+        );
+    }
+
+    #[test]
+    fn set_label_clears_a_stale_progress_suffix() {
+        // A caller that moves on to a plain (non-byte-progress) message must
+        // not have a previous transfer's byte count still glued to it —
+        // `render_current` would otherwise render an unrelated message with a
+        // stale suffix appended.
+        let mut spinner = Spinner::new("Downloading…");
+        spinner.set_progress("Downloading…", 900, Some(1000));
+        assert!(spinner.text.suffix().is_some());
+        spinner.set_label("Checking AMD GPU access…");
+        assert!(
+            spinner.text.suffix().is_none(),
+            "set_label must clear any progress suffix left over from a prior set_progress call"
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_keeps_the_progress_suffix_intact_when_the_label_would_overflow() {
+        // Regression test: an early version truncated the whole assembled
+        // line from the tail, which — once the byte count grew past a couple
+        // of characters — cut off the "(NN%)" suffix entirely on an ordinary
+        // 80-column terminal, silently hiding the download's percentage for
+        // the rest of the transfer. Truncation must eat the (already
+        // fully-shown-elsewhere) file name instead.
+        let label = "Downloading therock-dist-linux-gfx120X-all-7.10.0.tar.gz…";
+        let suffix = format_progress_suffix(1_608_192, Some(20_003_341));
+        let line = assemble_status_line("⠋", label, Some(&suffix), 79);
+        assert!(
+            line.contains(&suffix),
+            "the progress suffix must survive truncation intact: {line:?}"
+        );
+        assert!(
+            line.width() <= 79,
+            "the assembled line must still respect the terminal width: {line:?} (width {})",
+            line.width()
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_never_exceeds_max_width_when_suffix_alone_overflows() {
+        // Regression test: when the terminal is narrower than `frame + " " +
+        // suffix` alone, the label truncates to "" and an earlier version
+        // fell back to printing the untruncated suffix anyway, silently
+        // exceeding `max_width` — the same bug class this module exists to
+        // eliminate, just past the point where the suffix can stay intact.
+        let suffix = format_progress_suffix(1_608_192, Some(20_003_341));
+        assert!(suffix.width() > 10, "test needs an overlong suffix");
+        let line = assemble_status_line("⠋", "Downloading a file…", Some(&suffix), 10);
+        assert!(
+            line.width() <= 10,
+            "the assembled line must never exceed max_width, even when the \
+             suffix alone doesn't fit: {line:?} (width {})",
+            line.width()
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_fallback_does_not_double_the_space_before_suffix() {
+        // Regression test: `format_progress_suffix` already returns a string
+        // with its own leading space (e.g. " 883.1 MiB"). The narrow-terminal
+        // fallback used to insert another literal space before it, wasting a
+        // column of already-scarce width on a doubled-up gap.
+        let suffix = format_progress_suffix(883_147_264, None);
+        let max_width = 1 + suffix.width();
+        let line = assemble_status_line("⠋", "irrelevant label", Some(&suffix), max_width);
+        assert_eq!(
+            line,
+            format!("⠋{suffix}"),
+            "the suffix's own leading space must not be doubled up: {line:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_status_line_does_not_double_the_space_at_the_exact_fit_boundary() {
+        // Regression test: at `reserved == max_width` exactly (frame + the
+        // mandatory space + suffix fills the width with zero columns left for
+        // any label), an earlier version still took the label_budget branch
+        // with a budget of 0, truncating the label to nothing while leaving
+        // both the branch's own literal space *and* the suffix's leading
+        // space in the output — one column narrower and the fallback branch
+        // produced a single space instead. The exact-fit case must match its
+        // narrower neighbor, not double up.
+        let suffix = format_progress_suffix(883_147_264, None);
+        let max_width = "⠋".width() + 1 + suffix.width();
+        let line = assemble_status_line("⠋", "irrelevant label", Some(&suffix), max_width);
+        assert_eq!(
+            line,
+            format!("⠋{suffix}"),
+            "the exact-fit boundary must not double the space before suffix: {line:?}"
         );
     }
 
