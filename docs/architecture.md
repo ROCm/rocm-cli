@@ -58,8 +58,16 @@ Modularized (EAI-8032, Phase 1 of EAI-7768's sequencing): `parse.rs` (cucumber
 platform `Grid`, and the multi-platform HTML/markdown generation built on top —
 the largest module), `components.rs` (shared maud HTML fragment rendering, plus
 the CSS and timestamp helpers both generators use, depending only on `parse.rs`
-types to keep the module graph acyclic). `lib.rs` itself is just `pub mod` +
-`pub use` re-exports of the crate's public API.
+types to keep the module graph acyclic). The four modules are private
+`mod` declarations — `lib.rs` re-exports only the selected public API
+surface (`XfailReport`, `evaluate_xfail`, `scenario_results_by_id`,
+`generate`, `RunMeta`, `generate_consolidated`,
+`consolidated_summary_markdown`) via `pub use`, so consumers reach it
+through the crate root rather than through module-qualified paths like
+`e2e_report::parse::...`. This is a deliberate encapsulation choice
+tighter than the full-domain-extraction convention's `pub mod x;` +
+`pub use x::{...};` default described above — nothing outside this
+crate needs the module paths themselves, only the re-exported items.
 
 ### `engines/lemonade`, `engines/vllm` — inference engine adapters
 
