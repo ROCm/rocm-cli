@@ -340,11 +340,13 @@ fn possessive_owner_for<'a>(
     is_scoped_extension: bool,
     current_owner: Option<&'a str>,
 ) -> Option<&'a str> {
-    // Diagnostic-only: this guard shapes which citation gets an
-    // "(expected under ...)" hint in a failure message, never the pass/fail
-    // verdict itself — `citation_exists` never consults `section_dirs` for
-    // an unscoped extension, so an unnarrowed citation here just prints a
-    // plainer stale-path line rather than a wrong one.
+    // Diagnostic-only, and scoped to this function specifically: whether
+    // this returns `None` or a narrowed owner only changes what ends up in
+    // a citation's `section_dirs`, never `citation_exists`'s pass/fail
+    // verdict — it only ever consults `section_dirs` for a
+    // `SCOPED_BARE_EXTENSIONS` citation to begin with. Whether the
+    // resulting `section_dirs` are safe to print as an "(expected under
+    // ...)" hint is a separate question, decided in `format_stale_citation`.
     if !is_scoped_extension {
         return None;
     }
@@ -718,11 +720,20 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
 /// Fetch the doc's current path citations and fail, naming every one, if
 /// any no longer exist in the tracked tree.
 pub fn run() -> Result<()> {
-    let root = crate::paths::workspace_root()?;
+    check_doc_at(&crate::paths::workspace_root()?)
+}
+
+/// [`run`]'s actual work, over an arbitrary `root` rather than the real
+/// workspace — split out so a reviewer-flagged gap (`run`'s one-line
+/// delegation to [`check_citations`] was itself untested; discarding its
+/// result would still leave every test green) can be closed with a test
+/// that drives this same read-doc -> tracked-files -> check pipeline
+/// against a throwaway git repo instead of the real tree.
+fn check_doc_at(root: &Path) -> Result<()> {
     let doc_path = root.join(DOC_PATH);
     let markdown = std::fs::read_to_string(&doc_path)
         .with_context(|| format!("reading {}", doc_path.display()))?;
-    let tracked = tracked_files(&root)?;
+    let tracked = tracked_files(root)?;
     check_citations(&markdown, &tracked)
 }
 
@@ -791,7 +802,18 @@ fn dedupe_stale_for_display<'a>(stale: &[&'a Citation]) -> Vec<&'a Citation> {
 
 /// One line of [`stale_message`]'s report for a single stale citation.
 fn format_stale_citation(citation: &Citation) -> String {
-    if citation.section_dirs.is_empty() {
+    // `citation_exists` only ever consults `section_dirs` for a
+    // `SCOPED_BARE_EXTENSIONS` (`.rs`) citation — every other shape (a
+    // `.md`/`.toml` citation, an unconstrained suffix match, a bare
+    // crate-directory name) matches independent of section, regardless of
+    // whether `section_dirs` happens to be non-empty (it's attached from
+    // whichever heading was current when the citation was extracted; see
+    // `extract_path_citations`). Hinting a section for one of those would
+    // name a location the check never actually required.
+    let is_scoped_extension = SCOPED_BARE_EXTENSIONS
+        .iter()
+        .any(|ext| citation.text.ends_with(ext));
+    if citation.section_dirs.is_empty() || !is_scoped_extension {
         format!("  `{}`", citation.text)
     } else {
         format!(
@@ -1796,6 +1818,61 @@ See `apps/rocmd/src/main.rs` for the entry point.
         let err = check_citations(markdown, &tracked)
             .expect_err("a citation absent from `tracked` must fail the check");
         assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
+    }
+
+    #[test]
+    fn check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation() {
+        // Follow-up regression guard: after `check_citations_fails_and_names_a_stale_path`
+        // (above) closed the untested failure branch a reviewer had flagged,
+        // a later round found the gap had only moved one call outward —
+        // `run`'s own delegation to `check_citations` was itself unproven
+        // (e.g. discarding its result and always returning `Ok(())` would
+        // still leave every test green). This drives the full
+        // read-doc -> tracked-files -> check pipeline `run` actually runs,
+        // over a throwaway git repo, so `run`'s own composition is proven
+        // without touching the real `docs/architecture.md`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir docs");
+        std::fs::write(
+            root.join(DOC_PATH),
+            "`apps/rocm/src/deleted.rs` no longer exists.",
+        )
+        .expect("write doc");
+        run_git(&["add", "docs"]);
+
+        let err = check_doc_at(root).expect_err("a stale citation in the fabricated doc must fail");
+        assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
+    }
+
+    #[test]
+    fn stale_message_does_not_hint_a_section_for_a_root_level_extension_citation() {
+        // Regression case: `citation_exists` never consults `section_dirs`
+        // for a `.toml`/`.md` citation (root-only, per
+        // `ROOT_LEVEL_BARE_EXTENSIONS`) or any other non-`.rs` shape, but
+        // `extract_path_citations` still attaches whichever heading's
+        // directories were current when it was mentioned. A reviewer found
+        // the message then hinted a location the check never actually
+        // required — e.g. a stale `runtime-deps.toml` cited inside the
+        // `crates/rocm-deps` section reported "(expected under
+        // `crates/rocm-deps`)" even though the check demands it at the repo
+        // root regardless.
+        let root_toml_under_heading = citation("runtime-deps.toml", &["crates/rocm-deps"]);
+        let message = stale_message(&[&root_toml_under_heading]);
+        assert!(message.contains("`runtime-deps.toml`"));
+        assert!(!message.contains("expected under"));
     }
 
     #[test]
