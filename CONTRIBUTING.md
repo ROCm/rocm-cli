@@ -71,6 +71,8 @@ New subcommands and subsystems default to their own file from day one — don't 
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
 
+`docs/architecture.md`'s path citations are enforced by `cargo xtask check-architecture-doc` (`xtask/src/architecture_doc.rs`) — it fails CI if a backtick-quoted path the doc cites no longer exists in the tracked tree, though it doesn't check the accuracy of the surrounding prose.
+
 ### Test commands
 
 | Component | Command |
