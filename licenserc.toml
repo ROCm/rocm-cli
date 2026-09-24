@@ -15,6 +15,7 @@ includes = [
   "**/*.py",
   "**/*.sh",
   "**/*.md",
+  "**/*.ps1",
 ]
 
 excludes = [
@@ -27,3 +28,10 @@ excludes = [
 [[rules]]
 extensions = ["md"]
 style_out = "xml"
+
+## hawkeye has no built-in comment syntax for .ps1: without this rule the file is
+## reported `unsupported` and silently skipped (exit 0), so `includes` alone would
+## not enforce anything.
+[[rules]]
+extensions = ["ps1"]
+style_out = "script"
