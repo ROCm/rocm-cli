@@ -5,25 +5,27 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub(crate) struct VllmRuntime {
-    pub runtime_id: String,
-    pub env_id: String,
-    pub command: PathBuf,
-    pub python_executable: Option<PathBuf>,
-    pub version: Option<String>,
-    pub source: String,
-    pub sdk_root: Option<PathBuf>,
-    pub sdk_bin: Option<PathBuf>,
-    pub sdk_bin_paths: Vec<PathBuf>,
-    pub sdk_library_paths: Vec<PathBuf>,
+    pub(crate) runtime_id: String,
+    pub(crate) env_id: String,
+    pub(crate) command: PathBuf,
+    pub(crate) python_executable: Option<PathBuf>,
+    pub(crate) version: Option<String>,
+    pub(crate) source: String,
+    pub(crate) sdk_root: Option<PathBuf>,
+    pub(crate) sdk_bin: Option<PathBuf>,
+    pub(crate) sdk_bin_paths: Vec<PathBuf>,
+    pub(crate) sdk_library_paths: Vec<PathBuf>,
     /// ROCm SDK version recorded in the runtime manifest, if known. Drives
-    /// `vllm_install_route` and `apply_therock_env`'s ROCm 10.x discovery
-    /// dispatch.
-    pub rocm_sdk_version: Option<String>,
+    /// [`crate::install::vllm_install_route`] and
+    /// [`crate::process::apply_therock_env`]'s ROCm 10.x discovery dispatch.
+    pub(crate) rocm_sdk_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -518,7 +520,7 @@ if spec is not None:
         version = "unknown"
 print(json.dumps({"present": spec is not None, "version": version}))
 "#;
-    let output = std::process::Command::new(python)
+    let output = Command::new(python)
         .arg("-c")
         .arg(script)
         .output()
@@ -529,16 +531,15 @@ print(json.dumps({"present": spec is not None, "version": version}))
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("invalid vLLM probe JSON")?;
+    let value: Value = serde_json::from_slice(&output.stdout).context("invalid vLLM probe JSON")?;
     if value
         .get("present")
-        .and_then(serde_json::Value::as_bool)
+        .and_then(Value::as_bool)
         .unwrap_or(false)
     {
         Ok(value
             .get("version")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .map(str::to_owned))
     } else {
         bail!("Python environment does not contain the vLLM package")

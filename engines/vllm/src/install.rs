@@ -21,7 +21,7 @@ use crate::state::runtime_lock_hash;
 
 /// Known-good `(ROCm SDK version, vLLM version, ABI tag)` combinations for
 /// `uv pip install vllm`, keyed by the ROCm SDK version recorded in the
-/// runtime manifest (see `rocm_sdk_version_from_manifest`).
+/// runtime manifest (see [`crate::runtime::rocm_sdk_version_from_manifest`]).
 ///
 /// Add a row only once wheels.vllm.ai actually publishes a build for that
 /// ROCm SDK version — see `docs/vllm.md` for AMD's current ROCm X guidance
@@ -735,7 +735,7 @@ fn vllm_install_target(rocm_sdk_version: Option<&str>) -> Result<VllmInstallTarg
 /// in which case guessing the default row's wheel would very likely install
 /// an ABI-incompatible build, so that case fails closed instead. In practice
 /// callers route such a version through discovery before ever reaching this
-/// function (see `vllm_install_route`); this is a safety net for the case
+/// function (see [`vllm_install_route`]); this is a safety net for the case
 /// where they don't.
 fn resolve_vllm_install_target(
     index_override: Option<String>,
