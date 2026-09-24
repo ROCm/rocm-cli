@@ -20921,16 +20921,34 @@ fn select_auto_gpu_index(
     // every *reported* device is busy the terminal fallback would hand back a
     // busy GPU while an idle, merely untelemetried one went unconsidered —
     // exactly the "serve pinned to an occupied GPU" fault this selection exists
-    // to avoid. So when `visible` is known, union the detected `0..count` range
-    // back in: the retain below validates every ordinal against that mask, so
-    // nothing unconfirmed survives (under a `[2, 3]` mask with `count == 2` the
-    // synthetic `[0, 1]` is dropped wholesale and the rows still stand alone).
-    // Without `visible` there is no second source to confirm an ordinal
-    // against, so the rows remain authoritative and no index is invented.
+    // to avoid. So the `0..count` range is unioned back in — but only where it
+    // is evidence rather than invention, which is decided by the rows, not by
+    // `visible`:
+    //
+    //   * `detected` must be `Some(n > 0)`, so `count` is the `list` device
+    //     count — an independent source asserting those ordinals exist. When it
+    //     is absent `effective_gpu_count` falls back to `rows.len()`, which is
+    //     only the rows restating their own size and confirms nothing they omit.
+    //   * every row index must be below `count`. A row at or above it is the one
+    //     available proof that the ordinal space is re-indexed or sparse rather
+    //     than dense from 0 (`[2, 3]` with `count == 2`), and that is exactly the
+    //     masked shape the rows-only construction was introduced for, so there
+    //     the rows stay authoritative. Below the count the rows are a subset of a
+    //     dense range the count already asserts, and `0..count` is no stronger an
+    //     assumption than the telemetry-less arm below already makes.
+    //
+    // Gating on `visible.is_some()` instead would have left the bug standing
+    // wherever the mask is unknown, which is not a corner: `usable_amd_gpu_indices`
+    // is `None` unconditionally off Linux, so `visible` is always `None` on
+    // Windows. The retain below still runs on top whenever a mask *is* known, so
+    // no synthesised ordinal survives that the mask contradicts.
     let mut reported: Vec<u32> = match vram {
         Some(rows) => {
             let mut indices: Vec<u32> = rows.iter().map(|row| row.index).collect();
-            if visible.is_some() {
+            let count_is_independently_sourced = detected.is_some_and(|detected| detected > 0);
+            let rows_are_a_dense_range_subset =
+                indices.iter().all(|&index| (index as usize) < count);
+            if count_is_independently_sourced && rows_are_a_dense_range_subset {
                 indices.extend(0..count as u32);
             }
             indices
@@ -20971,11 +20989,17 @@ fn select_auto_gpu_index(
         }
         // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
         // (not free percentage, which can favor a smaller GPU on heterogeneous
-        // VRAM systems). No "does this ordinal have a row?" guard is needed:
-        // inside this branch every candidate came *from* a reported row, so
-        // `usage_for` is total over `candidate_indices`. It was needed when
-        // candidates were a synthetic `0..count` range, where an ordinal could
-        // be selected that telemetry had never reported.
+        // VRAM systems). `usage_for` is only *partial* over `candidate_indices` —
+        // the union above puts back ordinals the `list` count confirms but
+        // telemetry never reported — yet no "does this ordinal have a row?" guard
+        // is needed, because the comparator already orders them last: the keys are
+        // `Option<u64>`, and `None` sorts below every `Some`, including `Some(0)`.
+        // So a rowless ordinal can only be the maximum when *no* candidate has a
+        // row; then every key is `None`, every comparison falls through to the
+        // index tie-break, and the winner is the lowest candidate index — which is
+        // precisely what Pass 3 would return from an ascending `reported`. Adding
+        // the guard back would therefore change no outcome, only skip a pass that
+        // already agrees.
         if let Some(&index) = candidate_indices.iter().max_by(|left, right| {
             let left_free = usage_for(**left).map(|usage| usage.free_mb());
             let right_free = usage_for(**right).map(|usage| usage.free_mb());
@@ -30219,14 +30243,65 @@ install therock";
             "an idle-looking but service-pinned GPU 0 must still lose to the free GPU 1"
         );
         // The masking behaviour this rows-only construction was introduced for is
-        // untouched: under a `[2, 3]` mask the synthetic `0..count` range is
-        // dropped wholesale by the visible retain, so no unconfirmed ordinal is
-        // ever synthesised and the all-busy fallback still names a reported GPU.
+        // untouched: rows `[2, 3]` against `count == 2` put a row index at or above
+        // the count, which is the proof the ordinal space is re-indexed, so the
+        // union never happens and the rows stand alone. (The visible retain would
+        // also have dropped `0`/`1` here — this pins the row-index rule itself, so
+        // the masked case survives on a host where the mask is unknown too.)
         let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
         assert_eq!(
             select_auto_gpu_index(Some(2), Some(&[2, 3]), &[2, 3], Some(&masked)),
             vec![2],
             "a masked host must not gain candidates 0/1 from the detected count"
+        );
+    }
+
+    #[test]
+    fn auto_selection_considers_an_untelemetried_gpu_when_the_visible_set_is_unknown() {
+        // Same shape as the test above, but `visible` is `None`. That is not an
+        // exotic host: `probe_usable_amd_gpu_indices` returns `None`
+        // *unconditionally* off Linux, and `serve` threads that straight into
+        // `visible`, so every Windows run takes this path — as does any Linux host
+        // whose KFD topology and DRM cards are both unreadable. Gating the
+        // `0..count` union on `visible.is_some()` therefore left the whole bug
+        // standing on a supported platform.
+        //
+        // Nothing about the mask is needed to justify GPU 1 here: the amd-smi
+        // `list` count asserts two devices and the rows name only ordinals below
+        // that count, so the rows are a subset of a dense range, not a re-indexed
+        // one. GPU 0 is pinned by a managed service, so the untelemetried GPU 1 is
+        // the only free ordinal and must win over the busy reported fallback.
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[0], Some(&[vram(0, 182_000, 192_000)])),
+            vec![1],
+            "an unprobeable host must still consider a counted GPU that reported no VRAM row"
+        );
+        // A row index at or above the count is the only evidence available that the
+        // ordinal space is *not* a dense `0..count`, so there the rows stay
+        // authoritative even with no mask to retain against — otherwise an
+        // unprobeable masked host would have `[0, 1]` invented for it.
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[2, 3], Some(&masked)),
+            vec![2],
+            "re-indexed rows must not gain unconfirmed candidates 0/1 from the detected count"
+        );
+        // The count must come from the `list` enumeration to confirm anything.
+        // With `detected` absent it is `rows.len()`, i.e. the rows restating their
+        // own size, and `parse_gpu_vram_usage` can repeat an ordinal: it falls back
+        // to the array position only when an entry has no `gpu` field, so a payload
+        // naming `"gpu": 0` twice yields two index-0 rows. That makes `rows.len()`
+        // 2 with every index below it, and dropping the `detected` half of the
+        // condition would invent a GPU 1 nothing ever enumerated.
+        assert_eq!(
+            select_auto_gpu_index(
+                None,
+                None,
+                &[0],
+                Some(&[vram(0, 182_000, 192_000), vram(0, 182_000, 192_000)])
+            ),
+            vec![0],
+            "a row-derived count must not synthesise an ordinal no source reported"
         );
     }
 
