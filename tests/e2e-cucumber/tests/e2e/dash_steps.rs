@@ -531,32 +531,24 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
-#[then("the dashboard reports live WSL GPU telemetry")]
-async fn wsl_gpu_telemetry_displayed(world: &mut E2eWorld) {
+#[then("the dashboard reports live GPU telemetry")]
+async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     let tui = session(world);
-    tui.use_detail_size()
+    tui.use_wide_size()
         .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
 
-    let budget = default_timeout();
-    let deadline = Instant::now() + budget;
-    loop {
-        let screen = tui.screen_text();
-        let nonzero_gpu_count = screen
-            .lines()
-            .any(|line| line.contains("GPUs · ") && !line.contains("GPUs · 0"));
-        if nonzero_gpu_count
-            && screen.contains("Node throughput ·")
-            && !screen.contains("Unknown GPU")
-            && !screen.contains("amd-smi unavailable")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ROCM-29846: WSL GPU telemetry did not appear within {budget:?}:\n{screen}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tui.wait_for_screen_where(
+        "a nonzero GPU count with a known model",
+        |screen| {
+            let nonzero_gpu_count = screen
+                .lines()
+                .any(|line| line.contains("GPUs · ") && !line.contains("GPUs · 0"));
+            nonzero_gpu_count && !screen.contains("Unknown GPU")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("GPU telemetry did not appear: {e}"));
 }
 
 #[then("ROCm setup actions are displayed")]

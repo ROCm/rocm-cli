@@ -301,6 +301,6 @@ Feature: Interactive dashboard
   @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-gpu
   Scenario: dash-23 - Dashboard displays GPU telemetry through WSL
     When the user opens the dashboard
-    Then the dashboard reports live WSL GPU telemetry
+    Then the dashboard reports live GPU telemetry
     When the user quits the dashboard
     Then the dashboard exits successfully
