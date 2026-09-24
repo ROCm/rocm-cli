@@ -788,10 +788,20 @@ Release trust checks:
 ```bash
 cargo test -p rocm --bin rocm metadata_signature_verification_accepts_generated_key_and_rejects_tamper
 cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_rejects_tamper
+cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
 python scripts/release_readiness.py --self-test
-ROCDXG_CHECKSUM_SELF_TEST=1 bash scripts/wsl_setup_rocdxg.sh
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
 ```
+
+The ROCDXG digest check pins the shell fragment the WSL driver plan generates
+as a whole string — so a change to its quoting, spacing or field order fails
+the test rather than slipping past a substring assertion — and then runs that
+same generated fragment against a real file, with only the digest and the path
+redirected at a test payload: a matching digest, a mismatched one, a malformed
+one, and an empty one. That step is the only thing authenticating a package
+that is then installed as root, and this replaces the self-test that shipped
+with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
+`sha256sum`, so it is Unix-only.
 
 The release-readiness self-test is cross-platform and uses only workspace-local
 temporary files under `.rocm-work/tests/release-readiness`. It also checks exact
@@ -996,16 +1006,32 @@ Both forms run the same catalog. The host-side one collects its facts over
 `wsl.exe` with a POSIX shell, so the target distro needs neither `rocm-cli` nor
 Python.
 
-Interactive ROCDXG install inside WSL:
+ROCDXG install inside WSL:
 
 ```bash
-bash scripts/wsl_setup_rocdxg.sh
+rocm install driver            # review the plan
+rocm install driver --yes      # run it
+rocm examine                   # expect driver_status: wsl_rocdxg_ready
 rocm diagnose
 ```
 
-To require checksum verification for the downloaded ROCDXG `.deb`, provide the
-expected package digest from a trusted release source:
+The last two are the plan's own `post_install_checks`, so running them is what
+confirms the install took rather than merely that the commands exited zero.
+
+The `.deb` is verified against a digest pinned per ROCDXG release, so the
+default path needs nothing set. To exercise a release rocm-cli has no digest
+for, supply one — or opt out explicitly, which is the only way to reach an
+unverified install:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
+
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
 ```
+
+The install is covered by unit tests over the generated plan (`cargo test -p
+rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
+`/dev/dxg` and dxcore present, since the plan refuses before installing
+otherwise.

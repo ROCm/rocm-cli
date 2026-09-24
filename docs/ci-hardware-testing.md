@@ -48,9 +48,9 @@ Ubuntu-24.04 distro fresh inside the job rather than needing a dedicated
 `wsl`-labeled runner. That distro is unregistered between jobs by the pool's
 own design (confirmed by its maintainer, along with `/dev/dxg` passthrough
 working on these hosts), so every run pays a ~5min distro-install cost before
-installing ROCm's WSL driver bridge (`librocdxg`, via
-`scripts/wsl_setup_rocdxg.sh`) and cloning the checkout into the guest's
-native filesystem to avoid building against the slow DrvFs mount.
+cloning the checkout into the guest's native filesystem to avoid building
+against the slow DrvFs mount. The distro is deliberately left without ROCm's
+WSL driver bridge — see "What the WSL distro needs" below.
 
 This migration is scoped to the per-PR lanes in this table, plus the nightly
 WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
@@ -114,10 +114,18 @@ than carried out — are proven here and nowhere else.
 
 The distro is fresh every job (see above), so the lane provisions it from
 scratch each run: `pkg-config`, `build-essential`, `libcap-dev` and friends to
-build the workspace (installed unconditionally — the guest always runs as
-`root`, so there's no passwordless-sudo gate to check), and ROCm's WSL driver
-bridge via `scripts/wsl_setup_rocdxg.sh`, run advisory rather than fail-fast
-(see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
+build the workspace, installed unconditionally — the guest always runs as
+`root`, so there's no passwordless-sudo gate to check. `sudo` is on that list
+anyway, because `rocm install driver` emits a hard `command -v sudo`
+precondition into its WSL plan even for a root caller.
+
+What the lane deliberately does *not* provision is ROCm's WSL driver bridge.
+Installing ROCDXG is `rocm install driver`'s own job, and the `@requires-wsl`
+driver scenarios assert on the plan that command produces — a lane that
+pre-installed it would hand those scenarios a host already in the state the
+command under test exists to reach. That costs no coverage today, because
+`rocm-smi` is absent too, so `@requires-gpu` scenarios resolve to skip either
+way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
 `/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig
