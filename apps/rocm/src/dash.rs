@@ -69,6 +69,9 @@ pub fn runner_options(
         // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
         amd_smi_skip_device_preflight: false,
+        // Same verdict `serve`/`examine` already act on (handles WSL, where
+        // there is no single device node the dash crates can probe directly).
+        amd_smi_gpu_reachable: rocm_core::has_usable_amd_gpu(),
         test_clock_offset_path: dash_test_clock_offset_path(),
     }
 }

@@ -82,6 +82,14 @@ pub struct RunnerOptions {
     /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
     /// off-critical-path detection behaviour is genuinely exercised.
     pub amd_smi_skip_device_preflight: bool,
+    /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
+    /// that lets the amd-smi device pre-flight pass without a readable
+    /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
+    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
+    /// deliberately don't depend on `rocm-core` to compute this themselves;
+    /// the caller (`apps/rocm`) does and passes the answer through. `false`
+    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    pub amd_smi_gpu_reachable: bool,
     /// **Test-only.** When set, cycle timestamps come from the logical clock
     /// this file controls instead of `Utc::now()` — see [`TestClockDirective`]
     /// for the file's grammar. Production callers leave this unset; E2E
@@ -108,6 +116,7 @@ impl Default for RunnerOptions {
             services_dir: None,
             amd_smi_binary: None,
             amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: false,
             test_clock_offset_path: None,
         }
     }
@@ -331,6 +340,7 @@ pub async fn run_loop(
     // one discovery tick) and GPU metrics fill in the moment detection lands.
     let amd_smi_binary = opts.amd_smi_binary.clone();
     let amd_smi_skip_device_preflight = opts.amd_smi_skip_device_preflight;
+    let amd_smi_gpu_reachable = opts.amd_smi_gpu_reachable;
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
     tokio::spawn(async move {
@@ -338,7 +348,9 @@ pub async fn run_loop(
             Some(binary) if amd_smi_skip_device_preflight => {
                 AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
+            Some(binary) => {
+                AmdSmiCollector::detect_with_binary(binary, amd_smi_gpu_reachable).await
+            }
             None => AmdSmiCollector::detect().await,
         };
         let info = match &gpu {
