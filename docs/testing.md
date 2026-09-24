@@ -193,7 +193,9 @@ Then it verifies:
   pip creates it inside the ROCm folder when packages are downloaded
 - a single TheRock-index pip install plan for pinned `rocm`, `torch`, and
   `torchvision` requirements with exactly one `device-<detected-gfx-target>`
-  extra (`rocm` also requests `libraries,devel`), plus pinned `torchaudio`
+  extra (`rocm` also requests `libraries`), plus pinned `torchaudio`, and that
+  the toolchain is not planned for unless asked (pass the script `--devel` to
+  check the opt-in path instead, which adds `devel` to the `rocm` extras)
 - on a host with no detectable AMD GPU the preview reports `device_target:
   undetermined` and renders the device extra as a placeholder; a real install
   refuses rather than falling back to every published device payload
@@ -966,7 +968,9 @@ it must be an exact runtime key or an unambiguous runtime id. It requires
 TheRock SDK wheel directories.
 For TheRock 7.13, patch vLLM's GPTQ ROCm compatibility guard to include HIP
 7.13 before building from source; otherwise `q_gemm.hip` can fail on missing
-`half`/`half2` `atomicAdd` overloads.
+`half`/`half2` `atomicAdd` overloads. Building from source needs the compiler
+toolchain, so install the runtime with `rocm install sdk --devel` (see
+[vllm.md](vllm.md)).
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 

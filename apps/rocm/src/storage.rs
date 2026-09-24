@@ -32,9 +32,10 @@ use crate::{
     should_remove_runtime_install_root, therock,
 };
 
-/// Recent installs kept per channel/format/family by default: the one in use
-/// plus one rollback target. This is the natural floor rather than a tuned
-/// value — see the maintainer question in the pull request description.
+/// Recent installs kept per retention bucket by default (see
+/// [`retention_group`]): the one in use plus one rollback target. This is the
+/// natural floor rather than a tuned value — see the maintainer question in the
+/// pull request description.
 pub(crate) const DEFAULT_KEEP: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -174,7 +175,9 @@ impl HoldReason {
             Self::Default => "the configured default",
             Self::Marker => "named by the active install marker",
             Self::NotOwned => "added with adopt or import, so ROCm CLI does not own the folder",
-            Self::WithinKeepLimit => "one of the most recent installs kept for this GPU family",
+            Self::WithinKeepLimit => {
+                "one of the most recent installs kept for this GPU family and toolchain choice"
+            }
         }
     }
 }
@@ -268,12 +271,23 @@ pub(crate) fn unconditional_hold(
 }
 
 /// Retention group: a multi-GPU machine legitimately keeps one install per
-/// family, so recency is only ever compared inside a channel/format/family.
-fn retention_group(manifest: &therock::InstalledRuntimeManifest) -> (String, String, String) {
+/// family, so recency is only ever compared inside a
+/// channel/format/family/toolchain bucket.
+///
+/// The toolchain axis exists because the compiler is opt-in: `rocm install sdk`
+/// and `rocm install sdk --devel` at the same version produce two *separate*
+/// runtimes, since `wheel_runtime_key` hashes the requested package specs.
+/// Without this axis they compete for the same `--keep` slots, so prune can
+/// retain the newer runtime-only install and delete the toolchain one — a
+/// multi-gigabyte download the user explicitly asked for, gone without ever
+/// being named as a choice. They are not substitutes for each other, so they do
+/// not compete.
+fn retention_group(manifest: &therock::InstalledRuntimeManifest) -> (String, String, String, bool) {
     (
         manifest.channel.to_ascii_lowercase(),
         manifest.format.to_ascii_lowercase(),
         manifest.family.to_ascii_lowercase(),
+        manifest.includes_devel(),
     )
 }
 
@@ -289,8 +303,10 @@ pub(crate) fn select_runtimes_to_remove(
     keep: usize,
 ) -> (Vec<String>, Vec<(String, HoldReason)>) {
     let mut held: Vec<(String, HoldReason)> = Vec::new();
-    let mut groups: BTreeMap<(String, String, String), Vec<&therock::InstalledRuntimeManifest>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<
+        (String, String, String, bool),
+        Vec<&therock::InstalledRuntimeManifest>,
+    > = BTreeMap::new();
     let default_key = resolved_default_runtime_key(manifests, inputs);
 
     for manifest in manifests {
@@ -660,7 +676,8 @@ pub(crate) fn render_prune_plan(plan: &PrunePlan, keep: usize, dry_run: bool) ->
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Keeping the {keep} most recent install(s) for each channel, format, and GPU family."
+        "Keeping the {keep} most recent install(s) for each channel, format, GPU family, and \
+         toolchain choice."
     );
     let _ = writeln!(output);
     if plan.remove.is_empty() {
@@ -980,8 +997,30 @@ mod tests {
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         }
+    }
+
+    /// The same manifest with the compiler toolchain left out, recorded the way
+    /// a real `rocm install sdk` (no `--devel`) records it: the answer lives in
+    /// the specs `uv` was handed, and `includes_devel` reads it back out of
+    /// them. Writing the `devel` field alone would test a fallback rather than
+    /// the path every wheel install actually takes.
+    fn runtime_only(
+        mut record: therock::InstalledRuntimeManifest,
+        device_target: &str,
+    ) -> therock::InstalledRuntimeManifest {
+        record.devel = false;
+        record.wheel_composition = Some(therock::WheelRuntimeComposition {
+            source_layout_generation: "canonical".to_owned(),
+            package_specs: vec![format!(
+                "rocm[libraries,device-{device_target}]=={}",
+                record.version
+            )],
+            rocm_sdk_target: Some(device_target.to_owned()),
+        });
+        record
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
@@ -1063,6 +1102,55 @@ mod tests {
         assert!(
             held.iter()
                 .all(|(_, reason)| *reason == HoldReason::WithinKeepLimit)
+        );
+    }
+
+    /// A toolchain install and a runtime-only install of the same channel,
+    /// format and family are two separate runtimes, because `wheel_runtime_key`
+    /// hashes the requested specs. If they shared a retention bucket, prune
+    /// would rank them by recency alone and delete the multi-gigabyte toolchain
+    /// the user explicitly asked for — silently, since the failure only shows
+    /// up much later as a missing compiler. Only a *non-active* devel runtime
+    /// is exposed (the active and default ones are held unconditionally), which
+    /// is exactly the case nothing else protects.
+    #[test]
+    fn a_runtime_only_install_never_evicts_the_toolchain_install_it_sits_beside() {
+        let manifests = vec![
+            manifest("release-wheel-gfx120x-devel-1", "gfx120X-all", "7.13.0", 10),
+            manifest("release-wheel-gfx120x-devel-2", "gfx120X-all", "7.14.0", 20),
+            runtime_only(
+                manifest("release-wheel-gfx120x-only-1", "gfx120X-all", "7.13.0", 30),
+                "gfx1201",
+            ),
+            runtime_only(
+                manifest("release-wheel-gfx120x-only-2", "gfx120X-all", "7.14.0", 40),
+                "gfx1201",
+            ),
+        ];
+
+        // `keep = 1` so each bucket has something to give up: the axis must
+        // separate the two toolchain choices without also making `--keep` inert
+        // inside either of them.
+        let (removable, held) =
+            select_runtimes_to_remove(&manifests, &RetentionInputs::default(), 1);
+
+        assert_eq!(
+            removable,
+            vec![
+                "release-wheel-gfx120x-devel-1".to_owned(),
+                "release-wheel-gfx120x-only-1".to_owned(),
+            ],
+            "prune must drop the older install of each toolchain choice, not the \
+             older toolchain choice"
+        );
+        let kept: Vec<&str> = held.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "release-wheel-gfx120x-devel-2",
+                "release-wheel-gfx120x-only-2",
+            ],
+            "the newest install of each toolchain choice must survive"
         );
     }
 

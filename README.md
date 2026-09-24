@@ -300,7 +300,7 @@ sometimes because it also needs sudo or a reboot).
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
-                    [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
                     [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
@@ -310,7 +310,18 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. An install with no active default runtime never prompts, but once a
+by rocm-cli; pass `--devel` to also install the compiler and headers needed to
+build GPU code, roughly doubling the download. `--devel` is not an addition to
+an existing runtime: a runtime is identified by the packages it was installed
+from, so running `rocm install sdk` and later `rocm install sdk --devel` at the
+same version leaves you with **two** side-by-side runtimes — the second is a
+fresh full install, not a toolchain bolted onto the first — and the second one
+becomes active. `rocm runtimes list` marks each one `toolchain=included` or
+`toolchain=excluded`, `rocm examine` reports the active runtime's as
+`active_runtime_toolchain`, and `rocm storage remove-old-installs` counts the
+two kinds separately so neither evicts the other. To reclaim the space, uninstall
+the one you do not want with `rocm runtimes uninstall <runtime-key>`.
+An install with no active default runtime never prompts, but once a
 managed runtime is the active default every `install sdk` asks first, because
 the new install takes over as the active default. That gate is not scoped to the
 family or channel you are installing: a `--family` or `--channel` you have never
@@ -381,6 +392,13 @@ rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
 
+`list` shows each runtime's version, GPU family, mode, and whether it carries
+the compiler toolchain (`toolchain=included|excluded`). Runtimes are told apart
+by the packages they were installed from, not by version alone, so one version
+can appear more than once: a `--devel` install and a plain one of the same
+version are two separate runtimes, as are two installs that resolved different
+GPU device payloads.
+
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
 exits without prompting or making changes.
@@ -402,12 +420,15 @@ rocm storage remove-downloads [--dry-run] [--yes]
 ```
 
 `remove-old-installs` keeps the two most recent installs for each channel,
-format, and GPU family, and never touches the install in use, the rollback
-target, or a folder rocm-cli did not create. "Most recent" means most recently
-installed rather than highest version, so after a deliberate downgrade the
-older version counts as the newer install. Because the count applies per
-channel, format, and GPU family, a machine that has tried several channels
-keeps `--keep` installs for each of them. Anything it declines to remove is
+format, GPU family, and toolchain choice, and never touches the install in use,
+the rollback target, or a folder rocm-cli did not create. "Most recent" means
+most recently installed rather than highest version, so after a deliberate
+downgrade the older version counts as the newer install. Because the count
+applies per channel, format, GPU family, and toolchain choice, a machine that
+has tried several channels keeps `--keep` installs for each of them — and a
+runtime-only install never evicts a `--devel` one, since the two are separate
+runtimes serving different purposes rather than newer and older versions of the
+same thing. Anything it declines to remove is
 listed with the reason, and `--dry-run` shows the whole plan without changing
 anything. `remove-downloads` clears cached archives that rocm-cli can download
 again; a cache folder that is a link to somewhere else is left alone rather

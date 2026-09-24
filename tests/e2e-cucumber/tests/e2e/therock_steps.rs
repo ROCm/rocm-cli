@@ -373,6 +373,44 @@ async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain"
+)]
+async fn preview_pinned_wheel_install_with_devel(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--devel",
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the preview requests the gfx1200 device extras with the toolchain")]
+async fn preview_requests_device_extras_with_devel(world: &mut E2eWorld) {
+    // The opt-in half of the same assertion. Whole line for the same reason:
+    // `devel` has to be added to the rocm extras without disturbing the device
+    // payload on any of the four requirements.
+    let expected = format!(
+        "package_specs: rocm[libraries,devel,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEXT_TORCHAUDIO_VERSION}"
+    );
+    assert_contains(world, &expected, "device extras with devel");
+    assert_version_resolution_extras(world, true);
+}
+
 /// Distinct from [`preview_pinned_wheel_install`]: this scenario's whole point
 /// is that the override is ignored and resolution falls through to the real
 /// `DEFAULT_NEXT_RELEASE_PIP_BASE`, so the pin has to be a version that source
@@ -566,17 +604,39 @@ async fn preview_requests_device_extras(world: &mut E2eWorld) {
     // and torchvision and none for torchaudio, which only the whole spec list
     // shows. A group-bucket or `device-all` regression still matches any subset.
     let expected = format!(
-        "package_specs: rocm[libraries,devel,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
          torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
          torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
          torchaudio=={NEXT_TORCHAUDIO_VERSION}"
     );
     assert_contains(world, &expected, "device extras");
+    assert_version_resolution_extras(world, false);
     assert_contains(
         world,
         &format!("device_target: {RAW_ARCH}"),
         "device target",
     );
+}
+
+/// What version resolution asked `uv pip compile` for, as opposed to what the
+/// install plan says it will install.
+///
+/// These are produced by two different code paths from one `include_devel`, and
+/// only this assertion covers the first. `package_specs` alone passed while the
+/// requirements handed to `uv` were hardcoded to `rocm[libraries,devel,...]`,
+/// which constrained the chosen versions by a toolchain a default install never
+/// asked for.
+fn assert_version_resolution_extras(world: &mut E2eWorld, include_devel: bool) {
+    let extras = if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    };
+    let expected = format!(
+        "version_resolution_specs: rocm[{extras},device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] torchaudio"
+    );
+    assert_contains(world, &expected, "version resolution extras");
 }
 
 #[then("the preview resolves the ROCm 10 tarball catalog")]
