@@ -421,7 +421,9 @@ jobs:
       # instead of hanging to the job cap. Transient contention (VRAM still
       # draining from the reclaim above) self-heals within the ceiling. See the
       # e2e-gpu job for the rationale. gfx1151 shares system memory, so the free
-      # floor is smaller than the Instinct card but still catches a leftover serve.
+      # floor is smaller than the Instinct card but still catches a leftover
+      # serve — and it is applied to GTT rather than VRAM whenever the reported
+      # VRAM pool is only a BIOS carveout too small to satisfy it (see below).
       - name: GPU preflight (bounded wait for an available GPU)
         run: |
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
@@ -429,21 +431,58 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
+          # `<POOL> Total [Used ]Memory (B): <n>`, last GPU's row wins. The
+          # trailing `|| true` keeps a pool that this host does not report (GTT
+          # on a discrete card) an empty string for the guards below to handle,
+          # instead of killing the step under `-e`.
+          field() { printf '%s\n' "$out" | grep -i "$1" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
+          shown=0
           while [ "$SECONDS" -lt "$deadline" ]; do
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || out=""
+            case "$out" in
+              *'VRAM Total Memory'*) ;;
+              # A rocm-smi that rejects the two-pool form: fall back to the
+              # single-pool call this step has always made.
+              *) out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; } ;;
+            esac
+            total=$(field 'VRAM Total Memory')
+            used=$(field 'VRAM Total Used Memory')
+            gtt_total=$(field 'GTT Total Memory')
+            gtt_used=$(field 'GTT Total Used Memory')
             if [ -z "$total" ] || [ -z "$used" ]; then
               reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
               sleep 5; continue
             fi
+            # Print the raw pools once: without them a failure here cannot be
+            # told apart from a genuinely occupied GPU by reading this log.
+            if [ "$shown" -eq 0 ]; then
+              echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
+              shown=1
+            fi
+            pool=VRAM
+            if [ "$total" -lt "$min_free" ]; then
+              # An APU has no private VRAM: this total is the fixed BIOS carveout
+              # while the engine allocates out of GTT-backed system RAM, so the
+              # floor is being applied to a pool the engine never draws on — it
+              # fails healthy hosts and stays quiet on starved ones. See
+              # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
+              # withholds the product's equivalent warning for the same reason.
+              # A leftover serve still pins GTT, so the check keeps its purpose.
+              # Discrete cards never reach this branch — their VRAM total is far
+              # above the floor.
+              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
+                reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and rocm-smi reported no GTT pool — the floor cannot be met from VRAM on this host"
+                sleep 5; continue
+              fi
+              pool=GTT; total="$gtt_total"; used="$gtt_used"
+            fi
             free=$(( total - used ))
             if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (>= ${MIN_FREE_GIB} GiB)."
               exit 0
             fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            reason="${pool} never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (< ${MIN_FREE_GIB} GiB)…"
             sleep 5
           done
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
@@ -583,24 +622,59 @@ jobs:
             Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
             exit 0
           }
+          # `[regex]::Match` (not `Matches | Select -First 1`): a miss must yield
+          # an empty string for the guards below, not a $null dereference — GTT
+          # is legitimately absent on a discrete card.
+          function Get-Pool($text, $label) {
+            $m = [regex]::Match($text, "$label \(B\):\s*(\d+)")
+            if ($m.Success) { $m.Groups[1].Value } else { "" }
+          }
           $minFree = [int64]$minFreeGiB * 1GB
           $deadline = (Get-Date).AddSeconds($ceilingSecs)
           $reason = "rocm-smi never returned usable VRAM figures"
+          $shown = $false
           while ((Get-Date) -lt $deadline) {
-            $out = (rocm-smi --showmeminfo vram 2>$null | Out-String)
-            $total = ([regex]::Matches($out, 'VRAM Total Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
-            $used  = ([regex]::Matches($out, 'VRAM Total Used Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            $out = (rocm-smi --showmeminfo vram gtt 2>$null | Out-String)
+            # A rocm-smi that rejects the two-pool form: fall back to the
+            # single-pool call this step has always made.
+            if ($out -notmatch 'VRAM Total Memory') { $out = (rocm-smi --showmeminfo vram 2>$null | Out-String) }
+            $total = Get-Pool $out 'VRAM Total Memory'
+            $used  = Get-Pool $out 'VRAM Total Used Memory'
+            $gttTotal = Get-Pool $out 'GTT Total Memory'
+            $gttUsed  = Get-Pool $out 'GTT Total Used Memory'
             if (-not $total -or -not $used) {
               $reason = "rocm-smi returned no VRAM figures (no AMD GPU detected)"
               Start-Sleep -Seconds 5; continue
             }
+            # Print the raw pools once: without them a failure here cannot be
+            # told apart from a genuinely occupied GPU by reading this log.
+            if (-not $shown) {
+              $gttShown = if ($gttTotal) { "$gttUsed/$gttTotal" } else { "n/a" }
+              Write-Host "rocm-smi pools (used/total bytes): VRAM $used/$total, GTT $gttShown"
+              $shown = $true
+            }
+            $pool = "VRAM"
+            if ([int64]$total -lt $minFree) {
+              # An APU has no private VRAM: this total is the fixed BIOS carveout
+              # while the engine allocates out of GTT-backed system RAM, so the
+              # floor is being applied to a pool the engine never draws on - it
+              # fails healthy hosts and stays quiet on starved ones. See
+              # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
+              # withholds the product's equivalent warning for the same reason.
+              # A leftover serve still pins GTT, so the check keeps its purpose.
+              if (-not $gttTotal -or -not $gttUsed) {
+                $reason = "VRAM total is $([math]::Floor([int64]$total/1MB)) MiB, under the $minFreeGiB GiB floor, and rocm-smi reported no GTT pool - the floor cannot be met from VRAM on this host"
+                Start-Sleep -Seconds 5; continue
+              }
+              $pool = "GTT"; $total = $gttTotal; $used = $gttUsed
+            }
             $free = [int64]$total - [int64]$used
             if ($free -ge $minFree) {
-              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB free (>= $minFreeGiB GiB)."
+              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB $pool free (>= $minFreeGiB GiB)."
               exit 0
             }
-            $reason = "VRAM never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
-            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB)..."
+            $reason = "$pool never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
+            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB $pool free (< $minFreeGiB GiB)..."
             Start-Sleep -Seconds 5
           }
           Write-Host "::error::GPU preflight failed after ${ceilingSecs}s: $reason"
@@ -903,28 +977,59 @@ jobs:
           fi
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
+          # See the native Ubuntu lane for why the floor moves to GTT when the
+          # VRAM pool is only a BIOS carveout, and why `field` ends in `|| true`.
+          field() { printf '%s\n' "$out" | grep -i "$1" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
           saw_vram=0
+          unmeasurable=0
+          shown=0
+          pool=VRAM
           while [ "$SECONDS" -lt "$deadline" ]; do
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+            out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || out=""
+            case "$out" in
+              *'VRAM Total Memory'*) ;;
+              *) out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; } ;;
+            esac
+            total=$(field 'VRAM Total Memory')
+            used=$(field 'VRAM Total Used Memory')
+            gtt_total=$(field 'GTT Total Memory')
+            gtt_used=$(field 'GTT Total Used Memory')
             if [ -z "$total" ] || [ -z "$used" ]; then
               sleep 5; continue
             fi
             saw_vram=1
+            if [ "$shown" -eq 0 ]; then
+              echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
+              shown=1
+            fi
+            pool=VRAM
+            if [ "$total" -lt "$min_free" ]; then
+              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
+                unmeasurable=1
+                sleep 5; continue
+              fi
+              pool=GTT; total="$gtt_total"; used="$gtt_used"
+            fi
+            unmeasurable=0
             free=$(( total - used ))
             if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (>= ${MIN_FREE_GIB} GiB)."
               exit 0
             fi
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (< ${MIN_FREE_GIB} GiB)…"
             sleep 5
           done
           if [ "$saw_vram" -eq 0 ]; then
             echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
             exit 0
           fi
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
+          if [ "$unmeasurable" -eq 1 ]; then
+            # Advisory lane: an unmeasurable pool is a reported condition, not a
+            # held GPU. Failing here would claim a leftover serve we never saw.
+            echo "::warning::rocm-smi reported a VRAM pool under the ${MIN_FREE_GIB} GiB floor and no GTT pool — the free-memory floor could not be applied under WSL"
+            exit 0
+          fi
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${pool} never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
           # No `-eo pipefail` here, unlike its siblings: this script's own
           # empty-value guard above (`[ -z "$total" ] || [ -z "$used" ]`)
