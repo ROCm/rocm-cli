@@ -57,9 +57,9 @@ async fn assert_local_server_records_row(world: &mut E2eWorld) {
         "the report must print the real services path ({}):\n{stdout}",
         services.display()
     );
-    // The note has to explain what the size is made of. The engine's redirected
-    // stdout/stderr lives in this folder too and nothing rotates it, so a note
-    // naming only the record would contradict the number printed beside it.
+    // The note has to explain what the size is made of. The engine log lives in
+    // this folder too and nothing rotates it, so a note naming only the record
+    // would contradict the number printed beside it.
     assert!(
         stdout.contains("one record plus the engine log per local server launch"),
         "the report must say what is in the folder:\n{stdout}"
@@ -69,6 +69,13 @@ async fn assert_local_server_records_row(world: &mut E2eWorld) {
     assert!(
         stdout.contains("rocm services list --all"),
         "the report must say how to list the records:\n{stdout}"
+    );
+    // Listing is not reclaiming. No `rocm storage` command removes this folder,
+    // so without naming `rocm services prune` the row reports the size of
+    // something the user has no way to act on from here.
+    assert!(
+        stdout.contains("rocm services prune"),
+        "the report must say how to reclaim the space:\n{stdout}"
     );
 }
 

@@ -17326,9 +17326,16 @@ fn log_browser_source_label(source: &str, show_file_locations: bool) -> String {
 /// Tell the default (`!all`) view about local server records it is hiding.
 ///
 /// The default view lists only live servers, so a host whose serves all failed
-/// saw an empty list with no hint that anything was recorded. Name both the
-/// command that lists them and the one that reads a specific log, with a real
-/// id so the second line can be pasted as-is.
+/// saw an empty list with no hint that anything was recorded. Name the command
+/// that lists them, the one that reads a specific log (with a real id, so that
+/// line can be pasted as-is), and the one that deletes them.
+///
+/// `prune` is named last and without qualification on purpose. Every record
+/// carries an unrotated engine log, so on a host that has served real models
+/// this block is pointing at the only thing on disk the user can get back — and
+/// the other two lines only ever let them *look*. Nothing is said here about
+/// how `prune` decides what to remove: that is its own command's output, and
+/// its behaviour is under change on a sibling branch.
 fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id: Option<&str>) {
     if past_attempts == 0 {
         return;
@@ -17342,6 +17349,7 @@ fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id
     if let Some(id) = newest_id {
         let _ = writeln!(output, "  Read the newest: rocm services logs {id}");
     }
+    let _ = writeln!(output, "  Reclaim the space: rocm services prune");
 }
 
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
@@ -27441,6 +27449,14 @@ install therock";
         // A real id, newest first, so the line can be pasted as-is.
         assert!(
             rendered.contains("  Read the newest: rocm services logs svc-newest"),
+            "{rendered}"
+        );
+        // The other two lines only let the user look. Each record keeps an
+        // unrotated engine log, so `prune` is the only line here that gets any
+        // of that space back - without it the block is a dead end on exactly
+        // the host that needs it most.
+        assert!(
+            rendered.contains("  Reclaim the space: rocm services prune"),
             "{rendered}"
         );
         // The `--all` header is fixed by the same change; it lists the rows, so

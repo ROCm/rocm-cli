@@ -453,30 +453,37 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         PathUsage::measure("ROCm CLI cache folder", paths.cache_dir.clone(), None),
         PathUsage::measure("ROCm CLI data folder", paths.data_dir.clone(), None),
         // One JSON record per `rocm serve --managed` launch, kept after the
-        // server exits. Never mentioned anywhere and nothing ever removed them,
-        // so the folder was invisible to a user asking what is on disk.
-        // Reported, never touched by any prune path here.
+        // server exits. Never mentioned anywhere and no `rocm storage` command
+        // removes them, so the folder was invisible to a user asking what is on
+        // disk. Reported, never touched by any prune path here - deleting these
+        // belongs to `rocm services prune` / `rocm services remove`, which is
+        // why the note names `prune` as the way to reclaim the space.
         //
         // The note names the engine log too, not just the record: `measure`
-        // walks the whole folder, and every managed launch leaves the engine's
-        // redirected stdout/stderr (`<service_id>.log`) beside the manifest.
-        // `ManagedServiceRecord::new` only *computes* that path (via
-        // `AppPaths::service_log_path`) - it writes nothing. The file is created
-        // by the launch site, `spawn_managed_engine_child` here in `main.rs` for
+        // walks the whole folder, and every managed launch leaves an
+        // `<service_id>.log` beside the manifest. `ManagedServiceRecord::new`
+        // only *computes* that path (via `AppPaths::service_log_path`) - it
+        // writes nothing. The file is created by the launch site,
+        // `spawn_managed_engine_child` here in `main.rs` for
         // `rocm serve --managed` and `supervise_service` in `rocmd` on the
-        // supervised/recovery path, both of which redirect the engine child's
-        // stdout/stderr into it. The `rocm serve --managed` path additionally
-        // hands the child a `--log-path` (see `builtin_engine_serve_http_args`),
-        // so the engine adapter appends the server's own output there too; the
-        // supervised path passes no such flag and gets only the redirect. Nothing
-        // rotates that log, so on a host that has served real models the size
-        // printed here is dominated by logs - a note promising only "small
-        // files" would contradict the number beside it.
+        // supervised/recovery path. What *fills* it differs by platform, so the
+        // redirect cannot be stated unqualified: `supervise_service` redirects
+        // the engine child's stdout/stderr into it on every platform, and so
+        // does `spawn_managed_engine_child` on Unix, but on Windows that
+        // function takes the `spawn_detached_no_inherit` branch, which passes
+        // no std handles at all. What keeps the Windows file non-empty is the
+        // `--log-path` the `rocm serve --managed` path hands the child (see
+        // `builtin_engine_serve_http_args`), which makes the engine adapter
+        // append the server's own output; on Unix that adapter output lands in
+        // the same file on top of the redirect. Nothing rotates that log, so on
+        // a host that has served real models the size printed here is dominated
+        // by logs - a note promising only "small files" would contradict the
+        // number beside it.
         PathUsage::measure(
             "local server records",
             paths.services_dir(),
             Some(
-                "one record plus the engine log per local server launch, kept after it stops; list them with `rocm services list --all`"
+                "one record plus the engine log per local server launch, kept after it stops; list them with `rocm services list --all`, reclaim the space with `rocm services prune`"
                     .to_owned(),
             ),
         ),
@@ -1360,8 +1367,12 @@ mod tests {
     }
 
     /// `rocm serve --managed` leaves one JSON record per launch, kept after the
-    /// server exits, and nothing ever removed them. The report never named the
-    /// folder, so a user asking what is on disk could not see it existed.
+    /// server exits, and no `rocm storage` command removes them. The report
+    /// never named the folder, so a user asking what is on disk could not see
+    /// it existed. `rocm services prune` is what reclaims the space, so the
+    /// note has to name it - a row that only says how to *look* at a folder
+    /// whose size is dominated by unrotated logs is informational, not
+    /// actionable.
     #[test]
     fn report_lists_the_local_server_records_folder() -> Result<()> {
         let (root, paths) = test_paths("report-services");
@@ -1383,6 +1394,15 @@ mod tests {
         // contradicts the size printed next to it on a host that has served.
         assert!(
             rendered.contains("one record plus the engine log per local server launch"),
+            "{rendered}"
+        );
+        // No `rocm storage` command removes this folder, so the row is a dead
+        // end unless it names the command that does. Pinned separately from the
+        // listing pointer above: the two answer different questions ("what is
+        // in there" vs "how do I get the space back") and dropping either one
+        // would still leave the other's assertion green.
+        assert!(
+            rendered.contains("reclaim the space with `rocm services prune`"),
             "{rendered}"
         );
 
