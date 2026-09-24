@@ -126,8 +126,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
 /// Scoping to tracked files (rather than a raw filesystem walk) matches the
 /// issue's "still exists in the tree" wording and skips build artifacts
 /// under `target/` for free.
+///
+/// Passes `-c core.quotePath=false`: git's default quotes/escapes any
+/// non-ASCII byte in a path (e.g. `café.rs` comes back as
+/// `"caf\303\251.rs"`), which would never string-equal a citation's plain
+/// text — silently reporting an existing file as stale.
 fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
-    Ok(git(root, &["ls-files"])?
+    Ok(git(root, &["-c", "core.quotePath=false", "ls-files"])?
         .lines()
         .map(PathBuf::from)
         .collect())
@@ -202,16 +207,19 @@ fn is_hyphenated_bare_word(span: &str) -> bool {
 /// [`is_path_safe`]) — otherwise a stray bit of prose punctuation next to a
 /// `/` (`` `foo/bar!`'s `main.rs` ``) would be accepted as a directory,
 /// producing an unmatchable `section_dirs` entry that fails an accurate
-/// citation — and must NOT end in a [`BARE_FILE_EXTENSIONS`] extension,
-/// otherwise a full file path (`` `crates/rocm-core/src/diagnose.rs` ``)
-/// would be accepted as if it were the directory containing it, which is
-/// equally unmatchable. [`is_hyphenated_bare_word`] already excludes
-/// extensions and guarantees path-safety on its own, so only the slash
-/// branch needs the extra checks.
+/// citation — and its last component must have no extension (a `.`),
+/// otherwise a full file path (`` `crates/rocm-core/src/diagnose.rs` ``,
+/// or one ending in an extension outside [`BARE_FILE_EXTENSIONS`] like
+/// `` `.github/workflows/ci.yml` ``) would be accepted as if it were the
+/// directory containing it, which is equally unmatchable — checked
+/// generally rather than against just [`BARE_FILE_EXTENSIONS`], since a
+/// full path can end in any extension, not only the ones the doc cites
+/// bare. [`is_hyphenated_bare_word`] already excludes extensions and
+/// guarantees path-safety on its own, so only the slash branch needs the
+/// extra checks.
 fn is_directory_shaped(span: &str) -> bool {
-    let is_directory_path = span.contains('/')
-        && is_path_safe(span)
-        && !BARE_FILE_EXTENSIONS.iter().any(|ext| span.ends_with(ext));
+    let last_segment = span.rsplit('/').next().unwrap_or(span);
+    let is_directory_path = span.contains('/') && is_path_safe(span) && !last_segment.contains('.');
     is_directory_path || is_hyphenated_bare_word(span)
 }
 
@@ -439,6 +447,17 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     let mut citations = BTreeSet::new();
     let mut fence: Option<(char, usize)> = None;
     let mut section_dirs: Vec<String> = Vec::new();
+    // Remembers, for the current heading section, the single owner each
+    // `SCOPED_BARE_EXTENSIONS` citation text was last narrowed to by a
+    // possessive clause — so a later, unconnected repeat of the same bare
+    // filename under the same heading (e.g. a second sentence mentioning
+    // `agent.rs` again without repeating "`rocm-dash-tui`'s") keeps that
+    // narrowing instead of falling back to (and being held to) every
+    // crate the heading lists. Cleared whenever a new heading starts,
+    // alongside `section_dirs`, so it never leaks into an unrelated
+    // section.
+    let mut narrowed_owners: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for line in markdown.lines() {
         if let Some(candidate) = fence_line(line) {
             // A closing fence must use the same marker, be at least as long
@@ -500,6 +519,27 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 continue;
             }
 
+            // A bare hyphenated word is only a genuine directory citation
+            // in the doc's two real usages: declared in a heading, or as
+            // the owner of a possessive clause (`` `rocm-dash-tui`'s ``).
+            // Outside those, nothing distinguishes it from ordinary
+            // hyphenated prose (`` `read-only` ``, `` `best-effort` ``) —
+            // same "safer to miss than false-flag" tradeoff already made
+            // for non-hyphenated bare words (see `is_path_candidate`), so
+            // it's skipped as a standalone citation rather than checked
+            // for existence and false-failing on prose. `possessive_owner`
+            // resets exactly as it would have anyway: a hyphenated word
+            // never carries a `SCOPED_BARE_EXTENSIONS` suffix, so
+            // `possessive_owner_for` would have returned `None` for it too.
+            if is_hyphenated_bare_word(span) {
+                let starts_possessive_clause =
+                    parts.get(i + 1).is_some_and(|next| next.trim() == "'s");
+                if !is_heading(line) && !starts_possessive_clause {
+                    possessive_owner = None;
+                    continue;
+                }
+            }
+
             // Not restricted to a bare (no `/`) span: a partial slash-path
             // file citation (`` `app/mod.rs` ``) is just as eligible for
             // possessive narrowing as a bare one (`` `agent.rs` ``) — see
@@ -507,18 +547,31 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
             // scope just as much as a bare one does.
             let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| span.ends_with(ext));
             let owner = possessive_owner_for(&parts, i, is_scoped_extension, possessive_owner);
+            // A connector-less repeat of a citation already narrowed
+            // earlier in this heading section keeps that narrowing rather
+            // than falling back to `effective_section_dirs` — see the
+            // `narrowed_owners` doc comment above.
+            let remembered_owner = owner.map(str::to_string).or_else(|| {
+                is_scoped_extension
+                    .then(|| narrowed_owners.get(span).cloned())
+                    .flatten()
+            });
 
             citations.insert(Citation {
                 text: span.to_string(),
-                section_dirs: match owner {
-                    Some(owner) => vec![owner.to_string()],
+                section_dirs: match &remembered_owner {
+                    Some(owner) => vec![owner.clone()],
                     None => effective_section_dirs.clone(),
                 },
             });
+            if let Some(owner) = owner {
+                narrowed_owners.insert(span.to_string(), owner.to_string());
+            }
             possessive_owner = owner;
         }
         if is_heading(line) {
             section_dirs = heading_dirs;
+            narrowed_owners.clear();
         }
     }
     citations
@@ -585,12 +638,12 @@ fn path_is_under(path: &Path, dir: &str) -> bool {
 /// component anywhere in the tree.
 fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
     let text = citation.text.as_str();
+    let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext));
     if text.contains('/') {
         let citation_path = Path::new(text);
         if tracked.iter().any(|p| p.starts_with(citation_path)) {
             return true;
         }
-        let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext));
         if is_scoped_extension && !citation.section_dirs.is_empty() {
             return citation.section_dirs.iter().all(|dir| {
                 tracked
@@ -600,7 +653,6 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
         }
         return tracked.iter().any(|p| p.ends_with(citation_path));
     }
-    let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext));
     if is_scoped_extension && !citation.section_dirs.is_empty() {
         return citation.section_dirs.iter().all(|dir| {
             tracked
@@ -778,6 +830,40 @@ mod tests {
 
     fn tracked(paths: &[&str]) -> Vec<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn tracked_files_does_not_git_quote_non_ascii_paths() {
+        // Regression: git's default `core.quotePath` escapes any non-ASCII
+        // byte in a path into an octal-escaped, quoted string
+        // (`"caf\303\251.rs"`), which would never string-equal a plain
+        // citation like `café.rs` — silently treating an existing file as
+        // stale. Force `core.quotePath=true` locally so this test is
+        // meaningful regardless of the ambient environment's git config,
+        // then confirm `tracked_files` overrides it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        run_git(&["config", "core.quotePath", "true"]);
+        std::fs::write(root.join("café.rs"), b"").expect("write file");
+        run_git(&["add", "café.rs"]);
+
+        let tracked = tracked_files(root).expect("tracked_files");
+        assert!(
+            tracked.iter().any(|p| p == Path::new("café.rs")),
+            "expected an unescaped café.rs, got: {tracked:?}"
+        );
     }
 
     fn citation(text: &str, section_dirs: &[&str]) -> Citation {
@@ -1295,6 +1381,69 @@ More prose citing `lib.rs`.
     }
 
     #[test]
+    fn extract_path_citations_ignores_a_hyphenated_prose_word_outside_a_heading() {
+        // Regression: `is_hyphenated_bare_word` can't lexically tell a
+        // crate name (`rocm-dash-tui`) from ordinary hyphenated prose
+        // (`read-only`) — both are all-lowercase and hyphenated. Outside a
+        // heading declaration or a possessive-owner position, a bare
+        // hyphenated word must not become its own existence-checked
+        // citation, or a doc edit as innocuous as "a `read-only` mode"
+        // would false-fail CI as a stale path.
+        let markdown = "\
+### `engines/lemonade`, `engines/vllm` — inference engines
+
+This is a `read-only` mode test line.
+";
+        let citations = extract_path_citations(markdown);
+        assert!(
+            !citations.iter().any(|c| c.text == "read-only"),
+            "ordinary hyphenated prose must not be extracted as a citation"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_still_extracts_a_bare_owner_before_apostrophe_s() {
+        // The exclusion above must not swallow the doc's real possessive
+        // pattern: a bare hyphenated crate name immediately followed by
+        // `'s` is still a genuine directory citation (it narrows the
+        // citation right after it — see the next test) and should still be
+        // checked for existence itself.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` is **not yet modularized**.
+";
+        let citations = extract_path_citations(markdown);
+        assert!(citations.iter().any(|c| c.text == "rocm-dash-tui"));
+    }
+
+    #[test]
+    fn extract_path_citations_reuses_a_narrowed_scope_for_an_unconnected_repeat() {
+        // Regression: a bare scoped citation (`agent.rs`) narrowed by a
+        // possessive clause, then mentioned again later under the SAME
+        // heading without repeating the connector, must keep that
+        // narrowing rather than falling back to every crate the heading
+        // lists — the real `rocm-dash-*` heading names 4 crates but
+        // `agent.rs` only exists in `rocm-dash-tui`, so falling back would
+        // false-fail CI on a second, accurate sentence.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` is **not yet modularized**.
+
+A later, unconnected sentence also mentions `agent.rs` again for context.
+";
+        let citations = extract_path_citations(markdown);
+        let mentions: Vec<&Citation> = citations.iter().filter(|c| c.text == "agent.rs").collect();
+        assert_eq!(
+            mentions.len(),
+            1,
+            "both mentions should collapse to one citation with the same narrowed scope"
+        );
+        assert_eq!(mentions[0].section_dirs, vec!["rocm-dash-tui".to_string()]);
+    }
+
+    #[test]
     fn extract_path_citations_collects_every_heading_directory_shape() {
         // The real doc's dashboard/telemetry heading mixes one
         // slash-qualified directory with three bare crate names. A bare
@@ -1432,6 +1581,23 @@ See `apps/rocmd/src/main.rs` for the entry point.
             .find(|c| c.text == "examine.rs")
             .expect("expected an examine.rs citation");
         assert!(examine_citation.section_dirs.is_empty());
+    }
+
+    #[test]
+    fn extract_path_citations_ignores_a_full_file_path_with_an_unlisted_extension_as_an_owner() {
+        // Regression: excluding only `BARE_FILE_EXTENSIONS` (`.rs`/`.md`/
+        // `.toml`) from the directory-shaped check let a full file path
+        // ending in any OTHER extension (e.g. `.github/workflows/ci.yml`)
+        // through as if it were a directory — scoping `diagnose.rs` to an
+        // unmatchable "directory" (nothing can live under a leaf file) and
+        // false-failing CI on an accurate citation.
+        let markdown = "`.github/workflows/ci.yml`'s `diagnose.rs` is not yet modularized.\n";
+        let citations = extract_path_citations(markdown);
+        let diagnose_citation = citations
+            .iter()
+            .find(|c| c.text == "diagnose.rs")
+            .expect("expected a diagnose.rs citation");
+        assert!(diagnose_citation.section_dirs.is_empty());
     }
 
     #[test]
