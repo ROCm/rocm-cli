@@ -51,7 +51,15 @@ Pinned versions of the third-party runtimes rocm-cli manages (from workspace-roo
 
 ### `crates/e2e-report`
 
-`lib.rs` is **not yet modularized** — see EAI-7768.
+Modularized (EAI-8032, Phase 1 of EAI-7768's sequencing): `parse.rs` (cucumber
+`report.json` data model, parsing, and `@expected-failure` xfail evaluation),
+`single_report.rs` (single-platform HTML report generation), `consolidated.rs`
+(the `PlatformReport`/manifest/expectation model, the reconciled scenario ×
+platform `Grid`, and the multi-platform HTML/markdown generation built on top —
+the largest module), `components.rs` (shared maud HTML fragment rendering, plus
+the CSS and timestamp helpers both generators use, depending only on `parse.rs`
+types to keep the module graph acyclic). `lib.rs` itself is just `pub mod` +
+`pub use` re-exports of the crate's public API.
 
 ### `engines/lemonade`, `engines/vllm` — inference engine adapters
 
