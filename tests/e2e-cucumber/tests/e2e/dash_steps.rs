@@ -20,11 +20,21 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// File the daemon's test-only logical clock reads every cycle (see
 /// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
 ///
-/// Keep this path in step with `apps/rocm/src/dash.rs`'s
-/// `dash_test_clock_offset_path`: `rocm dash` looks for exactly
-/// `<ROCM_CLI_DATA_DIR>/telemetry/test-clock-offset` and falls back to wall time
-/// when it is absent, so a rename on either side silently drops the whole
-/// mechanism rather than failing loudly.
+/// `rocm dash` looks for exactly `<ROCM_CLI_DATA_DIR>/telemetry/test-clock-offset`
+/// and falls back to wall time when it is absent, so a rename or a move on
+/// either side would drop the whole mechanism without failing: the dashboard
+/// would just run on wall time and these scenarios would time out on a symptom
+/// that points nowhere near the cause.
+///
+/// `apps/rocm` is a binary crate, so this cannot import its
+/// `DASH_TEST_CLOCK_FILE` — and hosting the constant in a library both sides
+/// could depend on would add a first-party crate edge for one string (see
+/// `xtask check-crate-edges`). The two copies are instead pinned to each other
+/// by `dash::tests::e2e_harness_plants_the_file_rocm_dash_reads` in
+/// `apps/rocm/src/dash.rs`, which reads this file's source and fails in the
+/// every-PR unit lane. It needs this constant declared on one line, and needs
+/// `dash_clock_path` below to keep that name and to keep building the path
+/// from `.join(..)` links — otherwise the guard stops seeing this.
 const DASH_CLOCK_OFFSET_FILE: &str = "test-clock-offset";
 
 /// The Observe instances table's TTFT cell while the scripted mock is serving:
