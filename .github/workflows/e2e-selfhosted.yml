@@ -242,7 +242,7 @@ jobs:
       # Swatinem/rust-cache otherwise tries to SAVE the large target dir to
       # GitHub's cache service in a post-step (slow/hangs) and its cleanup wipes
       # the local target.
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
 
@@ -1144,7 +1144,7 @@ jobs:
 
       # cache: false for the same reason as e2e-gpu — the build cache is kept in
       # CARGO_TARGET_DIR on the PVC, not in GitHub's cache service.
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
 
@@ -1273,7 +1273,7 @@ jobs:
 
       # cache: false for the same reason as e2e-gpu — the build cache is kept in
       # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: false
 
@@ -1356,7 +1356,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       # Pull every self-hosted e2e artifact matching the glob; `xtask e2e-report`
       # turns each into one labeled platform and the `*-report` glob picks up any
