@@ -230,7 +230,58 @@ pub fn resolved_args(
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
+        // Records for local servers that are no longer running. The overlay
+        // renders only the live instances the daemon surfaces, so nothing there
+        // would otherwise admit that a failed server was ever recorded.
+        services_past_attempts: services_past_attempts(paths),
     }
+}
+
+/// Managed-service records that are no longer running, read from the same
+/// registry `rocm services` reads. A status-only file read: no readiness
+/// probes, no daemon.
+///
+/// **Known divergence — this can read lower than `rocm services list --all`,
+/// which is the command the overlay's own note points at.** The CLI path goes
+/// through `main.rs::load_managed_services`, which per record calls
+/// `refresh_from_engine_state` and then
+/// `refresh_managed_service_runtime_liveness`, demoting a crashed server's
+/// stale `running` record to `stopped` and writing it back. `stopped` is not a
+/// scrapeable status, so the CLI counts it; the raw status here is still
+/// `running`, so this does not. The two agree again as soon as any
+/// `rocm services` invocation rewrites the record.
+///
+/// Not refreshed here, for two reasons, in this order:
+///
+/// 1. It would not actually make the surfaces agree. This is a one-shot
+///    snapshot taken in `resolved_args` before the TUI starts (see
+///    `ResolvedArgs::services_past_attempts` — "a snapshot, not a live feed"),
+///    and nothing recomputes it for the life of the session. A server that
+///    crashes a minute into the dashboard diverges again regardless of how
+///    accurate this read was at launch. Closing the gap properly needs a live
+///    feed, not a better snapshot.
+/// 2. The CLI's verdict is not reachable without network I/O.
+///    `refresh_managed_service_runtime_liveness` decides liveness from
+///    `managed_service_endpoint_readiness`, which probes the endpoint — a model
+///    listing bounded by `SERVICE_LIVENESS_CHECK_TIMEOUT`, and for a record
+///    that lists but has not latched a verification, a real inference request
+///    bounded by `INFERENCE_PROBE_TIMEOUT` (8s). Those are per record and would
+///    be paid serially on the plain synchronous thread that `resolved_args`
+///    runs on, delaying the dashboard's first paint by seconds on exactly the
+///    hosts that serve models. It also *writes* records, which launching a
+///    read-only view should not do.
+///
+/// A cheaper approximation exists — adopt the engine state file and check the
+/// recorded pids with `process_is_running`, both local — but it is deliberately
+/// not taken: it trades this undercount for an *overcount* whenever a record's
+/// pids are dead while its endpoint still answers, and duplicates the CLI's
+/// liveness classification in a second place that could drift from it. Reading
+/// low is the safer failure: the note under this count invites the user to run
+/// `rocm services list --all`, which then shows them the true figure.
+fn services_past_attempts(paths: &AppPaths) -> usize {
+    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+    let records = load_service_records(&paths.services_dir());
+    discover_managed_services(&records).past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -860,6 +911,95 @@ mod tests {
             data_dir: PathBuf::from("/tmp/rocm-data"),
             cache_dir: PathBuf::from("/tmp/rocm-cache"),
         }
+    }
+
+    /// The services overlay renders only live instances, so the count of
+    /// records that are no longer running has to be adapted by the bin like
+    /// `model_recipes` / `runtimes` / `automations` are.
+    #[test]
+    fn resolved_args_counts_records_that_are_no_longer_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(args.services_past_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the divergence documented on [`services_past_attempts`]: this count
+    /// is a raw status read, so a crashed server whose record still says
+    /// `running` is NOT counted here, while `rocm services list --all` refreshes
+    /// liveness, demotes it to `stopped` and does count it.
+    ///
+    /// Witnessed rather than left implicit because the overlay's note sends the
+    /// user to that very command, so the two surfaces can disagree in front of
+    /// them. The pid below is the sentinel the `main.rs` service tests use for
+    /// "no such process", which is what makes the record stale: the CLI would
+    /// find no live pid and rewrite the status. Asserting 0 is asserting that no
+    /// refresh happens on this path — if someone later adds one, this test
+    /// fails and they are pointed at the doc comment explaining the trade-off
+    /// rather than silently flipping a launch-time read into network I/O.
+    #[test]
+    fn resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-stale-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        // A crashed server: status still `running`, pids long gone, nothing
+        // listening on the port.
+        std::fs::write(
+            p.services_dir().join("stale.json"),
+            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3,"supervisor_pid":999999999,"engine_pid":999999999}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(
+            args.services_past_attempts, 0,
+            "the overlay count is a raw status snapshot; refreshing it here \
+             would put per-service endpoint probes on the dashboard launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

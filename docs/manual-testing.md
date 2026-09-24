@@ -215,10 +215,23 @@ rocm services logs <service-id>
 
 Expected result:
 
-- `rocm services` shows only living local servers.
-- `rocm services list --all` shows saved history, including failed or stopped
-  attempts.
+- `rocm services` lists only living local servers, but its `Status:` line
+  counts the whole registry, so a failed or stopped record is counted as
+  `N not running` even though no row for it is shown.
+- When such records exist, `rocm services` ends with a `Past attempts:` block
+  giving their count and three runnable commands: `See them: rocm services list
+  --all`, `Read the newest: rocm services logs <service-id>` (with the id of the
+  newest record that is no longer running) and `Reclaim the space: rocm services
+  prune`. Paste the `Read the newest:` line as-is and confirm it opens the logs
+  for that attempt.
+- On a machine that has never served, `rocm services` prints no `Past attempts:`
+  block at all.
+- `rocm services list --all` shows saved history, including the failed or
+  stopped attempts the default view hides.
 - The logs command shows the exact service failure or startup output.
+- `rocm storage report` lists these records under `local server records` with
+  the folder that holds them; no `rocm storage` command deletes them, and the
+  row's note points at `rocm services prune` to reclaim the space.
 - Stop and restart require explicit approval:
 
 ```powershell

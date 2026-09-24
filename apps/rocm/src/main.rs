@@ -850,7 +850,8 @@ enum ComfyuiCommand {
 
 #[derive(Subcommand, Debug)]
 enum ServicesCommand {
-    /// Show currently running local model servers.
+    /// Show currently running local model servers, and count the records that
+    /// are no longer running.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
@@ -17322,12 +17323,53 @@ fn log_browser_source_label(source: &str, show_file_locations: bool) -> String {
     }
 }
 
+/// Tell the default (`!all`) view about local server records it is hiding.
+///
+/// The default view lists only live servers, so a host whose serves all failed
+/// saw an empty list with no hint that anything was recorded. Name the command
+/// that lists them, the one that reads a specific log (with a real id, so that
+/// line can be pasted as-is), and the one that deletes them.
+///
+/// `prune` is named last and without qualification on purpose. Every record
+/// carries an unrotated engine log, so on a host that has served real models
+/// this block is pointing at the only thing on disk the user can get back — and
+/// the other two lines only ever let them *look*. Nothing is said here about
+/// how `prune` decides what to remove: that is its own command's output, and
+/// its behaviour is under change on a sibling branch.
+fn write_past_attempts_hint(output: &mut String, past_attempts: usize, newest_id: Option<&str>) {
+    if past_attempts == 0 {
+        return;
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Past attempts: {past_attempts} local server record(s) that are no longer running."
+    );
+    let _ = writeln!(output, "  See them: rocm services list --all");
+    if let Some(id) = newest_id {
+        let _ = writeln!(output, "  Read the newest: rocm services logs {id}");
+    }
+    let _ = writeln!(output, "  Reclaim the space: rocm services prune");
+}
+
 pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String> {
-    let records = load_managed_services(paths)?
+    // Counts describe the WHOLE registry, not the rows this view keeps. The
+    // default view hides records that are not live, and counting the filtered
+    // list made the header say "none ready" on a host whose only local servers
+    // had failed - the records were on disk and nothing mentioned them. Rows
+    // stay filtered; only the header and the hint below see everything.
+    let all_records = load_managed_services(paths)?;
+    let counts = managed_service_sidebar_counts(&all_records);
+    // `load_managed_services` sorts newest-first, so the first record that is
+    // not live is the newest one - the id worth putting in a pasteable hint.
+    let newest_past_attempt = all_records
+        .iter()
+        .find(|record| !managed_service_is_live(record))
+        .map(|record| record.service_id.clone());
+    let records = all_records
         .into_iter()
         .filter(|record| all || managed_service_is_live(record))
         .collect::<Vec<_>>();
-    let counts = managed_service_sidebar_counts(&records);
     let mut output = String::new();
     let _ = writeln!(output, "Local Servers");
     let _ = writeln!(output);
@@ -17339,6 +17381,19 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         } else {
             writeln!(output, "No local servers are running.")
         };
+        // Gate the separator on the same condition as the hint, not just on
+        // `!all`: `write_past_attempts_hint` early-returns at zero, so a host
+        // that has never served would otherwise gain a blank line between "No
+        // local servers are running." and the next line - a visible change to
+        // the one output this PR is not meant to touch.
+        if !all && counts.past_attempts > 0 {
+            write_past_attempts_hint(
+                &mut output,
+                counts.past_attempts,
+                newest_past_attempt.as_deref(),
+            );
+            let _ = writeln!(output);
+        }
         let _ = writeln!(
             output,
             "Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve."
@@ -17370,6 +17425,15 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
                 record.service_id
             );
         }
+    }
+    // A host can have one server ready and three failed, so the populated
+    // branch needs the hint just as much as the empty one.
+    if !all {
+        write_past_attempts_hint(
+            &mut output,
+            counts.past_attempts,
+            newest_past_attempt.as_deref(),
+        );
     }
     Ok(output)
 }
@@ -18786,12 +18850,29 @@ fn refresh_managed_service_runtime_liveness(
     settled_pending_stop
 }
 
+/// One-line header for the local-servers views.
+///
+/// Records that are neither ready nor starting used to be invisible here, so a
+/// host with three failed servers and nothing live read "none ready" - true of
+/// the live set, misleading about what is on disk. They now get their own
+/// clause. The ready/starting wording is unchanged, so a header with no past
+/// attempts reads exactly as before; one with past attempts gains a third
+/// clause ("1 ready, 1 starting, 1 not running").
 fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
-    match (counts.ready, counts.starting) {
-        (0, 0) => "none ready".to_owned(),
-        (ready, 0) => format!("{ready} ready"),
-        (0, starting) => format!("{starting} starting"),
-        (ready, starting) => format!("{ready} ready, {starting} starting"),
+    let mut parts = Vec::new();
+    if counts.ready > 0 {
+        parts.push(format!("{} ready", counts.ready));
+    }
+    if counts.starting > 0 {
+        parts.push(format!("{} starting", counts.starting));
+    }
+    if counts.past_attempts > 0 {
+        parts.push(format!("{} not running", counts.past_attempts));
+    }
+    if parts.is_empty() {
+        "none ready".to_owned()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -27291,14 +27372,202 @@ install therock";
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("Local Servers"));
-        assert!(rendered.contains("Status: 1 ready, 1 starting"));
-        assert!(!rendered.contains("Past attempts"));
+        // The header counts the whole registry, so the hidden `failed` record
+        // is admitted to rather than silently dropped from the default view.
+        assert!(
+            rendered.contains("Status: 1 ready, 1 starting, 1 not running"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Past attempts: 1 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-failed"),
+            "{rendered}"
+        );
         assert!(rendered.contains("- svc-ready"));
         assert!(rendered.contains("  stop: rocm services stop svc-ready --yes"));
         assert!(!rendered.contains("- svc-failed"));
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
         assert!(!rendered.contains("running servers"));
+        Ok(())
+    }
+
+    /// The default view lists only live servers. The counts used to be taken
+    /// from that already-filtered list, so a host whose local servers had all
+    /// failed was told "none ready" and shown an empty list - the records were
+    /// on disk, unmentioned, and nothing on screen said how to reach them.
+    /// Counts now come from the unfiltered registry; the rows stay filtered.
+    #[test]
+    fn render_services_text_surfaces_records_the_default_view_hides() -> Result<()> {
+        let (root, paths) = test_paths("services-past-attempts-only");
+        paths.ensure()?;
+        // Not live, so `refresh_managed_service_runtime_liveness` returns before
+        // any endpoint probe or pid check: no network, no timing dependence.
+        for (service_id, created_at) in [("svc-older", 1_000_u128), ("svc-newest", 2_000_u128)] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                11500,
+                "managed",
+                999_999_999,
+                None,
+                None,
+                None,
+            );
+            record.status = "failed".to_owned();
+            record.created_at_unix_ms = created_at;
+            record.write()?;
+        }
+
+        let rendered = render_services_text(&paths, false)?;
+        let all = render_services_text(&paths, true)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(rendered.contains("Status: 2 not running"), "{rendered}");
+        assert!(!rendered.contains("none ready"), "{rendered}");
+        assert!(
+            rendered.contains("No local servers are running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Past attempts: 2 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  See them: rocm services list --all"),
+            "{rendered}"
+        );
+        // A real id, newest first, so the line can be pasted as-is.
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-newest"),
+            "{rendered}"
+        );
+        // The other two lines only let the user look. Each record keeps an
+        // unrotated engine log, so `prune` is the only line here that gets any
+        // of that space back - without it the block is a dead end on exactly
+        // the host that needs it most.
+        assert!(
+            rendered.contains("  Reclaim the space: rocm services prune"),
+            "{rendered}"
+        );
+        // The `--all` header is fixed by the same change; it lists the rows, so
+        // it does not repeat the pointer.
+        assert!(all.contains("Status: 2 not running"), "{all}");
+        assert!(all.contains("- svc-newest"), "{all}");
+        assert!(!all.contains("Past attempts:"), "{all}");
+        Ok(())
+    }
+
+    /// The host this change is NOT meant to touch: nothing has ever been served,
+    /// so there is no record to point at and the output must read exactly as it
+    /// did before. Every other test here plants at least one record, so without
+    /// this one the zero case has no coverage at all - and it is the case the
+    /// hint's separator regressed, by printing a blank line the old output never
+    /// had between "No local servers are running." and the next line.
+    #[test]
+    fn render_services_text_leaves_a_host_that_never_served_untouched() -> Result<()> {
+        let (root, paths) = test_paths("services-never-served");
+        paths.ensure()?;
+
+        let rendered = render_services_text(&paths, false)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            rendered,
+            "Local Servers\n\
+             \n\
+             Status: none ready\n\
+             \n\
+             No local servers are running.\n\
+             Start one with `rocm serve <model> --managed`, or run `rocm` and choose Serve.\n",
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A host can have one server running and several that failed, so the
+    /// populated branch of the default view needs the same pointer as the empty
+    /// one - the failed records are hidden there too.
+    #[test]
+    fn render_services_text_points_at_past_attempts_beside_a_live_server() -> Result<()> {
+        let (root, paths) = test_paths("services-past-attempts-mixed");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        // `starting` skips the endpoint probe and this process is a
+        // guaranteed-live pid, so the record stays live without any network.
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11501,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        live.status = "starting".to_owned();
+        live.engine_pid = Some(current_pid);
+        live.created_at_unix_ms = 3_000;
+        live.write()?;
+        for (service_id, created_at) in [
+            ("svc-failed-older", 1_000_u128),
+            ("svc-failed-newest", 2_000_u128),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                11502,
+                "managed",
+                999_999_999,
+                None,
+                None,
+                None,
+            );
+            record.status = "failed".to_owned();
+            record.created_at_unix_ms = created_at;
+            record.write()?;
+        }
+
+        let rendered = render_services_text(&paths, false)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains("Status: 1 starting, 2 not running"),
+            "{rendered}"
+        );
+        // Rows stay filtered: only the live server is listed.
+        assert!(rendered.contains("- svc-live"), "{rendered}");
+        assert!(!rendered.contains("- svc-failed-newest"), "{rendered}");
+        assert!(
+            rendered
+                .contains("Past attempts: 2 local server record(s) that are no longer running."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  See them: rocm services list --all"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  Read the newest: rocm services logs svc-failed-newest"),
+            "{rendered}"
+        );
         Ok(())
     }
 
@@ -27330,6 +27599,11 @@ install therock";
         let _ = fs::remove_dir_all(root);
 
         assert!(rendered.contains("No local servers are running."));
+        // The transition this test is named for reaches the header too: once the
+        // record is demoted it is a past attempt, so the header says so instead
+        // of the old "none ready" - which described the live set correctly and
+        // the disk misleadingly.
+        assert!(rendered.contains("Status: 1 not running"), "{rendered}");
         assert!(all.contains("- svc-stale-ready"));
         assert!(all.contains("  status: stopped"));
         assert_eq!(reloaded.status, "stopped");

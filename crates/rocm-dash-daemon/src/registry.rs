@@ -189,6 +189,15 @@ pub struct ManagedDiscovery {
     pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
+    /// How many records were skipped because they are no longer running
+    /// (`failed`/`stopped`/unrecognized status). These are dropped from the
+    /// scrape set on purpose - polling a dead port is pointless - but they are
+    /// still on disk, and a dashboard that only ever showed the live set gave
+    /// no sign they existed. Counted so the services overlay can say so.
+    ///
+    /// A live record with no bound port is NOT counted: it is skipped for a
+    /// different reason and is not a past attempt.
+    pub past_attempts: usize,
 }
 
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
@@ -204,6 +213,11 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
     let mut out = ManagedDiscovery::default();
     for record in records {
         let Some(svc) = discovered_from_record(record) else {
+            // Two things land here: a record that is no longer running, and a
+            // live record with no bound port. Only the first is a past attempt.
+            if !is_scrapeable_status(&record.status) {
+                out.past_attempts += 1;
+            }
             continue;
         };
         out.seen.insert(svc.container_id.clone());
@@ -584,6 +598,35 @@ mod tests {
         assert_eq!(
             vllm.status,
             rocm_dash_core::metrics::InstanceStatus::Running
+        );
+    }
+
+    #[test]
+    fn discover_managed_services_counts_records_that_are_no_longer_running() {
+        // Dead records are dropped from the scrape set on purpose, but they are
+        // still on disk; the dashboard only ever showed the live set, so a host
+        // whose services had all failed looked as if nothing was ever served.
+        let records: Vec<ServiceRecord> = [
+            record_json("svc-vllm", "vllm", 8000, "running", 4),
+            record_json("svc-stopped", "vllm", 9000, "stopped", 3),
+            record_json("svc-failed", "lemonade", 9001, "failed", 2),
+            // Live, but with no bound port: skipped for a different reason and
+            // NOT a past attempt.
+            record_json("svc-noport", "vllm", 0, "running", 1),
+        ]
+        .iter()
+        .map(|j| serde_json::from_str(j).unwrap())
+        .collect();
+
+        let disc = discover_managed_services(&records);
+        assert_eq!(
+            disc.svcs.len(),
+            1,
+            "only the one live, bound record scrapes"
+        );
+        assert_eq!(
+            disc.past_attempts, 2,
+            "stopped + failed only - never the zero-port live record"
         );
     }
 

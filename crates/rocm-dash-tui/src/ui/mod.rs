@@ -257,7 +257,15 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
         return;
     }
     if let Some(sm) = &state.services {
-        services_manager::draw_services_manager(f, rect, sm, &state.instances, &state.jobs, theme);
+        services_manager::draw_services_manager(
+            f,
+            rect,
+            sm,
+            &state.instances,
+            &state.jobs,
+            state.services_past_attempts,
+            theme,
+        );
     } else if let Some(w) = &state.serve_wizard {
         serve_wizard::draw_serve_wizard(f, rect, w, &state.jobs, &state.model_recipes, theme);
     } else if let Some(em) = &state.engine_manager {

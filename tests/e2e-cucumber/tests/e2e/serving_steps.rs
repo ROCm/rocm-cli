@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::mock_server::MockServer;
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
@@ -673,6 +673,26 @@ async fn setup_background_model(world: &mut E2eWorld) {
     }
 }
 
+#[given("a local server attempt has failed")]
+async fn setup_failed_local_server(world: &mut E2eWorld) {
+    // Plant the record a failed `rocm serve --managed` leaves behind, in this
+    // scenario's own isolated data dir (`<data>/services/e2e-mock.json`) - the
+    // World starts every scenario with an empty one, so a scenario that seeds
+    // nothing asserts against nothing and cannot fail. Reproducing a real serve
+    // failure would need a GPU and a deterministic way to break it; the record
+    // is the only thing `services list` reads, so planting it is the black-box
+    // equivalent. The mock server exists only to give the record a real
+    // endpoint to name: the CLI never probes a record that is not live.
+    let mock = MockServer::start("TestModel/E2E-1B").await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some("TestModel/E2E-1B".to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(ServiceRecordOptions {
+        status: "failed",
+        ..ServiceRecordOptions::default()
+    });
+}
+
 #[given("the served model has been detected")]
 async fn setup_model_detected(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
@@ -1208,6 +1228,43 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
     assert!(
         stdout.contains("127.0.0.1"),
         "endpoint not in services list:\n{stdout}"
+    );
+}
+
+#[then("the list reports the attempt and how to look at it")]
+async fn assert_past_attempts_reported(world: &mut E2eWorld) {
+    let stdout = world
+        .cli_output
+        .as_deref()
+        .expect("no CLI output captured - did the When step run?");
+    // Guard the premise: a record really is hidden from this view. If the
+    // planted record ever started showing up as a row, the assertions below
+    // would be testing the wrong branch.
+    assert!(
+        !stdout.contains("- e2e-mock"),
+        "the default view must still hide the failed record:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Past attempts: 1 local server record(s) that are no longer running."),
+        "the default view must count the record it hides:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rocm services list --all"),
+        "the user must be told how to see the hidden record:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rocm services logs e2e-mock"),
+        "the user must be given a pasteable command to read the log:\n{stdout}"
+    );
+    // The two lines above only let the user look. Every hidden record keeps an
+    // unrotated engine log, so this is the one line that gets that space back.
+    assert!(
+        stdout.contains("Reclaim the space: rocm services prune"),
+        "the user must be told how to reclaim the space:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Status: none ready"),
+        "the header must not claim nothing is recorded:\n{stdout}"
     );
 }
 
