@@ -140,13 +140,13 @@ pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
 };
-pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
-};
 #[cfg(windows)]
 pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
+    DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
+    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+};
+pub use process::{
+    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
 };
 pub use report::{
     APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
