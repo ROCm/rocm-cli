@@ -106,7 +106,13 @@ mod tests {
     /// Whether `text` takes one of the process-wide serializers.
     ///
     /// The suffix rule recognises the DISCIPLINE rather than a specific lock, so
-    /// a new `*_TEST_LOCK` is covered the day it is declared.
+    /// a new `*_TEST_LOCK` is covered the day it is declared. It is a suffix and
+    /// not a substring on purpose: `NOT_A_TEST_LOCK_HELPER` names something else.
+    ///
+    /// Applied per LINE by the caller, which is what lets it answer "was the
+    /// lock taken before this mutation?" rather than merely "somewhere in this
+    /// body". Every lock in this tree names itself on the line that acquires it
+    /// (`let _guard = SOME_TEST_LOCK` ...), so a per-line match loses nothing.
     fn serializes(text: &str) -> bool {
         NAMED_SERIALIZERS.iter().any(|name| text.contains(name))
             || text
@@ -274,6 +280,14 @@ mod tests {
     /// `i` (`r"`, `r#"`, `br##"`, ...).
     fn raw_string_opener(chars: &[char], i: usize) -> Option<(usize, usize)> {
         let mut j = i;
+        // Accepting the byte-string `b` here is cosmetic, and deliberately has
+        // no fixture: removing it only means the caller declines at the `b` and
+        // matches one character later at the `r`, which opens the same literal
+        // and strips the same span. The single character of difference is the
+        // `b` itself, emitted as code rather than as a space — and the stripped
+        // text is read only for braces and for the names in `MUTATIONS`, so a
+        // stray `b` cannot change a verdict. An equivalent mutant; a test for it
+        // would assert nothing.
         if chars.get(j) == Some(&'b') {
             j += 1;
         }
@@ -306,6 +320,12 @@ mod tests {
             // `'\n'`, `'\''`, `'\\'` -- always a literal.
             Some('\\') => true,
             Some(_) => chars.get(i + 2) == Some(&'\''),
+            // A `'` as the final character of the file. Deliberately untested:
+            // the two answers are indistinguishable, because the caller's loop
+            // ends on the next step either way and the one character of output
+            // that differs (`'` versus a space) is neither a brace nor part of
+            // a mutating call's name. Flipping this arm is an equivalent
+            // mutant, so a fixture for it would assert nothing.
             None => false,
         }
     }
@@ -331,10 +351,36 @@ mod tests {
     }
 
     /// A test function that mutates the environment.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Offense {
         line: usize,
         call: String,
+    }
+
+    /// A test body being scanned.
+    struct OpenTest {
+        /// The brace depth the body opened at; it closes on the way back down.
+        open_depth: usize,
+        /// The first line that took a serializer, if any. A mutation is exempt
+        /// only from that line ONWARD — see [`OpenTest::unserialized_hits`].
+        serialized_at: Option<usize>,
+        hits: Vec<Offense>,
+    }
+
+    impl OpenTest {
+        /// The hits this body does not serialize.
+        ///
+        /// A lock is an RAII guard: it protects from where it is taken until the
+        /// end of the scope, and nothing before. Matching the whole accumulated
+        /// body — which is what this used to do — accepted a lock written AFTER
+        /// the mutation it was supposed to protect, which is exactly the bug
+        /// this guard exists to catch, spelled slightly differently.
+        fn unserialized_hits(&self) -> impl Iterator<Item = Offense> + '_ {
+            self.hits
+                .iter()
+                .filter(move |hit| self.serialized_at.is_none_or(|at| hit.line < at))
+                .cloned()
+        }
     }
 
     /// Mutations inside a test function that does not serialize itself.
@@ -355,6 +401,13 @@ mod tests {
     /// * Attributes are recognised by path (see [`has_test_attribute`]), so a
     ///   harness whose attribute does not end in `test` — `#[test_case(..)]`,
     ///   `#[rstest]` — would not arm the scan. Neither is used in this tree.
+    /// * The scan checks that A lock is held, not that it is THE lock every
+    ///   other mutator of the same key takes. Two tests replacing one key under
+    ///   two different mutexes both pass and still race each other. Closing
+    ///   that needs the key each call names, and the keys are string literals
+    ///   this scan has deliberately stripped before it starts — recovering them
+    ///   would mean re-parsing, and they are often constants or variables
+    ///   anyway. The rejection message states the requirement instead.
     ///
     /// Mutations outside test functions are deliberately not flagged — that is
     /// production code, and test-support types such as `ScopedTestEnv` whose
@@ -364,8 +417,7 @@ mod tests {
         let mut offenses = Vec::new();
         let mut depth: usize = 0;
         let mut pending_test_attr = false;
-        // (depth at which the test fn body opened, body text so far, hits so far)
-        let mut current: Option<(usize, String, Vec<Offense>)> = None;
+        let mut current: Option<OpenTest> = None;
 
         for (index, line) in stripped.lines().enumerate() {
             let code = line.trim();
@@ -374,44 +426,53 @@ mod tests {
                 pending_test_attr = true;
             }
 
-            if let Some((_, body, hits)) = current.as_mut() {
-                body.push_str(line);
-                body.push('\n');
-                if let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle)) {
-                    hits.push(Offense {
-                        line: index + 1,
-                        call: (*found).to_owned(),
-                    });
-                }
-            }
-
             let opens = code.matches('{').count();
             let closes = code.matches('}').count();
 
+            // Opened BEFORE this line is scanned, so a mutation sharing the
+            // line with the body's opening brace is seen. The shape is a
+            // one-line `fn t() { unsafe { set_var(..) } }`; rustfmt normally
+            // splits it, so only a `#[rustfmt::skip]` test reaches it -- and
+            // that one used to slip through in silence.
             if pending_test_attr && opens > 0 {
                 pending_test_attr = false;
-                current = Some((depth, String::new(), Vec::new()));
+                current = Some(OpenTest {
+                    open_depth: depth,
+                    serialized_at: None,
+                    hits: Vec::new(),
+                });
             } else if pending_test_attr && code.ends_with(';') {
                 // The attribute gated a braceless item; disarm so the next brace
                 // anywhere in the file is not mistaken for a test body.
                 pending_test_attr = false;
             }
 
+            if let Some(open) = current.as_mut() {
+                // Before the hit, so a lock and a mutation on ONE line counts as
+                // serialized -- the lock is taken first in source order.
+                if open.serialized_at.is_none() && serializes(code) {
+                    open.serialized_at = Some(index + 1);
+                }
+                if let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle)) {
+                    open.hits.push(Offense {
+                        line: index + 1,
+                        call: (*found).to_owned(),
+                    });
+                }
+            }
+
             // Saturating purely so a file this scan misreads cannot panic the
             // build. With literals tokenized away the count is balanced on any
             // file that compiles, so the saturation is unreachable in practice
-            // — it is a backstop, not part of the logic.
+            // — it is a backstop, not part of the logic. (Proven by mutation:
+            // swapping it for a plain `-` leaves the whole suite green, so it
+            // is an equivalent mutant and no fixture is written for it.)
             depth = (depth + opens).saturating_sub(closes);
 
-            if let Some((open_depth, body, hits)) = current.as_ref()
-                && depth <= *open_depth
+            if let Some(open) = current.as_ref()
+                && depth <= open.open_depth
             {
-                if !serializes(body) {
-                    offenses.extend(hits.iter().map(|hit| Offense {
-                        line: hit.line,
-                        call: hit.call.clone(),
-                    }));
-                }
+                offenses.extend(open.unserialized_hits());
                 current = None;
             }
         }
@@ -421,10 +482,8 @@ mod tests {
         // it on the floor: over-reporting is visible and gets fixed, whereas a
         // silently discarded hit is the failure mode this guard exists to
         // prevent.
-        if let Some((_, body, hits)) = current
-            && !serializes(&body)
-        {
-            offenses.extend(hits);
+        if let Some(open) = current.as_ref() {
+            offenses.extend(open.unserialized_hits());
         }
 
         offenses
@@ -452,7 +511,11 @@ mod tests {
              runner (the Windows lane, a required check). Prefer passing the \
              value in through a seam (see `newest_rocm_install_dir_in`); \
              otherwise take `ScopedTestEnv` or any `*_TEST_LOCK` in the test \
-             body. Offenders:\n{}",
+             body. The lock must be taken BEFORE the mutation -- it protects \
+             from where it is acquired, not retroactively -- and it must be \
+             the SAME lock every test mutating that key takes, which this scan \
+             cannot check for you: two tests replacing one key under two \
+             different mutexes both satisfy it and still race. Offenders:\n{}",
             offenders.join("\n")
         );
     }
@@ -773,5 +836,274 @@ mod tests {
             stripped.contains('{') && stripped.contains('}'),
             "{stripped:?}"
         );
+    }
+
+    /// A raw string ends at its hashes, not at the first `"` inside it.
+    ///
+    /// The suite's only raw-string fixture used to be `r#"raw } {"#`, which
+    /// holds no quote — so the ordinary-string state consumed exactly the same
+    /// span and the raw-string branch could be deleted with all 18 tests still
+    /// green. A fixture that looks like coverage and provides none is the worst
+    /// case for a permanent gate, because the build stays green either way.
+    ///
+    /// Each literal here carries a quote, which is what makes the two states
+    /// diverge: read as an ordinary string, the text after that quote becomes
+    /// code and its `{` inflates the depth, which leaves the mutation below
+    /// inside a literal and invisible.
+    #[test]
+    fn a_raw_string_holding_a_quote_does_not_leak_its_braces() {
+        // A hashless `r"..."` cannot hold a quote at all -- that is what the
+        // hashes are for -- so it gets its own fixture below.
+        for literal in ["r#\"a \" b {\"#", "r##\"a \"# b {\"##", "br#\"a \" b {\"#"] {
+            let source = unguarded_test(&format!(
+                "let _s = {literal};\n        {}",
+                mutation_call("set_var")
+            ));
+            let hits = env_mutations_in_unserialized_tests(&source);
+            assert_eq!(
+                hits.len(),
+                1,
+                "{literal} must be stripped whole, braces included: {hits:?}"
+            );
+        }
+    }
+
+    /// A raw string with no hashes is closed by its very next `"`, so the
+    /// opener has to consume that quote. Consuming one character less leaves
+    /// the scan sitting on the quote it just opened, which closes the literal
+    /// immediately and spills its contents into the code stream.
+    #[test]
+    fn a_hashless_raw_string_is_not_closed_by_its_own_opening_quote() {
+        let source = unguarded_test(&format!(
+            "let _s = r\"leaks }} here\";\n        {}",
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "r\"...\" must be stripped whole: {hits:?}");
+    }
+
+    /// A char literal is a literal. Without the state the `}` in `'}'` closes
+    /// the enclosing test early and everything after it goes unwatched; with
+    /// the state but no exit the rest of the file is swallowed instead. Both
+    /// directions end with the mutation below unreported.
+    #[test]
+    fn a_char_literal_holding_a_brace_does_not_close_the_test() {
+        let source = unguarded_test(&format!(
+            "let _c = '}}';\n        {}",
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "'}}' is a literal, not a brace: {hits:?}");
+    }
+
+    /// `'\"'` is a char literal holding a quote. Failing to recognise it lets
+    /// that quote open an ordinary string, which then runs on and swallows the
+    /// mutation on the next line.
+    #[test]
+    fn an_escaped_quote_in_a_char_literal_does_not_open_a_string() {
+        let source = unguarded_test(&format!(
+            "let _c = '\\\"';\n        {}",
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "'\\\"' holds the quote: {hits:?}");
+    }
+
+    /// `'\''` is the one char literal whose escape matters: the escaped `'` is
+    /// not the closing `'`. Consuming it as the close leaves a stray quote in
+    /// the code stream, and here that quote is followed by `,'` — which reads
+    /// as another char literal opening, so the scan re-enters the literal state
+    /// one quote out of phase and the `}` after it escapes as code, closing the
+    /// test before the mutation.
+    ///
+    /// The adjacency is what makes this discriminating, and rustfmt would put a
+    /// space there. The scan runs over every `.rs` file including
+    /// `#[rustfmt::skip]` ones, so the unformatted shape is in scope.
+    #[test]
+    fn an_escaped_quote_does_not_end_a_char_literal_early() {
+        let source = unguarded_test(&format!(
+            "let _pair = ('\\'','}}');\n        {}",
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "the escaped quote is content: {hits:?}");
+    }
+
+    /// Rust block comments nest, so the first `*/` does not necessarily end
+    /// one. Treating it as the end hands the rest of the outer comment to the
+    /// code stream — here a `}` that closes the test early.
+    ///
+    /// The comment spans two lines so the same fixture also pins the newline:
+    /// collapsing it merges the two source lines and renumbers the mutation,
+    /// which is the `file:line` the assertion message promises.
+    #[test]
+    fn a_nested_block_comment_runs_to_its_outer_close() {
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n\
+             \x20       /* outer /* inner */\n\
+             \x20          }} still outer */\n\
+             \x20       {}\n    }}\n}}\n",
+            mutation_call("set_var")
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "the whole comment is a comment: {hits:?}");
+        assert_eq!(
+            hits[0].line, 7,
+            "the comment spans lines 5-6, so the mutation is on line 7"
+        );
+    }
+
+    /// `\"` inside a string is content, not the close. Ending the string there
+    /// spills the rest of the literal into the code stream — here a `}` that
+    /// closes the test before the mutation is reached.
+    #[test]
+    fn an_escaped_quote_in_a_string_does_not_close_it() {
+        let source = unguarded_test(&format!(
+            "let _s = \"esc \\\" }}\";\n        {}",
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "the escaped quote is content: {hits:?}");
+    }
+
+    /// A literal may span lines without a continuation backslash. Every
+    /// literal state has to put the newline back for the same reason the
+    /// continuation case does: the reported line number is the whole point.
+    #[test]
+    fn a_literal_spanning_two_lines_does_not_renumber_them() {
+        for (opener, closer) in [("\"", "\""), ("r#\"", "\"#")] {
+            let source = format!(
+                "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n\
+                 \x20       let _s = {opener}multi\nline{closer};\n\
+                 \x20       {}\n    }}\n}}\n",
+                mutation_call("set_var")
+            );
+            let hits = env_mutations_in_unserialized_tests(&source);
+            assert_eq!(hits.len(), 1, "{opener}: {hits:?}");
+            assert_eq!(
+                hits[0].line, 7,
+                "{opener} spans lines 5-6, so the mutation is on line 7"
+            );
+        }
+    }
+
+    /// A file that ends with a test body still open had its brace bookkeeping
+    /// defeated by something. Reporting what was collected is the safe
+    /// direction — over-reporting is visible and gets fixed, a dropped hit is
+    /// the silent failure this guard exists to prevent — but the exemption
+    /// still applies, or a correctly locked test would fail the build.
+    #[test]
+    fn an_unclosed_test_body_still_reports_what_it_collected() {
+        let call = mutation_call("set_var");
+        let unclosed =
+            format!("#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {call}\n");
+        assert_eq!(
+            env_mutations_in_unserialized_tests(&unclosed).len(),
+            1,
+            "a hit collected before the file ran out must not be dropped"
+        );
+
+        let unclosed_but_locked = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n\
+             \x20       let _guard = SOME_TEST_LOCK.lock().unwrap();\n        {call}\n"
+        );
+        assert!(
+            env_mutations_in_unserialized_tests(&unclosed_but_locked).is_empty(),
+            "the exemption applies at the end of the file too"
+        );
+    }
+
+    /// The documented limit, pinned so it cannot drift silently.
+    ///
+    /// `#[rstest]` and `#[test_case(..)]` both contain `test`; neither is one.
+    /// Relaxing the last-segment rule to a substring would arm the scan on
+    /// them, and since neither harness is used in this tree nothing else would
+    /// notice.
+    #[test]
+    fn an_attribute_merely_containing_test_does_not_arm_the_scan() {
+        for attribute in ["#[rstest]", "#[test_case(1)]", "#[tests]"] {
+            assert!(
+                !has_test_attribute(attribute),
+                "{attribute}'s path does not end in `test`"
+            );
+        }
+    }
+
+    /// A `#[test]` met while a body is already open belongs to something
+    /// nested. Re-arming on it starts a fresh body and throws away everything
+    /// the enclosing test had collected, mutation included.
+    #[test]
+    fn a_nested_test_attribute_does_not_restart_the_enclosing_body() {
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn outer() {{\n        {}\n\
+             \x20       mod inner {{\n            #[test]\n            fn t() {{}}\n\
+             \x20       }}\n    }}\n}}\n",
+            mutation_call("set_var")
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "the outer test's hit survives: {hits:?}");
+        assert_eq!(hits[0].line, 5);
+    }
+
+    /// A lock protects from where it is taken, not retroactively.
+    ///
+    /// Matching the whole accumulated body accepted a lock written after the
+    /// mutation it was supposed to cover — the same race the guard exists to
+    /// stop, spelled so that the guard agreed with it.
+    #[test]
+    fn a_lock_taken_after_the_mutation_does_not_serialize_it() {
+        let call = mutation_call("set_var");
+        let lock = "let _guard = SOME_TEST_LOCK.lock().unwrap();";
+
+        let late = unguarded_test(&format!("{call}\n        {lock}"));
+        let hits = env_mutations_in_unserialized_tests(&late);
+        assert_eq!(hits.len(), 1, "the mutation ran unlocked: {hits:?}");
+
+        let early = unguarded_test(&format!("{lock}\n        {call}"));
+        assert!(
+            env_mutations_in_unserialized_tests(&early).is_empty(),
+            "taking the lock first is the discipline this guard asks for"
+        );
+
+        // Same line, lock first in source order: still covered.
+        let same_line = unguarded_test(&format!("{lock} {call}"));
+        assert!(
+            env_mutations_in_unserialized_tests(&same_line).is_empty(),
+            "a lock earlier on the same line precedes the mutation"
+        );
+    }
+
+    /// The suffix rule is a suffix. `NOT_A_TEST_LOCK_HELPER` contains
+    /// `_TEST_LOCK` and is not a lock, so relaxing the match to a substring
+    /// would hand out the exemption to whatever happens to be named that way.
+    #[test]
+    fn a_name_merely_containing_test_lock_does_not_exempt_anything() {
+        let source = unguarded_test(&format!(
+            "let _x = NOT_A_TEST_LOCK_HELPER.get();\n        {}",
+            mutation_call("set_var")
+        ));
+        assert_eq!(
+            env_mutations_in_unserialized_tests(&source).len(),
+            1,
+            "nothing here takes a lock"
+        );
+    }
+
+    /// A mutation sharing the line that opens the test body.
+    ///
+    /// The body used to be opened after the line was scanned, so this one line
+    /// was never looked at. rustfmt splits the shape, which kept it out of
+    /// sight — but a `#[rustfmt::skip]` test would have gone through in
+    /// silence, and a guard that can silently stop catching things is the
+    /// failure mode this file is written against.
+    #[test]
+    fn a_mutation_sharing_the_opening_brace_line_is_flagged() {
+        let source = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{ {} }}\n}}\n",
+            mutation_call("set_var")
+        );
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(hits.len(), 1, "the whole test is on one line: {hits:?}");
+        assert_eq!(hits[0].line, 4);
     }
 }
