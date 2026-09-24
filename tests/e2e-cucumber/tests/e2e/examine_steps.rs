@@ -590,6 +590,104 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     );
 }
 
+#[then("the machine-readable report names a GPU target for the GPU it found")]
+async fn assert_json_names_target_per_gpu(world: &mut E2eWorld) {
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let json = parsed_json(world);
+    // The human report's target comes from sysfs and has always been right; the
+    // per-GPU records in the machine-readable form come from rocminfo, whose
+    // ISA `Name:` lines used to clobber the agent name (#393). The two must
+    // name the same target for the GPU this host has.
+    let expected = human_states(human, "detected_gfx_target")
+        .filter(|t| t.starts_with("gfx"))
+        .expect("the human report names no gfx target on a host that has a GPU");
+    let records: Vec<(String, String)> = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .map(|gpus| {
+            gpus.iter()
+                .map(|g| {
+                    let field = |name: &str| {
+                        g.get(name)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    (field("pci_id"), field("gfx_target"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        records.iter().any(|(_, t)| t == &expected),
+        "`examine --json` names no GPU with gfx_target {expected:?} \
+         (per-GPU records: {records:?}); the human report found it"
+    );
+
+    // Presence is not attachment: on an APU+dGPU host a target swapped between
+    // the two records would still be "present". KFD's topology lists each GPU
+    // with its PCI address, so where it is readable every record is checked
+    // against the target the kernel reports for that exact device.
+    for (pci_id, kernel_target) in kfd_gpu_targets_by_pci_id() {
+        let Some((_, reported)) = records.iter().find(|(id, _)| id == &pci_id) else {
+            continue;
+        };
+        assert_eq!(
+            reported, &kernel_target,
+            "`examine --json` attaches gfx_target {reported:?} to {pci_id}, but KFD reports \
+             {kernel_target} for that device (records: {records:?})"
+        );
+    }
+}
+
+/// `(pci_id, gfx target)` for every KFD GPU node whose target decodes
+/// unambiguously, read straight from sysfs.
+///
+/// `location_id` packs the address as `bus << 8 | device << 3 | function`;
+/// with the node's `domain` it renders as the `dddd:bb:dd.f` form `lspci -D`
+/// prints, which is what `examine --json` carries as `pci_id`. Targets use the
+/// same unambiguous-half rule as [`assert_gpu_target_matches_kfd`]: revisions
+/// of 10 and above are skipped rather than re-implementing the lettered form.
+/// Empty off Linux and on hosts with no readable KFD topology.
+fn kfd_gpu_targets_by_pci_id() -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes") else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let prop = |key: &str| -> Option<u32> {
+            properties.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                (parts.next()? == key).then(|| parts.next()?.parse::<u32>().ok())?
+            })
+        };
+        let Some(packed) = prop("gfx_target_version").filter(|v| *v != 0) else {
+            continue;
+        };
+        let (Some(location), Some(domain)) = (prop("location_id"), prop("domain")) else {
+            continue;
+        };
+        let (major, minor, revision) = (packed / 10_000, (packed / 100) % 100, packed % 100);
+        if revision >= 10 {
+            continue;
+        }
+        let pci_id = format!(
+            "{domain:04x}:{:02x}:{:02x}.{}",
+            location >> 8,
+            (location >> 3) & 0x1f,
+            location & 0x7
+        );
+        targets.push((pci_id, format!("gfx{major}{minor}{revision}")));
+    }
+    targets
+}
+
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
