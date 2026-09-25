@@ -341,3 +341,19 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # A managed engine is spawned detached, so if it dies on the way up there is no
+  # terminal for it to report to: the child's own service log is the only account
+  # of why. Without a startup check the CLI reported such a launch as a success
+  # and left the user waiting on a server that would never come up. The engine is
+  # scripted to die at startup in test builds (`rocm/e2e-test-hooks`), which also
+  # waives the no-GPU pre-flight and engine preparation so this reaches a real
+  # spawn without GPU hardware or a runtime download — the death itself is real,
+  # only its trigger is scripted. Ungated, so it gates every PR and covers Windows
+  # and WSL2 too, where the startup check is newest.
+  @id:serve-managed-engine-dies-at-startup @requires-no-gpu
+  Scenario: serve-26 - An engine that dies at startup fails the serve and names its log
+    Given the managed engine dies during startup
+    When the user serves a model with Lemonade
+    Then serving fails and names the engine's own log
+    And the failed launch does not block the next serve
