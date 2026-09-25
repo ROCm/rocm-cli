@@ -5099,45 +5099,99 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
     detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
 }
 
-/// How many GPUs the KFD topology describes and the single target they all
-/// report, or `None` when they disagree or the topology is unreadable.
+/// One GPU as the kernel's KFD topology describes it.
 ///
-/// [`detect_kfd_gfx_target_in`] answers "what is this host's target" by taking
-/// the lowest-numbered node, which is the right answer for HIP ordinal 0 and
-/// the wrong one to attribute to a *particular* device: on an APU+dGPU box that
-/// node is typically the integrated part, so its target would be stamped onto
-/// the discrete card. Callers that need to label an individual GPU want this
-/// instead, and must treat `None` as "cannot say" rather than falling back.
+/// This is the *kernel's* answer to "which GPUs exist here", which is a
+/// different question from the one the PCI bus answers. In a container the bus
+/// still carries every card the host has, while KFD carries only the devices
+/// passed through — so this is what `examine` must count, and the PCI scan is
+/// only good for naming what it finds here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KfdGpuNode {
+    /// The node's PCI address as `lspci -D` spells it (`0000:11:00.0`), or
+    /// empty when the node does not state a usable one.
+    pub(crate) pci_id: String,
+    /// The node's own gfx target (`gfx942`), or empty when unparseable.
+    ///
+    /// Per-node, so it can be attributed to a particular device: an APU+dGPU
+    /// host reports two different targets and each belongs to exactly one card.
+    pub(crate) gfx_target: String,
+}
+
+/// Every GPU the KFD topology describes, in node order. `None` when the
+/// topology could not be read at all, which callers must treat as "cannot say"
+/// rather than as "no GPUs".
 #[cfg(target_os = "linux")]
-pub(crate) fn detect_linux_uniform_kfd_gfx_target() -> Option<(usize, String)> {
+pub(crate) fn linux_kfd_gpu_nodes() -> Option<Vec<KfdGpuNode>> {
     if !runtime_is_linux() {
         return None;
     }
-    uniform_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+    kfd_gpu_nodes_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) const fn detect_linux_uniform_kfd_gfx_target() -> Option<(usize, String)> {
+pub(crate) fn linux_kfd_gpu_nodes() -> Option<Vec<KfdGpuNode>> {
     None
 }
 
-/// The uniform-target read, against a caller-supplied nodes directory. Same
+/// The per-node topology read, against a caller-supplied nodes directory. Same
 /// planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn uniform_kfd_gfx_target_in(nodes_dir: &Path) -> Option<(usize, String)> {
-    let targets: Vec<String> = fs::read_dir(nodes_dir)
+pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {
+    let mut nodes: Vec<((u64, String), KfdGpuNode)> = fs::read_dir(nodes_dir)
         .ok()?
         .flatten()
         .filter_map(|entry| {
-            let value = kfd_node_gfx_target_version(&entry.path())?;
-            parse_linux_kfd_gfx_target(value.trim())
+            let path = entry.path();
+            let version = kfd_node_gfx_target_version(&path)?;
+            if !kfd_gfx_target_version_is_gpu(version.trim()) {
+                return None;
+            }
+            let properties = fs::read_to_string(path.join("properties")).unwrap_or_default();
+            Some((
+                natural_node_order(&entry.file_name().to_string_lossy()),
+                KfdGpuNode {
+                    pci_id: kfd_node_pci_id(&properties).unwrap_or_default(),
+                    gfx_target: parse_linux_kfd_gfx_target(version.trim()).unwrap_or_default(),
+                },
+            ))
         })
         .collect();
-    let first = targets.first()?;
-    if targets.iter().any(|target| target != first) {
+    // `read_dir` order is filesystem-defined, so sort on the node number for the
+    // same reason `detect_kfd_gfx_target_in` does: node 0 is HIP ordinal 0.
+    nodes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Some(nodes.into_iter().map(|(_, node)| node).collect())
+}
+
+/// The PCI address a KFD topology node reports, spelled as `lspci -D` spells it.
+///
+/// KFD states the address as two decimal properties. `domain` is the PCI domain;
+/// `location_id` is the kernel's `pci_dev_id()`, i.e. `(bus << 8) | devfn`, with
+/// `devfn` packing the device number in bits 3..8 and the function in bits 0..3.
+/// So `location_id 4352` (`0x1100`) in domain 0 is `0000:11:00.0`.
+///
+/// Verified against an 8-GPU MI300X host: nodes 2..9 report `location_id` 4352,
+/// 12032, 17920, 23808, 35584, 43520, 49664 and 55808, which decode to exactly
+/// the eight addresses `lspci -D` lists for its accelerators (EAI-8449).
+///
+/// `None` when the property is absent or zero. Zero is refused rather than
+/// decoded: `0000:00:00.0` is the host bridge, so emitting it would be a
+/// wrong-but-plausible address that could match an unrelated PCI entry.
+#[cfg(any(target_os = "linux", test))]
+fn kfd_node_pci_id(properties: &str) -> Option<String> {
+    let location = kfd_property_value(properties, "location_id")?
+        .parse::<u32>()
+        .ok()?;
+    if location == 0 {
         return None;
     }
-    Some((targets.len(), first.clone()))
+    let domain = kfd_property_value(properties, "domain")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let bus = (location >> 8) & 0xff;
+    let device = (location >> 3) & 0x1f;
+    let function = location & 0x7;
+    Some(format!("{domain:04x}:{bus:02x}:{device:02x}.{function}"))
 }
 
 /// The KFD-topology read, against a caller-supplied nodes directory.
@@ -11216,58 +11270,107 @@ Class Name:                Display
     }
 
     #[test]
-    fn a_uniform_topology_reports_its_target_and_a_mixed_one_refuses() -> Result<()> {
-        // Eight identical MI300X GPUs behind two CPU nodes: the topology speaks
-        // for every one of them, so it can label an individual device.
-        let (root, _) = temp_app_paths("kfd-uniform-topology");
+    fn kfd_nodes_carry_a_decoded_pci_address_and_their_own_target() -> Result<()> {
+        // The first three GPU nodes of a real 8-GPU MI300X host, verbatim from
+        // its `location_id` values, behind the two CPU nodes it also reports.
+        // `lspci -D` lists those cards at 0000:11:00.0, 0000:2f:00.0 and
+        // 0000:46:00.0, so the decode is checked against the machine rather
+        // than against itself.
+        let (root, _) = temp_app_paths("kfd-nodes-pci");
         let nodes = root.join("nodes");
         for node in ["0", "1"] {
             fs::create_dir_all(nodes.join(node))?;
             fs::write(
                 nodes.join(node).join("properties"),
-                "cpu_cores_count 56\ngfx_target_version 0\n",
+                "cpu_cores_count 56\nsimd_count 0\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
             )?;
         }
-        for node in ["2", "3", "4", "5", "6", "7", "8", "9"] {
+        for (node, location) in [("2", 4352), ("3", 12032), ("4", 17920)] {
             fs::create_dir_all(nodes.join(node))?;
             fs::write(
                 nodes.join(node).join("properties"),
-                "simd_count 1216\ngfx_target_version 90402\n",
+                format!(
+                    "cpu_cores_count 0\nsimd_count 1216\ngfx_target_version 90402\n\
+                     location_id {location}\ndomain 0\n"
+                ),
             )?;
         }
-        let uniform = uniform_kfd_gfx_target_in(&nodes);
+        let read = kfd_gpu_nodes_in(&nodes);
         fs::remove_dir_all(&root).ok();
-        assert_eq!(uniform, Some((8, "gfx942".to_owned())));
 
-        // An APU + a discrete card: one target cannot describe both, and
-        // `detect_kfd_gfx_target_in` would hand back whichever node sorts first.
-        let (root, _) = temp_app_paths("kfd-mixed-topology");
+        let expected: Vec<KfdGpuNode> = ["0000:11:00.0", "0000:2f:00.0", "0000:46:00.0"]
+            .into_iter()
+            .map(|pci_id| KfdGpuNode {
+                pci_id: pci_id.to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            })
+            .collect();
+        // The CPU nodes are excluded, and node order is preserved so entry 0 is
+        // the device HIP calls ordinal 0.
+        assert_eq!(read, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn kfd_nodes_keep_their_targets_apart_and_refuse_an_unusable_address() -> Result<()> {
+        // An APU + a discrete card. Each node states its own target, which is
+        // the whole point of reading them per-node: a single host-wide answer
+        // would stamp the APU's gfx1103 onto the discrete card.
+        //
+        // The dGPU node here also reports `location_id 0`. That decodes to
+        // 0000:00:00.0 -- the host bridge -- so it must come back empty rather
+        // than as an address that could match an unrelated PCI entry.
+        let (root, _) = temp_app_paths("kfd-nodes-mixed");
         let nodes = root.join("nodes");
         fs::create_dir_all(nodes.join("0"))?;
         fs::write(
             nodes.join("0").join("properties"),
-            "cpu_cores_count 16\ngfx_target_version 0\n",
+            "cpu_cores_count 16\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
         )?;
         fs::create_dir_all(nodes.join("1"))?;
         fs::write(
             nodes.join("1").join("properties"),
-            "simd_count 256\ngfx_target_version 110003\n",
+            "simd_count 256\ngfx_target_version 110003\nlocation_id 25600\ndomain 0\n",
         )?;
         fs::create_dir_all(nodes.join("2"))?;
         fs::write(
             nodes.join("2").join("properties"),
-            "simd_count 768\ngfx_target_version 110000\n",
+            "simd_count 768\ngfx_target_version 110000\nlocation_id 0\ndomain 0\n",
         )?;
-        let mixed = uniform_kfd_gfx_target_in(&nodes);
+        let read = kfd_gpu_nodes_in(&nodes);
+        // The host-wide answer is still the APU, which is why it must not be
+        // attributed to the discrete card.
         let lowest = detect_kfd_gfx_target_in(&nodes);
         fs::remove_dir_all(&root).ok();
 
-        assert_eq!(mixed, None, "a mixed topology must refuse to speak");
-        // The contrast that makes the new read necessary: the host-wide answer
-        // is still available, and is the APU -- which is why it must not be
-        // attributed to the discrete card.
+        assert_eq!(
+            read,
+            Some(vec![
+                KfdGpuNode {
+                    pci_id: "0000:64:00.0".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                },
+                KfdGpuNode {
+                    pci_id: String::new(),
+                    gfx_target: "gfx1100".to_owned(),
+                },
+            ])
+        );
         assert_eq!(lowest.as_deref(), Some("gfx1103"));
         Ok(())
+    }
+
+    #[test]
+    fn a_kfd_node_decodes_a_nonzero_function_and_domain() {
+        // devfn packs the device in bits 3..8 and the function in bits 0..3, and
+        // the domain is a separate property -- so neither is assumed to be zero.
+        // 0x8ffa = bus 0x8f, device 0x1f, function 2.
+        assert_eq!(
+            kfd_node_pci_id("location_id 36858\ndomain 5\n").as_deref(),
+            Some("0005:8f:1f.2")
+        );
+        // A node that states no location at all cannot be placed on the bus.
+        assert_eq!(kfd_node_pci_id("gfx_target_version 90402\n"), None);
     }
 
     #[test]

@@ -395,6 +395,11 @@ impl Examination {
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
+            // Between the two, because it decides *which* AMD GPUs exist: the
+            // PCI scan over-reports in a container and `rocminfo` maps its
+            // agents onto the surviving entries by position, so it has to see
+            // the reconciled list rather than the whole bus.
+            probe_gpus_kernel_membership(&mut e);
             probe_gpus_rocminfo(&mut e);
             probe_gpus_sysfs_fallback(&mut e);
             summarise_gpu_categories(&mut e);
@@ -1247,15 +1252,13 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// vendor strings and the APU/discrete distinction that sysfs does not, and
 /// those are worth keeping whenever they are available.
 ///
-/// When the preceding probes *did* find AMD GPUs there is nothing to discover,
-/// but the kernel may still know something they left blank: `lspci` never knows
-/// a gfx target, and `rocminfo` is what normally supplies it. So that case is
-/// not a no-op either — it hands off to
-/// [`fill_missing_gfx_targets_from_topology`], which fills that one gap under
-/// much stricter conditions than the discovery path above.
+/// Reached only when the KFD topology could not be read or described no GPU,
+/// since [`probe_gpus_kernel_membership`] would otherwise have contributed an
+/// entry per node already. What is left for this to cover is the host whose
+/// target comes from DRM ip-discovery instead — see
+/// [`crate::detect_linux_sysfs_gfx_target`].
 fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     if e.gpus.iter().any(|gpu| gpu.is_amd) {
-        fill_missing_gfx_targets_from_topology(e);
         return;
     }
     let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
@@ -1279,45 +1282,124 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     );
 }
 
-/// Fill in `gfx_target` for AMD GPUs that `lspci` enumerated but could not name
-/// a target for, using the kernel topology.
+/// Make the reported AMD GPU list the set the *kernel* exposes, named from what
+/// the PCI scan found.
 ///
-/// `lspci` knows the PCI id, the vendor string and the APU/discrete
-/// distinction, but it does not know the gfx target: that normally arrives from
-/// `rocminfo`. On an Instinct host without ROCm on PATH nothing supplies it, so
-/// the entries would carry an empty target even though the kernel plainly
-/// states one — and `gpus[].gfx_target` is the only place the JSON report names
-/// the hardware's own target per device.
+/// The PCI bus answers a different question from the kernel. Matching the
+/// processing-accelerator class is what finally makes Instinct parts visible to
+/// [`probe_gpus_lspci`], but it also makes every card on the *host* bus visible
+/// to a container that was passed one of them: an MI300X node reports eight
+/// accelerators on the bus while KFD describes only the GPU the container may
+/// use. Enumerating from PCI alone would therefore tell that user they have
+/// eight GPUs, and `rocm serve` would then fail on a device `examine` had just
+/// advertised — worse than the under-detection this replaced, which at least
+/// failed honestly.
 ///
-/// Only fills when the topology **unambiguously** accounts for what `lspci`
-/// found: every KFD GPU node reports the same target, and there are exactly as
-/// many of them as there are AMD GPUs. Anything else is left empty rather than
-/// guessed. The topology read cannot attribute a target to a *particular*
-/// device, so on an APU+dGPU host a single host-wide answer would be stamped
-/// onto the discrete card — and `diagnose`'s iGPU/dGPU check splits precisely
-/// on `gfx_target` to tell the user which GPU to pin, where a confident wrong
-/// answer is worse than none.
-fn fill_missing_gfx_targets_from_topology(e: &mut Examination) {
-    let Some((gpu_nodes, gfx_target)) = crate::detect_linux_uniform_kfd_gfx_target() else {
+/// So count from the kernel and name from PCI. Only `is_amd` entries are
+/// touched: KFD describes AMD compute devices and says nothing about an NVIDIA
+/// card, which must survive untouched.
+fn probe_gpus_kernel_membership(e: &mut Examination) {
+    let Some(nodes) = crate::linux_kfd_gpu_nodes() else {
         return;
     };
-    fill_missing_gfx_targets(e, gpu_nodes, &gfx_target);
+    apply_kernel_gpu_membership(e, &nodes);
 }
 
-/// The gap-fill itself, against a caller-supplied topology reading.
+/// The reconcile itself, against a caller-supplied topology reading.
 ///
 /// Split out from the sysfs read for the same reason as `detect_kfd_gfx_target_in`:
 /// the hosts this matters on are the ones a test cannot run on, and reading the
 /// real topology from a test would make the assertion depend on the machine.
-fn fill_missing_gfx_targets(e: &mut Examination, gpu_nodes: usize, gfx_target: &str) {
-    if gpu_nodes != e.gpus.iter().filter(|gpu| gpu.is_amd).count() {
+/// Its caller holds no logic of its own, so pairing this with
+/// [`crate::kfd_gpu_nodes_in`] over a planted directory covers the whole path
+/// bar the `/sys` path constant — see
+/// `the_membership_read_reconciles_a_planted_topology_end_to_end`.
+///
+/// An empty `nodes` is deliberately a no-op rather than "report no GPUs". A
+/// readable topology with no GPU node is what a host whose `amdgpu` failed to
+/// load looks like, and "your card is on the bus but the driver did not bind"
+/// is the single most useful thing `examine` can say there — so the PCI list
+/// stands, and the driver probes explain why nothing is usable.
+fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode]) {
+    if nodes.is_empty() {
         return;
     }
-    for gpu in e.gpus.iter_mut().filter(|gpu| gpu.is_amd) {
+    let (from_pci, others): (Vec<Gpu>, Vec<Gpu>) = std::mem::take(&mut e.gpus)
+        .into_iter()
+        .partition(|gpu| gpu.is_amd);
+    let mut claimed = vec![false; from_pci.len()];
+    let mut unnamed = 0usize;
+
+    let mut gpus: Vec<Gpu> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        // Matched by address, not by position: the two enumerations order
+        // devices independently, and on a partitioned Instinct several KFD
+        // nodes legitimately share one physical card's address.
+        let matched = from_pci
+            .iter()
+            .position(|gpu| pci_ids_match(&gpu.pci_id, &node.pci_id));
+        let Some(index) = matched else {
+            // Kernel-visible but absent from the PCI scan: no `lspci` on PATH,
+            // or a node whose address could not be decoded. The device is still
+            // usable, so it must be listed -- just without the enriched name.
+            unnamed += 1;
+            gpus.push(Gpu {
+                name: "AMD GPU (from kernel topology)".to_owned(),
+                gfx_target: node.gfx_target.clone(),
+                pci_id: node.pci_id.clone(),
+                is_amd: true,
+                // Left unset rather than guessed, for the same reason
+                // `probe_gpus_sysfs_fallback` leaves it unset: KFD gives the
+                // target, not the packaging.
+                is_apu: None,
+            });
+            continue;
+        };
+        claimed[index] = true;
+        let mut gpu = from_pci[index].clone();
+        // The node's own target, so an APU+dGPU host labels each card with the
+        // target that belongs to it. Never an overwrite: `rocminfo` has not run
+        // yet here, but a target `lspci` resolved from the marketing name is a
+        // statement about this device and the node's is only a better one when
+        // there is nothing to compare it against.
         if gpu.gfx_target.is_empty() {
-            gpu.gfx_target = gfx_target.to_owned();
+            gpu.gfx_target = node.gfx_target.clone();
         }
+        gpus.push(gpu);
     }
+
+    let unexposed: Vec<&str> = from_pci
+        .iter()
+        .zip(&claimed)
+        .filter(|(_, claimed)| !**claimed)
+        .map(|(gpu, _)| gpu.pci_id.as_str())
+        .collect();
+    if !unexposed.is_empty() {
+        // Not dropped silently: the addresses still belong in the report,
+        // because "the bus has it and the kernel does not" is a diagnosis.
+        e.notes.push(format!(
+            "{} AMD PCI device(s) are on the bus but not exposed by the kernel here, so they \
+             are not listed as GPUs: {}. In a container this is expected — only the \
+             passed-through GPUs are usable.",
+            unexposed.len(),
+            unexposed.join(", ")
+        ));
+    }
+    if unnamed > 0 {
+        e.notes.push(format!(
+            "{unnamed} GPU(s) were taken from the kernel topology because the PCI enumeration \
+             did not list them; their marketing name is unknown."
+        ));
+    }
+
+    e.gpus = gpus;
+    e.gpus.extend(others);
+}
+
+/// Whether two PCI addresses name the same device. An empty address matches
+/// nothing: it means "unknown", not "wildcard".
+const fn pci_ids_match(left: &str, right: &str) -> bool {
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
 }
 
 fn summarise_gpu_categories(e: &mut Examination) {
@@ -2888,85 +2970,259 @@ mod tests {
         );
     }
 
+    /// The eight MI300X accelerators an MI300X host's `lspci -nn -D` lists,
+    /// verbatim down to the `Device` name its `pci.ids` gives them.
+    fn mi300x_bus_gpus() -> Vec<Gpu> {
+        [
+            "0000:11:00.0",
+            "0000:2f:00.0",
+            "0000:46:00.0",
+            "0000:5d:00.0",
+            "0000:8b:00.0",
+            "0000:aa:00.0",
+            "0000:c2:00.0",
+            "0000:da:00.0",
+        ]
+        .into_iter()
+        .map(|pci_id| Gpu {
+            name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+            gfx_target: String::new(),
+            pci_id: pci_id.to_owned(),
+            is_amd: true,
+            is_apu: Some(false),
+        })
+        .collect()
+    }
+
     #[test]
-    fn the_topology_fills_a_missing_gfx_target_but_never_replaces_one() {
-        // lspci knows no gfx target -- and on a host whose `pci.ids` predates
-        // the part it has no marketing name to guess one from either, naming an
-        // MI300X just "Device". So without rocminfo the entries carried an
-        // empty target while the kernel plainly said gfx942, and `gpus[]` is
-        // the only place the JSON names the hardware's own target per device.
+    fn the_report_lists_the_gpus_the_kernel_exposes_not_every_card_on_the_bus() {
+        // The container this regressed in: `lspci` reads the *host* bus and
+        // finds all eight MI300X accelerators, while KFD describes only the one
+        // passed through. Enumerating from PCI told that user they had eight
+        // GPUs, seven of which `rocm serve` could not open.
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:5d:00.0".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus.len(), 1, "only the exposed GPU may be listed");
+        // Matched by address, not by position: the exposed card is the fourth
+        // on the bus, so taking the first entry would name the wrong device.
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert!(
+            e.gpus[0].name.contains("Advanced Micro Devices"),
+            "the surviving entry keeps the name lspci gave it: {:?}",
+            e.gpus[0].name
+        );
+        // The seven are not erased from the report, only from `gpus[]`: "the
+        // bus has it and the kernel does not" is itself a diagnosis.
+        let note = e.notes.join("\n");
+        assert!(
+            note.contains("not exposed by the kernel") && note.contains("0000:11:00.0"),
+            "the unexposed devices must still be accounted for: {:?}",
+            e.notes
+        );
+    }
+
+    #[test]
+    fn a_kernel_visible_gpu_the_pci_scan_missed_is_still_listed() {
+        // The reverse case: no `lspci` on PATH, so nothing names the device --
+        // but the kernel exposes it and it is perfectly usable, so dropping it
+        // would under-report exactly the way this whole change is meant to fix.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:11:00.0".to_owned(),
+                    gfx_target: "gfx942".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:2f:00.0".to_owned(),
+                    gfx_target: "gfx942".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(e.gpus.len(), 2);
+        assert!(e.gpus.iter().all(|gpu| gpu.is_amd));
+        // The address still comes through, because KFD states it even when
+        // lspci is unavailable to confirm it.
+        assert_eq!(e.gpus[0].pci_id, "0000:11:00.0");
+        assert_eq!(e.gpus[1].gfx_target, "gfx942");
+        assert!(
+            e.notes.join("\n").contains("marketing name is unknown"),
+            "an unnamed entry must say so: {:?}",
+            e.notes
+        );
+    }
+
+    #[test]
+    fn each_kernel_node_labels_its_own_card_and_leaves_other_vendors_alone() {
+        // An APU + a discrete card. Reading the target per node is what makes
+        // this safe: a single host-wide answer would stamp the APU's gfx1103
+        // onto the dGPU, and diagnose's iGPU/dGPU check splits on exactly this
+        // field to tell the user which GPU to pin.
         let mut e = Examination {
             gpus: vec![
                 Gpu {
-                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
+                        .to_owned(),
                     gfx_target: String::new(),
-                    pci_id: "0000:11:00.0".to_owned(),
+                    pci_id: "0000:03:00.0".to_owned(),
                     is_amd: true,
                     is_apu: Some(false),
                 },
                 Gpu {
-                    name: "already resolved by rocminfo".to_owned(),
-                    gfx_target: "gfx90a".to_owned(),
-                    pci_id: "0000:2f:00.0".to_owned(),
-                    is_amd: true,
-                    is_apu: Some(false),
-                },
-                Gpu {
-                    name: "NVIDIA".to_owned(),
+                    name: "NVIDIA Corporation Device".to_owned(),
                     gfx_target: String::new(),
                     pci_id: "0000:46:00.0".to_owned(),
                     is_amd: false,
                     is_apu: Some(false),
                 },
+                Gpu {
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                    pci_id: "0000:64:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                },
             ],
             ..Examination::default()
         };
-        // Two AMD GPUs, so a two-GPU topology accounts for them exactly.
-        fill_missing_gfx_targets(&mut e, 2, "gfx942");
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:64:00.0".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:03:00.0".to_owned(),
+                    gfx_target: "gfx1100".to_owned(),
+                },
+            ],
+        );
 
-        assert_eq!(e.gpus[0].gfx_target, "gfx942", "the gap must be filled");
-        // A target rocminfo already resolved must survive: the topology read
-        // yields one target for the host and cannot describe a mixed machine.
-        assert_eq!(e.gpus[1].gfx_target, "gfx90a");
-        // A non-AMD entry is never given an AMD target.
-        assert_eq!(e.gpus[2].gfx_target, "");
+        let apu = &e.gpus[0];
+        let discrete = &e.gpus[1];
+        assert_eq!(apu.pci_id, "0000:64:00.0");
+        assert_eq!(apu.gfx_target, "gfx1103");
+        assert_eq!(apu.is_apu, Some(true), "lspci's packaging verdict survives");
+        assert_eq!(discrete.pci_id, "0000:03:00.0");
+        assert_eq!(
+            discrete.gfx_target, "gfx1100",
+            "the discrete card takes its own node's target, not the APU's"
+        );
+        // KFD says nothing about an NVIDIA card, so the entry must survive.
+        let nvidia = e
+            .gpus
+            .iter()
+            .find(|gpu| !gpu.is_amd)
+            .expect("the NVIDIA entry must survive");
+        assert_eq!(nvidia.pci_id, "0000:46:00.0");
+        assert_eq!(nvidia.gfx_target, "", "a non-AMD entry gets no AMD target");
+        assert!(
+            e.notes.is_empty(),
+            "a topology that accounts for every AMD card needs no note: {:?}",
+            e.notes
+        );
     }
 
     #[test]
-    fn a_topology_that_does_not_account_for_every_amd_gpu_fills_nothing() {
-        // The APU+dGPU host this guard exists for: lspci recognises the
-        // integrated part by name and resolves gfx1103, but the discrete card
-        // matches no pattern and comes back empty. Stamping a host-wide target
-        // onto it would label the dGPU with the APU's target -- and diagnose's
-        // iGPU/dGPU check splits on exactly this field to tell the user which
-        // GPU to pin, so a confident wrong answer is worse than none.
-        let discrete = Gpu {
-            name: "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]".to_owned(),
-            gfx_target: String::new(),
-            pci_id: "0000:03:00.0".to_owned(),
-            is_amd: true,
-            is_apu: Some(false),
-        };
-        let integrated = Gpu {
-            name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
-            gfx_target: "gfx1103".to_owned(),
-            pci_id: "0000:64:00.0".to_owned(),
-            is_amd: true,
-            is_apu: Some(true),
-        };
+    fn a_target_the_pci_scan_already_resolved_is_never_overwritten() {
+        // lspci resolves a target from the marketing name, which is a statement
+        // about that specific device. The node's answer is only a better one
+        // when there is nothing to compare it against.
         let mut e = Examination {
-            gpus: vec![discrete, integrated],
+            gpus: vec![Gpu {
+                name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
+                gfx_target: "gfx1103".to_owned(),
+                pci_id: "0000:64:00.0".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+            }],
             ..Examination::default()
         };
-
-        // Only the APU is a KFD GPU node here, so the topology does not account
-        // for both cards and must not speak for the one it cannot see.
-        fill_missing_gfx_targets(&mut e, 1, "gfx1103");
-        assert_eq!(
-            e.gpus[0].gfx_target, "",
-            "the discrete card must not inherit the APU's target"
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:64:00.0".to_owned(),
+                gfx_target: "gfx1150".to_owned(),
+            }],
         );
-        assert_eq!(e.gpus[1].gfx_target, "gfx1103");
+        assert_eq!(e.gpus[0].gfx_target, "gfx1103");
+    }
+
+    #[test]
+    fn a_kernel_that_exposes_no_gpu_leaves_the_pci_enumeration_standing() {
+        // A host whose `amdgpu` never bound: the topology is readable and
+        // describes nothing. "Your card is on the bus but the driver did not
+        // bind" is the most useful thing examine can say there, so the PCI
+        // list must survive for the driver probes to explain.
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(&mut e, &[]);
+        assert_eq!(
+            e.gpus.len(),
+            8,
+            "an empty topology must not empty the report"
+        );
+        assert!(e.notes.is_empty());
+    }
+
+    #[test]
+    fn the_membership_read_reconciles_a_planted_topology_end_to_end() {
+        // Everything above hands `apply_kernel_gpu_membership` a node list
+        // directly. This drives the real read as well -- sysfs bytes in, report
+        // out -- so the `location_id` decode and the reconcile are covered
+        // together rather than each assuming the other.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-kfd-membership-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let nodes = root.join("nodes");
+        std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
+        std::fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 56\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+        )
+        .expect("plant the CPU node properties");
+        // One GPU node, at the fourth accelerator on the bus: what the
+        // container sees when it is passed 0000:5d:00.0 out of the host's eight.
+        std::fs::create_dir_all(nodes.join("1")).expect("plant the GPU node");
+        std::fs::write(
+            nodes.join("1").join("properties"),
+            "simd_count 1216\ngfx_target_version 90402\nlocation_id 23808\ndomain 0\n",
+        )
+        .expect("plant the GPU node properties");
+
+        let read = crate::kfd_gpu_nodes_in(&nodes).expect("the planted topology must be readable");
+        std::fs::remove_dir_all(&root).ok();
+
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(&mut e, &read);
+        summarise_gpu_categories(&mut e);
+
+        assert_eq!(e.gpus.len(), 1, "the report lists what the kernel exposes");
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert!(e.has_amd_gpu);
+        assert!(e.has_discrete_amd);
     }
 
     #[test]
