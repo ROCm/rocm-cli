@@ -882,6 +882,313 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// Every `GPU preflight` step block in `text`, in file order.
+    fn gpu_preflight_steps(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut steps = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim_start().starts_with("- name: GPU preflight") {
+                continue;
+            }
+            let step_indent = indent_of(line);
+            let mut step = format!("{line}\n");
+            for body in &lines[i + 1..] {
+                if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                    break;
+                }
+                step.push_str(body);
+                step.push('\n');
+            }
+            steps.push(step);
+        }
+        steps
+    }
+
+    /// The POSIX-shell body a preflight step actually runs, dedented.
+    ///
+    /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
+    /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
+    /// to end yields `None` — driving those needs a PowerShell this test cannot
+    /// assume, so they are covered by the shape assertions instead.
+    fn preflight_shell_script(step: &str) -> Option<String> {
+        let lines: Vec<&str> = step.lines().collect();
+        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
+        let run_indent = indent_of(lines[run_at]);
+        let body: Vec<&str> = lines[run_at + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+            .copied()
+            .collect();
+        let body = match body
+            .iter()
+            .position(|l| l.trim_end().ends_with("-Script @'"))
+        {
+            Some(open) => {
+                let close = body.iter().position(|l| l.trim() == "'@")?;
+                body[open + 1..close].to_vec()
+            }
+            None if step.contains("shell: powershell") => return None,
+            None => body,
+        };
+        let pad = body
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| indent_of(l))
+            .min()?;
+        let dedented: Vec<&str> = body
+            .iter()
+            .map(|l| if l.len() > pad { &l[pad..] } else { l.trim() })
+            .collect();
+        Some(dedented.join("\n") + "\n")
+    }
+
+    /// Whether this preflight guards an APU lane (the 8 GiB floor) rather than a
+    /// discrete card (16 GiB).
+    fn is_apu_preflight(step: &str) -> bool {
+        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || step.contains("else { 8 }")
+    }
+
+    #[test]
+    fn every_apu_preflight_block_measures_the_gtt_pool() {
+        // A gfx1151 APU reports its BIOS carveout as VRAM total — 512 MiB on the
+        // hosts these lanes run on — while the engine allocates from GTT-backed
+        // system RAM. A floor applied to VRAM there can never be cleared, so the
+        // lane fails on every healthy host. Six blocks guard that hardware class
+        // and one was missed when the other five were converted; this is what
+        // makes the next copy-paste fail loudly rather than months later.
+        let mut checked = 0;
+        for (workflow, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text)
+                .iter()
+                .filter(|s| is_apu_preflight(s))
+            {
+                assert!(
+                    step.contains("showmeminfo vram gtt"),
+                    "{workflow}: an APU-class GPU preflight still queries VRAM only; on a \
+                     small-carveout gfx1151 host it can never clear its own floor"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 6,
+            "expected at least six APU-class preflight blocks, found {checked} — if a lane \
+             was removed update this floor, otherwise the extractor has stopped matching"
+        );
+    }
+
+    #[test]
+    fn apu_preflight_twins_do_not_drift() {
+        // The nightly lanes are copies of their per-PR twins. One was left on the
+        // pre-GTT script while the other five were converted and nothing failed,
+        // because every contract test here asserts step names, env keys and
+        // labels — never the script body.
+        let scripts = |name: &str| -> Vec<String> {
+            gpu_preflight_steps(&read_workflow(name))
+                .iter()
+                .filter(|s| is_apu_preflight(s))
+                .filter_map(|s| preflight_shell_script(s))
+                .collect()
+        };
+        let per_pr = scripts("e2e-selfhosted.yml");
+        let nightly = scripts("nightly.yml");
+        assert_eq!(
+            per_pr.len(),
+            2,
+            "expected a native and an advisory APU preflight in e2e-selfhosted.yml"
+        );
+        assert_eq!(per_pr.len(), nightly.len(), "APU preflight count differs");
+        for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "APU preflight script #{i} has drifted between e2e-selfhosted.yml and nightly.yml"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn smi_fixture(vram_total: u64, vram_used: u64, gtt: Option<(u64, u64)>) -> String {
+        use std::fmt::Write as _;
+
+        let mut s = String::from("===== ROCm System Management Interface =====\n");
+        let _ = writeln!(s, "GPU[0]\t\t: VRAM Total Memory (B): {vram_total}");
+        let _ = writeln!(s, "GPU[0]\t\t: VRAM Total Used Memory (B): {vram_used}");
+        if let Some((total, used)) = gtt {
+            let _ = writeln!(s, "GPU[0]\t\t: GTT Total Memory (B): {total}");
+            let _ = writeln!(s, "GPU[0]\t\t: GTT Total Used Memory (B): {used}");
+        }
+        s
+    }
+
+    /// A `rocm-smi` stub that answers each `--showmeminfo` shape the preflight
+    /// uses: both pools at once, GTT alone, VRAM alone. With `REJECT_COMBINED`
+    /// the two-pool form fails the way an older build does, which is the case
+    /// that must still reach GTT through the single-pool query.
+    #[cfg(unix)]
+    const SMI_STUB: &str = r#"#!/bin/sh
+case "$*" in
+  *vram*gtt*)
+    [ "${REJECT_COMBINED:-0}" = 1 ] && exit 1
+    cat "$FIXTURE" ;;
+  *gtt*) grep GTT "$FIXTURE" ;;
+  *)     grep -v GTT "$FIXTURE" ;;
+esac
+"#;
+
+    /// Run a preflight script against fixture `rocm-smi` output, returning its
+    /// exit code. `rocm-smi` is stubbed on `PATH`; nothing touches a real GPU.
+    #[cfg(unix)]
+    fn run_preflight(script: &str, fixture: &str, reject_combined: bool) -> i32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture_path = dir.path().join("smi.txt");
+        let script_path = dir.path().join("preflight.sh");
+        let stub = dir.path().join("rocm-smi");
+        std::fs::write(&fixture_path, fixture).expect("write fixture");
+        std::fs::write(&script_path, script).expect("write script");
+        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script_path)
+            .env("PATH", path)
+            .env("FIXTURE", &fixture_path)
+            .env("REJECT_COMBINED", if reject_combined { "1" } else { "0" })
+            // One poll, then the script's own 5s backoff ends the loop.
+            .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            .output()
+            .expect("running the preflight script")
+            .status
+            .code()
+            .expect("preflight exited with a status code")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apu_preflight_gates_on_the_pool_the_engine_uses() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        // The contract tests above cannot tell a working gate from a broken one:
+        // they all pass with the production logic reverted. This drives the real
+        // script against fixture tool output instead, which is what distinguishes
+        // "measures the right pool" from "passes whenever any pool looks free" —
+        // the zero-total row below failed before it was written.
+        if std::process::Command::new("timeout")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+
+        // (what the host reports, whether the two-pool query is rejected,
+        //  expected exit: native lane, advisory lane)
+        let cases: Vec<(&str, String, bool, i32, i32)> = vec![
+            (
+                "carveout with a free aperture",
+                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                false,
+                0,
+                0,
+            ),
+            // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
+            // single-pool fallback carries no GTT rows, so without a dedicated
+            // GTT query this healthy APU would fail as "no GTT pool" — the very
+            // false low-memory report this gate exists to stop producing.
+            (
+                "carveout where rocm-smi rejects the two-pool query",
+                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                true,
+                0,
+                0,
+            ),
+            (
+                "carveout with the aperture pinned by a leftover serve",
+                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB))),
+                false,
+                1,
+                1,
+            ),
+            (
+                "discrete card with VRAM free",
+                smi_fixture(192 * GIB, 10 * GIB, None),
+                false,
+                0,
+                0,
+            ),
+            (
+                "discrete card with VRAM held",
+                smi_fixture(192 * GIB, 191 * GIB, None),
+                false,
+                1,
+                1,
+            ),
+            // A wedged driver must not be read as "this is an APU" and waved
+            // through on whatever the other pool reports.
+            (
+                "zero VRAM total against a healthy aperture",
+                smi_fixture(0, 0, Some((62 * GIB, GIB))),
+                false,
+                1,
+                0,
+            ),
+            // Nothing measurable: the native lane fails, the advisory lane warns.
+            (
+                "carveout with no GTT pool reported",
+                smi_fixture(512 * MIB, 200 * MIB, None),
+                false,
+                1,
+                0,
+            ),
+        ];
+
+        let steps = gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"));
+        let native = steps
+            .iter()
+            .filter(|s| is_apu_preflight(s) && !s.contains("advisory"))
+            .find_map(|s| preflight_shell_script(s))
+            .expect("native APU preflight shell script");
+        let advisory = steps
+            .iter()
+            .filter(|s| s.contains("advisory"))
+            .find_map(|s| preflight_shell_script(s))
+            .expect("advisory APU preflight shell script");
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = cases
+                .iter()
+                .map(|(label, fixture, reject, want_native, want_advisory)| {
+                    let (native, advisory) = (&native, &advisory);
+                    scope.spawn(move || {
+                        (
+                            label,
+                            run_preflight(native, fixture, *reject),
+                            run_preflight(advisory, fixture, *reject),
+                            *want_native,
+                            *want_advisory,
+                        )
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (label, native, advisory, want_native, want_advisory) =
+                    handle.join().expect("preflight case thread");
+                assert_eq!(native, want_native, "native preflight, {label}");
+                assert_eq!(advisory, want_advisory, "advisory preflight, {label}");
+            }
+        });
+    }
+
     #[test]
     fn every_self_hosted_lane_pins_a_hardware_label() {
         // `e2e-gpu` and `e2e-gpu-nightly` shipped as `[self-hosted, linux,
