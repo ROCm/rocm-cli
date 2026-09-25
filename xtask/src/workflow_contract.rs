@@ -1473,4 +1473,185 @@ permissions:
         let block = "    env:\n      VALID: one\n      MALFORMED\n    steps:\n";
         let _ = job_mapping(block, "env");
     }
+
+    /// The E2E-owned roots declared in `scripts/reclaim-gpu.sh`.
+    ///
+    /// Parsed rather than duplicated: a copy here would drift the same way the
+    /// PowerShell mirrors can, which is the defect this test exists to prevent.
+    fn reclaim_script_roots() -> Vec<String> {
+        let p = repo_root().join("scripts/reclaim-gpu.sh");
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n");
+        let body = text
+            .split_once("E2E_ROOTS=(")
+            .unwrap_or_else(|| panic!("{} must declare E2E_ROOTS=(", p.display()))
+            .1
+            .split_once(')')
+            .unwrap_or_else(|| panic!("{} has an unterminated E2E_ROOTS array", p.display()))
+            .0;
+        let roots: Vec<String> = body
+            .lines()
+            .filter_map(|l| {
+                let l = strip_comment(l).trim();
+                l.strip_prefix('\'')
+                    .and_then(|l| l.strip_suffix('\''))
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            !roots.is_empty(),
+            "{} declared no E2E_ROOTS entries — the parser or the array shape changed",
+            p.display()
+        );
+        roots
+    }
+
+    /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
+    /// alternation on the `Where-Object` line.
+    ///
+    /// This cannot tell the reclaim's own matcher from any other
+    /// `Where-Object … -match` line. Each of these workflows has exactly one
+    /// today, so every alternation returned IS a reclaim matcher; add a second,
+    /// unrelated one and the caller's assertions would be applied to it too.
+    ///
+    /// Extracted rather than substring-matched against the whole file for the
+    /// reason this module's header gives: every root ALSO appears in these
+    /// workflows as an env var and in prose, so a `text.contains(root)` check
+    /// passes even when the alternation itself has lost that root. Confirmed by
+    /// mutation — deleting `e2e-prewarm` from the alternation left the
+    /// whole-file form of this test green.
+    fn powershell_reclaim_root_alternations(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("Where-Object") && l.contains("-match"))
+            .map(|l| {
+                let after = l.split_once("-match").expect("filtered on -match").1;
+                let body = after
+                    .split_once('\'')
+                    .unwrap_or_else(|| panic!("no opening quote in matcher line: {l}"))
+                    .1;
+                body.split_once('\'')
+                    .unwrap_or_else(|| panic!("unterminated matcher literal: {l}"))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// EAI-8751: native Windows has no bash, so the two PowerShell reclaim steps
+    /// restate the bash rule instead of sharing it. Nothing else in CI compares
+    /// the two, so a root added to the script — as `e2e-prewarm` was, to fix a
+    /// leak that held the card for 16 consecutive jobs — can silently miss the
+    /// Windows lanes.
+    ///
+    /// Only the ROOT half is pinned. The engine half is knowingly divergent on
+    /// Windows (EAI-8815), so asserting parity there would fail on a difference
+    /// that is recorded rather than accidental.
+    #[test]
+    fn reclaim_roots_are_mirrored_in_the_powershell_reclaims() {
+        let roots = reclaim_script_roots();
+        for workflow in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let text = read_workflow(workflow);
+            assert!(
+                text.contains("Get-CimInstance Win32_Process"),
+                "{workflow} must keep a PowerShell reclaim step (EAI-8751)"
+            );
+            let alternations = powershell_reclaim_root_alternations(&text);
+            assert!(
+                !alternations.is_empty(),
+                "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
+                 — the step's shape changed and this guard went blind (EAI-8751)"
+            );
+            // The scenario root is compared on its portable segment, and that
+            // asymmetry is deliberate rather than cosmetic.
+            //
+            // bash anchors it to an absolute path (`/tmp/rocm-e2e`, plus a
+            // TMPDIR-derived form appended at run time) because its roots are
+            // matched as unanchored substrings of a whole command line: the
+            // bare segment would also match an ARGUMENT naming it, and kill a
+            // hand-run serve the script promises to spare. The PowerShell
+            // mirrors carry the bare segment and so do have that exposure —
+            // pre-existing, and not something this test can fix by failing.
+            //
+            // That anchoring gap is NOT what EAI-8815 tracks. That ticket is
+            // scoped to the engine-marker divergence (`rocm.exe daemon`
+            // unmatched; `__engine-serve-http` sitting in the root alternation
+            // rather than the engine one), and closing it would leave the
+            // substring exposure untouched. The anchoring gap is untracked on
+            // the Windows side — said plainly here, so that closing EAI-8815
+            // cannot be misread as closing this as well.
+            //
+            // What it still pins is the part that matters here: that every root
+            // the script knows about is named in both mirrors, so a root added
+            // to one side cannot silently miss the Windows lanes.
+            let expected: Vec<&str> = roots
+                .iter()
+                .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
+                .collect();
+
+            // Pinned at one, which is what lets the exemption below be tracked
+            // per WORKFLOW rather than per alternation. Requiring EVERY
+            // alternation to name the exempted marker would fail spuriously the
+            // moment an unrelated `Where-Object … -match` line appeared — the
+            // case `powershell_reclaim_root_alternations` warns it cannot
+            // distinguish — but relaxing it to "some alternation" would stop
+            // catching a second matcher that copies every root and drops the
+            // marker. While there is exactly one, the two readings coincide;
+            // this assertion is what keeps that true, and fails loudly with
+            // something to decide if a second one is ever added.
+            assert_eq!(
+                alternations.len(),
+                1,
+                "{workflow} now has {} PowerShell reclaim matcher alternations; the \
+                 divergence-exemption check below assumes exactly one, and must be \
+                 re-read per alternation before this count changes (EAI-8751)",
+                alternations.len()
+            );
+            let mut divergence_seen = false;
+            for alternation in &alternations {
+                let present: Vec<&str> = alternation.split('|').collect();
+
+                // Script -> mirror: a root added to the script must reach Windows.
+                for needle in &expected {
+                    assert!(
+                        present.contains(needle),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` does not name \
+                         the E2E root `{needle}` declared in scripts/reclaim-gpu.sh (EAI-8751)"
+                    );
+                }
+
+                // Mirror -> script: and a root REMOVED from the script must not be
+                // left behind here. Without this direction the guard is one-way,
+                // which is how the lists drifted in the first place.
+                for token in &present {
+                    // Known divergence, not drift: `__engine-serve-http` is an
+                    // ENGINE marker that sits in this root alternation, so on
+                    // Windows it over-matches. Tracked in EAI-8815 — when that is
+                    // fixed, delete this arm and the assertion below will hold.
+                    if *token == "__engine-serve-http" {
+                        divergence_seen = true;
+                        continue;
+                    }
+                    assert!(
+                        expected.contains(token),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` names `{token}`, \
+                         which is not an E2E root in scripts/reclaim-gpu.sh — remove it here too, \
+                         or add it there (EAI-8751)"
+                    );
+                }
+            }
+
+            // An exemption nothing asserts is an exemption that rots: once
+            // EAI-8815 moves `__engine-serve-http` out of the root alternation,
+            // the arm above stops firing and would sit here forever as dead
+            // code exempting nothing. Fail instead, so the fix is told to
+            // finish the job.
+            assert!(
+                divergence_seen,
+                "no PowerShell reclaim matcher in {workflow} names `__engine-serve-http`, so the \
+                 EAI-8815 divergence looks fixed — delete the exemption arm in this test, which \
+                 is now dead code (EAI-8751)"
+            );
+        }
+    }
 }

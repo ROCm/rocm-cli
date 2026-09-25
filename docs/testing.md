@@ -791,6 +791,7 @@ cargo test -p rocm-core model_recipe_index_signature_accepts_generated_key_and_r
 cargo test -p rocm --bin rocm wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file
 python scripts/release_readiness.py --self-test
 bash scripts/setup-wsl-portable-build-deps.sh --self-test
+bash scripts/reclaim-gpu.sh --self-test
 ```
 
 The ROCDXG digest check pins the shell fragment the WSL driver plan generates
@@ -802,6 +803,21 @@ one, and an empty one. That step is the only thing authenticating a package
 that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
+
+`reclaim-gpu.sh` frees the GPU from engine processes a killed prior run leaked.
+The self-hosted Linux GPU lanes run it before their GPU preflight; the two
+native Windows lanes have no bash and restate the rule in PowerShell instead,
+with their root list pinned to the script's by an `xtask` contract test. The
+WSL lanes skip the proactive reclaim before preflight — they provision a fresh
+guest per job and unregister it afterwards, so no prior run's processes survive
+into them — but they still call the script for `--report-holders` when their
+preflight fails, as the other bash lanes do. The two native Windows lanes call
+it at neither point: their preflight failure path has no PowerShell equivalent
+of the diagnostic. Its `--self-test`
+needs no GPU — it spawns decoy processes and asserts which ones the matching
+rule selects — so it runs on the GitHub-hosted lane rather than only where GPU
+hardware is held, under the same `heavy` path filter as the other checks there
+(which any change under `scripts/` reaches).
 
 The release-readiness self-test is cross-platform and uses only workspace-local
 temporary files under `.rocm-work/tests/release-readiness`. It also checks exact

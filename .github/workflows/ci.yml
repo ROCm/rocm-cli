@@ -374,6 +374,22 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
 
+      # Runs here, on the GitHub-hosted lane, rather than on the GPU runners the
+      # reclaim protects: the matching rules are what regress, and they are
+      # provable against decoy processes with no GPU present.
+      - name: GPU reclaim self-test
+        if: needs.changes.outputs.heavy == 'true'
+        # Twice, because one of the rules is conditional on the environment.
+        # The scenario root follows TMPDIR, and the self-test can only assert
+        # the redirected form when the shell running it actually has one — a
+        # hosted runner does not, so a single plain run reports that arm as
+        # "not exercised" and the nightly Strix lane's redirect would be the
+        # first place a break showed up. The second run supplies the redirect.
+        run: |
+          bash scripts/reclaim-gpu.sh --self-test
+          mkdir -p "${RUNNER_TEMP}/redirected-tmp"
+          TMPDIR="${RUNNER_TEMP}/redirected-tmp" bash scripts/reclaim-gpu.sh --self-test
+
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
