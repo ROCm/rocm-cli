@@ -2813,17 +2813,6 @@ mod tests {
         assert_eq!(top.score, 100);
     }
 
-    /// Routing must stay defined for every framework the probe can report, and
-    /// must not claim targets it can never reach.
-    ///
-    /// The catalog docs previously advertised lemonade / ollama / lm-studio
-    /// routing that no probe could ever trigger; this pins the reachable set so
-    /// a re-added arm has to come with a probe that reaches it.
-    ///
-    /// The framework list below is **hand-maintained** to match what
-    /// `Examination::probe` sets in `examine.rs`. It is not derived from that
-    /// code, so adding a fifth framework there will not fail this test — see
-    /// the note on [`route_when_no_match`] for the three places to edit.
     /// The gate the rocm-doctor skill tells an agent to read, and the reason it
     /// is not "is `matched` empty?".
     ///
@@ -2891,6 +2880,19 @@ mod tests {
         );
     }
 
+    /// Routing must stay defined for every framework the probe can report, and
+    /// must not claim targets it can never reach.
+    ///
+    /// The catalog docs previously advertised lemonade / ollama / lm-studio
+    /// routing that no probe could ever trigger; this pins the reachable set so
+    /// a re-added arm has to come with a probe that reaches it.
+    ///
+    /// The list below is **hand-maintained**: its first four entries mirror what
+    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// probe never returns, kept so a re-added arm for one of them shows up.
+    /// Neither half is derived from that code, so adding a fifth framework to
+    /// the probe will not fail this test — see the note on
+    /// [`route_when_no_match`] for the three places to edit.
     #[test]
     fn routing_targets_cover_every_framework_the_probe_reports() {
         let mut targets = Vec::new();
