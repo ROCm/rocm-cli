@@ -48,9 +48,9 @@ use crate::{
     drop_orphaned_endpoint_key_on_already_running, engine_request,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported, gpu_vram_usage,
     parse_device_policy, parse_gpu_selection, print_managed_launch_plain, resolve_endpoint_auth,
-    resolve_engine_selection, run_attached_service, select_gpu_indices_under_launch_lock,
-    serve_gpu_low_memory_warning, start_managed_service, validate_bind_host,
-    validate_engine_selection_runtime, validate_pinned_gpu_index,
+    resolve_engine_selection, run_attached_service, scripted_managed_engine_startup_failure,
+    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, start_managed_service,
+    validate_bind_host, validate_engine_selection_runtime, validate_pinned_gpu_index,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -672,8 +672,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
     if !cpu_only
         && !scripted_backend_failure
+        && !scripted_managed_engine_startup_failure()
         && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
@@ -732,8 +736,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
