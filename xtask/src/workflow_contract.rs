@@ -1562,8 +1562,28 @@ permissions:
                 "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
                  — the step's shape changed and this guard went blind (EAI-8751)"
             );
-            // `/tmp/rocm-e2e` is POSIX-only; the mirrors match the `rocm-e2e`
-            // segment, the portable part of the same root.
+            // The scenario root is compared on its portable segment, and that
+            // asymmetry is deliberate rather than cosmetic.
+            //
+            // bash anchors it to an absolute path (`/tmp/rocm-e2e`, plus a
+            // TMPDIR-derived form appended at run time) because its roots are
+            // matched as unanchored substrings of a whole command line: the
+            // bare segment would also match an ARGUMENT naming it, and kill a
+            // hand-run serve the script promises to spare. The PowerShell
+            // mirrors carry the bare segment and so do have that exposure —
+            // pre-existing, and not something this test can fix by failing.
+            //
+            // That anchoring gap is NOT what EAI-8815 tracks. That ticket is
+            // scoped to the engine-marker divergence (`rocm.exe daemon`
+            // unmatched; `__engine-serve-http` sitting in the root alternation
+            // rather than the engine one), and closing it would leave the
+            // substring exposure untouched. The anchoring gap is untracked on
+            // the Windows side — said plainly here, so that closing EAI-8815
+            // cannot be misread as closing this as well.
+            //
+            // What it still pins is the part that matters here: that every root
+            // the script knows about is named in both mirrors, so a root added
+            // to one side cannot silently miss the Windows lanes.
             let expected: Vec<&str> = roots
                 .iter()
                 .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))

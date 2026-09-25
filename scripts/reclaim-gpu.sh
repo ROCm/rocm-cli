@@ -30,17 +30,59 @@
 set -euo pipefail
 
 # E2E-owned roots. A process must name one of these to be considered ours.
-#   /tmp/rocm-e2e   per-scenario temp dirs
+#   /tmp/rocm-e2e   per-scenario temp dirs (plus the TMPDIR-derived form below)
 #   e2e-shared      E2E_SHARED_CACHE_DIR (models, HF weights)
 #   e2e-prewarm     E2E_SHARED_RUNTIMES_DIR — the pre-warmed runtime tree the
 #                   engine binaries actually live in
 #   e2e-target      CARGO_TARGET_DIR for the suite's own binaries
+#
+# The scenario root stays ABSOLUTE, and follows TMPDIR.
+#
+# Scenario dirs come from `TempDir::with_prefix("rocm-e2e-")`, which builds on
+# `std::env::temp_dir()` and so follows TMPDIR; the nightly Strix lane redirects
+# it to `$HOME/actions-runner/tmp`. A bare `/tmp/rocm-e2e` kept matching there
+# only by accident — that directory is itself named `tmp`, so the substring
+# still appeared — and would silently stop matching under any redirect not
+# named `tmp`. Deriving the redirected form fixes that for ANY target.
+#
+# WHAT THE ANCHORING DOES AND DOES NOT BUY. Roots are matched as unanchored
+# substrings of the WHOLE command line, so any root also matches a process that
+# merely mentions it in an ARGUMENT. The bare segment `rocm-e2e` — what both
+# PowerShell mirrors use — makes that trivially reachable: a hand-run
+# `--hf-repo myorg/rocm-e2e-baseline-7b` on a shared runner is selected and
+# SIGKILLed. Measured, and briefly shipped, which is why it is spelled out.
+#
+# Anchoring the scenario root to an absolute path NARROWS that surface. It does
+# not close it, and the `/workload` promise below is correspondingly weaker than
+# it reads:
+#
+#   - under a redirected TMPDIR, an argument naming a sibling path still
+#     matches — `--extra-data-dir /tmp/mydir/rocm-e2e-notes` with
+#     TMPDIR=/tmp/mydir;
+#   - the three segment roots are NOT anchored at all, and "shared" and "target"
+#     are ordinary words. `--model-path /home/dev/e2e-shared-models/x.gguf` and
+#     `--served-model-name e2e-target-vs-baseline` are both selected today.
+#
+# Both predate this script and neither is fixed here; closing them properly
+# means matching on a path boundary rather than a substring, across the bash
+# rule and both mirrors together. Stated rather than implied, because an earlier
+# revision of this comment claimed these roots "name directories no argument
+# plausibly carries" — which is false, and is the same overclaim that made the
+# bare-segment change look safe.
 E2E_ROOTS=(
   '/tmp/rocm-e2e'
   'e2e-shared'
   'e2e-prewarm'
   'e2e-target'
 )
+# Appended rather than listed, because it is only known at run time. Skipped
+# when TMPDIR is unset or already /tmp, so the list stays exactly the pinned one
+# on every lane that does not redirect. A RELATIVE TMPDIR is skipped too: it
+# would append a relative root and quietly give up the anchoring above, and no
+# lane sets one.
+if [[ "${TMPDIR:-}" == /* && "${TMPDIR%/}" != "/tmp" ]]; then
+  E2E_ROOTS+=("${TMPDIR%/}/rocm-e2e")
+fi
 
 # Engine/serve processes that can hold VRAM. Matched anywhere in the command
 # line, so a wrapper or an absolute binary path both work.
@@ -87,33 +129,45 @@ process_alive() {
 # Fails when the process is gone or its command line is empty (a kernel thread,
 # or a zombie whose argv has already been released).
 #
-# TAB and NEWLINE are flattened along with the NUL separators, because they are
-# the record delimiters `select_leaked` emits and `reclaim` reads back. Only the
-# NUL is a separator the kernel inserted; a tab or newline INSIDE an argv element
-# is content, and `--chat-template` or `--prompt` can carry either. Left intact,
-# one such process emits a record that splits into two on the way back: the real
-# pid arrives carrying a truncated command line, fails the identity check against
-# its own full one, and is reported "recycled ... not signalling" — so the leak
-# survives both TERM and KILL while the summary prints "0 process(es) terminated".
-# That is the silent miss this whole script exists to end, so it is fixed at the
-# single point every consumer already reads through rather than at each of them.
+# NEWLINE is flattened along with the NUL separators the kernel inserted,
+# because it is the record terminator `select_leaked` emits and `reclaim` reads
+# back. A newline INSIDE an argv element is content, not a separator, and
+# `--chat-template` or `--prompt` can carry one. Left intact, such a process
+# emits a record that splits into two on the way back: the real pid arrives
+# carrying a truncated command line, fails the identity check against its own
+# full one, and is reported "recycled ... not signalling" — so the leak survives
+# both TERM and KILL while the summary prints "0 process(es) terminated". That is
+# the silent miss this whole script exists to end, so it is fixed at the single
+# point every consumer already reads through rather than at each of them.
 #
-# Matching is unaffected: no root or marker contains either byte. The identity
-# comparison in same_selected_process does get marginally coarser — two command
-# lines differing ONLY in which of these bytes sits at a given position now read
-# as equal, where before they differed. Both sides come through here, so they
-# are flattened alike; the cost is that a recycled pid whose new process differs
-# from the old one by nothing but delimiter bytes would be taken for the same
-# process. Against the silent miss above, which is reachable by any engine
-# invocation carrying a template or a prompt, that is the trade worth making —
-# but it is a trade, not a free win.
+# The TAB is deliberately NOT flattened, though it is the field separator. It
+# does not need to be, measured rather than reasoned:
+#
+#   record   "<pid>\t/path/llama-server --tmpl a\tb "
+#   read -r pid cmdline  ->  pid=[<pid>]  cmdline=[/path/llama-server --tmpl a\tb ]
+#
+# `read` gives leftover words AND their intervening separators to the LAST name,
+# so an embedded tab lands in `cmdline` verbatim; and only TRAILING separators
+# are stripped, which a tab can never be, because flattening the final NUL always
+# leaves the string ending in a space. An earlier revision of this comment
+# claimed the tab "shifts the field boundary" and flattened it too — that claim
+# was false, and deleting the tab from the flattening set failed no check in this
+# file. Flattening it anyway would have coarsened the identity comparison below
+# for nothing.
+#
+# Matching is unaffected either way: no root or marker contains a newline. The
+# identity comparison in same_selected_process is coarsened only for the newline
+# — two command lines differing ONLY in a newline-versus-space at one position
+# now read as equal. Both sides come through here, so they are flattened alike.
+# That is a real cost, weighed against a silent miss any engine invocation
+# carrying a prompt can reach.
 #
 # Redirect stderr BEFORE the input redirection: the shell applies them left to
 # right, so `<file 2>/dev/null` still lets the shell's own "No such file" reach
 # the terminal when the open fails.
 cmdline_of() {
   local cmdline
-  cmdline="$(tr '\0\n\t' '   ' 2>/dev/null <"/proc/${1}/cmdline")" || return 1
+  cmdline="$(tr '\0\n' '  ' 2>/dev/null <"/proc/${1}/cmdline")" || return 1
   [[ -n "${cmdline}" ]] || return 1
   printf '%s' "${cmdline}"
 }
@@ -424,6 +478,13 @@ assert_rule_covers_every_list_entry() {
   local root engine
   local expected_roots=('/tmp/rocm-e2e' 'e2e-shared' 'e2e-prewarm' 'e2e-target')
   local expected_markers=('llama-server' 'vllm' '__engine-serve-http' 'rocm daemon')
+  # The TMPDIR-derived scenario root is appended at load time, so the pinned
+  # list is the STATIC one plus that entry when it applies. Computed the same
+  # way the script does rather than assumed absent: this function also runs on a
+  # developer machine, and macOS sets TMPDIR for every shell.
+  if [[ "${TMPDIR:-}" == /* && "${TMPDIR%/}" != "/tmp" ]]; then
+    expected_roots+=("${TMPDIR%/}/rocm-e2e")
+  fi
 
   if [[ "$(printf '%s\n' "${E2E_ROOTS[@]}")" != "$(printf '%s\n' "${expected_roots[@]}")" ]]; then
     echo "FAIL: E2E_ROOTS changed — update this expectation AND both PowerShell mirrors"
@@ -459,6 +520,39 @@ assert_rule_covers_every_list_entry() {
       failures=$((failures + 1))
     fi
   done
+
+  # The scenario root must stay ANCHORED to an absolute path. These are argument
+  # strings, not paths: a hand-run serve on a shared runner that merely NAMES an
+  # E2E-suite baseline. A bare `rocm-e2e` root matches both and SIGKILLs them.
+  # The `/workload` fixtures above cannot catch it — they carry no arguments at
+  # all, so they stay green against exactly this mistake. It was made, and this
+  # is what would have caught it.
+  #
+  # This pins the scenario root ONLY. The header explains why that is a
+  # narrowing rather than a fix: the three segment roots stay unanchored, so
+  # `--model-path /home/dev/e2e-shared-models/x.gguf` is still selected. No
+  # assertion here claims otherwise, deliberately — a green run means the
+  # scenario root did not regress, not that a manual serve is safe.
+  for root in '--hf-repo myorg/rocm-e2e-baseline-7b' '--model-alias my-rocm-e2e-comparison'; do
+    if cmdline_matches_rule "/workload/manual/llama-server ${root}"; then
+      echo "FAIL: a manual serve was selected for merely NAMING '${root}'; the scenario root is not anchored"
+      failures=$((failures + 1))
+    fi
+  done
+
+  # The other half of the same decision: anchoring must not cost the redirect.
+  # Only assertable when this shell actually has a redirected TMPDIR, so it says
+  # which case ran rather than reporting a pass for a branch it skipped.
+  if [[ "${TMPDIR:-}" == /* && "${TMPDIR%/}" != "/tmp" ]]; then
+    if cmdline_matches_rule "${TMPDIR%/}/rocm-e2e-ab12/bin/llama-server --model m"; then
+      echo "ok: a scenario tree under the redirected TMPDIR is selected"
+    else
+      echo "FAIL: TMPDIR is redirected but a scenario tree under it is not selected"
+      failures=$((failures + 1))
+    fi
+  else
+    echo "note: no absolute TMPDIR redirect in this shell, so that arm was not exercised"
+  fi
 
   if [[ "${failures}" -eq 0 ]]; then
     echo "ok: every E2E root and every engine marker is individually enforced"
@@ -589,28 +683,38 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  # 3. The record format survives a command line containing the delimiters.
+  # 3. The record format survives a command line containing BOTH delimiter bytes.
   #
   #    select_leaked emits "pid<TAB>cmdline<NEWLINE>" and reclaim reads it back
-  #    with `IFS=$'\t' read -r`. A tab or newline inside an argv element is
-  #    content, not a separator — `--chat-template` and `--prompt` carry both —
-  #    and unless cmdline_of flattens them one record splits into two on the way
-  #    back. The genuine pid then arrives with a TRUNCATED command line, fails
-  #    the identity check against its own full one, and is passed over as
-  #    "recycled": the leak survives TERM and KILL alike while the run signs off
-  #    with "0 process(es) terminated". A silent miss is the one outcome this
-  #    script exists to prevent, so the format is asserted rather than assumed.
+  #    with `IFS=$'\t' read -r`. The two bytes are not symmetric, and this check
+  #    is the only place that says so:
+  #
+  #    - a NEWLINE in an argv element splits one record into two. The genuine pid
+  #      then arrives with a TRUNCATED command line, fails the identity check
+  #      against its own full one, and is passed over as "recycled": the leak
+  #      survives TERM and KILL alike while the run signs off with "0 process(es)
+  #      terminated". cmdline_of flattens it for that reason, and deleting that
+  #      flattening fails this check.
+  #    - a TAB does NOT, even though it is the field separator, because `read`
+  #      hands leftover separators to the last name and the trailing space left
+  #      by the final NUL keeps a tab from ever being stripped as a trailing one.
+  #      cmdline_of deliberately leaves it alone; see the reasoning there.
+  #
+  #    The tab fixture therefore guards the FORMAT, not the flattening: it is
+  #    what fails if the record shape is ever changed to something a tab can
+  #    break. Asserting it as though it pinned a flattening step would be a claim
+  #    of coverage that no mutation can falsify, which is how this check read
+  #    before — it announced the tab as individually asserted while deleting the
+  #    tab from the flattening set left every check green.
   #
   #    Placed HERE, ahead of containment, deliberately. A split record also
   #    trips check 7's escape loop — its continuation line names no scratch
   #    tree — which arms the gate and returns before checks 8-11 ever run. The
   #    run is red either way; what this adds is the true cause, printed before
   #    the one check 7 would otherwise report in its place.
-  # Read RAW, flattening only the kernel's NUL separators: cmdline_of now
-  # flattens the delimiters too, so asking it would report the fixture is fine
-  # no matter what the decoy was actually given. Both bytes are asserted
-  # individually, because either one alone breaks the format differently — the
-  # newline splits the record, the tab shifts the field boundary.
+  # Read RAW, flattening only the kernel's NUL separators: cmdline_of flattens
+  # the newline, so asking it would report the fixture carries one no matter what
+  # the decoy was actually given.
   # Counted apart from the record loop below, for the same reason check 7 keeps
   # its empty-selection count separate: these say the FIXTURE is unusable, the
   # loop says the FORMAT is broken, and the "ok:" line must not be able to
@@ -637,7 +741,7 @@ self_test() {
     case "${delimiter_raw}" in
       *$'\t'*) ;;
       *)
-        echo "FAIL: delimiter decoy's command line carries no tab; the record-format check is vacuous"
+        echo "FAIL: delimiter decoy's command line carries no tab; the record format is no longer exercised against one"
         fixture_failures=$((fixture_failures + 1))
         ;;
     esac
@@ -942,12 +1046,29 @@ self_test() {
 }
 
 main() {
+  local scenario_tmp
   case "${1:-}" in
     '')
       reclaim 0
       # Scenario temp dirs are recreated per run; clearing them keeps a wedged
       # runner's disk from filling with dead scenario state.
-      rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
+      #
+      # TMPDIR as well as /tmp, because the suite creates these through
+      # `std::env::temp_dir()` and the nightly Strix lane redirects TMPDIR to
+      # the runner's home. A bare `/tmp` glob removed nothing at all there, so
+      # the guard was dead on the one lane that redirects. Both are listed
+      # rather than just TMPDIR: the lanes that do not set it still want /tmp,
+      # and a stale tree from before a redirect was added would outlive it.
+      #
+      # The absolute-path test is the SAME one the roots above apply, and it
+      # matters most here: this is the only consumer that deletes rather than
+      # merely failing to match. Interpolated raw, a relative TMPDIR makes this
+      # `rm -rf relative/dir/rocm-e2e-*` resolved against the CWD — the repo
+      # checkout, on a CI runner. No lane sets one, which is a reason to skip
+      # the value, not a reason to hand it to `rm -rf` unchecked.
+      scenario_tmp="${TMPDIR:-}"
+      [[ "${scenario_tmp}" == /* ]] || scenario_tmp='/tmp'
+      rm -rf "${scenario_tmp%/}"/rocm-e2e-* /tmp/rocm-e2e-* 2>/dev/null || true
       ;;
     --dry-run) reclaim 1 ;;
     --report-holders) report_holders ;;
