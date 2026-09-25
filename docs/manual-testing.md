@@ -71,9 +71,8 @@ Expected result:
 - The setup shows a recommended ROCm folder.
 - The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
   can see that pip downloads stay inside the chosen ROCm folder.
-- The install-folder row opens an interactive folder picker. Arrow keys and the
-  mouse can choose folders; Enter opens or selects; Esc returns without losing
-  the current setup screen.
+- On the Install ROCm SDK step, `Tab` opens a folder picker to choose the
+  install location; leaving it unset uses the default managed folder.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
 - Install logs show only in the foreground progress card, with PageUp/PageDown

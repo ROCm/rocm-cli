@@ -378,14 +378,20 @@ fn field_line<'a>(
     theme: &Theme,
 ) -> Line<'a> {
     let (label, value): (&str, String) = match field {
-        Field::Channel => ("Channel", display(&i.channel, "(e.g. release)")),
+        Field::Channel => (
+            "Channel",
+            crate::ui::format::display_or_placeholder(&i.channel, "(e.g. release)"),
+        ),
         Field::Format => (
             "Format",
             FORMATS[i.format_idx.min(FORMATS.len() - 1)].to_string(),
         ),
         Field::Prefix => (
             "Folder",
-            display(&i.prefix, "(default managed folder · Tab to browse)"),
+            crate::ui::format::display_or_placeholder(
+                &i.prefix,
+                "(default managed folder · Tab to browse)",
+            ),
         ),
         Field::DryRun => (
             "Mode",
@@ -433,14 +439,6 @@ fn field_line<'a>(
         Span::styled(format!("{label:<8}"), label_style),
         Span::styled(value, value_style),
     ])
-}
-
-fn display(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
-        placeholder.to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 #[cfg(test)]

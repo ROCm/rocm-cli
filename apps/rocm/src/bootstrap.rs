@@ -17,13 +17,27 @@ pub(crate) fn run(command: Option<BootstrapCommand>) -> Result<()> {
     }
 }
 
+/// Shown when `rocm bootstrap setup` runs without an interactive terminal —
+/// must keep advertising the install-folder choice the onboarding wizard
+/// offers (see the dash-tui onboarding Configure step).
+const NON_INTERACTIVE_MESSAGE: &str = "ROCm setup needs an interactive terminal. Run `rocm bootstrap setup` from a terminal to choose an install folder and set up ROCm/TheRock.";
+
 fn run_setup() -> Result<()> {
     if interactive_terminal() {
         crate::dash::run_bootstrap()
     } else {
-        println!(
-            "ROCm setup needs an interactive terminal. Run `rocm bootstrap setup` from a terminal to set up ROCm/TheRock."
-        );
+        println!("{NON_INTERACTIVE_MESSAGE}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NON_INTERACTIVE_MESSAGE;
+
+    #[test]
+    fn non_interactive_message_advertises_the_install_folder_choice() {
+        assert!(NON_INTERACTIVE_MESSAGE.contains("choose an install folder"));
+        assert!(NON_INTERACTIVE_MESSAGE.contains("rocm bootstrap setup"));
     }
 }
