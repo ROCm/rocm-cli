@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+pub mod blocking_stdio;
 pub mod capability;
 pub mod expectation;
 pub mod http_server;
