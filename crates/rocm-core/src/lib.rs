@@ -42,10 +42,12 @@ pub use diagnose::{
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
-    mount_for_path, on_same_filesystem, warn_if_low_space, with_margin,
+    mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
 use examine::extract_rocm_version;
-pub use examine::{Examination, FrameworkProbe, WSL_ROUTE_OUT_NOTE, gfx_is_apu_family};
+pub use examine::{
+    Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
+};
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
@@ -53,17 +55,18 @@ pub use proc_lifecycle::{
 };
 use runtime::env_path_override;
 pub use runtime::{
-    RuntimeHost, RuntimePlatform, current_executable_path, default_cache_dir, default_config_dir,
-    default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
-    managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
-    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
-    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
-    normalize_runtime_path_text_for_storage, platform_binary_name, prepend_runtime_path,
-    resolve_path_through_symlinks, runtime_directory_label, runtime_drive_root_for_key,
-    runtime_drive_roots, runtime_exe_suffix, runtime_home_dir, runtime_install_root_is_protected,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, runtime_path_for_child,
-    runtime_path_for_windows_child, runtime_path_is_same_or_inside, runtime_path_list_join,
-    runtime_path_list_split, runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
+    RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,
+    default_cache_dir, default_config_dir, default_data_dir, default_interactive_shell_program,
+    managed_logs_dir, managed_pip_cache_dir, managed_runtime_cache_dir, managed_runtime_data_root,
+    managed_tools_dir, managed_uv_cache_dir, normalize_runtime_path_for_host,
+    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
+    normalize_runtime_path_text_for_platform, normalize_runtime_path_text_for_storage,
+    platform_binary_name, prepend_runtime_path, resolve_path_through_symlinks,
+    runtime_directory_label, runtime_drive_root_for_key, runtime_drive_roots, runtime_exe_suffix,
+    runtime_home_dir, runtime_install_root_is_protected, runtime_is_linux, runtime_is_windows,
+    runtime_os_name, runtime_path_for_child, runtime_path_for_windows_child,
+    runtime_path_is_same_or_inside, runtime_path_list_join, runtime_path_list_split,
+    runtime_path_sort_key, runtime_path_text_is_absolute_for_host,
     runtime_path_text_is_absolute_for_platform, runtime_paths_equivalent,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
@@ -1494,6 +1497,62 @@ pub fn process_is_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// An advisory, cross-process exclusive lock backed by a lock file.
+///
+/// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
+/// holds between *separate `rocm` processes*, not just threads: each caller opens
+/// the same lock-file path and only one can hold the lock at a time. It exists to
+/// serialize check-then-act sequences over shared on-disk state — the daemon
+/// autostart decision and the managed-serve GPU select-then-claim — so two
+/// concurrent invocations cannot both pass the same TOCTOU check.
+///
+/// The lock is released when the guard is dropped, and by the OS if the process
+/// exits while holding it (so a crashed holder never wedges the next caller).
+#[derive(Debug)]
+pub struct FileLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Acquire an exclusive lock on `path`, creating the lock file and any
+    /// missing parent directories first. Blocks until the lock is available.
+    ///
+    /// The lock file itself carries no data; it is a rendezvous point, so an
+    /// existing file is reused (never truncated) and its contents are ignored.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
+        Ok(Self { file, path })
+    }
+
+    /// The lock file backing this guard.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Best-effort: an unlock failure only means the OS releases it slightly
+        // later (at the latest when the file handle closes), never a lost lock.
+        let _ = self.file.unlock();
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // libc FFI (pre_exec/setsid)
 pub fn detach_command_session(command: &mut Command) {
@@ -1775,6 +1834,14 @@ impl AppPaths {
         self.data_dir.join("services")
     }
 
+    /// Lock file serializing the managed-serve GPU select-then-claim sequence, so
+    /// two concurrent `rocm serve` invocations cannot read the same free GPU and
+    /// both launch on it. Held from auto-selection through the claiming service
+    /// record write (see [`FileLock`]).
+    pub fn managed_launch_lock_path(&self) -> PathBuf {
+        self.services_dir().join("launch.lock")
+    }
+
     pub fn audit_dir(&self) -> PathBuf {
         self.data_dir.join("audit")
     }
@@ -1789,6 +1856,22 @@ impl AppPaths {
 
     pub fn automation_state_path(&self) -> PathBuf {
         self.automations_dir().join("runtime-state.json")
+    }
+
+    /// Lock file serializing the daemon autostart check-then-spawn, so two
+    /// concurrent callers cannot both observe "not running" and each spawn a
+    /// background automation daemon (see [`FileLock`]).
+    pub fn automation_autostart_lock_path(&self) -> PathBuf {
+        self.automations_dir().join("autostart.lock")
+    }
+
+    /// Short-lived claim written by the autostart holder right after it spawns
+    /// the daemon, recording the child PID and spawn time. It bridges the gap
+    /// between `spawn()` and the child publishing its runtime state: a concurrent
+    /// caller that acquires the autostart lock in that window sees the claim and
+    /// defers instead of spawning a duplicate daemon.
+    pub fn automation_autostart_claim_path(&self) -> PathBuf {
+        self.automations_dir().join("autostart.claim")
     }
 
     pub fn automation_events_path(&self) -> PathBuf {
@@ -2418,23 +2501,101 @@ fn normalize_cpu_model(value: &str) -> String {
 /// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
 /// matrix by reading one of them.
 ///
-/// This is the union of every signal any of them used: a false positive costs a
-/// route-out note, a false negative runs bare-metal driver checks against a
-/// platform that has no amdgpu module and reports nonsense.
+/// `/dev/dxg` is trusted on its own, and so is the kernel's own build string in
+/// `/proc/version` — nothing else stamps a kernel `-microsoft-standard-WSL2` or
+/// `-Microsoft`. `$WSL_DISTRO_NAME` is not trusted at all: it is an ordinary
+/// environment variable that can survive into a shell that merely inherited it
+/// (over `ssh`, in a `systemd` unit, under `sudo` without `-E`, under `env -i` or
+/// cron) without corroborating anything. See [`wsl_signals_indicate_wsl`] for why
+/// a false positive is no longer cheap.
 #[must_use]
 pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
             Path::new("/dev/dxg").exists(),
-            std::env::var_os("WSL_DISTRO_NAME").is_some(),
             &fs::read_to_string("/proc/version").unwrap_or_default(),
         )
 }
 
+/// Whether the host runs WSL 1 rather than WSL 2.
+///
+/// WSL 1 translates syscalls instead of running a real kernel, so it has no
+/// `/dev/dxg` and no GPU path at all. Without this the catalog would tell a WSL 1
+/// user to update a Windows driver that could never help them.
+///
+/// WSL 1 reports a kernel ending in `-Microsoft`, as in `4.4.0-19041-Microsoft`.
+/// WSL 2 builds all carry `microsoft-standard`, with the `-WSL2` suffix added
+/// later — `4.19.104-microsoft-standard` was the original and has no `WSL2` in
+/// it at all.
+///
+/// So the test is the `standard` marker and the trailing position, not the
+/// absence of `WSL2`. Keying on `WSL2` alone called every early WSL 2 kernel
+/// "WSL 1", which is the asymmetric error [`crate::examine::WslFacts::version`]
+/// documents as the one to avoid: it tells the user to convert a distribution
+/// that is already converted, at high confidence, while suppressing every other
+/// check. Anything unrecognised is read as WSL 2 for the same reason.
+#[must_use]
+pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
+    let kernel = kernel_release.trim().to_ascii_lowercase();
+    kernel.ends_with("-microsoft") && !kernel.contains("standard")
+}
+
+/// The dynamic linker cache, or `None` when `ldconfig` could not be run.
+///
+/// `ldconfig` lives in `/sbin`, which is not on a non-root user's `PATH` on
+/// Debian and derivatives. Looking it up by bare name there yields nothing, and
+/// an empty cache is indistinguishable from a cache that does not list the
+/// library — so a correctly installed ROCDXG read as "not registered with the
+/// linker" and the catalog told the user to run `ldconfig` on a working install.
+///
+/// Search the conventional locations, and report "could not ask" as `None`
+/// rather than as an empty answer.
+fn ldconfig_cache() -> Option<String> {
+    for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
+        if let Some(text) = capture_optional_command(program, &["-p"]) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether the linker cache lists ROCDXG, or `None` if it could not be read.
+pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
+    ldconfig_cache().map(|text| text.contains("librocdxg.so"))
+}
+
+/// Whether `relative` exists under any ROCm install on this host.
+///
+/// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
+/// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
+/// package that was in fact installed. Ask the same resolver the rest of the CLI
+/// uses, and keep the conventional root as a fallback for the case where
+/// discovery finds nothing.
+fn rocm_relative_file_exists(relative: &str) -> bool {
+    if Path::new("/opt/rocm").join(relative).exists() {
+        return true;
+    }
+    discover_rocm_installs()
+        .iter()
+        .any(|install| install.path.join(relative).exists())
+}
+
 /// The predicate itself, separated from reading the machine so the union can be
 /// tested — including the two cases that used to split the old implementations.
-fn wsl_signals_indicate_wsl(dxg_device: bool, distro_name_set: bool, proc_version: &str) -> bool {
-    if dxg_device || distro_name_set {
+///
+/// `/dev/dxg` alone is trusted outright — nothing but WSLg's GPU passthrough
+/// creates that device node. The kernel's own build string in `/proc/version` is
+/// also trusted alone: only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+/// `-Microsoft`, and that string cannot be inherited, forwarded, or left behind
+/// by an unrelated shell the way `$WSL_DISTRO_NAME` can. `$WSL_DISTRO_NAME` plays
+/// no part here at all — an ordinary bare-metal host that merely inherited it
+/// (over `ssh`, from a parent shell, under `sudo` without `-E`) has no
+/// `/proc/version` match to go with it, so it still reads as Linux. A false
+/// positive the other way no longer costs only a route-out note — this catalog
+/// now runs the WSL diagnosis and fix set directly, so a bare-metal host
+/// misread as WSL would have its entire bare-metal catalog silently disabled.
+fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
+    if dxg_device {
         return true;
     }
     let proc_version = proc_version.to_ascii_lowercase();
@@ -2450,10 +2611,12 @@ fn detect_wsl_summary() -> Option<WslSummary> {
     let is_wsl = true;
 
     let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
-    let librocdxg = Path::new("/opt/rocm/lib/librocdxg.so").exists();
-    let rocdxg_dids = Path::new("/opt/rocm/share/rocdxg/dids.conf").exists();
-    let ldconfig_text = capture_optional_command("ldconfig", &["-p"]).unwrap_or_default();
-    let ldconfig_librocdxg = ldconfig_text.contains("librocdxg.so");
+    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let ldconfig_text = ldconfig_cache();
+    let ldconfig_librocdxg = ldconfig_text
+        .as_deref()
+        .is_some_and(|text| text.contains("librocdxg.so"));
     let rocminfo = tool_on_path("rocminfo");
     let cargo = tool_on_path("cargo");
     let mut missing = Vec::new();
@@ -2464,7 +2627,9 @@ fn detect_wsl_summary() -> Option<WslSummary> {
         missing.push("/usr/lib/wsl/lib/libdxcore.so");
     }
     if !librocdxg {
-        missing.push("/opt/rocm/lib/librocdxg.so");
+        // Named without a directory: the file is looked up across every ROCm
+        // install, so quoting one root would misreport where it was not found.
+        missing.push("librocdxg.so");
     }
     if !ldconfig_librocdxg {
         missing.push("ldconfig:librocdxg.so");
@@ -2542,6 +2707,52 @@ fn detect_driver_summary() -> DriverSummary {
         status: "unsupported_platform".to_owned(),
         detail: None,
     }
+}
+
+/// The amdgpu kernel module's version on Linux, if it reports one.
+///
+/// Prefers the sysfs attribute (a plain file read, no subprocess) that DKMS
+/// builds of amdgpu expose. Falls back to `modinfo`, which is the only source
+/// for the in-tree kernel module -- it doesn't populate
+/// `/sys/module/amdgpu/version` at all.
+fn detect_linux_amdgpu_driver_version() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+        let version = text.trim();
+        if !version.is_empty() {
+            return Some(version.to_owned());
+        }
+    }
+    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    if rc != 0 {
+        return None;
+    }
+    out.lines()
+        .find_map(|line| line.strip_prefix("version:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPU driver version for this machine.
+///
+/// Sourced however the current platform exposes it: the amdgpu kernel module
+/// on Linux, the AMD display driver on Windows, or -- inside WSL -- the
+/// Windows host's display driver, since that's the driver a WSL guest's GPU
+/// workloads actually depend on, not its own (driver-less) amdgpu module.
+pub fn detect_gpu_driver_version() -> Option<String> {
+    if is_wsl_host() {
+        return match detect_wsl_host_driver() {
+            WslHostDriverProbe::Version(version) => Some(version),
+            WslHostDriverProbe::Unreachable | WslHostDriverProbe::NoAmdDisplay => None,
+        };
+    }
+    if runtime_is_windows() {
+        return detect_windows_amd_display_driver();
+    }
+    if runtime_is_linux() {
+        return detect_linux_amdgpu_driver_version();
+    }
+    None
 }
 
 impl WslSummary {
@@ -2792,7 +3003,7 @@ fn rocm_version_sort_key(version: &str) -> Vec<u32> {
         .collect()
 }
 
-fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
+pub fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
     // One resolver on both platforms, so the human report, the JSON probe and
     // the fix-6 runner cannot disagree about which installs exist or which one
     // is active. `discover_rocm_installs` picks the search roots and layout for
@@ -2821,6 +3032,18 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         detail,
         version,
     }
+}
+
+/// The best unmanaged ("legacy") ROCm install on this host, if any.
+///
+/// [`detect_legacy_rocm_summary`] resolves the same thing but as part of the
+/// full [`ExamineSummary`] probe; this is the standalone version+path for a
+/// caller like `rocm version` that wants just the SDK identity as a fallback
+/// once it's already established no managed TheRock runtime is active.
+pub fn detect_legacy_rocm_sdk() -> Option<(String, PathBuf)> {
+    let install = discover_rocm_installs().into_iter().next()?;
+    let version = install.version?;
+    Some((version, install.path))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // ROCm installs the runtime DLL as lowercase `amdhip64.dll`
@@ -3142,7 +3365,7 @@ pub fn detect_host_gpu_diagnostics() -> String {
                 .as_deref()
                 .unwrap_or("<not found>")
         );
-        if is_wsl_environment_fast() {
+        if is_wsl_host() {
             let wsl_probe = detect_wsl_windows_display_probe_text().unwrap_or_default();
             let _ = writeln!(
                 output,
@@ -3429,10 +3652,6 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn detect_host_therock_family() -> Option<String> {
-    detect_host_gfx_target().and_then(|target| normalize_therock_family(&target))
-}
-
 pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
 }
@@ -3612,6 +3831,79 @@ pub fn active_managed_therock_channel(
     config: &RocmCliConfig,
 ) -> Result<Option<String>> {
     Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.channel))
+}
+
+/// The interpreter a framework probe should run, plus the loader path its torch
+/// needs.
+///
+/// The library paths are not decoration. A TheRock runtime's torch resolves HIP
+/// from a sibling `_rocm_sdk_core` package rather than from its own `torch/lib`,
+/// so running the interpreter without them fails the import outright with
+/// `libroctx64.so.4: cannot open shared object file`. That reads as a broken
+/// runtime rather than as an unconfigured probe, which is a worse answer than
+/// the silence it would replace.
+#[derive(Debug, Clone)]
+pub struct FrameworkInterpreter {
+    pub python: PathBuf,
+    pub library_paths: Vec<PathBuf>,
+}
+
+/// The active managed runtime's Python interpreter, when there is one.
+///
+/// `None` on an unmanaged host, and also when the runtime records an interpreter
+/// that is no longer on disk — a caller that cannot spawn the interpreter is
+/// better served by the ambient one than by a path that fails to execute.
+///
+/// Not the only "which runtime is active" selector on this path. `rocm examine`'s
+/// *human* report resolves the runtime through `current_runtime_manifest`, which
+/// wants an active key or exactly one matching `default_runtime_id`, whereas the
+/// record chosen here falls back to the most recently installed one. With no
+/// active key set the two can disagree, so `examine --json` can report a
+/// framework read from a runtime the human form calls
+/// `active_runtime_status: unset`. The divergence predates this function; it is
+/// recorded because reading the framework through the runtime is what first made
+/// it observable.
+pub fn active_managed_framework_interpreter(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Option<FrameworkInterpreter> {
+    let record = select_active_managed_therock_record(paths, config)?;
+    let python = managed_therock_python_executable(&record)?;
+    Some(FrameworkInterpreter {
+        python,
+        library_paths: managed_therock_environment_from_record(&record).library_entries,
+    })
+}
+
+/// Prefer the interpreter the installer recorded over the conventional location
+/// inside the install root: an imported or read-only runtime can record an
+/// interpreter that does not sit under `install_root` at all.
+fn managed_therock_python_executable(record: &TheRockFamilyManifest) -> Option<PathBuf> {
+    record
+        .python_executable
+        .as_deref()
+        // Registry paths are used verbatim as stored, so this one still needs
+        // host-normalizing; the derived form below is normalized already.
+        .map(normalize_runtime_path_for_host)
+        .into_iter()
+        .chain(
+            record
+                .install_root
+                .as_deref()
+                .map(runtime_python_executable_in_env),
+        )
+        .find(|candidate| candidate.is_file())
+}
+
+/// Version (e.g. `"10.0.0"`) of the active managed TheRock runtime.
+///
+/// Reflects the version recorded at install time. Returns `None` when there is no managed
+/// runtime (system or legacy ROCm) or the registry record is malformed or hand-edited.
+pub fn active_managed_therock_version(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.version))
 }
 
 /// Pick the active managed TheRock runtime record: the one matching
@@ -3876,9 +4168,15 @@ struct TheRockFamilyManifest {
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
     install_root: Option<PathBuf>,
+    /// Recorded by the installer. Absent on records written before it was, and
+    /// on runtimes whose interpreter was never resolved.
+    #[serde(default)]
+    python_executable: Option<PathBuf>,
     #[serde(default)]
     installed_at_unix_ms: Option<u128>,
 }
@@ -4017,6 +4315,7 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx1152") => Some("gfx1152".to_owned()),
         value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
         "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
+        value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
         value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
         value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
@@ -4063,6 +4362,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx1152",
         "gfx1153",
         "gfx120X-all",
+        "gfx125X-dcgpu",
     ]
 }
 
@@ -4334,8 +4634,81 @@ fn detect_wsl_windows_display_name_fast() -> Option<String> {
         .and_then(parse_windows_display_name)
 }
 
+/// What the guest was able to learn about the Windows host's AMD display driver.
+///
+/// Three states, not two. Reaching the host requires WSL interop, which the user
+/// can switch off and which is absent entirely inside a container running on WSL.
+/// Collapsing "could not ask" into "no driver found" would make the catalog blame
+/// a Windows driver on every locked-down or containerised host, so the two stay
+/// distinct and the check abstains on [`Unreachable`](Self::Unreachable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WslHostDriverProbe {
+    /// WSL interop is unavailable, so the host was never asked.
+    Unreachable,
+    /// The host answered but reported no AMD display adapter.
+    NoAmdDisplay,
+    /// The host's AMD display driver version.
+    Version(String),
+}
+
+/// The AMD display driver of the machine this is running on.
+///
+/// The host-side counterpart to [`detect_wsl_host_driver`]: when `rocm` runs on
+/// Windows and inspects a WSL distribution, the driver is a local question and
+/// needs no interop to answer.
+///
+/// Returns the same tri-state, and for the same reason. An earlier version
+/// collapsed it to `Option<String>` and defaulted the `None`, so "this is not
+/// Windows" and "the inventory query failed" both arrived as an empty version --
+/// which the catalog reads as "the host has no AMD adapter" and reports as a
+/// missing driver on a machine it never managed to look at.
+pub(crate) fn detect_local_windows_host_driver() -> WslHostDriverProbe {
+    if !runtime_is_windows() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(inventory) = detect_windows_examine_inventory() else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    inventory
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
+/// Ask the Windows host, from inside the distro, which AMD display driver it runs.
+pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
+    if !is_wsl_host() {
+        return WslHostDriverProbe::Unreachable;
+    }
+    let Some(output) = capture_optional_command_with_timeout(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    ) else {
+        return WslHostDriverProbe::Unreachable;
+    };
+    parse_windows_examine_inventory(&output)
+        .preferred_amd_display()
+        .and_then(|display| display.driver_version.as_deref())
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
+            WslHostDriverProbe::Version(version.to_owned())
+        })
+}
+
 fn detect_wsl_windows_display_probe_text() -> Option<String> {
-    if !is_wsl_environment_fast() {
+    if !is_wsl_host() {
         return None;
     }
 
@@ -4357,15 +4730,6 @@ fn detect_wsl_windows_display_probe_text() -> Option<String> {
             .to_owned()
     })
     .filter(|output| !output.is_empty())
-}
-
-fn is_wsl_environment_fast() -> bool {
-    if !runtime_is_linux() {
-        return false;
-    }
-    Path::new("/dev/dxg").exists()
-        || fs::read_to_string("/proc/version")
-            .is_ok_and(|text| text.to_ascii_lowercase().contains("microsoft"))
 }
 
 #[cfg(target_os = "linux")]
@@ -4965,39 +5329,58 @@ fn kfd_gfx_target_version_is_gpu(value: &str) -> bool {
         .is_ok_and(|version| version != 0)
 }
 
-/// The active GPU visibility mask, preferring `HIP_VISIBLE_DEVICES` then
-/// `ROCR_VISIBLE_DEVICES`. `None` when neither is set; an explicitly empty value
-/// is returned as `Some("")` so callers can distinguish "unset" (all visible)
-/// from "set to nothing" (all masked out).
+/// The GPU visibility mask read from the environment: both variables, kept
+/// separately because they apply at different layers and in a fixed order.
+/// `ROCR_VISIBLE_DEVICES` masks at the ROCr level and HIP then re-indexes the
+/// survivors as `0..N`; `HIP_VISIBLE_DEVICES` selects *within* that re-indexed
+/// set. Collapsing the two into one "winning" value loses the composition and
+/// makes HIP tokens look like physical ordinals. See
+/// [`usable_amd_gpu_indices_from`].
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+struct GpuVisibilityMask {
+    /// `ROCR_VISIBLE_DEVICES`, when set. Its tokens are physical ordinals.
+    rocr: Option<String>,
+    /// `HIP_VISIBLE_DEVICES`, when set. Its tokens are ordinals in the space ROCr
+    /// leaves behind — the same as physical ordinals only when `rocr` is unset.
+    hip: Option<String>,
+}
+
+/// The active GPU visibility mask: whichever of `ROCR_VISIBLE_DEVICES` and
+/// `HIP_VISIBLE_DEVICES` are set, and both when both are. `None` when neither is
+/// set; an explicitly empty value is carried through as an empty string so
+/// callers can distinguish "unset" (all visible) from "set to nothing" (all
+/// masked out).
 ///
 /// Linux-only: its sole caller is the Linux probe. (Not `+ test` — no test
 /// references it directly, so compiling it into a non-Linux test build would be
 /// dead code, which the workspace lints deny.)
 #[cfg(target_os = "linux")]
-fn visibility_mask_from_env() -> Option<String> {
-    ["HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]
-        .into_iter()
-        .find_map(std::env::var_os)
-        .map(|value| value.to_string_lossy().into_owned())
+fn visibility_mask_from_env() -> Option<GpuVisibilityMask> {
+    let read = |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let mask = GpuVisibilityMask {
+        rocr: read("ROCR_VISIBLE_DEVICES"),
+        hip: read("HIP_VISIBLE_DEVICES"),
+    };
+    if mask.rocr.is_none() && mask.hip.is_none() {
+        return None;
+    }
+    Some(mask)
 }
 
-/// Apply a `HIP_VISIBLE_DEVICES`-style `mask` to the present device ordinals
-/// (`0..present`). `None` means no mask is set (every present device is visible).
-/// An empty value hides every device. A nonempty mask containing UUIDs or invalid
-/// ordinals returns `None`: the ordinal-only probe cannot interpret it
-/// authoritatively, so callers must not mistake it for "no GPU".
+/// The tokens of `mask` naming a device in `0..count`, de-duplicated and in mask
+/// order. An empty mask yields an empty set (every device hidden). `None` when
+/// the mask cannot be interpreted by ordinal alone — a UUID token, or an ordinal
+/// outside `0..count` — so callers must not mistake it for "no GPU".
 #[cfg(any(target_os = "linux", test))]
-fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<Vec<u32>> {
-    let Some(mask) = mask else {
-        return Some((0..present as u32).collect());
-    };
+fn mask_tokens_within(count: usize, mask: &str) -> Option<Vec<u32>> {
     if mask.is_empty() {
         return Some(Vec::new());
     }
     let mut visible = Vec::new();
     for token in mask.split(',') {
         let index = token.trim().parse::<u32>().ok()?;
-        if (index as usize) >= present {
+        if (index as usize) >= count {
             return None;
         }
         if !visible.contains(&index) {
@@ -5005,6 +5388,55 @@ fn usable_amd_gpu_indices_from(present: usize, mask: Option<String>) -> Option<V
         }
     }
     Some(visible)
+}
+
+/// Apply the visibility `mask` to the present device ordinals (`0..present`).
+/// A `None` `mask` means no mask is set (every present device is visible); a
+/// `None` *return* means the mask could not be interpreted authoritatively, so
+/// callers must not mistake it for "no GPU".
+///
+/// The returned ordinals are always in HIP space — the space rocm-cli pins its
+/// selection through `HIP_VISIBLE_DEVICES`. The two variables are therefore
+/// composed in the order the runtime applies them, not treated as alternatives:
+///
+/// 1. `ROCR_VISIBLE_DEVICES` hides physical devices *below* HIP, which then
+///    re-indexes the survivors as `0..N`. Returning the raw physical tokens would
+///    make `--gpu` validation reject the ordinals that actually bind and accept
+///    ones that do not.
+/// 2. `HIP_VISIBLE_DEVICES` then selects within that `0..N` space. Its tokens are
+///    already HIP ordinals and are kept as-is — but they must be range-checked
+///    against `N`, not against `present`: under an active ROCR mask a HIP token
+///    can sit below the physical count and still name no device HIP can see
+///    (EAI-7194). Checking it against `present` accepted a `--gpu` ordinal that
+///    cannot bind, and steered `--gpu auto` onto it — the exact failure this
+///    composition exists to prevent, reached through the other variable.
+#[cfg(any(target_os = "linux", test))]
+fn usable_amd_gpu_indices_from(
+    present: usize,
+    mask: Option<GpuVisibilityMask>,
+) -> Option<Vec<u32>> {
+    let Some(mask) = mask else {
+        return Some((0..present as u32).collect());
+    };
+    // How many devices HIP can see at all: the ROCr survivors, or every present
+    // device when no ROCR mask is set.
+    let hip_space = match mask.rocr.as_deref() {
+        None => present,
+        Some(rocr) => {
+            let survivors = mask_tokens_within(present, rocr)?;
+            if survivors.is_empty() {
+                // ROCr hid every device, so there is nothing for HIP to select
+                // from whatever HIP_VISIBLE_DEVICES names. Authoritatively empty.
+                return Some(Vec::new());
+            }
+            survivors.len()
+        }
+    };
+    let Some(hip) = mask.hip.as_deref() else {
+        // No HIP mask: every device HIP can see is selectable, numbered 0..N.
+        return Some((0..hip_space as u32).collect());
+    };
+    mask_tokens_within(hip_space, hip)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -5305,6 +5737,12 @@ fn default_permissions_mode() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetupConfig {
+    /// Described in: `rocm setup status`/`reset` output, their `--help` doc
+    /// comments, README.md's Setup section, docs/testing.md,
+    /// docs/manual-testing.md, and the module doc comment in
+    /// `crates/rocm-dash-tui/src/ui/onboarding.rs`. Nothing reads this to
+    /// auto-open onboarding — grep this field, not a phrase, before touching
+    /// any of those surfaces.
     #[serde(default)]
     pub completed: bool,
     #[serde(default)]
@@ -5365,6 +5803,12 @@ pub struct RocmCliConfig {
     pub previous_runtime_key: Option<String>,
     #[serde(default)]
     pub planner_provider: Option<String>,
+    /// Described in: `rocm setup status`/`reset` output, their `--help` doc
+    /// comments, README.md's Setup section, docs/testing.md,
+    /// docs/manual-testing.md, and the module doc comment in
+    /// `crates/rocm-dash-tui/src/ui/onboarding.rs`. Nothing reads this to
+    /// auto-open onboarding — grep this field, not a phrase, before touching
+    /// any of those surfaces.
     #[serde(default)]
     pub onboarding_dismissed: bool,
     #[serde(default)]
@@ -7611,6 +8055,86 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn file_lock_creates_missing_parent_dirs_and_lock_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("nested").join("child").join("guard.lock");
+        assert!(!lock_path.exists(), "precondition: lock file absent");
+
+        let guard = FileLock::acquire(&lock_path).expect("acquire creates parents");
+        assert!(lock_path.is_file(), "lock file is created on acquire");
+        assert_eq!(guard.path(), lock_path.as_path());
+        drop(guard);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_serializes_concurrent_holders() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-filelock-excl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("guard.lock");
+
+        // First holder takes the lock and keeps it until we explicitly release it.
+        let held = FileLock::acquire(&lock_path).expect("first acquire");
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread_path = lock_path;
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal about-to-acquire");
+            // Blocks until the main thread drops `held`.
+            let _guard = FileLock::acquire(&thread_path).expect("second acquire");
+            acquired_tx.send(()).expect("signal acquired");
+        });
+
+        // Ensure the contender has reached its acquire call before we assert it
+        // is blocked, so the negative check below is about the lock, not
+        // scheduling latency.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender started");
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "second acquire must block while the first lock is still held"
+        );
+
+        // Releasing the first lock lets the contender proceed promptly.
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second acquire proceeds once the first lock is released");
+        handle.join().expect("contender thread joins");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_lock_distinct_paths_do_not_contend() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-filelock-distinct-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Two different lock files are independent; holding one must not block the
+        // other in the same process.
+        let a = FileLock::acquire(dir.join("a.lock")).expect("acquire a");
+        let b = FileLock::acquire(dir.join("b.lock")).expect("acquire b");
+        drop(a);
+        drop(b);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn service_id_accepts_generated_and_plain_ids() {
         // A freshly generated id must always validate.
         let generated = generate_service_id("vllm", "Qwen/Qwen3.5");
@@ -9302,6 +9826,16 @@ mod tests {
         );
     }
 
+    /// ROCm 10's next layout publishes a `gfx125X-dcgpu` family; the raw
+    /// `gfx1250` arch a host reports has to land on it.
+    #[test]
+    fn normalize_therock_family_maps_gfx1250_to_gfx125x_dcgpu() {
+        assert_eq!(
+            normalize_therock_family("gfx1250"),
+            Some("gfx125X-dcgpu".to_owned())
+        );
+    }
+
     #[test]
     fn known_therock_families_all_round_trip() {
         for family in known_therock_families() {
@@ -9922,6 +10456,171 @@ Class Name:                Display
         Ok(())
     }
 
+    /// Write a registry record for a managed TheRock runtime, always planting a
+    /// real interpreter at the conventional location under `install_root` so the
+    /// DERIVED candidate exists on disk.
+    ///
+    /// `recorded_python` decides the record's `python_executable` key:
+    ///
+    /// - `None` writes no such key at all -- the shape of a record from before
+    ///   the installer recorded one, where only the derived candidate exists.
+    /// - `Some(path)` records that path verbatim, whether or not anything is
+    ///   there. Planting it is the caller's business, so a caller can exercise
+    ///   either side of the gate in `managed_therock_python_executable` -- which
+    ///   is `is_file()`, not `exists()`.
+    fn write_therock_runtime_with_interpreter(
+        registry: &Path,
+        install_root: &Path,
+        name: &str,
+        recorded_python: Option<&Path>,
+    ) -> Result<()> {
+        let bin = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        fs::create_dir_all(&bin)?;
+        fs::write(
+            bin.join(runtime_python_executable_name()),
+            b"#!/bin/sh\nexit 0\n",
+        )?;
+        let mut record = serde_json::json!({
+            "runtime_id": format!("therock-release:{name}"),
+            "runtime_key": name,
+            "family": "gfx94X-dcgpu",
+            "channel": "release",
+            "installed_at_unix_ms": 10,
+            "install_root": install_root,
+            "rocm_sdk": { "import_ok": true },
+        });
+        if let Some(python) = recorded_python {
+            record["python_executable"] = serde_json::json!(python);
+        }
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_framework_interpreter_is_none_without_a_managed_runtime() -> Result<()> {
+        // An unmanaged host must fall back to the ambient `PATH` probe, which is
+        // what `None` selects for the caller.
+        let (root, paths) = temp_app_paths("framework-interpreter-none");
+        assert!(active_managed_framework_interpreter(&paths, &RocmCliConfig::default()).is_none());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn the_framework_interpreter_is_derived_when_none_was_recorded() -> Result<()> {
+        // Records written before the installer recorded `python_executable` must
+        // still resolve, from the conventional location under `install_root`.
+        let (root, paths) = temp_app_paths("framework-interpreter-derived");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-derived");
+        write_therock_runtime_with_interpreter(&registry, &install_root, "derived", None)?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("a managed runtime with an interpreter on disk must resolve");
+        assert_eq!(
+            interpreter.python,
+            runtime_python_executable_in_env(&install_root)
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_outside_the_install_root_wins_over_the_derived_one() -> Result<()> {
+        // The branch the e2e scenario's relaxed assertion rests on: an imported
+        // or read-only runtime can record an interpreter that does not sit under
+        // `install_root`, and preferring the derived path would hand back the
+        // wrong interpreter whenever both exist.
+        let (root, paths) = temp_app_paths("framework-interpreter-recorded");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-recorded");
+        let elsewhere = paths.data_dir.join("outside").join("venv");
+        let recorded = runtime_python_executable_in_env(&elsewhere);
+        fs::create_dir_all(recorded.parent().expect("an interpreter has a parent"))?;
+        fs::write(&recorded, b"#!/bin/sh\nexit 0\n")?;
+        // `write_therock_runtime_with_interpreter` also plants the derived
+        // interpreter under `install_root`, so both candidates are on disk and
+        // the `exists()` gate cannot decide this for us.
+        write_therock_runtime_with_interpreter(
+            &registry,
+            &install_root,
+            "recorded",
+            Some(&recorded),
+        )?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("a managed runtime with an interpreter on disk must resolve");
+        assert_eq!(
+            interpreter.python, recorded,
+            "the recorded interpreter must win over the one derived from install_root"
+        );
+        assert!(
+            !interpreter.python.starts_with(&install_root),
+            "the point of the recorded path is that it need not sit under install_root"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_that_is_gone_does_not_resolve() -> Result<()> {
+        // Handing back a path that cannot be spawned would turn "no torch" into
+        // a spawn failure; the ambient probe is the better answer, so this must
+        // be `None` rather than the missing path.
+        //
+        // The record really carries a `python_executable`, which is the whole
+        // point: with none recorded this would drive the gate on the DERIVED
+        // candidate and stay green however the recorded half of it is mangled.
+        let (root, paths) = temp_app_paths("framework-interpreter-missing");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-gone");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("gone").join("venv"));
+        write_therock_runtime_with_interpreter(&registry, &install_root, "gone", Some(&recorded))?;
+        // The helper plants the derived interpreter; take it away so that BOTH
+        // candidates are recorded-or-derived paths that are not on disk, and
+        // neither can carry the result.
+        fs::remove_dir_all(&install_root)?;
+        assert!(!recorded.exists(), "the recorded interpreter must be gone");
+
+        assert!(
+            active_managed_framework_interpreter(&paths, &RocmCliConfig::default()).is_none(),
+            "a recorded interpreter that is not on disk must not be handed back"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_that_is_a_directory_is_passed_over() -> Result<()> {
+        // `exists()` would accept a directory and hand back something that
+        // cannot be spawned, which is the failure the gate exists to prevent;
+        // `is_file()` passes over it and the derived interpreter answers
+        // instead. Relaxing the predicate is otherwise invisible to the suite.
+        let (root, paths) = temp_app_paths("framework-interpreter-dir");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-dir");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("dir").join("venv"));
+        fs::create_dir_all(&recorded)?;
+        write_therock_runtime_with_interpreter(&registry, &install_root, "dir", Some(&recorded))?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("the derived interpreter is on disk, so something must resolve");
+        assert_eq!(
+            interpreter.python,
+            runtime_python_executable_in_env(&install_root),
+            "a recorded path that is a directory must not be preferred over a real interpreter"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     fn write_therock_channel_record(
         registry: &Path,
         name: &str,
@@ -9934,6 +10633,98 @@ Class Name:                Display
                 "runtime_id": format!("therock-{channel}:{name}"),
                 "family": "gfx120X-all",
                 "channel": channel,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_reads_recorded_version() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "version": "10.0.0",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_is_none_without_runtime() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-none");
+        let config = RocmCliConfig::default();
+        assert_eq!(active_managed_therock_version(&paths, &config)?, None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_falls_back_to_most_recent() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // No active_runtime_key set: the most recently installed runtime wins.
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_prefers_active_runtime_key() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-active-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // The active key points at the older runtime, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("therock-release:older".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("7.13.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_therock_version_record(
+        registry: &Path,
+        name: &str,
+        version: &str,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": format!("therock-release:{name}"),
+                "family": "gfx120X-all",
+                "version": version,
                 "installed_at_unix_ms": installed_at_unix_ms,
                 "rocm_sdk": { "import_ok": true }
             }))?,
@@ -11925,56 +12716,103 @@ last_installed_runtime_id = "therock-release"
     }
 
     #[test]
-    fn every_wsl_signal_is_believed_by_the_one_predicate() {
-        // The union. Each of these was decisive to at least one of the three
-        // implementations this replaces.
-        assert!(wsl_signals_indicate_wsl(true, false, ""), "/dev/dxg");
+    fn dev_dxg_is_believed_on_its_own() {
+        // Nothing but WSLg's GPU passthrough creates this device node, so it is
+        // trusted without corroboration.
+        assert!(wsl_signals_indicate_wsl(true, ""), "/dev/dxg");
         assert!(
-            wsl_signals_indicate_wsl(false, true, ""),
-            "$WSL_DISTRO_NAME"
-        );
-        assert!(
-            wsl_signals_indicate_wsl(
-                false,
-                false,
-                "Linux version 6.6.87.2-microsoft-standard-WSL2"
-            ),
-            "microsoft in /proc/version"
-        );
-        assert!(
-            wsl_signals_indicate_wsl(false, false, "Linux version 5.15.0 wsl2"),
-            "wsl in /proc/version"
-        );
-        assert!(
-            !wsl_signals_indicate_wsl(false, false, "Linux version 6.8.0-51-generic"),
-            "an ordinary kernel is not WSL"
+            wsl_signals_indicate_wsl(true, "Linux version 6.8.0-51-generic"),
+            "/dev/dxg overrides an otherwise ordinary kernel string"
         );
     }
 
     #[test]
-    fn the_two_old_predicates_disagreed_and_this_one_does_not() {
-        // The install summary asked for /dev/dxg or "microsoft"; the JSON probe
-        // asked for "microsoft"/"wsl" or $WSL_DISTRO_NAME. These are the two
-        // shapes that split them, and the reason `examine` could contradict
-        // `examine --json` about the platform it was describing.
-        let only_the_summary_saw_it = (true, false, "Linux version 6.8.0-generic");
-        let only_the_probe_saw_it = (false, true, "Linux version 6.8.0-generic");
-        for (dxg, distro, version) in [only_the_summary_saw_it, only_the_probe_saw_it] {
+    fn proc_version_alone_is_believed() {
+        // Only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+        // `-Microsoft` -- unlike $WSL_DISTRO_NAME, that string cannot be
+        // inherited or forwarded into an unrelated shell, so it needs no
+        // corroboration. This is also what makes a WSL2 container correctly
+        // read as WSL even when it was not started with /dev/dxg passed in:
+        // it shares the host kernel, so /proc/version still carries the
+        // marker even though the container has no $WSL_DISTRO_NAME of its own.
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 6.6.87.2-microsoft-standard-WSL2"),
+            "microsoft in /proc/version is enough on its own"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version is enough on its own"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_kernel_with_no_signals_is_not_wsl() {
+        assert!(
+            !wsl_signals_indicate_wsl(false, "Linux version 6.8.0-51-generic"),
+            "an ordinary kernel is not WSL"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, ""),
+            "no device and no /proc/version to read is not WSL"
+        );
+    }
+
+    #[test]
+    fn real_wsl2_and_wsl1_hosts_are_recognised_by_proc_version_alone() {
+        // Its own doc comment above records that WSL 1 kernels always end in
+        // "-microsoft" and WSL 2 kernels always carry "microsoft-standard" --
+        // so every real WSL host is recognised without needing $WSL_DISTRO_NAME
+        // or /dev/dxg at all.
+        let wsl2 = "Linux version 5.15.167.4-microsoft-standard-WSL2";
+        let wsl2_early = "Linux version 4.19.104-microsoft-standard";
+        let wsl1 = "Linux version 4.4.0-19041-Microsoft";
+        for proc_version in [wsl2, wsl2_early, wsl1] {
             assert!(
-                wsl_signals_indicate_wsl(dxg, distro, version),
-                "one predicate already believed this host was WSL: \
-                 dxg={dxg} distro_name={distro} {version:?}"
+                wsl_signals_indicate_wsl(false, proc_version),
+                "a real WSL host was not recognised: {proc_version:?}"
             );
         }
+        // WSL 2 with GPU passthrough enabled also has /dev/dxg, which is
+        // believed regardless of /proc/version.
+        assert!(wsl_signals_indicate_wsl(true, wsl2));
     }
 
     #[test]
     fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
-        assert!(wsl_signals_indicate_wsl(
-            false,
-            false,
-            "MICROSOFT-STANDARD-WSL2"
-        ));
+        assert!(wsl_signals_indicate_wsl(false, "MICROSOFT-STANDARD-WSL2"));
+    }
+
+    #[test]
+    fn wsl1_is_told_apart_from_wsl2_by_the_kernel_release() {
+        // The two are the same string family, distinguished only by the WSL2
+        // marker. Getting this backwards would send a WSL 1 user chasing a
+        // Windows driver update that can never give them a GPU, or hide the
+        // conversion advice from the one platform that needs it.
+        for wsl1 in [
+            "4.4.0-19041-Microsoft",
+            "4.4.0-18362-MICROSOFT",
+            "4.4.0-17763-microsoft",
+        ] {
+            assert!(is_wsl1_kernel(wsl1), "{wsl1} is a WSL 1 kernel");
+        }
+        for wsl2 in [
+            "6.6.87.2-microsoft-standard-WSL2",
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.18.33.2-MICROSOFT-STANDARD-WSL2",
+            // The `-WSL2` suffix is not the marker. These are the earlier WSL 2
+            // kernels, which carry `microsoft-standard` and no `WSL2` at all --
+            // testing for the absence of `WSL2` called every one of them WSL 1.
+            "4.19.104-microsoft-standard",
+            "4.19.128-microsoft-standard",
+            "5.10.16.3-microsoft-standard",
+        ] {
+            assert!(!is_wsl1_kernel(wsl2), "{wsl2} is a WSL 2 kernel");
+        }
+        // A bare-metal kernel is neither, and must not read as WSL 1 -- the
+        // caller only asks on a host already known to be WSL, but answering
+        // "yes" here would be wrong if that ever changed.
+        assert!(!is_wsl1_kernel("6.8.0-51-generic"));
+        assert!(!is_wsl1_kernel(""));
     }
 
     #[test]
@@ -12025,7 +12863,7 @@ last_installed_runtime_id = "therock-release"
         // An explicit empty mask still wins, so a user can opt out on WSL as
         // anywhere — HIP_VISIBLE_DEVICES="" hides the device.
         assert_eq!(
-            usable_amd_gpu_indices_from(usize::from(true), Some(String::new())),
+            usable_amd_gpu_indices_from(usize::from(true), hip_mask("")),
             Some(vec![])
         );
     }
@@ -12061,11 +12899,43 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(usable_amd_gpu_indices_from(3, None), Some(vec![0, 1, 2]));
     }
 
+    /// Only `HIP_VISIBLE_DEVICES` set: its ordinals are already in HIP space and
+    /// are used as-is.
+    fn hip_mask(value: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            rocr: None,
+            hip: Some(value.to_owned()),
+        })
+    }
+
+    /// Only `ROCR_VISIBLE_DEVICES` set: its physical ordinals are re-indexed into
+    /// HIP space (survivors become `0..N`).
+    fn rocr_mask(value: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            rocr: Some(value.to_owned()),
+            hip: None,
+        })
+    }
+
+    /// Both variables set. ROCr applies first and HIP re-indexes the survivors,
+    /// so `hip`'s tokens are ordinals *within* `rocr`'s survivor list.
+    fn rocr_then_hip_mask(rocr: &str, hip: &str) -> Option<GpuVisibilityMask> {
+        Some(GpuVisibilityMask {
+            rocr: Some(rocr.to_owned()),
+            hip: Some(hip.to_owned()),
+        })
+    }
+
     #[test]
     fn usable_gpu_indices_empty_mask_hides_every_device() {
         // The masked-device path: GPUs are present but fully masked out.
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some(String::new())),
+            usable_amd_gpu_indices_from(2, hip_mask("")),
+            Some(Vec::new())
+        );
+        // An empty ROCR mask hides every device too.
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, rocr_mask("")),
             Some(Vec::new())
         );
     }
@@ -12073,21 +12943,104 @@ last_installed_runtime_id = "therock-release"
     #[test]
     fn usable_gpu_indices_honors_valid_ordinal_masks() {
         assert_eq!(
-            usable_amd_gpu_indices_from(4, Some("2,0".to_owned())),
+            usable_amd_gpu_indices_from(4, hip_mask("2,0")),
             Some(vec![2, 0])
         );
         // Duplicates are collapsed.
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("1,1".to_owned())),
+            usable_amd_gpu_indices_from(2, hip_mask("1,1")),
             Some(vec![1])
         );
     }
 
     #[test]
     fn usable_gpu_indices_treats_unsupported_masks_as_unprobeable() {
-        assert_eq!(usable_amd_gpu_indices_from(2, Some("0,5".to_owned())), None);
+        assert_eq!(usable_amd_gpu_indices_from(2, hip_mask("0,5")), None);
         assert_eq!(
-            usable_amd_gpu_indices_from(2, Some("GPU-deadbeef".to_owned())),
+            usable_amd_gpu_indices_from(2, hip_mask("GPU-deadbeef")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hip_mask_keeps_its_ordinals_but_a_rocr_mask_is_reindexed_to_hip_space() {
+        // A HIP_VISIBLE_DEVICES mask is already in the HIP-ordinal space rocm-cli
+        // exports through, so its tokens are used as-is.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, hip_mask("2,3")),
+            Some(vec![2, 3])
+        );
+        // A ROCR_VISIBLE_DEVICES mask hides physical devices below HIP, which then
+        // re-indexes the survivors as 0..N. On a 4-GPU host, ROCR=2,3 leaves two
+        // devices that HIP sees as ordinals 0 and 1 — the values that actually
+        // bind when exported via HIP_VISIBLE_DEVICES — not the physical 2 and 3.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_mask("2,3")),
+            Some(vec![0, 1])
+        );
+        // A single-device ROCR mask re-indexes to just ordinal 0.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_mask("3")),
+            Some(vec![0])
+        );
+        // An out-of-range token is still "cannot interpret", regardless of source.
+        assert_eq!(usable_amd_gpu_indices_from(2, rocr_mask("5")), None);
+    }
+
+    #[test]
+    fn a_hip_mask_under_a_rocr_mask_is_bounded_by_the_rocr_survivors() {
+        // EAI-7194, second half: both variables set. ROCr applies first and HIP
+        // re-indexes the survivors as 0..N, so HIP tokens are ordinals within that
+        // reduced set — NOT physical ordinals. Range-checking them against the
+        // physical `present` accepted ordinals that cannot bind.
+        //
+        // 4 GPUs present, ROCR=2,3 leaves two devices HIP numbers 0 and 1.
+        // HIP=3 names nothing HIP can see, even though 3 < 4 physically: the probe
+        // cannot resolve the visible set and must say "unknown", not confidently
+        // hand back [3] for `--gpu 3` to be accepted against and `--gpu auto` to be
+        // steered onto.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "3")),
+            None
+        );
+        // The same shape one ordinal lower is a real device: HIP ordinal 1 is the
+        // second ROCr survivor (physical 3), and it stays selectable.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "1")),
+            Some(vec![1])
+        );
+        // Selecting every survivor keeps both re-indexed ordinals.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "1,0")),
+            Some(vec![1, 0])
+        );
+        // A one-device ROCr set leaves only HIP ordinal 0; ordinal 1 is unknown,
+        // not physical ordinal 1.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("3", "0")),
+            Some(vec![0])
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("3", "1")),
+            None
+        );
+        // Either variable hiding everything is authoritative: an empty ROCR mask
+        // leaves HIP nothing to select, so a HIP mask cannot resurrect a device.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("", "0")),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("2,3", "")),
+            Some(Vec::new())
+        );
+        // An uninterpretable ROCR mask is still "unknown" whatever HIP says.
+        assert_eq!(
+            usable_amd_gpu_indices_from(4, rocr_then_hip_mask("GPU-deadbeef", "0")),
+            None
+        );
+        assert_eq!(
+            usable_amd_gpu_indices_from(2, rocr_then_hip_mask("5", "0")),
             None
         );
     }

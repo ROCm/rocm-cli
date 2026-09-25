@@ -103,6 +103,14 @@ pub const fn runtime_python_executable_name() -> &'static str {
     }
 }
 
+/// The loader search-path variable used to expose a runtime's ROCm libraries to
+/// a child process.
+pub const RUNTIME_LIBRARY_PATH_ENV: &str = if cfg!(windows) {
+    "PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
 pub fn runtime_python_env_bin_dir(env_root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(env_root).join(runtime_python_bin_dir_name())
 }
@@ -300,8 +308,12 @@ pub fn managed_pip_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("pip-cache")
 }
 
-/// `uv`'s content-addressed cache, kept under the managed root so it shares a filesystem
-/// with the environments `uv` populates and hardlinking keeps working (see issue #160).
+/// `uv`'s content-addressed cache, kept under the managed root (see issue #160).
+///
+/// Colocating it keeps the cache reachable from the environments `uv` populates without
+/// crossing a mount point, which is what lets `uv` hardlink into them instead of copying.
+/// It is the mount, not the filesystem: a bind mount or `subPath` volume is enough to make
+/// Linux refuse the hardlink and send `uv` back to copying.
 pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("uv-cache")
 }
@@ -314,17 +326,75 @@ pub fn managed_tools_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("tools")
 }
 
+/// Split a search-path list into entries, host-normalising each one.
+///
+/// Safe on an inherited OS `PATH` as well as on a list this tool recorded
+/// itself: the Windows branch implements the same quoting rules as
+/// [`std::env::split_paths`] before it normalises. It adds trimming and the
+/// dropping of empty entries on top, which a recorded list wants and an
+/// inherited one does not mind.
+///
+/// That quote handling is load-bearing rather than incidental. `c:\some;dir` is
+/// a legal Windows path, so a list containing one has to quote it, and a naive
+/// `split(';')` both tears the entry in two and leaves the `"` characters in
+/// the result — where [`std::env::join_paths`] rejects them outright and the
+/// caller loses the whole list, not the one bad entry. Keep this in step with
+/// [`runtime_path_list_join`], which re-quotes on the way back out.
 pub fn runtime_path_list_split(value: &OsStr) -> Vec<PathBuf> {
     if !runtime_is_windows() {
         return std::env::split_paths(value).collect();
     }
-    value
-        .to_string_lossy()
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
+    split_windows_path_list_text(&value.to_string_lossy())
+        .iter()
         .map(|entry| normalize_runtime_path_for_host(Path::new(entry)))
         .collect()
+}
+
+/// Split a Windows `;`-separated path list, honouring the quoting rules
+/// [`std::env::split_paths`] uses: a `"` opens a run in which `;` is an ordinary
+/// character, and the quotes are removed rather than kept in the entry.
+///
+/// Entries are trimmed and empty ones dropped, so a trailing separator or a
+/// stray `;;` does not yield a path that resolves to the current directory.
+///
+/// Free of any host dependency so the Windows shape stays testable on Linux.
+fn split_windows_path_list_text(value: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                entries.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    entries.push(current);
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Render one entry for a Windows path list, quoting it when it contains the
+/// `;` separator so that [`runtime_path_list_split`] can recover it whole.
+///
+/// A `"` in the entry goes out raw, where [`std::env::join_paths`] rejects the
+/// list outright. That rests on a precondition rather than on a check, so name
+/// it: `"` is reserved in a Windows path, and the splitter above consumes quotes
+/// rather than emitting them, so neither a path from disk nor an entry recovered
+/// from a list can hold one. Rejecting the character would trade that
+/// unreachable case for the failure this pair exists to avoid -- one bad entry
+/// costing the caller every entry.
+fn windows_path_list_entry_text(path: &Path) -> String {
+    let text = runtime_path_for_windows_child(path);
+    if text.contains(';') {
+        return format!("\"{text}\"");
+    }
+    text
 }
 
 pub fn runtime_path_list_join<I, P>(entries: I) -> Result<OsString>
@@ -339,7 +409,7 @@ where
     if runtime_is_windows() {
         let joined = entries
             .iter()
-            .map(|entry| runtime_path_for_windows_child(entry))
+            .map(|entry| windows_path_list_entry_text(entry))
             .collect::<Vec<_>>()
             .join(";");
         return Ok(OsString::from(joined));
@@ -1134,5 +1204,78 @@ mod tests {
         assert_eq!(resolved, path_binary);
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    /// The Windows path-list tests below drive the text helpers directly rather
+    /// than `runtime_path_list_split`, which takes the `std::env::split_paths`
+    /// branch on a Linux host. The helpers carry the whole Windows shape and no
+    /// host dependency, so the behaviour is pinned on every lane; what a Windows
+    /// lane adds is that `runtime_path_list_split` really routes into them.
+    #[test]
+    fn a_quoted_windows_path_entry_survives_the_separator_inside_it() {
+        // `c:\some;dir` is a legal Windows path, so a list carrying one quotes
+        // it. Splitting on every `;` would tear it in two and invent a `dir`
+        // entry relative to wherever the child happens to start.
+        assert_eq!(
+            split_windows_path_list_text(r#"C:\rocm\bin;"C:\some;dir";C:\windows"#),
+            vec![
+                r"C:\rocm\bin".to_owned(),
+                r"C:\some;dir".to_owned(),
+                r"C:\windows".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn splitting_a_windows_path_list_strips_the_quotes_it_split_on() {
+        // The regression this guards: quotes left in an entry make
+        // `std::env::join_paths` fail on Windows, and the caller composing a
+        // loader path then loses every entry rather than the one bad one.
+        let entries = split_windows_path_list_text(r#""C:\quoted\bin";C:\plain\bin"#);
+        assert_eq!(
+            entries,
+            vec![r"C:\quoted\bin".to_owned(), r"C:\plain\bin".to_owned()]
+        );
+        assert!(
+            entries.iter().all(|entry| !entry.contains('"')),
+            "a quote reaching join_paths costs the caller the whole list: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn splitting_a_windows_path_list_trims_and_drops_empty_entries() {
+        // A trailing separator or a stray `;;` must not yield an entry that
+        // resolves against the child's current directory.
+        assert_eq!(
+            split_windows_path_list_text(r"C:\rocm\bin; ;;  C:\windows  ;"),
+            vec![r"C:\rocm\bin".to_owned(), r"C:\windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn joining_a_windows_path_list_requotes_an_entry_holding_the_separator() {
+        // The other half of the same rule: an entry that goes out unquoted comes
+        // back as two, so join has to restore what split consumed.
+        assert_eq!(
+            windows_path_list_entry_text(Path::new(r"C:\some;dir")),
+            r#""C:\some;dir""#
+        );
+        assert_eq!(
+            windows_path_list_entry_text(Path::new(r"C:\rocm\bin")),
+            r"C:\rocm\bin",
+            "an ordinary entry must not gain quotes it never had"
+        );
+    }
+
+    #[test]
+    fn a_windows_path_list_round_trips_through_split_and_join() {
+        let entries = [r"C:\rocm\bin", r"C:\some;dir", r"C:\windows"];
+        let joined = entries
+            .iter()
+            .map(|entry| windows_path_list_entry_text(Path::new(entry)))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        assert_eq!(split_windows_path_list_text(&joined), entries.to_vec());
     }
 }

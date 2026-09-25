@@ -32,6 +32,11 @@ jobs:
       date: ${{ steps.meta.outputs.date }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
       staging_tag: ${{ steps.staging.outputs.tag }}
+      # The branch this run resolved to (always "main" in practice: schedule
+      # and an un-overridden workflow_dispatch both default to the repo's
+      # default branch). Exposed so windows-nightly's build can forward the
+      # same ROCM_CLI_RELEASE_REF this job forwards into its own docker build.
+      ref: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -95,10 +100,16 @@ jobs:
 
           # Build as the runner user so cached Cargo/rustup files are owned by
           # the runner (the host-side cache save step must be able to read them).
+          #
+          # ROCM_CLI_RELEASE_REF is forwarded explicitly: see release.yml's
+          # Linux build step for why (this container sees none of GitHub's own
+          # GITHUB_REF_* env, which apps/rocm/build.rs would otherwise fall
+          # back to).
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
+            -e ROCM_CLI_RELEASE_REF="${{ github.ref_name }}" \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -205,6 +216,13 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
+        # See the Linux job's "Build release binaries" step: the release ref
+        # must come from the resolved `nightly` job output, not ambient
+        # GITHUB_REF_* context or local git state (a workflow_dispatch nightly
+        # checks out a detached HEAD, so `git rev-parse --abbrev-ref HEAD`
+        # can't recover the branch name either).
+        env:
+          ROCM_CLI_RELEASE_REF: ${{ needs.nightly.outputs.ref }}
         run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle
@@ -332,10 +350,11 @@ jobs:
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
-  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
+  # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
     name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
@@ -353,7 +372,7 @@ jobs:
 
       # Reclaim the GPU before running: kill only e2e leftovers scoped to
       # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
-      # any /workload manual-testing processes (see ci.yml e2e-gpu for the same).
+      # any /workload manual-testing processes (see e2e-selfhosted.yml e2e-gpu for the same).
       - name: Reclaim GPU from stray E2E processes
         run: |
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
@@ -414,11 +433,15 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Share uv's wheel cache off the near-full PVC, on the roomy `/` overlay
-          # (see ci.yml e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Share uv's wheel cache on the same mount as the runtimes it populates,
+          # so uv hardlinks into them instead of copying (see e2e-selfhosted.yml
+          # e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s. It must also be
+          # the directory the runner's uv-cache-gc initContainer bounds, or the
+          # cache grows without a floor on the volume holding `.runner`.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Share ONE installed managed runtime across serve/chat scenarios so
-          # install sdk runs once per runner, not per scenario (see ci.yml e2e-gpu).
+          # install sdk runs once per runner, not per scenario (see e2e-selfhosted.yml e2e-gpu).
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
           # post-install mv invalidates the absolute paths install sdk bakes into
           # the runtime manifest and every serve fails instantly (run 29320025393).
@@ -456,8 +479,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
-  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, own uv-cache
-  # PVC, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
+  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
+  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
   # the report crate asserts the nightly lanes publish the same platforms as the
   # per-PR lanes.
   e2e-gpu-nightly-rad3:
@@ -521,9 +544,11 @@ jobs:
           # being scaled away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Separate PVC mounted at exactly this path by the runner's cluster
-          # overlay; if you change this path, change the overlay that mounts it too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
@@ -610,9 +635,11 @@ jobs:
           # away, so the cargo target dir and shared caches stay warm.
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Separate volume mounted at exactly this path by the runner's
-          # deployment; if you change this path, change that deployment too.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
@@ -640,12 +667,16 @@ jobs:
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
-  # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
+  # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
-    # `native` disambiguates the two Linux Strix runners: the WSL host also
-    # carries `strix-halo`, but the paths below exist only on the native one.
+    # `native` disambiguates this runner from any host that might carry a bare
+    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
+    # before the WSL lanes moved to the ephemeral pool) -- the paths below
+    # exist only on the native host, whether or not that other runner remains
+    # registered.
     runs-on: [self-hosted, linux, strix-halo, native]
     continue-on-error: true
     env:
@@ -733,8 +764,9 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
-  # setup aligned with ci.yml's proven Strix Windows job while opting into the
-  # same platform-adaptive @nightly large-model scenario as the Linux runner.
+  # setup aligned with e2e-selfhosted.yml's proven Strix Windows job while
+  # opting into the same platform-adaptive @nightly large-model scenario as the
+  # Linux runner.
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
@@ -808,6 +840,15 @@ jobs:
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
+          # See e2e-gpu-strix-windows in e2e-selfhosted.yml: the harness's own
+          # isolate_env() derives HF_HOME/PIP_CACHE_DIR/ROCM_CLI_CACHE_DIR from
+          # this per scenario. Without it every serve scenario here re-downloads
+          # its model checkpoint cold, which raced serve-08's readiness timeout
+          # (EAI-8031 / #260) on every nightly run — this host was never actually
+          # warm for it, since Windows doesn't set HOME by default and the
+          # engine's cache lookup didn't fall back to USERPROFILE.
+          $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
+
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
           # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
           cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
@@ -831,34 +872,94 @@ jobs:
           name: e2e-gpu-strix-windows-report
           path: tests/e2e-cucumber/results/
 
-  # WSL2 counterpart to e2e-gpu-nightly-strix: the same Strix Halo box again, but
-  # reached through an Ubuntu distro under WSL2, so this lane exercises the WSL
-  # host boundary AND whatever GPU access WSL exposes. Mirrors the per-PR
-  # `e2e-wsl` lane in e2e-selfhosted.yml, opting into the same @nightly
-  # large-model scenario as the other nightly lanes. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner; the native lane's
-  # /home/ubuntu/actions-runner paths deliberately are NOT reused, since they do
-  # not exist in the WSL distro.
+  # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
+  # fresh inside WSL2 on a DevLab Dispatch pool Windows host — the same pool
+  # the per-PR `e2e-gpu-strix-windows`/`e2e-wsl` jobs use, not a separate
+  # `wsl`-labeled runner and not the `native` host e2e-gpu-nightly-strix-windows
+  # still runs on. Mirrors the per-PR `e2e-wsl` lane in e2e-selfhosted.yml step
+  # for step (see that job's header comment for the pool maintainer's
+  # sign-off), opting into the same @nightly large-model scenario as the other
+  # nightly lanes.
   e2e-wsl-nightly:
     name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, strix-halo, wsl]
+    # See e2e-wsl in e2e-selfhosted.yml: every job here is cold (fresh distro,
+    # fresh build, fresh prewarm) plus the ~5min/job distro-install overhead;
+    # conservative starting budget, tune down after a measured run.
+    timeout-minutes: 120
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
     env:
+      # wsl.exe emits UTF-16 by default; without this its own error/status text
+      # comes back mangled when captured through PowerShell. Matches the
+      # ubuntu/WSL composite action's own env.
+      WSL_UTF8: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
-      # The Strix lanes share one physical machine, so a TUI frame that renders
-      # well inside the 30s default on an idle runner can miss it while a sibling
-      # lane loads a model. Raise the wait budget rather than let that read as a
-      # product failure; a genuine hang still fails, just later.
+      # A freshly-provisioned pool host installing WSL2, a distro, and native
+      # build deps from scratch this run can leave a TUI frame that renders
+      # well inside the 30s default arriving late. Raise the wait budget rather
+      # than let that read as a product failure; a genuine hang still fails,
+      # just later.
       E2E_TUI_TIMEOUT_SECS: "90"
+      # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
+      # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
+      # guest's cargo build (wsl.exe doesn't share the calling process's
+      # environment, and the guest's own checkout is a detached-HEAD clone by
+      # SHA). Same fix this file's own docker build step already uses.
+      ROCM_CLI_RELEASE_REF: "${{ github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
+      # of these steps — this job mirrors it exactly, minus the scoped
+      # name_filter dispatch input this workflow doesn't have.
+      # See e2e-wsl's own comment: winget returns
+      # APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (0x8A15002B) rather than
+      # success when the package is already installed and up to date.
+      - name: Install WSL (pinned Microsoft.WSL)
+        shell: powershell
+        run: |
+          winget install --id Microsoft.WSL --exact --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+            Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          # See e2e-wsl in e2e-selfhosted.yml: GitHub's own PowerShell step
+          # wrapper fails on any left-over non-zero $LASTEXITCODE regardless
+          # of our own tolerant `if` above.
+          exit 0
+
+      - name: Install Ubuntu-24.04 distro
+        shell: powershell
+        run: |
+          # See e2e-wsl in e2e-selfhosted.yml: --shutdown first avoids
+          # wsl.exe's "the file cannot be accessed by the system" against a
+          # VM that is still mid-startup. It also tears down every WSL VM on
+          # the host, not just this job's -- safe only because the pool hands
+          # out one fresh, exclusive host per job; see that job's comment for
+          # the scoped fallback if the pool ever starts packing jobs.
+          wsl --shutdown
+          wsl --unregister Ubuntu-24.04 2>$null | Out-Null
+          wsl --install Ubuntu-24.04 --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::wsl --install Ubuntu-24.04 failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          wsl -d Ubuntu-24.04 -u root -- echo ok
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::distro did not come up after install"
+            exit $LASTEXITCODE
+          }
 
       # Fail fast and loudly if this job ever lands on a native Linux runner:
       # every WSL-tagged scenario would silently resolve to skip instead.
       - name: Verify the host really is WSL2
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1 for why this goes through a
+          # temp file rather than a pipe.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
             && [ -z "${WSL_DISTRO_NAME+x}" ] \
@@ -867,37 +968,44 @@ jobs:
             exit 1
           fi
           printf 'WSL kernel: %s\n' "$(uname -r)"
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The native Strix runners come pre-provisioned; a WSL distro often does
-      # not. Install the native build deps only when something is missing, and
-      # only if passwordless sudo is available — otherwise say what is missing
-      # instead of hanging on a password prompt.
       - name: Ensure native build deps
+        shell: powershell
         run: |
-          missing=""
-          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
-          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
-          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
-          if [ -z "$missing" ]; then
-            echo "native build deps present"
-          elif sudo -n true 2>/dev/null; then
-            echo "installing:$missing"
-            sudo -n apt-get update
-            # shellcheck disable=SC2086
-            sudo -n apt-get install -y $missing
-          else
-            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
-            exit 1
-          fi
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config build-essential libcap-dev git ca-certificates curl sudo
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Reclaim GPU from stray E2E processes
+      - name: Clone checkout into the WSL guest's native filesystem
+        shell: powershell
         run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+          # See .github/scripts/Invoke-WslBash.ps1.
+          $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
+          $script = @"
+          set -eo pipefail
+          rm -rf /root/work
+          mkdir -p /root/work
+          git clone --local '$winPath' /root/work/rocm-cli
+          cd /root/work/rocm-cli
+          git checkout --quiet '$sha'
+          "@
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script $script
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # NO librocdxg provisioning step here, deliberately — see the same note
+      # in e2e-wsl (e2e-selfhosted.yml): installing ROCDXG is the CLI's own job
+      # now, and a lane that pre-installed it would hand the @requires-wsl
+      # driver scenarios a host already in the state they exist to reach.
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
@@ -906,7 +1014,10 @@ jobs:
       # GPU that IS present but stays held by a leftover serve still fails, since
       # that would corrupt the serve scenarios' results.
       - name: GPU preflight (advisory bounded wait)
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
@@ -938,28 +1049,46 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
+          # No `-eo pipefail` here, unlike its siblings: this script's own
+          # empty-value guard above (`[ -z "$total" ] || [ -z "$used" ]`)
+          # relies on a non-matching `grep` in the pipeline being tolerated
+          # rather than aborting the script, so `rocm-smi` output this parser
+          # doesn't recognize retries instead of hard-failing the step.
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
       # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
       # the exact toolchain, installed on first cargo use. Idempotent.
       - name: Ensure Rust toolchain
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)
+        shell: powershell
         run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # See .github/scripts/Invoke-WslBash.ps1.
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd /root/work/rocm-cli
+
+          export CARGO_TARGET_DIR="/root/work/e2e-target"
+          export E2E_SHARED_CACHE_DIR="/root/work/e2e-shared"
           # Share ONE installed managed runtime across serve/chat scenarios and
           # PRE-WARM it in place (mirrors e2e-gpu-nightly-strix). Required for
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="/root/work/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -974,6 +1103,30 @@ jobs:
             cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 
           cargo xtask e2e
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Copy E2E results out of the WSL guest
+        if: always()
+        shell: powershell
+        run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
+          $script = @"
+          mkdir -p '$winPath/tests/e2e-cucumber/results'
+          if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then
+            cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
+          fi
+          "@
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script $script
+          # Best-effort per the step name: see e2e-wsl in e2e-selfhosted.yml.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::copy-out of E2E results exited $LASTEXITCODE (best-effort, not fatal)"
+          }
+          exit 0
 
       - name: Upload E2E report
         if: always()
@@ -981,6 +1134,17 @@ jobs:
         with:
           name: e2e-gpu-strix-wsl-report
           path: tests/e2e-cucumber/results/
+          # The copy-out step above is deliberately best-effort (it must not
+          # report red just because an earlier step already failed the job),
+          # so this is the only place left to catch a copy that failed for its
+          # own reason: default `warn` would upload nothing, and the
+          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
+          # omits any platform with no report.json rather than flagging it, so
+          # the lane would silently vanish from the report instead of showing
+          # as a failure. Only the WSL lanes need this: every other lane
+          # writes report.json directly in-job, with no extra guest-to-host
+          # copy step that can fail on its own.
+          if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the

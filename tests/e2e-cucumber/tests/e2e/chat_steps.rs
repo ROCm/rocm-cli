@@ -2,28 +2,21 @@
 //
 // SPDX-License-Identifier: MIT
 
-use std::time::Duration;
-
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::MockServer;
 
 use crate::E2eWorld;
 
-/// The prompt `chat-09` pipes on standard input. Shared by the `When` that
-/// writes it and the `Then` that identifies the request carrying it.
-const PIPED_PROMPT: &str = "Hello from standard input";
+/// The exact bytes `user_pipes_oneshot_chat` writes to the CLI's stdin. The
+/// leading indentation and the trailing space are content — a model reads them,
+/// the same as it would from `--prompt` — while the final newline is what
+/// `echo "…" |` appends, so only that may be stripped.
+const PIPED_PROMPT_STDIN: &str = "    Hello, indented and trailing-spaced \n";
 
-/// How long `chat-09` waits for the piped prompt to reach the mock.
-///
-/// Deliberately short, and deliberately not `default_timeout()`. The CLI has
-/// already run to completion by the time the assertion runs — the mock records
-/// a request before the CLI can receive its response — so nothing can arrive
-/// later than the process exit that already happened. There is no cold start to
-/// absorb here, which is what the 30s waits elsewhere exist for; those poll a
-/// live TUI. Until the stdin defect is fixed no request comes at all, so this
-/// budget is spent in full on every mock-lane run, and a larger one would buy
-/// no additional safety.
-const PIPED_PROMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// `PIPED_PROMPT_STDIN` minus the one line ending the writer appended: what the
+/// CLI must send byte for byte, so a piped prompt equals the same text passed
+/// with `--prompt`. Kept next to the input so the two cannot drift apart.
+const PIPED_PROMPT_SENT: &str = "    Hello, indented and trailing-spaced ";
 
 // ── Given ──────────────────────────────────────────────────────────
 
@@ -98,23 +91,23 @@ async fn user_sends_oneshot_chat(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[when("the user pipes a chat prompt to the CLI")]
-async fn user_pipes_chat_prompt(world: &mut E2eWorld) {
-    // Keep --model explicit: this scenario pins the stdin contract, not the
-    // default-model discovery defect covered separately by EAI-8009.
+#[when("the user pipes a one-shot chat prompt through the CLI")]
+async fn user_pipes_oneshot_chat(world: &mut E2eWorld) {
+    // Drive `rocm chat` with the prompt on stdin and no `--prompt`, matching the
+    // documented `echo "…" | rocm chat` path. `run_rocm_with_stdin` pipes stdin,
+    // so the child sees a non-terminal stdin and must read the prompt from it.
+    // Passing the served model id avoids depending on default-model resolution.
+    // The prompt carries indentation, a trailing space, and the newline `echo`
+    // adds, so the `Then` step can prove which of those the CLI forwards.
     let model = world.model_name.clone().expect("no model name set");
     let (stdout, stderr, rc) = crate::run_rocm_with_stdin(
         world,
         &["chat", "--provider", "local", "--model", &model],
-        &format!("{PIPED_PROMPT}\n"),
+        PIPED_PROMPT_STDIN,
         &[],
     );
-    assert_eq!(
-        rc, 0,
-        "piped rocm chat failed (rc={rc}):\n{stdout}\n{stderr}"
-    );
+    assert!(rc == 0, "rocm chat failed (rc={rc}):\n{stdout}\n{stderr}");
     world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -154,58 +147,6 @@ async fn assert_chat_successful(world: &mut E2eWorld) {
     );
 }
 
-/// The newest user-role message in a chat request body.
-///
-/// Reads the LAST user turn rather than assuming index 0: a correct fix is free
-/// to prepend a system prompt, and pinning `messages[0]` would keep this row
-/// xfailed against exactly that valid behaviour. Same shape as the managed-chat
-/// assertion in `dash_steps.rs`.
-fn last_user_message(body: &serde_json::Value) -> Option<&str> {
-    body.get("messages")?
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))?
-        .get("content")?
-        .as_str()
-}
-
-#[then("the CLI sends the piped prompt to the model")]
-async fn assert_piped_prompt_sent(world: &mut E2eWorld) {
-    // This is the load-bearing assertion. Today the command still exits 0 and
-    // prints an assistant status summary, but the mock receives no completion
-    // at all. Waiting for the actual request prevents any future incidental
-    // output from making the scenario pass for the wrong reason.
-    //
-    // Matched on content rather than taking whichever body landed first: only
-    // the newest request is retained, and a local endpoint check is itself a
-    // chat request ("Say ok."). `rocm chat` does not issue one on this path
-    // today, but if it ever did, waiting for any request at all would let this
-    // row fail for an unrelated reason and never go stale. Membership, not
-    // equality, so a prompt that arrives altered still reaches the assertion
-    // below and reports what was wrong with it.
-    let request = world
-        .mock
-        .as_ref()
-        .expect("no mock server running")
-        .wait_for_chat_request_where(PIPED_PROMPT_TIMEOUT, |body| {
-            last_user_message(body).is_some_and(|content| content.contains(PIPED_PROMPT))
-        })
-        .await
-        .unwrap_or_else(|e| panic!("the piped prompt never reached the model: {e}"));
-    let user_content = last_user_message(&request)
-        .unwrap_or_else(|| panic!("no user message in chat request:\n{request}"));
-    // Compare trimmed: the step pipes a trailing newline (as a shell pipeline
-    // does), and forwarding stdin verbatim is a perfectly correct fix. Demanding
-    // the exact untrimmed string would keep this row xfailed against exactly
-    // that behaviour — the stale-row failure mode this file sets out to avoid.
-    assert_eq!(
-        user_content.trim(),
-        PIPED_PROMPT,
-        "the model received the wrong prompt: {request}"
-    );
-}
-
 #[then("the CLI prints the assistant's reply")]
 async fn assert_cli_prints_reply(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no chat CLI output");
@@ -216,6 +157,38 @@ async fn assert_cli_prints_reply(world: &mut E2eWorld) {
     assert!(
         output.contains("mock response"),
         "chat CLI output does not contain the assistant reply:\n{output}"
+    );
+}
+
+#[then("the model receives the piped prompt with its whitespace intact")]
+async fn piped_chat_request_kept_whitespace(world: &mut E2eWorld) {
+    // The canned reply never varies with the prompt, so printing it proves only
+    // that stdin reached the send path, not that it arrived unaltered — trimming
+    // the piped text would still pass. Assert on the request the mock recorded:
+    // the model must see the piped prompt byte for byte, minus the single line
+    // ending the writer appended. The CLI process has already exited by now and
+    // the mock records the body before it answers, so the snapshot is final and
+    // needs no polling.
+    let body = world
+        .mock
+        .as_ref()
+        .expect("no mock server running")
+        .last_chat_request()
+        .unwrap_or_else(|| panic!("the mock never received a chat request"));
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("chat request had no messages array:\n{body}"));
+    let last_user_content = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("no user message found in chat request:\n{body}"));
+    assert_eq!(
+        last_user_content, PIPED_PROMPT_SENT,
+        "the piped prompt reached the model altered; full request:\n{body}"
     );
 }
 

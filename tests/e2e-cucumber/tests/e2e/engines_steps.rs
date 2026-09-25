@@ -128,10 +128,12 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
 
     let screen = session.screen_text();
+    // `$` for a normal user's prompt, `#` for root's -- this suite runs as root
+    // on the WSL2 hardware lane, so both are genuine prompt lines.
     let on_a_prompt_line = screen
         .lines()
         .filter(|line| line.contains(&marker))
-        .any(|line| line.contains('$'));
+        .any(|line| line.contains('$') || line.contains('#'));
     assert!(
         on_a_prompt_line,
         "the marker never reached a prompt line:\n{screen}"

@@ -127,7 +127,7 @@ async fn setup_active_runtime(world: &mut E2eWorld) {
     world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk"]);
+        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     } else {
         activate_shared_runtime_if_unset(world, &stdout);
     }
@@ -153,7 +153,14 @@ async fn setup_runtime_with_engine(world: &mut E2eWorld) {
     world.use_shared_runtimes();
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk"]);
+        // `--yes` for the same reason the sibling `a managed runtime is active`
+        // passes it: the harness spawns `rocm` with null stdin, so anything the
+        // consent gate does not read as an install with no active default
+        // refuses rather than prompts. `installed: none` no longer implies that
+        // on its own — the gate now keys on the config's active default, and a
+        // shared tree can carry one from a scenario that ran earlier — so the
+        // flag is load-bearing here, not just defensive.
+        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     } else {
         activate_shared_runtime_if_unset(world, &stdout);
     }
@@ -205,8 +212,10 @@ async fn user_installs_sdk(world: &mut E2eWorld) {
     // opt-out is one — without the Gherkin naming an environment variable. The
     // exit code is still asserted here, with the same diagnostic bundle
     // `run_rocm_ok` prints: an install that failed leaves every Then behind it
-    // reading output that was never produced.
-    let args = ["install", "sdk"];
+    // reading output that was never produced. `--yes` keeps the install
+    // non-interactive-safe: the e2e harness runs with null stdin, so the consent
+    // prompt would otherwise refuse rather than proceed.
+    let args = ["install", "sdk", "--yes"];
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
     assert!(
         rc == 0,
@@ -214,6 +223,65 @@ async fn user_installs_sdk(world: &mut E2eWorld) {
         e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
     );
     world.cli_output = Some(stdout);
+}
+
+#[when("the user reinstalls the SDK without confirming")]
+async fn user_reinstalls_sdk_without_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["install", "sdk"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user reinstalls the SDK with --yes")]
+async fn user_reinstalls_sdk_with_yes(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
+    world.cli_output = Some(stdout);
+}
+
+/// TheRock package families this step may ask for, in preference order. Real
+/// published names, not placeholders: an unknown family is rejected during
+/// resolution, which would exit non-zero for a reason that has nothing to do
+/// with the consent gate and would still satisfy "the reinstall is refused".
+/// Each is published as a `therock-dist-linux-<family>-<version>.tar.gz` in the
+/// canonical release tarball catalog, for the same reason: an artifact the
+/// catalog does not carry fails resolution short of the gate.
+const OTHER_FAMILY_CANDIDATES: &[&str] = &["gfx110X-all", "gfx120X-all", "gfx94X-dcgpu"];
+
+#[when("the user installs a different GPU family without confirming")]
+async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
+    // Pick a family the active runtime is not, rather than hard-coding one:
+    // this lane's GPU decides what the `Given` installed, and naming that same
+    // family would silently collapse this scenario into Scenario runtime-11.
+    // Matching is against the whole `runtimes list` text, which prints a
+    // case-preserving `family=` column — the runtime key alone would not do,
+    // since it is lowercase-slugified and would never match `gfx110X-all`.
+    let (runtimes, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let family = OTHER_FAMILY_CANDIDATES
+        .iter()
+        .find(|candidate| !runtimes.contains(*candidate))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!("no candidate family differs from the installed runtimes:\n{runtimes}")
+        });
+    // `--format tarball`, because the wheel path cannot reach the consent gate
+    // with another family's name on a host that has a GPU. The wheel install
+    // composes its device payload from the target this host reports, and it
+    // validates that target against the resolved family *before* the gate
+    // (deliberately: an install that cannot work has to say so rather than first
+    // demand a consent flag for it). So `--family gfx110X-all` on a gfx942 host
+    // stops at "detected GPU target `gfx942` belongs to family `gfx94X-dcgpu`"
+    // and never reaches the displacement this scenario is about. The tarball
+    // path resolves the archive for the family it was given and consults no
+    // host target at all, so it reaches the same gate — the one call to
+    // `active_default_runtime_relation` shared by both formats — with a family
+    // the host has genuinely never held. The refusal still costs only the
+    // catalog listing: it bails before the multi-GiB archive is fetched.
+    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
 }
 
 #[when("the user installs the SDK again")]
@@ -414,6 +482,162 @@ async fn assert_device_health_reported(world: &mut E2eWorld) {
             "the install reported `{unusable}` and exited 0 anyway:\n{output}"
         );
     }
+}
+
+/// Record the Lemonade backend-alignment opt-out for this scenario's next
+/// `rocm` command. Mirrors `setup_torch_alignment_opt_out` above.
+#[given("the user has opted out of realigning Lemonade's backend")]
+async fn setup_lemonade_backend_alignment_opt_out(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT", "1".into()));
+}
+
+/// `--reinstall` re-extracts the packaged embeddable, which resets
+/// `backend_versions.json` to its pinned defaults -- so this fires the
+/// alignment's Tier 1/Tier 2/revert state machine deterministically every time,
+/// even against a shared runtime tree where an earlier scenario already left
+/// Lemonade's backend aligned (in which case a plain, non-forcing install would
+/// find nothing left to do and print no alignment line at all).
+///
+/// Goes through `run_rocm_with_scenario_env` (not `run_rocm_ok`) so a Given can
+/// attach the alignment opt-out to this invocation, and keeps stderr so a Then
+/// can read the opt-out's own explanation of why it skipped.
+#[when("the user reinstalls the lemonade engine")]
+async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
+    let args = ["engines", "install", "lemonade", "--reinstall"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+}
+
+/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
+/// install's version does not match Lemonade's packaged pin, Tier 1's install
+/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
+/// build succeeds -- producing exactly this line. This is the one part of the
+/// alignment path with no other e2e coverage: the unit tests exercise the
+/// Tier 1/Tier 2/revert state machine directly (against injected install/align
+/// steps), but nothing else asserts that `rocm engines install lemonade`
+/// actually surfaces the outcome to the user.
+#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
+async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output
+            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
+        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+    );
+}
+
+/// The CLI names the variable whenever it is set, so a user can tell it was
+/// read -- this alone does not prove alignment was actually skipped.
+///
+/// The announcement now fires unconditionally as the first thing
+/// `prepare_llamacpp_backend_for_active_rocm` does when the variable is set,
+/// before any of the not-Linux/no-SDK-version/unreadable-pin/pin-matches
+/// skips run, so it can no longer distinguish "the opt-out was honoured"
+/// from "the variable was set and alignment ran anyway". That guarantee is
+/// proven elsewhere: the crate's own unit tests --
+/// `prepare_disabled_early_return_skips_every_lookup_and_installs_unforced`
+/// gates the real production early return on every per-PR and merge-queue
+/// lane, and `align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps`
+/// pins the state machine's own half of the contract -- and the sibling
+/// `the packaged pin survives the install` step below (its `Aligned …` /
+/// `could not align …` absence checks, run on the gated e2e lane).
+#[then("the CLI reports that Lemonade's backend alignment was skipped by the opt-out")]
+async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_deref().expect("no install stderr");
+    assert!(
+        stderr.contains("ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT"),
+        "the skipped alignment does not name the variable that skipped it:\n{stderr}"
+    );
+}
+
+/// The `version=` field on the active runtime's line in `rocm runtimes list`
+/// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
+///
+/// Read independently of Lemonade's own reporting, on purpose: this is the
+/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
+/// rewritten to match it, so it must not come from anything alignment itself
+/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// branch -- that surface is a different, later change).
+fn active_runtime_version(world: &E2eWorld) -> String {
+    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with('*'))
+        .and_then(|line| line.split_once("version="))
+        .map_or_else(
+            || panic!("no active runtime line with a version= field:\n{stdout}"),
+            |(_, rest)| rest.split_whitespace().next().unwrap_or_default(),
+        )
+        .to_owned()
+}
+
+/// The packaged pin was not rewritten.
+///
+/// Reads `resources/backend_versions.json` inside the runtime tree the install
+/// itself reports (`env_path:`) and compares it against the active runtime's
+/// own version (from `rocm runtimes list`, not from anything Lemonade's
+/// alignment reports), rather than inferring the outcome from an absent log
+/// line alone. Both checks matter: the revert path can fail to restore the
+/// pin (best-effort, matching its sibling warnings) while still printing no
+/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// failed-restore from an honestly untouched pin -- hence also checking for
+/// the revert path's own "could not align ... reverting" warning, which does
+/// fire whenever a restore was attempted. `--reinstall` (the When's own
+/// mechanism) always re-extracts the packaged embeddable first, and the
+/// disabled gate returns before any write to `backend_versions.json` at all
+/// (see `prepare_llamacpp_backend_for_active_rocm_impl`'s early return, the
+/// real production enforcement point), so the llama.cpp tag limb of the same
+/// file is provably untouched whenever both checks below hold -- both Tier 2
+/// and the revert path's own restore write sit behind that same gate.
+#[then("the packaged pin survives the install")]
+async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    assert!(
+        !output.contains("Aligned Lemonade's ROCm") && !stderr.contains("Aligned Lemonade's ROCm"),
+        "the backend was realigned even though the user opted out:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("could not align Lemonade's ROCm backend to"),
+        "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
+    );
+
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let pinned_version = parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
+
+    let active_version = active_runtime_version(world);
+    assert_ne!(
+        pinned_version, active_version,
+        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
+         opted out"
+    );
 }
 
 /// The engine inventory reports a usable engine runtime.
@@ -680,6 +904,23 @@ async fn assert_runtime_active(world: &mut E2eWorld) {
     );
 }
 
+#[then("the install reports that --yes approved replacing the existing runtime")]
+async fn assert_install_reported_yes_approval(world: &mut E2eWorld) {
+    // The registered-and-active Thens are true from the `Given` alone, so they
+    // cannot tell an approved reinstall from a no-op. This asserts the approved
+    // branch was actually taken: with `--yes` the gate resolves to
+    // `ProceedApproved(AssumeYes)`, whose only externally visible signal is this
+    // line. The `Approved by --yes:` prefix is what discriminates — the
+    // fresh-install line ("No active ROCm SDK runtime is configured") does not
+    // carry it, so if `--yes` regressed to a refusal, or the install silently
+    // took the fresh path, this fails.
+    let output = world.cli_output.as_deref().expect("no install output");
+    assert!(
+        output.contains("Approved by --yes: an existing ROCm SDK is the active default runtime"),
+        "reinstall with --yes did not report the approved replacement:\n{output}"
+    );
+}
+
 #[then("the runtime includes an inference engine")]
 async fn assert_runtime_has_stack(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
@@ -827,6 +1068,59 @@ async fn assert_adopt_error_explains(world: &mut E2eWorld) {
     );
 }
 
+#[then("the reinstall is refused")]
+async fn assert_reinstall_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command was run");
+    assert!(
+        rc != 0,
+        "install sdk unexpectedly succeeded without consent"
+    );
+}
+
+#[then("the error explains how to approve the replacement non-interactively")]
+async fn assert_reinstall_error_explains_consent(world: &mut E2eWorld) {
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    // The narrow flag first, because this message is what a script or CI job
+    // reads: it is the whole consent needed here, while `--yes` would also
+    // approve a `sudo` system-package install whose password prompt an
+    // unattended caller cannot answer.
+    let narrow = combined
+        .find("--approve-replacing-active-default")
+        .unwrap_or_else(|| {
+            panic!("error does not name the narrow consent flag:\n{stdout}\n{stderr}")
+        });
+    let yes = combined
+        .find("--yes")
+        .unwrap_or_else(|| panic!("error does not still explain --yes:\n{stdout}\n{stderr}"));
+    assert!(
+        narrow < yes,
+        "error recommends --yes ahead of the narrow flag:\n{stdout}\n{stderr}"
+    );
+}
+
+#[then("the error names the active default runtime it would replace")]
+async fn assert_error_names_active_default(world: &mut E2eWorld) {
+    // What distinguishes the consent gate from any other non-zero exit that
+    // happens to print `--yes` in a usage line: only the gate reports the
+    // runtime it is about to displace, and for a family the host has never
+    // installed it must report the *active default* rather than claiming no SDK
+    // exists. Without this Then, a family the resolver rejected outright would
+    // satisfy the scenario.
+    let stdout = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("is the active default runtime"),
+        "error does not name the active default runtime it would replace:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        combined.contains("replaces active default"),
+        "error does not describe the cross-family displacement:\n{stdout}\n{stderr}"
+    );
+}
+
 #[when("the user asks for rollback help")]
 async fn ask_rollback_help(world: &mut E2eWorld) {
     let stdout = crate::run_rocm_ok(world, &["runtimes", "rollback", "--help"]);
@@ -839,5 +1133,132 @@ async fn rollback_help_states_limit(world: &mut E2eWorld) {
     assert!(
         out.contains("rollback has no history"),
         "expected `rocm runtimes rollback --help` to state the single-level limit, got:\n{out}"
+    );
+}
+
+#[when("the user asks for SDK install help")]
+async fn ask_install_sdk_help(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["install", "sdk", "--help"]);
+    world.cli_output = Some(stdout);
+}
+
+#[then("the help offers a consent flag that does not approve system-package installs")]
+async fn install_sdk_help_separates_consents(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        out.contains("--approve-replacing-active-default"),
+        "expected `rocm install sdk --help` to offer the narrow consent flag, got:\n{out}"
+    );
+    // The distinction is the point: without it a script author reads the flag as
+    // a synonym for `--yes` and reaches for `--yes`, which on a host without
+    // passwordless sudo raises a password prompt the script cannot answer.
+    assert!(
+        out.contains("does not approve system-package installs"),
+        "expected `rocm install sdk --help` to say the narrow flag excludes system-package installs, got:\n{out}"
+    );
+}
+
+/// Point the CLI at an interpreter that does not exist, so `install sdk` fails
+/// on its very first step.
+///
+/// A behavioural precondition, not a mechanism the feature file names — the same
+/// idiom as the torch-alignment opt-out above. Scenario runtime-15 asserts on the
+/// two sections `rocm --yes <request>` prints *before* it dispatches, and on the
+/// GPU lanes the request it sends resolves to a real multi-GiB SDK install. This
+/// makes `resolve_python_launcher` bail: offline, instantly, writing nothing, and
+/// after the header is already on stdout.
+#[given("the CLI cannot reach a usable Python")]
+async fn setup_unusable_python(world: &mut E2eWorld) {
+    let missing = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("no-such-python");
+    world
+        .command_env
+        .push(("ROCM_CLI_PYTHON", missing.into_os_string()));
+}
+
+#[when("the user approves a natural-language SDK install with --yes")]
+async fn user_approves_freeform_sdk_install(world: &mut E2eWorld) {
+    // A prefix inside the scenario's own temp root, so the words that make this a
+    // high-confidence `install sdk` plan cannot name a folder outside it even if
+    // the Given ever stops stopping the install.
+    let prefix = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("freeform-therock")
+        .to_string_lossy()
+        .into_owned();
+    let request = format!("install the latest TheRock nightly for this GPU into {prefix}");
+    // `run_rocm`, not `run_rocm_ok`: the Given guarantees the dispatched install
+    // fails, and the exit code is not what this scenario is about.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["--yes", &request]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The `request plan` and `execution` halves of `rocm --yes <request>` output.
+///
+/// Split rather than searched whole because both sections print a `note:` line
+/// and a `tool_call:` line; asserting against the full text would let a match in
+/// the wrong section satisfy the wrong claim.
+fn freeform_plan_and_execution(world: &E2eWorld) -> (String, String) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    let (plan, execution) = out
+        .split_once("\nexecution\n")
+        .unwrap_or_else(|| panic!("no `execution` section in the freeform output:\n{out}"));
+    (plan.to_owned(), execution.to_owned())
+}
+
+#[then("the request plan shows an install command carrying no replacement consent")]
+async fn assert_freeform_plan_is_unapproved(world: &mut E2eWorld) {
+    let (plan, _) = freeform_plan_and_execution(world);
+    assert!(
+        plan.contains("tool_call: rocm install sdk"),
+        "expected the request plan to propose an SDK install, got:\n{plan}"
+    );
+    // The reviewable command a plain `rocm <request>` prints is this same render,
+    // so a consent flag reaching it would hand a human a pre-approved command.
+    assert!(
+        !plan.contains("--approve-replacing-active-default"),
+        "the request plan must stay unapproved, got:\n{plan}"
+    );
+}
+
+#[then("the executed command carries the replacement consent")]
+async fn assert_freeform_execution_is_approved(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    // The `tool_call:` line alone, not the whole section: the disclosure note
+    // below it quotes `--yes`, so a section-wide search could not tell a consent
+    // flag on the command from a mention of one in prose.
+    let executed = execution
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("tool_call: "))
+        .unwrap_or_else(|| panic!("no executed tool_call in:\n{execution}"));
+    assert!(
+        executed.starts_with("rocm install sdk")
+            && executed.contains("--approve-replacing-active-default"),
+        "expected the executed command to carry the narrow consent, got `{executed}`"
+    );
+    // Never `--yes`: this surface spawns with no terminal on which to answer the
+    // sudo password prompt a system-package install can raise.
+    assert!(
+        !executed.split_whitespace().any(|arg| arg == "--yes"),
+        "the executed command must not carry `--yes`, got `{executed}`"
+    );
+}
+
+#[then("the execution section says the consent came from the user's --yes")]
+async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    assert!(
+        execution.contains("was added here from your --yes"),
+        "the operator is shown a consent flag the plan above did not carry, with \
+         nothing saying where it came from:\n{execution}"
     );
 }

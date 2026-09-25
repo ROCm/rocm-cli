@@ -21,56 +21,98 @@ The AMD WSL path is:
 3. ROCDXG (`librocdxg`) installed inside WSL.
 4. A TheRock runtime installed by `rocm-cli` into a managed Python venv.
 
-Useful read-only preflight:
+Useful read-only preflight, from inside the distro:
 
 ```bash
-python scripts/wsl_preflight.py
-python scripts/wsl_preflight.py --json
-python scripts/wsl_preflight.py --require-ready
+rocm diagnose
+rocm diagnose --json
 ```
 
-From Windows PowerShell, target a specific distro:
+From Windows PowerShell, inspect a distro without installing anything in it:
 
 ```powershell
-python scripts\wsl_preflight.py --distro Ubuntu
+rocm diagnose --distro          # the only distro installed
+rocm diagnose --distro Ubuntu   # a named one
 ```
+
+The host-side form collects the facts over `wsl.exe` and runs the same catalog.
+It needs no `rocm-cli`, and no Python, inside the target distro — which is the
+point, since the distro being checked is usually the one that is not set up yet.
+
+It sees less than a run from inside, so prefer the in-distro form where you can:
+
+- It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
+  cannot honour a `$ROCM_PATH` pointing elsewhere. `wsl.exe --exec` runs a
+  non-login, non-interactive shell, so nothing exported from a shell profile is
+  set.
+- For the same reason it collects no environment, so the checks that read one —
+  `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework/ROCm version pairing —
+  do not run. It reports on the WSL GPU stack, not on the whole installation.
 
 ## Install ROCDXG In WSL
 
-Install build/runtime prerequisites:
+Use the CLI:
+
+```bash
+rocm install driver            # print the plan
+rocm install driver --yes      # run it
+```
+
+On WSL2 this installs ROCDXG rather than Linux DKMS — there is no in-tree
+amdgpu driver to build, because the GPU comes from the Windows host driver
+through `/dev/dxg`. The plan is printed for review first and only runs with
+`--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
+touching anything, installs the release package, runs `ldconfig`, and then
+verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
+No reboot is needed: ROCDXG is userspace.
+
+Confirm afterwards with `rocm examine`, which should report
+`driver_status: wsl_rocdxg_ready`.
+
+The download is verified before it is installed. `rocm install driver` carries a
+SHA-256 digest for each published ROCDXG release and checks the `.deb` against
+it; on a mismatch the plan stops before `apt install` runs the package's
+maintainer scripts as root. Nothing needs to be set for this.
+
+To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
+Because rocm-cli has no digest for a release it predates, supply one:
+
+```bash
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
+```
+
+`ROCM_CLI_ROCDXG_SHA256` also overrides the pinned digest for a known version.
+If you genuinely want to install without verifying, that has to be said out
+loud — the plan then prints a warning naming the version it is not checking:
+
+```bash
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1 rocm install driver --yes
+```
+
+Without one of those, an unpinned version is refused rather than installed
+unverified.
+
+### Doing it by hand
+
+The equivalent manual steps, for reference or for a host where the CLI is not
+installed yet. The `sha256sum -c` line is the same trust anchor `rocm install
+driver` uses — `apt install` runs the package's maintainer scripts as root, so
+do not skip it. The digest below is the one rocm-cli pins for 1.2.2; for a
+different release, take the digest published with it:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl git cmake build-essential python3 python3-venv
-```
-
-Preferred package install for the current public release:
-
-```bash
-curl -L -o /tmp/rocdxg-roct_1.2.0_amd64.deb \
-  https://github.com/ROCm/librocdxg/releases/download/v1.2.0/rocdxg-roct_1.2.0_amd64.deb
-sudo apt install -y /tmp/rocdxg-roct_1.2.0_amd64.deb
+sudo apt-get install -y ca-certificates curl
+curl -L -o /tmp/rocdxg-roct_1.2.2_amd64.deb \
+  https://github.com/ROCm/librocdxg/releases/download/v1.2.2/rocdxg-roct_1.2.2_amd64.deb
+printf '%s  %s\n' \
+  28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541 \
+  /tmp/rocdxg-roct_1.2.2_amd64.deb | sha256sum -c -
+sudo apt install -y /tmp/rocdxg-roct_1.2.2_amd64.deb
 sudo ldconfig
 ```
-
-From this repo inside WSL, the same supported path is wrapped as:
-
-```bash
-bash scripts/wsl_setup_rocdxg.sh
-python scripts/wsl_preflight.py --require-ready
-```
-
-To require checksum verification before installing the downloaded `.deb`, set
-`ROCDXG_SHA256` to the trusted 64-character SHA-256 digest for that exact
-ROCDXG package:
-
-```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
-```
-
-The wrapper intentionally does not guess or embed a production checksum. If
-`ROCDXG_SHA256` is set and the downloaded package does not match, installation
-stops before `apt install`.
 
 Source-build alternative:
 
@@ -127,19 +169,77 @@ For `rocm-cli`, the command itself should resolve the managed runtime manifest
 and apply that environment before launching HIP apps such as Lemonade's bundled
 `llama.cpp` backend. Users should not have to hand-export these values.
 
-## Examine And Install UX Recommendations
+## Diagnosing A WSL Host
 
-`rocm examine` should detect WSL cheaply and report:
+`rocm diagnose` carries a WSL catalog, separate from the bare-metal Linux one.
+The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
+never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
+naming one would send you after a fault that cannot exist on this platform.
+
+```bash
+rocm diagnose
+rocm diagnose --json
+```
+
+This catalog replaces the standalone preflight script this repo used to ship;
+it does not carry over that script's `--require-build-tools` flag or its
+Python venv-tooling check, so a distro missing only build tools or `venv`
+support reports clean here.
+
+The WSL entries, in the order a broken stack usually reveals them:
+
+| Fix id | Reported when |
+| --- | --- |
+| `fix-wsl-7-wsl1` | The distro runs under WSL 1, which has no GPU path at all |
+| `fix-wsl-1-gpu-not-exposed` | `/dev/dxg` is missing. Names which of the three causes applies: a container started without the device, a distro with no WSL GPU support wired in, or the Windows host driver |
+| `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
+| `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
+| `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
+| `fix-wsl-5-distro-too-old` | The distro release is below the floor in the prerequisites above |
+| `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
+
+One entry outside this list also applies here. `fix-19-shm-too-small` is not a
+WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
+serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
+can meet it on an otherwise healthy stack. Its guidance names the container and
+bare-metal cases; under WSL2 the remedy is the host one, remounting `/dev/shm`
+larger and adding the matching `/etc/fstab` line inside the distro.
+
+Every WSL remedy is print-only. `rocm fix <id>` shows the commands and does not
+run them: they either install packages with `sudo`, edit loader configuration, or
+belong to the Windows host, and none of that meets the bar the four
+auto-applicable fixes clear.
+
+Two deliberate silences, so a report can be trusted:
+
+- `fix-wsl-6` **abstains** when WSL interop cannot reach the Windows host, rather
+  than reading "could not ask" as "driver is too old". Inside a container, or
+  with interop switched off, the host driver is reported as unknown and no
+  finding blames it.
+- `fix-wsl-5` **abstains** when the distro release cannot be parsed. An
+  unreadable release is not evidence of a supported one, but it is not evidence
+  of an old one either.
+
+## What `rocm examine` Reports On WSL
+
+`rocm examine` detects WSL cheaply and reports:
 
 - `wsl: true`
-- WSL distro/version
+- WSL distro/version, and whether the release clears the supported floor
+- WSL major version (1 or 2)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
-- `/opt/rocm/lib/librocdxg.so` presence
+- `librocdxg.so` presence, resolved across every ROCm install rather than
+  assuming `/opt/rocm`
 - `librocdxg` linker-cache visibility from `ldconfig -p`
-- `rocminfo` from the active TheRock runtime after activation
-- whether `HSA_ENABLE_DXG_DETECTION` is needed or set
+- the Windows host AMD driver version, when WSL interop can reach the host
+- whether `HSA_ENABLE_DXG_DETECTION` is set
 - managed TheRock runtime count and active/default runtime
+
+The driver, device-node and group probes stay skipped, so `has_amd_gpu` and
+`gpus` describe the bare-metal view and are not populated here.
+
+## Install UX Recommendations
 
 `rocm install sdk` inside WSL should:
 
@@ -164,9 +264,9 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 Safe tests that do not mutate global WSL state:
 
-- `python scripts/wsl_preflight.py --self-test`
-- `python scripts/wsl_preflight.py --json`
-- `python scripts/wsl_preflight.py --require-ready` on a prepared WSL machine
+- `rocm diagnose --json`
+- `rocm diagnose --distro <name>` from the Windows host
+- `cargo test -p rocm-core wsl` for the catalog's own tests
 - `rocm install sdk --channel release --format wheel --dry-run` inside WSL with
   isolated `ROCM_CLI_*` directories
 

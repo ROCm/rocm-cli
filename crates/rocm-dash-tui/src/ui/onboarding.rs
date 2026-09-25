@@ -18,9 +18,11 @@
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
 //! first-run auto-trigger + `onboarding_dismissed` persistence, and the frozen
 //! flow's post-install `reconcile_onboarding_engine_preference` are documented
-//! fast-follows — this overlay is additive and key-triggered (`n`), so it never
-//! touches the frozen tui.rs first-run gate. Both paths run through the approval
-//! gate and the job-bridge — zero `std::thread::spawn`/`try_recv`.
+//! fast-follows — this overlay is additive and opens only via the explicit
+//! `n` key on the Observe tab (or explicit `Focus::Setup` selection); no
+//! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
+//! it. Both paths run through the approval gate and the job-bridge — zero
+//! `std::thread::spawn`/`try_recv`.
 
 use std::path::Path;
 
@@ -190,6 +192,12 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         cfg.channel.as_arg().to_string(),
         "--format".to_string(),
         "wheel".to_string(),
+        // Onboarding installs are spawned with null stdin, so a would-be
+        // consent prompt cannot be answered and the install would refuse. This
+        // keeps the first-run install non-interactive. Deliberately not `--yes`,
+        // which would also approve a `sudo` system-package install this spawn
+        // has no terminal to answer.
+        "--approve-replacing-active-default".to_string(),
     ];
     let pin = cfg.pin_value.trim();
     if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
@@ -210,6 +218,17 @@ pub struct PendingOnboard {
 }
 
 /// Overlay state. `None` on `AppState` means the wizard is closed.
+///
+/// Any new nested sub-view field (like `browser` or `install_config`) added
+/// here must also be listed in `active_overlay_at_root`'s onboarding clause
+/// in `app/mod.rs` — that hand-maintained enumeration is what tells the
+/// shared Esc back-out path not to eject the whole wizard while a sub-view
+/// has focus. The same applies to every other manager-state struct that
+/// clause enumerates (`serve_wizard`, `install_manager`, `runtime_manager`,
+/// `engine_manager`, `services`, `update_manager`, `config_manager`, ...).
+/// `app::tests::active_overlay_at_root_enumeration_is_exhaustive` destructures
+/// every one of those structs without `..`, so forgetting this fails to
+/// compile rather than silently mis-gating Esc.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
@@ -671,7 +690,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "default Release path must stay byte-identical to the pre-toggle args"
         );
@@ -918,7 +938,8 @@ mod tests {
                 "--channel",
                 "nightly",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ]
         );
     }
@@ -948,6 +969,7 @@ mod tests {
                 "nightly",
                 "--format",
                 "wheel",
+                "--approve-replacing-active-default",
                 "--build-date",
                 "2026-06-05"
             ]
@@ -983,7 +1005,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "an empty pin must not add a flag"
         );

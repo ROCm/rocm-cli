@@ -26,7 +26,25 @@ Feature: Automation watchers
     When the user tries to enable a watcher that does not exist
     Then the CLI refuses and names it as unknown
 
-  # Scenarios 1-3 enable a watcher by an id the test already knows. This one pins
+  # Autostart daemon singleton (EAI-7194): the first `automations enable` (or
+  # `serve`) that finds no running daemon spawns one, but the child does not
+  # publish its `running` runtime state until well after `spawn()` (clap parse,
+  # runtime build, config load, banner flush). A second invocation that lands in
+  # that spawn→publish window re-reads "not running" and — before the fix — spawned
+  # a duplicate daemon that orphaned the first. The autostart claim (child PID +
+  # spawn time, written under the lock before it drops) closes the window: a caller
+  # that sees a live, recent claim defers instead of spawning. This plants an
+  # in-flight claim (no published runtime state yet) and asserts the enable defers
+  # rather than launching a second daemon. Config-only — no GPU or network — so it
+  # runs on the mock lane every PR, which is why the race half of the PR can be
+  # covered without hardware.
+  @id:automations-autostart-defers-during-spawn-window @requires-os:linux
+  Scenario: automations-04 - Enabling during an in-flight daemon spawn starts no second daemon
+    Given a daemon spawn is already in flight
+    When the user enables an automation watcher in observe mode
+    Then the CLI does not start a second background daemon
+
+  # The scenarios above enable a watcher by an id the test already knows. This one pins
   # the complementary contract: the listing is the only place a user learns which
   # background checks exist, so whatever it shows has to be enough to act on.
   # Deriving each check's identifier from the listing the way a reader would IS
@@ -34,7 +52,7 @@ Feature: Automation watchers
   # the scenario or the steps, because hard-coding them would pass against a
   # listing that exposes nothing. No fixtures, no GPU, no network.
   @id:automations-listed-checks-can-be-enabled
-  Scenario: automations-04 - Every background check that is listed can be turned on
+  Scenario: automations-05 - Every background check that is listed can be turned on
     Given a machine with no background checks turned on
     When the user lists the background checks
     Then every listed check can be turned on by name
