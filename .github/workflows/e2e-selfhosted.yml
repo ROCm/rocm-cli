@@ -431,11 +431,14 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # `<POOL> Total [Used ]Memory (B): <n>`, last GPU's row wins. The
-          # trailing `|| true` keeps a pool that this host does not report (GTT
-          # on a discrete card) an empty string for the guards below to handle,
-          # instead of killing the step under `-e`.
-          field() { printf '%s\n' "$out" | grep -i "$1" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
+          # `<POOL> Total [Used ]Memory (B): <n>`, last GPU's row wins. Anchoring
+          # on the `(B)` unit stops a differently-denominated reading being
+          # compared as bytes. The trailing `|| true` yields an empty string for
+          # a pool this host does not report (GTT on a discrete card), which the
+          # guards below handle; these steps run `bash -e` WITHOUT pipefail, so
+          # the pipeline status is `tail`'s and `-e` would not fire anyway — it
+          # is insurance against a future pipefail, not load-bearing today.
+          field() { printf '%s\n' "$out" | grep -iE "$1 \(B\):" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
           shown=0
           while [ "$SECONDS" -lt "$deadline" ]; do
             out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || out=""
@@ -459,6 +462,13 @@ jobs:
               echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
               shown=1
             fi
+            # A zero total is a failed reading, not a carveout. Retry instead of
+            # reinterpreting it as an APU and passing the gate on whatever GTT
+            # reports — a wedged driver must not clear this step.
+            if [ "$total" -le 0 ]; then
+              reason="rocm-smi reported a VRAM total of 0 (unparseable or wedged reading)"
+              sleep 5; continue
+            fi
             pool=VRAM
             if [ "$total" -lt "$min_free" ]; then
               # An APU has no private VRAM: this total is the fixed BIOS carveout
@@ -467,7 +477,11 @@ jobs:
               # fails healthy hosts and stays quiet on starved ones. See
               # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
               # withholds the product's equivalent warning for the same reason.
-              # A leftover serve still pins GTT, so the check keeps its purpose.
+              # What the floor then means: ${MIN_FREE_GIB} GiB against the whole
+              # GTT aperture, so it trips only near exhaustion and will not
+              # notice a serve holding a few GiB. Same sensitivity this floor had
+              # on a large-carveout host rather than a new gap, but coarse either
+              # way — see #446.
               # Discrete cards never reach this branch — their VRAM total is far
               # above the floor.
               if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
@@ -622,12 +636,13 @@ jobs:
             Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
             exit 0
           }
-          # `[regex]::Match` (not `Matches | Select -First 1`): a miss must yield
-          # an empty string for the guards below, not a $null dereference — GTT
-          # is legitimately absent on a discrete card.
+          # Last match, mirroring the shell helper's `tail -1`, so both read the
+          # same GPU's row on a multi-GPU host. A miss yields an empty string for
+          # the guards below, never a $null dereference — GTT is legitimately
+          # absent on a discrete card.
           function Get-Pool($text, $label) {
-            $m = [regex]::Match($text, "$label \(B\):\s*(\d+)")
-            if ($m.Success) { $m.Groups[1].Value } else { "" }
+            $ms = [regex]::Matches($text, "$label \(B\):\s*(\d+)")
+            if ($ms.Count -gt 0) { $ms[$ms.Count - 1].Groups[1].Value } else { "" }
           }
           $minFree = [int64]$minFreeGiB * 1GB
           $deadline = (Get-Date).AddSeconds($ceilingSecs)
@@ -653,6 +668,13 @@ jobs:
               Write-Host "rocm-smi pools (used/total bytes): VRAM $used/$total, GTT $gttShown"
               $shown = $true
             }
+            # A zero total is a failed reading, not a carveout. Retry instead of
+            # reinterpreting it as an APU and passing the gate on whatever GTT
+            # reports - a wedged driver must not clear this step.
+            if ([int64]$total -le 0) {
+              $reason = "rocm-smi reported a VRAM total of 0 (unparseable or wedged reading)"
+              Start-Sleep -Seconds 5; continue
+            }
             $pool = "VRAM"
             if ([int64]$total -lt $minFree) {
               # An APU has no private VRAM: this total is the fixed BIOS carveout
@@ -661,7 +683,11 @@ jobs:
               # fails healthy hosts and stays quiet on starved ones. See
               # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
               # withholds the product's equivalent warning for the same reason.
-              # A leftover serve still pins GTT, so the check keeps its purpose.
+              # What the floor then means: $minFreeGiB GiB against the whole GTT
+              # aperture, so it trips only near exhaustion and will not notice a
+              # serve holding a few GiB. Same sensitivity this floor had on a
+              # large-carveout host rather than a new gap, but coarse either way
+              # - see #446.
               if (-not $gttTotal -or -not $gttUsed) {
                 $reason = "VRAM total is $([math]::Floor([int64]$total/1MB)) MiB, under the $minFreeGiB GiB floor, and rocm-smi reported no GTT pool - the floor cannot be met from VRAM on this host"
                 Start-Sleep -Seconds 5; continue
@@ -978,8 +1004,9 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           # See the native Ubuntu lane for why the floor moves to GTT when the
-          # VRAM pool is only a BIOS carveout, and why `field` ends in `|| true`.
-          field() { printf '%s\n' "$out" | grep -i "$1" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
+          # VRAM pool is only a BIOS carveout, why `field` anchors on `(B)`, and
+          # why a zero total is treated as a failed reading.
+          field() { printf '%s\n' "$out" | grep -iE "$1 \(B\):" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
           saw_vram=0
           unmeasurable=0
           shown=0
@@ -995,6 +1022,11 @@ jobs:
             gtt_total=$(field 'GTT Total Memory')
             gtt_used=$(field 'GTT Total Used Memory')
             if [ -z "$total" ] || [ -z "$used" ]; then
+              sleep 5; continue
+            fi
+            if [ "$total" -le 0 ]; then
+              # A zero total is a failed reading, not a carveout (see the native
+              # Ubuntu lane). Advisory here, so it stays a non-reading.
               sleep 5; continue
             fi
             saw_vram=1
@@ -1031,11 +1063,12 @@ jobs:
           fi
           echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${pool} never dropped below the floor — a serve is likely still holding the GPU"
           exit 1
-          # No `-eo pipefail` here, unlike its siblings: this script's own
-          # empty-value guard above (`[ -z "$total" ] || [ -z "$used" ]`)
-          # relies on a non-matching `grep` in the pipeline being tolerated
-          # rather than aborting the script, so `rocm-smi` output this parser
-          # doesn't recognize retries instead of hard-failing the step.
+          # No `-eo pipefail` here — and, contrary to what this note used to
+          # say, its siblings don't set it either: a `run:` step with no
+          # `shell:` key gets `bash -e`, so a pipeline's status is the last
+          # command's. Either way it is this script's own empty-value guard
+          # (`[ -z "$total" ] || [ -z "$used" ]`) that keeps `rocm-smi` output
+          # the parser doesn't recognize retrying instead of aborting the step.
           '@
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
