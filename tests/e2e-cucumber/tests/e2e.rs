@@ -1101,6 +1101,12 @@ async fn main() {
     use e2e_cucumber::capability::host_capability;
     use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
 
+    // Before anything writes: cucumber's `Basic` writer turns a write error into a
+    // panic, so a relayed stdout that arrives non-blocking (the self-hosted WSL2
+    // lane) aborts the run the first time the log consumer stalls — and takes the
+    // panic message down with it. See `blocking_stdio`.
+    e2e_cucumber::blocking_stdio::restore_blocking_stdio();
+
     let dir = results_dir();
     let json_file =
         std::fs::File::create(dir.join("report.json")).expect("failed to create report.json");

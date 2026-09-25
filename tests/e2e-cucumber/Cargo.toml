@@ -39,6 +39,12 @@ tower-http = { version = "0.6", features = ["fs"] }
 url = "2"
 vt100 = "0.16"
 
+# `fcntl(F_GETFL/F_SETFL)` only, to clear an inherited `O_NONBLOCK` from the
+# suite's own stdio (see `src/blocking_stdio.rs`). Already a workspace
+# dependency, so this adds no new crate to the tree.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [[test]]
 name = "e2e"
 harness = false
