@@ -46,6 +46,7 @@ Feature: Interactive dashboard
     When the user opens the dashboard with demo data
     And the user opens dashboard help
     Then navigation and next-step guidance are displayed
+    And the backdrop behind the popup is dimmed
     When the user closes dashboard help
     And the user quits the dashboard
     Then the dashboard exits successfully
@@ -123,19 +124,77 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
 
+  # Characterization coverage: this scenario observes that Escape closes the
+  # manager on a non-domain tab, but the services manager's own event-loop arm
+  # would close it on root Esc even without the tab-independent back-out path
+  # this PR generalized, so a revert of that change would not turn this red.
+  # The discriminating regression test for that change is the unit test
+  # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
+  # app/mod.rs, which does fail on revert.
+  @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
+  Scenario: dash-11 - Escape closes a manager overlay on any tab
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    When the user presses Escape
+    Then the services manager is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-chat-approval-defaults-to-deny @requires-os:linux
+  Scenario: dash-12 - A surfaced tool call defaults to Deny and confirming without moving denies it
+    Given interactive chat uses an offline assistant
+    When the user opens interactive chat
+    And the user sends a message that triggers a tool approval
+    Then a tool approval prompt is displayed
+    When the user confirms the approval prompt without moving the cursor
+    Then the tool call is shown as declined
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+
+  @id:dash-instance-detail-dims-backdrop @requires-os:linux
+  Scenario: dash-13 - Opening instance detail dims the screen behind the popup
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens instance detail
+    Then instance details are displayed
+    And the backdrop behind the popup is dimmed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-chat-idle-escape-opens-menu @requires-os:linux
+  Scenario: dash-14 - Escape opens the menu when idle on the Chat tab
+    When the user opens the dashboard with demo data
+    And the user opens the Chat view
+    When the user presses Escape
+    Then the dashboard menu is displayed
+    When the user presses Escape
+    Then the dashboard menu is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-theme-picker-dims-backdrop @requires-os:linux
+  Scenario: dash-15 - Opening the theme picker dims the screen behind it
+    When the user opens the dashboard with demo data
+    And the user opens the theme picker
+    Then the backdrop behind the popup is dimmed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   # EAI-8366: `--replay <missing>` must fail fast — validate the path BEFORE the
   # dashboard takes over the terminal, printing a clear error and exiting
   # non-zero. Driven through a PTY (like the rest of this file): the fail-fast
   # property is unobservable through a pipe, and under a real terminal the pre-fix
   # binary enters the alt-screen and hangs, which this scenario pins.
   @id:dash-replay-missing-file-fails-fast @requires-os:linux
-  Scenario: dash-11 - Replaying a missing recording fails before entering the dashboard
+  Scenario: dash-16 - Replaying a missing recording fails before entering the dashboard
     When the user replays a recording that does not exist
     Then the dashboard is refused before taking over the terminal
     And the user is told the replay file was not found
 
   @id:dash-sigterm-restores-terminal @requires-os:linux
-  Scenario: dash-12 - A SIGTERM restores the terminal and exits 143
+  Scenario: dash-17 - A SIGTERM restores the terminal and exits 143
     # Core regression for this PR: a SIGTERM to a running dashboard (e.g. a
     # supervisor stopping it) must run the restore path — leave the alternate
     # screen and show the cursor — and report the conventional 128+15 exit code,
@@ -147,11 +206,11 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-sigint-restores-terminal @requires-os:linux
-  Scenario: dash-13 - A SIGINT restores the terminal and exits 130
+  Scenario: dash-18 - A SIGINT restores the terminal and exits 130
     # An externally delivered SIGINT (`kill -INT` from another process) takes the
     # same restore path and reports the conventional 128+2 exit code. This is NOT
     # the typed Ctrl-C gesture: raw mode clears ISIG, so that keystroke never
-    # becomes a signal — dash-15 covers it as the key event it actually is.
+    # becomes a signal — dash-20 covers it as the key event it actually is.
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the dashboard receives a SIGINT
@@ -159,7 +218,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-launcher-sigterm-restores-terminal-across-a-session @requires-os:linux
-  Scenario: dash-14 - A SIGTERM to the launcher hub restores the terminal after a session
+  Scenario: dash-19 - A SIGTERM to the launcher hub restores the terminal after a session
     # EAI-7194 launcher-hub regression: bare `rocm` is a persistent hub whose
     # process outlives each session's Tokio runtime. Tokio never unregisters the
     # libc signal handler it installs, so a per-session watcher goes deaf the
@@ -187,7 +246,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-ctrl-c-restores-terminal @requires-os:linux
-  Scenario: dash-15 - Typing Ctrl-C in the dashboard restores the terminal and exits 130
+  Scenario: dash-20 - Typing Ctrl-C in the dashboard restores the terminal and exits 130
     # The gesture a user actually performs, and the one nothing covered. While
     # the TUI holds the terminal in raw mode the driver's ISIG translation is off
     # (ENABLE_PROCESSED_INPUT on Windows), so this keystroke is delivered to the
@@ -203,7 +262,7 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
 
   @id:dash-launcher-ctrl-c-restores-terminal @requires-os:linux
-  Scenario: dash-16 - Typing Ctrl-C at the launcher front door restores the terminal and exits 130
+  Scenario: dash-21 - Typing Ctrl-C at the launcher front door restores the terminal and exits 130
     # The same keystroke at the hub's synchronous menu. That loop is a separate
     # key loop from the dashboard's and had no Ctrl-C handling at all, so the
     # gesture left bare `rocm` sitting at the front door in raw mode. Both loops
@@ -214,3 +273,20 @@ Feature: Interactive dashboard
     When the user presses Ctrl-C in the launcher
     Then the launcher exits from the keystroke with code 130
     And the terminal is restored to the normal screen
+
+  @id:dash-instance-detail-scroll-hint @requires-os:linux
+  Scenario: dash-22 - Instance detail shows a scroll hint when content overflows
+    # Opening the Observe view already enlarges the terminal (so other
+    # journeys can assert the detail popup's full layout); even the demo
+    # fixtures' launch_args/env_vars overflow that size, but this scenario
+    # needs the args/env panes to overflow specifically once shrunk further,
+    # so the assertion right before the shrink pins that starting point.
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens instance detail
+    Then the instance detail footer does not show the scroll hint
+    When the user shrinks the terminal until the detail body overflows
+    Then the instance detail footer shows the scroll hint
+    And the instance detail body shows a scrollbar
+    When the user quits the dashboard
+    Then the dashboard exits successfully

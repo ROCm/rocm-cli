@@ -203,7 +203,11 @@ rocm install sdk
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it.
+creates a separate managed runtime alongside it. Running the command when a
+managed runtime is already the active default asks first, because the new
+install takes over as the active default; see
+[ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
+for that gate and the flags that approve it without a prompt.
 
 Then serve a model:
 
@@ -230,7 +234,7 @@ form works depends on the engine your GPU selects.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the rocm-cli version |
+| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -297,6 +301,7 @@ sometimes because it also needs sudo or a reboot).
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
                     [--version x.y.z | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--dry-run]
+                    [--approve-replacing-active-default] [--yes]
 
 rocm install driver [--dkms] [--yes] [--dry-run] [--reconcile]
 
@@ -305,17 +310,39 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. `install driver` installs the AMD kernel driver on Linux (DKMS or
-native package). `update` checks for a newer ROCm package; pass `--apply` to
-install it, or `--dry-run` to preview what `--apply` would do without changing
-anything (`--dry-run` does not require `--apply`). `--runtime` and `--activate`
-require `--apply` or `--dry-run` — pass one of those instead of naming a
-runtime or requesting activation on its own. `--json` prints the check
-result as a single line of JSON instead of text; `--timeout-secs` bounds its
-network calls (`--timeout-secs` requires `--json`; both `--json` and
-`--timeout-secs` conflict with `--apply`, and `--json` also conflicts with
-`--dry-run`). `update --apply` never prompts; `--yes` is accepted for
-consistency with other mutating commands but has no effect on it.
+by rocm-cli. An install with no active default runtime never prompts, but once a
+managed runtime is the active default every `install sdk` asks first, because
+the new install takes over as the active default. That gate is not scoped to the
+family or channel you are installing: a `--family` or `--channel` you have never
+installed before takes over the active default just as a same-family upgrade
+does, so it asks too. To approve that non-interactively — in scripts or CI, where
+the prompt would otherwise refuse — pass `--approve-replacing-active-default`,
+which is also what the refusal itself recommends and what ROCm CLI's own
+non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
+approval *and* approves installing required system packages (such as OpenMPI for
+vLLM), which means `sudo`; reach for it only where something can answer a sudo
+password prompt — which an unattended job cannot, unless it has passwordless sudo
+configured. In the default managed install root, the root and its manifest are
+keyed by version, so an upgrade or downgrade keeps the previous install on disk
+and only a same-version reinstall reuses the same root. `--prefix` opts out of
+that: the folder you name is used verbatim for every version, so successive
+installs into one prefix replace each other in place — and if the venv already
+there no longer runs its own Python, it is removed outright and rebuilt. The
+consent gate does not cover that: it asks about changing the active default
+runtime, not about what a named prefix loses. `install driver` installs the AMD
+kernel driver on Linux (DKMS or native package). `update` checks for a newer
+ROCm package; pass `--apply` to install it, or `--dry-run` to preview what
+`--apply` would do without changing anything (`--dry-run` does not require
+`--apply`). `--runtime` and `--activate` require `--apply` or `--dry-run` — pass
+one of those instead of naming a runtime or requesting activation on its own.
+`--json` prints the check result as a single line of JSON instead of text;
+`--timeout-secs` bounds its network calls (`--timeout-secs` requires `--json`;
+both `--json` and `--timeout-secs` conflict with `--apply`, and `--json` also
+conflicts with `--dry-run`). `update --apply` never prompts and needs no
+approval flag: selecting a runtime to update is itself the approval, and it
+leaves the active default alone unless you add `--activate`. `update` does
+accept `--yes`, for consistency with other mutating commands, but it grants
+nothing there — the approval line the update path prints never credits it.
 
 ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
 for it takes two things together: pin the version with `--version`, and name the
@@ -475,7 +502,22 @@ rocm services list [--all]
 rocm services logs <service-id>
 rocm services stop <service-id> [--yes]
 rocm services restart <service-id> [--yes]
+rocm services remove <service-id> --yes
+rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`remove` deletes one record that is no longer running, together with its log,
+its engine state file, and its endpoint key file; a running server is refused,
+so stop it first. `prune` does the same in bulk, always leaves running servers
+alone, and additionally clears leftover files whose record is already gone.
+Removal destroys both the log and the `restart` option for the records it
+takes, so `prune` only considers records untouched for 24 hours. Age is
+measured from when the record file was last written, so a stop, a restart, or a
+status correction all count as touching it. Pass `--older-than-hours <n>` for a
+different threshold, or `--any-age` to take every record that is not running
+however recent — that is the flag `prune` names in its own summary when it
+reports how many records it kept for being too recent. The two cannot be
+combined.
 
 ### Dashboard
 
@@ -651,6 +693,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More docs
 
+- Architecture and module map: `docs/architecture.md`
 - Testing and verification: `docs/testing.md`
 - Developer manual QA: `docs/manual-testing.md`
 - Engine plugin policy: `docs/engine-plugins.md`

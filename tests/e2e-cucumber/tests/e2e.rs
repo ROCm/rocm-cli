@@ -26,12 +26,14 @@ mod e2e {
     pub mod dash_steps;
     pub mod dependency_guard_steps;
     pub mod diagnose_steps;
+    pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
+    pub mod service_cleanup_steps;
     pub mod serving_steps;
     pub mod therock_steps;
     pub mod tui_driver;

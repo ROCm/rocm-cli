@@ -289,16 +289,48 @@ fn the_documented_count_of_clause_diagnostics_is_the_real_one() {
     );
 }
 
+/// The body of `fn <name>`: from its signature to the brace that closes it.
+///
+/// The marker convention is not unique to one function — `wait_until_gone`
+/// quotes its own bare marker in messages of its own — so a count of `{marker:?}`
+/// across the file measures every function that happens to name its parameter
+/// `marker`, not the one whose doc states the number.
+fn body_of<'a>(source: &'a str, name: &str) -> String {
+    let lines: Vec<&'a str> = source.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.contains(&format!("fn {name}(")))
+        .unwrap_or_else(|| panic!("{DRIVER} no longer declares `fn {name}`"));
+    let mut depth = 0i32;
+    let mut opened = false;
+    let mut end = start;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        depth += i32::try_from(line.matches('{').count()).unwrap_or(0);
+        depth -= i32::try_from(line.matches('}').count()).unwrap_or(0);
+        opened |= line.contains('{');
+        end = index;
+        if opened && depth == 0 {
+            break;
+        }
+    }
+    lines[start..=end].join("\n")
+}
+
 /// `terminal_state_after_wait`'s doc says a third path names no marker. A
-/// third marker-bearing message would contradict it silently.
+/// third marker-bearing message would contradict it silently. Counted in that
+/// function's own body — see [`body_of`].
 #[test]
 fn the_documented_count_of_marker_diagnostics_is_the_real_one() {
     let source = read(DRIVER);
     let expected = marker_diagnostics().len();
     assert_documented_count(&source, "terminal_state_after_wait", expected, "messages");
 
+    let body = body_of(&source, "terminal_state_after_wait");
     let marker = arg("marker:?");
-    let emitted: usize = diagnostic_lines(&source)
+    let emitted: usize = diagnostic_lines(&body)
         .map(|line| line.matches(marker.as_str()).count())
         .sum();
     assert_eq!(

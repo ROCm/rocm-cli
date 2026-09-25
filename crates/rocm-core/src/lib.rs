@@ -2709,6 +2709,52 @@ fn detect_driver_summary() -> DriverSummary {
     }
 }
 
+/// The amdgpu kernel module's version on Linux, if it reports one.
+///
+/// Prefers the sysfs attribute (a plain file read, no subprocess) that DKMS
+/// builds of amdgpu expose. Falls back to `modinfo`, which is the only source
+/// for the in-tree kernel module -- it doesn't populate
+/// `/sys/module/amdgpu/version` at all.
+fn detect_linux_amdgpu_driver_version() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+        let version = text.trim();
+        if !version.is_empty() {
+            return Some(version.to_owned());
+        }
+    }
+    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    if rc != 0 {
+        return None;
+    }
+    out.lines()
+        .find_map(|line| line.strip_prefix("version:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPU driver version for this machine.
+///
+/// Sourced however the current platform exposes it: the amdgpu kernel module
+/// on Linux, the AMD display driver on Windows, or -- inside WSL -- the
+/// Windows host's display driver, since that's the driver a WSL guest's GPU
+/// workloads actually depend on, not its own (driver-less) amdgpu module.
+pub fn detect_gpu_driver_version() -> Option<String> {
+    if is_wsl_host() {
+        return match detect_wsl_host_driver() {
+            WslHostDriverProbe::Version(version) => Some(version),
+            WslHostDriverProbe::Unreachable | WslHostDriverProbe::NoAmdDisplay => None,
+        };
+    }
+    if runtime_is_windows() {
+        return detect_windows_amd_display_driver();
+    }
+    if runtime_is_linux() {
+        return detect_linux_amdgpu_driver_version();
+    }
+    None
+}
+
 impl WslSummary {
     /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
     ///
@@ -2957,7 +3003,7 @@ fn rocm_version_sort_key(version: &str) -> Vec<u32> {
         .collect()
 }
 
-fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
+pub fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
     // One resolver on both platforms, so the human report, the JSON probe and
     // the fix-6 runner cannot disagree about which installs exist or which one
     // is active. `discover_rocm_installs` picks the search roots and layout for
@@ -2986,6 +3032,18 @@ fn detect_legacy_rocm_summary() -> LegacyRocmSummary {
         detail,
         version,
     }
+}
+
+/// The best unmanaged ("legacy") ROCm install on this host, if any.
+///
+/// [`detect_legacy_rocm_summary`] resolves the same thing but as part of the
+/// full [`ExamineSummary`] probe; this is the standalone version+path for a
+/// caller like `rocm version` that wants just the SDK identity as a fallback
+/// once it's already established no managed TheRock runtime is active.
+pub fn detect_legacy_rocm_sdk() -> Option<(String, PathBuf)> {
+    let install = discover_rocm_installs().into_iter().next()?;
+    let version = install.version?;
+    Some((version, install.path))
 }
 
 #[allow(clippy::case_sensitive_file_extension_comparisons)] // ROCm installs the runtime DLL as lowercase `amdhip64.dll`
@@ -3795,6 +3853,16 @@ pub struct FrameworkInterpreter {
 /// `None` on an unmanaged host, and also when the runtime records an interpreter
 /// that is no longer on disk — a caller that cannot spawn the interpreter is
 /// better served by the ambient one than by a path that fails to execute.
+///
+/// Not the only "which runtime is active" selector on this path. `rocm examine`'s
+/// *human* report resolves the runtime through `current_runtime_manifest`, which
+/// wants an active key or exactly one matching `default_runtime_id`, whereas the
+/// record chosen here falls back to the most recently installed one. With no
+/// active key set the two can disagree, so `examine --json` can report a
+/// framework read from a runtime the human form calls
+/// `active_runtime_status: unset`. The divergence predates this function; it is
+/// recorded because reading the framework through the runtime is what first made
+/// it observable.
 pub fn active_managed_framework_interpreter(
     paths: &AppPaths,
     config: &RocmCliConfig,
@@ -3825,6 +3893,17 @@ fn managed_therock_python_executable(record: &TheRockFamilyManifest) -> Option<P
                 .map(runtime_python_executable_in_env),
         )
         .find(|candidate| candidate.is_file())
+}
+
+/// Version (e.g. `"10.0.0"`) of the active managed TheRock runtime.
+///
+/// Reflects the version recorded at install time. Returns `None` when there is no managed
+/// runtime (system or legacy ROCm) or the registry record is malformed or hand-edited.
+pub fn active_managed_therock_version(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+) -> Result<Option<String>> {
+    Ok(select_active_managed_therock_record(paths, config).and_then(|record| record.version))
 }
 
 /// Pick the active managed TheRock runtime record: the one matching
@@ -4088,6 +4167,8 @@ struct TheRockFamilyManifest {
     therock_family: Option<String>,
     #[serde(default)]
     channel: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     rocm_sdk: Option<TheRockSdkProbeManifest>,
     #[serde(default)]
@@ -10375,6 +10456,171 @@ Class Name:                Display
         Ok(())
     }
 
+    /// Write a registry record for a managed TheRock runtime, always planting a
+    /// real interpreter at the conventional location under `install_root` so the
+    /// DERIVED candidate exists on disk.
+    ///
+    /// `recorded_python` decides the record's `python_executable` key:
+    ///
+    /// - `None` writes no such key at all -- the shape of a record from before
+    ///   the installer recorded one, where only the derived candidate exists.
+    /// - `Some(path)` records that path verbatim, whether or not anything is
+    ///   there. Planting it is the caller's business, so a caller can exercise
+    ///   either side of the gate in `managed_therock_python_executable` -- which
+    ///   is `is_file()`, not `exists()`.
+    fn write_therock_runtime_with_interpreter(
+        registry: &Path,
+        install_root: &Path,
+        name: &str,
+        recorded_python: Option<&Path>,
+    ) -> Result<()> {
+        let bin = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        fs::create_dir_all(&bin)?;
+        fs::write(
+            bin.join(runtime_python_executable_name()),
+            b"#!/bin/sh\nexit 0\n",
+        )?;
+        let mut record = serde_json::json!({
+            "runtime_id": format!("therock-release:{name}"),
+            "runtime_key": name,
+            "family": "gfx94X-dcgpu",
+            "channel": "release",
+            "installed_at_unix_ms": 10,
+            "install_root": install_root,
+            "rocm_sdk": { "import_ok": true },
+        });
+        if let Some(python) = recorded_python {
+            record["python_executable"] = serde_json::json!(python);
+        }
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&record)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_framework_interpreter_is_none_without_a_managed_runtime() -> Result<()> {
+        // An unmanaged host must fall back to the ambient `PATH` probe, which is
+        // what `None` selects for the caller.
+        let (root, paths) = temp_app_paths("framework-interpreter-none");
+        assert!(active_managed_framework_interpreter(&paths, &RocmCliConfig::default()).is_none());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn the_framework_interpreter_is_derived_when_none_was_recorded() -> Result<()> {
+        // Records written before the installer recorded `python_executable` must
+        // still resolve, from the conventional location under `install_root`.
+        let (root, paths) = temp_app_paths("framework-interpreter-derived");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-derived");
+        write_therock_runtime_with_interpreter(&registry, &install_root, "derived", None)?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("a managed runtime with an interpreter on disk must resolve");
+        assert_eq!(
+            interpreter.python,
+            runtime_python_executable_in_env(&install_root)
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_outside_the_install_root_wins_over_the_derived_one() -> Result<()> {
+        // The branch the e2e scenario's relaxed assertion rests on: an imported
+        // or read-only runtime can record an interpreter that does not sit under
+        // `install_root`, and preferring the derived path would hand back the
+        // wrong interpreter whenever both exist.
+        let (root, paths) = temp_app_paths("framework-interpreter-recorded");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-recorded");
+        let elsewhere = paths.data_dir.join("outside").join("venv");
+        let recorded = runtime_python_executable_in_env(&elsewhere);
+        fs::create_dir_all(recorded.parent().expect("an interpreter has a parent"))?;
+        fs::write(&recorded, b"#!/bin/sh\nexit 0\n")?;
+        // `write_therock_runtime_with_interpreter` also plants the derived
+        // interpreter under `install_root`, so both candidates are on disk and
+        // the `exists()` gate cannot decide this for us.
+        write_therock_runtime_with_interpreter(
+            &registry,
+            &install_root,
+            "recorded",
+            Some(&recorded),
+        )?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("a managed runtime with an interpreter on disk must resolve");
+        assert_eq!(
+            interpreter.python, recorded,
+            "the recorded interpreter must win over the one derived from install_root"
+        );
+        assert!(
+            !interpreter.python.starts_with(&install_root),
+            "the point of the recorded path is that it need not sit under install_root"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_that_is_gone_does_not_resolve() -> Result<()> {
+        // Handing back a path that cannot be spawned would turn "no torch" into
+        // a spawn failure; the ambient probe is the better answer, so this must
+        // be `None` rather than the missing path.
+        //
+        // The record really carries a `python_executable`, which is the whole
+        // point: with none recorded this would drive the gate on the DERIVED
+        // candidate and stay green however the recorded half of it is mangled.
+        let (root, paths) = temp_app_paths("framework-interpreter-missing");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-gone");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("gone").join("venv"));
+        write_therock_runtime_with_interpreter(&registry, &install_root, "gone", Some(&recorded))?;
+        // The helper plants the derived interpreter; take it away so that BOTH
+        // candidates are recorded-or-derived paths that are not on disk, and
+        // neither can carry the result.
+        fs::remove_dir_all(&install_root)?;
+        assert!(!recorded.exists(), "the recorded interpreter must be gone");
+
+        assert!(
+            active_managed_framework_interpreter(&paths, &RocmCliConfig::default()).is_none(),
+            "a recorded interpreter that is not on disk must not be handed back"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn a_recorded_interpreter_that_is_a_directory_is_passed_over() -> Result<()> {
+        // `exists()` would accept a directory and hand back something that
+        // cannot be spawned, which is the failure the gate exists to prevent;
+        // `is_file()` passes over it and the derived interpreter answers
+        // instead. Relaxing the predicate is otherwise invisible to the suite.
+        let (root, paths) = temp_app_paths("framework-interpreter-dir");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        let install_root = paths.data_dir.join("rt-dir");
+        let recorded = runtime_python_executable_in_env(&paths.data_dir.join("dir").join("venv"));
+        fs::create_dir_all(&recorded)?;
+        write_therock_runtime_with_interpreter(&registry, &install_root, "dir", Some(&recorded))?;
+
+        let interpreter = active_managed_framework_interpreter(&paths, &RocmCliConfig::default())
+            .expect("the derived interpreter is on disk, so something must resolve");
+        assert_eq!(
+            interpreter.python,
+            runtime_python_executable_in_env(&install_root),
+            "a recorded path that is a directory must not be preferred over a real interpreter"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     fn write_therock_channel_record(
         registry: &Path,
         name: &str,
@@ -10387,6 +10633,98 @@ Class Name:                Display
                 "runtime_id": format!("therock-{channel}:{name}"),
                 "family": "gfx120X-all",
                 "channel": channel,
+                "installed_at_unix_ms": installed_at_unix_ms,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_reads_recorded_version() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "version": "10.0.0",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": { "import_ok": true }
+            }))?,
+        )?;
+
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_is_none_without_runtime() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-none");
+        let config = RocmCliConfig::default();
+        assert_eq!(active_managed_therock_version(&paths, &config)?, None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_falls_back_to_most_recent() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-recent");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // No active_runtime_key set: the most recently installed runtime wins.
+        let config = RocmCliConfig::default();
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("10.0.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn active_managed_therock_version_prefers_active_runtime_key() -> Result<()> {
+        let (root, paths) = temp_app_paths("active-therock-version-active-key");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        fs::create_dir_all(&registry)?;
+        write_therock_version_record(&registry, "older", "7.13.0", 10)?;
+        write_therock_version_record(&registry, "newer", "10.0.0", 20)?;
+
+        // The active key points at the older runtime, overriding recency.
+        let config = RocmCliConfig {
+            active_runtime_key: Some("therock-release:older".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        assert_eq!(
+            active_managed_therock_version(&paths, &config)?,
+            Some("7.13.0".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn write_therock_version_record(
+        registry: &Path,
+        name: &str,
+        version: &str,
+        installed_at_unix_ms: u64,
+    ) -> Result<()> {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": format!("therock-release:{name}"),
+                "family": "gfx120X-all",
+                "version": version,
                 "installed_at_unix_ms": installed_at_unix_ms,
                 "rocm_sdk": { "import_ok": true }
             }))?,

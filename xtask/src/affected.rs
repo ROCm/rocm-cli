@@ -198,18 +198,9 @@ struct Node {
 /// `--locked` mirrors [`crate::manifest`]: use the committed `Cargo.lock`
 /// exactly rather than letting metadata resolve to newer registry versions.
 pub fn load_graph() -> Result<Graph> {
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--locked"])
-        .output()
-        .context("failed to run `cargo metadata`")?;
-    if !output.status.success() {
-        bail!(
-            "`cargo metadata` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout)
-        .context("failed to parse `cargo metadata` output")?;
+    let stdout = crate::paths::run_cargo_metadata(&[])?;
+    let metadata: Metadata =
+        serde_json::from_slice(&stdout).context("failed to parse `cargo metadata` output")?;
     let graph = build_graph(&metadata);
     // A member at the repository root would have an empty source dir and so own
     // every changed file, silently defeating the conservative full-workspace

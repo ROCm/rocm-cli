@@ -116,10 +116,13 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
         .wait_for_screen_where(
             &format!("{marker} appears on a prompt line"),
             |screen| {
+                // `$` for a normal user's prompt, `#` for root's -- the suite
+                // runs as root on the WSL2 hardware lane, so both are genuine
+                // prompt lines.
                 screen
                     .lines()
                     .filter(|line| line.contains(&marker))
-                    .any(|line| line.contains('$'))
+                    .any(|line| line.contains('$') || line.contains('#'))
             },
             SCREEN_TIMEOUT,
         )

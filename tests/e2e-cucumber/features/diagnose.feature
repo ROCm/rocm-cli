@@ -20,6 +20,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom
     Then the CLI reports a likely cause with a suggested fix
     And every reported cause comes with a command that applies it
+    And every reported cause states its remediation flags
 
   @id:diagnose-always-offers-a-way-forward
   Scenario: diagnose-02 - Diagnosing any failure always gives the user a way to escalate
@@ -40,12 +41,17 @@ Feature: Diagnosing failures and listing fixes
     And each fix indicates whether the CLI can apply it automatically
     And the listing explains what those indicators mean
 
+  # This scenario exercises `rocm fix <id> --dry-run` (print_recipe's `Flags:`
+  # line), not the `rocm diagnose` report itself -- see diagnose-01's "states
+  # its remediation flags" step for the equivalent `flags:` line on that
+  # surface.
   @id:diagnose-fix-dry-run-changes-nothing
   Scenario: diagnose-05 - Previewing a fix explains the change without making it
     Given a user who has chosen a known fix
     When the user previews that fix without applying it
     Then the CLI describes what the fix would change
     And nothing on the machine is changed
+    And the preview states plainly that this fix is manual only
 
   @id:diagnose-fix-unknown-id-rejected
   Scenario: diagnose-06 - Asking for a fix the CLI does not know is refused clearly
@@ -267,12 +273,29 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
 
+  # diagnose-05 only proves the manual/zero-optional-flags wording, because
+  # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
+  # sudo+re-login combination only exists on a fix gated to bare-metal Linux
+  # (fix-4-render-group), so it needs its own scenario -- but, like
+  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
+  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
+  # under test renders identically regardless of which lane runs it. The step
+  # asserts only that printed text, never the exit code -- `fix-4-render-group`
+  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
+  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
+  @id:diagnose-fix-preview-states-required-flags
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
+    Given a user who has chosen a fix that needs sudo and a re-login
+    When the user previews that fix without applying it
+    Then the preview states that the fix requires sudo and a re-login
+    And the preview states that the CLI can run it automatically
+
   # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
   @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux
-  Scenario: diagnose-20 - Diagnosing a problem and previewing its fix agree on how to verify it
+  Scenario: diagnose-21 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview
     Then both give the same way to verify that the fix worked
@@ -284,17 +307,17 @@ Feature: Diagnosing failures and listing fixes
   # (the lookup failure now falls back to the conventional group), so this ships
   # as a guard rather than an expected failure.
   @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-21 - Every group named in a diagnosis is one the machine recognises
+  Scenario: diagnose-22 - Every group named in a diagnosis is one the machine recognises
     Given the GPU device belongs to a group the machine cannot name
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
   # Expected to FAIL on a bare-metal GPU host whose device group is not the
   # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario diagnose-20:
+  # previews another. This is distinct from scenario diagnose-21:
   # even after the verify text agrees, the actual change must agree too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-22 - Diagnosing a problem and previewing its fix agree on the remedy command
+  Scenario: diagnose-23 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
@@ -304,7 +327,7 @@ Feature: Diagnosing failures and listing fixes
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.
   @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-23 - A usable GPU device is not diagnosed as a permission failure
+  Scenario: diagnose-24 - A usable GPU device is not diagnosed as a permission failure
     Given the user can already read and write the GPU device
     When the user asks the CLI to diagnose the machine
     Then adding the user to a device group is not offered as a cause

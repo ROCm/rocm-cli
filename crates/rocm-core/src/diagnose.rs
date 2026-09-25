@@ -1011,6 +1011,13 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
+    // Marked auto_applicable below, but `rocm fix fix-9-igpu-dgpu` still needs
+    // --device-index to actually make the change: without it, both the Linux
+    // and Windows runners only print the query that finds the index and
+    // change nothing (see README's --device-index caveat).
+    let note = format!(
+        "{note} Without --device-index, `rocm fix` only prints this query and makes no change, despite being marked AUTO."
+    );
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -1038,7 +1045,10 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: false,
+            // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
+            // true, runner: run_hip_visible_devices) -- `rocm fix` can already
+            // carry this out on Linux, so the report must not claim otherwise.
+            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
@@ -1740,16 +1750,16 @@ fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let fix = Fix {
         summary: "Install ROCDXG inside the distro: it is the ROCm-to-DXCore shim the WSL path runs on.".to_owned(),
         commands: vec![
-            "bash scripts/wsl_setup_rocdxg.sh".to_owned(),
-            "# Or, to pin the package you install:".to_owned(),
-            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh".to_owned(),
+            "rocm install driver".to_owned(),
+            "# Then, once the plan looks right:".to_owned(),
+            "#   rocm install driver --yes".to_owned(),
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
         auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
-            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. Set ROCDXG_SHA256 to verify the download against a digest you trust.".to_owned(),
+            "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the download against a digest pinned for that ROCDXG release.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -2184,22 +2194,13 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             for c in &fix.commands {
                 let _ = writeln!(out, "     $ {c}");
             }
-            let mut flags = Vec::new();
-            if fix.needs_sudo {
-                flags.push("sudo");
-            }
-            if fix.needs_reboot {
-                flags.push("reboot required");
-            }
-            if fix.needs_relogin {
-                flags.push("re-login required");
-            }
-            if fix.auto_applicable {
-                flags.push("rocm fix can run it");
-            }
-            if !flags.is_empty() {
-                let _ = writeln!(out, "   flags: {}", flags.join(", "));
-            }
+            let flags = crate::fix::format_flags(
+                fix.needs_sudo,
+                fix.needs_reboot,
+                fix.needs_relogin,
+                fix.auto_applicable,
+            );
+            let _ = writeln!(out, "   flags: {}", flags.join(", "));
             for n in &fix.notes {
                 let _ = writeln!(out, "   note: {n}");
             }
@@ -2869,6 +2870,110 @@ mod tests {
             !note.contains("usually the higher-numbered"),
             "note must not repeat the old wrong gfx-number heuristic: {note}"
         );
+        assert!(
+            note.contains("Without --device-index") && note.contains("despite being marked AUTO"),
+            "note must warn that fix-9 is a no-op without --device-index: {note}"
+        );
+    }
+
+    #[test]
+    fn fix_9_igpu_dgpu_is_auto_applicable_on_linux() {
+        // `check_9_igpu_dgpu_collision`'s Linux/else branch sets
+        // `auto_applicable: true` to match the `fix-9-igpu-dgpu` FixRecipe in
+        // fix.rs (`run_hip_visible_devices` already handles it on Linux). This
+        // is a behavioural change, not text-only: it flips both the `Fix`
+        // struct field that `rocm diagnose --json` serialises and the
+        // `flags:` line `render_report_text` prints. Pin it directly so a
+        // regression back to `false` (the pre-fix value) fails here instead of
+        // only being visible by eyeballing output.
+        let mut e = linux_base();
+        e.has_apu = true;
+        e.has_discrete_amd = true;
+        e.gpus = vec![
+            Gpu {
+                gfx_target: "gfx1103".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+        ];
+        let report = diagnose(&e, "torch crashes with a segfault");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-9-igpu-dgpu")
+            .expect("iGPU+dGPU collision should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        assert!(
+            fix.auto_applicable,
+            "fix-9-igpu-dgpu must be auto_applicable on Linux, matching the fix.rs catalog"
+        );
+
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-9-igpu-dgpu")
+            .expect("fix-9-igpu-dgpu should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-9-igpu-dgpu should have a flags: line");
+        // Exact match, not `contains`: fix-9 carries only the auto flag, so a
+        // revert of the `render_report_text` call site to its pre-PR inline
+        // logic would still print a line containing "rocm fix can run it" and
+        // not "manual only" -- `contains` can't tell the two implementations
+        // apart. See `fix_11_iommu_rendered_flags_line_is_exact` for a fix-id
+        // whose optional flags actually differ between old and new wording.
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: rocm fix can run it",
+            "rendered flags: line for fix-9-igpu-dgpu: {flags_line}"
+        );
+    }
+
+    #[test]
+    fn fix_11_iommu_rendered_flags_line_is_exact() {
+        // Companion to `fix_9_igpu_dgpu_is_auto_applicable_on_linux`: that test
+        // only pins a fix-id with just the auto flag set, which an exact-match
+        // assertion can't distinguish from the pre-PR `render_report_text`
+        // inline logic (both print "rocm fix can run it" for it). fix-11-iommu
+        // carries sudo+reboot+manual, so this pins the full comma-joined,
+        // reworded `flags:` line through the real render call site.
+        let mut e = linux_base();
+        e.iommu_kernel_param = "on".to_owned();
+        e.gpus = vec![
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+        ];
+        let report = diagnose(&e, "");
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-11-iommu")
+            .expect("fix-11-iommu should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-11-iommu should have a flags: line");
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
+            "rendered flags: line for fix-11-iommu: {flags_line}"
+        );
     }
 
     #[test]
@@ -3092,10 +3197,20 @@ mod tests {
             !fix.auto_applicable,
             "installing a .deb with sudo must stay print-only"
         );
+        // Verification is no longer something the user has to remember to turn
+        // on: `rocm install driver` pins a digest per release. The note has to
+        // say so, because a print-only recipe is all the user sees here.
         assert!(
-            fix.notes.iter().any(|n| n.contains("ROCDXG_SHA256")),
-            "must offer the checksum option: {:?}",
+            fix.notes.iter().any(|n| n.contains("digest")),
+            "must state that the download is verified: {:?}",
             fix.notes
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("rocm install driver")),
+            "must route to the command that carries the plan: {:?}",
+            fix.commands
         );
     }
 
