@@ -448,3 +448,83 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
          while detection was still in flight"
     );
 }
+
+/// `amd_smi_gpu_reachable: true` (the rocm-core verdict — KFD/DRM on Linux,
+/// ROCDXG bridge on WSL) is a plumbing-presence signal, not proof that amd-smi
+/// can actually enumerate a supported GPU. On WSL, ROCDXG can report ready on
+/// an APU/GPU model ROCm does not support at all, so `amd-smi version` still
+/// fails. That contradiction must produce a warning that says so, distinct
+/// from the bare-metal "device inaccessible" message — the generic message
+/// would flatly contradict what `examine` just told the same user (ready).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inaccessibility() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Fails immediately, mirroring a real amd-smi's "Drivers not loaded" exit on
+    // a WSL host whose GPU ROCDXG can reach but ROCm does not support.
+    let fake = dir.path().join("amd-smi-broken");
+    std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            // Force the fake through the real detection path (as in the test
+            // above) while independently asserting reachability, mirroring how
+            // `apps/rocm` threads `rocm_core::has_usable_amd_gpu()` through
+            // regardless of whether the device pre-flight itself was skipped.
+            amd_smi_skip_device_preflight: true,
+            amd_smi_gpu_reachable: true,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    let overall = Duration::from_secs(10);
+    let mut found = None;
+    loop {
+        let ev = match timeout(overall, rx.recv()).await {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        };
+        if let Event::Snapshot(snap) = ev
+            && !snap.warnings.is_empty()
+        {
+            found = Some(snap.warnings);
+            break;
+        }
+    }
+
+    handle.abort();
+    let _ = handle.await;
+
+    let warnings = found.expect("a warning-carrying snapshot must arrive");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("found no usable GPU") && w.contains("detected by other means")),
+        "expected the reachable-but-failing contradiction message, got: {warnings:?}"
+    );
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w == "amd-smi unavailable (GPU device inaccessible or probe failed)"),
+        "must not fall back to the bare-metal inaccessible message when reachability was asserted: {warnings:?}"
+    );
+}
