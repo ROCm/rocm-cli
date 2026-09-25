@@ -38,6 +38,7 @@ separate tier flag or tag filter to maintain.
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
 | `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
+| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
 
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
@@ -81,7 +82,8 @@ resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
-`e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p`) run on AMD GPU systems, so they
+`e2e-wsl`, `e2e-gpu-rad3`, `e2e-gpu-mi350p`,
+and `e2e-gpu-w7900`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -147,8 +149,9 @@ reports — including partial or failed runs — by scenario id into one HTML re
 and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
-`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
+`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-w7900-report`,
+`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
+`e2e-gpu-strix-wsl-report`) in every workflow,
 because the report derives each platform's name and OS from the artifact name.
 An unrecognised name renders as a guessed platform on Linux, which would report
 a Windows lane as Linux; `xtask`'s
@@ -176,11 +179,12 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`, `mi350p`) — which self-hosted job(s) to run. `app-dev-gpu`
-  maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3` to
-  `e2e-gpu-rad3`, and `mi350p` to `e2e-gpu-mi350p`. (The mock lane has its own
-  `platform` input on `ci.yml`; it is not part of this workflow.)
+  `strix-wsl`, `rad3`, `mi350p`, `w7900`) — which self-hosted job(s) to run.
+  `app-dev-gpu` maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`,
+  `strix-windows` to `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3`
+  to `e2e-gpu-rad3`, `mi350p` to `e2e-gpu-mi350p`, and `w7900` to
+  `e2e-gpu-w7900`. (The mock lane has its own `platform` input on `ci.yml`; it
+  is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -262,13 +266,16 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
+`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, `e2e-gpu-mi350p`, and
+`e2e-gpu-w7900` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
 it reports. Five of them run with `continue-on-error: false`, so a real
-regression shows red instead of always green; `e2e-gpu-mi350p` still runs with
-`continue-on-error: true`, unchanged and out of scope here. Their results also
-surface in the self-hosted consolidated report for visibility.
+regression shows red instead of always green; `e2e-gpu-mi350p` and
+`e2e-gpu-w7900` run with `continue-on-error: true` while that hardware is
+being proven out, and should be flipped to `false` once each has a track
+record. Their results also surface in the self-hosted consolidated report for
+visibility.
 
 ### Timeouts on the Strix lanes
 
