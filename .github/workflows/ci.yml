@@ -1145,6 +1145,13 @@ jobs:
       - name: Guard against an ungraded skills/ directory
         run: |
           set -euo pipefail
+          # Without nullglob, a skills/ with no subdirectories leaves the
+          # pattern unexpanded and the loop runs once on the literal
+          # `skills/*/`, reporting `skills/* is neither graded ...` -- a
+          # made-up skill name, from a tree that has no ungraded skill in it.
+          # With it the loop simply does not run, which is the right answer for
+          # "nothing to grade".
+          shopt -s nullglob
           known="rocm-doctor rocm-cli-assistant"
           for dir in skills/*/; do
             name="${dir%/}"

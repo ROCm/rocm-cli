@@ -1013,13 +1013,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
-    // Marked auto_applicable below, but `rocm fix fix-9-igpu-dgpu` still needs
-    // --device-index to actually make the change: without it, both the Linux
-    // and Windows runners only print the query that finds the index and
-    // change nothing (see README's --device-index caveat).
-    let note = format!(
-        "{note} Without --device-index, `rocm fix` only prints this query and makes no change, despite being marked AUTO."
-    );
+    // Both branches below are marked auto_applicable, but `rocm fix
+    // fix-9-igpu-dgpu` still needs --device-index to actually make the change:
+    // without it, the Linux and the Windows runner alike only print the query
+    // that finds the index and change nothing (see README's --device-index
+    // caveat). Each branch states that once, in its second note.
+    // `render_report_text` prints every note on its own line, so saying it
+    // again here -- appended to the detected-targets note -- would show up as a
+    // second bullet repeating the first.
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -3082,9 +3083,82 @@ mod tests {
             "note must not repeat the old wrong gfx-number heuristic: {note}"
         );
         assert!(
-            note.contains("Without --device-index") && note.contains("despite being marked AUTO"),
+            note.contains("--device-index"),
             "note must warn that fix-9 is a no-op without --device-index: {note}"
         );
+    }
+
+    /// The `note:` lines `render_report_text` prints for one diagnosis, in
+    /// order, with the `   note: ` prefix stripped.
+    fn rendered_notes(report: &DiagnoseReport, id: &str) -> Vec<String> {
+        let text = render_report_text(report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == format!("id: {id}"))
+            .unwrap_or_else(|| panic!("{id} should appear in the rendered report:\n{text}"));
+        lines[id_line..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with("apply with:"))
+            .filter_map(|l| l.trim_start().strip_prefix("note: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An APU + discrete pairing, on the OS family given, that fires fix-9.
+    fn igpu_dgpu_host(os_family: &str) -> Examination {
+        Examination {
+            os_family: os_family.to_owned(),
+            has_apu: true,
+            has_discrete_amd: true,
+            gpus: vec![
+                Gpu {
+                    gfx_target: "gfx1103".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        }
+    }
+
+    #[test]
+    fn fix_9_states_the_device_index_caveat_exactly_once() {
+        // `render_report_text` prints every note on its own line, so two notes
+        // that both say "--device-index is required for the auto-apply to do
+        // anything" reach the user as two bullets saying the same thing. The
+        // caveat is worth stating -- once. Checked on the rendered lines rather
+        // than on `Fix::notes`, because the duplicate is only a defect at the
+        // point where it is printed, and checked on both OS branches, which
+        // build their `Fix` separately and have drifted apart before.
+        for os_family in ["linux", "windows"] {
+            let report = diagnose(&igpu_dgpu_host(os_family), "torch crashes with a segfault");
+            let notes = rendered_notes(&report, "fix-9-igpu-dgpu");
+            let caveats: Vec<&String> = notes
+                .iter()
+                .filter(|n| n.contains("--device-index"))
+                .collect();
+            assert_eq!(
+                caveats.len(),
+                1,
+                "{os_family}: the --device-index caveat must be stated once, not {}; notes: {notes:#?}",
+                caveats.len()
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            for note in &notes {
+                assert!(
+                    seen.insert(note.clone()),
+                    "{os_family}: fix-9 prints the same note twice: {note}"
+                );
+            }
+        }
     }
 
     #[test]

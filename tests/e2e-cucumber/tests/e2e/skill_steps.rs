@@ -43,8 +43,9 @@ const AUTO_APPLICABLE_PROSE: &str = "auto-applicable";
 /// One catalog row, from either side of the comparison.
 #[derive(Debug, PartialEq, Eq)]
 struct Remediation {
-    /// Machines it applies to, normalised to the CLI's spelling
-    /// (`linux`, `windows`, `linux/windows`).
+    /// Machines it applies to, as each side spells it. Neither side is
+    /// normalised, so a catalog that invents its own shorthand shows up as a
+    /// mismatch instead of being quietly translated into agreement.
     os_scope: String,
     /// Whether the CLI applies it itself, as opposed to printing a plan.
     auto: bool,
@@ -63,7 +64,7 @@ fn reference_md_path() -> PathBuf {
 /// Read the closed-catalog table out of the skill's reference doc.
 ///
 /// Rows look like:
-/// `| `fix-1-arch` | both | <mode> | <signal> | no |`
+/// `| `fix-1-arch` | linux/windows/wsl | <mode> | <signal> | no |`
 /// Only rows whose first cell is a backticked `fix-*` id are taken, which skips
 /// the header, the separator, and the exit-code table further up the file.
 fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
@@ -81,10 +82,14 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
         if !id.starts_with("fix-") {
             continue;
         }
-        let os_scope = match cells[1] {
-            "both" => "linux/windows".to_owned(),
-            other => other.to_owned(),
-        };
+        // Taken verbatim, never normalised. A shorthand like `both` used to be
+        // rewritten to `linux/windows` here, which would have silently dropped
+        // `wsl` from a linux/windows/wsl row -- the exact OS-scope mismatch
+        // `assert_same_os_scope` exists to catch. Unrewritten, any spelling the
+        // CLI does not use fails there naming the id and both values, and
+        // `catalog_os_scopes_use_the_cli_spellings` (tests/skill_reference.rs)
+        // fails sooner, in the ordinary `cargo test` set.
+        let os_scope = cells[1].to_owned();
         // An unrecognised cell drops the row rather than aborting the parse, so
         // a reworded table surfaces as the scenario's own set diff — naming the
         // ids that went missing — instead of a panic from inside the reader.
