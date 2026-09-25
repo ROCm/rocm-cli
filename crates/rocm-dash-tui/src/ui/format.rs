@@ -21,8 +21,12 @@ use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 /// `v`, or `placeholder` when `v` is empty.
 ///
 /// Shared by the install-manager and onboarding overlays for their `--prefix`
-/// folder row, which both leave blank until the
-/// [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser) sets it.
+/// folder row display, which both leave blank until a value is chosen (either
+/// via the [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or, in
+/// install-manager's case, by typing directly). Whether to trim the *value*
+/// before using it as an argument is a separate, caller-specific decision —
+/// see `install_manager::InstallManagerState::build_args` and
+/// `onboarding::build_install_args`.
 pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
     if v.is_empty() {
         placeholder.to_string()
