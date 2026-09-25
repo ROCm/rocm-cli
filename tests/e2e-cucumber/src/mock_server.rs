@@ -680,6 +680,15 @@ pub struct ServiceRecordOptions {
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    /// The runtime the service recorded when it was launched, as a runtime
+    /// *key* (`release-tarball-gfx942`) — the field is named `runtime_id` on
+    /// disk, but every launch path resolves its selector to an exact key before
+    /// writing it, and the CLI compares it against a key. `None` (the default)
+    /// keeps the historical `"runtime_id": null`, i.e. a record that predates
+    /// runtime pinning and therefore says nothing about which runtime it runs
+    /// on. Set it when a scenario needs the CLI to see a server still on a
+    /// *different* runtime than the one being activated.
+    pub runtime_id: Option<&'static str>,
 }
 
 impl Default for ServiceRecordOptions {
@@ -689,6 +698,7 @@ impl Default for ServiceRecordOptions {
             startup_phase: None,
             supervisor_pid: 0,
             engine_pid: None,
+            runtime_id: None,
         }
     }
 }
@@ -708,8 +718,9 @@ pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
 /// Like [`write_service_record`], but with caller-specified lifecycle fields.
 ///
 /// See [`ServiceRecordOptions`] -- e.g. a "still loading" status/startup_phase,
-/// or `supervisor_pid`/`engine_pid` pointed at a live process so the CLI's
-/// liveness overlay doesn't mark the planted record dead.
+/// `supervisor_pid`/`engine_pid` pointed at a live process so the CLI's
+/// liveness overlay doesn't mark the planted record dead, or a `runtime_id`
+/// naming the runtime the service was launched against.
 pub fn write_service_record_with(
     services_dir: &Path,
     model: &str,
@@ -736,7 +747,7 @@ pub fn write_service_record_with(
         "startup_phase": options.startup_phase,
         "supervisor_pid": options.supervisor_pid,
         "engine_pid": options.engine_pid,
-        "runtime_id": null,
+        "runtime_id": options.runtime_id,
         "env_id": null,
         "device_policy": null,
         "gpu_indices": [],

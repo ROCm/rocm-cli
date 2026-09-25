@@ -4420,7 +4420,7 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
         path,
