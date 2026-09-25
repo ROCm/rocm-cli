@@ -1020,10 +1020,25 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         s
     }
 
+    /// A `rocm-smi` stub that answers each `--showmeminfo` shape the preflight
+    /// uses: both pools at once, GTT alone, VRAM alone. With `REJECT_COMBINED`
+    /// the two-pool form fails the way an older build does, which is the case
+    /// that must still reach GTT through the single-pool query.
+    #[cfg(unix)]
+    const SMI_STUB: &str = r#"#!/bin/sh
+case "$*" in
+  *vram*gtt*)
+    [ "${REJECT_COMBINED:-0}" = 1 ] && exit 1
+    cat "$FIXTURE" ;;
+  *gtt*) grep GTT "$FIXTURE" ;;
+  *)     grep -v GTT "$FIXTURE" ;;
+esac
+"#;
+
     /// Run a preflight script against fixture `rocm-smi` output, returning its
     /// exit code. `rocm-smi` is stubbed on `PATH`; nothing touches a real GPU.
     #[cfg(unix)]
-    fn run_preflight(script: &str, fixture: &str) -> i32 {
+    fn run_preflight(script: &str, fixture: &str, reject_combined: bool) -> i32 {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1032,7 +1047,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        std::fs::write(&stub, "#!/bin/sh\ncat \"$FIXTURE\"\n").expect("write rocm-smi stub");
+        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("make the stub executable");
 
@@ -1046,6 +1061,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             .arg(&script_path)
             .env("PATH", path)
             .env("FIXTURE", &fixture_path)
+            .env("REJECT_COMBINED", if reject_combined { "1" } else { "0" })
             // One poll, then the script's own 5s backoff ends the loop.
             .env("GPU_PREFLIGHT_CEILING_SECS", "1")
             .output()
@@ -1075,29 +1091,45 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             return;
         }
 
-        // (what the host is reporting, expected exit: native lane, advisory lane)
-        let cases: Vec<(&str, String, i32, i32)> = vec![
+        // (what the host reports, whether the two-pool query is rejected,
+        //  expected exit: native lane, advisory lane)
+        let cases: Vec<(&str, String, bool, i32, i32)> = vec![
             (
                 "carveout with a free aperture",
                 smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                false,
+                0,
+                0,
+            ),
+            // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
+            // single-pool fallback carries no GTT rows, so without a dedicated
+            // GTT query this healthy APU would fail as "no GTT pool" — the very
+            // false low-memory report this gate exists to stop producing.
+            (
+                "carveout where rocm-smi rejects the two-pool query",
+                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                true,
                 0,
                 0,
             ),
             (
                 "carveout with the aperture pinned by a leftover serve",
                 smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB))),
+                false,
                 1,
                 1,
             ),
             (
                 "discrete card with VRAM free",
                 smi_fixture(192 * GIB, 10 * GIB, None),
+                false,
                 0,
                 0,
             ),
             (
                 "discrete card with VRAM held",
                 smi_fixture(192 * GIB, 191 * GIB, None),
+                false,
                 1,
                 1,
             ),
@@ -1106,6 +1138,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             (
                 "zero VRAM total against a healthy aperture",
                 smi_fixture(0, 0, Some((62 * GIB, GIB))),
+                false,
                 1,
                 0,
             ),
@@ -1113,6 +1146,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             (
                 "carveout with no GTT pool reported",
                 smi_fixture(512 * MIB, 200 * MIB, None),
+                false,
                 1,
                 0,
             ),
@@ -1133,13 +1167,13 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         std::thread::scope(|scope| {
             let handles: Vec<_> = cases
                 .iter()
-                .map(|(label, fixture, want_native, want_advisory)| {
+                .map(|(label, fixture, reject, want_native, want_advisory)| {
                     let (native, advisory) = (&native, &advisory);
                     scope.spawn(move || {
                         (
                             label,
-                            run_preflight(native, fixture),
-                            run_preflight(advisory, fixture),
+                            run_preflight(native, fixture, *reject),
+                            run_preflight(advisory, fixture, *reject),
                             *want_native,
                             *want_advisory,
                         )

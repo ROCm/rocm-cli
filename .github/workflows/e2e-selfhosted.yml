@@ -485,6 +485,15 @@ jobs:
               # Discrete cards never reach this branch — their VRAM total is far
               # above the floor.
               if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
+                # The two-pool form above may have been rejected outright, in
+                # which case the fallback query carried no GTT rows. Ask for the
+                # pool on its own before concluding the host has none, or a CLI
+                # quirk fails a healthy APU with the very report this avoids.
+                out=$(timeout 15 rocm-smi --showmeminfo gtt 2>/dev/null) || out=""
+                gtt_total=$(field 'GTT Total Memory')
+                gtt_used=$(field 'GTT Total Used Memory')
+              fi
+              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
                 reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and rocm-smi reported no GTT pool — the floor cannot be met from VRAM on this host"
                 sleep 5; continue
               fi
@@ -688,6 +697,15 @@ jobs:
               # serve holding a few GiB. Same sensitivity this floor had on a
               # large-carveout host rather than a new gap, but coarse either way
               # - see #446.
+              if (-not $gttTotal -or -not $gttUsed) {
+                # The two-pool form above may have been rejected outright, in
+                # which case the fallback query carried no GTT rows. Ask for the
+                # pool on its own before concluding the host has none, or a CLI
+                # quirk fails a healthy APU with the very report this avoids.
+                $gttOut = (rocm-smi --showmeminfo gtt 2>$null | Out-String)
+                $gttTotal = Get-Pool $gttOut 'GTT Total Memory'
+                $gttUsed  = Get-Pool $gttOut 'GTT Total Used Memory'
+              }
               if (-not $gttTotal -or -not $gttUsed) {
                 $reason = "VRAM total is $([math]::Floor([int64]$total/1MB)) MiB, under the $minFreeGiB GiB floor, and rocm-smi reported no GTT pool - the floor cannot be met from VRAM on this host"
                 Start-Sleep -Seconds 5; continue
@@ -1036,6 +1054,13 @@ jobs:
             fi
             pool=VRAM
             if [ "$total" -lt "$min_free" ]; then
+              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
+                # See the native lane: the two-pool form may have been rejected,
+                # so ask for GTT alone before calling the pool unmeasurable.
+                out=$(timeout 15 rocm-smi --showmeminfo gtt 2>/dev/null) || out=""
+                gtt_total=$(field 'GTT Total Memory')
+                gtt_used=$(field 'GTT Total Used Memory')
+              fi
               if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
                 unmeasurable=1
                 sleep 5; continue
