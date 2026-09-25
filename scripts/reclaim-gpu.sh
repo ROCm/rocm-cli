@@ -148,14 +148,17 @@ process_alive() {
 #
 # `read` gives leftover words AND their intervening separators to the LAST name,
 # so a tab EMBEDDED in the command line lands in `cmdline` verbatim. Separators
-# are stripped only where the assigned field BEGINS or ENDS with them, and the
-# command line is argv[0] first — a path — so neither applies here.
+# are stripped only where the assigned field BEGINS or ENDS with them, and BOTH
+# edges are ruled out here — each by its own property, so both are named:
 #
-# That is narrower than it first read. Leading separators of the trailing field
-# are stripped too: `IFS=$'\t' read -r pid cmdline <<<$'1\t\tx'` yields `x`, not
-# a tab then `x`. It would take an argv[0] that itself began with a tab to reach
-# that, which no caller of this script produces — but "a tab can never be
-# stripped" is not the true statement, and this comment said so for a revision.
+#   - leading: the command line starts with argv[0], a path, so the trailing
+#     field never begins with a separator. (Were it to, a leading tab WOULD be
+#     stripped: `IFS=$'\t' read -r pid cmdline <<<$'1\t\tx'` yields `x`.)
+#   - trailing: flattening the final NUL always leaves the string ending in a
+#     space, so a tab is never the last byte. This one is load-bearing and
+#     measured — with the trailing space `…arg\t ` survives intact, without it
+#     the same tab is stripped. The same property is relied on again at the
+#     self-test's record check; if it ever changes, both move together.
 #
 # An earlier revision also claimed the tab "shifts the field boundary" and
 # flattened it for that reason — also false, and deleting the tab from the
@@ -652,11 +655,24 @@ self_test() {
   delimiter_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9754/llama-server"
 
   # Each pid is registered with the EXIT trap the moment it exists, for the same
-  # reason the scratch-dir traps above are widened one statement at a time: every
-  # spawn below is fallible (mkdir, cp, chmod), and `set -e` aborts the function
-  # on the first failure. Registering them only in the list further down would
-  # leave every ALREADY-spawned decoy running with nothing arranged to kill it —
-  # including the stubborn one, which ignores SIGTERM and loops forever.
+  # reason the scratch-dir traps above are widened one statement at a time:
+  # registering them only in the list further down would leave every
+  # ALREADY-spawned decoy running with nothing arranged to kill it — including
+  # the stubborn one, which ignores SIGTERM and loops forever. Measured: a
+  # failing statement between two spawns left 3 survivors before this change and
+  # 0 after.
+  #
+  # NOT because `set -e` aborts on a failing spawn — it does not, and an earlier
+  # version of this comment said it did. `inherit_errexit` is off, so errexit
+  # does not reach inside `$( )`, and each helper ends in an `echo` that
+  # succeeds regardless; a hard failure injected into a spawn helper runs the
+  # suite to a green exit 0. The routes that DO reach the trap mid-way are a
+  # signal (a cancelled CI job), and any fallible statement between the spawns
+  # here — including one a later edit adds, which is the case this guards.
+  #
+  # The flip side is worth knowing: because a broken spawn does not abort, it
+  # yields a live-looking pid for a process that died immediately, and surfaces
+  # later as a confusing assertion failure rather than as "the spawn failed".
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
   selftest_track_decoy "${prewarm_pid}"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
@@ -676,6 +692,27 @@ self_test() {
   # itself is absent deliberately: it is already dead, and killing its keeper is
   # what lets init reap it. Same set the trap holds, by construction.
   decoy_pids=("${SELFTEST_DECOY_PIDS[@]}")
+  # The registration itself, pinned. Without this, dropping a
+  # `selftest_track_decoy` call is silent AND leaks for real: both the EXIT trap
+  # and the final kill read this same list, so an untracked decoy is signalled
+  # by nothing. It survives even a GREEN run — measured, the `/workload` fixture
+  # outlives the suite by its full 300s, because `reclaim` is supposed to spare
+  # that one and the tracked list is the only other thing that would kill it.
+  # (An earlier version of this comment claimed such a decoy "is still killed at
+  # the end". It is not, and it is only incidentally true for the three fixtures
+  # `reclaim` itself signals.)
+  #
+  # LIMITATION, since an exact literal cannot carry its own maintenance: this
+  # catches a tracking call REMOVED from an existing decoy, where the count
+  # drops. It does NOT catch a decoy ADDED without one — the count stays at the
+  # stale literal and the run passes. Adding a spawn means bumping this number
+  # in the same edit; there is no mechanism enforcing that.
+  if [[ "${#SELFTEST_DECOY_PIDS[@]}" -ne 7 ]]; then
+    echo "FAIL: ${#SELFTEST_DECOY_PIDS[@]} decoys registered with the EXIT trap, expected 7"
+    echo "      tracked: ${SELFTEST_DECOY_PIDS[*]}"
+    echo "      a spawn is not being tracked; it would outlive the run, aborted or not"
+    failures=$((failures + 1))
+  fi
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 

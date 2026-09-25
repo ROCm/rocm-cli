@@ -811,7 +811,9 @@ with their root list pinned to the script's by an `xtask` contract test. The
 WSL lanes skip the proactive reclaim before preflight — they provision a fresh
 guest per job and unregister it afterwards, so no prior run's processes survive
 into them — but they still call the script for `--report-holders` when their
-preflight fails, like every other lane. Its `--self-test`
+preflight fails, as the other bash lanes do. The two native Windows lanes call
+it at neither point: their preflight failure path has no PowerShell equivalent
+of the diagnostic. Its `--self-test`
 needs no GPU — it spawns decoy processes and asserts which ones the matching
 rule selects — so it runs on the GitHub-hosted lane rather than only where GPU
 hardware is held, under the same `heavy` path filter as the other checks there
