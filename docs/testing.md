@@ -503,6 +503,56 @@ asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
 
+`prune`'s leftover sweep carries a second, unrelated race: a file with no record
+beside it is also what a *launch in progress* looks like, because `rocm serve`
+writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
+no age rule to hide that window behind. `serve` already holds the shared
+managed-launch lock across both writes, so `prune` acquires the same lock before
+it reads the directory.
+
+Testing that is awkward, because `FileLock::acquire` blocks and has no `try_`
+variant: a test that took the lock and then called `prune` on the same thread
+would simply deadlock. Both tests therefore stage the launch from a second
+thread and let the code under test block on it.
+
+- `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
+  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  written, runs `prune` on a worker, asserts the worker does *not* report
+  completion while the lock is held, then publishes the record and releases.
+  Two assertions fail independently if the acquire is removed: that negative
+  wait, and the endpoint key still being on disk with its original value. The
+  second only works because the record is published with
+  `plant_service_record_without_its_key` — the full planter rewrites the key, and
+  a rewritten key is present at the end whether or not the sweep deleted it,
+  which would leave only the timing assertion doing real work. The negative wait
+  in turn cannot pass vacuously: the worker physically cannot report anything
+  without first holding a lock the main thread has.
+- `service-cleanup-07` does the cross-process half, which the unit test cannot:
+  a thread holds the real `launch.lock` with `rocm_core::FileLock` while a
+  separate real `rocm services prune --any-age --yes` process runs, and only
+  publishes the record after a fixed delay sized to outlast that process's
+  startup. A fixed delay against a variable startup fails one-sidedly in the
+  unhelpful direction — a slow runner lets the prune arrive after the record is
+  already published, where the key survives for a reason unrelated to the lock —
+  so the scenario also asserts the prune's own wall clock covers the hold
+  (`the prune blocked until the launch published its record`). That converts a
+  timing-lucky pass into a failure.
+
+Both go red if the `FileLock::acquire` is removed from
+`prune_managed_service_records`, and `services_prune_sweeps_engine_state_left_behind_by_a_deleted_record`
+still pins that real leftovers are swept at any age, so a fix that simply
+stopped sweeping could not pass either.
+
+What neither pins is the lock's *scope*. `prune_managed_service_records` argues
+for holding the guard across the apply phase as well as the scan, and both tests
+still pass if it is released after the plan is built. That is not an oversight to
+fix with another test: the only behaviour the wider span changes needs a service
+id to repeat across runs (a backwards clock step), and a test that instead tried
+to slip a launch in between the two phases would be racing a microsecond-wide
+window and would pass on a timing-lucky run rather than flake — the same defect
+`service-cleanup-07`'s wall-clock assertion exists to remove. The scope is a
+documented conservative choice, not a covered property.
+
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
 via `spawn_hidden_console_with_log`, whose env-override API is path-valued only,
 so it cannot receive the value-typed `LEMONADE_API_KEY` that Lemonade's server

@@ -39,6 +39,18 @@ tower-http = { version = "0.6", features = ["fs"] }
 url = "2"
 vt100 = "0.16"
 
+[dev-dependencies]
+# `FileLock`, so the service-cleanup lane can hold the managed-launch lock that a
+# real `rocm serve` holds and watch a real `rocm services prune` *process* block
+# on it. Using the production type rather than a hand-rolled `flock` is the
+# point: the scenario proves the two contend across process boundaries, which is
+# the property the fix rests on and which no in-process test can show.
+#
+# A dev-dependency, not a normal one: the only use is in the `e2e` test target
+# below, nothing under `src/` touches it, and `xtask check-crate-edges` exempts
+# dev edges by design — so keeping it here needs no allowlist entry.
+rocm-core = { path = "../../crates/rocm-core" }
+
 [[test]]
 name = "e2e"
 harness = false

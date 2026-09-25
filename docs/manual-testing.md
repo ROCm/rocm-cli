@@ -264,6 +264,22 @@ Expected result:
 - A record whose server died long ago but has not been listed since is still
   removed by a plain `rocm services prune --yes`: age is read from the record
   file as it was before the command refreshed it, not after.
+- A prune running during a launch does not delete the starting server's endpoint
+  key. `rocm serve` writes `<data>/services/<id>.endpoint-key` before it writes
+  `<id>.json`, and `prune` waits on the shared `<data>/services/launch.lock` that
+  `serve` holds across both writes. Start `rocm serve --managed ...` and, while
+  it is still coming up, run `rocm services prune --any-age --yes` from a second
+  shell: the prune shows `Waiting for a launch already under way…` on a terminal
+  and blocks until the launch has published its record — as long as that takes,
+  with no timeout — then leaves that service's key and record alone (reporting it
+  under "still running, left alone") while still removing every other non-running
+  record. `--dry-run` waits in exactly the same way. Run in the other order, a
+  `serve` started while a prune is scanning waits for the prune instead — the
+  same lock, the same cost, in the other direction.
+- `rocm services prune --dry-run` on a machine that has never served creates
+  `<data>/services/` and an empty `launch.lock` (the lock the wait above needs),
+  and reports that nothing would be removed. That is the only thing a preview
+  writes.
 
 ## 5. ComfyUI Verification
 

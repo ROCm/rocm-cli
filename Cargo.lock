@@ -1271,6 +1271,7 @@ dependencies = [
  "e2e-report",
  "portable-pty",
  "reqwest 0.13.4",
+ "rocm-core",
  "serde",
  "serde_json",
  "tempfile",
