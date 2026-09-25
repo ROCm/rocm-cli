@@ -13,6 +13,8 @@ active-implementation-log.md
 current-user-asks.md
 __pycache__/
 /.hawkeye-bin/
+# skillscope writes its JSON run reports here.
+/.skillscope/
 /.claude
 /plans/
 /workspace/
