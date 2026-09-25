@@ -924,6 +924,24 @@ mod tests {
     }
 
     #[test]
+    fn draw_wraps_long_warning_text_instead_of_clipping() {
+        let long_warning = "amd-smi is missing, unresolvable, or failed to run, even though a \
+             GPU was detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+             model may not be supported by the installed amd-smi/ROCm, or not supported on WSL \
+             yet"
+        .to_string();
+        let snap = Snapshot {
+            warnings: vec![long_warning],
+            ..Default::default()
+        };
+        let out = render_to_string(&state_with_snapshot(snap), 40, 45);
+        assert!(
+            out.contains("WSL yet"),
+            "warning tail must survive wrapping at a narrow panel width instead of being clipped: {out:?}"
+        );
+    }
+
+    #[test]
     fn info_line_renders_with_sysinfo() {
         let si = GpuSystemInfo {
             rocm_version: Some("6.2.0".into()),

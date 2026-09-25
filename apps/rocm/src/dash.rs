@@ -69,9 +69,16 @@ pub fn runner_options(
         // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
         amd_smi_skip_device_preflight: false,
-        // Same verdict `serve`/`examine` already act on (handles WSL, where
-        // there is no single device node the dash crates can probe directly).
-        amd_smi_gpu_reachable: rocm_core::has_usable_amd_gpu(),
+        // Gated on `is_wsl_host()`: `has_usable_amd_gpu()` is deliberately
+        // fail-open on an unprobeable platform (so it never blocks a launch),
+        // which is the wrong polarity for this pre-flight's hang guard — an
+        // unknown verdict must NOT skip the real `/dev/kfd` open. Restricting
+        // the substitution to WSL (where there is no device node the dash
+        // crates can probe directly, only the shared ROCDXG-plumbing probe
+        // this same function backs) keeps bare-metal behaviour byte-identical
+        // to a plain `/dev/kfd` check. Runs once per dashboard launch here,
+        // not per refresh tick, so the extra subprocess spawn is negligible.
+        amd_smi_gpu_reachable: rocm_core::is_wsl_host() && rocm_core::has_usable_amd_gpu(),
         test_clock_offset_path: dash_test_clock_offset_path(),
     }
 }
@@ -891,6 +898,21 @@ mod tests {
         assert!(
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
+        );
+    }
+
+    /// Pins the WSL-gating: catches an argument transposition at this call
+    /// site, and a regression back to the un-gated `has_usable_amd_gpu()`
+    /// (which would flip this to a fixed `true` on any host where the
+    /// fail-open verdict fires, bare metal included).
+    #[test]
+    fn runner_options_gates_gpu_reachable_on_wsl() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.amd_smi_skip_device_preflight);
+        assert_eq!(
+            opts.amd_smi_gpu_reachable,
+            rocm_core::is_wsl_host() && rocm_core::has_usable_amd_gpu()
         );
     }
 

@@ -433,17 +433,20 @@ pub async fn run_loop(
                 }
             }
         } else if gpu_init_done {
-            // `amd_smi_gpu_reachable` is the rocm-core verdict (KFD/DRM on Linux,
-            // ROCDXG bridge on WSL) that let the device pre-flight pass. If it was
+            // `amd_smi_gpu_reachable` is only ever true on WSL (the wiring in
+            // `apps/rocm/src/dash.rs` gates the rocm-core verdict on
+            // `is_wsl_host()`) — it let the device pre-flight pass without a
+            // readable `/dev/kfd`, which doesn't exist on WSL anyway. If it was
             // true and amd-smi *still* found nothing, that's a real contradiction
             // worth calling out — plumbing readiness (e.g. `wsl_rocdxg_ready`) is
             // not the same as amd-smi enumerating a supported GPU, and a generic
             // "device inaccessible" message would flatly contradict what `examine`
             // just told the same user.
             warnings.push(if amd_smi_gpu_reachable {
-                "amd-smi found no usable GPU even though a GPU was detected by other means \
-                 (WSL ROCDXG bridge or Linux device topology) — this GPU model may not be \
-                 supported by the installed amd-smi/ROCm, or not supported on WSL yet"
+                "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
+                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 model may not be supported by the installed amd-smi/ROCm, or not supported on \
+                 WSL yet"
                     .into()
             } else {
                 "amd-smi unavailable (GPU device inaccessible or probe failed)".into()
