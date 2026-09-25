@@ -198,10 +198,12 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         "--format".to_string(),
         "wheel".to_string(),
     ];
-    let prefix = cfg.prefix.trim();
-    if !prefix.is_empty() {
+    // Never trim the value itself: `cfg.prefix` comes only from the folder
+    // browser (never typed), so trimming could silently redirect the install
+    // into a different directory if a real folder name ends in whitespace.
+    if !cfg.prefix.trim().is_empty() {
         args.push("--prefix".to_string());
-        args.push(prefix.to_string());
+        args.push(cfg.prefix.clone());
     }
     args.push(
         // Onboarding installs are spawned with null stdin, so a would-be
@@ -1138,6 +1140,21 @@ mod tests {
             staged_args(ob.as_ref().unwrap())
                 .iter()
                 .any(|a| a == "--prefix")
+        );
+    }
+
+    #[test]
+    fn prefix_with_trailing_whitespace_is_passed_through_untrimmed() {
+        let cfg = InstallConfig {
+            prefix: "/opt/rocm-sdk ".to_string(),
+            ..Default::default()
+        };
+        let args = build_install_args(&cfg);
+        let idx = args.iter().position(|a| a == "--prefix").unwrap();
+        assert_eq!(
+            args[idx + 1],
+            "/opt/rocm-sdk ",
+            "a real folder name is never mangled, even if it ends in whitespace"
         );
     }
 
