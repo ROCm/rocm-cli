@@ -14,6 +14,7 @@ mod endpoint_keys;
 mod logging;
 mod provider_keys;
 mod providers;
+mod remote;
 mod serve_summary;
 mod storage;
 mod therock;
@@ -409,6 +410,16 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Allow binding to a non-local address.
         #[arg(long)]
         allow_public_bind: bool,
+        /// Require an API key even on a loopback bind.
+        ///
+        /// Loopback serving is credential-free because only this machine can
+        /// reach it. That stops being true when something else republishes the
+        /// port — a tailnet publish, a reverse proxy, a container port map — at
+        /// which point the bind address no longer describes who can call it.
+        /// Pass this to keep the endpoint authenticated anyway. `rocm remote`
+        /// sets it on every session it starts.
+        #[arg(long)]
+        require_api_key: bool,
         /// vLLM tool-call parser to enable OpenAI tool calling for this model
         /// (e.g. `hermes`, `llama3_json`, `mistral`). Overrides any catalog default
         /// and implies `--enable-auto-tool-choice`. Applies to vLLM only.
@@ -444,8 +455,9 @@ rocm serve qwen --verbose --device gpu_required")]
         /// When binding a public interface and this is omitted, a strong key is
         /// generated automatically. Prefer the `ROCM_SERVE_API_KEY` environment
         /// variable over this flag so the secret does not appear in shell history
-        /// or the process table. Ignored for loopback binds, which stay
-        /// credential-free.
+        /// or the process table. Ignored for a loopback bind unless
+        /// `--require-api-key` is also passed, which makes a loopback endpoint
+        /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
     },
@@ -459,6 +471,11 @@ rocm serve qwen --verbose --device gpu_required")]
     Services {
         #[command(subcommand)]
         command: Option<ServicesCommand>,
+    },
+    /// [preview] Work with GPU machines on your tailnet.
+    Remote {
+        #[command(subcommand)]
+        command: remote::RemoteCommand,
     },
     /// [preview] Manage optional background checks and review requests.
     Automations {
@@ -855,6 +872,13 @@ enum ServicesCommand {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
         all: bool,
+        /// Emit the service records as JSON instead of a table.
+        ///
+        /// This is the machine-readable form `rocm remote` reads back over its
+        /// control channel to discover which service a remote `rocm serve` just
+        /// started, rather than scraping the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Show logs for a local model server.
     Logs {
@@ -2327,6 +2351,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            require_api_key,
             tool_call_parser,
             gpu_memory_utilization,
             temperature,
@@ -2347,6 +2372,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             verbose,
             no_smoke_test,
             allow_public_bind,
+            require_api_key,
             tool_call_parser,
             gpu_memory_utilization,
             temperature,
@@ -2356,6 +2382,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
+        Some(Command::Remote { command }) => remote::run(command),
         Some(Command::Automations { command }) => automations(command),
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
@@ -5839,6 +5866,7 @@ struct ServeArgs {
     verbose: bool,
     no_smoke_test: bool,
     allow_public_bind: bool,
+    require_api_key: bool,
     tool_call_parser: Option<String>,
     gpu_memory_utilization: Option<String>,
     temperature: Option<f32>,
@@ -5862,6 +5890,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         verbose,
         no_smoke_test,
         allow_public_bind,
+        require_api_key,
         tool_call_parser,
         gpu_memory_utilization,
         temperature,
@@ -5881,7 +5910,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     });
-    let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref())?;
+    let endpoint_auth = resolve_endpoint_auth(&host, supplied_key.as_deref(), require_api_key)?;
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
     // Host GPU detection can involve sysfs/WSL probing, so only run it when engine
@@ -6198,6 +6227,7 @@ fn serve(args: ServeArgs) -> Result<()> {
             resolve.engine_recipe.as_ref(),
             endpoint_auth.as_deref(),
             launch_lock,
+            require_api_key,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;
@@ -6277,6 +6307,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         resolved_selection.env_id.as_deref(),
         endpoint_auth.as_deref(),
         launch_lock,
+        require_api_key,
     )
 }
 
@@ -6348,8 +6379,20 @@ fn is_loopback_host(host: &str) -> bool {
 ///   otherwise generate a strong random one so a public endpoint can never come
 ///   up anonymous. An empty/whitespace supplied key is rejected rather than
 ///   silently treated as "no auth".
-fn resolve_endpoint_auth(host: &str, supplied: Option<&str>) -> Result<Option<String>> {
-    if is_loopback_host(host) {
+/// - **`required`** → treat a loopback bind as public for this purpose.
+///
+/// That last case exists because "loopback" is a statement about the bind
+/// address, not about who can reach the port. Publishing the port onto a
+/// tailnet, proxying it, or mapping it out of a container all leave the bind
+/// loopback while widening the audience — and the policy above would then hand
+/// out an unauthenticated endpoint. Whoever widens the reach is responsible for
+/// asking for the credential, so this is an explicit flag rather than a guess.
+fn resolve_endpoint_auth(
+    host: &str,
+    supplied: Option<&str>,
+    required: bool,
+) -> Result<Option<String>> {
+    if is_loopback_host(host) && !required {
         return Ok(None);
     }
     match supplied {
@@ -6434,7 +6477,27 @@ fn ensure_public_bind_engine_supported(
 /// `key_present` is a plain `bool` rather than a path so both branches are
 /// unit-testable without touching the filesystem, mirroring `is_windows` in
 /// [`ensure_public_bind_engine_supported`].
-fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+fn ensure_public_service_has_endpoint_key(
+    host: &str,
+    key_present: bool,
+    requires_api_key: bool,
+) -> Result<()> {
+    // Two ways a service can need a key. A public bind is the obvious one. The
+    // other is a service that asked for auth on a loopback bind, because
+    // something outside this process republishes the port — a tailnet publish
+    // survives a reboot, let alone a restart, so "loopback" stops meaning
+    // "only this machine" and the bind address can no longer be trusted to
+    // answer the question on its own.
+    if requires_api_key && !key_present {
+        bail!(
+            "managed service was launched with `--require-api-key` but has no endpoint API key, \
+             so restarting it would reopen it without authentication. Something outside this \
+             machine may still be publishing its port. The key is dropped when a service stops \
+             and cannot be recovered. Launch it again with \
+             `rocm serve --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, \
+             to choose the key instead of generating one)."
+        );
+    }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
@@ -6578,6 +6641,7 @@ fn spawn_managed_engine_child(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
+    require_api_key: bool,
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -6600,6 +6664,32 @@ fn spawn_managed_engine_child(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
                 existing.service_id,
                 resolve.canonical_model_id
+            );
+        }
+        // Reuse cannot satisfy a demand for auth the running server never got.
+        // The engine reads its key once, at launch, from the environment this
+        // function builds below — so a server started without one keeps serving
+        // anonymously no matter what is written afterwards. Upgrading the record
+        // here would be worse than doing nothing: the record would claim auth
+        // that the live process does not enforce, and
+        // `ensure_public_service_has_endpoint_key` would pass on the strength of
+        // a key file nothing reads.
+        //
+        // This is what `rocm remote serve` relies on. It publishes a loopback
+        // port onto the tailnet and prints "the API key above is what stops
+        // anyone else calling it". Reusing an unauthenticated service silently
+        // would make that sentence false about an endpoint the whole tailnet can
+        // reach. Refusing is the only answer that fails closed, and it is the
+        // same shape as the recipe mismatch above.
+        if require_api_key && !existing.requires_api_key {
+            bail!(
+                "managed service `{}` is already running for engine `{engine}` and model `{}` \
+                 without authentication, and a running server cannot be given a key it did not \
+                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 serve it with `--require-api-key`",
+                existing.service_id,
+                resolve.canonical_model_id,
+                existing.service_id
             );
         }
         record_cli_audit_event(
@@ -6640,6 +6730,19 @@ fn spawn_managed_engine_child(
     );
     record.gpu_indices = gpu_indices.to_vec();
     record.engine_recipe_json = requested_recipe_json;
+    // The flag the user actually passed, carried through rather than re-derived.
+    //
+    // Deriving it from key-file presence looked equivalent and was not:
+    // `resolve_endpoint_auth` mints a key for *every* non-loopback bind whether or
+    // not auth was demanded, so a plain `--host 0.0.0.0 --allow-public-bind`
+    // recorded `true` here. The guard below tests this field before the bind
+    // address, so that service was then refused with a message naming a flag it
+    // never used and a relaunch command that drops `--allow-public-bind` — the
+    // public-bind branch, which carries the right command, became unreachable.
+    //
+    // This field means "the user demanded auth on a bind that would not otherwise
+    // require it". A public bind needs no such record; its address still says so.
+    record.requires_api_key = require_api_key;
     record.write()?;
 
     if let Some(parent) = record.engine_state_path.parent() {
@@ -6675,11 +6778,24 @@ fn spawn_managed_engine_child(
     // still produce an unauthenticated public listener.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
         .filter(|path| rocm_engine_protocol::endpoint_api_key_from_file(path).is_some());
-    // `serve()` already resolved and stored the key for a public bind, so this
-    // cannot fire on the fresh-launch path today. It is the shared choke point
-    // for managed spawns, so enforce the invariant here too rather than relying
-    // on every future caller having done so.
-    ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
+    // `serve()` already resolved and stored the key for a public bind, so the
+    // public-bind branch cannot fire on the fresh-launch path today. It is the
+    // shared choke point for managed spawns, so enforce the invariant here too
+    // rather than relying on every future caller having done so.
+    //
+    // `record.requires_api_key` is passed, not a literal, and the two arguments
+    // are deliberately different things: that field is the `--require-api-key`
+    // flag the caller passed, `endpoint_key_file` is whether a *usable* key is on
+    // disk. A present but empty or malformed key file is where they disagree, and
+    // is exactly what the `requires_api_key` branch exists to refuse.
+    //
+    // The field is threaded, never derived from the key file. Deriving it marked
+    // every public bind as having demanded auth — see the assignment above.
+    ensure_public_service_has_endpoint_key(
+        host,
+        endpoint_key_file.is_some(),
+        record.requires_api_key,
+    )?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -6748,6 +6864,7 @@ fn start_managed_service(
     engine_recipe: Option<&EngineRecipeHint>,
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
+    require_api_key: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -6764,6 +6881,7 @@ fn start_managed_service(
         runtime_id,
         env_id,
         engine_recipe,
+        require_api_key,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -7061,6 +7179,7 @@ fn run_attached_service(
     env_id: Option<&str>,
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
+    require_api_key: bool,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -7077,6 +7196,7 @@ fn run_attached_service(
         runtime_id,
         env_id,
         resolve.engine_recipe.as_ref(),
+        require_api_key,
     )?;
     // The claiming record is persisted (or an existing service was found), so the
     // selected GPU is now visible to concurrent auto-selection. Release the launch
@@ -7327,9 +7447,16 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
-    match command.unwrap_or(ServicesCommand::List { all: false }) {
-        ServicesCommand::List { all } => {
-            print!("{}", render_services_text(&paths, all)?);
+    match command.unwrap_or(ServicesCommand::List {
+        all: false,
+        json: false,
+    }) {
+        ServicesCommand::List { all, json } => {
+            if json {
+                print!("{}", render_services_json(&paths, all)?);
+            } else {
+                print!("{}", render_services_text(&paths, all)?);
+            }
             Ok(())
         }
         ServicesCommand::Logs { service_id } => {
@@ -13950,6 +14077,31 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Setup".to_owned(),
             })
         }
+        // Mirrors the daemon's `ensure_rocm_command_is_read_only`, which admits
+        // the same three verbs. The daemon's arm carries the reasoning; the
+        // invariant is that the two agree, and this PR added the arm there
+        // first, so the two disagreed until this was written.
+        Some("remote")
+            if second
+                .as_deref()
+                .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")) =>
+        {
+            Ok(ChatRocmCommandAction::ReadOnly(args))
+        }
+        // `serve`, `attach` and `stop` start, publish or tear down something on
+        // another machine, so they go through approval like any other mutation.
+        Some("remote")
+            if second
+                .as_deref()
+                .is_some_and(|value| matches!(value, "serve" | "attach" | "stop")) =>
+        {
+            let verb = second.as_deref().unwrap_or_default().to_owned();
+            Ok(ChatRocmCommandAction::Approval {
+                args,
+                pending_title: format!("Remote {verb}"),
+                command_title: "Remote".to_owned(),
+            })
+        }
         Some(command) => bail!("local assistant cannot use unsupported rocm command `{command}`"),
         None => bail!("rocm_command requires at least one argument"),
     }
@@ -17374,6 +17526,25 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
     Ok(output)
 }
 
+/// The machine-readable counterpart to [`render_services_text`].
+///
+/// Applies the same liveness filter as the text form so `--json` and the table
+/// agree on which services they consider current — the two must not disagree
+/// about what is running. Emits the `ManagedServiceRecord`s verbatim rather than
+/// a bespoke projection: `rocm remote` deserializes them back into the same type
+/// on the other side of its control channel, so any field this dropped would be
+/// a field the remote orchestration could never see.
+pub(crate) fn render_services_json(paths: &AppPaths, all: bool) -> Result<String> {
+    let records = load_managed_services(paths)?
+        .into_iter()
+        .filter(|record| all || managed_service_is_live(record))
+        .collect::<Vec<_>>();
+    let mut output = serde_json::to_string_pretty(&records)
+        .context("failed to serialize the managed service records as JSON")?;
+    output.push('\n');
+    Ok(output)
+}
+
 fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "managed_services: {}", records.len());
@@ -17744,7 +17915,11 @@ fn restart_internal_managed_service(
     let preserved_endpoint_key = endpoint_keys::endpoint_api_key(paths, service_id);
     // Checked before the stop, so a refused restart leaves a running service
     // running instead of stopping it and then failing to bring it back.
-    ensure_public_service_has_endpoint_key(&record.host, preserved_endpoint_key.is_some())?;
+    ensure_public_service_has_endpoint_key(
+        &record.host,
+        preserved_endpoint_key.is_some(),
+        record.requires_api_key,
+    )?;
     let _ = stop_internal_managed_service(paths, service_id);
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
@@ -20010,6 +20185,45 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         ));
     }
 
+    // Remote sessions are worse than local ones to drop silently. The model runs
+    // on someone else's machine and its endpoint is published there, so removing
+    // the record here does not stop either — it only destroys the last thing that
+    // knew they existed. Name them and the command that tears them down properly.
+    //
+    // A read that fails is reported, not defaulted away. `load_all` already warns
+    // past an individual unreadable record and keeps going, so an `Err` here is a
+    // directory-level I/O failure, and a missing directory is `Ok`. Taking the
+    // default would state "there are none" on the one path where we do not know —
+    // and this plan goes on to delete the data directory those records live in,
+    // so the warning that something is still published elsewhere would be lost at
+    // exactly the moment it was the last copy.
+    let remote_sessions = match remote::session::load_all(paths) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            plan.warnings.push(format!(
+                "could not read the remote session records under {}: {error:#}\n\
+                 This pass cannot tell whether models are still running on other machines with \
+                 their endpoints published. Check with `rocm remote status` before continuing.",
+                paths.remote_sessions_dir().display()
+            ));
+            Vec::new()
+        }
+    };
+    if !remote_sessions.is_empty() {
+        plan.warnings.push(format!(
+            "{} remote session record(s) exist under {}; their models keep running on the \
+             remote machines and their endpoints stay published. Removing these records only \
+             loses track of them — run `rocm remote stop <session>` for each first: {}",
+            remote_sessions.len(),
+            paths.remote_sessions_dir().display(),
+            remote_sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     plan.actions
         .sort_by(|left, right| left.path.cmp(&right.path));
     plan.actions.dedup_by(|left, right| left.path == right.path);
@@ -21609,6 +21823,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "comfyui",
         "comfy",
         "services",
+        "remote",
         "automations",
         "config",
         "logs",
@@ -25625,6 +25840,17 @@ model recipes
                 "old-runtime".to_owned(),
                 "--dry-run".to_owned(),
             ],
+            // Must agree with the daemon's `ensure_rocm_command_is_read_only`.
+            // Its comment claims the two are mirrored, and nothing enforced
+            // that — the arm was added there and not here, and the classifiers
+            // disagreed until a reviewer noticed.
+            vec!["remote".to_owned(), "targets".to_owned()],
+            vec![
+                "remote".to_owned(),
+                "doctor".to_owned(),
+                "gpu-box".to_owned(),
+            ],
+            vec!["remote".to_owned(), "status".to_owned()],
         ];
         for args in read_only {
             let action = chat_rocm_command_action_from_args(args.clone())
@@ -25635,32 +25861,67 @@ model recipes
             );
         }
 
+        // Paired with whether the command has a `--yes` to inject. The flag
+        // exists to keep a consent prompt from hanging a null-stdin spawn, so
+        // the demand only makes sense for commands that would prompt — and
+        // injecting it where clap defines no such flag would make the spawn fail
+        // to parse rather than succeed unattended.
         let mutating = [
-            vec!["update".to_owned(), "--apply".to_owned()],
-            vec!["comfyui".to_owned(), "install".to_owned()],
-            vec!["comfyui".to_owned(), "start".to_owned()],
-            vec!["comfyui".to_owned(), "stop".to_owned()],
-            vec!["uninstall".to_owned()],
-            vec!["setup".to_owned(), "reset".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-            ],
+            (vec!["update".to_owned(), "--apply".to_owned()], true),
+            // These start, publish or tear down on another machine. They take no
+            // `--yes` because they never prompt: consent is the approval step
+            // itself, and every destructive choice they make is already settled
+            // by an explicit flag (`remote stop --force`). Give any of them an
+            // interactive prompt and it needs a consent flag here too.
+            (
+                vec![
+                    "remote".to_owned(),
+                    "serve".to_owned(),
+                    "gpu-box".to_owned(),
+                    "m".to_owned(),
+                ],
+                false,
+            ),
+            (
+                vec!["remote".to_owned(), "attach".to_owned(), "sess".to_owned()],
+                false,
+            ),
+            (
+                vec!["remote".to_owned(), "stop".to_owned(), "sess".to_owned()],
+                false,
+            ),
+            (vec!["comfyui".to_owned(), "install".to_owned()], true),
+            (vec!["comfyui".to_owned(), "start".to_owned()], true),
+            (vec!["comfyui".to_owned(), "stop".to_owned()], true),
+            (vec!["uninstall".to_owned()], true),
+            (vec!["setup".to_owned(), "reset".to_owned()], true),
+            (
+                vec![
+                    "runtimes".to_owned(),
+                    "uninstall".to_owned(),
+                    "old-runtime".to_owned(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "runtimes".to_owned(),
+                    "remove".to_owned(),
+                    "old-runtime".to_owned(),
+                ],
+                true,
+            ),
         ];
-        for args in mutating {
+        for (args, expects_yes) in mutating {
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
             match &action {
                 ChatRocmCommandAction::Approval { args, .. } => {
-                    assert!(
+                    assert_eq!(
                         args.iter().any(|arg| arg == "--yes"),
-                        "{args:?} should have --yes injected for the approval path"
+                        expects_yes,
+                        "{args:?} disagrees with whether the approval path should \
+                         carry --yes"
                     );
                 }
                 other @ ChatRocmCommandAction::ReadOnly(_) => {
@@ -27303,6 +27564,126 @@ install therock";
     }
 
     #[test]
+    fn services_json_round_trips_and_applies_the_same_liveness_filter_as_the_table() -> Result<()> {
+        // This JSON is a contract, not a convenience: `rocm remote` parses it
+        // back over its control channel to learn which service a remote serve
+        // just started. Two things have to hold — every record survives the
+        // round trip, and `--json` agrees with the table about what is live. If
+        // they disagreed, the remote orchestration would act on a different set
+        // of services than the operator sees.
+        let (root, paths) = test_paths("services-json");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        for (service_id, status, port) in [
+            ("svc-live", "starting", 11440_u16),
+            ("svc-past", "failed", 11441_u16),
+        ] {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                service_id,
+                "vllm",
+                "qwen",
+                "Qwen/Qwen3.5",
+                "127.0.0.1",
+                port,
+                "managed",
+                current_pid,
+                Some("therock-release".to_owned()),
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            record.status = status.to_owned();
+            record.write()?;
+        }
+
+        let live = render_services_json(&paths, false)?;
+        let every = render_services_json(&paths, true)?;
+        let _ = fs::remove_dir_all(root);
+
+        let live: Vec<ManagedServiceRecord> = serde_json::from_str(&live)?;
+        let every: Vec<ManagedServiceRecord> = serde_json::from_str(&every)?;
+
+        assert_eq!(
+            live.iter()
+                .map(|r| r.service_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc-live"],
+            "the default listing must hide past attempts, exactly as the table does"
+        );
+        let mut every_ids = every
+            .iter()
+            .map(|r| r.service_id.as_str())
+            .collect::<Vec<_>>();
+        every_ids.sort_unstable();
+        assert_eq!(every_ids, vec!["svc-live", "svc-past"]);
+
+        // The fields remote orchestration actually reads must survive intact.
+        let record = &live[0];
+        assert_eq!(record.port, 11440);
+        assert_eq!(record.status, "starting");
+        // Note for remote orchestration: the recorded endpoint is already the
+        // OpenAI-compatible base, `/v1` suffix included — not a bare origin.
+        assert_eq!(record.endpoint_url, "http://127.0.0.1:11440/v1");
+        assert_eq!(record.canonical_model_id, "Qwen/Qwen3.5");
+        Ok(())
+    }
+
+    #[test]
+    fn service_records_tolerate_unknown_fields_but_not_missing_required_ones() -> Result<()> {
+        // A remote may run a different CLI version than the machine driving it.
+        // Newer fields it emits must not break an older parser, or a version skew
+        // turns every remote command into a parse error; a genuinely absent
+        // required field must still fail, and name itself when it does.
+        // Built from a real record rather than hand-written JSON, so the fixture
+        // cannot drift out of step with the struct and quietly stop testing the
+        // thing it claims to.
+        let (root, paths) = test_paths("services-json-contract");
+        paths.ensure()?;
+        let record = ManagedServiceRecord::new(
+            &paths,
+            "svc-a",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11440,
+            "managed",
+            4242,
+            None,
+            None,
+            None,
+        );
+        let mut value = serde_json::to_value(&record)?;
+        let _ = fs::remove_dir_all(root);
+        let fields = value
+            .as_object_mut()
+            .expect("a service record serializes as a JSON object");
+
+        fields.insert(
+            "a_field_from_a_newer_release".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        let parsed: ManagedServiceRecord = serde_json::from_value(value.clone())
+            .context("a newer remote's extra fields must not break an older parser")?;
+        assert_eq!(parsed.service_id, "svc-a");
+        assert_eq!(parsed.port, 11440);
+
+        value
+            .as_object_mut()
+            .expect("still an object")
+            .remove("port")
+            .expect("port was present before removal");
+        let error = serde_json::from_value::<ManagedServiceRecord>(value)
+            .expect_err("a missing required field must be rejected, not defaulted")
+            .to_string();
+        assert!(
+            error.contains("port"),
+            "the error should name the missing field, got: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn render_services_text_demotes_stale_ready_record() -> Result<()> {
         let (root, paths) = test_paths("services-stale-ready");
         paths.ensure()?;
@@ -28423,6 +28804,7 @@ install therock";
             None,
             None,
             Some(&requested_recipe),
+            false,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -28437,6 +28819,163 @@ install therock";
         assert!(
             message.contains("recipe hint, tool-call parser, or generation defaults"),
             "message should not single out generation defaults as the sole cause: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_managed_engine_child_refuses_to_reuse_an_unauthenticated_service() -> Result<()> {
+        // `--require-api-key` used to be accepted and dropped on this path. The
+        // reuse branch returns before the flag is recorded and before the
+        // endpoint key is checked, so a caller demanding auth got a server that
+        // never had it, with no error. `rocm remote serve` then published that
+        // endpoint onto the tailnet and printed a freshly minted key under "the
+        // API key above is what stops anyone else calling it" — a false
+        // assurance about an endpoint the whole tailnet can reach.
+        //
+        // Asserted through `spawn_managed_engine_child` rather than against the
+        // guard's own arguments: the defect was the early return, so only the
+        // real call site can fail for it.
+        let (root, paths) = test_paths("dup-managed-unauthenticated-reuse");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-3000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        // The state that matters: live, matching, and serving without auth.
+        existing.requires_api_key = false;
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-3001",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11520,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            // The demand that used to be silently discarded.
+            true,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!(
+                "reusing an unauthenticated service must not satisfy `--require-api-key`; a \
+                 satisfied reuse leaves the endpoint open while the caller is told it is not"
+            )
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("without authentication"),
+            "the refusal must say why it refused: {message}"
+        );
+        assert!(
+            message.contains("rocm services stop lemonade-qwen-3000"),
+            "the refusal must name the way out, with the service to stop: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_managed_spawn_refuses_an_invalid_key_file_on_a_service_that_requires_one() -> Result<()> {
+        // Drives the real call site, not the guard's own arguments. The service
+        // was launched with `--require-api-key`, and its key file is present but
+        // empty — so `requires_api_key` is true while `key_present` is false,
+        // which is the only way to reach the first branch. A test calling
+        // `ensure_public_service_has_endpoint_key` directly cannot catch a
+        // mis-wired call site, which is the defect that has occurred here twice.
+        //
+        // The flag is passed explicitly rather than inferred from the key file.
+        // Inferring it marked every public bind as having demanded auth, because
+        // a public bind always has a key file whether or not it asked for one.
+        let (root, paths) = test_paths("managed-spawn-invalid-key");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        // Empty, so the file exists (requires_api_key = true) but yields no
+        // usable key (key_present = false).
+        endpoint_keys::store_endpoint_api_key(&paths, "lemonade-qwen-3000", "")?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-3000",
+            "qwen",
+            &resolve,
+            // Loopback on purpose: the public-bind branch must not be what
+            // refuses this, or the test would pass with the guard disabled.
+            "127.0.0.1",
+            11512,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            true,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!("a service requiring a key must not spawn with an unusable key file")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("--require-api-key"),
+            "the refusal must name the flag the service was launched with: {message}"
+        );
+        assert!(
+            message.contains("without authentication"),
+            "the refusal must say what the risk is: {message}"
         );
         Ok(())
     }
@@ -28550,6 +29089,31 @@ install therock";
         );
         assert!(update_should_preview_or_apply(true, false));
         assert!(update_should_preview_or_apply(true, true));
+    }
+
+    #[test]
+    fn remote_is_structured_not_freeform() {
+        // `rocm remote …` reads like a plain-English request, so without an
+        // entry in the structured allowlist the natural-language planner
+        // swallows it and the real command becomes unreachable. This guards the
+        // allowlist against losing `remote`.
+        let invocation = parse_freeform_invocation(&[
+            "remote".to_owned(),
+            "targets".to_owned(),
+            "--tag".to_owned(),
+            "gpu".to_owned(),
+        ]);
+        assert!(!treat_as_natural_language(&invocation.request_args));
+        assert!(!should_treat_as_freeform(&invocation));
+
+        Cli::try_parse_from(["rocm", "remote", "targets"])
+            .expect("remote targets should be a real command");
+        Cli::try_parse_from(["rocm", "remote", "targets", "--tag", "gpu"])
+            .expect("remote targets should accept a tag filter");
+        // The group has no useful default action, so a bare `rocm remote` must
+        // show help rather than silently doing something.
+        Cli::try_parse_from(["rocm", "remote"])
+            .expect_err("bare `rocm remote` should require a subcommand");
     }
 
     #[test]
@@ -28759,14 +29323,42 @@ install therock";
     fn resolve_endpoint_auth_loopback_stays_credential_free() {
         // Loopback binds never require auth, even if a key is supplied.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            assert_eq!(resolve_endpoint_auth(host, None).unwrap(), None);
-            assert_eq!(resolve_endpoint_auth(host, Some("ignored")).unwrap(), None);
+            assert_eq!(resolve_endpoint_auth(host, None, false).unwrap(), None);
+            assert_eq!(
+                resolve_endpoint_auth(host, Some("ignored"), false).unwrap(),
+                None
+            );
         }
     }
 
     #[test]
+    fn resolve_endpoint_auth_loopback_can_be_required_when_something_republishes_it() {
+        // "Loopback" describes the bind address, not who can reach the port. A
+        // tailnet publish, a proxy, or a container port map all leave the bind
+        // loopback while widening the audience, and the default policy would
+        // hand out an unauthenticated endpoint. Whoever widens the reach asks
+        // for the credential explicitly.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let generated = resolve_endpoint_auth(host, None, true)
+                .unwrap()
+                .expect("a required key must be generated, not skipped");
+            assert!(!generated.trim().is_empty());
+
+            assert_eq!(
+                resolve_endpoint_auth(host, Some("supplied-key"), true).unwrap(),
+                Some("supplied-key".to_owned()),
+                "a supplied key must be honoured rather than ignored as it is by default"
+            );
+        }
+
+        // The same validation a public bind gets: an empty key is a refusal, not
+        // a silent downgrade to no auth.
+        assert!(resolve_endpoint_auth("127.0.0.1", Some("  "), true).is_err());
+    }
+
+    #[test]
     fn resolve_endpoint_auth_public_uses_supplied_key_trimmed() {
-        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "))
+        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "), false)
             .unwrap()
             .expect("public bind must have a key");
         assert_eq!(key, "my-key");
@@ -28774,7 +29366,7 @@ install therock";
 
     #[test]
     fn resolve_endpoint_auth_public_generates_key_when_absent() {
-        let key = resolve_endpoint_auth("0.0.0.0", None)
+        let key = resolve_endpoint_auth("0.0.0.0", None, false)
             .unwrap()
             .expect("public bind must generate a key");
         assert_eq!(key.len(), 48);
@@ -28783,7 +29375,7 @@ install therock";
 
     #[test]
     fn resolve_endpoint_auth_public_rejects_empty_supplied_key() {
-        let error = resolve_endpoint_auth("0.0.0.0", Some("   ")).unwrap_err();
+        let error = resolve_endpoint_auth("0.0.0.0", Some("   "), false).unwrap_err();
         assert!(error.to_string().contains("non-empty"), "{error:#}");
     }
 
@@ -28797,7 +29389,7 @@ install therock";
             "good-key\nmore",
             "line\rreturn",
         ] {
-            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied)).unwrap_err();
+            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied), false).unwrap_err();
             assert!(error.to_string().contains("control character"), "{error:#}");
         }
     }
@@ -28841,10 +29433,92 @@ install therock";
     }
 
     #[test]
+    fn a_public_bind_is_refused_with_the_command_that_restores_it() {
+        // `resolve_endpoint_auth` mints a key for every non-loopback bind whether
+        // or not auth was demanded, so deriving `requires_api_key` from key-file
+        // presence marked ordinary public binds as having asked for it. The guard
+        // tests that field first, so those services were refused with a message
+        // naming a flag they never passed and a relaunch command that drops
+        // `--allow-public-bind` — coming back on loopback instead.
+        //
+        // A plain `--host 0.0.0.0 --allow-public-bind` launch: key file present,
+        // `--require-api-key` never passed.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false)
+            .expect_err("a public bind with no key must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("--allow-public-bind"),
+            "the refusal must name the command that restores the public bind: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--require-api-key"),
+            "a service that never passed the flag must not be told it did: {rendered}"
+        );
+
+        // And the loopback-with-forced-auth case still reports its own reason.
+        let error = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
+            .expect_err("a service that demanded auth must not come back without it");
+        assert!(
+            format!("{error:#}").contains("--require-api-key"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn restarting_a_keyless_public_service_names_the_public_bind_not_the_key_flag() -> Result<()> {
+        // The same defect at a real call site rather than through the guard's own
+        // arguments. `restart` reads `requires_api_key` off the record on disk, so
+        // a record written by an ordinary public-bind launch must not claim the
+        // service asked for `--require-api-key` — the branch order means a record
+        // that claims it wins, and its remediation drops `--allow-public-bind`.
+        let (root, paths) = test_paths("restart-public-no-key");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "vllm-public-2000",
+            "vllm",
+            "qwen",
+            "qwen-canonical",
+            "0.0.0.0",
+            12000,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        // What a plain `--host 0.0.0.0 --allow-public-bind` launch records: the
+        // bind is public, and the flag was never passed.
+        record.requires_api_key = false;
+        record.write()?;
+
+        // No key file: the situation after a stop, which drops it.
+        let error = restart_internal_managed_service(&paths, "vllm-public-2000")
+            .expect_err("a keyless public service must not be restarted");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("--allow-public-bind"),
+            "the refusal must name the command that brings it back public: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--require-api-key"),
+            "a service that never passed the flag must not be told it did: {rendered}"
+        );
+
+        // The refusal happens before the stop, so the service is left alone.
+        assert!(
+            load_managed_service(&paths, "vllm-public-2000").is_ok(),
+            "a refused restart must not have removed the record"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
         // A stop deletes the key file, so a later restart of a public service
         // would otherwise respawn it with no auth at all.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("0.0.0.0"), "{error:#}");
         assert!(message.contains("without authentication"), "{error:#}");
@@ -28852,17 +29526,36 @@ install therock";
         assert!(message.contains("--allow-public-bind"), "{error:#}");
 
         // A public service that still has its key restarts normally.
-        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
     }
 
     #[test]
     fn respawn_allows_loopback_services_without_an_endpoint_key() {
         // Loopback stays credential-free, so every accepted spelling must pass
-        // the guard with no key present.
+        // the guard with no key present — when nothing asked for auth.
         for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false)
+            ensure_public_service_has_endpoint_key(host, false, false)
                 .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
         }
+    }
+
+    #[test]
+    fn respawn_refuses_a_loopback_service_that_was_launched_with_a_key() {
+        // The hole this closes: a loopback bind that something else republishes
+        // — a tailnet publish, a proxy, a container port map. The publish
+        // outlives the process, so a restart after the key was dropped would
+        // reopen a reachable endpoint with no authentication, and the bind
+        // address gives the guard no way to notice.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let error = ensure_public_service_has_endpoint_key(host, false, true)
+                .expect_err("a service launched with a key must not restart without one");
+            let message = format!("{error:#}");
+            assert!(message.contains("without authentication"), "{message}");
+            assert!(message.contains("--require-api-key"), "{message}");
+        }
+
+        // With its key still present it restarts normally.
+        ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
     }
 
     #[test]
