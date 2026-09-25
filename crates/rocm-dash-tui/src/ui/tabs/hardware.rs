@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot};
 
@@ -245,7 +245,7 @@ fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme
             )
         };
         let inner = panel::bento(f, area, Some("GPUs"), role, false, theme);
-        f.render_widget(Paragraph::new(lines), inner);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         return;
     }
 
