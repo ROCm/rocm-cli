@@ -397,10 +397,6 @@ async fn user_inspects_both_ways(world: &mut E2eWorld) {
 }
 
 /// The runtime key config names as active while the registry holds nothing.
-/// A successful `install sdk` leaves both halves behind — `activate_runtime`
-/// records the key, `finalize_successful_sdk_install` records setup's folder —
-/// so this plants the state that remains when the registry is later lost and
-/// the install tree is not.
 const FORGOTTEN_RUNTIME_KEY: &str = "release-tarball-gfx942";
 
 /// Where the `Given` plants that folder, recomputed rather than carried on the
@@ -422,10 +418,35 @@ async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
     std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
     std::fs::write(install_root.join("payload.txt"), "payload")
         .expect("failed to write runtime payload");
+    // The install tree's own copy of its manifest. This is what makes the
+    // registry entry recoverable, so planting it is what makes the scenario's
+    // ordering load-bearing: run the text form first and
+    // `recover_setup_runtime_registration` re-files this into the registry,
+    // after which `--json` can resolve `active_runtime_root` without having
+    // earned it. Without this file recovery bails and both orders agree.
+    let manifest = serde_json::json!({
+        "runtime_key": FORGOTTEN_RUNTIME_KEY,
+        // `:` is safe in a field value; only the registry filename comes from
+        // `runtime_key`.
+        "runtime_id": "therock-release:gfx942",
+        "channel": "release",
+        "format": "tarball",
+        "family": "gfx942",
+        "family_source": "manual",
+        "version": "1.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/release-tarball-gfx942.tar.gz",
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write local runtime manifest");
     // Black-box: plain JSON matching the CLI's on-disk config schema, not a
     // typed import from the crates. Every field defaults, so naming these two
     // is enough. The isolated registry starts empty, which IS the state under
-    // test — the install tree survives a registry entry that is gone.
+    // test.
     let config = serde_json::json!({
         "active_runtime_key": FORGOTTEN_RUNTIME_KEY,
         "setup": { "therock_venv": install_root },
@@ -439,12 +460,12 @@ async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
 
 #[when("the user inspects the system for scripting before reading")]
 async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
-    // The order is the scenario. Running the text form first would let its
-    // `recover_setup_runtime_registration` repair the registry, handing the
-    // machine-readable form an answer it is supposed to reach by itself — which
-    // is exactly why examine-15, which runs them the other way round, cannot see
-    // this. The text form still runs, second, so the comparison step can hold
-    // the two to each other.
+    // The order is the scenario. The `Given` plants an install tree the text
+    // form's `recover_setup_runtime_registration` can re-file the registry
+    // entry from, so running it first would hand the machine-readable form an
+    // `active_runtime_root` it is supposed to have no way to resolve — swap
+    // these two lines and the last `Then` fails. The text form still runs,
+    // second, so the comparison step can hold the two to each other.
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
     world.cli_stderr = Some(human);
@@ -549,11 +570,11 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
         panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
     };
     // Both forms resolve the active manifest the same way, so a disagreement
-    // means one of the two paths is looking at a different runtime. Note what
-    // this cannot see: the human run happens first and re-files a missing
-    // registry entry on its way, so by the time `--json` runs there is nothing
-    // left for the two to disagree about. examine-16 covers that case, and
-    // runs the machine-readable form first precisely so it stays visible.
+    // means one of the two paths is looking at a different runtime. What this
+    // cannot see: were the registry entry missing, the human run — which goes
+    // first — would re-file it before `--json` ever looked. examine-16 plants
+    // exactly that state and runs the machine-readable form first, so the
+    // divergence stays visible there.
     if let Some(stated) = human_states(human, "active_runtime_root") {
         assert_eq!(
             root, stated,

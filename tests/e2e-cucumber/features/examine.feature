@@ -182,15 +182,15 @@ Feature: GPU detection and system inspection
   # folder is reachable from config without the registry and without writing,
   # which is what these fields carry.
   #
-  # examine-15 cannot catch this: its step runs `rocm examine` before `rocm
-  # examine --json`, and the first run performs the repair the second then
-  # benefits from. So this scenario asks the machine-readable form FIRST, while
-  # the registry is still empty, and only then runs the text form to hold the
-  # two answers against each other.
+  # The order of the two runs is load-bearing: the `Given` plants an install
+  # tree the text form CAN repair from, so running it first would hand `--json`
+  # an `active_runtime_root` it is supposed to have no way to resolve. The
+  # machine-readable form goes FIRST, while the registry is still empty; the
+  # text form follows so the two answers can be held against each other.
   #
-  # No GPU needed: the config is planted, and the isolated registry is empty by
-  # design (see `E2eWorld::default`) — which is precisely the missing-entry
-  # state under test.
+  # No GPU needed: config and install tree are planted, and the isolated
+  # registry is empty by design (see `E2eWorld::default`) — which is precisely
+  # the missing-entry state under test.
   @id:examine-json-names-the-setup-runtime-folder
   Scenario: examine-16 - The scripting form names the setup runtime folder unaided
     Given setup names a runtime folder the registry has forgotten
