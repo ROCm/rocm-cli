@@ -53,6 +53,10 @@ const DETAIL_COLS: u16 = 120;
 /// `DETAIL_ROWS`/`DETAIL_COLS`, both of which only ever *enlarge* it.
 const OVERFLOW_ROWS: u16 = 20;
 const OVERFLOW_COLS: u16 = 90;
+/// Matches `rocm_dash_tui::ui::dock::{WIDE_ROWS, WIDE_COLS}` — the geometry the
+/// dock switches its GPU panel into the wide layout at.
+const WIDE_ROWS: u16 = 45;
+const WIDE_COLS: u16 = 180;
 
 /// How often `wait_for_*` re-checks the screen/process while waiting. This is a
 /// poll cadence, not a fixed readiness sleep: every wait has a deadline and
@@ -403,6 +407,12 @@ impl TuiSession {
     /// rows below the dashboard's summary cards.
     pub fn use_detail_size(&mut self) -> Result<(), String> {
         self.resize_to(DETAIL_ROWS, DETAIL_COLS)
+    }
+
+    /// Enlarge to [`WIDE_ROWS`]x[`WIDE_COLS`], the geometry the dock's GPU
+    /// panel needs to render its wide layout (see `dock::is_wide`).
+    pub fn use_wide_size(&mut self) -> Result<(), String> {
+        self.resize_to(WIDE_ROWS, WIDE_COLS)
     }
 
     /// Shrink to [`OVERFLOW_ROWS`]x[`OVERFLOW_COLS`] — small enough that the

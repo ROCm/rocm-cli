@@ -74,14 +74,22 @@ pub struct RunnerOptions {
     /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
     /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
     pub amd_smi_binary: Option<OsString>,
-    /// **Test-only.** Skip the mandatory `/dev/kfd` pre-flight in amd-smi
+    /// **Test-only.** Skip the mandatory GPU-device pre-flight in amd-smi
     /// detection so a *fake* `amd_smi_binary` is actually invoked on a GPU-less
     /// CI host instead of short-circuiting to "no GPU". Never set in
-    /// production: the KFD guard prevents a *real* `amd-smi` from hanging in
+    /// production: the device guard prevents a *real* `amd-smi` from hanging in
     /// uninterruptible D-state. Only the daemon integration test that points
     /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
     /// off-critical-path detection behaviour is genuinely exercised.
-    pub amd_smi_skip_kfd_preflight: bool,
+    pub amd_smi_skip_device_preflight: bool,
+    /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
+    /// that lets the amd-smi device pre-flight pass without a readable
+    /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
+    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
+    /// deliberately don't depend on `rocm-core` to compute this themselves;
+    /// the caller (`apps/rocm`) does and passes the answer through. `false`
+    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    pub amd_smi_gpu_reachable: bool,
     /// **Test-only.** When set, cycle timestamps come from the logical clock
     /// this file controls instead of `Utc::now()` — see [`TestClockDirective`]
     /// for the file's grammar. Production callers leave this unset; E2E
@@ -107,7 +115,8 @@ impl Default for RunnerOptions {
             persist_dir: None,
             services_dir: None,
             amd_smi_binary: None,
-            amd_smi_skip_kfd_preflight: false,
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: false,
             test_clock_offset_path: None,
         }
     }
@@ -330,15 +339,18 @@ pub async fn run_loop(
     // the loop starts ticking immediately (surfacing serving instances within
     // one discovery tick) and GPU metrics fill in the moment detection lands.
     let amd_smi_binary = opts.amd_smi_binary.clone();
-    let amd_smi_skip_kfd_preflight = opts.amd_smi_skip_kfd_preflight;
+    let amd_smi_skip_device_preflight = opts.amd_smi_skip_device_preflight;
+    let amd_smi_gpu_reachable = opts.amd_smi_gpu_reachable;
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
     tokio::spawn(async move {
         let gpu = match amd_smi_binary {
-            Some(binary) if amd_smi_skip_kfd_preflight => {
-                AmdSmiCollector::detect_with_binary_skipping_kfd_preflight(binary).await
+            Some(binary) if amd_smi_skip_device_preflight => {
+                AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
+            Some(binary) => {
+                AmdSmiCollector::detect_with_binary(binary, amd_smi_gpu_reachable).await
+            }
             None => AmdSmiCollector::detect().await,
         };
         let info = match &gpu {
@@ -389,7 +401,7 @@ pub async fn run_loop(
                         );
                     } else {
                         warn!(
-                            "amd-smi not available (no /dev/kfd or `amd-smi version` failed); GPU disabled"
+                            "amd-smi not available (no accessible GPU device or `amd-smi version` failed); GPU disabled"
                         );
                     }
                     gpu = detected;
@@ -421,7 +433,24 @@ pub async fn run_loop(
                 }
             }
         } else if gpu_init_done {
-            warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+            // `amd_smi_gpu_reachable` is only ever true on WSL (the wiring in
+            // `apps/rocm/src/dash.rs` gates the rocm-core verdict on
+            // `is_wsl_host()`) — it let the device pre-flight pass without a
+            // readable `/dev/kfd`, which doesn't exist on WSL anyway. If it was
+            // true and amd-smi *still* found nothing, that's a real contradiction
+            // worth calling out — plumbing readiness (e.g. `wsl_rocdxg_ready`) is
+            // not the same as amd-smi enumerating a supported GPU, and a generic
+            // "device inaccessible" message would flatly contradict what `examine`
+            // just told the same user.
+            warnings.push(if amd_smi_gpu_reachable {
+                "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
+                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 model may not be supported by the installed amd-smi/ROCm, or not supported on \
+                 WSL yet"
+                    .into()
+            } else {
+                "amd-smi unavailable (GPU device inaccessible or probe failed)".into()
+            });
             Vec::new()
         } else {
             // Detection is still in flight (spawned off the critical path), so
