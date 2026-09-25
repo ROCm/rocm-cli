@@ -171,7 +171,10 @@ fn marker_diagnostics() -> Vec<Documented> {
 fn code_text(source: &str) -> String {
     source
         .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+        .map(str::trim_start)
+        // `/*` and a leading `*` too: an own-line block comment is prose just
+        // as a `//` line is, and could vouch for a template the same way.
+        .filter(|line| !line.starts_with("//") && !line.starts_with("/*") && !line.starts_with('*'))
         .collect::<Vec<_>>()
         .join("\n")
 }

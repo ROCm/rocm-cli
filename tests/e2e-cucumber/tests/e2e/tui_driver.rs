@@ -477,10 +477,10 @@ impl TuiSession {
     /// `timed out … waiting until {describe}`, `before {describe}.`, and `…
     /// draining the final frame, waiting until {describe}`. The last of those
     /// is assembled from two fragments in two functions, and both carry the
-    /// clause. So it must be a clause that
-    /// fits all four ("the screen shows X", "generation throughput leaves
-    /// the screen"), not a bare noun; and it carries whatever quoting the
-    /// caller puts in it, since none is added here.
+    /// clause. So it must be a clause that fits all four ("the screen shows
+    /// X", "generation throughput leaves the screen"), not a bare noun; and it
+    /// carries whatever quoting the caller puts in it, since none is added
+    /// here.
     ///
     /// `src/diagnostic_wording.rs` pins this list against the templates below
     /// — both that each one still exists and that this comment still names it,

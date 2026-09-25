@@ -1412,6 +1412,22 @@ async fn assert_no_device_group_remedy(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     let report: serde_json::Value =
         serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    // An absent entry is the outcome asked for, so it must be absent because the
+    // checks ran and cleared it — not because the run failed or routed out
+    // before evaluating anything. Not `!matched.is_empty()`: with no symptom
+    // given, a healthy machine correctly matches nothing at all.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query):\n{output}"
+    );
+    assert!(
+        report
+            .get("out_of_scope")
+            .is_none_or(serde_json::Value::is_null),
+        "this bare-metal Linux host was routed out of scope, so the device checks never \
+         ran and an absent cause proves nothing:\n{output}"
+    );
     let matched = report
         .get("matched")
         .and_then(|m| m.as_array())
@@ -1419,10 +1435,16 @@ async fn assert_no_device_group_remedy(world: &mut E2eWorld) {
     let offered = matched.iter().find(|entry| {
         entry.get("id").and_then(serde_json::Value::as_str) == Some(DEVICE_PERMISSION_FIX_ID)
     });
-    let score = offered
-        .and_then(|entry| entry.get("score"))
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
+    // Absent means not offered; present without a readable score is a report
+    // this step cannot judge, and is not allowed to read as a zero.
+    let score = offered.map_or(0, |entry| {
+        entry
+            .get("score")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| {
+                panic!("the '{DEVICE_PERMISSION_FIX_ID}' entry has no score:\n{output}")
+            })
+    });
     // Belonging to a conventional group is one way to reach the device, not the
     // point of doing so. With access already demonstrated, repairing permissions
     // is not a cause of anything, and offering it sends the user to change their
