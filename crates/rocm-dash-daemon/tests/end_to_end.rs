@@ -528,3 +528,156 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
         "must not fall back to the bare-metal inaccessible message when reachability was asserted: {warnings:?}"
     );
 }
+
+/// The production wiring (`apps/rocm/src/dash.rs` threading
+/// `rocm_core::has_usable_amd_gpu()` into `RunnerOptions.amd_smi_gpu_reachable`)
+/// is only exercised through `AmdSmiCollector::detect_with_binary`'s real
+/// device pre-flight — `amd_smi_skip_device_preflight: false` here, unlike the
+/// tests above. Without this, the `gpu_reachable` OR-branch in
+/// `preflight_passes` could be reverted or transposed and nothing would fail.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Succeeds on every subcommand `version`/`metric --json`/`static --json`/
+    // `topology --json` all get called; only `metric` needs a real payload.
+    let fake = dir.path().join("amd-smi-ok");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: true,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    let overall = Duration::from_secs(10);
+    let mut found = false;
+    loop {
+        let ev = match timeout(overall, rx.recv()).await {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        };
+        if let Event::Snapshot(snap) = ev
+            && !snap.gpus.is_empty()
+        {
+            found = true;
+            break;
+        }
+    }
+
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(
+        found,
+        "gpu_reachable: true must let the real device pre-flight pass and the fake amd-smi \
+         produce telemetry, even with no accessible /dev/kfd on this host"
+    );
+}
+
+/// Sibling of the above with `amd_smi_gpu_reachable: false`: pins the negative
+/// direction and kills the argument-transposition mutant (swapping the two
+/// bools would make this pass with reachability actually false, or make the
+/// positive test above fail). Relies on this test host having no accessible
+/// `/dev/kfd` (true in CI and on this WSL host, which is the whole premise of
+/// the WSL amd-smi detection this PR adds).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/kfd")
+            .is_err(),
+        "this test assumes no accessible /dev/kfd on the host running it"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Same fake as above: if this ran, it would prove telemetry, but the
+    // pre-flight must reject it first since neither OR-condition holds.
+    let fake = dir.path().join("amd-smi-ok");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: false,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // The runner ticks forever (a fresh Snapshot every 50ms), so waiting for
+    // the channel to go idle would hang: check a bounded handful of ticks
+    // instead of waiting for silence that never comes.
+    let overall = Duration::from_secs(10);
+    let mut snapshots_seen = 0;
+    loop {
+        let ev = match timeout(overall, rx.recv()).await {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        };
+        if let Event::Snapshot(snap) = ev {
+            assert!(
+                snap.gpus.is_empty(),
+                "amd-smi must never run when neither gpu_reachable nor a readable /dev/kfd hold"
+            );
+            snapshots_seen += 1;
+            if snapshots_seen >= 5 {
+                break;
+            }
+        }
+    }
+
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(snapshots_seen >= 5, "expected at least 5 snapshot ticks");
+}
