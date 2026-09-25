@@ -143,6 +143,28 @@ impl Drop for StagingDir {
     }
 }
 
+/// Make the remote's staging directory, restricted to its owner.
+///
+/// 0700 on the far side for the same reason [`create_restricted_dir`] insists on
+/// it here: the archive, its checksum, and its signature sit in this directory
+/// *before* they are verified, so another user on a shared remote box could
+/// otherwise read them, or swap one out between the push and the check. The
+/// signature gate still has to be defeated for that to become an install, but
+/// "only one gate left" is not the posture the local side settles for.
+///
+/// `umask 077` covers the creation itself — a mode applied afterwards leaves a
+/// window at whatever the remote's umask happens to be — and the `chmod` then
+/// repairs a directory a previous run already left too permissive. `mkdir -m`
+/// does neither: it ignores an existing directory and skips the parent
+/// directories `-p` creates.
+///
+/// `remote_dir` is interpolated unquoted so the far shell still expands the
+/// `$HOME` in [`REMOTE_STAGING`]; see
+/// `the_staging_path_still_expands_on_the_remote_shell`.
+fn staging_dir_command(remote_dir: &str) -> String {
+    format!("(umask 077 && mkdir -p {remote_dir}) && chmod 700 {remote_dir}")
+}
+
 /// Fetch a build for the remote's platform on this machine, then push it.
 fn push_matched_artifact(
     transport: &dyn Transport,
@@ -157,7 +179,7 @@ fn push_matched_artifact(
 
     let remote_dir = REMOTE_STAGING;
     transport
-        .run(&format!("mkdir -p {remote_dir}"))
+        .run(&staging_dir_command(remote_dir))
         .context("failed to make a staging directory on the remote")?;
 
     // The archive travels with its checksum and, when present, its signature, so
@@ -561,6 +583,89 @@ mod tests {
             "the staging path did not expand; the remote would look for a file \
              whose name begins with a literal `$HOME`: {command}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_remote_staging_directory_is_restricted_to_its_owner() {
+        // The remote counterpart of `create_restricted_dir`'s 0700: the archive,
+        // checksum, and signature land here before any of them is verified.
+        //
+        // Asked of a real shell for the resulting *mode*, not of the string: a
+        // `contains("umask 077")` assertion would keep passing through the two
+        // ways this actually goes wrong — `mkdir -m` semantics, and a directory
+        // a previous run left permissive.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-remote-staging-mode-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fresh = root.join("fresh/provision");
+        let stale = root.join("stale/provision");
+
+        // The second case has to start wrong to prove the `chmod` repairs it —
+        // 0755 is what a default umask would have left behind.
+        std::fs::create_dir_all(&stale).expect("the stale dir");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the stale dir");
+
+        // `parent_is_ours` marks the case where `mkdir -p` creates the parent
+        // itself. In the stale case this test pre-created it, so its mode
+        // reflects this process's umask rather than anything the command did.
+        for (directory, parent_is_ours) in [(&fresh, true), (&stale, false)] {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                // A permissive umask on the invoking side, so a pass here means
+                // the command set the mode rather than inheriting a lucky one.
+                .arg(format!(
+                    "umask 022 && {}",
+                    staging_dir_command(&directory.to_string_lossy())
+                ))
+                .status()
+                .expect("sh should run");
+            assert!(
+                status.success(),
+                "the staging command failed for {directory:?}"
+            );
+
+            let mode = std::fs::metadata(directory)
+                .expect("the staging dir exists")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "{directory:?} is mode {mode:o}; another user on the remote could \
+                 read or race the artifacts staged there before they are verified"
+            );
+
+            // The parent, and this is the half that makes the `umask` testable.
+            // `chmod` names the leaf only, so it sets the leaf whether or not
+            // the `umask` is there — asserting the leaf alone passes with
+            // `umask 077` deleted, which is precisely the branch the doc comment
+            // calls load-bearing. A parent that `mkdir -p` created is covered by
+            // the umask and by nothing else, so under the harness's `umask 022`
+            // it is 0700 with the umask and 0755 without.
+            if parent_is_ours {
+                let parent = directory.parent().expect("the staging dir has a parent");
+                let parent_mode = std::fs::metadata(parent)
+                    .expect("the parent exists")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(
+                    parent_mode, 0o700,
+                    "{parent:?} is mode {parent_mode:o}; the umask is not covering \
+                     directory creation, so the staged artifacts are readable for \
+                     the window between `mkdir` and `chmod`"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

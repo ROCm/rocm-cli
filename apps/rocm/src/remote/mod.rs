@@ -368,9 +368,18 @@ fn serve_with_transport(
     }
 
     println!("Starting {} on {} ...", request.model, request.target);
-    let start = match transport
-        .exec_with_stdin(&remote_serve_command(&remote_cli, request), Some(&api_key))
-    {
+    // The trailing newline is what makes the `&&` chain in
+    // `remote_serve_command` work, not cosmetics: `IFS= read -r` returns
+    // non-zero when it hits EOF without one, even though it did assign the
+    // variable. Send the bare key and the remote reads it, reports failure, and
+    // the `&&` stops the model from ever starting. It is also what makes the
+    // short circuit *mean* something — a write truncated part-way delivers no
+    // newline, so the read fails and nothing serves with half a key.
+    let key_payload = format!("{api_key}\n");
+    let start = match transport.exec_with_stdin(
+        &remote_serve_command(&remote_cli, request),
+        Some(&key_payload),
+    ) {
         Ok(start) => start,
         Err(error) => {
             // The command may already have reached the remote — contact can be
@@ -599,9 +608,16 @@ fn resolve_target(target: &str) -> Result<String> {
 /// table, so an interpolated key would be readable by any other user on either
 /// machine. `--require-api-key` is what makes the loopback bind authenticated
 /// anyway, since the publish widens who can reach it.
+///
+/// Joined with `&&`, not `;`, and that is load-bearing rather than stylistic.
+/// [`transport::run_with_piped_io`] treats a broken pipe on the stdin writer as a
+/// mere symptom whenever the command itself failed, which is only sound if a
+/// failed `read` cannot be followed by a successful `serve`. `&&` is what makes
+/// the shell enforce that; under `;` the compound's status is whatever `serve`
+/// returned, so a truncated key could report success on the credential path.
 fn remote_serve_command(remote_cli: &str, request: &ServeRequest) -> String {
     let mut command = format!(
-        "IFS= read -r ROCM_SERVE_API_KEY; export ROCM_SERVE_API_KEY; \
+        "IFS= read -r ROCM_SERVE_API_KEY && export ROCM_SERVE_API_KEY && \
          {remote_cli} serve {} --managed --require-api-key --host {} --port {}",
         shell_quote(&request.model),
         publish::LOOPBACK,
@@ -1241,10 +1257,83 @@ mod tests {
         // interpolated key would be readable by any other user on either.
         let command = remote_serve_command("rocm", &request());
         assert!(
-            command.starts_with("IFS= read -r ROCM_SERVE_API_KEY;"),
+            command.starts_with("IFS= read -r ROCM_SERVE_API_KEY &&"),
             "{command}"
         );
         assert!(command.contains("export ROCM_SERVE_API_KEY"), "{command}");
+    }
+
+    /// Run the generated serve command under a real shell with `stdin_payload`
+    /// on its stdin, and report whether it succeeded and whether it reached the
+    /// serve step.
+    ///
+    /// `echo REACHED_SERVE` stands in for the remote CLI: reaching it means the
+    /// `&&` chain did not short-circuit, and the marker says so in the failure.
+    fn serve_command_under_a_shell(stdin_payload: &str) -> (bool, bool) {
+        use std::io::Write as _;
+
+        let command = remote_serve_command("echo REACHED_SERVE", &request());
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to run the generated command under a shell");
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(stdin_payload.as_bytes())
+            .expect("the payload is far smaller than a pipe buffer");
+
+        let output = child.wait_with_output().expect("the shell should finish");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).contains("REACHED_SERVE"),
+        )
+    }
+
+    #[test]
+    fn only_a_complete_key_lets_the_command_reach_serve() {
+        // The invariant `transport::run_with_piped_io` leans on: it demotes a
+        // broken-pipe write error to a symptom whenever the command also failed,
+        // which is only sound if a failed `read` cannot be followed by a
+        // successful `serve`. Under `;` it could be — the compound's status
+        // would be whatever `serve` returned — and a truncated API key would
+        // then classify as success on the one path guarding the model.
+        //
+        // Asked of a real shell, and asked for the *exit status*: the whole
+        // property is what `&&` does to a compound command, which no assertion
+        // about the string can see. The same reasoning as
+        // `the_staging_path_still_expands_on_the_remote_shell` in `provision`.
+
+        // Nothing at all — the far side of a pipe that broke before any byte.
+        assert_eq!(
+            serve_command_under_a_shell(""),
+            (false, false),
+            "no key arrived, yet the command served or reported success"
+        );
+
+        // A key with no terminating newline. This is the case that matters and
+        // the one a closed-stdin test cannot see: `read` assigns the variable
+        // but still returns non-zero at EOF, so this is indistinguishable from
+        // a truncated write — and must not serve. It is also exactly what the
+        // caller used to send, which made the `&&` chain refuse every real
+        // start until the caller began terminating the payload.
+        assert_eq!(
+            serve_command_under_a_shell("abc123"),
+            (false, false),
+            "an unterminated key is a truncated key; it must not reach serve"
+        );
+
+        // A complete line: the shape `serve_with_transport` actually sends.
+        assert_eq!(
+            serve_command_under_a_shell("abc123\n"),
+            (true, true),
+            "a complete key must reach serve, or no remote model ever starts"
+        );
     }
 
     #[test]
@@ -1957,10 +2046,22 @@ mod tests {
             } if command.contains("read -r ROCM_SERVE_API_KEY") => Some(key.clone()),
             _ => None,
         });
+        let sent_key = sent_key.unwrap_or_else(|| {
+            panic!(
+                "the model-starting command must receive the key over stdin: {:?}",
+                transport.calls()
+            )
+        });
+        assert!(!sent_key.trim().is_empty(), "the key sent was blank");
+        // The terminator is as load-bearing as the key. `IFS= read -r` returns
+        // non-zero at EOF without one, so an unterminated payload short-circuits
+        // the `&&` chain and the model never starts — which is what the
+        // container lane caught after the chain was tightened, and what no
+        // assertion about the command string could see.
         assert!(
-            sent_key.is_some_and(|key| !key.is_empty()),
-            "the model-starting command must receive the key over stdin: {:?}",
-            transport.calls()
+            sent_key.ends_with('\n'),
+            "the key must arrive as a complete line or `read` fails and nothing \
+             serves; got {sent_key:?}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -453,7 +453,15 @@ fn run_with_piped_io(
             // `remote_serve_command` puts `IFS= read -r` first in the
             // remote command, so a broken pipe means the read never
             // finished, which means the command cannot have exited 0.
-            // Reorder that command and this demotion needs rechecking.
+            //
+            // That ordering is enforced by the shell rather than by prose:
+            // the caller joins the read, the export, and `serve` with `&&`,
+            // so a failed read short-circuits and the compound's status
+            // reflects it. Under `;` the status would be whatever `serve`
+            // returned and this demotion would be unsound. A reorder that
+            // breaks the coupling fails
+            // `only_a_complete_key_lets_the_command_reach_serve` in
+            // `remote::mod`, which asks a real shell for the exit status.
             let explained_by_the_command =
                 error.kind() == std::io::ErrorKind::BrokenPipe && !output.status.success();
             if !explained_by_the_command {

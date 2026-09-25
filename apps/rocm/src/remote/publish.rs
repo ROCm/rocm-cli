@@ -446,6 +446,14 @@ pub(crate) fn withdraw(
     // port, not a forward, so it would happily tear down whatever is on that
     // port — including something another tool or another person put there after
     // our session was recorded.
+    //
+    // Known and accepted limitation: this is a check, and the `off` below is the
+    // act, so a third party republishing onto this port in between still gets
+    // torn down and reported `Ok`. Re-reading the state immediately before the
+    // exec would only narrow that window, not close it — `tailscale` offers no
+    // compare-and-swap on a port, so nothing short of a daemon holding the claim
+    // makes check-and-act atomic. Narrowing it is not worth the extra round trip
+    // and the false impression of safety it would give the next reader.
     match publish_state(transport, tailnet_port, remote_port)? {
         PublishState::Published => {}
         // Already gone. Nothing to do, and nothing to complain about: teardown

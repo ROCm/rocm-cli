@@ -879,8 +879,11 @@ jobs:
     name: remote control channel (containerised)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    # Gated like every other heavy job here: a fast lint failure should
+    # short-circuit before this spends 30 minutes on a container and a cold
+    # cargo build, and a manual dispatch should stay a fast loop.
+    needs: [changes, clippy, prek]
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
