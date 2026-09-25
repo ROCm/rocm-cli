@@ -2626,6 +2626,15 @@ struct ExamineJsonSummary<'a> {
     /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
     /// import` all set it freely.
     active_runtime_root: Option<String>,
+    /// The folder setup was configured for, straight from config. Distinct from
+    /// `active_runtime_root`, not a fallback for it: setup's folder can be a
+    /// stale or removed install while a different runtime is active. Reachable
+    /// without the registry, which is what makes it worth carrying — see
+    /// `recover_setup_runtime_registration`, the write `--json` will not do.
+    setup_runtime_root: Option<String>,
+    /// The text form's sibling fact, derived from `setup_runtime_root` rather
+    /// than stored, so it cannot drift from where the pip cache actually goes.
+    setup_runtime_pip_cache_dir: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2654,6 +2663,9 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
         let active_runtime_root = current_runtime_manifest(&config, &manifests)
             .map(|manifest| manifest.install_root.display().to_string());
+        let (setup_runtime_root, setup_runtime_pip_cache_dir) = setup_runtime_paths(&config)
+            .map(|(root, cache)| (root.display().to_string(), cache.display().to_string()))
+            .unzip();
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2663,6 +2675,8 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
                 active_runtime_root,
+                setup_runtime_root,
+                setup_runtime_pip_cache_dir,
                 host: &host,
             },
         };
@@ -11356,6 +11370,21 @@ fn recover_setup_runtime_registration(
     Ok(Some(manifest.runtime_key))
 }
 
+/// The folder setup was configured for and its pip cache — the pair both
+/// `examine` forms report. Shared so the two cannot name different folders.
+///
+/// An empty configured path counts as unset, matching
+/// `recover_setup_runtime_registration`'s own guard: `config.json` is
+/// hand-editable, and `managed_pip_cache_dir("")` is a bogus relative path.
+fn setup_runtime_paths(config: &RocmCliConfig) -> Option<(&Path, PathBuf)> {
+    let root = config
+        .setup
+        .therock_venv
+        .as_deref()
+        .filter(|path| !path.as_os_str().is_empty())?;
+    Some((root, managed_pip_cache_dir(root)))
+}
+
 pub(crate) fn current_runtime_manifest<'a>(
     config: &RocmCliConfig,
     manifests: &'a [therock::InstalledRuntimeManifest],
@@ -15981,12 +16010,12 @@ fn append_examine_runtime_state(
         };
         let _ = writeln!(output, "  active_runtime_mode: {mode}");
     }
-    if let Some(setup_root) = config.setup.therock_venv.as_deref() {
+    if let Some((setup_root, pip_cache_dir)) = setup_runtime_paths(config) {
         let _ = writeln!(output, "  setup_runtime_root: {}", setup_root.display());
         let _ = writeln!(
             output,
             "  setup_runtime_pip_cache_dir: {}",
-            managed_pip_cache_dir(setup_root).display()
+            pip_cache_dir.display()
         );
     }
     let keys = if manifests.is_empty() {
