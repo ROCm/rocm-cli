@@ -176,6 +176,7 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
+| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | Radeon PRO W7900 (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -188,7 +189,7 @@ skip there.
 
 The nightly workflow covers a strict superset of the hardware in the table
 above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
-`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
+`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-w7900`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
 grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR

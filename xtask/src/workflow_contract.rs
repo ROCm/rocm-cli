@@ -1816,8 +1816,8 @@ esac
         }
         assert_eq!(
             lanes.len(),
-            8,
-            "expected 8 shell GPU preflight blocks across both workflows — if a \
+            10,
+            "expected 10 shell GPU preflight blocks across both workflows — if a \
              lane was added or removed, update this count"
         );
 
