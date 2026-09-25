@@ -518,7 +518,8 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
     assert!(
         warnings
             .iter()
-            .any(|w| w.contains("found no usable GPU") && w.contains("detected by other means")),
+            .any(|w| w.contains("is missing, unresolvable, or failed to run")
+                && w.contains("detected by other means")),
         "expected the reachable-but-failing contradiction message, got: {warnings:?}"
     );
     assert!(
@@ -530,11 +531,14 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
 }
 
 /// The production wiring (`apps/rocm/src/dash.rs` threading
-/// `rocm_core::has_usable_amd_gpu()` into `RunnerOptions.amd_smi_gpu_reachable`)
-/// is only exercised through `AmdSmiCollector::detect_with_binary`'s real
-/// device pre-flight — `amd_smi_skip_device_preflight: false` here, unlike the
-/// tests above. Without this, the `gpu_reachable` OR-branch in
-/// `preflight_passes` could be reverted or transposed and nothing would fail.
+/// `is_wsl_host() && rocm_core::has_usable_amd_gpu()` into
+/// `RunnerOptions.amd_smi_gpu_reachable`) is only exercised through
+/// `AmdSmiCollector::detect_with_binary`'s real device pre-flight —
+/// `amd_smi_skip_device_preflight: false` here, unlike the tests above.
+/// Without this, the `gpu_reachable` OR-branch in `preflight_passes` could be
+/// reverted and nothing would fail (the branch is a symmetric OR, so swapping
+/// its two `bool` arguments is behaviour-preserving and not something an
+/// integration test at this layer can catch either way).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight() {
@@ -601,23 +605,25 @@ async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight()
 }
 
 /// Sibling of the above with `amd_smi_gpu_reachable: false`: pins the negative
-/// direction and kills the argument-transposition mutant (swapping the two
-/// bools would make this pass with reachability actually false, or make the
-/// positive test above fail). Relies on this test host having no accessible
+/// direction (reachability false must not let the fake `amd-smi` run without
+/// an accessible `/dev/kfd`). Relies on this test host having no accessible
 /// `/dev/kfd` (true in CI and on this WSL host, which is the whole premise of
-/// the WSL amd-smi detection this PR adds).
+/// the WSL amd-smi detection this PR adds) — on a dev machine with a real,
+/// readable GPU device this precondition doesn't hold, so the test skips
+/// itself instead of failing red.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
     use std::os::unix::fs::PermissionsExt;
 
-    assert!(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open("/dev/kfd")
-            .is_err(),
-        "this test assumes no accessible /dev/kfd on the host running it"
-    );
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/kfd")
+        .is_ok()
+    {
+        eprintln!("skipping: this test requires no accessible /dev/kfd, but this host has one");
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
 
