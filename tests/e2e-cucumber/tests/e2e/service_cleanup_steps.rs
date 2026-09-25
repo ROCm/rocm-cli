@@ -32,19 +32,33 @@ const STARTING_ID: &str = "vllm-e2e-still-starting";
 /// The value in that service's key file, asserted back so a truncating write is
 /// caught as well as a deletion.
 const STARTING_KEY: &str = "live-endpoint-key";
-/// How long the staged launch keeps the lock before publishing its record. Sized
-/// to comfortably outlast spawning and starting the real `rocm` binary, so the
-/// prune is provably blocked on the lock rather than merely arriving late.
+/// How long the staged launch keeps the lock once the prune is under way.
+///
+/// The clock starts in the *When* step, immediately before the `rocm` process is
+/// spawned — not in the Given. An earlier revision started it in the Given and
+/// slept a fixed two seconds, which made the whole hold a budget that the step
+/// transition had to fit inside. It did on a developer box and did not on a
+/// loaded CI runner: the lock was released before `rocm` was spawned, the prune
+/// sailed through in 4ms, and the assertion below reported "it did not block on
+/// the lock" for a build where it would have. Tying the hold to the spawn
+/// removes the runner's scheduling from the measurement entirely.
 const LAUNCH_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Slack allowed when asserting the prune really did block for that hold.
 ///
-/// The hold's clock starts inside the Given step, one step transition before the
-/// timer around the `rocm` process starts, so an exact `>= LAUNCH_PUBLISH_DELAY`
-/// could in principle undershoot by that transition. This is orders of magnitude
-/// larger than a step transition, and orders of magnitude smaller than the gap
-/// to the failure it detects: a prune that never takes the lock returns in well
-/// under a second.
+/// The releasing thread is started just before the spawn rather than exactly at
+/// it, so the prune's own timer can begin a hair after the hold's. That gap is
+/// microseconds, and it is orders of magnitude smaller than what this assertion
+/// separates: a prune that never takes the lock returns in well under a second.
 const LAUNCH_WAIT_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Set by the staged-launch Given step, consumed by the prune When step.
+///
+/// The staged launch holds the lock until it is told to let go, so the hold
+/// cannot expire while the harness is between steps. Only the launch-lock
+/// scenario registers a sender; the other prune scenarios find `None` and run
+/// unimpeded.
+static LAUNCH_RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
 
 fn data_dir(world: &E2eWorld) -> PathBuf {
     world
@@ -276,11 +290,17 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
     });
     let lock_path = services.join("launch.lock");
     let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let lock =
             rocm_core::FileLock::acquire(&lock_path).expect("failed to take the launch lock");
         held_tx.send(()).expect("signal that the lock is held");
-        std::thread::sleep(LAUNCH_PUBLISH_DELAY);
+        // Hold until the prune is actually running. Sleeping a fixed span here
+        // instead would put the harness's step transition inside the hold, and
+        // a transition slower than the span releases the lock before `rocm` is
+        // ever spawned. The generous timeout is a stuck-test guard, not the
+        // hold: the When step signals within milliseconds of the spawn.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_mins(2));
         // Write 2 of 2, still under the lock.
         std::fs::write(
             &manifest,
@@ -294,6 +314,7 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
     held_rx
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the launch lock was taken");
+    *LAUNCH_RELEASE.lock().expect("launch-release slot poisoned") = Some(release_tx);
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -344,6 +365,21 @@ async fn run_prune_default_age(world: &mut E2eWorld) {
 /// prune that came back before the staged launch let go of it.
 #[when("the user prunes every record whatever its age")]
 async fn run_prune_any_age(world: &mut E2eWorld) {
+    // If a launch is staged, start its hold now rather than when it was staged,
+    // so the span the prune has to block for begins at the spawn and cannot be
+    // eaten by however long the harness took to get from that step to this one.
+    // Taken into a local first so the guard is dropped on this line rather than
+    // being held across the spawn below.
+    let staged_release = LAUNCH_RELEASE
+        .lock()
+        .expect("launch-release slot poisoned")
+        .take();
+    if let Some(release) = staged_release {
+        std::thread::spawn(move || {
+            std::thread::sleep(LAUNCH_PUBLISH_DELAY);
+            let _ = release.send(());
+        });
+    }
     let started = std::time::Instant::now();
     let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "prune", "--any-age", "--yes"]);
     world.cli_elapsed = Some(started.elapsed());
