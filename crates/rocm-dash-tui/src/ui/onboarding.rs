@@ -413,9 +413,9 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
             }
         }
         KeyCode::Tab => {
-            let prefix = o.install_config.as_ref().map(|cfg| cfg.prefix.trim());
+            let prefix = o.install_config.as_ref().map(|cfg| cfg.prefix.as_str());
             let start = match prefix {
-                Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                Some(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
                 _ => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
             };
             o.browser = Some(FolderBrowser::new("Pick an install folder", start));
@@ -1127,6 +1127,25 @@ mod tests {
             fb.current_dir,
             std::path::PathBuf::from("/mnt/data/rocm-env"),
             "re-opening the browser must resume near the prior choice, not cwd"
+        );
+    }
+
+    #[test]
+    fn tab_reopens_at_the_untrimmed_prefix_even_with_trailing_whitespace() {
+        let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/mnt/data/rocm-env ".to_string();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let fb = ob
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .expect("Tab opens the folder browser");
+        assert_eq!(
+            fb.current_dir,
+            std::path::PathBuf::from("/mnt/data/rocm-env "),
+            "a real folder name is never mangled, even if it ends in whitespace"
         );
     }
 
