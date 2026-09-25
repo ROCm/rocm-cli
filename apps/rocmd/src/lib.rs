@@ -18,10 +18,10 @@ use rocm_core::{
     AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
     ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
-    load_recent_automation_events, model_artifact_cache_status, resolve_amd_smi_binary,
-    resolve_model_recipe_artifact, unix_time_millis,
+    amd_smi_json, append_audit_event, append_automation_event, append_automation_proposal,
+    builtin_watcher, builtin_watchers, daemon_binary_path, default_engine_for_platform,
+    format_host_port, load_recent_automation_events, model_artifact_cache_status,
+    resolve_model_recipe_artifact, run_command_with_timeout, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -1468,34 +1468,7 @@ fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBridgeGpuSnaps
 }
 
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
-    let amd_smi_binary = resolve_amd_smi_binary();
-    let mut command = ProcessCommand::new(&amd_smi_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
-        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        anyhow::bail!(
-            "amd-smi {} failed: {}",
-            args.join(" "),
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
+    amd_smi_json(args, AMD_SMI_PROBE_TIMEOUT)
 }
 
 fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
@@ -2400,45 +2373,6 @@ fn run_rocm_capture_for_paths(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {

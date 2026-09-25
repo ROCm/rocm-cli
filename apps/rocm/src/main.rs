@@ -15068,7 +15068,7 @@ fn run_rocm_capture_for_paths(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_app_path_env(&mut command, paths);
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::run_command_with_timeout(command, timeout)
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
@@ -15293,45 +15293,6 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
         ),
     )?
     .output)
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn internal_mcp_install_sdk_args(
@@ -20918,23 +20879,18 @@ fn select_auto_gpu_index(
     vec![all[0]]
 }
 
+/// How long the `serve` path waits on `amd-smi` before giving up on it. Both
+/// probes below are advisory — GPU auto-selection degrades to service state
+/// alone without them — so a stalled `amd-smi` must not hold up a launch. This
+/// bounds the ordinary stalls only; the unkillable one is prevented by the
+/// pre-flight inside [`rocm_core::amd_smi_json`], not by any timeout.
+const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Best-effort per-GPU VRAM occupancy via `amd-smi metric --json`. Returns
 /// `None` when amd-smi is unavailable or its output cannot be parsed (callers
 /// then fall back to service-state-only auto-selection).
 fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("metric")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = rocm_core::amd_smi_json(&["metric", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
     let rows = parse_gpu_vram_usage(&value);
     if rows.is_empty() { None } else { Some(rows) }
 }
@@ -21072,19 +21028,7 @@ fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
 /// amd-smi is unavailable or its output cannot be parsed (callers then fall
 /// back to conservative defaults).
 fn detect_gpu_count() -> Option<usize> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("list")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = rocm_core::amd_smi_json(&["list", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
     let count = value.as_array().map(Vec::len)?;
     if count == 0 { None } else { Some(count) }
 }
