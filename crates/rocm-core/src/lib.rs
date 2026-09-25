@@ -8000,7 +8000,12 @@ fn kfd_readable(_device: &Path) -> bool {
 /// ordinary failures — a slow or wedged-but-signalable `amd-smi` — and nothing
 /// more.
 pub fn amd_smi_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
-    amd_smi_json_with(&resolve_amd_smi_binary(), Path::new(KFD_DEVICE), args, timeout)
+    amd_smi_json_with(
+        &resolve_amd_smi_binary(),
+        Path::new(KFD_DEVICE),
+        args,
+        timeout,
+    )
 }
 
 fn amd_smi_json_with(
@@ -9800,8 +9805,7 @@ mod tests {
         );
         let ran_while_blocked = marker.exists();
 
-        let allowed =
-            amd_smi_json_with(fake_amd_smi.as_os_str(), &readable_device, &args, timeout);
+        let allowed = amd_smi_json_with(fake_amd_smi.as_os_str(), &readable_device, &args, timeout);
         let ran_while_allowed = marker.exists();
 
         let _ = fs::remove_dir_all(&temp_root);
@@ -9850,8 +9854,16 @@ mod tests {
         let output = run_command_with_timeout(command, Duration::from_secs(10))?;
 
         assert!(output.status.success(), "the child should have exited 0");
-        assert_eq!(output.stdout.len(), BYTES, "stdout was truncated or stalled");
-        assert_eq!(output.stderr.len(), BYTES, "stderr was truncated or stalled");
+        assert_eq!(
+            output.stdout.len(),
+            BYTES,
+            "stdout was truncated or stalled"
+        );
+        assert_eq!(
+            output.stderr.len(),
+            BYTES,
+            "stderr was truncated or stalled"
+        );
         Ok(())
     }
 

@@ -17,11 +17,11 @@ use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
-    ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
-    amd_smi_json, append_audit_event, append_automation_event, append_automation_proposal,
-    builtin_watcher, builtin_watchers, daemon_binary_path, default_engine_for_platform,
-    format_host_port, load_recent_automation_events, model_artifact_cache_status,
-    resolve_model_recipe_artifact, run_command_with_timeout, unix_time_millis,
+    ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot, amd_smi_json,
+    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
+    builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
+    load_recent_automation_events, model_artifact_cache_status, resolve_model_recipe_artifact,
+    run_command_with_timeout, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
