@@ -2937,13 +2937,14 @@ mod tests {
     ///
     /// An agent following the rocm-doctor skill branches on `auto_applicable`
     /// from `diagnose --json` to decide whether to offer to run `rocm fix` or
-    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. When
-    /// the two disagree the CLI contradicts itself: fix-9 advertised
-    /// `auto_applicable: false` on Linux and then applied itself anyway.
+    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. The
+    /// two are written in different files and nothing but this test holds them
+    /// together, so a drift makes the CLI contradict itself: it would advertise
+    /// a fix as one it can run and then refuse, or the reverse.
     ///
     /// Both OS families are exercised because the checkers build their `Fix`
-    /// per-OS and only one branch is taken per run — the Linux branch was the
-    /// stale one, and a Linux-only test would not have seen it.
+    /// per-OS and only one branch is taken per run, so a Linux-only test would
+    /// leave the Windows branch free to drift unobserved.
     #[test]
     fn every_diagnosis_agrees_with_the_fix_catalog_on_auto_applicability() {
         for os in ["linux", "windows"] {
