@@ -14,6 +14,7 @@
 //! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
 
 use ratatui::style::{Color, Modifier, Style};
+use rocm_dash_core::state::JobStatus;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -30,7 +31,7 @@ pub struct Theme {
     pub border: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
     Neutral,
     Muted,
@@ -244,6 +245,48 @@ impl Theme {
             StatusTone::Success => self.ok,
             StatusTone::Error | StatusTone::Alert => self.err,
         }
+    }
+
+    /// Color for a [`JobStatus`], via [`Self::tone_color`]. The single source
+    /// of truth for job-status color shared by the job console banner and the
+    /// Home tab activity feed — they must not each pick their own mapping.
+    /// The LOGS dock shares the same underlying tone table via
+    /// `log_body_tone` rather than calling this function directly, since it
+    /// needs `Running` to stay neutral instead of accent — see
+    /// `dock::logs_dock` and `log_body_tone`'s doc comment.
+    pub const fn job_status_color(&self, status: &JobStatus) -> Color {
+        self.tone_color(job_status_tone(status))
+    }
+}
+
+/// Tone for a [`JobStatus`], shared by [`Theme::job_status_color`] and
+/// [`log_body_tone`]. Kept as a plain exhaustive `match` (not a method on
+/// `JobStatus` itself) since `StatusTone` lives here in `rocm-dash-tui`, not
+/// in `rocm-dash-core` where `JobStatus` is defined.
+const fn job_status_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        // Accent (cyan) rather than the warning/in-progress tone
+        // `docs/ux-guidelines.md` suggests for "work in progress": a
+        // running job is the thing the user's attention should be on
+        // right now, which is what accent means elsewhere in this app,
+        // and warn/orange is reserved for a job that finished with a
+        // nonzero exit code.
+        JobStatus::Running => StatusTone::Accent,
+        JobStatus::Done { code: 0 } => StatusTone::Success,
+        JobStatus::Done { .. } => StatusTone::Warning,
+        JobStatus::Failed { .. } => StatusTone::Error,
+        JobStatus::Cancelled => StatusTone::Muted,
+    }
+}
+
+/// Like [`job_status_tone`], except `Running` stays neutral — see
+/// `dock::logs_dock`'s doc comment for why a saturated accent tone doesn't
+/// belong on an entire streamed log body. Exhaustive, so a new `JobStatus`
+/// variant forces a decision here instead of silently defaulting to accent.
+pub(crate) const fn log_body_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        JobStatus::Running => StatusTone::Neutral,
+        other => job_status_tone(other),
     }
 }
 
@@ -685,5 +728,48 @@ mod tests {
             fixed_color, old_trick_color,
             "the fix should pick a different (and better-contrasting) color than the old bg-based trick"
         );
+    }
+
+    #[test]
+    fn job_status_tone_covers_all_variants() {
+        let cases = [
+            (JobStatus::Running, StatusTone::Accent),
+            (JobStatus::Done { code: 0 }, StatusTone::Success),
+            (JobStatus::Done { code: 7 }, StatusTone::Warning),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                StatusTone::Error,
+            ),
+            (JobStatus::Cancelled, StatusTone::Muted),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(job_status_tone(&status), expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn log_body_tone_matches_job_status_tone_except_running() {
+        // `log_body_tone` exists solely to keep `Running` neutral in the LOGS
+        // dock (see `dock::logs_dock`'s doc comment); every other variant
+        // must stay identical to the shared `job_status_tone` mapping.
+        let cases = [
+            JobStatus::Done { code: 0 },
+            JobStatus::Done { code: 7 },
+            JobStatus::Failed {
+                message: "boom".into(),
+            },
+            JobStatus::Cancelled,
+        ];
+        for status in cases {
+            assert_eq!(
+                log_body_tone(&status),
+                job_status_tone(&status),
+                "{status:?}"
+            );
+        }
+        assert_eq!(log_body_tone(&JobStatus::Running), StatusTone::Neutral);
+        assert_ne!(job_status_tone(&JobStatus::Running), StatusTone::Neutral);
     }
 }

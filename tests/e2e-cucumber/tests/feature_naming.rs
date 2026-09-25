@@ -30,6 +30,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("dash.feature", "dash"),
     ("dependency_guard.feature", "deps-guard"),
     ("diagnose.feature", "diagnose"),
+    ("driver_install.feature", "driver-install"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
@@ -40,6 +41,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
+    ("service_record_cleanup.feature", "service-cleanup"),
     ("therock_next_generation.feature", "therock-next"),
     ("update.feature", "update"),
 ];

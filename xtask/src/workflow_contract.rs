@@ -696,6 +696,31 @@ mod tests {
 trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
+
+    #[test]
+    fn every_ci_job_declares_a_timeout() {
+        let ci = read_workflow("ci.yml");
+        let jobs = top_level_block(&ci, "jobs");
+        let job_ids: Vec<&str> = jobs
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .collect();
+        assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
+        for job in job_ids {
+            let block = job_block(&ci, job);
+            assert!(
+                block
+                    .lines()
+                    .any(|line| indent_of(line) == 4 && line.trim().starts_with("timeout-minutes:")),
+                "job `{job}` in ci.yml has no timeout-minutes -- GitHub's 360min default applies, \
+                 so a hung step (an unbounded network call, an unresponsive registry) holds a \
+                 runner for six hours instead of failing fast (see the convention comment at the \
+                 top of the jobs: block)"
+            );
+        }
+    }
+
     #[test]
     fn ci_yml_schedules_no_self_hosted_job() {
         let ci = read_workflow("ci.yml");
@@ -785,6 +810,34 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{workflow} job {job} must not use the narrower osrelease-only WSL check"
             );
         }
+    }
+
+    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
+    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
+    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
+    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
+    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
+    /// runs-on; `native` never applied to this job, only to the two
+    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
+    /// this file green while the doc and the comment both quietly went false
+    /// again.
+    #[test]
+    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let nightly = read_workflow("nightly.yml");
+        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
+        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
+        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
+        assert!(
+            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
+             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
+        );
+        assert_eq!(
+            per_pr, nightly_wsl,
+            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
+             the same DevLab Dispatch pool"
+        );
     }
 
     #[test]
@@ -889,8 +942,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let dispatch_timeout = job_scalar(job_block(&self_hosted, "e2e-wsl"), "timeout-minutes");
         let nightly_timeout = job_scalar(job_block(&nightly, "e2e-wsl-nightly"), "timeout-minutes");
         assert_eq!(
-            dispatch_timeout, "90",
-            "the 2400s large-model readiness budget needs the established 90-minute job cap for setup and the remaining suite"
+            dispatch_timeout, "120",
+            "the 2400s large-model readiness budget plus the ephemeral pool's per-job WSL install/build/prewarm \
+             overhead needs the established 120-minute job cap for setup and the remaining suite"
         );
         assert_eq!(
             dispatch_timeout, nightly_timeout,

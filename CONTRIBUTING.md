@@ -65,6 +65,12 @@ cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_
 | `crates/rocm-engine-protocol` | Engine IPC protocol |
 | `engines/` | Inference engine adapters (lemonade, vllm) |
 
+### Module organization
+
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full.
+
+Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
+
 ### Test commands
 
 | Component | Command |

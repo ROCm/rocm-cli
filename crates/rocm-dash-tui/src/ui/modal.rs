@@ -113,28 +113,6 @@ pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -
     panel::popup(f, area, title, theme)
 }
 
-/// Shared chrome: a titled popup whose body is a scrollable block of `lines`.
-///
-/// Centralizes the `draw_modal_*` pattern so operational screens don't rebuild
-/// it (Phase 3 Wave 0). `scroll` is the first visible line offset.
-pub fn draw_scrollable_lines(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    lines: Vec<Line>,
-    scroll: u16,
-    theme: &Theme,
-) {
-    let inner = draw_popup_frame(f, area, title, theme);
-    if inner.height == 0 {
-        return;
-    }
-    let p = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, inner);
-}
-
 /// Render the Help modal for the active tab.
 ///
 /// The popup is sized to the height its *wrapped* content actually needs,
@@ -152,6 +130,7 @@ pub fn draw_scrollable_lines(
 /// guess, which is the whole of what is claimed here: an honest indicator, not a
 /// guarantee that everything is visible.
 pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
+    grey_overlay(f);
     let mut lines: Vec<Line> = vec![
         key_line("q", "quit", theme),
         // Ctrl-C is a first-class quit gesture in both key loops (it restores the
@@ -299,6 +278,7 @@ pub fn draw_theme_picker(
     current_name: &str,
     active_theme: &Theme,
 ) {
+    grey_overlay(f);
     let popup = centered_rect(80, 80, 110, 30, area);
     let inner = draw_popup_frame(
         f,
@@ -907,7 +887,8 @@ pub fn opt_row(
 
 #[cfg(test)]
 mod ported_chrome_tests {
-    use super::{draw_logo, grey_overlay, opt_row};
+    use super::{draw_help, draw_logo, grey_overlay, opt_row};
+    use crate::app::ActiveTab;
     use crate::ui::theme::Theme;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -977,6 +958,27 @@ mod ported_chrome_tests {
     }
 
     #[test]
+    fn draw_help_dims_the_backdrop() {
+        // `draw_help` sizes its popup to its content, so on a large area there
+        // is backdrop left uncovered around it — the corner is always part of
+        // that backdrop, not the popup. Before `draw_help` called
+        // `grey_overlay`, that corner kept whatever the tab underneath had
+        // painted there instead of the dimmed wash every other modal uses.
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(120, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_help(f, f.area(), ActiveTab::Observe, &theme))
+            .unwrap();
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "help modal must dim its backdrop like every other modal"
+        );
+    }
+
+    #[test]
     fn p4_overlays_render_key_content() {
         use crate::app::{ActiveTab, AppState};
         let theme = Theme::from_name("default-dark");
@@ -1013,7 +1015,9 @@ mod ported_chrome_tests {
         );
         assert!(options.contains("General"), "options missing tab label");
 
-        let help = render(&|f| super::draw_global_help(f, area, &theme));
+        let help = render(&|f| {
+            super::draw_global_help(f, area, &theme);
+        });
         assert!(
             help.contains("Keyboard"),
             "global help missing title: {help:?}"

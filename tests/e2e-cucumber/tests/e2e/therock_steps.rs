@@ -812,3 +812,27 @@ print(json.dumps({"rocm_sdk": rocm_sdk.__version__, "torch": torch.__version__, 
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[when("the user reinstalls vllm")]
+async fn user_reinstalls_vllm(world: &mut E2eWorld) {
+    // `--reinstall` so the adapter's ROCm 10.x discovery route (dry-run
+    // resolve, then reinstall pinned to what that reported) runs even though
+    // the SDK install above may already have installed vLLM once.
+    let args = ["engines", "install", "vllm", "--reinstall", "--yes"];
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &args);
+    assert!(
+        rc == 0,
+        "{}",
+        cli_failure_report(&args, rc, &stdout, &stderr)
+    );
+    world.cli_output = Some(stdout);
+}
+
+#[then("the install reports the vLLM ROCm 10.x discovery pins")]
+async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
+    let install_output = stdout(world);
+    assert!(
+        install_output.contains("vLLM ROCm 10.x discovery pinned:"),
+        "vLLM install against a live ROCm 10.x runtime did not report discovery pins:\n{install_output}"
+    );
+}

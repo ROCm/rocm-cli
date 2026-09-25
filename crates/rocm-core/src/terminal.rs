@@ -24,9 +24,9 @@
 //! grammar to get wrong, and the first one took three rounds to get right. So
 //! the grammar lives here once, in one private stepping function, and each
 //! caller interprets the classified tokens it yields. The third needs no walk
-//! at all, only the character classification ([`is_control_or_format`]) the
-//! other two end on — which is why it lives here rather than beside either of
-//! its two callers.
+//! at all, only the character predicates ([`is_control_or_format`] and
+//! [`is_control_or_line_separator`]) the other two end on — which is why it
+//! lives here rather than beside either of its two callers.
 //!
 //! # Line breaks inside a string body: merging and losing rows
 //!
@@ -158,6 +158,25 @@ pub fn is_control_or_format(c: char) -> bool {
             | '\u{e0020}'..='\u{e007f}')
 }
 
+/// Whether `c` is a `Cc` control or one of the two Unicode separators that
+/// mandate a line break.
+///
+/// `U+2028 LINE SEPARATOR` and `U+2029 PARAGRAPH SEPARATOR` are `Zl`/`Zp`, so
+/// neither `char::is_control` nor [`is_control_or_format`]'s enumerated `Cf`
+/// set covers them, yet a terminal draws the text after either on the next row.
+/// The two places that must not let that happen — this module's classifier and
+/// [`quotable_in_single_quotes`], the guard on what may be quoted into the
+/// `rocm diagnose --symptom '...'` command the OOM surfaces print — therefore
+/// share this predicate instead of each deciding for itself what breaks a line.
+/// The classifier was widened to the pair when this walk moved out of the vLLM
+/// engine (the commit that moved it says "behaviour is unchanged", which is
+/// true of everything except this); the guard was not, and a line separator
+/// went on riding into the printed command.
+#[must_use]
+pub fn is_control_or_line_separator(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
 ///
 /// The value is untrusted subprocess output (the vLLM startup log tail) and the
@@ -186,12 +205,17 @@ pub fn is_control_or_format(c: char) -> bool {
 /// `rocm serve` summary's OOM note — and a guard that protects only one of them
 /// is the bug it was written to prevent.
 ///
-/// The character test is [`is_control_or_format`], not `char::is_control`: the
-/// latter is Unicode `Cc` only, so a bidi override in the failing line survived
-/// into the printed command and reordered how it renders.
+/// The character test is [`is_control_or_format`] together with
+/// [`is_control_or_line_separator`], because each covers scalars the other does
+/// not and `symptom` is the *raw* log line, not the stripped one: a `Cf` bidi
+/// override reordered how the printed command renders, and a `Zl` line
+/// separator broke it across two rows.
 #[must_use]
 pub fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'') && !symptom.chars().any(is_control_or_format)
+    !symptom.contains('\'')
+        && !symptom
+            .chars()
+            .any(|c| is_control_or_format(c) || is_control_or_line_separator(c))
 }
 
 /// Consumes one glyph, control character or escape sequence and says which of
@@ -302,32 +326,18 @@ fn next_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<To
 /// Classifies a character that is not an escape introducer.
 ///
 /// `\t` is [`Token::Text`] rather than a boundary: it moves the cursor along the
-/// row it is already on, so it is legitimate intra-line whitespace. Every other
-/// `Cc` control is a boundary — `\n` and `\r` obviously, but equally `\x0b`
-/// (`VT`) and `\x0c` (`FF`), which advance a line, `\u{85}` (`NEL`), and the
-/// bytes that do nothing at all. The last group is the lopsidedness above: a
-/// stray `\x01` between two rendered lines is far likelier to be a mangled line
-/// advance than intra-line text, and guessing "boundary" costs a missed
-/// diagnosis where guessing "text" costs a wrong one.
-///
-/// `U+2028`/`U+2029` are `Zl`/`Zp` rather than `Cc`, so `char::is_control` does
-/// not cover them, but Unicode defines both as mandatory line breaks.
-///
-/// Those two scalars are the one place where moving this walk out of the vLLM
-/// engine changed [`strip_terminal_control_sequences`] rather than merely
-/// relocating it, and the commit that moved it says "behaviour is unchanged",
-/// which is true of everything except this. The engine-local stripper tested
-/// every non-escape character with [`is_control_or_format`] alone; that is
-/// `false` for both (neither is `Cc`, neither is in the enumerated `Cf` set), so
-/// both used to survive into the stripped message and now do not. The widening
-/// is intentional — a mandatory line break is exactly the kind of non-drawing
-/// character that stripper exists to remove — and the stripper table test in
-/// `engines/vllm/src/lib.rs` pins both scalars so the next drift is caught.
+/// row it is already on, so it is legitimate intra-line whitespace. Everything
+/// else [`is_control_or_line_separator`] accepts is a boundary — `\n` and `\r`
+/// obviously, but equally `\x0b` (`VT`) and `\x0c` (`FF`), which advance a line,
+/// `\u{85}` (`NEL`), and the bytes that do nothing at all. The last group is the
+/// lopsidedness above: a stray `\x01` between two rendered lines is far likelier
+/// to be a mangled line advance than intra-line text, and guessing "boundary"
+/// costs a missed diagnosis where guessing "text" costs a wrong one.
 fn classify_char(c: char) -> Token {
     if c == '\t' {
         return Token::Text(c);
     }
-    if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+    if is_control_or_line_separator(c) {
         return Token::LineBreak;
     }
     if is_control_or_format(c) {
@@ -476,13 +486,23 @@ mod tests {
         assert!(quotable_in_single_quotes(
             "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
         ));
-        // Cf characters must also be inadmissible in the quoted command, not
-        // merely stripped from the echoed sentence: the two guards are separate
-        // because they are separate call sites and only one of them used
-        // `char::is_control`.
+        // Every scalar the stripper removes must also be inadmissible in the
+        // quoted command, not merely stripped from the echoed sentence: the
+        // candidate this guard sees is built from the *raw* line, not the
+        // stripped one, so it needs its own pins. `Cf` is not `char::is_control`
+        // and `Zl`/`Zp` are in neither, which is why the test below is two
+        // predicates rather than one.
         assert!(
             !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
             "a bidi override must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            !quotable_in_single_quotes("vllm: HIP\u{2028}out of memory"),
+            "a line separator must make a line unquotable, not ride into the command"
+        );
+        assert!(
+            !quotable_in_single_quotes("vllm: HIP\u{2029}out of memory"),
+            "a paragraph separator must make a line unquotable, not ride into the command"
         );
         assert!(
             quotable_in_single_quotes("vllm: HIP out of memory"),
@@ -584,6 +604,19 @@ mod tests {
                 "RuntimeError: \u{202e}HIP out of memory",
                 "RuntimeError: HIP out of memory",
                 "a bidi override must not survive into the message",
+            ),
+            // The `Zl`/`Zp` pair that `is_control_or_line_separator` adds to
+            // `char::is_control`: drop it from that predicate and both of these
+            // go red, as do the quoting assertions above.
+            (
+                "RuntimeError: HIP\u{2028}out of memory",
+                "RuntimeError: HIPout of memory",
+                "a line separator must not survive into the message",
+            ),
+            (
+                "RuntimeError: HIP\u{2029}out of memory",
+                "RuntimeError: HIPout of memory",
+                "a paragraph separator must not survive into the message",
             ),
             // The text-only control: nothing is removed from a clean line.
             (

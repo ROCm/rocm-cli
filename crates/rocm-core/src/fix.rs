@@ -532,16 +532,17 @@ const RECIPES: &[FixRecipe] = &[
         rationale: "ROCDXG (librocdxg) is the ROCm-to-DXCore shim the WSL path runs on. It is a distro-side package, so unlike the driver and DXCore pieces this one is entirely in the user's hands.",
         auto_applicable: false,
         commands: &[
-            "bash scripts/wsl_setup_rocdxg.sh",
-            "# To verify the download against a digest you trust:",
-            "#   ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh",
+            "rocm install driver",
+            "# Then, once the plan looks right:",
+            "#   rocm install driver --yes",
         ],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: false,
         verify: "ldconfig -p | grep librocdxg",
         notes: &[
-            "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. rocm-cli does not run that for you, and the script does not bake in a production checksum -- set ROCDXG_SHA256 to one you trust.",
+            "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. `rocm install driver` prints the plan first so the URL and the package are reviewable before anything runs.",
+            "The download is checked against a digest pinned for that ROCDXG release. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
         ],
         applies_on: WSL_ONLY,
         runner: None,
@@ -830,6 +831,45 @@ pub fn list_recipes() -> String {
     out
 }
 
+/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>`
+/// and `rocm diagnose` so the same `(sudo, reboot, relogin, auto_applicable)`
+/// values render as the same text from either command. This only
+/// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
+/// diagnose's `Fix` still supply those independently, so a fix-id's rendered
+/// flags can still differ if the two disagree on a value (known example:
+/// `fix-5-amdgpu-load`'s `needs_reboot`). Also out of scope: the bare
+/// `rocm fix` catalog listing (`list_recipes`) describes the same
+/// `auto_applicable` property with a separate, untouched AUTO/PRINT-ONLY
+/// vocabulary.
+// These mirror the `FixRecipe`/`Fix` struct fields, where
+// `clippy::struct_excessive_bools` is already allowed workspace-wide; that
+// allow doesn't reach this free function's parameters, so
+// `clippy::fn_params_excessive_bools` is separately allowed below.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn format_flags(
+    needs_sudo: bool,
+    needs_reboot: bool,
+    needs_relogin: bool,
+    auto_applicable: bool,
+) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if needs_sudo {
+        flags.push("requires sudo");
+    }
+    if needs_reboot {
+        flags.push("requires reboot");
+    }
+    if needs_relogin {
+        flags.push("requires re-login");
+    }
+    flags.push(if auto_applicable {
+        "rocm fix can run it"
+    } else {
+        "manual only (`rocm fix` will NOT run it automatically)"
+    });
+    flags
+}
+
 fn print_recipe(r: &FixRecipe) {
     println!("Fix:        {}  -- {}", r.fix_id, r.title);
     println!("OS scope:   {}", r.applies_on.join(", "));
@@ -840,22 +880,13 @@ fn print_recipe(r: &FixRecipe) {
             println!("  $ {c}");
         }
     }
-    let mut flags = Vec::new();
-    if r.needs_sudo {
-        flags.push("requires sudo");
-    }
-    if r.needs_reboot {
-        flags.push("requires reboot");
-    }
-    if r.needs_relogin {
-        flags.push("requires re-login");
-    }
-    if !r.auto_applicable {
-        flags.push("manual only (this command will NOT run it)");
-    }
-    if !flags.is_empty() {
-        println!("Flags:      {}", flags.join(", "));
-    }
+    let flags = format_flags(
+        r.needs_sudo,
+        r.needs_reboot,
+        r.needs_relogin,
+        r.auto_applicable,
+    );
+    println!("Flags:      {}", flags.join(", "));
     for n in r.notes {
         println!("Note:       {n}");
     }
@@ -1778,5 +1809,42 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+    }
+
+    #[test]
+    fn format_flags_covers_every_flag_combination_and_both_auto_states() {
+        // Exhaustive over all 2^4 = 16 combinations of the 3 optional flags
+        // (sudo/reboot/relogin) x both auto_applicable states, so a wording
+        // regression on any one flag, or on the always-present auto/manual
+        // marker, fails here rather than only being visible by eyeballing
+        // `rocm fix`/`rocm diagnose` output.
+        for bits in 0..16u8 {
+            let needs_sudo = bits & 1 != 0;
+            let needs_reboot = bits & 2 != 0;
+            let needs_relogin = bits & 4 != 0;
+            let auto_applicable = bits & 8 != 0;
+
+            let mut expected = Vec::new();
+            if needs_sudo {
+                expected.push("requires sudo");
+            }
+            if needs_reboot {
+                expected.push("requires reboot");
+            }
+            if needs_relogin {
+                expected.push("requires re-login");
+            }
+            expected.push(if auto_applicable {
+                "rocm fix can run it"
+            } else {
+                "manual only (`rocm fix` will NOT run it automatically)"
+            });
+
+            let flags = format_flags(needs_sudo, needs_reboot, needs_relogin, auto_applicable);
+            assert_eq!(
+                flags, expected,
+                "sudo={needs_sudo} reboot={needs_reboot} relogin={needs_relogin} auto={auto_applicable}"
+            );
+        }
     }
 }

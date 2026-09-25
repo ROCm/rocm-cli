@@ -21,6 +21,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::state::JobStatus;
+
 use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
@@ -203,15 +205,10 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .map(|(_, job)| job)
         .take(feed.height as usize)
     {
-        let (glyph, color) = match job.status {
-            rocm_dash_core::state::JobStatus::Failed { .. } => ("✗ ", theme.err),
-            rocm_dash_core::state::JobStatus::Cancelled => ("○ ", theme.muted),
-            rocm_dash_core::state::JobStatus::Done { code: 0 } => ("✓ ", theme.ok),
-            rocm_dash_core::state::JobStatus::Done { .. } => ("! ", theme.warn),
-            rocm_dash_core::state::JobStatus::Running => ("⋯ ", theme.muted),
-        };
+        let glyph = job.status.glyph();
+        let color = theme.job_status_color(&job.status);
         lines.push(Line::from(vec![
-            Span::styled(glyph, Style::default().fg(color)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(job.cmd.clone(), Style::default().fg(theme.fg)),
         ]));
     }
@@ -223,9 +220,14 @@ fn draw_activity(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     // Glyph key, appended last: `truncate` below already drops it whenever
     // there's no spare room, so it never displaces real activity on a
-    // squeezed card — no separate room check needed.
+    // squeezed card — no separate room check needed. Built from
+    // `JobStatus::legend_glyphs()` so the key can't drift from the real
+    // glyphs.
+    let [done, warn, failed, running, cancelled] = JobStatus::legend_glyphs();
     lines.push(Line::from(Span::styled(
-        "● live  ✓ done  ! warn  ✗ failed  ⋯ running  ○ cancelled",
+        format!(
+            "● live  {done} done  {warn} warn  {failed} failed  {running} running  {cancelled} cancelled"
+        ),
         Style::default().fg(theme.muted),
     )));
     lines.truncate(feed.height as usize);
@@ -1103,45 +1105,153 @@ mod tests {
     }
 
     #[test]
-    fn activity_feed_glyphs_match_job_console_vocabulary() {
+    fn activity_feed_glyphs_match_shared_job_status_glyphs() {
+        // The previous version of this test only asserted that each glyph
+        // appeared *somewhere* in the whole rendered frame via
+        // `out.contains(glyph)`. That's satisfied by the glyph key line
+        // alone (which always renders all five glyphs), so it would still
+        // pass even if every activity row used the wrong glyph. Assert
+        // instead that each job's own row pairs the *correct* glyph
+        // immediately before its command name, mirroring
+        // `activity_feed_colors_match_shared_job_status_color`'s per-row
+        // approach below.
         use rocm_dash_core::state::StateEvent;
 
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Home;
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("ok".into(), job("ok-job", JobStatus::Done { code: 0 }));
+        s.jobs
+            .jobs
+            .insert("warn".into(), job("warn-job", JobStatus::Done { code: 7 }));
+        // Driven through the real state machine (unlike the other jobs in
+        // this test, which are hand-built `JobState` values) so this test
+        // still proves `StateEvent::JobErr` actually produces the `Failed`
+        // status it asserts against, not just that the renderer paints a
+        // pre-built `Failed` status correctly.
         s.jobs.apply(StateEvent::StartJob {
-            id: "a".into(),
-            cmd: "ok".into(),
+            id: "failed".into(),
+            cmd: "failed-job".into(),
             args: vec![],
         });
-        s.jobs.apply(StateEvent::JobDone {
-            id: "a".into(),
-            code: 0,
+        s.jobs.apply(StateEvent::JobErr {
+            id: "failed".into(),
+            message: "boom".into(),
         });
-        s.jobs.apply(StateEvent::StartJob {
-            id: "b".into(),
-            cmd: "bad".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::JobDone {
-            id: "b".into(),
-            code: 1,
-        });
-        s.jobs.apply(StateEvent::StartJob {
-            id: "c".into(),
-            cmd: "cancelled".into(),
-            args: vec![],
-        });
-        s.jobs.apply(StateEvent::CancelJob("c".into()));
-        s.jobs.apply(StateEvent::StartJob {
-            id: "d".into(),
-            cmd: "running".into(),
-            args: vec![],
-        });
+        s.jobs.jobs.insert(
+            "cancelled".into(),
+            job("cancelled-job", JobStatus::Cancelled),
+        );
+        s.jobs
+            .jobs
+            .insert("running".into(), job("running-job", JobStatus::Running));
 
         let out = render(&s, 160, 30);
-        assert!(out.contains('✓'), "zero-exit glyph missing: {out:?}");
-        assert!(out.contains('!'), "nonzero-exit glyph missing: {out:?}");
-        assert!(out.contains('○'), "cancelled glyph missing: {out:?}");
-        assert!(out.contains('⋯'), "running glyph missing: {out:?}");
+        for (name, status) in [
+            ("ok-job", JobStatus::Done { code: 0 }),
+            ("warn-job", JobStatus::Done { code: 7 }),
+            (
+                "failed-job",
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+            ),
+            ("cancelled-job", JobStatus::Cancelled),
+            ("running-job", JobStatus::Running),
+        ] {
+            let glyph = status.glyph();
+            let expected = format!("{glyph} {name}");
+            assert!(
+                out.contains(&expected),
+                "expected glyph {glyph:?} immediately before {name}'s row, got: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn activity_feed_colors_match_shared_job_status_color() {
+        // Regression coverage for `job_status_color()` centralization: each
+        // activity-feed row's glyph must render in the color the shared
+        // helper defines for that job's status, not a renderer-local guess.
+        let mut s = state_with_gpu();
+        s.jobs
+            .jobs
+            .insert("ok".into(), job("ok-job", JobStatus::Done { code: 0 }));
+        s.jobs
+            .jobs
+            .insert("warn".into(), job("warn-job", JobStatus::Done { code: 7 }));
+        s.jobs.jobs.insert(
+            "failed".into(),
+            job(
+                "failed-job",
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+            ),
+        );
+        s.jobs.jobs.insert(
+            "cancelled".into(),
+            job("cancelled-job", JobStatus::Cancelled),
+        );
+        s.jobs
+            .jobs
+            .insert("running".into(), job("running-job", JobStatus::Running));
+
+        let backend = TestBackend::new(160, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, f.area(), &s, &s.theme)).unwrap();
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let theme = s.theme;
+
+        // Locate the row containing the job's name, then find the glyph cell
+        // within that row by its actual rendered symbol (from
+        // `JobStatus::glyph()`) rather than a fixed column offset from the
+        // name — so this test doesn't silently break if the spacing between
+        // the glyph and the job name ever changes.
+        let glyph_color_for = |name: &str, status: &JobStatus| {
+            let row = buf
+                .content()
+                .chunks(width)
+                .find(|row| {
+                    row.iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                        .contains(name)
+                })
+                .unwrap_or_else(|| panic!("row for {name} not found"));
+            let glyph = status.glyph();
+            let glyph_col = row
+                .iter()
+                .position(|cell| cell.symbol() == glyph)
+                .unwrap_or_else(|| panic!("glyph {glyph:?} not found in {name}'s row"));
+            row[glyph_col].fg
+        };
+
+        assert_eq!(
+            glyph_color_for("ok-job", &JobStatus::Done { code: 0 }),
+            theme.ok
+        );
+        assert_eq!(
+            glyph_color_for("warn-job", &JobStatus::Done { code: 7 }),
+            theme.warn
+        );
+        assert_eq!(
+            glyph_color_for(
+                "failed-job",
+                &JobStatus::Failed {
+                    message: "boom".into()
+                }
+            ),
+            theme.err
+        );
+        assert_eq!(
+            glyph_color_for("cancelled-job", &JobStatus::Cancelled),
+            theme.muted
+        );
+        assert_eq!(
+            glyph_color_for("running-job", &JobStatus::Running),
+            theme.accent
+        );
     }
 }

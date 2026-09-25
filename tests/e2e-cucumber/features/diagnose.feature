@@ -20,6 +20,7 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom
     Then the CLI reports a likely cause with a suggested fix
     And every reported cause comes with a command that applies it
+    And every reported cause states its remediation flags
 
   @id:diagnose-always-offers-a-way-forward
   Scenario: diagnose-02 - Diagnosing any failure always gives the user a way to escalate
@@ -40,12 +41,17 @@ Feature: Diagnosing failures and listing fixes
     And each fix indicates whether the CLI can apply it automatically
     And the listing explains what those indicators mean
 
+  # This scenario exercises `rocm fix <id> --dry-run` (print_recipe's `Flags:`
+  # line), not the `rocm diagnose` report itself -- see diagnose-01's "states
+  # its remediation flags" step for the equivalent `flags:` line on that
+  # surface.
   @id:diagnose-fix-dry-run-changes-nothing
   Scenario: diagnose-05 - Previewing a fix explains the change without making it
     Given a user who has chosen a known fix
     When the user previews that fix without applying it
     Then the CLI describes what the fix would change
     And nothing on the machine is changed
+    And the preview states plainly that this fix is manual only
 
   @id:diagnose-fix-unknown-id-rejected
   Scenario: diagnose-06 - Asking for a fix the CLI does not know is refused clearly
@@ -267,11 +273,28 @@ Feature: Diagnosing failures and listing fixes
     Then the CLI refuses and explains that it could not reach that machine
     And no diagnosis of this machine is reported
 
+  # diagnose-05 only proves the manual/zero-optional-flags wording, because
+  # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
+  # sudo+re-login combination only exists on a fix gated to bare-metal Linux
+  # (fix-4-render-group), so it needs its own scenario -- but, like
+  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
+  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
+  # under test renders identically regardless of which lane runs it. The step
+  # asserts only that printed text, never the exit code -- `fix-4-render-group`
+  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
+  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
+  @id:diagnose-fix-preview-states-required-flags
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
+    Given a user who has chosen a fix that needs sudo and a re-login
+    When the user previews that fix without applying it
+    Then the preview states that the fix requires sudo and a re-login
+    And the preview states that the CLI can run it automatically
+
   # vLLM runs on Linux and WSL, but not native Windows. This scenario is
   # GPU-independent: it supplies the captured startup error as symptom text and
   # proves the public diagnosis output preserves both branches of the remedy.
   @id:diagnose-vllm-oom-is-conditional @requires-os:linux
-  Scenario: diagnose-20 - A vLLM startup OOM receives conditional remediation
+  Scenario: diagnose-21 - A vLLM startup OOM receives conditional remediation
     Given a user whose vLLM server ran out of GPU memory
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the diagnosis identifies the vLLM startup OOM
@@ -294,7 +317,7 @@ Feature: Diagnosing failures and listing fixes
   # engine's error text back as the evidence for it. A confidently wrong cause is
   # worse than no cause, so this is pinned at the level the user sees it.
   @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
-  Scenario: diagnose-21 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+  Scenario: diagnose-22 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
     Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then no vLLM startup OOM is reported

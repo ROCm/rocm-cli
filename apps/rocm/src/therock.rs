@@ -3864,7 +3864,12 @@ impl MetadataSignaturePolicy {
     }
 }
 
-fn truthy_env(name: &str) -> bool {
+/// Whether an environment variable is set to an affirmative value.
+///
+/// Deliberately an allowlist rather than "set to anything non-empty": the
+/// callers are opt-ins to weaker behaviour, so `=0` and `=false` must read as
+/// off rather than as "the variable is present, therefore yes".
+pub(crate) fn truthy_env(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|value| {
         matches!(
             value.trim(),

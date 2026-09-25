@@ -18,14 +18,13 @@ use ratatui::widgets::Paragraph;
 
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
-use rocm_dash_core::state::JobStatus;
 
 use crate::app::{ActiveTab, AppState};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, log_body_tone};
 
 /// Minimum terminal size for the wide triptych. Below this the dash stays
 /// single-column (byte-for-byte the pre-Phase-6 layout).
@@ -148,11 +147,13 @@ pub fn logs_dock(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     jobs.sort_by(|a, b| a.0.cmp(b.0));
     let mut lines: Vec<Line> = Vec::new();
     for (_, job) in jobs {
-        let color = match job.status {
-            JobStatus::Failed { .. } => theme.err,
-            JobStatus::Done { .. } => theme.ok,
-            _ => theme.fg,
-        };
+        // `Running` deliberately stays neutral here: unlike the small status
+        // badges in the console header and Home's activity feed,
+        // `job_status_color`'s accent tone would wash an entire in-flight
+        // job's streamed output in saturated cyan for as long as it runs —
+        // the common case while a user is actually reading LOGS. Terminal
+        // statuses (done/warn/failed/cancelled) still take the shared color.
+        let color = theme.tone_color(log_body_tone(&job.status));
         for l in &job.output {
             lines.push(Line::from(Span::styled(
                 l.clone(),
@@ -310,6 +311,43 @@ mod tests {
             .collect()
     }
 
+    /// Foreground color of the cell where `needle` starts, in the row that
+    /// contains it. Locates the exact cell by mapping `needle`'s byte offset
+    /// back through each cell's symbol length, rather than matching a single
+    /// character (which could land on an unrelated cell earlier in the row,
+    /// e.g. in surrounding chrome).
+    ///
+    /// Takes the *first* row containing `needle`; safe as long as callers use
+    /// a needle unique to one row in the rendered buffer (true of every
+    /// current call site).
+    fn fg_at_substring(term: &Terminal<TestBackend>, needle: &str) -> ratatui::style::Color {
+        let buf = term.backend().buffer();
+        let width = buf.area().width as usize;
+        let row = buf
+            .content()
+            .chunks(width)
+            .find(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .expect("rendered log line not found");
+        let symbols: Vec<&str> = row.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let joined = symbols.concat();
+        let byte_offset = joined.find(needle).expect("log line text not found in row");
+        let mut acc = 0;
+        let col = symbols
+            .iter()
+            .position(|s| {
+                let start = acc;
+                acc += s.len();
+                byte_offset >= start && byte_offset < acc
+            })
+            .expect("start of log line text not found in row");
+        row[col].fg
+    }
+
     #[test]
     fn is_wide_and_triptych_extents() {
         assert!(!is_wide(160, 44));
@@ -370,6 +408,104 @@ mod tests {
         assert!(up.contains("LINE00"), "scroll-up reveals oldest: {up:?}");
         assert!(!up.contains("LINE29"), "newest scrolled off");
         assert!(up.contains('↑'), "title shows the scroll offset");
+    }
+
+    #[test]
+    fn logs_dock_tints_nonzero_exit_as_warn_not_ok() {
+        // Regression guard for the bug this PR fixes: `logs_dock` used to map
+        // every `Done{code}` to `theme.ok` (green), so a job that exited
+        // nonzero showed green log lines while every other renderer flagged
+        // it as a warn state. Render through the real `logs_dock` path (not
+        // just the shared color helper in isolation) so a reintroduced
+        // hand-rolled match here would fail this test.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "warned line".into(),
+        });
+        s.jobs.apply(StateEvent::JobDone {
+            id: "build".into(),
+            code: 1,
+        });
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let fg = fg_at_substring(&term, "warned line");
+        assert_eq!(fg, theme.warn, "nonzero-exit job line should be theme.warn");
+        assert_ne!(fg, theme.ok, "nonzero-exit job line must not be theme.ok");
+    }
+
+    #[test]
+    fn logs_dock_keeps_running_job_neutral_not_accent() {
+        // `Running` is deliberately special-cased to `theme.fg` in `logs_dock`
+        // (unlike the small status badges in the console header and Home's
+        // activity feed, which use the shared `job_status_color()` accent):
+        // washing an entire streamed log body in saturated cyan for the whole
+        // duration a job runs — the common case while LOGS is actually being
+        // read — would hurt readability. Lock in that choice so a future
+        // switch back to the shared helper here doesn't silently regress it.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "still running line".into(),
+        });
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let fg = fg_at_substring(&term, "still running line");
+        assert_eq!(fg, theme.fg, "in-flight job line should stay neutral");
+        assert_ne!(
+            fg, theme.accent,
+            "in-flight job line must not use the shared accent tone"
+        );
+    }
+
+    #[test]
+    fn logs_dock_tints_cancelled_as_muted() {
+        // Regression guard for the other intentional color change in this
+        // PR: `logs_dock` now maps `Cancelled` to `theme.muted` instead of
+        // the previous neutral `theme.fg`. Render through the real
+        // `logs_dock` path so a reintroduced hand-rolled match here would
+        // fail this test, not just the cross-file helper-comparison test.
+        use rocm_dash_core::state::StateEvent;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.jobs.apply(StateEvent::StartJob {
+            id: "build".into(),
+            cmd: "rocm".into(),
+            args: vec!["build".into()],
+        });
+        s.jobs.apply(StateEvent::JobLine {
+            id: "build".into(),
+            line: "cancelled line".into(),
+        });
+        s.jobs.apply(StateEvent::CancelJob("build".into()));
+        let theme = s.theme;
+        let backend = TestBackend::new(DOCK_W, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| logs_dock(f, f.area(), &s, &theme)).unwrap();
+
+        let fg = fg_at_substring(&term, "cancelled line");
+        assert_eq!(fg, theme.muted, "cancelled job line should be theme.muted");
+        assert_ne!(
+            fg, theme.fg,
+            "cancelled job line must not stay the old neutral theme.fg"
+        );
     }
 
     #[test]
