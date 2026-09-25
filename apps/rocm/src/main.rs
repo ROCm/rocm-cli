@@ -6302,6 +6302,32 @@ fn spawn_managed_engine_child(
                 resolve.canonical_model_id
             );
         }
+        // Reuse cannot satisfy a demand for auth the running server never got.
+        // The engine reads its key once, at launch, from the environment this
+        // function builds below — so a server started without one keeps serving
+        // anonymously no matter what is written afterwards. Upgrading the record
+        // here would be worse than doing nothing: the record would claim auth
+        // that the live process does not enforce, and
+        // `ensure_public_service_has_endpoint_key` would pass on the strength of
+        // a key file nothing reads.
+        //
+        // This is what `rocm remote serve` relies on. It publishes a loopback
+        // port onto the tailnet and prints "the API key above is what stops
+        // anyone else calling it". Reusing an unauthenticated service silently
+        // would make that sentence false about an endpoint the whole tailnet can
+        // reach. Refusing is the only answer that fails closed, and it is the
+        // same shape as the recipe mismatch above.
+        if require_api_key && !existing.requires_api_key {
+            bail!(
+                "managed service `{}` is already running for engine `{engine}` and model `{}` \
+                 without authentication, and a running server cannot be given a key it did not \
+                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 serve it with `--require-api-key`",
+                existing.service_id,
+                resolve.canonical_model_id,
+                existing.service_id
+            );
+        }
         record_cli_audit_event(
             paths,
             "service",
@@ -28429,6 +28455,93 @@ install therock";
         assert!(
             message.contains("recipe hint, tool-call parser, or generation defaults"),
             "message should not single out generation defaults as the sole cause: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_managed_engine_child_refuses_to_reuse_an_unauthenticated_service() -> Result<()> {
+        // `--require-api-key` used to be accepted and dropped on this path. The
+        // reuse branch returns before the flag is recorded and before the
+        // endpoint key is checked, so a caller demanding auth got a server that
+        // never had it, with no error. `rocm remote serve` then published that
+        // endpoint onto the tailnet and printed a freshly minted key under "the
+        // API key above is what stops anyone else calling it" — a false
+        // assurance about an endpoint the whole tailnet can reach.
+        //
+        // Asserted through `spawn_managed_engine_child` rather than against the
+        // guard's own arguments: the defect was the early return, so only the
+        // real call site can fail for it.
+        let (root, paths) = test_paths("dup-managed-unauthenticated-reuse");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-3000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        // The state that matters: live, matching, and serving without auth.
+        existing.requires_api_key = false;
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-qwen-3001",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11520,
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            // The demand that used to be silently discarded.
+            true,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = result else {
+            panic!(
+                "reusing an unauthenticated service must not satisfy `--require-api-key`; a \
+                 satisfied reuse leaves the endpoint open while the caller is told it is not"
+            )
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("without authentication"),
+            "the refusal must say why it refused: {message}"
+        );
+        assert!(
+            message.contains("rocm services stop lemonade-qwen-3000"),
+            "the refusal must name the way out, with the service to stop: {message}"
         );
         Ok(())
     }
