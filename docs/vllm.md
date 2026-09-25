@@ -199,7 +199,10 @@ a tiny model. rocm-cli helps in three ways:
   The printed command quotes your actual failing line when it can be rendered as
   one intact single-quoted argument; a line carrying an apostrophe or terminal
   control bytes falls back to the canonical symptom below rather than handing you
-  a command whose quoting the log text broke.
+  a command whose quoting the log text broke. The same rule applies to the
+  `rocm serve` summary's out-of-memory note, which builds the same command from
+  the same engine log — both surfaces share one guard, so neither can hand you a
+  half-quoted command the other rejects.
 
 Explicitly, the workaround for an OOM on a shared card is:
 
