@@ -174,3 +174,26 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system both for reading and for scripting
     Then the framework report names the runtime's interpreter
+
+  # EAI-8950. The text form repairs a lost registry entry from the install tree
+  # before rendering (`recover_setup_runtime_registration`), so it names the
+  # folder; `--json` skips that call because it writes, and used to answer
+  # `active_runtime_root: null` with no folder anywhere in the document. The
+  # folder is reachable from config without the registry and without writing,
+  # which is what these fields carry.
+  #
+  # examine-15 cannot catch this: its step runs `rocm examine` before `rocm
+  # examine --json`, and the first run performs the repair the second then
+  # benefits from. So this scenario asks the machine-readable form FIRST, while
+  # the registry is still empty, and only then runs the text form to hold the
+  # two answers against each other.
+  #
+  # No GPU needed: the config is planted, and the isolated registry is empty by
+  # design (see `E2eWorld::default`) — which is precisely the missing-entry
+  # state under test.
+  @id:examine-json-names-the-setup-runtime-folder
+  Scenario: examine-16 - The scripting form names the setup runtime folder unaided
+    Given setup names a runtime folder the registry has forgotten
+    When the user inspects the system for scripting before reading
+    Then the machine-readable form names the setup runtime folder
+    And it does not pass that folder off as the active runtime's

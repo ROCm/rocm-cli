@@ -396,6 +396,62 @@ async fn user_inspects_both_ways(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The runtime key config names as active while the registry holds nothing.
+/// A successful `install sdk` leaves both halves behind — `activate_runtime`
+/// records the key, `finalize_successful_sdk_install` records setup's folder —
+/// so this plants the state that remains when the registry is later lost and
+/// the install tree is not.
+const FORGOTTEN_RUNTIME_KEY: &str = "release-tarball-gfx942";
+
+/// Where the `Given` plants that folder, recomputed rather than carried on the
+/// World: it is a pure function of the scenario's isolated root, so a field
+/// would only be a second place for it to be wrong.
+fn planted_setup_runtime_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("setup-runtime")
+}
+
+#[given("setup names a runtime folder the registry has forgotten")]
+async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let install_root = planted_setup_runtime_root(world);
+    std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    // Black-box: plain JSON matching the CLI's on-disk config schema, not a
+    // typed import from the crates. Every field defaults, so naming these two
+    // is enough. The isolated registry starts empty, which IS the state under
+    // test — the install tree survives a registry entry that is gone.
+    let config = serde_json::json!({
+        "active_runtime_key": FORGOTTEN_RUNTIME_KEY,
+        "setup": { "therock_venv": install_root },
+    });
+    std::fs::write(
+        root.path().join("config").join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user inspects the system for scripting before reading")]
+async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
+    // The order is the scenario. Running the text form first would let its
+    // `recover_setup_runtime_registration` repair the registry, handing the
+    // machine-readable form an answer it is supposed to reach by itself — which
+    // is exactly why examine-15, which runs them the other way round, cannot see
+    // this. The text form still runs, second, so the comparison step can hold
+    // the two to each other.
+    let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    let (human, _, _) = crate::run_rocm(world, &["examine"]);
+    world.cli_stderr = Some(human);
+    world.cli_output = Some(json);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects the system without probing frameworks")]
 async fn user_inspects_skipping_frameworks(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -430,6 +486,14 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
     // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
     // set `install_root` freely.
     ("active_runtime_root", &["active_runtime_root"]),
+    // Setup's folder, which is a different fact from the active runtime's: it
+    // can name a stale or removed install while another runtime is active, and
+    // it is readable when the registry is not.
+    ("setup_runtime_root", &["setup_runtime_root"]),
+    (
+        "setup_runtime_pip_cache_dir",
+        &["setup_runtime_pip_cache_dir"],
+    ),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -564,6 +628,65 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
         "the machine-readable form withholds what the readable one states:\n{}\n\n\
          A caller reading `--json` cannot learn these without scraping text.",
         withheld.join("\n")
+    );
+}
+
+#[then("the machine-readable form names the setup runtime folder")]
+async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
+    let planted = planted_setup_runtime_root(world).display().to_string();
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let value = parsed_json(world);
+    // The folder itself against what the `Given` planted, which is the
+    // correctness half: two forms agreeing on a wrong path would still agree.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_root")
+            .and_then(serde_json::Value::as_str),
+        Some(planted.as_str()),
+        "config names the setup runtime folder and the text form prints it, so a \
+         caller reading `--json` must not have to scrape text for it:\n{value:#}"
+    );
+    // The pip cache against the TEXT form rather than a path built here.
+    // `managed_pip_cache_dir` runs its argument through
+    // `normalize_runtime_path_for_host`, which rewrites separators and the drive
+    // letter on Windows; re-deriving it in the test would re-implement that and
+    // fail on the Windows lane for a product that is behaving. Holding the two
+    // forms to each other is also the fact this ticket is about.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_pip_cache_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        human_states(human, "setup_runtime_pip_cache_dir"),
+        "the pip cache is the text form's sibling fact, derived from the same \
+         folder, so the two forms must not name different ones:\n{value:#}"
+    );
+}
+
+#[then("it does not pass that folder off as the active runtime's")]
+async fn assert_json_keeps_setup_and_active_apart(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    // Without this the scenario would pass on a host where nothing is active at
+    // all, which is not the state the two fields have to stay distinct in.
+    assert!(
+        value
+            .pointer("/summary/active_runtime_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty()),
+        "the planted config names an active runtime key:\n{value:#}"
+    );
+    // Setup's folder is where setup was pointed, which can be a stale or removed
+    // install while a different runtime is active. Answering `active_runtime_root`
+    // with it would mislabel, so the unresolvable root stays null.
+    assert_eq!(
+        value.pointer("/summary/active_runtime_root"),
+        Some(&serde_json::Value::Null),
+        "no registry entry resolves, so the active runtime has no root to name — \
+         reporting setup's folder here would be a different fact under this \
+         label:\n{value:#}"
     );
 }
 
