@@ -34,7 +34,7 @@ fn serve_timeout_secs() -> u64 {
 /// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
 /// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
 /// it fails fast).
-fn serve_timeout_for(world: &E2eWorld) -> u64 {
+pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
         .unwrap_or_else(serve_timeout_secs)
@@ -47,7 +47,11 @@ fn serve_timeout_for(world: &E2eWorld) -> u64 {
 /// scenario A's `rocm` has no record of scenario B's managed service and can't
 /// stop it; a plain 200 check would then proceed against the WRONG model. Wait
 /// for the expected model so the readiness signal reflects this scenario's serve.
-async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) -> bool {
+pub(crate) async fn model_is_ready(
+    models_url: &str,
+    expect_model: Option<&str>,
+    timeout_secs: u64,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(models_url).await
@@ -1251,7 +1255,7 @@ fn resolved_model(output: &str) -> Option<&str> {
 /// (`Qwen3-4B-Instruct-2507-GGUF`) matches the concrete artifact the endpoint
 /// reports (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) — both share the base
 /// `Qwen3-4B-Instruct-2507`.
-fn ready_substr_for(model_id: &str) -> &str {
+pub(crate) fn ready_substr_for(model_id: &str) -> &str {
     let base = model_id.rsplit('/').next().unwrap_or(model_id);
     base.strip_suffix("-GGUF")
         .or_else(|| base.strip_suffix("-gguf"))

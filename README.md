@@ -373,13 +373,52 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key>
-rocm runtimes rollback
+rocm runtimes activate <runtime-key> [--restart-services] [--yes]
+rocm runtimes rollback [--restart-services] [--yes]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
                     [--runtime-key KEY] [--channel LABEL] [--replace]
 ```
+
+`activate` and `rollback` change which runtime the next install or server
+picks up. A server that is already running is not moved: it keeps serving on
+the runtime it started with until it is restarted. Both commands count the
+servers they leave behind and name each one, from what those servers themselves
+recorded:
+
+```
+  services_on_previous_runtime: 2
+    - svc-a engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
+    - svc-b engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
+  note: those keep serving on their recorded runtime until they are restarted; run `rocm runtimes activate release-wheel-gfx942-7-13-0 --restart-services --yes` to move them
+```
+
+When nothing is left behind the count is `services_on_previous_runtime: 0`. A
+running server whose record names no runtime is counted separately under
+`services_with_unrecorded_runtime:`, because what it loaded cannot be read back
+from the record. Only servers on an engine that brings its own runtime
+(`lemonade`) are never counted; an `env_id` recorded in a service record is not
+a pin and does not exempt the server. The same summary appears in the
+`rocm install sdk` and `rocm update --apply --activate` reports, which activate
+a runtime without taking `--restart-services` themselves — which is why the note
+names the `rocm runtimes activate` invocation that does, rather than a flag to
+add to whatever was just run.
+
+Add `--restart-services` to move those servers onto the newly active runtime
+rather than leave them behind; each one is put on the new runtime and then
+restarted, so it comes back serving from it. Moving a server also clears any
+`env_id` stored in its record; the engine writes its own back on the next
+launch. That restarts running servers, so it requires `--yes` and never
+prompts, the same as `rocm services restart <service-id> --yes`. Servers are
+handled one at a time and a failure does not stop the rest: every failure is
+named in the summary, its record is put back on the runtime it last ran on, and
+the command exits with an error. After a failure the server is read back: one
+that is still live stays counted under `services_on_previous_runtime`, and one
+that is not is reported as stopped by the attempt. The error says which is
+which. Read `rocm services logs <service-id>` first — a restart that just
+failed is likely to fail the same way again — then start a stopped server with
+`rocm services restart <service-id> --yes` once the cause is fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
