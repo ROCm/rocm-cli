@@ -5999,8 +5999,12 @@ fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
     if !cpu_only
         && !scripted_backend_failure
+        && !scripted_managed_engine_startup_failure()
         && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
@@ -6059,8 +6063,12 @@ fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
@@ -6499,6 +6507,42 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
 /// that fails at startup fails the same way on each.
 const MANAGED_ENGINE_STARTUP_SETTLE: Duration = Duration::from_millis(200);
 
+/// E2E-only switch that makes the managed engine die during startup, so the
+/// black-box suite can assert what a user sees when it does.
+///
+/// Read in the *parent*, which is what spawns the engine, so nothing test-only
+/// leaks into the child's own code path. The child is the real `rocm` binary,
+/// really spawned and really dead — only its arguments are swapped for ones the
+/// CLI rejects outright, so the launch takes exactly the path a broken engine
+/// takes.
+#[cfg(feature = "e2e-test-hooks")]
+const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
+
+/// Whether the E2E startup-failure switch is armed.
+#[cfg(feature = "e2e-test-hooks")]
+fn scripted_managed_engine_startup_failure() -> bool {
+    std::env::var_os(MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV).is_some()
+}
+
+/// Release builds do not enable `e2e-test-hooks`, so the switch does not exist
+/// there and no environment variable can arm it.
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn scripted_managed_engine_startup_failure() -> bool {
+    false
+}
+
+/// Arguments that make the spawned `rocm` exit immediately with a non-zero
+/// status. Used only under [`scripted_managed_engine_startup_failure`].
+///
+/// An unrecognised *flag*, deliberately: clap rejects it with exit code 2 before
+/// any work. An unrecognised subcommand would not do — the CLI falls back to
+/// natural-language request parsing for those and exits 0, which is a different
+/// (and much slower) thing than an engine dying.
+#[cfg(feature = "e2e-test-hooks")]
+fn managed_engine_startup_failure_args() -> Vec<String> {
+    vec!["--e2e-managed-engine-startup-failure".to_owned()]
+}
+
 /// Retire the service record of a launch that did not get an engine running.
 ///
 /// Callers must reach this on *every* path that abandons a record, because a
@@ -6521,24 +6565,23 @@ fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
     record.write()
 }
 
-/// Run `spawn` and retire `record` if it fails, so a launch that never got a
-/// child off the ground does not leave the record claiming its engine + model.
+/// Retire `record` when `outcome` failed, so *any* bail-out between writing the
+/// record and getting a live child stops it claiming its engine + model.
 ///
-/// Without this the `?` on a failed spawn returns straight past the retirement
-/// and wedges the service exactly the way an unretired early exit would — the
-/// failure is different, the stranded record is the same.
-fn spawn_or_retire_record<T>(
-    record: &mut ManagedServiceRecord,
-    spawn: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    match spawn() {
-        Ok(spawned) => Ok(spawned),
-        Err(error) => {
-            // Report the spawn failure, not a bookkeeping failure behind it.
-            let _ = mark_managed_launch_failed(record);
-            Err(error)
-        }
-    }
+/// Every fallible step after `record.write()` has to go through here. Each one
+/// that does not is another way to strand the pid-0 `"starting"` corpse — the
+/// failures differ, the wedge is identical.
+///
+/// Takes an already-evaluated `Result` rather than a closure so it can wrap the
+/// straight-line prefix between the record write and the spawn without holding a
+/// second borrow of `record` across the call.
+///
+/// The retirement error is deliberately dropped: what the user needs to see is
+/// the failure that aborted the launch, not a bookkeeping failure behind it.
+fn retire_record_on_error<T>(record: &mut ManagedServiceRecord, outcome: Result<T>) -> Result<T> {
+    outcome.inspect_err(|_| {
+        let _ = mark_managed_launch_failed(record);
+    })
 }
 
 /// Fail the launch if the freshly spawned engine had already exited, retiring the
@@ -6555,7 +6598,10 @@ fn fail_managed_launch_if_engine_died(
     let Some(status) = startup_exit else {
         return Ok(());
     };
-    mark_managed_launch_failed(record)?;
+    // Dropped, not propagated, for the same reason as `retire_record_on_error`:
+    // the engine's own exit status and log tail are what diagnose this launch, and
+    // a failed record write must not displace them.
+    let _ = mark_managed_launch_failed(record);
     bail!(
         "{}",
         managed_engine_startup_failure_detail(status, &record.log_path)
@@ -6725,15 +6771,23 @@ fn spawn_managed_engine_child(
     record.engine_recipe_json = requested_recipe_json;
     record.write()?;
 
-    if let Some(parent) = record.engine_state_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    // From here to a live child, every fallible step goes through
+    // `retire_record_on_error`: the record is on disk claiming this engine + model,
+    // so any bail-out that skips the retirement wedges the service just as an
+    // unretired startup death would.
+    let engine_state_parent = record.engine_state_path.parent().map(Path::to_path_buf);
+    if let Some(parent) = engine_state_parent {
+        let created = fs::create_dir_all(&parent)
+            .with_context(|| format!("failed to create {}", parent.display()));
+        retire_record_on_error(&mut record, created)?;
     }
-    fs::File::create(&record.log_path)
-        .with_context(|| format!("failed to create {}", record.log_path.display()))?;
-    let current_exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let serve_args = builtin_engine_serve_http_args(
+    let log_created = fs::File::create(&record.log_path)
+        .with_context(|| format!("failed to create {}", record.log_path.display()));
+    retire_record_on_error(&mut record, log_created)?;
+    let launcher =
+        managed_service_launcher_path().context("failed to resolve current rocm executable path");
+    let current_exe = retire_record_on_error(&mut record, launcher)?;
+    let built_args = builtin_engine_serve_http_args(
         engine,
         service_id,
         &resolve.canonical_model_id,
@@ -6746,8 +6800,18 @@ fn spawn_managed_engine_child(
         engine_recipe,
         &record.engine_state_path,
         Some(&record.log_path),
-    )?;
-    let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
+    );
+    let serve_args = retire_record_on_error(&mut record, built_args)?;
+    // E2E-only: swap in arguments the child rejects immediately, so the launch
+    // below observes a real engine that really died during startup.
+    #[cfg(feature = "e2e-test-hooks")]
+    let serve_args = if scripted_managed_engine_startup_failure() {
+        managed_engine_startup_failure_args()
+    } else {
+        serve_args
+    };
+    let envs_root = env_root_for_service(paths, engine, runtime_id, env_id);
+    let engine_envs_root = retire_record_on_error(&mut record, envs_root)?;
     // Hand the child the *path* to the endpoint key file (public bind only) via the
     // environment. A path — not the secret value — is what the detached-spawn
     // primitives accept as an env override, and it keeps the key off both the argv
@@ -6762,7 +6826,9 @@ fn spawn_managed_engine_child(
     // cannot fire on the fresh-launch path today. It is the shared choke point
     // for managed spawns, so enforce the invariant here too rather than relying
     // on every future caller having done so.
-    ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some())?;
+    let public_key_guard =
+        ensure_public_service_has_endpoint_key(host, endpoint_key_file.is_some());
+    retire_record_on_error(&mut record, public_key_guard)?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -6775,15 +6841,14 @@ fn spawn_managed_engine_child(
         // open instead — the Windows helper does that internally, which is what
         // makes the check free of the PID-reuse race a later `OpenProcess` would
         // have.
-        let spawn = spawn_or_retire_record(&mut record, || {
-            rocm_core::spawn_detached_no_inherit_watching_startup(
-                &current_exe,
-                &serve_args,
-                &env_refs,
-                MANAGED_ENGINE_STARTUP_SETTLE,
-            )
-            .context("failed to launch managed engine process")
-        })?;
+        let spawned = rocm_core::spawn_detached_no_inherit_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to launch managed engine process");
+        let spawn = retire_record_on_error(&mut record, spawned)?;
         fail_managed_launch_if_engine_died(&mut record, managed_startup_exit(&spawn))?;
         spawn.pid
     };
@@ -6800,11 +6865,10 @@ fn spawn_managed_engine_child(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
-        let mut child = spawn_or_retire_record(&mut record, || {
-            command
-                .spawn()
-                .context("failed to launch managed engine process")
-        })?;
+        let spawned = command
+            .spawn()
+            .context("failed to launch managed engine process");
+        let mut child = retire_record_on_error(&mut record, spawned)?;
         let child_pid = child.id();
         thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
         let startup_exit = child
@@ -6866,6 +6930,12 @@ fn start_managed_service(
     // visible to any concurrent auto-selection. Release the launch lock before
     // the readiness wait below, which can block for many seconds — holding it
     // that long would needlessly serialize unrelated serves.
+    //
+    // What the lock *does* still cover is the startup check above: both platforms
+    // spend `MANAGED_ENGINE_STARTUP_SETTLE` inside `spawn_managed_engine_child`,
+    // so a concurrent serve waits that much longer for the lock. That is
+    // deliberate — the check has to see the child before the record is promoted to
+    // `"running"` — and bounded, unlike the readiness wait.
     drop(launch_lock);
 
     let readiness = wait_for_service_http_ready_with_progress(
@@ -17894,15 +17964,14 @@ fn restart_internal_managed_service(
         // Same reasoning as the launch path: without a `Child` to `try_wait()` on,
         // the only race-free liveness check is the one the Windows helper performs
         // while the process handle is still open.
-        let spawn = spawn_or_retire_record(&mut record, || {
-            rocm_core::spawn_detached_no_inherit_watching_startup(
-                &current_exe,
-                &serve_args,
-                &env_refs,
-                MANAGED_ENGINE_STARTUP_SETTLE,
-            )
-            .context("failed to restart managed engine process")
-        })?;
+        let spawned = rocm_core::spawn_detached_no_inherit_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to restart managed engine process");
+        let spawn = retire_record_on_error(&mut record, spawned)?;
         fail_managed_launch_if_engine_died(&mut record, managed_startup_exit(&spawn))?;
         spawn.pid
     };
@@ -17919,11 +17988,10 @@ fn restart_internal_managed_service(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
-        let mut child = spawn_or_retire_record(&mut record, || {
-            command
-                .spawn()
-                .context("failed to restart managed engine process")
-        })?;
+        let spawned = command
+            .spawn()
+            .context("failed to restart managed engine process");
+        let mut child = retire_record_on_error(&mut record, spawned)?;
         thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
         let startup_exit = child
             .try_wait()
@@ -28649,9 +28717,10 @@ install therock";
         let mut record = pre_spawn_record(&paths, 11515);
         record.write()?;
 
-        let outcome: Result<u32> = spawn_or_retire_record(&mut record, || {
-            bail!("failed to launch managed engine process")
-        });
+        let outcome: Result<u32> = retire_record_on_error(
+            &mut record,
+            Err(anyhow::anyhow!("failed to launch managed engine process")),
+        );
 
         let still_blocking = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
