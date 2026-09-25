@@ -2893,7 +2893,23 @@ mod tests {
     #[test]
     fn routing_targets_cover_every_framework_the_probe_reports() {
         let mut targets = Vec::new();
-        for framework in ["skipped", "pytorch", "llama-cpp", "unknown"] {
+        // The first four are what `rocm examine` can actually report. The last
+        // three never come back from the probe, and are here precisely for
+        // that reason: `route_when_no_match` once carried arms for them, and
+        // removing those arms is what this test pins. Without these values in
+        // the loop, restoring `"lemonade" => "lemonade"` changes nothing the
+        // assertion below observes, and the CLI could go back to advertising
+        // routing the probe can never reach with every test still green. With
+        // them, an unreachable arm grows the target set and fails loudly.
+        for framework in [
+            "skipped",
+            "pytorch",
+            "llama-cpp",
+            "unknown",
+            "lemonade",
+            "ollama",
+            "lm-studio",
+        ] {
             let e = Examination {
                 framework: framework.to_owned(),
                 ..Examination::default()

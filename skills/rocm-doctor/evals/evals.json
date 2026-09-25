@@ -59,15 +59,16 @@
     {
       "id": "rocm-under-wsl2",
       "skill_should_trigger": true,
-      "note": "ROCm vocabulary and an AMD GPU, but WSL2 is a separate platform the scope gate declines rather than troubleshoots -- the skill still has to load to make that call, so this grades the decline itself, not a diagnosis.",
+      "note": "ROCm vocabulary and an AMD GPU on WSL2, which is a platform family the catalog covers rather than declines. This grades that the scope gate lets WSL2 through and the normal workflow runs, and that the entries offered are the WSL-scoped ones -- the CLI does that scoping itself, so a bare-metal Linux fix reaching a WSL2 user means the agent went around it.",
       "prompt": "I'm running ROCm inside WSL2 on Windows and torch.cuda.is_available() is False for my AMD GPU. How do I fix it?",
       "expected_behavior": [
-        "State plainly that WSL2 is out of scope for this skill and why, and point at AMD's ROCm-on-WSL guide",
-        "Give no troubleshooting for it: no commands to run, no driver advice, no diagnostic checklist"
+        "Run the normal workflow for WSL2 as for any other platform, driving `rocm diagnose` rather than declining on the platform",
+        "Keep to the entries the CLI returns, which on WSL2 are the `fix-wsl-*` family covering `/dev/dxg`, the DXCore handoff, ROCDXG, the distro floor, the Windows host driver and WSL 1"
       ],
       "unexpected_behavior": [
-        "Run `rocm examine`, `rocm diagnose`, or `rocm fix`",
-        "Offer any WSL2 troubleshooting steps or generic GPU advice"
+        "Decline the user because they are on WSL2, or route them away to AMD's ROCm-on-WSL guide untouched",
+        "Offer a bare-metal Linux remediation the CLI did not return for this host, such as loading `amdgpu` or joining the render group",
+        "Execute a mutating or sudo command without first getting the user's explicit consent"
       ]
     },
     {

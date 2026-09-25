@@ -2,8 +2,8 @@
 name: rocm-doctor
 description: >-
   Diagnoses why ROCm, the HIP SDK, PyTorch, or llama.cpp is broken on an AMD GPU
-  on Linux or Windows, then applies a low-risk fix with consent or hands back the
-  exact next step. Also routes Lemonade, LM Studio, and Ollama problems to the
+  on Linux, Windows, or WSL2, then applies a low-risk fix with consent or hands
+  back the exact next step. Also routes Lemonade, LM Studio, and Ollama problems to the
   right upstream channel. Use when the user reports that ROCm or HIP "isn't
   working", torch.cuda.is_available() is False, rocminfo / hipInfo can't see the
   GPU, or hits hipErrorNoBinaryForGpu, HSA_STATUS_ERROR_INVALID_ISA, "invalid
