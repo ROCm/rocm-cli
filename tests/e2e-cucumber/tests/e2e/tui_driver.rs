@@ -311,6 +311,39 @@ impl TuiSession {
         self.screen_snapshot().0
     }
 
+    /// The visible screen as LOGICAL lines: rows the terminal soft-wrapped are
+    /// rejoined into the single line the application actually emitted.
+    ///
+    /// [`Self::screen_text`] is the right lens for "what does the user see", and
+    /// most assertions look for a short marker where wrapping is irrelevant. A
+    /// step that must read a whole VALUE off the screen — a filesystem path, a
+    /// URL — needs this instead: at 80 columns a long path silently splits
+    /// across two rows, and a step parsing the raw rows would then assert
+    /// against a truncated value and fail for a reason that has nothing to do
+    /// with the product.
+    pub fn screen_logical_lines(&self) -> Vec<String> {
+        let parser = self
+            .parser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<String> = Vec::new();
+        let mut continuing = false;
+        for row in 0..rows {
+            let text = screen.contents_between(row, 0, row, cols);
+            if continuing {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(&text);
+                }
+            } else {
+                lines.push(text);
+            }
+            continuing = screen.row_wrapped(row);
+        }
+        lines
+    }
+
     /// Whether the top-left cell carries the dimmed-backdrop wash a popup
     /// overlay paints behind itself (`grey_overlay`'s fixed RGB(0x1c, 0x1e,
     /// 0x22)). Popups drawn via `centered_rect` always leave a pad outside
