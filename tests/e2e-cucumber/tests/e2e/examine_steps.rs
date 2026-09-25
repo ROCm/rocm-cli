@@ -549,7 +549,11 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
         panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
     };
     // Both forms resolve the active manifest the same way, so a disagreement
-    // means one of the two paths is looking at a different runtime.
+    // means one of the two paths is looking at a different runtime. Note what
+    // this cannot see: the human run happens first and re-files a missing
+    // registry entry on its way, so by the time `--json` runs there is nothing
+    // left for the two to disagree about. examine-16 covers that case, and
+    // runs the machine-readable form first precisely so it stays visible.
     if let Some(stated) = human_states(human, "active_runtime_root") {
         assert_eq!(
             root, stated,
