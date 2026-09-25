@@ -147,13 +147,20 @@ process_alive() {
 #   read -r pid cmdline  ->  pid=[<pid>]  cmdline=[/path/llama-server --tmpl a\tb ]
 #
 # `read` gives leftover words AND their intervening separators to the LAST name,
-# so an embedded tab lands in `cmdline` verbatim; and only TRAILING separators
-# are stripped, which a tab can never be, because flattening the final NUL always
-# leaves the string ending in a space. An earlier revision of this comment
-# claimed the tab "shifts the field boundary" and flattened it too — that claim
-# was false, and deleting the tab from the flattening set failed no check in this
-# file. Flattening it anyway would have coarsened the identity comparison below
-# for nothing.
+# so a tab EMBEDDED in the command line lands in `cmdline` verbatim. Separators
+# are stripped only where the assigned field BEGINS or ENDS with them, and the
+# command line is argv[0] first — a path — so neither applies here.
+#
+# That is narrower than it first read. Leading separators of the trailing field
+# are stripped too: `IFS=$'\t' read -r pid cmdline <<<$'1\t\tx'` yields `x`, not
+# a tab then `x`. It would take an argv[0] that itself began with a tab to reach
+# that, which no caller of this script produces — but "a tab can never be
+# stripped" is not the true statement, and this comment said so for a revision.
+#
+# An earlier revision also claimed the tab "shifts the field boundary" and
+# flattened it for that reason — also false, and deleting the tab from the
+# flattening set failed no check in this file. Flattening it anyway would have
+# coarsened the identity comparison below for nothing.
 #
 # Matching is unaffected either way: no root or marker contains a newline. The
 # identity comparison in same_selected_process is coarsened only for the newline
@@ -560,6 +567,24 @@ assert_rule_covers_every_list_entry() {
   return "${failures}"
 }
 
+# Decoys the self-test has spawned so far, read by its EXIT trap.
+#
+# Global, and read at trap FIRE time rather than expanded at definition time the
+# way the scratch-dir paths are: a pid is not known until its spawn returns, so
+# the one thing that must not be baked into the trap string is this list.
+SELFTEST_DECOY_PIDS=()
+
+selftest_track_decoy() {
+  SELFTEST_DECOY_PIDS+=("$1")
+}
+
+# SIGKILL, not TERM: one decoy ignores TERM by design, and this runs on the way
+# out with nothing left to wait for it.
+selftest_kill_decoys() {
+  [[ "${#SELFTEST_DECOY_PIDS[@]}" -gt 0 ]] || return 0
+  kill -KILL "${SELFTEST_DECOY_PIDS[@]}" 2>/dev/null || true
+}
+
 self_test() {
   local tmp prewarm_decoy workload_decoy harness_decoy stubborn_decoy
   local prewarm_pid workload_pid harness_pid stubborn_pid selected reclaim_out
@@ -588,7 +613,7 @@ self_test() {
   # that aborts the function — with `tmp` already on disk and, if the trap were
   # installed only afterwards, nothing left to clean it up.
   # shellcheck disable=SC2064 # expand ${tmp} now, at trap definition time
-  trap "rm -rf '${tmp}'" EXIT
+  trap "selftest_kill_decoys; rm -rf '${tmp}'" EXIT
   # A SECOND tree, outside the scope, for the bystander decoy below. Everything
   # reachable through SELFTEST_SCOPE is inside `tmp` by construction, so a
   # negative case for the scope filter cannot live there.
@@ -597,7 +622,7 @@ self_test() {
   # same reason the narrow trap above exists: anything fallible in between is a
   # window where a tree is on disk with nothing arranged to remove it.
   # shellcheck disable=SC2064 # expand both paths now, at trap definition time
-  trap "rm -rf '${tmp}' '${outside}'" EXIT
+  trap "selftest_kill_decoys; rm -rf '${tmp}' '${outside}'" EXIT
   export RECLAIM_SELFTEST_SCOPE="${tmp}"
   SELFTEST_SCOPE="${tmp}"
   # The stubborn decoy never exits on its own, so the grace loop always runs to
@@ -626,19 +651,31 @@ self_test() {
   # on strings that cannot break it.
   delimiter_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9754/llama-server"
 
+  # Each pid is registered with the EXIT trap the moment it exists, for the same
+  # reason the scratch-dir traps above are widened one statement at a time: every
+  # spawn below is fallible (mkdir, cp, chmod), and `set -e` aborts the function
+  # on the first failure. Registering them only in the list further down would
+  # leave every ALREADY-spawned decoy running with nothing arranged to kill it —
+  # including the stubborn one, which ignores SIGTERM and loops forever.
   prewarm_pid="$(spawn_decoy "${prewarm_decoy}")"
+  selftest_track_decoy "${prewarm_pid}"
   workload_pid="$(spawn_decoy "${workload_decoy}")"
+  selftest_track_decoy "${workload_pid}"
   harness_pid="$(spawn_decoy "${harness_decoy}")"
+  selftest_track_decoy "${harness_pid}"
   stubborn_pid="$(spawn_stubborn_decoy "${stubborn_decoy}")"
+  selftest_track_decoy "${stubborn_pid}"
   outside_pid="$(spawn_decoy "${outside_decoy}")"
+  selftest_track_decoy "${outside_pid}"
   delimiter_pid="$(spawn_delimiter_decoy "${delimiter_decoy}")"
+  selftest_track_decoy "${delimiter_pid}"
   read -r zombie_pid zombie_keeper_pid <<<"$(spawn_zombie "${tmp}/zombie")"
+  selftest_track_decoy "${zombie_keeper_pid}"
   # Every process this function spawned that can still be signalled, so cleanup
   # is one list rather than a line kept in step at each early return. The zombie
   # itself is absent deliberately: it is already dead, and killing its keeper is
-  # what lets init reap it.
-  decoy_pids=("${prewarm_pid}" "${workload_pid}" "${harness_pid}" "${stubborn_pid}"
-    "${outside_pid}" "${delimiter_pid}" "${zombie_keeper_pid}")
+  # what lets init reap it. Same set the trap holds, by construction.
+  decoy_pids=("${SELFTEST_DECOY_PIDS[@]}")
   # Give the decoys a moment to appear in /proc with their full argv.
   sleep 1
 
