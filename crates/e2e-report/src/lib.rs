@@ -414,6 +414,7 @@ fn parse_descriptor(name: &str) -> Descriptor {
         "gpu" => ("MI300X", "Linux"),
         "gpu-rad3" => ("R9700", "Linux"),
         "gpu-mi350p" => ("MI350P", "Linux"),
+        "gpu-w7900" => ("W7900", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
         // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
@@ -2223,6 +2224,7 @@ mod tests {
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-mi350p-report", "MI350P", "Linux"),
+            ("e2e-gpu-w7900-report", "W7900", "Linux"),
             ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
             ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
             // Must not fall through to `fallback_descriptor`, which would render

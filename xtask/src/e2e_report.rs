@@ -133,6 +133,10 @@ fn label_for_root_report(dir: &Path) -> String {
         Some("mi300x") => "e2e-gpu-report".to_owned(),
         Some("gfx1201") => "e2e-gpu-rad3-report".to_owned(),
         Some("mi350p") => "e2e-gpu-mi350p-report".to_owned(),
+        // Like gfx1201 above, gfx1100 has no product-name mapping in
+        // `platform_hardware_slug` — the raw gfx target IS the slug — so the
+        // sidecar carries `gfx1100` for the W7900 lane.
+        Some("gfx1100") => "e2e-gpu-w7900-report".to_owned(),
         Some("strix-halo-linux") => "e2e-gpu-strix-ubuntu-report".to_owned(),
         Some("strix-halo-windows") => "e2e-gpu-strix-windows-report".to_owned(),
         // This workflow is statically pinned to the Strix WSL runner. A bare
@@ -190,6 +194,7 @@ mod tests {
         "e2e-gpu-report",
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
+        "e2e-gpu-w7900-report",
         "e2e-gpu-strix-ubuntu-report",
         "e2e-gpu-strix-windows-report",
         "e2e-gpu-strix-wsl-report",
@@ -303,6 +308,7 @@ mod tests {
             ("mi300x", "e2e-gpu-report"),
             ("gfx1201", "e2e-gpu-rad3-report"),
             ("mi350p", "e2e-gpu-mi350p-report"),
+            ("gfx1100", "e2e-gpu-w7900-report"),
             ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
             ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),
