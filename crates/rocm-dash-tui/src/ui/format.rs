@@ -18,6 +18,19 @@
 use chrono::{DateTime, Utc};
 use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 
+/// `v`, or `placeholder` when `v` is empty.
+///
+/// Shared by the install-manager and onboarding overlays for their `--prefix`
+/// folder row, which both leave blank until the
+/// [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser) sets it.
+pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
+    if v.is_empty() {
+        placeholder.to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 /// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
 /// Promotes to GiB at 1024, TiB at 1024², with one decimal.
 pub fn mib(value: u64) -> String {

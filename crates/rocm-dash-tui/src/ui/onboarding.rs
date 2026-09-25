@@ -411,7 +411,11 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
             }
         }
         KeyCode::Tab => {
-            let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let prefix = o.install_config.as_ref().map(|cfg| cfg.prefix.trim());
+            let start = match prefix {
+                Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                _ => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            };
             o.browser = Some(FolderBrowser::new("Pick an install folder", start));
         }
         other => {
@@ -662,20 +666,14 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
     lines.push(Line::from(vec![
         Span::styled("Folder:   ", Style::default().fg(theme.fg)),
         Span::styled(
-            display(&cfg.prefix, "(default managed folder · Tab to browse)"),
+            crate::ui::format::display_or_placeholder(
+                &cfg.prefix,
+                "(default managed folder · Tab to browse)",
+            ),
             Style::default().fg(theme.fg),
         ),
     ]));
     f.render_widget(Paragraph::new(lines), area);
-}
-
-/// `v`, or `placeholder` when `v` is empty.
-fn display(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
-        placeholder.to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -1085,7 +1083,10 @@ mod tests {
         on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
         let s = ob.as_ref().unwrap();
         assert!(s.browser.is_some());
-        assert!(s.install_config.is_some(), "Configure stays open underneath");
+        assert!(
+            s.install_config.is_some(),
+            "Configure stays open underneath"
+        );
     }
 
     #[test]
@@ -1106,6 +1107,25 @@ mod tests {
             .as_ref()
             .expect("Configure regains focus after choosing a folder");
         assert!(!cfg.prefix.is_empty());
+    }
+
+    #[test]
+    fn tab_reopens_browser_at_the_already_chosen_prefix() {
+        let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/mnt/data/rocm-env".to_string();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let fb = ob
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .expect("Tab opens the folder browser");
+        assert_eq!(
+            fb.current_dir,
+            std::path::PathBuf::from("/mnt/data/rocm-env"),
+            "re-opening the browser must resume near the prior choice, not cwd"
+        );
     }
 
     #[test]
