@@ -68,9 +68,6 @@ Expected result:
 - The launcher opens; choosing "Set up this system" there opens the setup
   screen. It does not open automatically before the main TUI, and the user
   does not need to type `/setup`.
-- The setup shows a recommended ROCm folder.
-- The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
-  can see that pip downloads stay inside the chosen ROCm folder.
 - On the Install ROCm SDK step, `Tab` opens a folder picker to choose the
   install location; leaving it unset uses the default managed folder.
 - The setup asks for approval before installing anything.

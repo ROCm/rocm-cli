@@ -482,7 +482,10 @@ fn field_line<'a>(
         "(type a name / path, or Tab to browse)"
     };
     let (label, value): (&str, String) = match field {
-        Field::Model => ("Model", display_value(&w.model, model_placeholder)),
+        Field::Model => (
+            "Model",
+            crate::ui::format::display_or_placeholder(&w.model, model_placeholder),
+        ),
         Field::Engine => (
             "Engine",
             ENGINES[w.engine_idx.min(ENGINES.len() - 1)].to_string(),
@@ -491,8 +494,14 @@ fn field_line<'a>(
             "Device",
             DEVICES[w.device_idx.min(DEVICES.len() - 1)].to_string(),
         ),
-        Field::Host => ("Host", display_value(&w.host, "(engine default)")),
-        Field::Port => ("Port", display_value(&w.port, "(engine default)")),
+        Field::Host => (
+            "Host",
+            crate::ui::format::display_or_placeholder(&w.host, "(engine default)"),
+        ),
+        Field::Port => (
+            "Port",
+            crate::ui::format::display_or_placeholder(&w.port, "(engine default)"),
+        ),
         Field::Mode => (
             "Mode",
             if w.managed {
@@ -534,14 +543,6 @@ fn field_line<'a>(
         Span::styled(format!("{label:<8}"), label_style),
         Span::styled(value, value_style),
     ])
-}
-
-fn display_value(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
-        placeholder.to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 #[cfg(test)]

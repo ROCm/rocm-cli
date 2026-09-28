@@ -277,7 +277,13 @@ pub fn on_key(
         return Vec::new();
     };
 
-    // 1) Adopt folder browser has focus.
+    // 1) A folder browser has focus — either the Adopt-path browser, or the
+    //    Configure step's prefix browser opened via Tab. `install_config` is
+    //    the disambiguator: `Some` means Configure opened this browser and
+    //    the chosen path fills `cfg.prefix`; `None` means the Adopt path
+    //    opened it and the chosen path becomes the adopt root instead. Key
+    //    dispatch intercepts every key while Configure holds focus, so this
+    //    can never see a stale `install_config` from a prior step.
     if let Some(fb) = o.browser.as_mut() {
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
@@ -604,8 +610,8 @@ pub fn draw_onboarding(
     }
 }
 
-/// Render the SDK Configure sub-view: channel toggle, pin-mode selector, and
-/// (when a pin is selected) the value field.
+/// Render the SDK Configure sub-view: channel toggle, pin-mode selector,
+/// (when a pin is selected) the pin value field, and the install-folder row.
 fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme) {
     let chan = |c: Channel| -> Span {
         if cfg.channel == c {
@@ -1180,12 +1186,17 @@ mod tests {
     #[test]
     fn cancelling_folder_browser_leaves_configure_untouched() {
         let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/existing/prefix".to_string();
         on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
         on_key(&mut ob, &mut jobs, key(KeyCode::Esc)); // cancel the browser
         let s = ob.as_ref().unwrap();
         assert!(s.browser.is_none());
         let cfg = s.install_config.as_ref().expect("back on Configure");
-        assert!(cfg.prefix.is_empty(), "no folder was chosen");
+        assert_eq!(
+            cfg.prefix, "/existing/prefix",
+            "cancelling the browser must not clear an already-chosen prefix"
+        );
     }
 
     #[test]

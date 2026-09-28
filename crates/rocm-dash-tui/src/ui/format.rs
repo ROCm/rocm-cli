@@ -14,16 +14,20 @@
 //! - SI units (k / M / B) for token throughput and request counts.
 //! - Percentages always with 1 decimal unless < 0.1, then 2 decimals.
 //! - Optional values render `-`.
+//! - [`display_or_placeholder`] is the one exception to "numeric": a small
+//!   shared UI helper for rendering an optional field's value, reused by
+//!   install-manager and onboarding so both overlays stay visually consistent.
 
 use chrono::{DateTime, Utc};
 use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 
-/// `v`, or `placeholder` when `v` is empty.
+/// An optional field's value, or `placeholder` when unset.
 ///
-/// Shared by the install-manager and onboarding overlays for their `--prefix`
-/// folder row display, which both leave blank until a value is chosen (either
-/// via the [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or, in
-/// install-manager's case, by typing directly). Whether to trim the *value*
+/// Shared by the install-manager (Channel row, `--prefix` folder row) and
+/// onboarding (Configure step's Folder row) overlays, all of which leave the
+/// field blank until a value is chosen — either via the
+/// [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or, in
+/// install-manager's case, by typing directly. Whether to trim the *value*
 /// before using it as an argument is a separate, caller-specific decision —
 /// see `install_manager::InstallManagerState::build_args` and
 /// `onboarding::build_install_args`.
