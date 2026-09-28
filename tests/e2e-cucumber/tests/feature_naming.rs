@@ -51,14 +51,102 @@ fn features_dir() -> PathBuf {
 }
 
 /// Every `.feature` file actually present, by file name.
+///
+/// Flat, not recursive — and it refuses to run rather than quietly covering
+/// less if that stops being true. `feature_files` in `src/expectation.rs` makes
+/// the same assumption and its refusal message names THIS scan as the other
+/// place to fix, so the two guards belong together: a subdirectory that made
+/// one of them fail loudly while the other silently skipped it would be the
+/// worst of both.
 fn feature_files() -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(features_dir())
-        .expect("features dir")
-        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into())
-        .filter(|n: &String| n.ends_with(".feature"))
-        .collect();
+    feature_files_in(&features_dir())
+}
+
+/// The scan itself, split out so the subdirectory refusal can be exercised
+/// against a temporary tree — against the real `features/` it could only fire
+/// by someone breaking the repository.
+///
+/// Deliberately the same shape as `feature_files_in` in `src/expectation.rs`:
+/// same refusal, the same `Path::extension()` test rather than a `.feature`
+/// string suffix, and the same non-empty assertion. The extension test is not
+/// interchangeable with the suffix one — a file named exactly `.feature` has no
+/// extension and would have been taken by one scan and skipped by the other,
+/// which is the divergence this pair exists to prevent.
+fn feature_files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("features dir") {
+        let path = entry.expect("dir entry").path();
+        assert!(
+            !path.is_dir(),
+            "features/ has grown a subdirectory ({}), which this scan does not descend \
+             into — make it recursive, here and in src/expectation.rs, before moving any \
+             .feature file into one",
+            path.display()
+        );
+        if path.extension().is_some_and(|ext| ext == "feature") {
+            let name = path.file_name().expect("dir entry name").to_string_lossy();
+            names.push(name.into_owned());
+        }
+    }
+    assert!(
+        !names.is_empty(),
+        "found no .feature files in {}",
+        dir.display()
+    );
     names.sort();
     names
+}
+
+#[test]
+fn the_feature_scan_takes_the_flat_files_it_finds() {
+    // Pins FILTERING and MEMBERSHIP, not sort order. `read_dir` order is
+    // unspecified and happens to come back alphabetical here, so removing
+    // `names.sort()` leaves this green — verified. Nothing can force a real
+    // directory to yield entries out of order, so the ordering is asserted for
+    // a stable comparison rather than because this test proves it.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("b.feature"), "Feature: b\n").unwrap();
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    // A file named exactly `.feature` has no extension, so neither this scan nor
+    // its sibling takes it. Present here so the two stay agreed on that.
+    std::fs::write(dir.path().join(".feature"), "not a feature file\n").unwrap();
+    assert_eq!(feature_files_in(dir.path()), ["a.feature", "b.feature"]);
+}
+
+#[test]
+#[should_panic(expected = "found no .feature files")]
+fn the_feature_scan_refuses_a_directory_with_no_feature_files() {
+    // The assertion this pins turns a `features/` that stopped yielding files
+    // into ONE clear failure naming the directory. It is not what stops the
+    // other checks passing vacuously — they already fail on their own, just
+    // confusingly: `feature_files_and_declared_keys_agree` reports the first
+    // FEATURE_KEYS entry as one that "does not exist", and the other three
+    // panic inside `scenarios_of` with a read error. Verified by pointing
+    // `features_dir()` at an empty directory with the assertion deleted: four
+    // of the five checks fail, none of them saying the directory is empty.
+    //
+    // Unreachable against the real directory, so pinned here — and pinned the
+    // same way in `src/expectation.rs`, whose scan carries the same assertion.
+    //
+    // The fixture writes a non-`.feature` file on purpose: what the scan
+    // refuses is an empty RESULT, not an empty directory, and this covers the
+    // stronger case.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("notes.md"), "ignored\n").unwrap();
+    let _ = feature_files_in(dir.path());
+}
+
+#[test]
+#[should_panic(expected = "has grown a subdirectory")]
+fn the_feature_scan_refuses_a_subdirectory_rather_than_skipping_it() {
+    // The branch that stops this scan quietly covering less than it claims.
+    // Unreachable against the real `features/`, so it is pinned here — the same
+    // way `src/expectation.rs` pins its twin.
+    let dir = tempfile::tempdir().expect("no temp dir");
+    std::fs::write(dir.path().join("a.feature"), "Feature: a\n").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    let _ = feature_files_in(dir.path());
 }
 
 /// The `@id:` tags and scenario names in one feature file, paired in declaration

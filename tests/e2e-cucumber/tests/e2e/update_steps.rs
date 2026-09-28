@@ -8,6 +8,10 @@
 //! host-invariant and is what pins the "distinguishes configured from
 //! not-configured feeds" behaviour. Contracts verified against the running Linux
 //! binary (EAI-8072). Mock lane.
+//!
+//! The flag-handling steps below are argument handling only: nothing there
+//! contacts a package index or changes the machine either, so they run on every
+//! lane too.
 
 use cucumber::{given, then, when};
 

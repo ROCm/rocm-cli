@@ -1303,9 +1303,9 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
          engines — the rows below are the list, so naming them here would only go \
          stale as lanes are added. They are **non-blocking**: they still run and \
          are reported here, but \
-         a failure does NOT block the PR from merging (the hardware/runners are still \
-         being proven out, so their results are informational rather than a merge \
-         gate).\n\n\
+         a failure does NOT block the PR from merging — their check names are not in \
+         branch protection's required list. See `.github/workflows/e2e-selfhosted.yml`'s \
+         header for the dated confirmation and where else it is recorded.\n\n\
          Column meanings: **Pass** = scenarios that passed as expected; \
          **Xfail** = known bugs that failed as expected (healthy — the bug still \
          reproduces); **Skip** = not applicable on this platform (e.g. a GPU-only \
@@ -1939,7 +1939,8 @@ fn legend() -> Markup {
                 }
                 li {
                     b { "Every other platform" }
-                    " — real self-hosted GPU hardware; non-blocking while proven out."
+                    " — real self-hosted GPU hardware; non-blocking because these \
+                     check names are not in branch protection's required list."
                 }
                 li {
                     b { "Status" }

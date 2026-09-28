@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT
 
 pub mod capability;
+#[cfg(test)]
+mod diagnostic_wording;
 pub mod expectation;
 pub mod http_server;
 pub mod installer_fixture;

@@ -75,6 +75,128 @@ async fn user_asks_help(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+// ── What the help itself promises ──────────────────────────────────
+
+/// Model references named after `rocm serve ` in an examples block, from both
+/// the top-level help and `serve`'s own. A worked example is copied verbatim, so
+/// the name in it is the one that has to work.
+fn serve_example_models(help: &str) -> Vec<String> {
+    help.lines()
+        .filter_map(|line| line.trim().strip_prefix("rocm serve "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        // The generic placeholders the help uses to describe the FORM of a model
+        // reference are not names anyone is expected to run.
+        .filter(|model| !model.starts_with('<'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every name the CLI's own model listing answers to: each recipe's canonical id
+/// plus its aliases, as `rocm model --verbose` prints them.
+fn known_model_names(listing: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in listing.lines() {
+        let Some((head, rest)) = line.trim().split_once(" aliases=[") else {
+            continue;
+        };
+        names.push(head.trim().to_owned());
+        if let Some((aliases, _)) = rest.split_once(']') {
+            names.extend(aliases.split(',').map(|alias| alias.trim().to_owned()));
+        }
+    }
+    names
+}
+
+#[when("the user reads the serve examples the help offers")]
+async fn user_reads_serve_examples(world: &mut E2eWorld) {
+    // Both example blocks that name a model: the top-level one a new user meets
+    // first, and `serve`'s own.
+    let (general, _, _) = crate::run_rocm(world, &["help"]);
+    let (serve, _, _) = crate::run_rocm(world, &["serve", "--help"]);
+    let (listing, _, _) = crate::run_rocm(world, &["model", "--verbose"]);
+    world.cli_output = Some(format!("{general}\n{serve}"));
+    world.cli_other_output = Some(listing);
+}
+
+#[then("every model named there is one the CLI can resolve")]
+async fn assert_example_models_resolve(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    let listing = world.cli_other_output.as_ref().expect("no model listing");
+    let examples = serve_example_models(help);
+    assert!(
+        !examples.is_empty(),
+        "no `rocm serve <model>` example found in the help:\n{help}"
+    );
+    let known = known_model_names(listing);
+    assert!(
+        !known.is_empty(),
+        "could not read any model name out of the listing:\n{listing}"
+    );
+    // Two forms are legitimate, and the README documents both: a name this CLI's
+    // own catalog answers to, or an explicit `owner/repo` reference to fetch. The
+    // check accepts either, so it says the example must WORK without dictating
+    // which model it should be.
+    let unresolvable: Vec<&String> = examples
+        .iter()
+        .filter(|model| {
+            !model.contains('/') && !known.iter().any(|name| name.eq_ignore_ascii_case(model))
+        })
+        .collect();
+    assert!(
+        unresolvable.is_empty(),
+        "the help offers {unresolvable:?} as models to serve, but they are neither a name the \
+         model listing knows nor an `owner/repo` reference — copying the example verbatim \
+         cannot work.\nmodel listing knows: {known:?}"
+    );
+}
+
+#[then("running the CLI with no subcommand is not described as the dashboard command")]
+async fn assert_default_command_described_distinctly(world: &mut E2eWorld) {
+    let help = world.cli_output.as_ref().expect("no help output");
+    // What the help says the dedicated dashboard command does. Taken from the
+    // help itself rather than hardcoded, so this stays true if the wording
+    // changes.
+    let dash_row = help
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("dash "))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        dash_row.contains("dashboard"),
+        "expected the help to list a `dash` command that opens the dashboard:\n{help}"
+    );
+    // The sentence describing what running the CLI with no subcommand does.
+    //
+    // Read from the whole PARAGRAPH the phrase sits in, not from its one line:
+    // clap wraps `long_about` at the terminal width, and this sentence sits near
+    // a wrap boundary. Matching a single line would let a future wording that
+    // does call the plain command the dashboard slip through whenever the wrap
+    // happened to fall between "subcommand" and "dashboard" — passing while the
+    // defect this exists to catch is present.
+    let paragraph: Vec<&str> = help
+        .split("\n\n")
+        .find(|block| block.contains("with no subcommand"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .collect();
+    let default_sentence = paragraph.join(" ").to_ascii_lowercase();
+    assert!(
+        !default_sentence.is_empty(),
+        "the help does not say what running the CLI with no subcommand does:\n{help}"
+    );
+    // Two commands, two different screens. Describing the plain command as the
+    // dashboard leaves the reader unable to tell them apart, and unaware that
+    // the plain command opens something else entirely.
+    assert!(
+        !default_sentence.contains("dashboard"),
+        "the help describes running the CLI with no subcommand as opening the dashboard, which \
+         is what it also says `dash` does — the two are different screens:\n  \
+         default: {default_sentence}\n  dash:    {dash_row}"
+    );
+}
+
 #[when("the user previews the driver install plan")]
 async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     // `--dry-run` renders the plan and returns before touching the system, so
@@ -389,9 +511,11 @@ fn parsed_json(world: &E2eWorld) -> serde_json::Value {
 async fn user_inspects_both_ways(world: &mut E2eWorld) {
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
-    // Both are needed by the comparison step; the human form goes in the stderr
-    // slot rather than adding a World field for one scenario.
-    world.cli_stderr = Some(human);
+    // Both are needed by the comparison step. The human form is a second
+    // command's STDOUT, so it goes in `cli_other_output` — the field that did
+    // not exist when this step was written, which is why it used to borrow the
+    // stderr slot.
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -468,8 +592,11 @@ fn human_states(human: &str, label: &str) -> Option<String> {
 
 #[then("the framework report names the runtime's interpreter")]
 async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
+    // `cli_other_output`, not `cli_stderr`: the human form is a second command's
+    // STDOUT, and the `When` above moved it out of the stderr slot it used to
+    // borrow. Reading the old slot found `None` on every GPU lane.
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -544,7 +671,7 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -570,7 +697,7 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
 #[then("both reports agree on whether this machine has an AMD GPU")]
 async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
@@ -593,7 +720,7 @@ async fn assert_forms_agree_on_gpu(world: &mut E2eWorld) {
 #[then("both reports agree on whether this platform is in scope")]
 async fn assert_forms_agree_on_platform(world: &mut E2eWorld) {
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let json = parsed_json(world);
