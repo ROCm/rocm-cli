@@ -1133,3 +1133,119 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
         "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }
+
+#[when("the user asks the CLI what a report would carry")]
+async fn user_asks_what_a_report_would_carry(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI what a report would carry in machine-readable form")]
+async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI either shows the whole report or says why it will not prepare one")]
+async fn report_is_shown_or_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let shown = out.contains("a report would carry");
+    let refused = out.contains("no report was prepared") || out.contains("No report was prepared");
+    assert!(
+        shown || refused,
+        "asking for a report produced neither a report nor a stated refusal, which leaves a \
+         user unable to tell what would be published:\n{out}"
+    );
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "a refusal is this command working, not failing, so both branches exit 0:\n{out}"
+    );
+}
+
+#[then("the CLI states that nothing has been sent")]
+async fn nothing_has_been_sent(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Only the prepared-report branch makes the promise; a refusal prepared
+    // nothing to send, so requiring the sentence there would assert about a
+    // report that does not exist.
+    if out.contains("a report would carry") {
+        assert!(
+            out.contains("Nothing has been sent"),
+            "the report was shown without saying it stayed here, which is the one thing a user \
+             needs to know before reading it:\n{out}"
+        );
+    }
+}
+
+#[then("the answer names no user, no host, and no file path")]
+async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal envelope (`{"schema","refused","explanation"}`) trivially
+    // contains none of the markers swept below, so on a lane whose hardware is
+    // not on the allowlist -- the common case, since most lanes have no AMD
+    // GPU at all -- every sweep would pass without a report ever having
+    // existed to sweep. Branch on the outcome, the same way the sibling step
+    // `nothing_has_been_sent` already does.
+    //
+    // `cli_version` is the discriminator, not `architecture`: the
+    // `ArchitectureUnreadable` refusal's own explanation text ("No AMD GPU
+    // *architecture* could be read here...") contains the word "architecture",
+    // so keying off that field name would make this same vacuous pass survive
+    // under a different guise on exactly the refusal this sandbox reaches.
+    // `cli_version` is a field `Report` carries and no refusal explanation
+    // does.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains("architecture"),
+            "a genuine report is missing the architecture field it is supposed to carry:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+        return;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    if !user.is_empty() && user.len() > 2 {
+        assert!(
+            !out.contains(&user),
+            "the user name reached what a report would publish:\n{out}"
+        );
+    }
+    let host = hostname_of_this_machine();
+    if !host.is_empty() && host.len() > 2 {
+        assert!(
+            !out.contains(&host),
+            "the host name reached what a report would publish:\n{out}"
+        );
+    }
+    for path_marker in ["/opt/rocm", "/home/", "C:\\", "/usr/"] {
+        assert!(
+            !out.contains(path_marker),
+            "a file path ({path_marker}) reached what a report would publish:\n{out}"
+        );
+    }
+}
+
+/// This machine's host name, or empty when it cannot be read.
+///
+/// Read here rather than from the CLI: the assertion is that the name never
+/// appears in a report, so taking it from the thing under test would compare
+/// the report against itself.
+fn hostname_of_this_machine() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
