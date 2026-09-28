@@ -199,8 +199,11 @@ if command -v script >/dev/null 2>&1; then
     pass "and without batch mode the same host waits for input instead"
   else
     # Not a product failure: some ssh builds give up on a pty with no reader.
-    # Say so rather than asserting a behaviour this environment does not show.
-    pass "and without batch mode the same host does not refuse cleanly (rc=${hung})"
+    # Reported as `skip`, not `pass`, for the same reason the branch below is a
+    # skip -- this environment did not reproduce the hang, so it demonstrated
+    # nothing, and calling that a pass would make the check unable to fail for
+    # the property it exists to show.
+    echo "  skip  batch-mode counterfactual (no hang to observe here, rc=${hung})"
   fi
 else
   echo "  skip  batch-mode counterfactual (no 'script' to allocate a pty)"

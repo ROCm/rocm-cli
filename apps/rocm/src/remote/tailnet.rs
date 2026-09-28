@@ -415,7 +415,7 @@ mod tests {
         "Online": true
       },
       "Peer": {
-        "nodekey:bbb": {
+        "nodekey:ccc": {
           "ID": "nBBB",
           "HostName": "gpu-box-2",
           "DNSName": "gpu-box-2.example-tailnet.ts.net.",
@@ -425,7 +425,7 @@ mod tests {
           "Online": false,
           "LastSeen": "2026-08-30T11:02:41Z"
         },
-        "nodekey:aaa": {
+        "nodekey:bbb": {
           "ID": "nAAA",
           "HostName": "gpu-box-1",
           "DNSName": "gpu-box-1.example-tailnet.ts.net.",
@@ -434,7 +434,7 @@ mod tests {
           "Tags": ["tag:gpu", "tag:prod"],
           "Online": true
         },
-        "nodekey:ccc": {
+        "nodekey:aaa": {
           "ID": "nCCC",
           "HostName": "phone",
           "DNSName": "phone.example-tailnet.ts.net.",
@@ -455,6 +455,12 @@ mod tests {
 
         // A peer map has no inherent order; unsorted output would shuffle
         // between runs and make the listing unreadable.
+        //
+        // The fixture's node keys are deliberately permuted against its host
+        // names — `aaa` is the phone, `ccc` is gpu-box-2 — because `Peer` is
+        // deserialised into a `BTreeMap` and therefore already comes back in key
+        // order. Key them in host order and this assertion passes with the sort
+        // deleted, which is exactly the coverage it is supposed to provide.
         assert_eq!(
             status
                 .peers

@@ -25,6 +25,8 @@
 
 use std::fmt::Write as _;
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use rocm_core::{AppPaths, ManagedServiceRecord};
@@ -367,6 +369,24 @@ fn serve_with_transport(
         ));
     }
 
+    // Taken before anything starts: this is what lets the discovery below tell a
+    // service this command created from one the machine was already running. A
+    // failure here stops us before the model starts, which is the safe
+    // direction — it is the same command the discovery runs afterwards, so a
+    // registry we cannot read now is one we could not have verified later.
+    let pre_existing = match live_service_ids_on_port(transport, &remote_cli, request.remote_port) {
+        Ok(ids) => ids,
+        Err(error) => {
+            session::clear_key(paths, &session_id);
+            return Err(error.context(format!(
+                "cannot confirm what is already serving on {} port {}, and starting a model \
+                 without that would risk publishing an endpoint this command did not \
+                 authenticate",
+                request.target, request.remote_port
+            )));
+        }
+    };
+
     println!("Starting {} on {} ...", request.model, request.target);
     // The trailing newline is what makes the `&&` chain in
     // `remote_serve_command` work, not cosmetics: `IFS= read -r` returns
@@ -415,27 +435,31 @@ fn serve_with_transport(
     // From here the model is running on someone's GPU. Every remaining failure
     // has to leave the machine in a state the user can find and act on, so each
     // one unwinds what has been done rather than returning and forgetting.
-    let remote_service_id =
-        match discover_started_service(transport, &remote_cli, request.remote_port) {
-            Ok(service_id) => service_id,
-            Err(error) => {
-                // The key stays. The model is very likely running and it was
-                // handed this credential, so deleting our only copy would leave
-                // a service the user can find but cannot call — or stop through
-                // its own API. Nothing can be stopped by name when the name is
-                // what could not be read, so say where to look and hand back the
-                // credential rather than implying it was all cleaned up.
-                return Err(error.context(format!(
-                    "a model may now be running on {} port {} with nothing tracking it.\n\
+    let remote_service_id = match discover_started_service(
+        transport,
+        &remote_cli,
+        request.remote_port,
+        &pre_existing,
+    ) {
+        Ok(service_id) => service_id,
+        Err(error) => {
+            // The key stays. The model is very likely running and it was
+            // handed this credential, so deleting our only copy would leave
+            // a service the user can find but cannot call — or stop through
+            // its own API. Nothing can be stopped by name when the name is
+            // what could not be read, so say where to look and hand back the
+            // credential rather than implying it was all cleaned up.
+            return Err(error.context(format!(
+                "a model may now be running on {} port {} with nothing tracking it.\n\
                      Check with: ssh {} -- {remote_cli} services list\n\
                      Its API key was kept at {} — it is the only copy.",
-                    request.target,
-                    request.remote_port,
-                    request.target,
-                    session::key_path(paths, &session_id).display()
-                )));
-            }
-        };
+                request.target,
+                request.remote_port,
+                request.target,
+                session::key_path(paths, &session_id).display()
+            )));
+        }
+    };
 
     println!("Publishing to the tailnet ...");
     if let Err(error) = publish::publish(transport, request.tailnet_port, request.remote_port) {
@@ -633,10 +657,51 @@ fn remote_serve_command(remote_cli: &str, request: &ServeRequest) -> String {
 }
 
 /// Find the service the remote just started, by the port we asked it to bind.
+/// Read the remote's service registry and return the ids of the services
+/// already *live* on `remote_port`.
+///
+/// Taken before the model is started so [`discover_started_service`] can tell a
+/// service this command created from one that was already there. Ids rather than
+/// timestamps on purpose: `created_at_unix_ms` is stamped by the *remote's*
+/// clock, and comparing it against ours would turn ordinary clock skew between
+/// two machines into either a spurious refusal or a missed one.
+///
+/// No `--all` here, unlike the discovery afterwards: only a live service can be
+/// reused, so a stopped record sharing the port is not something this command
+/// could be handed instead of a fresh start.
+fn live_service_ids_on_port(
+    transport: &dyn Transport,
+    remote_cli: &str,
+    remote_port: u16,
+) -> Result<BTreeSet<String>> {
+    let listing = transport
+        .run(&format!("{remote_cli} services list --json"))
+        .context("could not read the remote's service registry before starting the model")?;
+    let records: Vec<ManagedServiceRecord> = serde_json::from_str(&listing).context(
+        "could not understand the remote's service registry; the remote CLI may be a \
+         different version than this one",
+    )?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.port == remote_port)
+        .map(|record| record.service_id)
+        .collect())
+}
+
+/// Find the service the remote just started, by the port we asked it to bind.
+///
+/// `pre_existing` is the same port's ids from before the start. A discovered id
+/// that was already there means the remote reused a service rather than starting
+/// one, and that is a refusal rather than a success: the engine reads its API key
+/// once, at launch, so a service we did not start is not enforcing the key this
+/// command just minted. Publishing it would put an endpoint on the tailnet while
+/// [`render_started`] prints a credential it will reject, and the printed key is
+/// the only copy the user gets.
 fn discover_started_service(
     transport: &dyn Transport,
     remote_cli: &str,
     remote_port: u16,
+    pre_existing: &BTreeSet<String>,
 ) -> Result<String> {
     let listing = transport
         .run(&format!("{remote_cli} services list --json --all"))
@@ -646,7 +711,7 @@ fn discover_started_service(
          different version than this one",
     )?;
 
-    records
+    let service_id = records
         .into_iter()
         .filter(|record| record.port == remote_port)
         // Several records can share a port over a machine's lifetime; the newest
@@ -655,7 +720,19 @@ fn discover_started_service(
         .map(|record| record.service_id)
         .with_context(|| {
             format!("the remote started no service on port {remote_port}; nothing to publish")
-        })
+        })?;
+
+    if pre_existing.contains(&service_id) {
+        bail!(
+            "`{service_id}` was already serving on port {remote_port} before this command ran, \
+             so the remote reused it instead of starting a model with the API key just sent. \
+             A running server cannot be given a key it did not start with, so publishing this \
+             endpoint would expose it on the tailnet while printing a key it would reject.\n\
+             Stop it and run this again: ssh into the machine and run \
+             `{remote_cli} services stop {service_id}`."
+        );
+    }
+    Ok(service_id)
 }
 
 fn base_url_for(peer_host: &str, tailnet_port: u16) -> String {
@@ -1430,8 +1507,43 @@ mod tests {
         let transport =
             ScriptedTransport::new(vec![ScriptedStep::ok("services list --json", listing)]);
         assert_eq!(
-            discover_started_service(&transport, "rocm", 11434).unwrap(),
+            discover_started_service(&transport, "rocm", 11434, &BTreeSet::new()).unwrap(),
             "new"
+        );
+    }
+
+    #[test]
+    fn a_service_that_was_already_serving_is_refused_rather_than_published() {
+        // The half the reuse guard in `main.rs` does not cover. That one refuses
+        // when the caller wants a key and the running service has none; this is
+        // the mirror, where the running service has a key of its own. The remote
+        // reuses it, discards the key it was just sent, and exits 0 — so without
+        // this check the controlling side publishes the endpoint and prints a
+        // credential the engine will reject, as the only copy the user gets.
+        let listing = r#"[
+          {"service_id":"already-there","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+           "host":"127.0.0.1","port":11434,"endpoint_url":"http://127.0.0.1:11434/v1",
+           "mode":"managed","status":"ready","supervisor_pid":1,
+           "manifest_path":"/a","log_path":"/b","engine_state_path":"/c",
+           "created_at_unix_ms":100}
+        ]"#;
+        let transport =
+            ScriptedTransport::new(vec![ScriptedStep::ok("services list --json", listing)]);
+
+        let pre_existing = live_service_ids_on_port(&transport, "rocm", 11434)
+            .expect("the snapshot reads the same registry");
+        assert!(pre_existing.contains("already-there"));
+
+        let error = discover_started_service(&transport, "rocm", 11434, &pre_existing)
+            .expect_err("a service that predates the command must not be published")
+            .to_string();
+        assert!(
+            error.contains("already serving on port 11434"),
+            "the refusal must say what it found: {error}"
+        );
+        assert!(
+            error.contains("services stop already-there"),
+            "the refusal must name the way out: {error}"
         );
     }
 
@@ -1441,7 +1553,7 @@ mod tests {
             "services list --json",
             "not json at all",
         )]);
-        let error = discover_started_service(&transport, "rocm", 11434)
+        let error = discover_started_service(&transport, "rocm", 11434, &BTreeSet::new())
             .unwrap_err()
             .to_string();
         assert!(error.contains("different version"), "{error}");
@@ -1987,6 +2099,12 @@ mod tests {
     /// registry lookup that follows it, and the publish that follows that.
     fn full_serve_steps() -> Vec<ScriptedStep> {
         let mut steps = ready_steps();
+        // The live-services snapshot taken before anything starts. Empty: this
+        // fixture is a machine with nothing already on the port, so the service
+        // discovered afterwards is one this command created. Matched on the
+        // `--all`-less form, which is also what distinguishes it from the
+        // discovery listing below for the scripted transport.
+        steps.push(ScriptedStep::ok("services list --json", "[]"));
         steps.push(ScriptedStep::ok("read -r", ""));
         steps.push(ScriptedStep::ok(
             "services list --json --all",
