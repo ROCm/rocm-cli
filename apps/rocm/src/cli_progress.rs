@@ -146,7 +146,9 @@ impl Spinner {
         // e2e PTY harness and most real terminals default to, so this path
         // still truncates instead of emitting an unbounded line — it's rare
         // (an unusual stderr, not merely "not a TTY", which `enabled` already
-        // filters out above) but not untested.
+        // filters out above). The fallback *value* is covered by assembling
+        // at `FALLBACK_WIDTH` directly; the `size()` error branch itself is
+        // not exercised by any test.
         let cols = crossterm::terminal::size().map_or(FALLBACK_WIDTH, |(cols, _)| cols);
         let line = assemble_status_line(
             frame,
@@ -212,9 +214,10 @@ fn truncate_to_width(line: &str, max_width: usize) -> String {
 /// and a blind tail-truncation would silently drop the percentage for the
 /// rest of the transfer.
 ///
-/// If `frame` and `suffix` alone already meet or exceed `max_width` (an
-/// extremely narrow terminal, a suffix wider than the terminal, or the exact
-/// boundary where there'd be zero columns left for the label), there is no
+/// If `frame`, the mandatory separator space, and `suffix` together already
+/// meet or exceed `max_width` (an extremely narrow terminal, a suffix wider
+/// than the terminal, or the exact boundary where there'd be zero columns
+/// left for the label), there is no
 /// longer room to keep `suffix` intact with a label alongside it either —
 /// falls back to truncating `"{frame}{suffix}"` as a whole (no literal
 /// space; `suffix` already carries its own leading space), same as the
@@ -226,7 +229,7 @@ fn assemble_status_line(
     suffix: Option<&str>,
     max_width: usize,
 ) -> String {
-    let Some(suffix) = suffix.filter(|s| !s.is_empty()) else {
+    let Some(suffix) = suffix else {
         return truncate_to_width(&format!("{frame} {label}"), max_width);
     };
     debug_assert!(
@@ -483,6 +486,23 @@ mod tests {
             "the assembled line must still respect the terminal width: {line:?} (width {})",
             line.width()
         );
+    }
+
+    #[test]
+    fn assemble_status_line_produces_exact_output_on_the_ordinary_label_fits_path() {
+        // Regression test: the tests around this one only assert
+        // `contains`/`width <=` on the ordinary (non-boundary, non-fallback)
+        // `label_budget` branch, so a mutation dropping the separator space
+        // between `frame` and `label`, or shrinking `label_budget` by one,
+        // would still pass every other test in this module. A label whose
+        // width exactly fills its budget makes both mutations visible: the
+        // former glues `frame` and `label` together, and the latter forces
+        // an otherwise-unwarranted truncation.
+        let suffix = format_progress_suffix(883_147_264, None);
+        let label = "exact";
+        let max_width = "⠋".width() + 1 + suffix.width() + label.width();
+        let line = assemble_status_line("⠋", label, Some(&suffix), max_width);
+        assert_eq!(line, format!("⠋ {label}{suffix}"));
     }
 
     #[test]

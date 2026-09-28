@@ -74,6 +74,11 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # `download-progress-01` — this scenario's intermediate progress frame
   # depends on real wall-clock pacing that CPU contention from up to 63
   # concurrently-running scenarios can starve away entirely.
+  # Note: "Fetching ComfyUI source archive…" is short enough to never
+  # truncate at 80 columns, so this scenario does not exercise the
+  # label-truncation fix in `cli_progress::assemble_status_line` — the
+  # tarball scenario in `download_progress_pty.feature` is the regression
+  # test for that.
   @id:comfyui-source-download-shows-live-progress @requires-os:linux @serial
   Scenario: comfyui-04 - The source-archive download spinner renders progress and clears on completion
     Given a paced ComfyUI source archive fixture
