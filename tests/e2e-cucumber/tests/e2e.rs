@@ -1100,6 +1100,7 @@ async fn main() {
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
     use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
     let json_file =
@@ -1207,13 +1208,23 @@ async fn main() {
             }
             Box::pin(async {})
         })
-        .with_writer(
+        // The clock correction wraps the whole stack, so it sees events in
+        // arrival order — it must stay OUTSIDE `.normalized()`. `Normalize`
+        // re-emits events grouped by scenario rather than chronologically, and
+        // up to 64 scenarios run at once, so after normalisation a timestamp
+        // lower than its predecessor is ordinary. Correcting there would fire
+        // constantly on healthy runs and flatten the durations this is meant
+        // to protect. Before it, a backward move means the wall clock moved:
+        // the Strix Halo WSL2 guest steps its clock back (34 s observed) when
+        // Hyper-V resynchronises it, and both writers below turn the resulting
+        // negative duration into a panic that cucumber silences (EAI-9018).
+        .with_writer(MonotonicClockWriter::new(
             writer::Basic::raw(std::io::stdout(), writer::Coloring::Auto, 1)
                 .summarized()
                 .tee(writer::Json::new(json_file).discard_stats_writes())
                 .tee(writer::JUnit::new(junit_file, 0).discard_stats_writes())
                 .normalized(),
-        )
+        ))
         // Resolve every scenario's expectation from its tags + host capability +
         // the xfail matrix. Scenarios resolving to `Skip` (not-applicable on this
         // host — e.g. a required engine can't start) are filtered out and never
