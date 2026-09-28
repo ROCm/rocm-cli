@@ -228,6 +228,7 @@ form works depends on the engine your GPU selects.
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
 | `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
+| `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
@@ -261,7 +262,7 @@ the JSON report, not the human-readable one.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
@@ -283,6 +284,14 @@ fix` takes the id, not the position.
   skips checks that need to read the distribution's own environment
   (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
   `rocm diagnose` inside the distribution for those.
+- `--report` shows exactly what this machine would contribute to a problem
+  report, and sends nothing — there is no transport yet, and there will be no
+  automatic one: a report leaves a machine only by its owner's own action. The
+  content is deliberately narrow (a schema version, the matched entry, whether
+  a fix was offered for it, the GPU architecture, the OS family and major
+  version, the CLI version), and it carries no host name, user name, file
+  path, or error text. Hardware that is not on AMD's published compatibility
+  matrix produces no report at all, and the CLI says why.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id

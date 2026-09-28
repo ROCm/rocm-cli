@@ -1268,3 +1268,24 @@ The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
 including the two that need a synthetic signed catalog to trigger
 deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
 produce them on an arbitrary real host.
+
+## Doctor Report Preflight
+
+Preview the content a problem report would carry, without sending anything:
+
+```bash
+rocm diagnose --report
+rocm diagnose --report --json
+```
+
+The command refuses rather than prepares a report on two hosts: one with an
+architecture the ROCm compatibility matrix does not list as supported, and
+one whose AMD GPU architecture could not be read at all. Both refusals exit 0
+and are distinguishable from `--json`'s `refused` field.
+
+On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
+`crates/rocm-core/src/report.rs`), the command prints the full `Report`:
+`schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
+`os_major`, `cli_version`, and `fix_offered`. This path has not been exercised
+against real hardware in CI; verifying it needs a lane whose GPU architecture
+is on the allowlist.
