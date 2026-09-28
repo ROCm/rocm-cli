@@ -438,8 +438,9 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // the always-on auto/manual marker) rather than a specific fix-id's exact
     // flags: the top match is environment-dependent, and a shared vocabulary
     // doesn't guarantee diagnose and the fix.rs catalog agree on the
-    // underlying values for a given fix-id (known drift: fix-5-amdgpu-load's
-    // needs_reboot).
+    // underlying values for a given fix-id -- unit tests in diagnose.rs pin
+    // per-fix-id values against the catalog (e.g.
+    // `assert_needs_reboot_matches_the_catalog`) for that.
     let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
     let flag_lines: Vec<&str> = output

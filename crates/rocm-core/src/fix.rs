@@ -704,6 +704,25 @@ pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&st
     );
 }
 
+/// Assert that the `needs_reboot` a [`crate::diagnose::Fix`] carries matches
+/// the catalog recipe's.
+///
+/// Same hand-maintained-copies problem as [`assert_plan_matches_the_catalog_copy`],
+/// for a single flag instead of the command block: `FixRecipe` and `Fix` set
+/// `needs_reboot` independently, so a silent divergence means `rocm diagnose`
+/// and `rocm fix <id>` tell a user different things about the same fix-id
+/// (this is what happened with `fix-5-amdgpu-load` before it was closed here).
+#[cfg(test)]
+pub(crate) fn assert_needs_reboot_matches_the_catalog(fix_id: &str, needs_reboot: bool) {
+    let recipe = find_recipe(fix_id)
+        .unwrap_or_else(|| panic!("{fix_id}: no catalog recipe to compare against"));
+    assert_eq!(
+        recipe.needs_reboot, needs_reboot,
+        "{fix_id}: diagnose's needs_reboot has drifted from the catalog recipe \
+         `rocm fix` reports; a user may see either surface for the same fix-id"
+    );
+}
+
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
@@ -768,11 +787,12 @@ pub fn list_recipes() -> String {
 /// values render as the same text from either command. This only
 /// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
 /// diagnose's `Fix` still supply those independently, so a fix-id's rendered
-/// flags can still differ if the two disagree on a value (known example:
-/// `fix-5-amdgpu-load`'s `needs_reboot`). Also out of scope: the bare
-/// `rocm fix` catalog listing (`list_recipes`) describes the same
-/// `auto_applicable` property with a separate, untouched AUTO/PRINT-ONLY
-/// vocabulary.
+/// flags can still differ if the two disagree on a value; see
+/// [`assert_needs_reboot_matches_the_catalog`] and
+/// [`assert_plan_matches_the_catalog_copy`] for the guards that catch that.
+/// Also out of scope: the bare `rocm fix` catalog listing (`list_recipes`)
+/// describes the same `auto_applicable` property with a separate, untouched
+/// AUTO/PRINT-ONLY vocabulary.
 // These mirror the `FixRecipe`/`Fix` struct fields, where
 // `clippy::struct_excessive_bools` is already allowed workspace-wide; that
 // allow doesn't reach this free function's parameters, so
