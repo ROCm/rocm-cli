@@ -67,6 +67,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("xtask", "e2e-report"),
     ("xtask", "rocm-core"),
     ("e2e-cucumber", "e2e-report"),
+    // The E2E suite derives the planted Lemonade runtime's `env_id` from the
+    // same pinned version `rocm` builds its expected id from, rather than
+    // copying it — see the dependency's note in the suite's Cargo.toml.
+    ("e2e-cucumber", "rocm-deps"),
 ];
 
 /// Subset of `cargo metadata --no-deps` output we consume: the manifest-level
