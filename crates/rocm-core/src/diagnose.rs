@@ -457,9 +457,11 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
     let fix = Fix {
         summary: "Reinstall the framework from a wheel index that includes this GPU's gfx target. Use HSA_OVERRIDE_GFX_VERSION ONLY as a temporary workaround when no native wheel exists.".to_owned(),
         commands: vec![
-            "# Recommended: PyTorch ROCm nightly that ships the gfx115x kernels.".to_owned(),
+            "# Recommended: a PyTorch ROCm nightly, which often carries kernels a".to_owned(),
+            "# release has not shipped yet. Pick the nightly for the ROCm major you".to_owned(),
+            "# have, not an older one.".to_owned(),
             "pip uninstall -y torch torchvision torchaudio".to_owned(),
-            "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm6.4".to_owned(),
+            "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm7.14".to_owned(),
             "# llama.cpp: rebuild with AMDGPU_TARGETS set to this GPU's gfx.".to_owned(),
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx_target>".to_owned(),
         ],
@@ -937,9 +939,10 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
             summary: "Reinstall the framework from the wheel index that matches the system ROCm major (or upgrade the system ROCm to match the wheel).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
-                "# Pick the index that matches your system ROCm major. Examples:".to_owned(),
-                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4".to_owned(),
-                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3".to_owned(),
+                "# Install the index for the ROCm major `rocm examine` reports:".to_owned(),
+                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14".to_owned(),
+                "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:".to_owned(),
+                "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0".to_owned(),
                 "# Then re-check:".to_owned(),
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
@@ -2270,6 +2273,58 @@ mod tests {
             rocm_version: "6.4.1".to_owned(),
             ..linux_base()
         }
+    }
+
+    use crate::fix::{OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, torch_rocm_indexes_named_in};
+
+    /// A remedy has to be able to resolve the mismatch that produced it.
+    ///
+    /// `check_8` fires when the framework's HIP major differs from the system
+    /// ROCm major, and tells the user to pick the wheel index matching their
+    /// system. If every index it names is older than any ROCm this CLI installs,
+    /// there is nothing to pick: following the instruction installs a torch for
+    /// a major the machine does not have, and this same check fires again on the
+    /// result. A remedy that re-creates its own precondition is worse than none,
+    /// because the user has spent a reinstall to arrive back where they started.
+    #[test]
+    fn the_wheel_mismatch_remedy_can_resolve_the_mismatch_it_reports() {
+        let machine = Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=6.4.43482".to_owned(),
+            framework_source: "path".to_owned(),
+            rocm_version: "7.14.60850".to_owned(),
+            ..linux_base()
+        };
+
+        let hit = check_8_wheel_rocm_mismatch(&machine, "");
+        // Non-vacuity: without the finding there is no remedy to judge, and the
+        // assertions below would pass against a check that never fires.
+        let fix = hit
+            .fix
+            .as_ref()
+            .expect("a HIP 6 torch against a ROCm 7 system is the mismatch this check exists for");
+
+        let named = torch_rocm_indexes_named_in(fix.commands.iter().map(String::as_str));
+        assert!(
+            !named.is_empty(),
+            "the remedy names no wheel index at all, so \"pick the one that matches\" points at \
+             nothing: {:?}",
+            fix.commands
+        );
+        // Every index, not merely one of them. "At least one is current" would
+        // pass with a stale line sitting beside a good one, and the user picking
+        // between them has no way to tell which is which -- that is the same
+        // position this defect put them in to begin with.
+        let stale: Vec<_> = named
+            .iter()
+            .filter(|(major, _)| *major < OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "this remedy offers an index older than ROCm {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, \
+             which this CLI installs. A user who picks that line installs a torch for a major \
+             they do not have, and this same check fires again on the result: {stale:?}"
+        );
     }
 
     #[test]

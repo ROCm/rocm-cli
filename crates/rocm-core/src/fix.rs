@@ -90,10 +90,11 @@ const RECIPES: &[FixRecipe] = &[
         rationale: "Your GPU's gfx target is not in the framework wheel's compiled kernel list. Re-install the framework from an index that includes this gfx, OR rebuild llama.cpp with AMDGPU_TARGETS=<gfx>.",
         auto_applicable: false,
         commands: &[
-            "# PyTorch (Linux): switch to the ROCm nightly that ships the gfx115x kernels.",
+            "# PyTorch (Linux): a nightly often carries kernels a release has not shipped yet.",
+            "# Pick the nightly for the ROCm major you have, not an older one.",
             "pip uninstall -y torch torchvision torchaudio",
             "pip install --pre torch torchvision torchaudio \\",
-            "  --index-url https://download.pytorch.org/whl/nightly/rocm6.4",
+            "  --index-url https://download.pytorch.org/whl/nightly/rocm7.14",
             "# PyTorch (Windows): use TheRock's per-gfx wheels (https://github.com/ROCm/TheRock).",
             "# llama.cpp:",
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<your_gfx_target>",
@@ -230,9 +231,10 @@ const RECIPES: &[FixRecipe] = &[
         auto_applicable: false,
         commands: &[
             "pip uninstall -y torch torchvision torchaudio",
-            "# Linux: pick the index that matches your system ROCm major:",
-            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4",
-            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3",
+            "# Linux: install the index for the ROCm major `rocm examine` reports:",
+            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14",
+            "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:",
+            "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0",
             "# Windows: use TheRock's wheels matching your HIP SDK major:",
             "#   https://github.com/ROCm/TheRock",
         ],
@@ -706,6 +708,42 @@ pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&st
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
+}
+
+/// The oldest ROCm major this CLI will leave on a machine.
+///
+/// A statement about the product, not a preference: the installer ships ROCm 7
+/// series wheels and supports the ROCm 10 layout, so 7 is the floor a user can
+/// actually end up on. Remediations are checked against it, because a step
+/// naming a wheel index older than this cannot help anyone the catalog can
+/// reach — and in `fix-8-wheel-rocm`'s case re-creates the very mismatch it
+/// reports.
+///
+/// Raise it when the installer stops producing ROCm 7.
+///
+/// Test-only: it exists to be asserted against, not to steer runtime behaviour.
+#[cfg(test)]
+pub(crate) const OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS: u32 = 7;
+
+/// Every PyTorch ROCm wheel index named in `commands`, as `(major, command)`.
+///
+/// Shared by the catalog's guard and `diagnose`'s, so the two cannot disagree
+/// about what counts as naming an index.
+#[cfg(test)]
+pub(crate) fn torch_rocm_indexes_named_in<'a>(
+    commands: impl IntoIterator<Item = &'a str>,
+) -> Vec<(u32, String)> {
+    commands
+        .into_iter()
+        .filter_map(|c| {
+            let tail = &c[c.find("download.pytorch.org/whl/")?..];
+            let digits: String = tail[tail.find("rocm")? + 4..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok().map(|major| (major, c.to_owned()))
+        })
+        .collect()
 }
 
 /// The platform family a recipe's `applies_on` is matched against.
@@ -1473,6 +1511,44 @@ mod tests {
         assert!(
             found.is_empty(),
             "an empty directory is not an install, but {found:?} was returned"
+        );
+    }
+
+    /// No entry sends a user to a wheel index older than any ROCm this CLI
+    /// installs.
+    ///
+    /// The decay this catches is invisible to everything else. The advice
+    /// compiles, the tests pass, and `assert_plan_matches_the_catalog_copy`
+    /// confirms the catalog and `diagnose` copies agree — which they did, while
+    /// both went stale together. A guard checking that two copies match each
+    /// other cannot notice that both have drifted from the world outside.
+    #[test]
+    fn no_remediation_names_a_wheel_index_older_than_the_rocm_we_install() {
+        let named: Vec<(&str, u32, String)> = RECIPES
+            .iter()
+            .flat_map(|r| {
+                torch_rocm_indexes_named_in(r.commands.iter().copied())
+                    .into_iter()
+                    .map(move |(major, command)| (r.fix_id, major, command))
+            })
+            .collect();
+
+        // Non-vacuity: entries do name wheel indexes, and a parser that matched
+        // none would leave the assertion below checking an empty list forever.
+        assert!(
+            !named.is_empty(),
+            "no entry was seen to name a wheel index, so this guard is checking nothing"
+        );
+
+        let stale: Vec<_> = named
+            .iter()
+            .filter(|(_, major, _)| *major < OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these steps name a ROCm older than {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, the oldest \
+             this CLI installs, so a user following them installs a framework for a major they \
+             do not have: {stale:#?}"
         );
     }
 
