@@ -904,21 +904,40 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         steps
     }
 
+    /// The lines of a step's `run: |` block, still indented.
+    fn run_block(step: &str) -> Option<Vec<&str>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
+        let run_indent = indent_of(lines[run_at]);
+        Some(
+            lines[run_at + 1..]
+                .iter()
+                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+                .copied()
+                .collect(),
+        )
+    }
+
+    fn dedent(body: &[&str]) -> Option<String> {
+        let pad = body
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| indent_of(l))
+            .min()?;
+        let dedented: Vec<&str> = body
+            .iter()
+            .map(|l| if l.len() > pad { &l[pad..] } else { l.trim() })
+            .collect();
+        Some(dedented.join("\n") + "\n")
+    }
+
     /// The POSIX-shell body a preflight step actually runs, dedented.
     ///
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
-    /// to end yields `None` — driving those needs a PowerShell this test cannot
-    /// assume, so they are covered by the shape assertions instead.
+    /// to end yields `None`; `preflight_powershell_script` carries those.
     fn preflight_shell_script(step: &str) -> Option<String> {
-        let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
-        let body: Vec<&str> = lines[run_at + 1..]
-            .iter()
-            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
-            .copied()
-            .collect();
+        let body = run_block(step)?;
         let body = match body
             .iter()
             .position(|l| l.trim_end().ends_with("-Script @'"))
@@ -930,16 +949,37 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             None if step.contains("shell: powershell") => return None,
             None => body,
         };
-        let pad = body
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| indent_of(l))
-            .min()?;
-        let dedented: Vec<&str> = body
-            .iter()
-            .map(|l| if l.len() > pad { &l[pad..] } else { l.trim() })
-            .collect();
-        Some(dedented.join("\n") + "\n")
+        dedent(&body)
+    }
+
+    /// The PowerShell body a preflight step runs, for the steps that are
+    /// PowerShell end to end.
+    ///
+    /// The WSL lanes are excluded deliberately: their PowerShell is a wrapper
+    /// around a bash here-string that `preflight_shell_script` already carries.
+    /// Without this the Windows-native blocks are invisible to the drift check
+    /// below — reproducing, on the test side, the very gap that let one of the
+    /// six production blocks sit un-converted.
+    fn preflight_powershell_script(step: &str) -> Option<String> {
+        if !step.contains("shell: powershell") || step.contains("-Script @'") {
+            return None;
+        }
+        dedent(&run_block(step)?)
+    }
+
+    /// The shell options a lane's body actually runs under in CI.
+    ///
+    /// Driving a lane under the wrong ones tests a shell production never uses,
+    /// which is how a script can pass here and abort on a runner.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum PreflightShell {
+        /// A plain `run:` step, which GitHub runs as `bash -e {0}` — `-e` but,
+        /// unlike an explicit `shell: bash`, no pipefail.
+        DefaultRunStep,
+        /// The WSL lanes pass their body to `Invoke-WslBash.ps1` *without*
+        /// `-PipeFail`, which execs a bare `bash <file>`: no `-e` either.
+        WslBareBash,
     }
 
     /// Whether this preflight guards an APU lane (the 8 GiB floor) rather than a
@@ -983,26 +1023,40 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // pre-GTT script while the other five were converted and nothing failed,
         // because every contract test here asserts step names, env keys and
         // labels — never the script body.
-        let scripts = |name: &str| -> Vec<String> {
+        type Extract = fn(&str) -> Option<String>;
+        let scripts = |name: &str, extract: Extract| -> Vec<String> {
             gpu_preflight_steps(&read_workflow(name))
                 .iter()
                 .filter(|s| is_apu_preflight(s))
-                .filter_map(|s| preflight_shell_script(s))
+                .filter_map(|s| extract(s))
                 .collect()
         };
-        let per_pr = scripts("e2e-selfhosted.yml");
-        let nightly = scripts("nightly.yml");
-        assert_eq!(
-            per_pr.len(),
-            2,
-            "expected a native and an advisory APU preflight in e2e-selfhosted.yml"
-        );
-        assert_eq!(per_pr.len(), nightly.len(), "APU preflight count differs");
-        for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
+        // Both languages, or the check reproduces the bug it exists to catch:
+        // the Windows blocks are PowerShell end to end, and an edit landing in
+        // only one of the two files would otherwise go unnoticed.
+        for (language, extract, want) in [
+            ("shell", preflight_shell_script as Extract, 2),
+            ("PowerShell", preflight_powershell_script as Extract, 1),
+        ] {
+            let per_pr = scripts("e2e-selfhosted.yml", extract);
+            let nightly = scripts("nightly.yml", extract);
             assert_eq!(
-                a, b,
-                "APU preflight script #{i} has drifted between e2e-selfhosted.yml and nightly.yml"
+                per_pr.len(),
+                want,
+                "expected {want} {language} APU preflight block(s) in e2e-selfhosted.yml"
             );
+            assert_eq!(
+                per_pr.len(),
+                nightly.len(),
+                "{language} APU preflight count differs"
+            );
+            for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "{language} APU preflight script #{i} has drifted between \
+                     e2e-selfhosted.yml and nightly.yml"
+                );
+            }
         }
     }
 
@@ -1021,24 +1075,46 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// A `rocm-smi` stub that answers each `--showmeminfo` shape the preflight
-    /// uses: both pools at once, GTT alone, VRAM alone. With `REJECT_COMBINED`
-    /// the two-pool form fails the way an older build does, which is the case
-    /// that must still reach GTT through the single-pool query.
+    /// uses: both pools at once, GTT alone, VRAM alone.
+    ///
+    /// `REJECT_COMBINED` fails the two-pool form the way an older build does —
+    /// the case that must still reach GTT through the single-pool query.
+    /// `FAIL_GTT` fails the GTT-alone query, which has to stay distinguishable
+    /// from a host that answers and simply has no GTT pool (hence the `|| true`
+    /// on the `grep`: an absent pool is an empty answer, not a failed call).
+    /// `GOOD_CALLS` degrades the tool after N calls, for the polls that have to
+    /// survive a reading going away mid-wait.
     #[cfg(unix)]
     const SMI_STUB: &str = r#"#!/bin/sh
+n=$(cat "$COUNTER" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$COUNTER"
+if [ -n "${GOOD_CALLS:-}" ] && [ "$n" -gt "$GOOD_CALLS" ]; then exit 1; fi
 case "$*" in
   *vram*gtt*)
     [ "${REJECT_COMBINED:-0}" = 1 ] && exit 1
     cat "$FIXTURE" ;;
-  *gtt*) grep GTT "$FIXTURE" ;;
-  *)     grep -v GTT "$FIXTURE" ;;
+  *gtt*)
+    [ "${FAIL_GTT:-0}" = 1 ] && exit 1
+    grep GTT "$FIXTURE" || true ;;
+  *)
+    grep -v GTT "$FIXTURE" || true ;;
 esac
 "#;
 
     /// Run a preflight script against fixture `rocm-smi` output, returning its
-    /// exit code. `rocm-smi` is stubbed on `PATH`; nothing touches a real GPU.
+    /// exit code and everything it logged. `rocm-smi` is stubbed on `PATH`;
+    /// nothing touches a real GPU.
+    ///
+    /// `shell` decides how the body is invoked, so each lane is driven the way
+    /// CI drives it rather than under whichever options happen to be stricter.
     #[cfg(unix)]
-    fn run_preflight(script: &str, fixture: &str, reject_combined: bool) -> i32 {
+    fn run_preflight(
+        script: &str,
+        shell: PreflightShell,
+        fixture: &str,
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1056,102 +1132,34 @@ esac
             dir.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        std::process::Command::new("bash")
-            .arg("-e")
+        let mut cmd = std::process::Command::new("bash");
+        if matches!(shell, PreflightShell::DefaultRunStep) {
+            cmd.arg("-e");
+        }
+        let out = cmd
             .arg(&script_path)
             .env("PATH", path)
             .env("FIXTURE", &fixture_path)
-            .env("REJECT_COMBINED", if reject_combined { "1" } else { "0" })
-            // One poll, then the script's own 5s backoff ends the loop.
+            .env("COUNTER", dir.path().join("calls"))
+            // One poll, then the script's own 5s backoff ends the loop. Cases
+            // that need a second poll raise this.
             .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            .envs(env.iter().copied())
             .output()
-            .expect("running the preflight script")
-            .status
-            .code()
-            .expect("preflight exited with a status code")
+            .expect("running the preflight script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("preflight exited with a status code"),
+            log,
+        )
     }
 
+    /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
     #[cfg(unix)]
-    #[test]
-    fn apu_preflight_gates_on_the_pool_the_engine_uses() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        const MIB: u64 = 1024 * 1024;
-
-        // The contract tests above cannot tell a working gate from a broken one:
-        // they all pass with the production logic reverted. This drives the real
-        // script against fixture tool output instead, which is what distinguishes
-        // "measures the right pool" from "passes whenever any pool looks free" —
-        // the zero-total row below failed before it was written.
-        if std::process::Command::new("timeout")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
-            return;
-        }
-
-        // (what the host reports, whether the two-pool query is rejected,
-        //  expected exit: native lane, advisory lane)
-        let cases: Vec<(&str, String, bool, i32, i32)> = vec![
-            (
-                "carveout with a free aperture",
-                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
-                false,
-                0,
-                0,
-            ),
-            // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
-            // single-pool fallback carries no GTT rows, so without a dedicated
-            // GTT query this healthy APU would fail as "no GTT pool" — the very
-            // false low-memory report this gate exists to stop producing.
-            (
-                "carveout where rocm-smi rejects the two-pool query",
-                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
-                true,
-                0,
-                0,
-            ),
-            (
-                "carveout with the aperture pinned by a leftover serve",
-                smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB))),
-                false,
-                1,
-                1,
-            ),
-            (
-                "discrete card with VRAM free",
-                smi_fixture(192 * GIB, 10 * GIB, None),
-                false,
-                0,
-                0,
-            ),
-            (
-                "discrete card with VRAM held",
-                smi_fixture(192 * GIB, 191 * GIB, None),
-                false,
-                1,
-                1,
-            ),
-            // A wedged driver must not be read as "this is an APU" and waved
-            // through on whatever the other pool reports.
-            (
-                "zero VRAM total against a healthy aperture",
-                smi_fixture(0, 0, Some((62 * GIB, GIB))),
-                false,
-                1,
-                0,
-            ),
-            // Nothing measurable: the native lane fails, the advisory lane warns.
-            (
-                "carveout with no GTT pool reported",
-                smi_fixture(512 * MIB, 200 * MIB, None),
-                false,
-                1,
-                0,
-            ),
-        ];
-
+    fn apu_lanes() -> (String, String) {
         let steps = gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"));
         let native = steps
             .iter()
@@ -1163,30 +1171,314 @@ esac
             .filter(|s| s.contains("advisory"))
             .find_map(|s| preflight_shell_script(s))
             .expect("advisory APU preflight shell script");
+        (native, advisory)
+    }
 
+    /// The Windows-native APU preflight body, which is PowerShell end to end.
+    #[cfg(unix)]
+    fn windows_apu_lane() -> String {
+        gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"))
+            .iter()
+            .filter(|s| is_apu_preflight(s))
+            .find_map(|s| preflight_powershell_script(s))
+            .expect("Windows APU preflight PowerShell script")
+    }
+
+    /// Whether GNU `timeout` — which every shell lane wraps `rocm-smi` in — is
+    /// available to drive these scripts at all.
+    #[cfg(unix)]
+    fn has_timeout() -> bool {
+        std::process::Command::new("timeout")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[cfg(unix)]
+    fn has_pwsh() -> bool {
+        std::process::Command::new("pwsh")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// Run the Windows preflight body under `pwsh`, stubbing `rocm-smi` on
+    /// `PATH` exactly as the shell lanes do.
+    ///
+    /// Unix-only because the stub is a `/bin/sh` script; on Windows CI this
+    /// block is still covered by the drift and shape checks. `pwsh` ships on
+    /// GitHub's Ubuntu images, so this normally runs rather than skips.
+    #[cfg(unix)]
+    fn run_preflight_pwsh(script: &str, fixture: &str, env: &[(&str, &str)]) -> (i32, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fixture_path = dir.path().join("smi.txt");
+        let script_path = dir.path().join("preflight.ps1");
+        let stub = dir.path().join("rocm-smi");
+        std::fs::write(&fixture_path, fixture).expect("write fixture");
+        std::fs::write(&script_path, script).expect("write script");
+        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-File"])
+            .arg(&script_path)
+            .env("PATH", path)
+            .env("FIXTURE", &fixture_path)
+            .env("COUNTER", dir.path().join("calls"))
+            .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            .envs(env.iter().copied())
+            .output()
+            .expect("running the preflight script under pwsh");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status
+                .code()
+                .expect("preflight exited with a status code"),
+            log,
+        )
+    }
+
+    /// One host reading, and what each lane must make of it.
+    #[cfg(unix)]
+    struct GateCase {
+        label: &'static str,
+        fixture: String,
+        env: Vec<(&'static str, &'static str)>,
+        /// Exit code, plus phrases the log must carry, for the native lane…
+        native: (i32, &'static [&'static str]),
+        /// …and for the advisory one.
+        advisory: (i32, &'static [&'static str]),
+    }
+
+    #[cfg(unix)]
+    fn assert_gate(lane: &str, case: &str, got: (i32, String), want: (i32, &[&str])) {
+        let (code, log) = got;
+        assert_eq!(code, want.0, "{lane} preflight, {case} — logged:\n{log}");
+        for phrase in want.1 {
+            assert!(
+                log.contains(phrase),
+                "{lane} preflight, {case}: expected {phrase:?} in the log, got:\n{log}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apu_preflight_gates_on_the_pool_the_engine_uses() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        // The shape tests above cannot tell a working gate from a broken one:
+        // they all pass with the production logic reverted. This drives the real
+        // script against fixture tool output instead, which is what distinguishes
+        // "measures the right pool" from "passes whenever any pool looks free".
+        //
+        // Each case pins the reason as well as the exit code. Several branches
+        // here exist ONLY to produce an honest reason: deleting the "no GTT
+        // pool" bail leaves every exit code untouched and swaps the message back
+        // to the false "a serve is likely still holding the GPU" this change
+        // exists to stop — invisible to an exit-code-only assertion.
+        //
+        // All three hard-failing lanes are driven, the Windows one included: it
+        // is a third copy of the same logic in another language, and the bug
+        // that prompted this work was one copy left behind.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let windows = has_pwsh().then(windows_apu_lane);
+        if windows.is_none() {
+            eprintln!("skipping the Windows lane: no `pwsh` on PATH");
+        }
+
+        let cases = vec![
+            GateCase {
+                label: "carveout with a free aperture",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![],
+                native: (0, &["GPU ready: 61 GiB GTT free"]),
+                advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+            },
+            // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
+            // single-pool fallback carries no GTT rows, so without a dedicated
+            // GTT query this healthy APU would fail as "no GTT pool" — the very
+            // false low-memory report this gate exists to stop producing. The
+            // separate-query line must appear too: the pool line printed earlier
+            // necessarily said `GTT n/a/n/a`, and a log that stops there
+            // contradicts the verdict.
+            GateCase {
+                label: "carveout where rocm-smi rejects the two-pool query",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("REJECT_COMBINED", "1")],
+                native: (
+                    0,
+                    &[
+                        "rocm-smi GTT pool (separate query):",
+                        "GPU ready: 61 GiB GTT free",
+                    ],
+                ),
+                advisory: (
+                    0,
+                    &[
+                        "rocm-smi GTT pool (separate query):",
+                        "GPU ready: 61 GiB GTT free",
+                    ],
+                ),
+            },
+            GateCase {
+                label: "carveout with the aperture pinned by a leftover serve",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, 61 * GIB))),
+                env: vec![],
+                native: (1, &["GTT never dropped below the floor"]),
+                advisory: (1, &["GTT never dropped below the floor"]),
+            },
+            GateCase {
+                label: "discrete card with VRAM free",
+                fixture: smi_fixture(192 * GIB, 10 * GIB, None),
+                env: vec![],
+                native: (0, &["GPU ready: 182 GiB VRAM free"]),
+                advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+            },
+            GateCase {
+                label: "discrete card with VRAM held",
+                fixture: smi_fixture(192 * GIB, 191 * GIB, None),
+                env: vec![],
+                native: (1, &["VRAM never dropped below the floor"]),
+                advisory: (1, &["VRAM never dropped below the floor"]),
+            },
+            // A wedged driver must not be read as "this is an APU" and waved
+            // through on whatever the other pool reports.
+            GateCase {
+                label: "zero VRAM total against a healthy aperture",
+                fixture: smi_fixture(0, 0, Some((62 * GIB, GIB))),
+                env: vec![],
+                native: (1, &["reported a VRAM total of 0"]),
+                advisory: (0, &["no VRAM figures under WSL"]),
+            },
+            // The same defect one pool over: a GTT total that parses as zero is
+            // a failed reading, not an exhausted aperture. Unguarded it produced
+            // `0 GiB free … a serve is likely still holding the GPU` — verbatim
+            // the report this change exists to eliminate — and hard-failed the
+            // one lane specified never to fail on a host it cannot read.
+            GateCase {
+                label: "carveout with a GTT total of zero",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((0, 0))),
+                env: vec![],
+                native: (1, &["reported a GTT total of 0"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+            // Nothing measurable: the native lane fails, the advisory lane warns.
+            GateCase {
+                label: "carveout with no GTT pool reported",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, None),
+                env: vec![],
+                native: (1, &["reported no GTT pool"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+            // A query that failed is not a host without the pool. The aperture
+            // is right there in the fixture; only the call for it broke, and
+            // saying "no GTT pool" here would report a flake as a hardware fact.
+            GateCase {
+                label: "carveout where the GTT query itself fails",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("REJECT_COMBINED", "1"), ("FAIL_GTT", "1")],
+                native: (1, &["the GTT query itself failed"]),
+                advisory: (0, &["no usable GTT pool"]),
+            },
+        ];
+
+        let (native, advisory) = apu_lanes();
         std::thread::scope(|scope| {
             let handles: Vec<_> = cases
                 .iter()
-                .map(|(label, fixture, reject, want_native, want_advisory)| {
-                    let (native, advisory) = (&native, &advisory);
+                .map(|case| {
+                    let (native, advisory, windows) = (&native, &advisory, &windows);
                     scope.spawn(move || {
                         (
-                            label,
-                            run_preflight(native, fixture, *reject),
-                            run_preflight(advisory, fixture, *reject),
-                            *want_native,
-                            *want_advisory,
+                            case,
+                            run_preflight(
+                                native,
+                                PreflightShell::DefaultRunStep,
+                                &case.fixture,
+                                &case.env,
+                            ),
+                            run_preflight(
+                                advisory,
+                                PreflightShell::WslBareBash,
+                                &case.fixture,
+                                &case.env,
+                            ),
+                            windows
+                                .as_ref()
+                                .map(|w| run_preflight_pwsh(w, &case.fixture, &case.env)),
                         )
                     })
                 })
                 .collect();
             for handle in handles {
-                let (label, native, advisory, want_native, want_advisory) =
+                let (case, native, advisory, windows) =
                     handle.join().expect("preflight case thread");
-                assert_eq!(native, want_native, "native preflight, {label}");
-                assert_eq!(advisory, want_advisory, "advisory preflight, {label}");
+                assert_gate("native", case.label, native, case.native);
+                assert_gate("advisory", case.label, advisory, case.advisory);
+                // The Windows block guards the same hardware class with the
+                // same floor, so it owes the same verdicts as the native lane.
+                if let Some(windows) = windows {
+                    assert_gate("Windows", case.label, windows, case.native);
+                }
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apu_preflight_verdict_reflects_the_last_completed_reading() {
+        const MIB: u64 = 1024 * 1024;
+
+        // A poll that ends in an early `continue` — rocm-smi timing out, empty
+        // fields — learned nothing, so it must not overwrite what the last
+        // completed poll established. Here poll 1 reads a carveout with no GTT
+        // pool and the tool then stops answering entirely.
+        //
+        // The advisory lane must still WARN: it is specified never to hard-fail
+        // on a host it cannot measure. Re-deriving that state per poll instead
+        // would let the silent second poll flip this to `exit 1` with "a serve
+        // is likely still holding the GPU" — a serve this run never observed,
+        // which is the report the whole change exists to stop.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+
+        // Two polls: one at t=0, one after the script's own 5s backoff. The
+        // first spends two calls (combined, then GTT alone); everything after
+        // that fails, so the second poll reads nothing.
+        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "6")];
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, None);
+        let (native, advisory) = apu_lanes();
+
+        assert_gate(
+            "advisory",
+            "reading lost after the first poll",
+            run_preflight(&advisory, PreflightShell::WslBareBash, &fixture, &env),
+            (0, &["no usable GTT pool"]),
+        );
+        // The native lane hard-fails either way, but for the reason the last
+        // completed poll actually found rather than a default about a serve.
+        assert_gate(
+            "native",
+            "reading lost after the first poll",
+            run_preflight(&native, PreflightShell::DefaultRunStep, &fixture, &env),
+            (1, &["reported no GTT pool"]),
+        );
     }
 
     #[test]
