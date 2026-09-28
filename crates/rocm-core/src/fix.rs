@@ -787,12 +787,12 @@ pub fn list_recipes() -> String {
 /// values render as the same text from either command. This only
 /// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
 /// diagnose's `Fix` still supply those independently, so a fix-id's rendered
-/// flags can still differ if the two disagree on a value; see
-/// [`assert_needs_reboot_matches_the_catalog`] and
-/// [`assert_plan_matches_the_catalog_copy`] for the guards that catch that.
-/// Also out of scope: the bare `rocm fix` catalog listing (`list_recipes`)
-/// describes the same `auto_applicable` property with a separate, untouched
-/// AUTO/PRINT-ONLY vocabulary.
+/// flags can still differ if the two disagree on a value; `assert_needs_reboot_matches_the_catalog`
+/// and `assert_plan_matches_the_catalog_copy` are targeted regression tests
+/// that pin specific fix-ids against that drift, not a blanket guarantee for
+/// every fix-id. Also out of scope: the bare `rocm fix` catalog listing
+/// (`list_recipes`) describes the same `auto_applicable` property with a
+/// separate, untouched AUTO/PRINT-ONLY vocabulary.
 // These mirror the `FixRecipe`/`Fix` struct fields, where
 // `clippy::struct_excessive_bools` is already allowed workspace-wide; that
 // allow doesn't reach this free function's parameters, so
