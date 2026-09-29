@@ -1441,7 +1441,17 @@ serve_timeout_secs = 90
         let without_hook = cap("mock");
         assert!(!without_hook.oom_fault_injection);
         assert!(matches!(
-            resolve(&d, &without_hook, &m, false, false, false),
+            resolve(
+                &d,
+                &without_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
 
@@ -1449,7 +1459,17 @@ serve_timeout_secs = 90
         let mut with_hook = cap("mock");
         with_hook.oom_fault_injection = true;
         assert_eq!(
-            resolve(&d, &with_hook, &m, false, false, false),
+            resolve(
+                &d,
+                &with_hook,
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
     }
