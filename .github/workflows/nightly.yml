@@ -1175,6 +1175,71 @@ jobs:
           '@
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Same clock hazard as `e2e-wsl` in e2e-selfhosted.yml, which this job
+      # mirrors: a fresh guest whose clock is still being corrected steps
+      # backwards mid-run, and cucumber measures scenario durations with
+      # `SystemTime`. See that job's copy of this step for the full reasoning.
+      # Kept in sync by hand until the two lanes are deduplicated (#294).
+      - name: Settle the clock before anything times a scenario
+        shell: powershell
+        run: |
+          # `shell: powershell` runs with $ErrorActionPreference = 'Stop', under
+          # which a native command's stderr becomes a terminating error. `w32tm`
+          # writes there routinely on a machine with no configured time source, so
+          # relax the preference rather than let a best-effort probe abort the
+          # step. This line, not a try/catch, is what keeps the two calls below
+          # non-fatal: a native command's exit code never throws, and under
+          # 'Continue' its stderr is not promoted to a terminating error either,
+          # so a `catch` around them could never fire. Their raw output still
+          # reaches the log.
+          $ErrorActionPreference = 'Continue'
+
+          # Host first, and deliberately not concurrently with the guest below:
+          # in WSL2 the guest clock tracks the host, so settling the host is what
+          # gives the guest's own sync an already-correct reference to land on.
+          Write-Host "host time before: $((Get-Date).ToUniversalTime().ToString('o'))"
+          & w32tm /resync /force
+          & w32tm /query /status
+          Write-Host "host time after:  $((Get-Date).ToUniversalTime().ToString('o'))"
+
+          # See .github/scripts/Invoke-WslBash.ps1. No -PipeFail: the guest script
+          # below is a sequence of probes that must each be allowed to fail.
+          # Wrapped, unlike the `w32tm` calls: this one can raise a genuine
+          # terminating exception (a missing helper, `wsl` failing to invoke),
+          # which 'Continue' does not suppress and which would otherwise abort the
+          # block before the `exit 0` that makes this step non-fatal.
+          try {
+            & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
+          printf 'guest time before: %s\n' "$(date -u +%FT%T.%NZ)"
+          if command -v timedatectl >/dev/null 2>&1 && timedatectl show >/dev/null 2>&1; then
+            timedatectl show -p NTP -p NTPSynchronized -p TimeUSec || true
+            # Wait for the client to report a completed sync before switching it
+            # off: an unsynchronised clock means a correction is still owed, and
+            # it must land here -- while nothing is timing a scenario -- rather
+            # than arriving mid-suite. Already-synchronised returns immediately,
+            # since then nothing is pending.
+            timedatectl set-ntp true 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+              sleep 1
+            done
+            # Then take the stepper out of the picture for the rest of the job.
+            timedatectl set-ntp false 2>/dev/null || true
+            timedatectl show -p NTP -p NTPSynchronized || true
+          else
+            # No systemd in this guest: there is no in-guest NTP client to settle,
+            # so any step the suite sees came from the host. Say so -- the next
+            # failure is read against this line.
+            echo "timedatectl unavailable; no in-guest NTP client to settle"
+          fi
+          printf 'guest time after:  %s\n' "$(date -u +%FT%T.%NZ)"
+          '@
+          } catch {
+            Write-Host "guest clock probe did not run: $_"
+          }
+          # Best-effort by design: never fail the lane on a clock it could not settle.
+          exit 0
+
       - name: Ensure native build deps
         shell: powershell
         run: |

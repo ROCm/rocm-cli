@@ -1065,22 +1065,32 @@ jobs:
         shell: powershell
         run: |
           # `shell: powershell` runs with $ErrorActionPreference = 'Stop', under
-          # which a native command's stderr redirected into the pipeline (`2>&1`)
-          # becomes a terminating error. `w32tm` writes there routinely on a
-          # machine with no configured time source, so relax the preference for
-          # this step rather than let a best-effort probe abort it.
+          # which a native command's stderr becomes a terminating error. `w32tm`
+          # writes there routinely on a machine with no configured time source, so
+          # relax the preference rather than let a best-effort probe abort the
+          # step. This line, not a try/catch, is what keeps the two calls below
+          # non-fatal: a native command's exit code never throws, and under
+          # 'Continue' its stderr is not promoted to a terminating error either,
+          # so a `catch` around them could never fire. Their raw output still
+          # reaches the log.
           $ErrorActionPreference = 'Continue'
 
-          # Host first: land the correction now rather than have it arrive
-          # mid-suite, then report what the service thinks.
+          # Host first, and deliberately not concurrently with the guest below:
+          # in WSL2 the guest clock tracks the host, so settling the host is what
+          # gives the guest's own sync an already-correct reference to land on.
           Write-Host "host time before: $((Get-Date).ToUniversalTime().ToString('o'))"
-          try { & w32tm /resync /force } catch { Write-Host "w32tm /resync: $_" }
-          try { & w32tm /query /status } catch { Write-Host "w32tm /query: $_" }
+          & w32tm /resync /force
+          & w32tm /query /status
           Write-Host "host time after:  $((Get-Date).ToUniversalTime().ToString('o'))"
 
           # See .github/scripts/Invoke-WslBash.ps1. No -PipeFail: the guest script
           # below is a sequence of probes that must each be allowed to fail.
-          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
+          # Wrapped, unlike the `w32tm` calls: this one can raise a genuine
+          # terminating exception (a missing helper, `wsl` failing to invoke),
+          # which 'Continue' does not suppress and which would otherwise abort the
+          # block before the `exit 0` that makes this step non-fatal.
+          try {
+            & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
           printf 'guest time before: %s\n' "$(date -u +%FT%T.%NZ)"
           if command -v timedatectl >/dev/null 2>&1 && timedatectl show >/dev/null 2>&1; then
             timedatectl show -p NTP -p NTPSynchronized -p TimeUSec || true
@@ -1105,6 +1115,9 @@ jobs:
           fi
           printf 'guest time after:  %s\n' "$(date -u +%FT%T.%NZ)"
           '@
+          } catch {
+            Write-Host "guest clock probe did not run: $_"
+          }
           # Best-effort by design: never fail the lane on a clock it could not settle.
           exit 0
 
