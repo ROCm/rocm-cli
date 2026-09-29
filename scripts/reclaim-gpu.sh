@@ -154,11 +154,19 @@ process_alive() {
 #   - leading: the command line starts with argv[0], a path, so the trailing
 #     field never begins with a separator. (Were it to, a leading tab WOULD be
 #     stripped: `IFS=$'\t' read -r pid cmdline <<<$'1\t\tx'` yields `x`.)
-#   - trailing: flattening the final NUL always leaves the string ending in a
-#     space, so a tab is never the last byte. This one is load-bearing and
-#     measured — with the trailing space `…arg\t ` survives intact, without it
-#     the same tab is stripped. The same property is relied on again at the
-#     self-test's record check; if it ever changes, both move together.
+#   - trailing: /proc/<pid>/cmdline ends in a NUL for every process as execve
+#     left it — every engine this rule matches — and flattening that NUL
+#     leaves a trailing space, so a tab is never the last byte. This one is
+#     load-bearing and measured — with the trailing space `…arg\t ` survives
+#     intact, without it the same tab is stripped. The same property is relied
+#     on again at the self-test's record check; if it ever changes, both move
+#     together.
+#
+#     Not every process, though. One that rewrites its argv AND environment
+#     with no NUL left in either (setproctitle taken to the limit) gets a
+#     cmdline with no terminator at all — measured, it can end in a tab. The
+#     tab is then stripped, the identity check below fails, and the pid is
+#     reported "recycled" and not signalled: a miss, never a wrong kill.
 #
 # An earlier revision also claimed the tab "shifts the field boundary" and
 # flattened it for that reason — also false, and deleting the tab from the
@@ -596,6 +604,7 @@ self_test() {
   local forced_out guard_pid
   local escapee_pid escapee_cmd guard_rc probe_cmd
   local zombie_pid zombie_keeper_pid
+  local holders_out holders_engines tmp_case
   local decoy_pids
   local superseded_hit=0
   local probe_failures=0
@@ -956,8 +965,16 @@ self_test() {
   #    The COMPARISON is covered here; check 9 covers the two CALL SITES by
   #    forcing the verdict, because a pid cannot be made to be reused by a
   #    different process on demand.
-  if same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")"; then
+  # The accept case needs the stubborn decoy alive to be comparable at all. If
+  # it has already exited, both reads fail and the guard answers "gone" — a
+  # dead fixture, not a guard that rejects a match, so it is reported as one.
+  guard_rc=0
+  same_selected_process "${stubborn_pid}" "$(cmdline_of "${stubborn_pid}")" || guard_rc=$?
+  if [[ "${guard_rc}" == 0 ]]; then
     echo "ok: escalation guard accepts an unchanged command line"
+  elif [[ "${guard_rc}" == 2 ]]; then
+    echo "FAIL: SIGTERM-ignoring decoy (pid=${stubborn_pid}) exited before the escalation guard could be checked"
+    failures=$((failures + 1))
   else
     echo "FAIL: escalation guard rejected an unchanged command line; nothing would escalate"
     failures=$((failures + 1))
@@ -1106,6 +1123,51 @@ self_test() {
     echo "ok: ordinary decoy exited on SIGTERM without escalation"
   fi
 
+  # 12. report_holders' engine filter — the diagnostic every bash lane runs on a
+  #     failed preflight. The bystanders survived check 10, so they are still
+  #     there to be listed: the manual serve carries an engine marker and must
+  #     appear, the harness binary carries none and must not. Deleting the
+  #     marker derivation leaves grep with no pattern at all, which lists
+  #     nothing and fails the first assertion.
+  holders_out="$(report_holders 2>&1)"
+  holders_engines="$(sed -n '/^--- engine\/serve processes/,/^--- of those/p' <<<"${holders_out}")"
+  if awk -v p="${workload_pid}" '$1 == p { found = 1 } END { exit !found }' <<<"${holders_engines}"; then
+    echo "ok: report_holders lists a process carrying an engine marker"
+  else
+    echo "FAIL: report_holders did not list the manual serve (pid=${workload_pid})"
+    failures=$((failures + 1))
+  fi
+  if awk -v p="${harness_pid}" '$1 == p { found = 1 } END { exit !found }' <<<"${holders_engines}"; then
+    echo "FAIL: report_holders listed a process with no engine marker (pid=${harness_pid})"
+    failures=$((failures + 1))
+  else
+    echo "ok: report_holders leaves out a process with no engine marker"
+  fi
+  #     Fixed-string, not regex: under -E the `.` in this marker would match the
+  #     `-` in the manual serve's path and list it. None of the real markers
+  #     holds a metacharacter, so only an override can tell the two apart.
+  holders_out="$(ENGINE_MARKERS=('manual-serve/llama.server') && report_holders 2>&1)"
+  holders_engines="$(sed -n '/^--- engine\/serve processes/,/^--- of those/p' <<<"${holders_out}")"
+  if awk -v p="${workload_pid}" '$1 == p { found = 1 } END { exit !found }' <<<"${holders_engines}"; then
+    echo "FAIL: report_holders matched a marker as a regex, not a literal substring"
+    failures=$((failures + 1))
+  else
+    echo "ok: report_holders matches markers as literal substrings"
+  fi
+
+  # 13. The bare invocation's rm -rf root. Asserted on the resolver rather than
+  #     by running the deletion, which would clear the host's real scenario
+  #     dirs. A relative TMPDIR must fall back to /tmp — the one branch whose
+  #     failure is `rm -rf` against the CWD.
+  for tmp_case in 'relative/dir|/tmp' '|/tmp' '/abs/dir/|/abs/dir' '/abs/dir|/abs/dir'; do
+    if [[ "$(TMPDIR="${tmp_case%%|*}" scenario_tmp_root)" == "${tmp_case#*|}" ]]; then
+      echo "ok: TMPDIR='${tmp_case%%|*}' clears under ${tmp_case#*|}"
+    else
+      echo "FAIL: TMPDIR='${tmp_case%%|*}' did not resolve to ${tmp_case#*|}"
+      failures=$((failures + 1))
+    fi
+  done
+
   # Includes prewarm_pid: on a GREEN run reclaim has already killed it, but on a
   # FAILED run it was not selected, and it would otherwise outlive the scratch
   # tree for its full 300s as an orphan. Killing the zombie's keeper lets init
@@ -1119,8 +1181,23 @@ self_test() {
   echo "reclaim-gpu self-test: all checks passed"
 }
 
+# The directory the bare invocation clears scenario temp dirs under: TMPDIR when
+# it is absolute, /tmp otherwise. Printed without a trailing slash.
+#
+# The absolute-path test is the SAME one the roots above apply, and it matters
+# most here: this feeds the only consumer that deletes rather than merely
+# failing to match. Interpolated raw, a relative TMPDIR makes the caller's
+# `rm -rf relative/dir/rocm-e2e-*` resolve against the CWD — the repo checkout,
+# on a CI runner. No lane sets one, which is a reason to skip the value, not a
+# reason to hand it to `rm -rf` unchecked. A function rather than inline so the
+# self-test can assert the fallback without deleting anything.
+scenario_tmp_root() {
+  local root="${TMPDIR:-}"
+  [[ "${root}" == /* ]] || root='/tmp'
+  printf '%s' "${root%/}"
+}
+
 main() {
-  local scenario_tmp
   case "${1:-}" in
     '')
       reclaim 0
@@ -1133,16 +1210,7 @@ main() {
       # the guard was dead on the one lane that redirects. Both are listed
       # rather than just TMPDIR: the lanes that do not set it still want /tmp,
       # and a stale tree from before a redirect was added would outlive it.
-      #
-      # The absolute-path test is the SAME one the roots above apply, and it
-      # matters most here: this is the only consumer that deletes rather than
-      # merely failing to match. Interpolated raw, a relative TMPDIR makes this
-      # `rm -rf relative/dir/rocm-e2e-*` resolved against the CWD — the repo
-      # checkout, on a CI runner. No lane sets one, which is a reason to skip
-      # the value, not a reason to hand it to `rm -rf` unchecked.
-      scenario_tmp="${TMPDIR:-}"
-      [[ "${scenario_tmp}" == /* ]] || scenario_tmp='/tmp'
-      rm -rf "${scenario_tmp%/}"/rocm-e2e-* /tmp/rocm-e2e-* 2>/dev/null || true
+      rm -rf "$(scenario_tmp_root)"/rocm-e2e-* /tmp/rocm-e2e-* 2>/dev/null || true
       ;;
     --dry-run) reclaim 1 ;;
     --report-holders) report_holders ;;

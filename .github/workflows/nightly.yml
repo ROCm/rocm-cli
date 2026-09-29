@@ -1353,7 +1353,11 @@ jobs:
           # Name what is holding the card instead of leaving the next reader to
           # reconstruct it: --report-holders prints per-process VRAM and the
           # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
+          # From the guest clone, like every sibling step: `wsl -- bash <file>`
+          # gets no --cd, so a bare relative path would resolve against whatever
+          # directory WSL maps the Windows step's cwd to, and `|| true` would
+          # hide a miss.
+          (cd /root/work/rocm-cli && bash scripts/reclaim-gpu.sh --report-holders) || true
           exit 1
           # This body runs under a bare `bash <file>`: Invoke-WslBash.ps1 adds
           # `-eo pipefail` only when passed `-PipeFail`, which this step does
