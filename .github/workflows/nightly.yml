@@ -373,8 +373,9 @@ jobs:
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
       # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees, so a manual /workload serve on a shared self-hosted runner is
-      # never touched. See scripts/reclaim-gpu.sh.
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
         run: bash scripts/reclaim-gpu.sh
 
@@ -496,8 +497,9 @@ jobs:
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
       # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees, so a manual /workload serve on a shared self-hosted runner is
-      # never touched. See scripts/reclaim-gpu.sh.
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
         run: bash scripts/reclaim-gpu.sh
 
@@ -589,8 +591,9 @@ jobs:
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
       # process on the card and starves this job's serves. Scoped to E2E-owned
-      # trees, so a manual /workload serve on a shared self-hosted runner is
-      # never touched. See scripts/reclaim-gpu.sh.
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
         run: bash scripts/reclaim-gpu.sh
 

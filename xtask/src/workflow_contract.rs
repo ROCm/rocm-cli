@@ -2082,22 +2082,74 @@ permissions:
         let text = std::fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
             .replace("\r\n", "\n");
-        let body = text
+        let after = text
             .split_once("E2E_ROOTS=(")
             .unwrap_or_else(|| panic!("{} must declare E2E_ROOTS=(", p.display()))
-            .1
+            .1;
+
+        // Comments come off BEFORE the closing `)` is located, not per line
+        // afterwards. An inline comment containing a `)` — `'/tmp/rocm-e2e'
+        // # see docs (section 3)` — otherwise closes the array at that paren,
+        // and every root below it vanishes from the parse. The test then fails
+        // in the mirror->script direction naming a root that is plainly still
+        // in the script, and a maintainer who follows that message deletes a
+        // real root from both PowerShell mirrors. Measured: that spelling made
+        // this test demand the deletion of `e2e-prewarm`, the root this whole
+        // change exists to add.
+        let decommented = after
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with('#') {
+                    ""
+                } else {
+                    strip_comment(l)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = decommented
             .split_once(')')
             .unwrap_or_else(|| panic!("{} has an unterminated E2E_ROOTS array", p.display()))
             .0;
-        let roots: Vec<String> = body
-            .lines()
-            .filter_map(|l| {
-                let l = strip_comment(l).trim();
-                l.strip_prefix('\'')
-                    .and_then(|l| l.strip_suffix('\''))
-                    .map(str::to_owned)
-            })
-            .collect();
+
+        // Every non-empty line inside the array must parse into exactly one
+        // root. This is the load-bearing half: without it an unrecognised
+        // spelling is silently DROPPED, and a dropped root is indistinguishable
+        // from mirror drift downstream — so the failure arrives as a confident
+        // wrong remedy rather than as "this parser did not understand the
+        // array". A checker that converts a formatting change into advice that
+        // removes Windows coverage is worse than no checker on that axis.
+        //
+        // Deliberately NOT tokenised on whitespace: that would silently split a
+        // future root containing a space into two bogus roots, which is this
+        // same defect class in a new place.
+        let mut roots: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Both bash quotings are accepted. A quoted root can never contain
+            // its OWN delimiter, so requiring that is what rejects the whole
+            // array folded onto one line — `E2E_ROOTS=('a' 'b')` parses as the
+            // single bogus root `a' 'b` under a prefix/suffix strip alone, and
+            // then fails script->mirror naming a root nobody wrote.
+            let parsed = ['\'', '"'].into_iter().find_map(|q| {
+                line.strip_prefix(q)
+                    .and_then(|l| l.strip_suffix(q))
+                    .filter(|inner| !inner.contains(q))
+            });
+            let Some(root) = parsed else {
+                panic!(
+                    "{}: E2E_ROOTS line `{line}` is not a single quoted root. This test's \
+                     parser did not understand it — that is NOT drift against the PowerShell \
+                     mirrors, so do not remove anything from them. Restore one quoted root \
+                     per line, or teach this parser the new spelling (EAI-8751)",
+                    p.display()
+                );
+            };
+            roots.push(root.to_owned());
+        }
         assert!(
             !roots.is_empty(),
             "{} declared no E2E_ROOTS entries — the parser or the array shape changed",
@@ -2183,6 +2235,15 @@ permissions:
             // What it still pins is the part that matters here: that every root
             // the script knows about is named in both mirrors, so a root added
             // to one side cannot silently miss the Windows lanes.
+            //
+            // CAVEAT: the `/tmp/` prefix below is the only absolute prefix this
+            // mapping knows. A future root anchored under any other one — say
+            // `/var/tmp/rocm-e2e` — would be compared to the mirrors verbatim,
+            // fail against their bare segment, and need this line edited by
+            // hand: the manual sync this test exists to remove, reappearing one
+            // level up. Named rather than generalised, because there is exactly
+            // one anchored root today and a speculative prefix list would be
+            // untested code.
             let expected: Vec<&str> = roots
                 .iter()
                 .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))

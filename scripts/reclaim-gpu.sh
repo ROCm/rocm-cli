@@ -23,9 +23,16 @@
 #
 # The rule here is order-independent and covers every E2E-owned tree: a process
 # is reclaimed when its command line names an E2E root AND an engine/serve
-# process. Both halves are required, which is what keeps a legitimate
-# `/workload` manual-testing serve on a shared self-hosted runner safe — it
-# names no E2E root.
+# process. Both halves are required, which is what spares a legitimate
+# `/workload` manual-testing serve on a shared self-hosted runner in the
+# ordinary case: it names no E2E root, so the root half does not hold.
+#
+# That is a narrowing, NOT a guarantee, and it is stated here rather than only
+# in WHAT THE ANCHORING DOES AND DOES NOT BUY below, because a reader who stops
+# at this paragraph is the operator deciding whether their own serve is safe. A
+# `/workload` serve IS selected when its command line happens to name a root in
+# an argument — `--model-path /home/dev/e2e-shared-models/x.gguf` is the
+# measured case. Read that section before relying on this one.
 
 set -euo pipefail
 
@@ -53,8 +60,8 @@ set -euo pipefail
 # SIGKILLed. Measured, and briefly shipped, which is why it is spelled out.
 #
 # Anchoring the scenario root to an absolute path NARROWS that surface. It does
-# not close it, and the `/workload` promise below is correspondingly weaker than
-# it reads:
+# not close it, and the `/workload` narrowing stated at the top of this file is
+# correspondingly weaker than it would read on its own:
 #
 #   - under a redirected TMPDIR, an argument naming a sibling path still
 #     matches — `--extra-data-dir /tmp/mydir/rocm-e2e-notes` with
@@ -136,7 +143,7 @@ process_alive() {
 # emits a record that splits into two on the way back: the real pid arrives
 # carrying a truncated command line, fails the identity check against its own
 # full one, and is reported "recycled ... not signalling" — so the leak survives
-# both TERM and KILL while the summary prints "0 process(es) terminated". That is
+# both TERM and KILL while the summary prints "0 process(es) signalled". That is
 # the silent miss this whole script exists to end, so it is fixed at the single
 # point every consumer already reads through rather than at each of them.
 #
@@ -344,7 +351,14 @@ reclaim() {
     esac
   done <<<"${selected}"
 
-  echo "reclaim: ${killed} process(es) terminated"
+  # SIGNALLED, not terminated. The count is incremented where TERM is sent, and
+  # both kill calls are `2>/dev/null || true` so a signal this process was not
+  # permitted to send is invisible here; the SIGKILL loop does not touch the
+  # count at all. Claiming termination would therefore report success for a
+  # process still holding the card — the exact failure mode the unconditional
+  # `reclaimed` line had, which is what let this go unnoticed for hours. The
+  # per-process lines above are where the detail lives.
+  echo "reclaim: ${killed} process(es) signalled"
 }
 
 # Diagnostics for a preflight that hit its ceiling. Never fails: it runs on the
@@ -776,7 +790,7 @@ self_test() {
   #      then arrives with a TRUNCATED command line, fails the identity check
   #      against its own full one, and is passed over as "recycled": the leak
   #      survives TERM and KILL alike while the run signs off with "0 process(es)
-  #      terminated". cmdline_of flattens it for that reason, and deleting that
+  #      signalled". cmdline_of flattens it for that reason, and deleting that
   #      flattening fails this check.
   #    - a TAB does NOT, even though it is the field separator, because `read`
   #      hands leftover separators to the last name and the trailing space left
@@ -855,10 +869,24 @@ self_test() {
     echo "ok: every selection record survives delimiters in a command line"
   fi
 
+  # Checks 4 and 5 are NEGATIVE assertions, and a negative assertion is
+  # satisfied trivially by a selection that is empty. Both therefore gate their
+  # affirmation on the selection being non-empty, the same way check 7 gates its
+  # containment line and for the same reason: checks 2 and 6 already fail such a
+  # run, so this is not a false green — but "ok: a manual serve is not selected"
+  # printed on a run where nothing was selected at all is evidence that misleads
+  # whoever is diagnosing it.
+  #
+  # Reported as SKIP rather than counted as a failure, so the run's cause stays
+  # the check that actually detected the breakage rather than these two
+  # restating it.
+
   # 4. A manual-testing serve is left alone (engine marker, but no E2E root).
   if grep -q "^${workload_pid}	" <<<"${selected}"; then
     echo "FAIL: /workload manual serve was selected; reclaim must not touch it"
     failures=$((failures + 1))
+  elif [[ -z "${selected}" ]]; then
+    echo "SKIP: /workload manual serve was not selected, but the selection is EMPTY — this check proved nothing"
   else
     echo "ok: /workload manual serve is not selected"
   fi
@@ -868,6 +896,8 @@ self_test() {
   if grep -q "^${harness_pid}	" <<<"${selected}"; then
     echo "FAIL: E2E test binary was selected; the engine half of the rule is not enforced"
     failures=$((failures + 1))
+  elif [[ -z "${selected}" ]]; then
+    echo "SKIP: the E2E test binary was not selected, but the selection is EMPTY — this check proved nothing"
   else
     echo "ok: an E2E root without an engine marker is not selected"
   fi
@@ -1167,6 +1197,18 @@ self_test() {
       failures=$((failures + 1))
     fi
   done
+  #     The resolver is only half of it. Nothing above asserts that the `rm -rf`
+  #     statement still CALLS it, so reverting that one line to an inline
+  #     `${TMPDIR:-/tmp}` reintroduces the relative-TMPDIR hazard with the whole
+  #     suite green — a covered helper nothing is obliged to use. Asserted
+  #     against this file's own source, because actually running the deletion is
+  #     what the paragraph above rules out.
+  if grep -qE '^[[:space:]]*rm -rf "\$\(scenario_tmp_root\)"' "${BASH_SOURCE[0]}"; then
+    echo "ok: the bare invocation clears its scenario dirs through scenario_tmp_root"
+  else
+    echo "FAIL: the rm -rf statement no longer calls scenario_tmp_root; TMPDIR handling is bypassed"
+    failures=$((failures + 1))
+  fi
 
   # Includes prewarm_pid: on a GREEN run reclaim has already killed it, but on a
   # FAILED run it was not selected, and it would otherwise outlive the scratch
