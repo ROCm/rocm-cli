@@ -943,7 +943,8 @@ enum ServicesCommand {
     ///
     /// Waits for a managed launch already under way to publish its record
     /// before reading the directory, and waits as long as that launch takes.
-    /// There is no timeout. It says so on screen while it waits.
+    /// There is no timeout. On an interactive terminal it says so while it
+    /// waits; piped or redirected output stays silent.
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///

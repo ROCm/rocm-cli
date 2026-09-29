@@ -577,10 +577,14 @@ thread and let the code under test block on it.
   publishes the record after a fixed delay sized to outlast that process's
   startup. A fixed delay against a variable startup fails one-sidedly in the
   unhelpful direction — a slow runner lets the prune arrive after the record is
-  already published, where the key survives for a reason unrelated to the lock —
-  so the scenario also asserts the prune's own wall clock covers the hold
-  (`the prune blocked until the launch published its record`). That converts a
-  timing-lucky pass into a failure.
+  already published, where the key survives for a reason unrelated to the lock.
+  The scenario's discriminating assertion is the key surviving, and it only
+  discriminates while the prune's startup is shorter than the hold. The wall
+  clock it also asserts (`the prune blocked until the launch published its
+  record`) is a one-sided sanity bound, not a cure for that: `cli_elapsed`
+  brackets the whole child process, so a long elapsed time does not establish
+  that the prune blocked on the lock. It catches a prune that returned *too
+  fast* to have waited; it cannot catch one that was merely slow to start.
 
 Both go red if the `FileLock::acquire` is removed from
 `prune_managed_service_records`, and `services_prune_sweeps_engine_state_left_behind_by_a_deleted_record`

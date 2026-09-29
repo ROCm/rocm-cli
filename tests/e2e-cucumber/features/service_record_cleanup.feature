@@ -96,11 +96,16 @@ Feature: Local server record cleanup
   # scheduling. The `rocm services prune` under test is a separate process, which
   # is the whole point: cross-process exclusion is what the fix relies on.
   #
-  # The staged hold is a fixed two seconds, so the risk is one-sided and points
-  # the wrong way: a prune that reached the lock only after the hold expired
-  # would leave the key alone for the wrong reason and pass without exercising
-  # anything. The prune's own wall clock is therefore asserted to cover the
-  # hold — it either blocked, or the scenario fails instead of passing quietly.
+  # The key surviving is the assertion that carries this: inside the staged
+  # window that key is the only file the starting service owns, which is exactly
+  # what the leftover sweep deletes. The staged hold is a fixed two seconds
+  # against a variable process startup, so the risk is one-sided and points the
+  # wrong way — a prune that reached the lock only after the hold expired leaves
+  # the key alone for a reason unrelated to the lock, and nothing here detects
+  # that. The wall-clock step below is a sanity bound, not a cure: it catches a
+  # prune that returns while the lock is still held, which is what dropping the
+  # acquire produces, but a slow start satisfies it without the prune ever
+  # queueing on the lock.
   #
   # The record `--any-age` was asked to remove still goes, in the same run: a
   # record file on disk is what makes its companions not-leftovers in the first
@@ -110,6 +115,6 @@ Feature: Local server record cleanup
     Given a local server record that is no longer running
     And a managed launch holding the launch lock between its key write and its record write
     When the user prunes every record whatever its age
-    Then the prune blocked until the launch published its record
+    Then the prune did not return before the staged hold elapsed
     And every file belonging to that record is gone
     And the endpoint key file of the starting server is still there

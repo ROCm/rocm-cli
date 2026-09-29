@@ -43,22 +43,15 @@ const STARTING_KEY: &str = "live-endpoint-key";
 /// the lock" for a build where it would have. Tying the hold to the spawn
 /// removes the runner's scheduling from the measurement entirely.
 const LAUNCH_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-/// Slack allowed when asserting the prune really did block for that hold.
+/// Slack allowed on the prune's elapsed time before it is called shorter than
+/// the hold.
 ///
 /// The releasing thread is started just before the spawn rather than exactly at
 /// it, so the prune's own timer can begin a hair after the hold's. That gap is
-/// microseconds, and it is orders of magnitude smaller than what this assertion
-/// separates: a prune that never takes the lock returns in well under a second.
+/// microseconds, and it is orders of magnitude smaller than the difference the
+/// bound in [`prune_did_not_return_before_the_hold`] is there to notice: a prune
+/// that never takes the lock returns in well under a second.
 const LAUNCH_WAIT_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Set by the staged-launch Given step, consumed by the prune When step.
-///
-/// The staged launch holds the lock until it is told to let go, so the hold
-/// cannot expire while the harness is between steps. Only the launch-lock
-/// scenario registers a sender; the other prune scenarios find `None` and run
-/// unimpeded.
-static LAUNCH_RELEASE: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
-    std::sync::Mutex::new(None);
 
 fn data_dir(world: &E2eWorld) -> PathBuf {
     world
@@ -246,11 +239,14 @@ async fn orphaned_engine_state(world: &mut E2eWorld) {
 /// That is a fixed duration against a variable startup, and the way it fails is
 /// one-sided in the unhelpful direction — a slow or loaded runner does not flake
 /// the scenario, it lets the prune arrive after the record is published, where
-/// the key survives for a reason that has nothing to do with the lock. So the
-/// staged hold is not trusted on its own: `prune_blocked_for_the_hold` asserts
-/// the prune's own wall clock covers [`LAUNCH_PUBLISH_DELAY`], which turns that
-/// timing-lucky pass into a failure. Overshooting the sleep is safe — it only
-/// widens the margin the prune has to cover.
+/// the key survives for a reason that has nothing to do with the lock. Nothing
+/// in the scenario detects that case, and `prune_did_not_return_before_the_hold`
+/// is not a cure for it: the prune's elapsed time brackets the whole child
+/// process, so a startup longer than the hold satisfies that bound without the
+/// prune ever having queued on the lock. What the scenario rests on is
+/// [`starting_key_present`], and that is evidence about the lock only while
+/// startup is shorter than the hold. Overshooting the sleep is therefore the
+/// safe direction: it widens the startup margin the hold covers.
 #[given("a managed launch holding the launch lock between its key write and its record write")]
 async fn launch_between_its_two_writes(world: &mut E2eWorld) {
     let services = services_dir(world);
@@ -291,7 +287,7 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
     let lock_path = services.join("launch.lock");
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let staged = std::thread::spawn(move || {
         let lock =
             rocm_core::FileLock::acquire(&lock_path).expect("failed to take the launch lock");
         held_tx.send(()).expect("signal that the lock is held");
@@ -299,7 +295,9 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
         // instead would put the harness's step transition inside the hold, and
         // a transition slower than the span releases the lock before `rocm` is
         // ever spawned. The generous timeout is a stuck-test guard, not the
-        // hold: the When step signals within milliseconds of the spawn.
+        // hold: the When step signals within milliseconds of the spawn, and a
+        // scenario that never reaches it drops the sender, which disconnects this
+        // receive at once rather than leaving it to time out.
         let _ = release_rx.recv_timeout(std::time::Duration::from_mins(2));
         // Write 2 of 2, still under the lock.
         std::fs::write(
@@ -314,7 +312,8 @@ async fn launch_between_its_two_writes(world: &mut E2eWorld) {
     held_rx
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the launch lock was taken");
-    *LAUNCH_RELEASE.lock().expect("launch-release slot poisoned") = Some(release_tx);
+    world.launch_release = Some(release_tx);
+    world.launch_stage = Some(staged);
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -360,21 +359,19 @@ async fn run_prune_default_age(world: &mut E2eWorld) {
 /// `--older-than-hours 0` equivalent: the point is that the advertised flag
 /// reaches the same code path.
 ///
-/// Timed, because for `service-cleanup-07` how long this takes *is* the
-/// behaviour: a prune that never acquired the managed-launch lock is exactly a
-/// prune that came back before the staged launch let go of it.
+/// Timed for `service-cleanup-07`, where a prune that came back before the
+/// staged launch let go of the managed-launch lock cannot have waited for that
+/// lock. The converse does not hold — see
+/// [`prune_did_not_return_before_the_hold`].
 #[when("the user prunes every record whatever its age")]
 async fn run_prune_any_age(world: &mut E2eWorld) {
     // If a launch is staged, start its hold now rather than when it was staged,
     // so the span the prune has to block for begins at the spawn and cannot be
     // eaten by however long the harness took to get from that step to this one.
-    // Taken into a local first so the guard is dropped on this line rather than
-    // being held across the spawn below.
-    let staged_release = LAUNCH_RELEASE
-        .lock()
-        .expect("launch-release slot poisoned")
-        .take();
-    if let Some(release) = staged_release {
+    // The sender lives on this scenario's own World, so a concurrently running
+    // scenario sharing this step's text cannot consume it (see
+    // `E2eWorld::launch_release`).
+    if let Some(release) = world.launch_release.take() {
         std::thread::spawn(move || {
             std::thread::sleep(LAUNCH_PUBLISH_DELAY);
             let _ = release.send(());
@@ -502,28 +499,44 @@ async fn preview_lists_both(world: &mut E2eWorld) {
     );
 }
 
-/// The assertion that makes the staged hold a test rather than a hope.
+/// A sanity bound on how long the prune ran — not evidence that it blocked.
 ///
-/// Without it the scenario's only risk points the wrong way: on a slow or loaded
-/// runner the `rocm` process could take longer to reach the lock than the thread
-/// holds it, and the key would then survive because the record was already
-/// published — a pass that never exercised the defect at all. Requiring the
-/// prune's own wall clock to cover the hold turns that timing-lucky pass into a
-/// failure, so the scenario either proves the block or says it could not.
-#[then("the prune blocked until the launch published its record")]
-async fn prune_blocked_for_the_hold(world: &mut E2eWorld) {
+/// [`crate::run_rocm`] spawns a prebuilt binary and the timer brackets the whole
+/// `Command::output()`, so process startup is inside the measurement. A prune
+/// that ran longer than [`LAUNCH_PUBLISH_DELAY`] may have been queued on the
+/// lock for the hold, or may merely have been slow to start on a loaded runner
+/// and then found a lock that was already free; this assertion cannot separate
+/// those. What it does catch is the other end: a prune that comes back before
+/// the lock was ever released cannot have waited for it. That is what removing
+/// the `FileLock::acquire` from `prune_managed_service_records` produces on any
+/// runner whose `rocm` startup is shorter than the hold. The scenario's
+/// discriminating assertion is [`starting_key_present`]; see the note there for
+/// the limit it carries.
+#[then("the prune did not return before the staged hold elapsed")]
+async fn prune_did_not_return_before_the_hold(world: &mut E2eWorld) {
     let elapsed = world
         .cli_elapsed
         .expect("the prune step must record how long it took");
     assert!(
         elapsed + LAUNCH_WAIT_SLACK >= LAUNCH_PUBLISH_DELAY,
         "prune returned after {elapsed:?}, less than the {LAUNCH_PUBLISH_DELAY:?} the staged \
-         launch held the launch lock — so it did not block on the lock, and whatever else this \
-         scenario asserts was not decided by the fix:\n{}",
+         launch held the launch lock — it came back while the lock was still held, so it cannot \
+         have waited for it, and whatever else this scenario asserts was not decided by the \
+         fix:\n{}",
         combined_output(world)
     );
 }
 
+/// The scenario's discriminating assertion: the 0600 key of a launch that has
+/// not published its record yet must survive the sweep.
+///
+/// It discriminates only while `rocm`'s startup is shorter than the staged hold.
+/// Inside that window the prune reads the directory while the key is the only
+/// file that service owns, which is exactly what the leftover sweep deletes, so
+/// a prune that did not take the lock deletes it. Outside it — a runner slow
+/// enough that the record was published before the prune looked — the key is not
+/// a leftover any more and survives whatever the prune does. The scenario has no
+/// way to tell which of the two it just observed.
 #[then("the endpoint key file of the starting server is still there")]
 async fn starting_key_present(world: &mut E2eWorld) {
     assert_succeeded(world);
@@ -540,9 +553,9 @@ async fn starting_key_present(world: &mut E2eWorld) {
         STARTING_KEY,
         "the key the starting server is about to need must survive intact"
     );
-    // The launch's own second write, which only lands once prune has waited out
-    // the lock. Its presence is what makes the assertion above meaningful rather
-    // than a statement about age.
+    // The launch's own second write. It lands roughly LAUNCH_PUBLISH_DELAY after
+    // the When step began whatever the prune does, so this says the staged thread
+    // got that far — it is a premise check, not evidence about ordering.
     assert!(
         services.join(format!("{STARTING_ID}.json")).exists(),
         "premise: the staged launch must have published its record:\n{}",

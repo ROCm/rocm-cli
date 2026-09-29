@@ -543,9 +543,11 @@ combined. A file whose record has not been written *yet* belongs to a server
 that is still starting, not to something left behind, so `prune` waits for any
 managed launch already under way to finish publishing its record before it looks
 at the directory. That wait lasts as long as the launch does and has no timeout,
-so it is usually imperceptible but is not bounded: `prune` prints
-`Waiting for a launch already under way…` while it waits, including under
-`--dry-run`. The same lock runs in the other direction, so a `rocm serve`
+so it is usually imperceptible but is not bounded: on an interactive terminal
+`prune` prints `Waiting for a launch already under way…` while it waits,
+including under `--dry-run`. That notice goes to stderr and is suppressed when
+stderr is not a terminal, so a piped or scripted prune waits silently. The same
+lock runs in the other direction, so a `rocm serve`
 started while a `prune` is scanning waits for the prune.
 
 `--json` prints the service records verbatim, for scripting and for the remote
