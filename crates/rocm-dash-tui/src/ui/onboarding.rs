@@ -1067,7 +1067,12 @@ mod tests {
         on_key(&mut ob, &mut jobs, key(KeyCode::Esc));
         on_key(&mut ob, &mut jobs, key(KeyCode::Right));
         assert_eq!(
-            ob.as_ref().unwrap().install_config.as_ref().unwrap().channel,
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .channel,
             Channel::Nightly
         );
     }

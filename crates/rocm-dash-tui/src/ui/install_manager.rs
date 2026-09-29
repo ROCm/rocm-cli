@@ -529,7 +529,8 @@ mod tests {
         let args = i.build_args().unwrap();
         let idx = args.iter().position(|a| a == "--prefix").unwrap();
         assert_eq!(
-            args[idx + 1], "/opt/rocm-sdk",
+            args[idx + 1],
+            "/opt/rocm-sdk",
             "this prefix is typed as well as browser-filled, so surrounding \
              whitespace is treated as a typo — unlike onboarding's prefix, \
              which the folder browser is the only writer of"
