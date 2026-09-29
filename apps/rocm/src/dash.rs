@@ -265,7 +265,7 @@ fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
 
 /// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
 /// applies at creation so there is no umask window; a pre-existing directory is
-/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+/// tightened best-effort afterward (matching `server.rs`/`agent/clients.rs`).
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

@@ -20,9 +20,12 @@
 //!
 //! Split into submodules mirroring the crate's `app/mod.rs` → `app/chat.rs`/
 //! `slash.rs`/`summary.rs` mechanical-relocation convention: this file holds
-//! the shared `AgentClient` seam; [`snapshot`] holds the pure JSON telemetry
-//! helpers; [`tools`] holds the rig `Tool` wrappers and dispatch; [`clients`]
-//! holds the four backend implementations.
+//! the shared `AgentClient` seam; `snapshot` holds the pure JSON telemetry
+//! helpers; `tools` holds the rig `Tool` wrappers and dispatch; `clients`
+//! holds the four backend implementations. Unlike `app/mod.rs`'s private
+//! siblings, this file re-exports the submodules' public items — this module
+//! (and its pre-split `crate::agent::*` surface) has in-crate and cross-crate
+//! consumers, so the existing paths must keep resolving.
 
 use async_trait::async_trait;
 

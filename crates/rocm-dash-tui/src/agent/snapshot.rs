@@ -142,6 +142,7 @@ pub fn bench_summary_json(snap: &StateSnapshot) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::fixture_snapshot;
     use rocm_dash_core::metrics::Instance;
 
     fn fixture_with_observation(
@@ -171,7 +172,7 @@ mod tests {
 
     #[test]
     fn gpu_status_json_returns_known_gpu_metrics() {
-        let snap = crate::agent::fixture_snapshot();
+        let snap = fixture_snapshot();
         let v = gpu_status_json(&snap, Some(2));
         let g = &v["gpu"];
         assert_eq!(g["device_id"], "gpu-2");
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn list_instances_json_reports_instance_fields() {
-        let v = list_instances_json(&crate::agent::fixture_snapshot());
+        let v = list_instances_json(&fixture_snapshot());
         assert_eq!(v["instance_count"], 1);
         let i = &v["instances"][0];
         assert_eq!(i["name"], "vllm-a");
@@ -201,13 +202,13 @@ mod tests {
     #[test]
     fn tokens_per_watt_json_matches_core_efficiency() {
         // gen_tps 500 / power 250 (gpu-2) = 2.0, matching the reducer.
-        let v = tokens_per_watt_json(&crate::agent::fixture_snapshot());
+        let v = tokens_per_watt_json(&fixture_snapshot());
         assert_eq!(v["instances"][0]["tokens_per_watt"], 2.0);
     }
 
     #[test]
     fn bench_summary_json_rolls_up_groups() {
-        let v = bench_summary_json(&crate::agent::fixture_snapshot());
+        let v = bench_summary_json(&fixture_snapshot());
         assert_eq!(v["group_count"], 1);
         let g = &v["groups"][0];
         assert_eq!(g["cell"], "c1");
