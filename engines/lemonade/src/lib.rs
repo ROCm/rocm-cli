@@ -25,6 +25,12 @@ mod process;
 mod runtime_dir;
 mod state;
 
+// Re-exported so this stays reachable at its pre-split crate-root path —
+// `backend_alignment` is a private module, but this constant was `pub` at
+// the crate root before the split, and `apps/rocm` depends on this crate's
+// lib target.
+pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
+
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 pub(crate) const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
