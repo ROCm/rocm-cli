@@ -727,6 +727,12 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Remove amdgpu from any modprobe blacklist and load it.".to_owned(),
         commands,
         needs_sudo: true,
+        // Catalog-aligned, not state-derived: fix.rs's FixRecipe for this fix-id sets
+        // needs_reboot unconditionally, even on this no-blacklist path where the plan
+        // above is just `modprobe amdgpu`. Diagnose conforms to the catalog rather
+        // than the reverse (see assert_needs_reboot_matches_the_catalog below) so
+        // `rocm diagnose` and `rocm fix` never disagree; occasionally over-warning
+        // here is judged cheaper than the drift it replaces.
         needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
         auto_applicable: false,
