@@ -189,8 +189,8 @@ enum Command {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]
         channel: String,
-        /// Recent installs to keep per channel, format, and GPU family when
-        /// pruning after an install or update.
+        /// Recent installs to keep per channel, format, GPU family, and
+        /// toolchain choice when pruning after an install or update.
         #[arg(long, default_value_t = 2)]
         keep: usize,
         /// Pre-warm root holding `config/`, `data/`, and `cache/`. Its

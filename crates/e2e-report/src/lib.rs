@@ -1665,6 +1665,12 @@ struct CommandKey {
 /// coverage % reflects the real surface (a deliberate, reviewable denominator
 /// beats silently drifting).
 const KNOWN_COMMAND_SURFACE: &[&str] = &[
+    "rocm remote targets",
+    "rocm remote serve",
+    "rocm remote doctor",
+    "rocm remote status",
+    "rocm remote attach",
+    "rocm remote stop",
     "rocm examine",
     "rocm diagnose",
     "rocm fix",
