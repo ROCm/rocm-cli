@@ -6663,16 +6663,23 @@ fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
     record.write()
 }
 
-/// Retire `record` when `outcome` failed, so *any* bail-out between writing the
-/// record and getting a live child stops it claiming its engine + model.
+/// Retire `record` when `outcome` failed, so a bail-out before the child exists
+/// stops it claiming its engine + model.
 ///
-/// Every fallible step after `record.write()` has to go through here. Each one
-/// that does not is another way to strand the pid-0 `"starting"` corpse — the
-/// failures differ, the wedge is identical.
+/// Every fallible step between `record.write()` and the spawn has to go through
+/// here. Each one that does not is another way to strand the pid-0 `"starting"`
+/// corpse — the failures differ, the wedge is identical.
 ///
-/// Takes an already-evaluated `Result` rather than a closure so it can wrap the
-/// straight-line prefix between the record write and the spawn without holding a
-/// second borrow of `record` across the call.
+/// **The span ends at the spawn, deliberately.** Once a child exists, retiring the
+/// record is no longer the safe default: it frees this engine + model for the next
+/// `rocm serve`, which would start a rival engine on the same port while the child
+/// this launch spawned may still be alive. Past that point the caller has to decide
+/// per failure whether the child is known dead — which is what
+/// [`fail_managed_launch_if_engine_died`] does, and why a failed *liveness query*
+/// is not routed here.
+///
+/// Takes an already-evaluated `Result` rather than a closure so it can wrap that
+/// prefix without holding a second borrow of `record` across the call.
 ///
 /// The retirement error is deliberately dropped: what the user needs to see is
 /// the failure that aborted the launch, not a bookkeeping failure behind it.
@@ -6687,8 +6694,15 @@ fn retire_record_on_error<T>(record: &mut ManagedServiceRecord, outcome: Result<
 ///
 /// Both platforms funnel their startup check through here — Unix from
 /// `Child::try_wait`, Windows from the watched detached spawn — so a child that
-/// dies on the way up produces the same error, carrying the same tail of the
-/// child's own log, whichever platform the user is on.
+/// is *observed* to have died produces the same error, carrying the same tail of
+/// the child's own log, whichever platform the user is on.
+///
+/// A liveness query that *fails* is a different case, and the platforms do not
+/// agree on it. Windows degrades to "assume it is alive": `observe_early_exit`
+/// reports `None` when the wait times out or the exit code cannot be read, so the
+/// launch proceeds. Unix propagates the `try_wait` error and fails the launch.
+/// Neither retires the record, because at that point the child may be running and
+/// releasing the engine + model would invite a rival engine onto the same port.
 fn fail_managed_launch_if_engine_died(
     record: &mut ManagedServiceRecord,
     startup_exit: Option<ExitStatus>,
@@ -6909,10 +6923,12 @@ fn spawn_managed_engine_child(
     record.requires_api_key = require_api_key;
     record.write()?;
 
-    // From here to a live child, every fallible step goes through
+    // From here up to and including the spawn, every fallible step goes through
     // `retire_record_on_error`: the record is on disk claiming this engine + model,
     // so any bail-out that skips the retirement wedges the service just as an
-    // unretired startup death would.
+    // unretired startup death would. The span stops at the spawn — see that
+    // helper's doc for why retiring is no longer the safe default once a child
+    // exists.
     let engine_state_parent = record.engine_state_path.parent().map(Path::to_path_buf);
     if let Some(parent) = engine_state_parent {
         let created = fs::create_dir_all(&parent)
@@ -7009,7 +7025,10 @@ fn spawn_managed_engine_child(
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
+        // Evaluated first so the borrow of `record.log_path` ends before the
+        // `&mut record` the retirement needs.
+        let attached = attach_background_stdio(&mut command, Some(&record.log_path));
+        retire_record_on_error(&mut record, attached)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
@@ -7024,6 +7043,10 @@ fn spawn_managed_engine_child(
         let mut child = retire_record_on_error(&mut record, spawned)?;
         let child_pid = child.id();
         thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
+        // NOT routed through `retire_record_on_error`: the child is already
+        // spawned, and a failed query means its state is unknown, not that it
+        // died. Retiring here would release the engine + model to the next serve
+        // while this child may still be listening on the port.
         let startup_exit = child
             .try_wait()
             .context("failed to check managed engine startup state")?;
@@ -18287,9 +18310,14 @@ fn restart_internal_managed_service(
     }
     // The stop above may have recorded an unconfirmed-stop marker; a successful
     // restart supersedes it. Leaving it set would let the next liveness refresh
-    // delete the key of the service we are bringing back up. Reaches disk with
-    // the record writes below; if the restart bails before one of those, the
-    // marker stays set on disk — correct, since then the stop is what stands.
+    // delete the key of the service we are bringing back up.
+    //
+    // A failed restart now persists the cleared marker too: the bail paths below
+    // retire the record, and retiring writes it. So the key outlives a restart
+    // that never got an engine up, rather than being reclaimed by the next
+    // refresh. That is the safe direction — the record is left `"failed"`, which
+    // is not live, so nothing reuses the service while the key waits for a
+    // retry — but it is a change from when every bail left the marker set.
     record.stop_requested_unix_ms = None;
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
@@ -18354,7 +18382,10 @@ fn restart_internal_managed_service(
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
+        // Evaluated first so the borrow of `record.log_path` ends before the
+        // `&mut record` the retirement needs.
+        let attached = attach_background_stdio(&mut command, Some(&record.log_path));
+        retire_record_on_error(&mut record, attached)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
@@ -18368,6 +18399,8 @@ fn restart_internal_managed_service(
             .context("failed to restart managed engine process");
         let mut child = retire_record_on_error(&mut record, spawned)?;
         thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
+        // Not retired on a failed query, for the reason given at the launch site:
+        // an unknown child state is not a dead child.
         let startup_exit = child
             .try_wait()
             .context("failed to check restarted engine startup state")?;
