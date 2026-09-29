@@ -15,22 +15,25 @@
 //! - Percentages always with 1 decimal unless < 0.1, then 2 decimals.
 //! - Optional values render `-`.
 //! - [`display_or_placeholder`] is the one exception to "numeric": a small
-//!   shared UI helper for rendering an optional field's value, reused by
-//!   install-manager and onboarding so both overlays stay visually consistent.
+//!   shared UI helper for rendering an optional field's value, so every overlay
+//!   that has one stays visually consistent.
 
 use chrono::{DateTime, Utc};
 use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 
 /// An optional field's value, or `placeholder` when unset.
 ///
-/// Shared by the install-manager (Channel row, `--prefix` folder row) and
-/// onboarding (Configure step's Folder row) overlays, all of which leave the
-/// field blank until a value is chosen — either via the
-/// [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or, in
-/// install-manager's case, by typing directly. Whether to trim the *value*
-/// before using it as an argument is a separate, caller-specific decision —
-/// see `install_manager::InstallManagerState::build_args` and
-/// `onboarding::build_install_args`.
+/// For any overlay row that stays blank until the user fills it — by typing, or
+/// via the [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or by
+/// picking from a list. The callers are deliberately not enumerated here: that
+/// list has gone stale twice, and a grep for the function name is exact.
+///
+/// "Unset" means whitespace-only, matching every caller's own emptiness test,
+/// so a row never looks populated while the command would reject the value as
+/// empty. Whether to trim the *value* before passing it on is a separate,
+/// caller-specific decision: onboarding's install prefix is written only by the
+/// folder browser and so is kept byte-exact, while the typed fields elsewhere
+/// are trimmed. See `onboarding::build_install_args` for that contrast.
 pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
     if v.trim().is_empty() {
         placeholder.to_string()

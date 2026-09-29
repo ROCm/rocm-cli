@@ -176,13 +176,18 @@ impl ServeWizardState {
 
     /// Build the `rocm` argv for the current form, or an error message.
     fn build_args(&self) -> Result<Vec<String>, String> {
-        // Never trim the value itself: `self.model` can come from the folder
-        // browser, so trimming could silently redirect the launch to a
-        // different path if a real model folder name ends in whitespace.
-        if self.model.trim().is_empty() {
+        // Trimmed, and deliberately so: `self.model` is typed as often as it is
+        // browser-filled, and three other places already derive from the
+        // trimmed form — the approval card's title, the job id, and the
+        // "already running" guard. Staging an untrimmed value here would let
+        // two launches differing only by trailing whitespace collide on one job
+        // id while actually running different commands. `host` and `port` below
+        // follow the same rule.
+        let model = self.model.trim();
+        if model.is_empty() {
             return Err("model is required".to_string());
         }
-        let mut args = vec!["serve".to_string(), self.model.clone()];
+        let mut args = vec!["serve".to_string(), model.to_string()];
         args.push("--engine".to_string());
         args.push(ENGINES[self.engine_idx.min(ENGINES.len() - 1)].to_string());
         // Index 0 = engine default → omit --device.
@@ -621,16 +626,17 @@ mod tests {
     }
 
     #[test]
-    fn model_with_trailing_whitespace_is_passed_through_untrimmed() {
+    fn model_is_trimmed_so_argv_matches_the_job_id_and_approval_title() {
         let w = ServeWizardState {
-            model: "/mnt/models/glm ".into(),
+            model: " /mnt/models/glm ".into(),
             ..Default::default()
         };
         let args = w.build_args().unwrap();
         assert_eq!(
-            args[1], "/mnt/models/glm ",
-            "model can come from the folder browser — a real folder name is \
-             never mangled, even if it ends in whitespace"
+            args[1], "/mnt/models/glm",
+            "the approval title, the job id and the duplicate-launch guard all \
+             key off model.trim(); staging an untrimmed value here would let \
+             two launches share one job id while running different commands"
         );
     }
 

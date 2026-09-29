@@ -146,12 +146,24 @@ impl InstallManagerState {
             "--format".to_string(),
             FORMATS[self.format_idx.min(FORMATS.len() - 1)].to_string(),
         ];
-        // Never trim the value itself: `self.prefix` can come from the folder
-        // browser, so trimming could silently redirect the install into a
-        // different directory if a real folder name ends in whitespace.
-        if !self.prefix.trim().is_empty() {
+        // The crate's rule is "byte-exact where the folder browser is the only
+        // writer; trimmed where a human types". This field is both — the
+        // browser fills it, and `type_char` lets it be edited — so it is
+        // trimmed, like `channel` above and like every other typed field in
+        // this form. `onboarding::build_install_args` is the other side of that
+        // rule: nothing but the browser can write its prefix, so it stays exact.
+        //
+        // The tradeoff is deliberate and worth stating, because it is a real
+        // loss: a directory whose name genuinely ends in whitespace (legal on
+        // Linux) and is picked through the browser will be staged trimmed, and
+        // the install goes elsewhere. That is accepted here because the same
+        // whitespace is far more often a typo or a paste artefact on a field a
+        // user types into, and silently installing to a path with an invisible
+        // trailing space is the worse of the two failures.
+        let prefix = self.prefix.trim();
+        if !prefix.is_empty() {
             args.push("--prefix".to_string());
-            args.push(self.prefix.clone());
+            args.push(prefix.to_string());
         }
         if self.dry_run {
             args.push("--dry-run".to_string());
@@ -509,18 +521,32 @@ mod tests {
     }
 
     #[test]
-    fn prefix_with_trailing_whitespace_is_passed_through_untrimmed() {
+    fn prefix_is_trimmed_before_staging() {
         let i = InstallManagerState {
-            prefix: "/opt/rocm-sdk ".into(),
+            prefix: "  /opt/rocm-sdk ".into(),
             ..Default::default()
         };
         let args = i.build_args().unwrap();
         let idx = args.iter().position(|a| a == "--prefix").unwrap();
         assert_eq!(
-            args[idx + 1],
-            "/opt/rocm-sdk ",
-            "prefix comes from the folder browser, never typed — a real folder \
-             name is never mangled, even if it ends in whitespace"
+            args[idx + 1], "/opt/rocm-sdk",
+            "this prefix is typed as well as browser-filled, so surrounding \
+             whitespace is treated as a typo — unlike onboarding's prefix, \
+             which the folder browser is the only writer of"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_prefix_stages_no_prefix_flag() {
+        let i = InstallManagerState {
+            prefix: "   ".into(),
+            ..Default::default()
+        };
+        let args = i.build_args().unwrap();
+        assert!(
+            !args.iter().any(|a| a == "--prefix"),
+            "a blank prefix means 'default managed folder', which the Folder \
+             row already renders as its placeholder"
         );
     }
 

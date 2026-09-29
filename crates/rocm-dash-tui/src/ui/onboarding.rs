@@ -186,9 +186,14 @@ pub struct InstallConfig {
     pub prefix: String,
 }
 
-/// Build the `install sdk` args from a configuration. A `None` pin (or an empty
-/// value) leaves the command at `--channel <ch> --format wheel`, so the default
-/// Release path is byte-identical to the pre-toggle behavior.
+/// Build the `install sdk` args from a configuration.
+///
+/// The command is always `--channel <ch> --format wheel
+/// --approve-replacing-active-default`. Two optional pairs slot in: `--prefix`
+/// (only when a folder has been chosen, before the approval flag) and
+/// `--build-date`/`--version` (only when a pin mode is selected with a non-empty
+/// value, after it). Leaving both unset keeps the default Release path
+/// byte-identical to the pre-toggle behavior.
 fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
     let mut args = vec![
         "install".to_string(),
@@ -418,17 +423,40 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                 stage_approval(o, OnboardingChoice::InstallSdk, args);
             }
         }
+        // `Tab` browses for the install folder, mirroring the Tab-browse
+        // binding the install-manager and serve-wizard forms already use. The
+        // channel is on `←/→` only — see the catch-all arm below.
+        //
+        // Gated on `install_config` rather than assuming the caller checked:
+        // `on_key`'s folder-browser branch uses `install_config.is_some()` to
+        // tell a Configure browse from an Adopt one, so opening this browser
+        // with `install_config` unset would silently stage the chosen path as an
+        // *adopt* instead. The guard makes that impossible here rather than
+        // relying on a single caller to keep it true.
         KeyCode::Tab => {
-            let prefix = o.install_config.as_ref().map(|cfg| cfg.prefix.as_str());
-            let start = match prefix {
-                Some(p) if !p.trim().is_empty() => std::path::PathBuf::from(p),
-                _ => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
-            };
-            o.browser = Some(FolderBrowser::new("Pick an install folder", start));
+            if let Some(cfg) = o.install_config.as_ref() {
+                // Reopen where the user left off, byte-exact: `cfg.prefix` is
+                // written only by the browser, so a real folder name ending in
+                // whitespace must not be trimmed into a different path.
+                let start = if cfg.prefix.trim().is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                } else {
+                    std::path::PathBuf::from(cfg.prefix.as_str())
+                };
+                o.browser = Some(FolderBrowser::new("Pick an install folder", start));
+            }
         }
         other => {
             if let Some(cfg) = o.install_config.as_mut() {
                 match other {
+                    // `←/→` only, deliberately: `Tab` is the folder-browser key
+                    // in the arm above, as it is in the install-manager and
+                    // serve-wizard forms, and one key cannot do both. An
+                    // earlier revision of this view (#73) did also toggle the
+                    // channel on `Tab`; do not re-add it here. The on-screen
+                    // hint advertises `←→ channel`, and the test
+                    // `tab_browses_instead_of_toggling_the_channel` pins the
+                    // split.
                     KeyCode::Left | KeyCode::Right => {
                         cfg.channel = cfg.channel.toggled();
                     }
@@ -1014,6 +1042,33 @@ mod tests {
                 "wheel",
                 "--approve-replacing-active-default"
             ]
+        );
+    }
+
+    /// `Tab` opens the folder browser and `←/→` toggle the channel — two
+    /// separate keys. An earlier revision of this view (#73) toggled the
+    /// channel on `Tab` as well, so pin the split explicitly: a future
+    /// re-grouping of `configure_key`'s catch-all arm could otherwise restore
+    /// or lose either half without a test noticing.
+    #[test]
+    fn tab_browses_instead_of_toggling_the_channel() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        {
+            let o = ob.as_ref().unwrap();
+            assert!(o.browser.is_some(), "Tab opens the folder browser");
+            assert_eq!(
+                o.install_config.as_ref().unwrap().channel,
+                Channel::Release,
+                "Tab must not also cycle the channel"
+            );
+        }
+        // Esc closes the browser without choosing; ←/→ still own the channel.
+        on_key(&mut ob, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Right));
+        assert_eq!(
+            ob.as_ref().unwrap().install_config.as_ref().unwrap().channel,
+            Channel::Nightly
         );
     }
 
