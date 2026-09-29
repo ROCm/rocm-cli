@@ -7951,8 +7951,12 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
     "amd-smi".into()
 }
 
-/// Device node of the AMD kernel fusion driver. Linux-only; no other platform
-/// exposes one.
+/// Device node of the AMD kernel fusion driver. Bare-metal Linux only: no other
+/// platform exposes one, and WSL — which *is* `target_os = "linux"` — is not an
+/// exception to hand-wave past. It reaches the GPU through `/dev/dxg` and the
+/// Windows host driver and has no `/dev/kfd` at all, which is why the WSL
+/// diagnosis catalog skips every bare-metal driver check (see `docs/wsl.md` and
+/// [`crate::examine::WslFacts`]).
 const KFD_DEVICE: &str = "/dev/kfd";
 
 /// Whether it is safe to launch `amd-smi` on this host.
@@ -7971,6 +7975,15 @@ const KFD_DEVICE: &str = "/dev/kfd";
 /// pedantic: `amd-smi.exe` is a supported Windows binary (see
 /// [`managed_sdk_tool_path`]), so a check that simply failed to find `/dev/kfd`
 /// there would silently disable GPU detection on every Windows host.
+///
+/// WSL needs the same wave-through for the same reason, and cannot get it from
+/// `cfg`: it compiles as Linux yet has no `/dev/kfd` (see [`KFD_DEVICE`]), so
+/// the real open would fail on every WSL host and decline every launch. WSL is
+/// supported here — it has its own diagnosis catalog and its own GPU E2E lane —
+/// and both `serve` probes discard the error with `.ok()?`, so that would be a
+/// silent loss of GPU detection rather than a visible failure. The D-state hazard
+/// this gate exists for is an `amdgpu`/KFD one, which is precisely the stack WSL
+/// does not load.
 #[must_use]
 pub fn amd_smi_preflight_ok() -> bool {
     kfd_readable(Path::new(KFD_DEVICE))
@@ -7978,6 +7991,16 @@ pub fn amd_smi_preflight_ok() -> bool {
 
 #[cfg(target_os = "linux")]
 fn kfd_readable(device: &Path) -> bool {
+    kfd_readable_with(is_wsl_host(), device)
+}
+
+/// [`kfd_readable`] with the WSL determination injected, so the wave-through can
+/// be pinned from a test on an ordinary Linux host rather than only on WSL.
+#[cfg(target_os = "linux")]
+fn kfd_readable_with(is_wsl: bool, device: &Path) -> bool {
+    if is_wsl {
+        return true;
+    }
     fs::OpenOptions::new().read(true).open(device).is_ok()
 }
 
@@ -9781,6 +9804,13 @@ mod tests {
     fn the_kfd_gate_stops_amd_smi_before_it_is_spawned() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        // WSL compiles as Linux but is waved through deliberately (see
+        // `the_kfd_preflight_waves_through_wsl_hosts`), so there is no gate to
+        // exercise on such a host and the blocked case could never hold.
+        if is_wsl_host() {
+            return Ok(());
+        }
+
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-kfd-gate-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
@@ -9876,6 +9906,29 @@ mod tests {
     fn the_kfd_preflight_waves_through_hosts_that_have_no_kfd() {
         assert!(kfd_readable(Path::new("/definitely/not/a/device/node")));
         assert!(amd_smi_preflight_ok());
+    }
+
+    /// WSL has no `/dev/kfd` either, but unlike Windows it cannot be waved
+    /// through by `cfg`: it compiles as Linux, so the real open runs, always
+    /// fails, and declines every routed `amd-smi` launch on a supported
+    /// platform — silently, since both `serve` probes drop the error with
+    /// `.ok()?`. Same wave-through as the off-Linux case above, decided at
+    /// runtime instead.
+    ///
+    /// The bare-metal assertion is the control: without it this would still
+    /// pass with the wave-through deleted.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kfd_preflight_waves_through_wsl_hosts() {
+        let absent = Path::new("/definitely/not/a/device/node");
+        assert!(
+            kfd_readable_with(true, absent),
+            "WSL has no /dev/kfd, so its absence must not decline the launch"
+        );
+        assert!(
+            !kfd_readable_with(false, absent),
+            "a bare-metal host with no readable KFD must still be declined"
+        );
     }
 
     #[test]
