@@ -785,24 +785,33 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         flattened_list_items(&branches[0])
     }
 
-    /// Reverting or mistyping the `release/**` push branch (EAI-8761) in either
-    /// workflow would leave every other assertion in this suite green, since
-    /// none of them read `on.push.branches`. Both workflows must carry it: a
-    /// release-branch push should get the same hosted build/clippy/mock-e2e
-    /// gate (`ci.yml`) that every other push gets, alongside the self-hosted
-    /// GPU matrix (`e2e-selfhosted.yml`) — neither workflow gates the other.
+    /// Reverting or mistyping the `release/**` push branch (EAI-8761) would
+    /// leave every other assertion in this suite green, since none of them
+    /// read `on.push.branches`. Only `e2e-selfhosted.yml` carries it — a
+    /// release-branch push should get the self-hosted regression matrix ahead
+    /// of cutting the `v*` tag `release.yml` builds from. `ci.yml`'s own push
+    /// trigger stays `main`-only: a `release/**` push already went through
+    /// that gate on the PR that landed it.
     #[test]
-    fn ci_and_self_hosted_workflows_both_fire_on_release_branch_push() {
-        let expected = vec!["main".to_string(), "release/**".to_string()];
-        for name in ["ci.yml", "e2e-selfhosted.yml"] {
-            let workflow = read_workflow(name);
-            assert_eq!(
-                push_branches(&workflow),
-                expected,
-                "{name} must run its push-triggered jobs on `main` and any `release/**` branch, \
-                 ahead of cutting the `v*` tag release.yml builds from (EAI-8761)"
-            );
-        }
+    fn self_hosted_workflow_fires_on_release_branch_push() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string(), "release/**".to_string()],
+            "e2e-selfhosted.yml must run its push-triggered jobs on `main` and any \
+             `release/**` branch, ahead of cutting the `v*` tag release.yml builds from (EAI-8761)"
+        );
+    }
+
+    #[test]
+    fn ci_workflow_push_trigger_stays_main_only() {
+        let workflow = read_workflow("ci.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string()],
+            "ci.yml's push trigger must stay main-only; a release/** push already went \
+             through this gate via the PR that landed it, so it must not re-run on push too"
+        );
     }
 
     #[test]
