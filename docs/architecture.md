@@ -55,4 +55,4 @@ Pinned versions of the third-party runtimes rocm-cli manages (from workspace-roo
 
 ### `engines/lemonade`, `engines/vllm` — inference engine adapters
 
-Both crates' `lib.rs` are **not yet modularized** — see EAI-7768.
+`engines/vllm` follows full domain extraction: `runtime.rs` (TheRock/managed-runtime resolution), `install.rs` (ROCm/vLLM build-variant discovery, install execution, runtime-repair assessment), `process.rs` (spawn/env/path setup, readiness polling), `state.rs` (service state file I/O). `lib.rs` keeps only CLI/envelope dispatch and the few items shared across those modules. `engines/lemonade`'s `lib.rs` is **not yet modularized** — see EAI-7768.
