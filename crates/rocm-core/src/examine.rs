@@ -1298,8 +1298,32 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
 /// So count from the kernel and name from PCI. Only `is_amd` entries are
 /// touched: KFD describes AMD compute devices and says nothing about an NVIDIA
 /// card, which must survive untouched.
+#[cfg(any(target_os = "linux", test))]
 fn probe_gpus_kernel_membership(e: &mut Examination) {
-    let Some(nodes) = crate::linux_kfd_gpu_nodes() else {
+    probe_gpus_kernel_membership_in(e, Path::new("/sys/class/kfd/kfd/topology/nodes"));
+}
+
+/// KFD is a Linux interface, so off Linux there is no topology to read.
+#[cfg(not(any(target_os = "linux", test)))]
+fn probe_gpus_kernel_membership(_e: &mut Examination) {}
+
+/// The probe itself, against a caller-supplied nodes directory.
+///
+/// Split from the `/sys` path exactly as [`crate::kfd_gpu_nodes_in`] is, and for
+/// the same reason one level further out: it leaves the *whole* probe drivable
+/// from a test — the read, the "cannot say" early return, and the handoff to
+/// [`apply_kernel_gpu_membership`] — rather than only the reconcile that handoff
+/// calls.
+///
+/// The seam is not decoration. Before it, the handoff was a statement no test
+/// could reach, because its only caller read the host's own `/sys`: deleting the
+/// call left the entire workspace suite green, since every unit test drove the
+/// inner function directly with a hand-supplied node list. See
+/// `the_membership_probe_reconciles_the_topology_it_is_pointed_at`, which fails
+/// if that handoff goes away.
+#[cfg(any(target_os = "linux", test))]
+fn probe_gpus_kernel_membership_in(e: &mut Examination, nodes_dir: &Path) {
+    let Some(nodes) = crate::kfd_gpu_nodes_in(nodes_dir) else {
         return;
     };
     apply_kernel_gpu_membership(e, &nodes);
@@ -3187,27 +3211,9 @@ mod tests {
         // directly. This drives the real read as well -- sysfs bytes in, report
         // out -- so the `location_id` decode and the reconcile are covered
         // together rather than each assuming the other.
-        let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-kfd-membership-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
-        ));
-        let nodes = root.join("nodes");
-        std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
-        std::fs::write(
-            nodes.join("0").join("properties"),
-            "cpu_cores_count 56\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
-        )
-        .expect("plant the CPU node properties");
         // One GPU node, at the fourth accelerator on the bus: what the
         // container sees when it is passed 0000:5d:00.0 out of the host's eight.
-        std::fs::create_dir_all(nodes.join("1")).expect("plant the GPU node");
-        std::fs::write(
-            nodes.join("1").join("properties"),
-            "simd_count 1216\ngfx_target_version 90402\nlocation_id 23808\ndomain 0\n",
-        )
-        .expect("plant the GPU node properties");
-
+        let (root, nodes) = plant_kfd_topology("membership", &[(23808, 90402)]);
         let read = crate::kfd_gpu_nodes_in(&nodes).expect("the planted topology must be readable");
         std::fs::remove_dir_all(&root).ok();
 
@@ -3223,6 +3229,94 @@ mod tests {
         assert_eq!(e.gpus[0].gfx_target, "gfx942");
         assert!(e.has_amd_gpu);
         assert!(e.has_discrete_amd);
+    }
+
+    /// Plant a KFD topology: one CPU node, then one GPU node per
+    /// `(location_id, gfx_target_version)` pair. Returns the `nodes` directory;
+    /// the caller removes `root` once the read is done.
+    fn plant_kfd_topology(tag: &str, gpu_nodes: &[(u32, u32)]) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-kfd-{tag}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let nodes = root.join("nodes");
+        std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
+        std::fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 56\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+        )
+        .expect("plant the CPU node properties");
+        for (index, (location_id, version)) in gpu_nodes.iter().enumerate() {
+            let dir = nodes.join((index + 1).to_string());
+            std::fs::create_dir_all(&dir).expect("plant the GPU node");
+            std::fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 1216\ngfx_target_version {version}\nlocation_id {location_id}\n\
+                     domain 0\n"
+                ),
+            )
+            .expect("plant the GPU node properties");
+        }
+        (root, nodes)
+    }
+
+    #[test]
+    fn the_membership_probe_reconciles_the_topology_it_is_pointed_at() {
+        // The *wiring*, not the reconcile. Every test above hands
+        // `apply_kernel_gpu_membership` a node list directly, which proves that
+        // function and says nothing about whether the probe ever reaches it --
+        // deleting the handoff left the whole workspace suite green. So drive
+        // the probe's own entry point instead, over a planted topology, and the
+        // read, the handoff and the gfx-target fill are all covered at once.
+        let (root, nodes) = plant_kfd_topology("membership-probe", &[(23808, 90402)]);
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        probe_gpus_kernel_membership_in(&mut e, &nodes);
+        std::fs::remove_dir_all(&root).ok();
+        summarise_gpu_categories(&mut e);
+
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "the probe must reduce the eight-card bus to the one node the kernel exposes: {:#?}",
+            e.gpus
+        );
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        // `mi300x_bus_gpus` leaves every target empty, the way lspci does when
+        // `pci.ids` spells an Instinct part "Device 74a1". The node's target is
+        // the only thing that can fill it, so this is exactly the statement the
+        // review found untested.
+        assert_eq!(
+            e.gpus[0].gfx_target, "gfx942",
+            "the probe must fill the target its own topology attributes to that card"
+        );
+        assert!(e.has_amd_gpu);
+    }
+
+    #[test]
+    fn the_membership_probe_leaves_the_report_alone_when_the_topology_is_unreadable() {
+        // The early return. No KFD at all -- `amdgpu` never loaded, or this is
+        // not Linux -- is "cannot say", not "no GPUs", so the PCI enumeration
+        // must come back exactly as it went in and no note may be invented.
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        probe_gpus_kernel_membership_in(
+            &mut e,
+            &std::env::temp_dir().join("rocm-cli-absent-kfd-topology-nodes"),
+        );
+
+        assert_eq!(
+            e.gpus,
+            mi300x_bus_gpus(),
+            "an unreadable topology must leave the PCI enumeration untouched"
+        );
+        assert!(e.notes.is_empty(), "notes: {:#?}", e.notes);
     }
 
     #[test]

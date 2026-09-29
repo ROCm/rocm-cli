@@ -184,11 +184,18 @@ Feature: GPU detection and system inspection
   # `gpus[]` itself, cross-checked against the kernel's own GPU node count
   # rather than against a fixed number, which keeps it host-agnostic.
   #
-  # The step no-ops where the premise does not hold -- no readable KFD topology,
-  # or no `lspci` to supply PCI addresses -- because the fallback it would
-  # otherwise flag is the correct answer on such a host.
-  @id:examine-lists-every-gpu-with-its-pci-address @requires-gpu
+  # It also reads `gpus[].gfx_target`, which is the observable end of the second
+  # half of that fix: `lspci` resolves a target from the marketing name, and on
+  # an Instinct host `pci.ids` frequently spells that "Device 74a1", so without
+  # `rocminfo` the per-node target the kernel reports is the only thing that can
+  # fill the field.
+  #
+  # The step no-ops where a premise does not hold -- no readable KFD topology,
+  # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
+  # target -- because on such a host the answer it would otherwise flag is the
+  # correct one.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
   Scenario: examine-16 - The machine-readable report lists every GPU the kernel sees
     Given a machine with an AMD GPU
     When the user inspects the system both for reading and for scripting
-    Then it lists one AMD GPU per kernel GPU node, each with its PCI address
+    Then it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target

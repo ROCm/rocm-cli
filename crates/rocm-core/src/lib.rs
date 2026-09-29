@@ -5118,24 +5118,14 @@ pub(crate) struct KfdGpuNode {
     pub(crate) gfx_target: String,
 }
 
-/// Every GPU the KFD topology describes, in node order. `None` when the
-/// topology could not be read at all, which callers must treat as "cannot say"
-/// rather than as "no GPUs".
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_kfd_gpu_nodes() -> Option<Vec<KfdGpuNode>> {
-    if !runtime_is_linux() {
-        return None;
-    }
-    kfd_gpu_nodes_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn linux_kfd_gpu_nodes() -> Option<Vec<KfdGpuNode>> {
-    None
-}
-
-/// The per-node topology read, against a caller-supplied nodes directory. Same
-/// planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
+/// Every GPU the KFD topology describes, in node order, read from a
+/// caller-supplied nodes directory. `None` when the topology could not be read
+/// at all, which callers must treat as "cannot say" rather than as "no GPUs".
+///
+/// Same planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
+/// The `/sys` path lives in the probe that calls this
+/// (`examine::probe_gpus_kernel_membership`), so that probe's own wiring is
+/// drivable from a test too rather than only the reconcile it hands off to.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {
     let mut nodes: Vec<((u64, String), KfdGpuNode)> = fs::read_dir(nodes_dir)
