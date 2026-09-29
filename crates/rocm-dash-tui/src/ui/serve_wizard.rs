@@ -176,11 +176,13 @@ impl ServeWizardState {
 
     /// Build the `rocm` argv for the current form, or an error message.
     fn build_args(&self) -> Result<Vec<String>, String> {
-        let model = self.model.trim();
-        if model.is_empty() {
+        // Never trim the value itself: `self.model` can come from the folder
+        // browser, so trimming could silently redirect the launch to a
+        // different path if a real model folder name ends in whitespace.
+        if self.model.trim().is_empty() {
             return Err("model is required".to_string());
         }
-        let mut args = vec!["serve".to_string(), model.to_string()];
+        let mut args = vec!["serve".to_string(), self.model.clone()];
         args.push("--engine".to_string());
         args.push(ENGINES[self.engine_idx.min(ENGINES.len() - 1)].to_string());
         // Index 0 = engine default → omit --device.
@@ -616,6 +618,20 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--device", "gpu_required"]));
         assert!(args.contains(&"--foreground".to_string()));
         assert!(!args.contains(&"--managed".to_string()));
+    }
+
+    #[test]
+    fn model_with_trailing_whitespace_is_passed_through_untrimmed() {
+        let w = ServeWizardState {
+            model: "/mnt/models/glm ".into(),
+            ..Default::default()
+        };
+        let args = w.build_args().unwrap();
+        assert_eq!(
+            args[1], "/mnt/models/glm ",
+            "model can come from the folder browser — a real folder name is \
+             never mangled, even if it ends in whitespace"
+        );
     }
 
     #[test]

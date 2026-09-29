@@ -146,10 +146,12 @@ impl InstallManagerState {
             "--format".to_string(),
             FORMATS[self.format_idx.min(FORMATS.len() - 1)].to_string(),
         ];
-        let prefix = self.prefix.trim();
-        if !prefix.is_empty() {
+        // Never trim the value itself: `self.prefix` can come from the folder
+        // browser, so trimming could silently redirect the install into a
+        // different directory if a real folder name ends in whitespace.
+        if !self.prefix.trim().is_empty() {
             args.push("--prefix".to_string());
-            args.push(prefix.to_string());
+            args.push(self.prefix.clone());
         }
         if self.dry_run {
             args.push("--dry-run".to_string());
@@ -504,6 +506,22 @@ mod tests {
             ..Default::default()
         };
         assert!(i.build_args().unwrap_err().contains("channel"));
+    }
+
+    #[test]
+    fn prefix_with_trailing_whitespace_is_passed_through_untrimmed() {
+        let i = InstallManagerState {
+            prefix: "/opt/rocm-sdk ".into(),
+            ..Default::default()
+        };
+        let args = i.build_args().unwrap();
+        let idx = args.iter().position(|a| a == "--prefix").unwrap();
+        assert_eq!(
+            args[idx + 1],
+            "/opt/rocm-sdk ",
+            "prefix comes from the folder browser, never typed — a real folder \
+             name is never mangled, even if it ends in whitespace"
+        );
     }
 
     #[test]

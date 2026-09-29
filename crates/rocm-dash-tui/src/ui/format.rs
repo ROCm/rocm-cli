@@ -32,7 +32,7 @@ use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 /// see `install_manager::InstallManagerState::build_args` and
 /// `onboarding::build_install_args`.
 pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
+    if v.trim().is_empty() {
         placeholder.to_string()
     } else {
         v.to_string()
@@ -322,6 +322,13 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_or_placeholder_treats_whitespace_only_as_unset() {
+        assert_eq!(display_or_placeholder("", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("   ", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("release", "(default)"), "release");
+    }
 
     #[test]
     fn mib_promotes_to_gib_then_tib() {
