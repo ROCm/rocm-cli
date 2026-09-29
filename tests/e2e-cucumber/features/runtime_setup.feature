@@ -1,5 +1,15 @@
 Feature: Runtime configuration
 
+  # The acceptance criterion for the runtime-only default, kept engine-agnostic
+  # on purpose: every GPU lane must check that a fresh install registers,
+  # activates, still carries an inference engine, and omits the compiler
+  # toolchain. Pinning this to one engine would drop that check on the lanes
+  # where that engine is not the effective one.
+  #
+  # The last two Thens are the same fact from the two surfaces that can
+  # disagree: what the install recorded, and what the diagnostic tells the user
+  # it recorded. The toolchain is now something a user can end up without, so
+  # `rocm examine` staying silent about it is its own defect.
   @id:runtime-install-sdk-active @requires-gpu @nightly
   Scenario: runtime-01 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
@@ -7,6 +17,8 @@ Feature: Runtime configuration
     Then a runtime is registered
     And the runtime is set as active
     And the runtime includes an inference engine
+    And the runtime excludes the compiler toolchain
+    And the inspection reports the active runtime has no compiler toolchain
 
   # Dogfooding #17: re-provisioning was observed writing inside the previous
   # runtime, producing a recursively nested `runtimes/wheel/.../runtimes/wheel/`
@@ -345,3 +357,16 @@ Feature: Runtime configuration
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's backend alignment was skipped by the opt-out
     And the packaged pin survives the install
+
+  # The other half: that a runtime installed without the toolchain can actually
+  # serve. vLLM compiles Triton kernels at runtime, which is the case most
+  # likely to need `devel`, so it is the one worth proving end to end.
+  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @nightly
+  Scenario: runtime-18 - A runtime-only SDK install serves vLLM inference
+    Given a machine with no CLI-managed runtimes
+    When the user installs the SDK
+    Then the runtime excludes the compiler toolchain
+    When the user serves a model on GPU from the installed runtime
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
