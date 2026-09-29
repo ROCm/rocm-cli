@@ -224,6 +224,11 @@ struct PlatformVersions {
     vllm: Option<String>,
     #[serde(default)]
     lemonade: Option<String>,
+    /// Release channel ("release" | "nightly") the platform's active runtime was
+    /// installed under. `None` on artifacts predating the field, or when no
+    /// managed runtime was active — those render as a single unlabelled column.
+    #[serde(default)]
+    channel: Option<String>,
 }
 
 impl PlatformVersions {
@@ -405,6 +410,17 @@ struct GridColumn {
     details: std::collections::BTreeMap<String, ManifestExpectation>,
 }
 
+impl GridColumn {
+    /// Column heading label: the slug, plus its channel when known — the part of
+    /// column identity that doesn't already show up in `versions.summary()`.
+    fn label(&self) -> String {
+        match self.versions.channel.as_deref() {
+            Some(channel) => format!("{} ({channel})", self.slug),
+            None => self.slug.clone(),
+        }
+    }
+}
+
 /// One row of the grid: a scenario, with the identity used to place and order it.
 struct GridRow {
     id: String,
@@ -480,11 +496,19 @@ impl Grid {
             // Actual results by id from this platform's report.json.
             let actual = id_pass_map(json_path);
 
-            // Merge into an existing column with the same slug (defensive; with
-            // one job per platform there is exactly one input per slug).
+            // Merge into an existing column with the same (slug, channel) —
+            // channel is part of column identity so a nightly and a release run
+            // of the same platform land in separate columns instead of one
+            // colliding into the other (defensive; with one job per platform per
+            // channel there is exactly one input per (slug, channel)).
+            #[allow(clippy::suspicious_operation_groupings)]
+            // field names legitimately differ: GridColumn::slug vs PlatformManifest::platform_slug
             let col_idx = columns
                 .iter()
-                .position(|c| c.slug == manifest.platform_slug)
+                .position(|c| {
+                    c.slug == manifest.platform_slug
+                        && c.versions.channel == manifest.versions.channel
+                })
                 .unwrap_or_else(|| {
                     columns.push(GridColumn {
                         slug: manifest.platform_slug.clone(),
@@ -530,12 +554,15 @@ impl Grid {
                 }
                 let outcome =
                     CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied());
-                // A real result supersedes a defensive Missing on merge.
+                // A real result supersedes a defensive Missing on merge, and a
+                // problem outcome is never silently displaced by a clean one for
+                // the same id in the same column — a second, conflicting result
+                // must stay visible rather than being masked by the first.
                 columns[col_idx]
                     .outcomes
                     .entry(exp.id.clone())
                     .and_modify(|o| {
-                        if *o == CellOutcome::Missing {
+                        if *o == CellOutcome::Missing || (outcome.is_problem() && !o.is_problem()) {
                             *o = outcome;
                         }
                     })
@@ -568,17 +595,12 @@ impl Grid {
     }
 
     /// Every problem cell across the grid, as `(slug, id, outcome, detail)`.
-    fn problems(&self) -> Vec<(&str, &str, CellOutcome, Option<&ManifestExpectation>)> {
+    fn problems(&self) -> Vec<(String, &str, CellOutcome, Option<&ManifestExpectation>)> {
         let mut out = Vec::new();
         for col in &self.columns {
             for (id, outcome) in &col.outcomes {
                 if outcome.is_problem() {
-                    out.push((
-                        col.slug.as_str(),
-                        id.as_str(),
-                        *outcome,
-                        col.details.get(id),
-                    ));
+                    out.push((col.label(), id.as_str(), *outcome, col.details.get(id)));
                 }
             }
         }
@@ -1034,7 +1056,7 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
                         @for col in &grid.columns {
                             @let versions = col.versions.summary();
                             th {
-                                (col.slug)
+                                (col.label())
                                 @if !col.engine.is_empty() { br; small { (col.engine) } }
                                 @if !versions.is_empty() { br; small.versions { (versions) } }
                             }
@@ -1125,7 +1147,7 @@ fn expectation_grid_markdown(
             } else {
                 format!("<br><sub>{}</sub>", col.engine)
             };
-            let _ = write!(out, " {}{} |", col.slug, eng);
+            let _ = write!(out, " {}{} |", col.label(), eng);
         }
         out.push('\n');
         out.push_str("|---|");
@@ -2057,6 +2079,111 @@ mod tests {
             vec!["serve-b".to_string(), "serve-a".to_string()],
             "the last artifact to name a scenario sets its sort position",
         );
+    }
+
+    #[test]
+    fn two_channels_same_platform_yield_two_columns() {
+        // Same platform_slug, different channel: must not collide into one
+        // column, or a nightly run's results silently overwrite a release run's.
+        let release = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let nightly = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "nightly"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let (_d1, release_path) = write_platform(&report, release);
+        let (_d2, nightly_path) = write_platform(&report, nightly);
+        let inputs = vec![
+            ("mi300x-release".to_string(), release_path),
+            ("mi300x-nightly".to_string(), nightly_path),
+        ];
+
+        let grid = Grid::build(&inputs);
+        assert_eq!(
+            grid.columns.len(),
+            2,
+            "same slug, different channel, must be two columns"
+        );
+        let labels: Vec<_> = grid.columns.iter().map(GridColumn::label).collect();
+        assert!(
+            labels.contains(&"mi300x (release)".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"mi300x (nightly)".to_string()),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn nightly_failure_is_not_masked_by_release_pass() {
+        // The bug this guards: pre-fix, both inputs shared one "mi300x" column,
+        // and the release pass (inserted first) blocked the nightly fail from
+        // ever overwriting it — a real nightly regression rendered invisible.
+        let release = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let nightly = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "nightly"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let passed = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let failed = feature_json(&[(&["id:serve-x"], &["failed"])]);
+        let (_d1, release_path) = write_platform(&passed, release);
+        let (_d2, nightly_path) = write_platform(&failed, nightly);
+        let inputs = vec![
+            ("mi300x-release".to_string(), release_path),
+            ("mi300x-nightly".to_string(), nightly_path),
+        ];
+
+        let grid = Grid::build(&inputs);
+        let nightly_col = grid
+            .columns
+            .iter()
+            .find(|c| c.versions.channel.as_deref() == Some("nightly"))
+            .expect("nightly column present");
+        let outcome = *nightly_col
+            .outcomes
+            .get("serve-x")
+            .expect("serve-x outcome");
+        assert_eq!(outcome, CellOutcome::UnexpectedFail, "{outcome:?}");
+        assert!(outcome.is_problem());
+        assert!(
+            grid.problems()
+                .iter()
+                .any(|(label, id, _, _)| label == "mi300x (nightly)" && *id == "serve-x"),
+            "the nightly failure must surface in the needs-attention list",
+        );
+    }
+
+    #[test]
+    fn single_channel_artifacts_render_unchanged() {
+        // No channel anywhere in the input (older artifact / no runtime active):
+        // exactly one column, and its heading is the bare slug, unchanged.
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+
+        let grid = Grid::build(&inputs);
+        assert_eq!(grid.columns.len(), 1);
+        assert_eq!(grid.columns[0].label(), "mock");
     }
 
     #[test]
