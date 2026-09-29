@@ -31,6 +31,7 @@ mod e2e {
     pub mod examine_steps;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
@@ -63,6 +64,14 @@ pub struct E2eWorld {
     /// the managed-launch lock is exactly a prune that returned too fast. Set by
     /// the When step that measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
+    /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
+    /// tailscale stand-in, and the status document it should serve. Set by a
+    /// Given step so the When steps stay about what the user does.
+    pub remote_env: Vec<(String, String)>,
+    /// Container standing in for a second machine, for the `@requires-docker`
+    /// scenarios. Held on the World so it lives for the scenario and is torn
+    /// down when the World drops, even if a step panics.
+    pub remote_machine: Option<e2e::remote_steps::RemoteMachine>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
     /// report can join commands to pass/fail results.
@@ -176,9 +185,10 @@ fn shared_uv_cache_dir() -> Option<PathBuf> {
 /// persistent disk; unset for local runs, where every scenario installs its own.
 ///
 /// Why opt-in and not global: a cold `rocm install sdk` installs a multi-GiB
-/// TheRock runtime (and its post-install probe unpacks an ~8.8 GiB devel tarball),
-/// and each scenario's isolated data dir made it re-run per scenario — the GPU job
-/// then exceeds its time cap. Scenarios that just need a runtime present
+/// TheRock runtime (`--devel`, when passed, unpacks an additional ~8.8 GiB
+/// compiler/headers tarball), and each scenario's isolated data dir made it
+/// re-run per scenario — the GPU job then exceeds its time cap. Scenarios that
+/// just need a runtime present
 /// ("a managed runtime is active") point their `data/runtimes` at this shared tree
 /// (see [`E2eWorld::use_shared_runtimes`]) so the install happens once per runner.
 /// Scenarios that ASSERT a clean slate ("a machine with no CLI-managed runtimes",
@@ -226,6 +236,8 @@ impl Default for E2eWorld {
             cli_stderr: None,
             cli_rc: None,
             cli_elapsed: None,
+            remote_env: Vec::new(),
+            remote_machine: None,
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,
@@ -1107,6 +1119,7 @@ async fn main() {
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
     use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
     let json_file =
@@ -1130,6 +1143,11 @@ async fn main() {
     // install/uninstall) are skipped unless the caller opts in via
     // `E2E_INCLUDE_LIFECYCLE`, so the default `cargo xtask e2e` stays fast.
     let include_lifecycle = std::env::var_os("E2E_INCLUDE_LIFECYCLE").is_some_and(|v| v == "1");
+    // The container-backed remote scenarios need a runner that can *build* the
+    // fixture image, which a working daemon alone does not guarantee — a
+    // restricted network gives you one without the other. Opt in explicitly on
+    // the lanes where it holds.
+    let include_docker = std::env::var_os("E2E_INCLUDE_DOCKER").is_some_and(|v| v == "1");
     // CI runs just the lifecycle set after opting in. Keep this selection inside
     // our custom filter instead of cucumber's `--tags`/`-n`: cucumber 0.23 uses
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
@@ -1214,13 +1232,23 @@ async fn main() {
             }
             Box::pin(async {})
         })
-        .with_writer(
+        // The clock correction wraps the whole stack, so it sees events in
+        // arrival order — it must stay OUTSIDE `.normalized()`. `Normalize`
+        // re-emits events grouped by scenario rather than chronologically, and
+        // up to 64 scenarios run at once, so after normalisation a timestamp
+        // lower than its predecessor is ordinary. Correcting there would fire
+        // constantly on healthy runs and flatten the durations this is meant
+        // to protect. Before it, a backward move means the wall clock moved:
+        // the Strix Halo WSL2 guest steps its clock back (34 s observed) when
+        // Hyper-V resynchronises it, and both writers below turn the resulting
+        // negative duration into a panic that cucumber silences (EAI-9018).
+        .with_writer(MonotonicClockWriter::new(
             writer::Basic::raw(std::io::stdout(), writer::Coloring::Auto, 1)
                 .summarized()
                 .tee(writer::Json::new(json_file).discard_stats_writes())
                 .tee(writer::JUnit::new(junit_file, 0).discard_stats_writes())
                 .normalized(),
-        )
+        ))
         // Resolve every scenario's expectation from its tags + host capability +
         // the xfail matrix. Scenarios resolving to `Skip` (not-applicable on this
         // host — e.g. a required engine can't start) are filtered out and never
@@ -1232,9 +1260,12 @@ async fn main() {
                     &decl,
                     cap,
                     matrix,
-                    include_nightly,
-                    include_lifecycle,
-                    include_merge_queue,
+                    e2e_cucumber::expectation::Included {
+                        nightly: include_nightly,
+                        lifecycle: include_lifecycle,
+                        docker: include_docker,
+                        merge_queue: include_merge_queue,
+                    },
                 );
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
