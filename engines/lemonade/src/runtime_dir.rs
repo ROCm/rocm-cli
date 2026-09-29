@@ -2,9 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::{anyhow, bail};
 use rocm_core::runtime_is_linux;
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -465,7 +469,9 @@ fn create_private_runtime_dir(dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::process::{LemonadeProcessEnvironment, lemonade_process_environment_vars};
 
     // `XDG_RUNTIME_DIR` is a Linux/freedesktop concept and the Lemonade server

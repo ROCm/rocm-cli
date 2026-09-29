@@ -15,6 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Seek};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::backend_alignment::LemonadeRuntime;
