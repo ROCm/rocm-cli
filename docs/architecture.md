@@ -39,7 +39,7 @@ Already-extracted subsystem modules include `diagnose.rs`, `examine.rs`, and sev
 
 ### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
 
-`rocm-dash-tui`'s `agent.rs` and `app/mod.rs` are **not yet modularized** — see EAI-7768. `crates/rocm-dash-tui/src/ui/approval.rs` is the shared component for approval-state prompts — reuse it rather than hand-rolling new approval UI.
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs` (the `AgentClient` seam, `AgentError`, `StateSnapshot`, `InferenceParams`, `REQUEST_TIMEOUT`), `agent/snapshot.rs` (pure JSON telemetry helpers with no `rig` dependency), `agent/tools.rs` (the `rig::tool::Tool` "Skill" wrappers and ROCm read/mutating tool dispatch), and `agent/clients.rs` (the `RigAgentClient`/`ChatGptAgentClient`/`AnthropicAgentClient`/`MockAgentClient` backends) — a mechanical relocation, since the shared seam types stay in `agent/mod.rs` and are reached from the split-out files via `super::`. `app/mod.rs` is **not yet modularized** — see EAI-7768. `crates/rocm-dash-tui/src/ui/approval.rs` is the shared component for approval-state prompts — reuse it rather than hand-rolling new approval UI.
 
 ### `crates/rocm-engine-protocol` — engine IPC protocol
 
