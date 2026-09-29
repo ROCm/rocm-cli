@@ -54,6 +54,14 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
+The `license-headers` hook (`hawkeye check --config licenserc.toml`) is tagged `groups: [local-tools]` and skipped by default for the same reason — it needs its own binary, which is a full Rust compile (a few minutes), not a quick download:
+
+```bash
+cargo install hawkeye --version 7.0.0 --locked   # optional; pin matches CI's HAWKEYE_VERSION in ci.yml
+```
+
+Without it, that hook stays skipped locally and CI's dedicated `license-headers` job remains the gate.
+
 ### Workspace layout
 
 | Path | Description |
