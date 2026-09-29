@@ -1305,7 +1305,7 @@ fn probe_gpus_kernel_membership(e: &mut Examination) {
 
 /// KFD is a Linux interface, so off Linux there is no topology to read.
 #[cfg(not(any(target_os = "linux", test)))]
-fn probe_gpus_kernel_membership(_e: &mut Examination) {}
+const fn probe_gpus_kernel_membership(_e: &mut Examination) {}
 
 /// The probe itself, against a caller-supplied nodes directory.
 ///
@@ -1344,6 +1344,7 @@ fn probe_gpus_kernel_membership_in(e: &mut Examination, nodes_dir: &Path) {
 /// load looks like, and "your card is on the bus but the driver did not bind"
 /// is the single most useful thing `examine` can say there — so the PCI list
 /// stands, and the driver probes explain why nothing is usable.
+#[cfg(any(target_os = "linux", test))]
 fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode]) {
     if nodes.is_empty() {
         return;
@@ -1422,6 +1423,7 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
 
 /// Whether two PCI addresses name the same device. An empty address matches
 /// nothing: it means "unknown", not "wildcard".
+#[cfg(any(target_os = "linux", test))]
 const fn pci_ids_match(left: &str, right: &str) -> bool {
     !left.is_empty() && left.eq_ignore_ascii_case(right)
 }

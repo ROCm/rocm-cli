@@ -5117,6 +5117,7 @@ fn detect_linux_kfd_gfx_target() -> Option<String> {
 /// still carries every card the host has, while KFD carries only the devices
 /// passed through — so this is what `examine` must count, and the PCI scan is
 /// only good for naming what it finds here.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KfdGpuNode {
     /// The node's PCI address as `lspci -D` spells it (`0000:11:00.0`), or
