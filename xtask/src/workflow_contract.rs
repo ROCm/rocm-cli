@@ -1669,6 +1669,7 @@ esac
                 )
             })
             .filter(|name| !name.starts_with("e2e-consolidated-report"))
+            .map(|name| crate::e2e_report::without_channel_matrix_segment(&name))
             .collect();
         declared_artifacts.sort();
         declared_artifacts.dedup();

@@ -156,6 +156,17 @@ fn label_for_root_report(dir: &Path) -> String {
 /// Lives outside `mod tests` so `workflow_contract`'s docs guard can derive the
 /// canonical artifact list from the same scan this module's guard asserts on,
 /// rather than keeping a second copy that could drift from it.
+/// Strips the literal `${{ matrix.channel }}` template segment nightly's
+/// per-lane matrix inserts into its artifact names, so a name like
+/// `e2e-gpu-${{ matrix.channel }}-report` compares as its canonical
+/// `e2e-gpu-report` base. This scan is text-based over the raw workflow
+/// source and does not simulate matrix expansion, so the template text
+/// would otherwise appear verbatim and never match anything.
+#[cfg(test)]
+pub(crate) fn without_channel_matrix_segment(name: &str) -> String {
+    name.replace("-${{ matrix.channel }}-", "-")
+}
+
 #[cfg(test)]
 pub(crate) fn uploaded_e2e_artifacts(path: &Path) -> Vec<String> {
     let text =
@@ -236,8 +247,9 @@ mod tests {
                 if name.starts_with("e2e-consolidated-report") {
                     continue;
                 }
+                let base = without_channel_matrix_segment(&name);
                 assert!(
-                    CANONICAL_REPORT_ARTIFACTS.contains(&name.as_str()),
+                    CANONICAL_REPORT_ARTIFACTS.contains(&base.as_str()),
                     "{file} uploads `{name}`, which the report cannot map to a \
                      platform; it would render as a guessed name on Linux. Use one \
                      of {CANONICAL_REPORT_ARTIFACTS:?} or teach parse_descriptor."
@@ -252,15 +264,24 @@ mod tests {
         // platforms. If the two ever diverge, the nightly grid is comparing
         // different hardware than the PR grid without saying so.
         let lanes = |file: &str| {
-            let mut names = uploaded_e2e_artifacts(
+            let names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("..")
                     .join(".github")
                     .join("workflows")
                     .join(file),
             );
-            names.retain(|n| !n.starts_with("e2e-consolidated-report"));
+            let mut names: Vec<String> = names
+                .into_iter()
+                .filter(|n| !n.starts_with("e2e-consolidated-report"))
+                .map(|n| without_channel_matrix_segment(&n))
+                .collect();
             names.sort();
+            // nightly's channel matrix uploads two literal names per lane
+            // (release, nightly) that normalize to the same base; collapse
+            // them so the comparison is platform-for-platform, not upload-
+            // count-for-upload-count.
+            names.dedup();
             names
         };
         assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
