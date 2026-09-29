@@ -9,8 +9,9 @@
 //! exists because nothing previously checked that the paths it cites still
 //! exist. A renamed or removed file then rots silently in the doc until a
 //! reader notices. This check makes the doc self-policing instead: it
-//! extracts every backtick-quoted path citation and fails with the stale
-//! path named if one no longer exists in the tree.
+//! extracts every backtick-quoted path citation and fails, naming every one
+//! not found where it's cited (scoped to its nearest heading's directories,
+//! or anywhere in the tracked tree for an unscoped citation).
 //!
 //! Same shape as [`crate::crate_edges`]: a reusable [`run`] plus
 //! `#[cfg(test)]` unit tests on the pure extraction/lookup helpers, and one
@@ -58,12 +59,14 @@ const DOC_PATH: &str = "docs/architecture.md";
 ///
 /// A bare citation whose extension isn't in this list is NOT a candidate
 /// (see [`is_path_candidate`]) — the same deliberate, documented blind spot
-/// as a bare non-hyphenated word (module doc comment): the doc doesn't cite
-/// any other extension bare today, and guessing at arbitrary extensions
-/// would risk false-flagging prose (version strings, flag names) as path
-/// citations. A future bare citation with an unlisted extension (e.g.
-/// `` `ci.yml` ``) needs a directory-qualified path (`` `.github/workflows/ci.yml` ``)
-/// to be checked, or this list extended deliberately.
+/// as a bare non-hyphenated word (module doc comment). The doc does cite one
+/// other bare extension today (`` `report.json` ``, in the `crates/e2e-report`
+/// section) — it's silently never checked, by the same tradeoff: guessing at
+/// arbitrary extensions would risk false-flagging prose (version strings,
+/// flag names) as path citations. A future bare citation with an unlisted
+/// extension (e.g. `` `ci.yml` ``) needs a directory-qualified path
+/// (`` `.github/workflows/ci.yml` ``) to be checked, or this list extended
+/// deliberately.
 const BARE_FILE_EXTENSIONS: [&str; 3] = [".rs", ".md", ".toml"];
 
 /// Extensions among [`BARE_FILE_EXTENSIONS`] whose bare citations get scoped
@@ -78,6 +81,14 @@ const BARE_FILE_EXTENSIONS: [&str; 3] = [".rs", ".md", ".toml"];
 /// (`main.rs`/`lib.rs`/`agent.rs`), which is exactly the case that needs
 /// scoping (see the module doc comment).
 const SCOPED_BARE_EXTENSIONS: [&str; 1] = [".rs"];
+
+/// Whether `text` ends in one of [`SCOPED_BARE_EXTENSIONS`] — shared by
+/// [`extract_path_citations`], [`citation_exists`], and
+/// [`format_stale_citation`] so the three can't drift apart the way two of
+/// them once did (see `multi_directory_citation_requires_every_directory_to_have_the_file`).
+fn is_scoped_extension(text: &str) -> bool {
+    SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext))
+}
 
 /// The remaining [`BARE_FILE_EXTENSIONS`] — `.md`/`.toml` — matched in
 /// [`citation_exists`] against the repo root specifically, rather than by
@@ -479,6 +490,15 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     let mut narrowed_owners: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for line in markdown.lines() {
+        // Captured before updating `prev_line_blank` below, so this line's
+        // own indented-block-start check (further down) sees the PREVIOUS
+        // line's blank status, not this one's — updating unconditionally,
+        // right here, is what fixes `prev_line_blank` going stale across a
+        // fence (see the doc comment on the `is_blank`/`skip_as_indented_code`
+        // check below for why that mattered).
+        let is_blank = line.trim().is_empty();
+        let was_prev_line_blank = prev_line_blank;
+        prev_line_blank = is_blank;
         if let Some(candidate) = fence_line(line) {
             // A closing fence must use the same marker, be at least as long
             // as the opener (CommonMark) — a four-backtick fence can safely
@@ -503,7 +523,12 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
             continue;
         }
         let indent = line.chars().take_while(|&c| c == ' ').count();
-        let is_blank = line.trim().is_empty();
+        // Uses `was_prev_line_blank` (the true previous *processed* line,
+        // whether or not it was itself skipped as a fence delimiter or fence
+        // content), not the stale-across-fences `prev_line_blank` this used
+        // to read here — CommonMark only starts an indented block right
+        // after an actual blank line, and a fence's closing delimiter is not
+        // blank.
         let skip_as_indented_code = if in_indented_block {
             if is_blank || indent > 3 {
                 true
@@ -511,13 +536,12 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 in_indented_block = false;
                 false
             }
-        } else if !is_blank && indent > 3 && prev_line_blank {
+        } else if !is_blank && indent > 3 && was_prev_line_blank {
             in_indented_block = true;
             true
         } else {
             false
         };
-        prev_line_blank = is_blank;
         if skip_as_indented_code {
             continue;
         }
@@ -592,14 +616,14 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
             // possessive narrowing as a bare one (`` `agent.rs` ``) — see
             // [`citation_exists`] for why a partial suffix match needs this
             // scope just as much as a bare one does.
-            let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| span.ends_with(ext));
-            let owner = possessive_owner_for(&parts, i, is_scoped_extension, possessive_owner);
+            let is_scoped = is_scoped_extension(span);
+            let owner = possessive_owner_for(&parts, i, is_scoped, possessive_owner);
             // A connector-less repeat of a citation already narrowed
             // earlier in this heading section keeps that narrowing rather
             // than falling back to `effective_section_dirs` — see the
             // `narrowed_owners` doc comment above.
             let remembered_owner = owner.map(str::to_string).or_else(|| {
-                is_scoped_extension
+                is_scoped
                     .then(|| narrowed_owners.get(span).cloned())
                     .flatten()
             });
@@ -684,13 +708,13 @@ fn path_is_under(path: &Path, dir: &str) -> bool {
 /// component anywhere in the tree.
 fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
     let text = citation.text.as_str();
-    let is_scoped_extension = SCOPED_BARE_EXTENSIONS.iter().any(|ext| text.ends_with(ext));
+    let is_scoped = is_scoped_extension(text);
     if text.contains('/') {
         let citation_path = Path::new(text);
         if tracked.iter().any(|p| p.starts_with(citation_path)) {
             return true;
         }
-        if is_scoped_extension && !citation.section_dirs.is_empty() {
+        if is_scoped && !citation.section_dirs.is_empty() {
             return citation.section_dirs.iter().all(|dir| {
                 tracked
                     .iter()
@@ -699,7 +723,7 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
         }
         return tracked.iter().any(|p| p.ends_with(citation_path));
     }
-    if is_scoped_extension && !citation.section_dirs.is_empty() {
+    if is_scoped && !citation.section_dirs.is_empty() {
         return citation.section_dirs.iter().all(|dir| {
             tracked
                 .iter()
@@ -717,8 +741,18 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
         .any(|p| p.components().any(|c| c.as_os_str() == text))
 }
 
-/// Fetch the doc's current path citations and fail, naming every one, if
-/// any no longer exist in the tracked tree.
+/// Fetch the doc's current path citations and fail, naming every one not
+/// found where it's cited (scoped to its nearest heading's directories, or
+/// anywhere in the tracked tree for an unscoped citation).
+///
+/// This one-line delegation to [`check_doc_at`] is itself unproven: no test
+/// drives `run` end-to-end, so silently discarding `check_doc_at`'s result
+/// here (e.g. `let _ = check_doc_at(...); Ok(())`) would still leave every
+/// test green. [`check_doc_at`]'s own logic is covered directly against a
+/// fabricated root (see
+/// `check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation`), but
+/// proving this specific line would need `workspace_root()` itself to be
+/// swappable for a fabricated root — not worth adding just for this.
 pub fn run() -> Result<()> {
     check_doc_at(&crate::paths::workspace_root()?)
 }
@@ -768,7 +802,7 @@ fn check_citations(markdown: &str, tracked: &[PathBuf]) -> Result<()> {
 fn stale_message(stale: &[&Citation]) -> String {
     let stale = dedupe_stale_for_display(stale);
     format!(
-        "{DOC_PATH} cites {} path(s) that no longer exist in the tree:\n{}\n\
+        "{DOC_PATH} cites {} path(s) not found where they're cited:\n{}\n\
          update the citation to the path's new location, or remove it if the \
          file/directory is gone for good",
         stale.len(),
@@ -810,10 +844,8 @@ fn format_stale_citation(citation: &Citation) -> String {
     // whichever heading was current when the citation was extracted; see
     // `extract_path_citations`). Hinting a section for one of those would
     // name a location the check never actually required.
-    let is_scoped_extension = SCOPED_BARE_EXTENSIONS
-        .iter()
-        .any(|ext| citation.text.ends_with(ext));
-    if citation.section_dirs.is_empty() || !is_scoped_extension {
+    let is_scoped = is_scoped_extension(&citation.text);
+    if citation.section_dirs.is_empty() || !is_scoped {
         format!("  `{}`", citation.text)
     } else {
         format!(
@@ -928,6 +960,19 @@ mod tests {
         paths.iter().map(PathBuf::from).collect()
     }
 
+    /// Run `git` in a throwaway test repo at `root`, asserting success.
+    /// Shared by the two tests below that each need a real git repo rather
+    /// than a fabricated `tracked` file list.
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     #[test]
     fn tracked_files_does_not_git_quote_non_ascii_paths() {
         // Regression: git's default `core.quotePath` escapes any non-ASCII
@@ -939,21 +984,12 @@ mod tests {
         // then confirm `tracked_files` overrides it.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        let run_git = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run_git(&["init", "-q"]);
-        run_git(&["config", "user.email", "test@example.com"]);
-        run_git(&["config", "user.name", "test"]);
-        run_git(&["config", "core.quotePath", "true"]);
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "test"]);
+        run_git(root, &["config", "core.quotePath", "true"]);
         std::fs::write(root.join("café.rs"), b"").expect("write file");
-        run_git(&["add", "café.rs"]);
+        run_git(root, &["add", "café.rs"]);
 
         let tracked = tracked_files(root).expect("tracked_files");
         assert!(
@@ -1418,6 +1454,25 @@ Prose citing `lib.rs` after the fence actually closes.
     }
 
     #[test]
+    fn an_indented_citation_right_after_a_fence_close_is_still_parsed() {
+        // Regression: `prev_line_blank` was only updated on lines that
+        // reached the bottom of the loop body, but every fence-delimiter and
+        // inside-fence line `continue`s before that point — so once a blank
+        // line preceded a fence, `prev_line_blank` stayed stuck `true` across
+        // the whole fenced block. The line right after the fence's close
+        // (itself non-blank) then wrongly looked as if it followed a blank
+        // line, incorrectly starting an indented code block (CommonMark:
+        // that only happens after an ACTUAL blank line) and dropping a
+        // citation that should have been parsed as ordinary prose.
+        let markdown = "Prologue.\n\n```\ncode\n```\n    `lib.rs` continues right after the fence, not preceded by a blank line.\n";
+        let citations = extract_path_citations(markdown);
+        assert!(
+            citations.iter().any(|c| c.text == "lib.rs"),
+            "expected lib.rs to be parsed as prose, not dropped as indented code"
+        );
+    }
+
+    #[test]
     fn blank_lines_inside_prose_do_not_toggle_fence_state() {
         // Regression case for the vacuous-match bug above: a blank line
         // between two citations (ordinary paragraph breaks, not a fence)
@@ -1833,25 +1888,16 @@ See `apps/rocmd/src/main.rs` for the entry point.
         // without touching the real `docs/architecture.md`.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        let run_git = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .status()
-                .expect("git command");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run_git(&["init", "-q"]);
-        run_git(&["config", "user.email", "test@example.com"]);
-        run_git(&["config", "user.name", "test"]);
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "test"]);
         std::fs::create_dir_all(root.join("docs")).expect("mkdir docs");
         std::fs::write(
             root.join(DOC_PATH),
             "`apps/rocm/src/deleted.rs` no longer exists.",
         )
         .expect("write doc");
-        run_git(&["add", "docs"]);
+        run_git(root, &["add", "docs"]);
 
         let err = check_doc_at(root).expect_err("a stale citation in the fabricated doc must fail");
         assert!(err.to_string().contains("`apps/rocm/src/deleted.rs`"));
